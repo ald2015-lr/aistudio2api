@@ -1,0 +1,308 @@
+export type Locale = 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko' | 'fr' | 'de'
+
+export type TabID = 'logs' | 'accounts' | 'models' | 'requests' | 'settings' | 'playground'
+
+export type AccountState =
+  'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled'
+
+export interface Account {
+  id: string
+  label: string
+  enabled: boolean
+  state: AccountState
+  proxy: string
+  locale: string
+  timezone: string
+  models: string[]
+  benefit_tier: string
+  message: string
+}
+
+export interface AccountDraft {
+  label: string
+  enabled: boolean
+  proxy: string
+  locale: string
+  timezone: string
+}
+
+export interface AccountLoginInput {
+  proxy: string
+  locale: string
+  timezone: string
+}
+
+export interface ChromeImportProfile {
+  id: string
+  profile: string
+  display_name: string
+  email: string
+  locale: string
+}
+
+export interface ChromeImportInput extends AccountLoginInput {
+  account_ids: string[]
+}
+
+export interface AccountCounters {
+  total: number
+  ready: number
+  busy: number
+  cooldown: number
+  auth_required: number
+}
+
+// OnboardingPolicy 为新账户自动处理设置
+export interface OnboardingPolicy {
+  auto_verify: boolean
+  auto_enable: boolean
+  batch_size: number
+  concurrency: number
+}
+
+export type OnboardingResult =
+  | 'enabled'
+  | 'verified'
+  | 'verify_failed'
+  | 'error'
+  | 'skipped'
+  | 'manual'
+  | 'baseline'
+
+export interface OnboardingEvent {
+  account_id: string
+  result: OnboardingResult
+  detail?: string
+  at: string
+}
+
+// OnboardingStatus 为新账户自动处理队列状态；next_batch_seconds 为 -1 表示队列为空
+export interface OnboardingStatus {
+  policy: OnboardingPolicy
+  pending: number
+  processing: string[] | null
+  next_batch_seconds: number
+  counts: Partial<Record<OnboardingResult, number>> | null
+  recent: OnboardingEvent[] | null
+}
+
+// PrewarmState 为预热循环的实时状态；loop_age_seconds 持续变大说明循环被卡住
+export interface PrewarmState {
+  active: boolean
+  inflight: number
+  launched: number
+  round_seconds: number
+  loop_age_seconds: number
+  reason?: string
+}
+
+// WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户
+export interface WorkerCounters {
+  warm: number
+  starting: number
+  target: number
+  max: number
+  occupied?: number
+  prewarm?: PrewarmState
+  warm_ids?: string[]
+  starting_ids?: string[]
+}
+
+export interface ServiceStatus {
+  state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
+  running: boolean
+  ready: boolean
+  version: string
+  active_requests: number
+  accounts: AccountCounters
+  workers?: WorkerCounters
+}
+
+export type WorkerState = 'warm' | 'starting' | 'none'
+
+export interface AdminLog {
+  time: string
+  level: string
+  source: string
+  message: string
+  event: string
+  request?: RequestLog
+}
+
+// RequestLog 对应请求日志的结构化载荷
+export interface RequestLog {
+  id: string
+  state: 'running' | 'completed' | 'tool_calls' | 'limited' | 'blocked' | 'failed' | 'cancelled'
+  model?: string
+  method?: string
+  path?: string
+  status?: number
+  duration_ms?: number
+  tool_calls?: number
+  finish_reason?: string
+  error?: string
+  input_messages?: number
+  input_text_chars?: number
+  input_media?: number
+  input_media_bytes?: number
+  input_files?: number
+  parameters?: Record<string, string>
+  first_event_ms?: number
+  upstream_bytes?: number
+  channel?: UpstreamChannel
+  usage?: {
+    input_tokens: number
+    reasoning_tokens: number
+    reply_tokens: number
+    output_tokens: number
+    total_tokens: number
+    average_tokens_per_second: number
+  }
+  downgrade?: DowngradeDecision
+}
+
+export interface Model {
+  id: string
+  name: string
+  description?: string
+  methods: string[]
+  input_token_limit?: number
+  output_token_limit?: number
+  capabilities?: Record<string, boolean>
+  capability_options?: Record<string, string[]>
+  access_modes?: number[]
+  paid?: boolean
+  channels?: UpstreamChannel[]
+}
+
+export type UpstreamChannel = 'playground' | 'build'
+
+export interface Cooldown {
+  account_id: string
+  account_label: string
+  channel: UpstreamChannel
+  model_id: string
+  until: string
+  reason?: string
+}
+
+export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
+
+export interface RequestSummary {
+  id: string
+  model: string
+  account_id: string
+  account_label: string
+  channel?: UpstreamChannel
+  state: RequestState
+  started_at: string
+}
+
+// DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（服务配置页，修改后立即生效）
+export interface DowngradeGuardConfig {
+  enabled: boolean
+  models: string[]
+  speed_threshold: number
+  min_tokens: number
+  min_window_ms: number
+  fuzzy_low: number
+  fuzzy_high: number
+  count_timeout_ms: number
+  fast_mode: boolean
+  memory_minutes: number
+  max_hold_ms: number
+}
+
+// DowngradeDecision 为一次降级判定的依据（请求日志的 downgrade 字段）
+export interface DowngradeDecision {
+  verdict: 'rejected' | 'passed' | 'unjudged'
+  reason?: string
+  mode?: string
+  channel?: string
+  served_model?: string
+  speed?: number
+  estimated_speed?: number
+  tokens?: number
+  window_ms?: number
+  estimated?: boolean
+  count_tokens?: boolean
+  count_tokens_ms?: number
+  count_tokens_error?: string
+  memory?: boolean
+  held_ms?: number
+  text_held_ms?: number
+  capped?: boolean
+  basis: string
+}
+
+export interface ServiceConfig {
+  auth_states: string
+  listen_addr: string
+  proxy_api_key: string
+  active_listen_addr: string
+  active_proxy_api_key: string
+  management_restart_required: boolean
+  service_restart_required: boolean
+  proxy: string
+  init_timeout: string
+  request_timeout: string
+  warm_worker_limit: number
+  max_active_workers: number
+  warm_startup_concurrency: number
+  per_account_concurrency: number
+  routing_strategy: 'round-robin' | 'fill-first'
+  upstream_channels: UpstreamChannel[]
+  waa_backend: 'camoufox' | 'go'
+  temporary_chat: boolean
+  ignore_client_seed: boolean
+  repeat_prompt_nonce: boolean
+  min_output_tokens: number
+  downgrade_guard: DowngradeGuardConfig
+}
+
+export type AdminEvent =
+  | { type: 'status'; data: ServiceStatus }
+  | { type: 'log'; data: AdminLog }
+  | { type: 'accounts'; data: { accounts: Account[] } }
+  | { type: 'models'; data: { models: Model[] } }
+  | { type: 'cooldowns'; data: Cooldown[] }
+  | { type: 'request'; data: RequestSummary }
+
+export type PlaygroundProtocol = 'openai-chat' | 'openai-responses' | 'anthropic' | 'gemini'
+
+export type PlaygroundMode = 'text' | 'image' | 'speech' | 'music' | 'video'
+
+export type PlaygroundReasoning = '' | 'low' | 'medium' | 'high'
+
+export type PlaygroundTool =
+  '' | 'web_search' | 'image_search' | 'code_interpreter' | 'url_context' | 'google_maps'
+
+export interface PlaygroundInput {
+  mode: PlaygroundMode
+  protocol: PlaygroundProtocol
+  model: string
+  prompt: string
+  system: string
+  stream: boolean
+  reasoning: PlaygroundReasoning
+  tool: PlaygroundTool
+  imageSize: 'auto' | '1024x1024' | '1536x1024' | '1024x1536'
+  imageQuality: 'auto' | 'low' | 'medium' | 'high'
+  voice: string
+  apiKey: string
+}
+
+export interface PlaygroundMedia {
+  mime: string
+  url: string
+}
+
+export interface PlaygroundResult {
+  text: string
+  reasoning: string
+  tools: string
+  media: PlaygroundMedia[]
+  raw: string
+  durationMs: number
+  status: number
+}
