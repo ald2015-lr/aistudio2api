@@ -193,45 +193,48 @@ func (manager *runtimeManager) StopService(ctx context.Context) (api.AdminStatus
 	return current.admin.StopService(ctx)
 }
 
-// Close 释放当前生成服务
+// Close 释放当前生成服务；在锁外关闭，关闭期间仍在收尾的请求可以照常记录访问日志
 func (manager *runtimeManager) Close() error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
-	return manager.current.Close()
+	return manager.generation().Close()
+}
+
+// generation 返回当前生成服务实例的快照。
+//
+// 只在读取指针时持有 mu，调用方在锁外使用快照：原先各方法在整个调用期间持有读锁，
+// 调用链里再次读锁（例如生成请求写访问日志时回调 RecordAccessStart）会与排队的写锁
+// （保存配置、启停服务）互相等待，整个服务永久卡死；登录、验证等长操作持锁时，
+// 保存配置也会让所有新请求排在写锁后面。替换实例只交换指针，旧实例由 StartService 关闭，
+// 仍在使用旧快照的调用会收到服务已停止的错误
+func (manager *runtimeManager) generation() *runtimeGeneration {
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
+	return manager.current
 }
 
 // Models 返回当前生成服务模型
 func (manager *runtimeManager) Models(ctx context.Context) ([]aistudio.Model, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.service.Models(ctx)
+	return manager.generation().service.Models(ctx)
 }
 
 // CountTokens 由当前生成服务计数
 func (manager *runtimeManager) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.service.CountTokens(ctx, request)
+	return manager.generation().service.CountTokens(ctx, request)
 }
 
 // Generate 由当前生成服务生成事件流
 func (manager *runtimeManager) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
-	manager.mu.RLock()
-	var current any = manager.current.service
+	var current any = manager.generation().service
 	starter, ok := current.(interface {
 		startGenerate(context.Context, aistudio.GenerateRequest) (<-chan aistudio.Event, func() error, error)
 	})
 	if !ok {
-		defer manager.mu.RUnlock()
-		return manager.current.service.Generate(ctx, request)
+		return current.(managedService).Generate(ctx, request)
 	}
 	events, wait, err := starter.startGenerate(ctx, request)
-	manager.mu.RUnlock()
 	if err != nil || wait == nil {
 		return events, err
 	}
-	// 降级判定（流式严格模式）要等到判定出结果才返回：在锁外等待。持有读锁等待会挡住配置热更新与重启，
-	// 写锁排队时后来的读锁也会被挡住，所有新请求都会卡住
+	// 降级判定（流式严格模式）要等到判定出结果才返回
 	if err := wait(); err != nil {
 		return nil, err
 	}
@@ -240,9 +243,7 @@ func (manager *runtimeManager) Generate(ctx context.Context, request aistudio.Ge
 
 // GenerateVideo 由当前生成服务创建视频任务
 func (manager *runtimeManager) GenerateVideo(ctx context.Context, request aistudio.VideoRequest) (aistudio.VideoOperation, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.VideoService)
+	service, ok := manager.generation().service.(aistudio.VideoService)
 	if !ok {
 		return aistudio.VideoOperation{}, fmt.Errorf("video service 不可用")
 	}
@@ -251,9 +252,7 @@ func (manager *runtimeManager) GenerateVideo(ctx context.Context, request aistud
 
 // GetGenerateVideoOperation 由当前生成服务读取视频任务
 func (manager *runtimeManager) GetGenerateVideoOperation(ctx context.Context, id string) (aistudio.VideoOperation, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.VideoService)
+	service, ok := manager.generation().service.(aistudio.VideoService)
 	if !ok {
 		return aistudio.VideoOperation{}, fmt.Errorf("video service 不可用")
 	}
@@ -262,9 +261,7 @@ func (manager *runtimeManager) GetGenerateVideoOperation(ctx context.Context, id
 
 // DownloadFile 由当前生成服务下载文件
 func (manager *runtimeManager) DownloadFile(ctx context.Context, id string) (aistudio.MediaStream, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.VideoService)
+	service, ok := manager.generation().service.(aistudio.VideoService)
 	if !ok {
 		return aistudio.MediaStream{}, fmt.Errorf("video service 不可用")
 	}
@@ -273,9 +270,7 @@ func (manager *runtimeManager) DownloadFile(ctx context.Context, id string) (ais
 
 // UploadFile 由当前生成服务上传文件
 func (manager *runtimeManager) UploadFile(ctx context.Context, request aistudio.UploadRequest) (aistudio.FileRef, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.FileService)
+	service, ok := manager.generation().service.(aistudio.FileService)
 	if !ok {
 		return aistudio.FileRef{}, fmt.Errorf("file service 不可用")
 	}
@@ -284,9 +279,7 @@ func (manager *runtimeManager) UploadFile(ctx context.Context, request aistudio.
 
 // FileMetadata 由当前生成服务读取文件元数据
 func (manager *runtimeManager) FileMetadata(ctx context.Context, id string) (aistudio.FileMetadata, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.FileService)
+	service, ok := manager.generation().service.(aistudio.FileService)
 	if !ok {
 		return aistudio.FileMetadata{}, fmt.Errorf("file service 不可用")
 	}
@@ -295,9 +288,7 @@ func (manager *runtimeManager) FileMetadata(ctx context.Context, id string) (ais
 
 // DeleteFile 由当前生成服务删除文件
 func (manager *runtimeManager) DeleteFile(ctx context.Context, id string) error {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.FileService)
+	service, ok := manager.generation().service.(aistudio.FileService)
 	if !ok {
 		return fmt.Errorf("file service 不可用")
 	}
@@ -306,9 +297,7 @@ func (manager *runtimeManager) DeleteFile(ctx context.Context, id string) error 
 
 // OpenBidi 由当前生成服务创建实时会话
 func (manager *runtimeManager) OpenBidi(ctx context.Context, request aistudio.BidiRequest) (*aistudio.BidiSession, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.BidiService)
+	service, ok := manager.generation().service.(aistudio.BidiService)
 	if !ok {
 		return nil, fmt.Errorf("bidi service 不可用")
 	}
@@ -317,9 +306,7 @@ func (manager *runtimeManager) OpenBidi(ctx context.Context, request aistudio.Bi
 
 // Transcribe 由当前生成服务执行音频转录
 func (manager *runtimeManager) Transcribe(ctx context.Context, request aistudio.TranscriptionRequest) (aistudio.TranscriptionResult, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	service, ok := manager.current.service.(aistudio.TranscriptionService)
+	service, ok := manager.generation().service.(aistudio.TranscriptionService)
 	if !ok {
 		return aistudio.TranscriptionResult{}, fmt.Errorf("transcription service 不可用")
 	}
@@ -328,65 +315,47 @@ func (manager *runtimeManager) Transcribe(ctx context.Context, request aistudio.
 
 // Status 返回当前生成服务状态
 func (manager *runtimeManager) Status(ctx context.Context) (api.AdminStatus, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.Status(ctx)
+	return manager.generation().admin.Status(ctx)
 }
 
 // Accounts 返回当前生成服务账户
 func (manager *runtimeManager) Accounts(ctx context.Context) ([]api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.Accounts(ctx)
+	return manager.generation().admin.Accounts(ctx)
 }
 
 // CreateAccount 在当前生成服务创建账户
 func (manager *runtimeManager) CreateAccount(ctx context.Context, input api.AccountCreateInput) (api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.CreateAccount(ctx, input)
+	return manager.generation().admin.CreateAccount(ctx, input)
 }
 
 // ChromeImportProfiles 返回当前生成服务可导入的 Chrome 账号
 func (manager *runtimeManager) ChromeImportProfiles(ctx context.Context) ([]api.ChromeImportProfile, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.ChromeImportProfiles(ctx)
+	return manager.generation().admin.ChromeImportProfiles(ctx)
 }
 
 // ImportChromeAccounts 在当前生成服务批量导入 Chrome 账号
 func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.ImportChromeAccounts(ctx, input)
+	return manager.generation().admin.ImportChromeAccounts(ctx, input)
 }
 
 // UpdateAccount 在当前生成服务更新账户
 func (manager *runtimeManager) UpdateAccount(ctx context.Context, id string, input api.AccountInput) (api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.UpdateAccount(ctx, id, input)
+	return manager.generation().admin.UpdateAccount(ctx, id, input)
 }
 
 // DeleteAccount 在当前生成服务删除账户
 func (manager *runtimeManager) DeleteAccount(ctx context.Context, id string) error {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.DeleteAccount(ctx, id)
+	return manager.generation().admin.DeleteAccount(ctx, id)
 }
 
 // LoginAccount 在当前生成服务登录账户
 func (manager *runtimeManager) LoginAccount(ctx context.Context, id string) (api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.LoginAccount(ctx, id)
+	return manager.generation().admin.LoginAccount(ctx, id)
 }
 
 // VerifyAccount 在当前生成服务验证账户
 func (manager *runtimeManager) VerifyAccount(ctx context.Context, id string) (api.AdminAccount, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.VerifyAccount(ctx, id)
+	return manager.generation().admin.VerifyAccount(ctx, id)
 }
 
 // ClearLogs 清空进程级管理日志
@@ -397,51 +366,45 @@ func (manager *runtimeManager) ClearLogs(context.Context) error {
 
 // RuntimeConfig 返回已保存配置与进程级生效状态
 func (manager *runtimeManager) RuntimeConfig(ctx context.Context) (api.RuntimeConfig, error) {
-	manager.mu.RLock()
-	value, err := manager.current.admin.RuntimeConfig(ctx)
-	if err == nil {
-		value = manager.decorateRuntimeConfig(value, manager.current.config)
+	value, err := manager.generation().admin.RuntimeConfig(ctx)
+	if err != nil {
+		return value, err
 	}
-	manager.mu.RUnlock()
-	return value, err
+	return manager.decorateCurrent(value), nil
 }
 
 // UpdateRuntimeConfig 保存下一次启动生成服务时使用的配置
 func (manager *runtimeManager) UpdateRuntimeConfig(ctx context.Context, value api.RuntimeConfig) (api.RuntimeConfig, error) {
-	manager.mu.RLock()
-	updated, err := manager.current.admin.UpdateRuntimeConfig(ctx, value)
-	manager.mu.RUnlock()
+	updated, err := manager.generation().admin.UpdateRuntimeConfig(ctx, value)
 	if err != nil {
 		return updated, err
 	}
 	// API 密钥保存后立即生效；Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
 	manager.applyAPIKey(updated.APIKey)
 	manager.applyLiveConfig()
+	return manager.decorateCurrent(updated), nil
+}
+
+// decorateCurrent 在锁内读取进程级配置与当前实例配置后标记生效时机；不回调任何实例方法
+func (manager *runtimeManager) decorateCurrent(value api.RuntimeConfig) api.RuntimeConfig {
 	manager.mu.RLock()
-	updated = manager.decorateRuntimeConfig(updated, manager.current.config)
-	manager.mu.RUnlock()
-	return updated, nil
+	defer manager.mu.RUnlock()
+	return manager.decorateRuntimeConfig(value, manager.current.config)
 }
 
 // Cooldowns 返回当前生成服务冷却状态
 func (manager *runtimeManager) Cooldowns(ctx context.Context) ([]api.AdminCooldown, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.Cooldowns(ctx)
+	return manager.generation().admin.Cooldowns(ctx)
 }
 
 // Requests 返回进程级活动请求
 func (manager *runtimeManager) Requests(ctx context.Context) ([]api.AdminRequest, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.Requests(ctx)
+	return manager.generation().admin.Requests(ctx)
 }
 
 // CancelRequest 取消进程级活动请求
 func (manager *runtimeManager) CancelRequest(ctx context.Context, id string) error {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
-	return manager.current.admin.CancelRequest(ctx, id)
+	return manager.generation().admin.CancelRequest(ctx, id)
 }
 
 // Events 创建生成服务实例切换期间持续可用的管理事件流
@@ -449,18 +412,14 @@ func (manager *runtimeManager) Events(ctx context.Context) (<-chan api.AdminEven
 	return openAdminEvents(ctx, manager.lifecycle, manager.requests, manager)
 }
 
-// RecordAccessStart 记录公开 API 请求开始
+// RecordAccessStart 记录公开 API 请求开始；会在生成调用链内被回调，不能在持锁期间调用实例方法
 func (manager *runtimeManager) RecordAccessStart(entry api.AccessLog) {
-	manager.mu.RLock()
-	manager.current.admin.RecordAccessStart(entry)
-	manager.mu.RUnlock()
+	manager.generation().admin.RecordAccessStart(entry)
 }
 
 // RecordAccessLog 记录公开 API 请求结果
 func (manager *runtimeManager) RecordAccessLog(entry api.AccessLog) {
-	manager.mu.RLock()
-	manager.current.admin.RecordAccessLog(entry)
-	manager.mu.RUnlock()
+	manager.generation().admin.RecordAccessLog(entry)
 }
 
 // decorateRuntimeConfig 标记配置所属的进程级与生成服务生效时机
