@@ -257,14 +257,11 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 			return withMethod(err, "CreateInteractionStream")
 		}
 		if code != 0 {
-			rpcError := &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Code: code}
-			if status, ok := interactionStatusHTTP[code]; ok {
-				rpcError.StatusCode = status
+			statusCode := http.StatusBadGateway
+			if mapped, ok := interactionStatusHTTP[code]; ok {
+				statusCode = mapped
 			}
-			if len(status) > 1 {
-				rpcError.Message, _ = rawString(status[1], "$[1][1]", trailing[0])
-			}
-			return rpcError
+			return DecodeRPCError("CreateInteractionStream", statusCode, trailing[0])
 		}
 	}
 	if !finished {

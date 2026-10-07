@@ -429,27 +429,21 @@ func parseBidiStatusPayload(raw json.RawMessage) (BidiEvent, bool, error) {
 	if err != nil {
 		return BidiEvent{}, true, withBidiMethod(err)
 	}
-	message, err := rawString(status[1], "$.__sm__.status[0][0][1]", raw)
-	if err != nil {
+	if _, err := rawString(status[1], "$.__sm__.status[0][0][1]", raw); err != nil {
 		return BidiEvent{}, true, withBidiMethod(err)
 	}
-	statusCode := 0
-	switch code {
-	case 3:
-		statusCode = 400
-	case 5:
-		statusCode = 404
-	case 7:
-		statusCode = 403
-	default:
+	// 带内状态码与 Interaction 流尾使用同一套 google.rpc.Code 映射（8→429、14→503、16→401 等）
+	statusCode, ok := interactionStatusHTTP[code]
+	if !ok {
 		return BidiEvent{}, true, &ProtocolEvidenceError{
 			Method: "BidiGenerateContent", Path: "$.__sm__.status[0][0][0]",
 			Detail: fmt.Sprintf("未识别的状态码 %d", code), Raw: cloneRaw(raw),
 		}
 	}
+	// 按完整状态解码，保留 ErrorInfo 与 RetryInfo，额度冷却据此判定周期和作用域
 	return BidiEvent{
 		Kind: BidiEventError,
-		Err:  &RPCError{Method: "BidiGenerateContent", StatusCode: statusCode, Code: code, Message: message},
+		Err:  DecodeRPCError("BidiGenerateContent", statusCode, middle[0]),
 		Raw:  cloneRaw(raw),
 	}, true, nil
 }

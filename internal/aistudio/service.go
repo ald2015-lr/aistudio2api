@@ -669,6 +669,15 @@ func forwardEventsWithLease(
 				if err := lease.MarkAuthenticationRequired(event.Err.Error()); err != nil {
 					event.Err = errors.Join(event.Err, err)
 				}
+			} else if cooldown, ok := QuotaCooldownForError(event.Err, time.Now()); ok {
+				// 已经输出内容后才出现的额度 429 同样写回冷却
+				scope := lease.CooldownScope(modelID)
+				if cooldown.Global {
+					scope = ""
+				}
+				if err := pool.MarkCooldownIfGeneration(accountID, scope, accessGeneration, checkedAt, cooldown.Until, cooldown.Reason); err != nil {
+					event.Err = errors.Join(event.Err, err)
+				}
 			}
 		}
 		select {

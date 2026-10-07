@@ -1001,7 +1001,31 @@ func (s *BidiSession) consumeBackchannelFrame(raw json.RawMessage) (int, error) 
 }
 
 func (s *BidiSession) recordScopedModelAccess(event *BidiEvent) {
-	if event == nil || s.modelAccessScope == "" {
+	if event == nil {
+		return
+	}
+	// 会话建立后的额度 429 同样写回冷却，避免调度继续把新会话分到这个账号
+	if event.Kind == BidiEventError {
+		if cooldown, ok := QuotaCooldownForError(event.Err, time.Now()); ok {
+			scope := s.modelAccessScope
+			if scope == "" {
+				scope = s.model
+			}
+			if cooldown.Global {
+				scope = ""
+			}
+			checkedAt := s.finishQualificationAttempt(true)
+			if err := s.lease.pool.MarkCooldownIfGeneration(
+				s.accountID, scope, s.lease.ModelAccessGeneration(), checkedAt, cooldown.Until, cooldown.Reason,
+			); err != nil {
+				event.Err = errors.Join(event.Err, err)
+			} else {
+				s.notifyModelAccessChanged()
+			}
+			return
+		}
+	}
+	if s.modelAccessScope == "" {
 		return
 	}
 	if event.Kind == BidiEventError && DefinitiveAuthenticationFailure(event.Err) {

@@ -27,8 +27,8 @@ const (
 	quotaSharedRatio = 20
 	// quotaPendingTTL 另一个通道在这段时间内没有新的尝试，就放弃这次观察
 	quotaPendingTTL = 30 * time.Minute
-	// dailyQuotaKind 与 aistudio.QuotaCooldownForError 返回的每日限额类型一致
-	dailyQuotaKind = "每日限额"
+	// dailyQuotaKind 为 aistudio.QuotaCooldownForError 返回的每日限额类型
+	dailyQuotaKind = aistudio.DailyQuotaKind
 )
 
 // quotaSharingStats 为某模型的观察计数

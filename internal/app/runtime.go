@@ -3572,49 +3572,14 @@ func (service *trackedService) generateWithRetry(
 			}
 		}
 		cooled, switchedToBuild := false, false
-		if cooldown, ok := aistudio.QuotaCooldownForError(err, time.Now()); ok {
+		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, err, ""); ok {
 			cooled = true
-			modelAccessScope := lease.CooldownScope(modelID)
-			scopeLabel := modelAccessScope
-			if cooldown.Global {
-				modelAccessScope = ""
-				scopeLabel = "全局"
-			}
-			stateErr := service.pool.MarkCooldownIfGeneration(
-				request.AccountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
-				cooldown.Until, cooldown.Reason,
-			)
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
-			} else {
-				service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-					"账号冷却 | 类型=%s | 范围=%s | 恢复=%s",
-					cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339),
-				))
-				// 每日限额：该模型已判定两个通道共用额度时，同时冷却另一个通道，
-				// 避免请求再去另一个通道失败一次、再换号重试
-				if !cooldown.Global && cooldown.Kind == dailyQuotaKind {
-					other, coolOther := service.quota.dailyLimitHit(
-						request.AccountID, modelID, lease.Channel(), lease.CheckedAt(), time.Now(),
-					)
-					if coolOther {
-						otherScope := aistudio.ChannelCooldownScope(other, modelID)
-						if otherErr := service.pool.MarkCooldownIfGeneration(
-							request.AccountID, otherScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
-							cooldown.Until, "每日限额（与另一通道共用额度，同步冷却）: "+strings.TrimPrefix(cooldown.Reason, dailyQuotaKind+": "),
-						); otherErr == nil {
-							service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-								"账号冷却 | 类型=%s | 范围=%s | 恢复=%s | 与另一通道共用额度，同步冷却",
-								cooldown.Kind, otherScope, cooldown.Until.Format(time.RFC3339),
-							))
-						}
-					}
-				}
-				if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, selection) {
-					delete(attempted, request.AccountID)
-					maxAttempts++
-				}
+			} else if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, selection) {
+				delete(attempted, request.AccountID)
+				maxAttempts++
 			}
 		}
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度
@@ -3723,6 +3688,57 @@ func (service *trackedService) generateWithRetry(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
 	)
+}
+
+// applyQuotaCooldown 在上游返回额度 429 时冷却该账号的模型（或整个账号），并记录日志；
+// 每日限额且该模型已判定两个通道共用额度时，同时冷却另一个通道，避免请求再去另一个通道失败一次。
+// ok 表示 err 是额度错误；stateErr 为写入冷却状态失败的原因
+func (service *trackedService) applyQuotaCooldown(
+	lease *aistudio.AccountLease, accountLabel string, modelID string, err error, note string,
+) (cooldown aistudio.QuotaCooldown, ok bool, stateErr error) {
+	cooldown, ok = aistudio.QuotaCooldownForError(err, time.Now())
+	if !ok {
+		return cooldown, false, nil
+	}
+	accountID := lease.Account().ID
+	modelAccessScope := lease.CooldownScope(modelID)
+	scopeLabel := modelAccessScope
+	if cooldown.Global {
+		modelAccessScope = ""
+		scopeLabel = "全局"
+	}
+	if stateErr = service.pool.MarkCooldownIfGeneration(
+		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
+		cooldown.Until, cooldown.Reason,
+	); stateErr != nil {
+		return cooldown, true, stateErr
+	}
+	suffix := ""
+	if note != "" {
+		suffix = " | " + note
+	}
+	service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s",
+		cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), suffix,
+	))
+	if cooldown.Global || cooldown.Kind != dailyQuotaKind {
+		return cooldown, true, nil
+	}
+	other, coolOther := service.quota.dailyLimitHit(accountID, modelID, lease.Channel(), lease.CheckedAt(), time.Now())
+	if !coolOther {
+		return cooldown, true, nil
+	}
+	otherScope := aistudio.ChannelCooldownScope(other, modelID)
+	if otherErr := service.pool.MarkCooldownIfGeneration(
+		accountID, otherScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
+		cooldown.Until, "每日限额（与另一通道共用额度，同步冷却）: "+strings.TrimPrefix(cooldown.Reason, dailyQuotaKind+": "),
+	); otherErr == nil {
+		service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+			"账号冷却 | 类型=%s | 范围=%s | 恢复=%s | 与另一通道共用额度，同步冷却",
+			cooldown.Kind, otherScope, cooldown.Until.Format(time.RFC3339),
+		))
+	}
+	return cooldown, true, nil
 }
 
 // generateFailureLimit 为单个请求非额度类失败的换号上限
@@ -4016,6 +4032,10 @@ func (service *trackedService) forwardEvents(
 					requestErr = errors.Join(requestErr, stateErr)
 					event.Err = requestErr
 				}
+			} else if _, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, requestedModelID, event.Err, "已输出内容后"); ok && stateErr != nil {
+				// 已经开始输出后才出现的 429 无法换号重试，但仍写回冷却，后续请求不再选中这个账号或模型
+				requestErr = errors.Join(requestErr, stateErr)
+				event.Err = requestErr
 			}
 			state = finalRequestState(event.Err)
 			terminal = true

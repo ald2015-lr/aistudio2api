@@ -621,7 +621,7 @@ bootstrap 模型只负责建立账户 Worker，不是业务模型白名单，一
 | 受保护请求网络错误 | 同上 |
 | `GenerateContent`、`GenerateVideo`、Bidi 返回 HTTP 404、Code 5 且消息含 `Ambiguous request for service ''` | 同账户重建 Worker 并重放一次 |
 | HTTP 403 或 Code 7 | 保留账户与模型资格，首个上游事件前切换到未尝试的同能力账户；不重建 Worker |
-| HTTP 429 | 按分钟或每日限额写入冷却（Build 通道为 `build:<模型>`），同账户另一通道可用时在同账户重试 |
+| HTTP 429 | 按分钟或每日限额写入冷却（Build 通道为 `build:<模型>`；周期判定与 RetryInfo/Retry-After 规则见 build.md），同账户另一通道可用时在同账户重试；已输出内容后与 Live 会话中的 429 也写回冷却 |
 | HTTP 401 | Chrome 导入账户在同一出口续签，重建 WAA runtime 后重放一次；没有续签材料或续签后仍为 401 的账户进入 `auth_required` |
 | Worker 启动失败 | 记录 `WAA Worker 启动失败`，请求可切换账户 |
 | runtime 租约由其他进程持有 | 账户暂停调度，首次 5 秒后重试，间隔翻倍到 1 分钟 |

@@ -8,8 +8,10 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -122,7 +124,12 @@ type RPCError struct {
 	Code       int64
 	Message    string
 	Metadata   map[string]string
+	// RetryDelay 为上游建议的重试等待时间，来自 google.rpc.RetryInfo 或 HTTP Retry-After；0 表示没有
+	RetryDelay time.Duration
 }
+
+// maxRetryDelay 为采纳上游重试建议的上限，异常的超大值按此截断
+const maxRetryDelay = 24 * time.Hour
 
 // Error 返回结构化上游错误
 func (e *RPCError) Error() string {
@@ -206,7 +213,11 @@ func validateRPCResponse(method string, response *RPCResponse) (*RPCResponse, er
 		if readErr != nil {
 			return nil, fmt.Errorf("读取 AI Studio %s 错误响应: %w", method, readErr)
 		}
-		return nil, DecodeRPCError(method, response.StatusCode, raw)
+		rpcError := DecodeRPCError(method, response.StatusCode, raw)
+		if rpcError.RetryDelay <= 0 {
+			rpcError.RetryDelay = parseRetryAfter(response.Header.Get("Retry-After"), time.Now())
+		}
+		return nil, rpcError
 	}
 	contentType := response.Header.Get("Content-Type")
 	mediaType, _, err := mime.ParseMediaType(contentType)
@@ -262,7 +273,17 @@ func decodeRPCErrorMetadata(rpcError *RPCError, raw json.RawMessage) {
 			continue
 		}
 		var typeURL string
-		if err := json.Unmarshal(detail[0], &typeURL); err != nil || typeURL != "type.googleapis.com/google.rpc.ErrorInfo" {
+		if err := json.Unmarshal(detail[0], &typeURL); err != nil {
+			continue
+		}
+		if typeURL == "type.googleapis.com/google.rpc.RetryInfo" {
+			var info []json.RawMessage
+			if json.Unmarshal(detail[1], &info) == nil && len(info) > 0 {
+				rpcError.RetryDelay = max(rpcError.RetryDelay, decodeRPCRetryDuration(info[0]))
+			}
+			continue
+		}
+		if typeURL != "type.googleapis.com/google.rpc.ErrorInfo" {
 			continue
 		}
 		var info []json.RawMessage
@@ -283,4 +304,56 @@ func decodeRPCErrorMetadata(rpcError *RPCError, raw json.RawMessage) {
 			rpcError.Metadata[pair[0]] = pair[1]
 		}
 	}
+}
+
+// decodeRPCRetryDuration 读取 RetryInfo.retry_delay（google.protobuf.Duration 的数组形式 [秒, 纳秒]）
+func decodeRPCRetryDuration(raw json.RawMessage) time.Duration {
+	var fields []json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || len(fields) == 0 {
+		return 0
+	}
+	var seconds int64
+	if err := json.Unmarshal(fields[0], &seconds); err != nil {
+		// 数组协议中 int64 可能编码为字符串
+		var text string
+		if json.Unmarshal(fields[0], &text) != nil {
+			return 0
+		}
+		if seconds, err = strconv.ParseInt(text, 10, 64); err != nil {
+			return 0
+		}
+	}
+	if seconds < 0 || seconds > int64(maxRetryDelay/time.Second) {
+		return 0
+	}
+	delay := time.Duration(seconds) * time.Second
+	if len(fields) > 1 && !isJSONNull(fields[1]) {
+		var nanos int64
+		if json.Unmarshal(fields[1], &nanos) != nil || nanos < 0 || nanos >= int64(time.Second) {
+			return 0
+		}
+		delay += time.Duration(nanos)
+	}
+	return delay
+}
+
+// parseRetryAfter 解析 HTTP Retry-After：整数秒或 HTTP 日期；无法识别、已过期或超过上限时返回 0
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	var delay time.Duration
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 || seconds > int64(maxRetryDelay/time.Second) {
+			return 0
+		}
+		delay = time.Duration(seconds) * time.Second
+	} else if until, err := http.ParseTime(value); err == nil {
+		delay = until.Sub(now)
+	}
+	if delay <= 0 || delay > maxRetryDelay {
+		return 0
+	}
+	return delay
 }
