@@ -1188,6 +1188,15 @@ func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID
 		if account == nil {
 			continue
 		}
+		// 正在启动或替换 Worker 的账户不作为淘汰对象：启动流程持有该账户的 startupMu 之后还要拿 rebalanceMu，
+		// 而淘汰在持有 rebalanceMu 时要拿 startupMu，两边互相等待会让全局调度永久停住
+		if _, opening := manager.openingSet.Load(accountID); opening {
+			continue
+		}
+		if !account.startupMu.TryLock() {
+			continue
+		}
+		account.startupMu.Unlock()
 		// 锁被占用说明正在处理请求，不可能是空闲 Worker，直接跳过而不是排队等待
 		if !account.mu.TryLock() {
 			continue

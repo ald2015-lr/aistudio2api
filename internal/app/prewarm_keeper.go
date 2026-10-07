@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -15,6 +16,8 @@ const (
 	keepWarmInterval = 5 * time.Second
 	// warmFailureBackoff 为预热失败的账户在此期间内不再被自动预热
 	warmFailureBackoff = 5 * time.Minute
+	// failedWorkerSweepWait 为后台关闭失败 Worker 时等待该账户进行中请求结束的上限；超时则下一轮再试
+	failedWorkerSweepWait = 3 * time.Second
 )
 
 // keepWarm 服务运行期间持续把常驻 Worker 补齐到目标数：
@@ -41,6 +44,7 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 			service.rotateCooledWorkers(dataContext)
 		}
 		workers := service.workers
+		workers.sweepFailedWorkers(dataContext)
 		if len(workers.WarmAccountIDs())+len(workers.OpeningAccountIDs()) >= workers.PrewarmTarget() {
 			continue
 		}
@@ -239,4 +243,27 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		"WAA Worker 冷却轮换 | 替换=%d | 预热池中长时间冷却=%s", rotated, strings.Join(details, "，"),
 	))
 	workers.StartPrewarm(ctx)
+}
+
+// sweepFailedWorkers 关闭已失败的常驻 Worker（浏览器退出、控制连接断开等），释放常驻名额，随后由 keepWarm 补齐。
+// 原先失败的 Worker 只看 warm 标志仍计入常驻数，也没有巡检，可用容量会悄悄缩水，只能等请求到来时现场重建
+func (manager *accountWorkerManager) sweepFailedWorkers(ctx context.Context) {
+	for _, accountID := range manager.WarmAccountIDs() {
+		if ctx.Err() != nil {
+			return
+		}
+		if !manager.WorkerFailed(accountID) {
+			continue
+		}
+		generation := manager.WorkerGeneration(accountID)
+		sweepCtx, cancel := context.WithTimeout(ctx, failedWorkerSweepWait)
+		reset, err := manager.ResetIfGeneration(sweepCtx, accountID, generation)
+		cancel()
+		switch {
+		case reset:
+			manager.requests.log(accountID, "WARN", "常驻 Worker 已失败，后台关闭以便重新预热")
+		case err != nil && ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded):
+			manager.requests.log(accountID, "WARN", "关闭失败的常驻 Worker 出错 | "+strings.TrimSpace(err.Error()))
+		}
+	}
 }
