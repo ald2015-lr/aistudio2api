@@ -1,10 +1,12 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testAdminToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -95,5 +97,24 @@ func TestAdminPageTokenLogin(t *testing.T) {
 	handler.ServeHTTP(recorder, localRequest("/?admin_token=wrong"))
 	if recorder.Code != http.StatusUnauthorized || len(recorder.Result().Cookies()) != 0 {
 		t.Fatalf("错误令牌参数 status = %d", recorder.Code)
+	}
+}
+
+// TestAdminLimiterGlobalCap 伪造来源轮换地址时，全部来源合计的错误上限仍会暂停密码登录
+func TestAdminLimiterGlobalCap(t *testing.T) {
+	limiter := &adminLoginLimiter{entries: make(map[string]*adminLoginEntry)}
+	now := time.Now()
+	for index := range adminAuthGlobalMaxFailures {
+		ip := fmt.Sprintf("198.51.100.%d", index%250)
+		if limiter.blocked(ip, now) {
+			t.Fatalf("第 %d 次之前不应封禁", index)
+		}
+		limiter.fail(ip, now)
+	}
+	if !limiter.blocked("203.0.113.77", now) {
+		t.Fatal("合计错误达到上限后应暂停所有来源的密码登录")
+	}
+	if limiter.blocked("203.0.113.77", now.Add(adminAuthBlock+time.Second)) {
+		t.Fatal("封禁到期后应恢复")
 	}
 }

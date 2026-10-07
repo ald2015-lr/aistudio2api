@@ -16,12 +16,16 @@ const (
 	adminAuthWindow      = 10 * time.Minute
 	adminAuthBlock       = 15 * time.Minute
 	adminAuthMaxEntries  = 10000
+	// adminAuthGlobalMaxFailures 为全部来源合计的错误上限：经反向代理时来源地址取自可伪造的转发头，
+	// 攻击者每次换一个地址就能绕过按来源的计数；合计达到上限后暂停密码登录（管理令牌不受影响）
+	adminAuthGlobalMaxFailures = 50
 )
 
-// adminLoginLimiter 按来源 IP 限制管理密码的错误尝试
+// adminLoginLimiter 按来源 IP 与全部来源合计限制管理密码的错误尝试
 type adminLoginLimiter struct {
 	mu      sync.Mutex
 	entries map[string]*adminLoginEntry
+	global  adminLoginEntry
 }
 
 type adminLoginEntry struct {
@@ -36,6 +40,9 @@ var adminLimiter = &adminLoginLimiter{entries: make(map[string]*adminLoginEntry)
 func (limiter *adminLoginLimiter) blocked(ip string, now time.Time) bool {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
+	if now.Before(limiter.global.blockedUntil) {
+		return true
+	}
 	entry, ok := limiter.entries[ip]
 	return ok && now.Before(entry.blockedUntil)
 }
@@ -44,6 +51,7 @@ func (limiter *adminLoginLimiter) blocked(ip string, now time.Time) bool {
 func (limiter *adminLoginLimiter) fail(ip string, now time.Time) {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
+	limiter.global.record(now, adminAuthGlobalMaxFailures)
 	if len(limiter.entries) >= adminAuthMaxEntries {
 		for key, entry := range limiter.entries {
 			if !now.Before(entry.blockedUntil) && now.Sub(entry.windowStart) > adminAuthWindow {
@@ -53,6 +61,10 @@ func (limiter *adminLoginLimiter) fail(ip string, now time.Time) {
 	}
 	entry, ok := limiter.entries[ip]
 	if !ok {
+		if len(limiter.entries) >= adminAuthMaxEntries {
+			// 清理后仍然满：不再为新来源建记录（由全部来源合计的上限兜底），避免伪造来源让记录无限增长
+			return
+		}
 		entry = &adminLoginEntry{windowStart: now}
 		limiter.entries[ip] = entry
 	}
@@ -62,6 +74,20 @@ func (limiter *adminLoginLimiter) fail(ip string, now time.Time) {
 	}
 	entry.failures++
 	if entry.failures >= adminAuthMaxFailures {
+		entry.blockedUntil = now.Add(adminAuthBlock)
+		entry.failures = 0
+		entry.windowStart = now
+	}
+}
+
+// record 在窗口内累计一次错误，达到上限时开始封禁
+func (entry *adminLoginEntry) record(now time.Time, limit int) {
+	if now.Sub(entry.windowStart) > adminAuthWindow {
+		entry.failures = 0
+		entry.windowStart = now
+	}
+	entry.failures++
+	if entry.failures >= limit {
 		entry.blockedUntil = now.Add(adminAuthBlock)
 		entry.failures = 0
 		entry.windowStart = now

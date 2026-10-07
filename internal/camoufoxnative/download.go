@@ -3,6 +3,8 @@ package camoufoxnative
 import (
 	"archive/zip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +17,16 @@ import (
 )
 
 const camoufoxRelease = "152.0.4-beta.29"
+
+// camoufoxSHA256 为固定版本各平台发行包的 SHA-256。下载后先校验再解压执行：只依赖 HTTPS 时，
+// 发行包被替换（发布账号被盗、中间人代理）会让服务直接执行被篡改的浏览器。升级 camoufoxRelease 时同步更新
+var camoufoxSHA256 = map[string]string{
+	"camoufox-152.0.4-beta.29-win.x86_64.zip": "b9ccdc298330e96f807999fe22aa212e9847fc9e210bc36b2e965b6cce03b25b",
+	"camoufox-152.0.4-beta.29-lin.x86_64.zip": "1bea4b55a51c88e82dc7d426d9c75093d942d2afc8c911cb8fc78ebf723d686c",
+	"camoufox-152.0.4-beta.29-lin.arm64.zip":  "c8844c03f3c233d6a466d59fd3f4e6f21470bd685e1b7cc82d650379a9b23e35",
+	"camoufox-152.0.4-beta.29-mac.x86_64.zip": "eeada250746edefc5d7b63fc371d51ed3252b21134e971ac64ca590ff78e7bb7",
+	"camoufox-152.0.4-beta.29-mac.arm64.zip":  "620d33289b5d52154cc7d92a9cca5915329aa6684105ab0f371d01480768eb53",
+}
 
 // installCamoufox 下载当前协议传输已对齐的 Camoufox 版本
 func installCamoufox(ctx context.Context, executableName string) (string, error) {
@@ -60,11 +72,15 @@ func installCamoufox(ctx context.Context, executableName string) (string, error)
 	if response.ContentLength > 0 {
 		slog.Info("Camoufox 下载已开始", "size_mib", response.ContentLength/(1024*1024))
 	}
-	_, copyErr := io.Copy(archive, contextReader{ctx: ctx, reader: response.Body})
+	hasher := sha256.New()
+	_, copyErr := io.Copy(io.MultiWriter(archive, hasher), contextReader{ctx: ctx, reader: response.Body})
 	closeErr := response.Body.Close()
 	archiveCloseErr := archive.Close()
 	if copyErr != nil || closeErr != nil || archiveCloseErr != nil {
 		return "", fmt.Errorf("保存 Camoufox: %w", firstError(copyErr, closeErr, archiveCloseErr))
+	}
+	if err := verifyCamoufoxArchive(asset, hex.EncodeToString(hasher.Sum(nil))); err != nil {
+		return "", err
 	}
 	staging, err := os.MkdirTemp(filepath.Dir(root), ".camoufox-stage-*")
 	if err != nil {
@@ -95,6 +111,21 @@ func installCamoufox(ctx context.Context, executableName string) (string, error)
 	executable := filepath.Join(root, executableName)
 	slog.Info("Camoufox 已就绪", "path", executable)
 	return executable, nil
+}
+
+// verifyCamoufoxArchive 校验下载的发行包；没有固定校验值的平台（例如 32 位）记录警告后继续
+func verifyCamoufoxArchive(asset string, actual string) error {
+	expected, known := camoufoxSHA256[asset]
+	if !known {
+		slog.Warn("Camoufox 发行包没有固定校验值，跳过校验", "asset", asset, "sha256", actual)
+		return nil
+	}
+	if !strings.EqualFold(expected, actual) {
+		return fmt.Errorf("Camoufox 发行包校验失败（%s）：期望 SHA-256 %s，实际 %s；文件可能被篡改或下载不完整，已拒绝执行",
+			asset, expected, actual)
+	}
+	slog.Info("Camoufox 发行包校验通过", "asset", asset)
+	return nil
 }
 
 func camoufoxInstallRoot() (string, error) {
