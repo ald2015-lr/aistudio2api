@@ -30,3 +30,8 @@ Thumbs.db
 
 /reports/
 /aistudio2api.prev
+
+# Python 缓存与备份文件
+__pycache__/
+*.pyc
+*.bak

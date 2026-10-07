@@ -37,8 +37,19 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - name: Check Go Formatting
+        run: |
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [[ -n "$unformatted" ]]; then
+            echo "以下文件未经 gofmt 格式化：" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
       - name: Run Unit Tests
-        run: go test -mod=readonly ./cmd/... ./internal/...
+        # 竞态检测需要 cgo；发布构建仍使用 CGO_ENABLED=0
+        env:
+          CGO_ENABLED: '1'
+        run: go test -mod=readonly -race ./cmd/... ./internal/...
       - name: Check Minimum Go Version
         run: |
           go version

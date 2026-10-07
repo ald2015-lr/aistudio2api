@@ -1,8 +1,8 @@
 package api
 
 import (
-	"encoding/json"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,9 +21,9 @@ import (
 // 只是额外为每个 POST 请求写一份完整排查记录到 logs/trace/。主路由流量大、不适合记录大体积日志，
 // 需要排查时把一个测试渠道的接口地址改成 http://服务器:端口/trace 即可，主路由完全不受影响
 const (
-	tracePrefix            = "/trace"
-	defaultTraceDir        = "logs/trace"
-	traceKeepFiles         = 100
+	tracePrefix     = "/trace"
+	defaultTraceDir = "logs/trace"
+	traceKeepFiles  = 100
 	// traceResponseHeadLimit 与上游回复的记录上限相同，便于核对客户端实际收到的内容
 	traceResponseHeadLimit = 1 << 20
 )

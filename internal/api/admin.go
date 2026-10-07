@@ -58,14 +58,14 @@ type AdminPrewarmState struct {
 
 // AdminWorkerCounts 表示 WAA Worker 的实时数量与对应账户
 type AdminWorkerCounts struct {
-	Warm        int      `json:"warm"`
-	Starting    int      `json:"starting"`
-	Target      int      `json:"target"`
-	Max         int      `json:"max"`
-	Occupied    int      `json:"occupied"`
+	Warm        int               `json:"warm"`
+	Starting    int               `json:"starting"`
+	Target      int               `json:"target"`
+	Max         int               `json:"max"`
+	Occupied    int               `json:"occupied"`
 	Prewarm     AdminPrewarmState `json:"prewarm"`
-	WarmIDs     []string `json:"warm_ids,omitempty"`
-	StartingIDs []string `json:"starting_ids,omitempty"`
+	WarmIDs     []string          `json:"warm_ids,omitempty"`
+	StartingIDs []string          `json:"starting_ids,omitempty"`
 }
 
 // AdminLog 表示管理页面展示的一条运行日志
@@ -80,31 +80,31 @@ type AdminLog struct {
 
 // RequestLog 保存可关联的请求状态、用量与诊断字段
 type RequestLog struct {
-	ID              string            `json:"id"`
-	State           string            `json:"state"`
-	Model           string            `json:"model,omitempty"`
-	Method          string            `json:"method,omitempty"`
-	Path            string            `json:"path,omitempty"`
-	Status          int               `json:"status,omitempty"`
-	DurationMS      float64           `json:"duration_ms,omitempty"`
-	Usage           *RequestLogUsage  `json:"usage,omitempty"`
-	ToolCalls       int               `json:"tool_calls,omitempty"`
-	FinishReason    string            `json:"finish_reason,omitempty"`
-	ReplyHash       string            `json:"reply_hash,omitempty"`
+	ID           string           `json:"id"`
+	State        string           `json:"state"`
+	Model        string           `json:"model,omitempty"`
+	Method       string           `json:"method,omitempty"`
+	Path         string           `json:"path,omitempty"`
+	Status       int              `json:"status,omitempty"`
+	DurationMS   float64          `json:"duration_ms,omitempty"`
+	Usage        *RequestLogUsage `json:"usage,omitempty"`
+	ToolCalls    int              `json:"tool_calls,omitempty"`
+	FinishReason string           `json:"finish_reason,omitempty"`
+	ReplyHash    string           `json:"reply_hash,omitempty"`
 	// ServedModel 为上游标明的实际服务模型，只在与请求的模型系列不同时出现
-	ServedModel     string            `json:"served_model,omitempty"`
+	ServedModel string `json:"served_model,omitempty"`
 	// Downgrade 为降级判定的依据（只有被拦截的模型才有）
-	Downgrade *aistudio.DowngradeDecision `json:"downgrade,omitempty"`
-	Error           string            `json:"error,omitempty"`
-	InputMessages   int               `json:"input_messages,omitempty"`
-	InputTextChars  int               `json:"input_text_chars,omitempty"`
-	InputMedia      int               `json:"input_media,omitempty"`
-	InputMediaBytes int64             `json:"input_media_bytes,omitempty"`
-	InputFiles      int               `json:"input_files,omitempty"`
-	Parameters      map[string]string `json:"parameters,omitempty"`
-	FirstEventMS    float64           `json:"first_event_ms,omitempty"`
-	UpstreamBytes   int64             `json:"upstream_bytes,omitempty"`
-	Channel         string            `json:"channel,omitempty"`
+	Downgrade       *aistudio.DowngradeDecision `json:"downgrade,omitempty"`
+	Error           string                      `json:"error,omitempty"`
+	InputMessages   int                         `json:"input_messages,omitempty"`
+	InputTextChars  int                         `json:"input_text_chars,omitempty"`
+	InputMedia      int                         `json:"input_media,omitempty"`
+	InputMediaBytes int64                       `json:"input_media_bytes,omitempty"`
+	InputFiles      int                         `json:"input_files,omitempty"`
+	Parameters      map[string]string           `json:"parameters,omitempty"`
+	FirstEventMS    float64                     `json:"first_event_ms,omitempty"`
+	UpstreamBytes   int64                       `json:"upstream_bytes,omitempty"`
+	Channel         string                      `json:"channel,omitempty"`
 }
 
 // RequestLogUsage 区分输入、思考、回复与端到端输出速率

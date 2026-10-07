@@ -128,14 +128,14 @@ type accountWorkerManager struct {
 	bootstrapMu    sync.Mutex
 	bootstrapCache aistudio.BootstrapSummary
 	bootstrapAt    time.Time
-	mu              sync.RWMutex
-	fillMu          sync.Mutex
-	rebalanceMu     sync.Mutex
-	pool            *aistudio.AccountPool
-	accounts        map[string]*accountWorker
-	openings        map[string]chan struct{}
+	mu             sync.RWMutex
+	fillMu         sync.Mutex
+	rebalanceMu    sync.Mutex
+	pool           *aistudio.AccountPool
+	accounts       map[string]*accountWorker
+	openings       map[string]chan struct{}
 	// openingSet 是 openings 的无锁镜像，供状态接口读取正在启动的账户
-	openingSet      sync.Map
+	openingSet sync.Map
 	// warmFailures 记录预热失败的账户与时间，冷却期内不再反复尝试
 	warmFailMu   sync.Mutex
 	warmFailures map[string]time.Time
@@ -149,7 +149,7 @@ type accountWorkerManager struct {
 	fillStartedAt atomic.Int64
 	fillLoopAt    atomic.Int64
 	// hotModels 为预热池中被大量账户长时间冷却的模型，预热选号时优先避开在这些模型上冷却的账户
-	hotModels atomic.Pointer[[]string]
+	hotModels       atomic.Pointer[[]string]
 	requests        *requestRegistry
 	camoufox        string
 	globalProxy     string
@@ -294,7 +294,7 @@ func newAccountWorkerManager(
 		pool: pool, accounts: make(map[string]*accountWorker, len(accounts)), requests: requests, camoufox: camoufoxPath,
 		globalProxy: globalProxy,
 		openings:    make(map[string]chan struct{}),
-		lifecycle: lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
+		lifecycle:   lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
 		victims: make(map[string]struct{}),
 	}
 	manager.initTimeout.Store(int64(initTimeout))
@@ -1942,13 +1942,13 @@ func (provider *accountHeaderProvider) ProtocolHeaders(ctx context.Context, acco
 
 // trackedService 跟踪生成请求及其唯一账户租约
 type trackedService struct {
-	lifecycle          context.Context
-	service            aistudio.Service
-	catalog            modelCatalogService
-	pool               *aistudio.AccountPool
-	requests           *requestRegistry
-	workers            *accountWorkerManager
-	forbidden          *forbiddenTracker
+	lifecycle context.Context
+	service   aistudio.Service
+	catalog   modelCatalogService
+	pool      *aistudio.AccountPool
+	requests  *requestRegistry
+	workers   *accountWorkerManager
+	forbidden *forbiddenTracker
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
 	quota *quotaSharing
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
@@ -1960,7 +1960,7 @@ type trackedService struct {
 	// minOutputTokens 为最大输出 token 的下限（MIN_OUTPUT_TOKENS，可热更新）
 	minOutputTokens atomic.Int64
 	// downgradeGuard 为降级判定的生效设置（服务配置页修改后立即替换，见 downgrade_guard.go）
-	downgradeGuard atomic.Pointer[downgradeSettings]
+	downgradeGuard     atomic.Pointer[downgradeSettings]
 	timeout            atomic.Int64
 	state              atomic.Int32
 	lifecycleMu        sync.Mutex
@@ -4031,7 +4031,7 @@ const (
 	// 可用账户超过 bootstrapCacheMinAccounts 时，预热概况缓存 bootstrapSummaryTTL
 	bootstrapCacheMinAccounts = 200
 	// 账户上万时一次统计要几百毫秒（最长 3 秒），5 秒刷新一次仍占约 7% 的锁时间；预热目标按分钟变化，60 秒足够
-	bootstrapSummaryTTL       = 60 * time.Second
+	bootstrapSummaryTTL = 60 * time.Second
 )
 
 // bootstrapSummary 返回预热概况；账户多时缓存几秒。统计要在账户池锁内扫描全部账户的模型（账户多时几百毫秒），

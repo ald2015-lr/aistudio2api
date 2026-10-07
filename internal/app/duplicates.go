@@ -94,9 +94,9 @@ type duplicateDetector struct {
 	byReply map[string]replyRecord
 	// byPrompt 为每个提示词指纹最近一次完成的记录，用于统计重新生成时回复是否相同
 	byPrompt map[string]replyRecord
-	order   []duplicateKey
-	recent  []duplicatePair
-	stats   duplicateStats
+	order    []duplicateKey
+	recent   []duplicatePair
+	stats    duplicateStats
 }
 
 // replyDuplicates 在进程内共享，服务重启（管理页重启生成服务）后统计不清零
@@ -400,4 +400,3 @@ func nonceLabel(added bool) string {
 	}
 	return "未加"
 }
-

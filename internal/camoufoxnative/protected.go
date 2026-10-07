@@ -1,7 +1,6 @@
 package camoufoxnative
 
 import (
-	"sync/atomic"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -13,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 

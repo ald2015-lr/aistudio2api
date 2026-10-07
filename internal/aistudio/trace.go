@@ -39,9 +39,9 @@ const (
 )
 
 type traceData struct {
-	StartedAt  time.Time         `json:"started_at"`
-	FinishedAt time.Time         `json:"finished_at"`
-	RequestID  string            `json:"request_id,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at"`
+	RequestID  string    `json:"request_id,omitempty"`
 	// Summary、Flags、Findings 为记录结束时自动判断的结论，放在最前面
 	Summary    string            `json:"summary"`
 	Flags      []string          `json:"flags"`
@@ -55,7 +55,7 @@ type traceData struct {
 	Outcome    *TraceOutcome     `json:"outcome,omitempty"`
 	Notes      []string          `json:"notes,omitempty"`
 	// Timeline 为该请求的进度记录（等待账号、换号原因、首个事件、重复回复等），与管理日志一致
-	Timeline   []TraceTimelineEntry `json:"timeline,omitempty"`
+	Timeline []TraceTimelineEntry `json:"timeline,omitempty"`
 }
 
 // TraceClient 为客户端发来的原始请求（鉴权头已隐藏）
@@ -132,16 +132,16 @@ type TraceReply struct {
 	ProviderModel string `json:"provider_model,omitempty"`
 	// ModelVersions 为上游依次标明的模型（去掉相邻重复）：Build 通道最后一块报告实际服务的模型
 	ModelVersions []string `json:"model_versions,omitempty"`
-	Events        int    `json:"events"`
-	TextBytes     int    `json:"text_bytes"`
-	TextHash      string `json:"text_hash,omitempty"`
-	Text          string `json:"text,omitempty"`
-	ThoughtBytes  int    `json:"thought_bytes"`
-	Thought       string `json:"thought,omitempty"`
-	FinishReason  string `json:"finish_reason,omitempty"`
-	Usage         *Usage `json:"usage,omitempty"`
-	ToolCalls     int    `json:"tool_calls,omitempty"`
-	Error         string `json:"error,omitempty"`
+	Events        int      `json:"events"`
+	TextBytes     int      `json:"text_bytes"`
+	TextHash      string   `json:"text_hash,omitempty"`
+	Text          string   `json:"text,omitempty"`
+	ThoughtBytes  int      `json:"thought_bytes"`
+	Thought       string   `json:"thought,omitempty"`
+	FinishReason  string   `json:"finish_reason,omitempty"`
+	Usage         *Usage   `json:"usage,omitempty"`
+	ToolCalls     int      `json:"tool_calls,omitempty"`
+	Error         string   `json:"error,omitempty"`
 	// 各事件相对请求开始的时间（毫秒）：区分慢在上游生成，还是生成结束后迟迟没有收尾
 	FirstEventMS  float64 `json:"first_event_ms,omitempty"`
 	LastEventMS   float64 `json:"last_event_ms,omitempty"`

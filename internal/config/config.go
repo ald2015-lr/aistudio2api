@@ -92,9 +92,9 @@ type Config struct {
 	MinOutputTokens int `json:"min_output_tokens"`
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
-	WAABackend             string        `json:"waa_backend"`
-	AutoStart              bool          `json:"auto_start"`
-	AdminPassword          string        `json:"-"`
+	WAABackend     string         `json:"waa_backend"`
+	AutoStart      bool           `json:"auto_start"`
+	AdminPassword  string         `json:"-"`
 }
 
 // Default 返回可直接启动的默认配置
@@ -354,24 +354,24 @@ func validateUpstreamChannels(channels []string) error {
 // MarshalJSON 将时长输出为 env 使用的文本格式
 func (c Config) MarshalJSON() ([]byte, error) {
 	type payload struct {
-		AuthStates             string   `json:"auth_states"`
-		ListenAddr             string   `json:"listen_addr"`
-		ProxyAPIKey            string   `json:"proxy_api_key"`
-		Proxy                  string   `json:"proxy"`
-		InitTimeout            string   `json:"init_timeout"`
-		RequestTimeout         string   `json:"request_timeout"`
-		WarmWorkerLimit        int      `json:"warm_worker_limit"`
-		MaxActiveWorkers       int      `json:"max_active_workers"`
-		WarmStartupConcurrency int      `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int      `json:"per_account_concurrency"`
-		RoutingStrategy        string   `json:"routing_strategy"`
-		UpstreamChannels       []string `json:"upstream_channels"`
-		TemporaryChat          bool     `json:"temporary_chat"`
-		IgnoreClientSeed       bool     `json:"ignore_client_seed"`
-		RepeatPromptNonce      bool     `json:"repeat_prompt_nonce"`
-		MinOutputTokens        int      `json:"min_output_tokens"`
+		AuthStates             string         `json:"auth_states"`
+		ListenAddr             string         `json:"listen_addr"`
+		ProxyAPIKey            string         `json:"proxy_api_key"`
+		Proxy                  string         `json:"proxy"`
+		InitTimeout            string         `json:"init_timeout"`
+		RequestTimeout         string         `json:"request_timeout"`
+		WarmWorkerLimit        int            `json:"warm_worker_limit"`
+		MaxActiveWorkers       int            `json:"max_active_workers"`
+		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int            `json:"per_account_concurrency"`
+		RoutingStrategy        string         `json:"routing_strategy"`
+		UpstreamChannels       []string       `json:"upstream_channels"`
+		TemporaryChat          bool           `json:"temporary_chat"`
+		IgnoreClientSeed       bool           `json:"ignore_client_seed"`
+		RepeatPromptNonce      bool           `json:"repeat_prompt_nonce"`
+		MinOutputTokens        int            `json:"min_output_tokens"`
 		DowngradeGuard         DowngradeGuard `json:"downgrade_guard"`
-		WAABackend             string   `json:"waa_backend"`
+		WAABackend             string         `json:"waa_backend"`
 	}
 	return json.Marshal(payload{
 		AuthStates:             c.AuthStates,
@@ -398,24 +398,24 @@ func (c Config) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON 从管理接口使用的文本时长解析配置
 func (c *Config) UnmarshalJSON(data []byte) error {
 	type payload struct {
-		AuthStates             string   `json:"auth_states"`
-		ListenAddr             string   `json:"listen_addr"`
-		ProxyAPIKey            string   `json:"proxy_api_key"`
-		Proxy                  string   `json:"proxy"`
-		InitTimeout            string   `json:"init_timeout"`
-		RequestTimeout         string   `json:"request_timeout"`
-		WarmWorkerLimit        int      `json:"warm_worker_limit"`
-		MaxActiveWorkers       int      `json:"max_active_workers"`
-		WarmStartupConcurrency int      `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int      `json:"per_account_concurrency"`
-		RoutingStrategy        string   `json:"routing_strategy"`
-		UpstreamChannels       []string `json:"upstream_channels"`
-		TemporaryChat          bool     `json:"temporary_chat"`
-		IgnoreClientSeed       bool     `json:"ignore_client_seed"`
-		RepeatPromptNonce      *bool    `json:"repeat_prompt_nonce"`
-		MinOutputTokens        *int     `json:"min_output_tokens"`
+		AuthStates             string          `json:"auth_states"`
+		ListenAddr             string          `json:"listen_addr"`
+		ProxyAPIKey            string          `json:"proxy_api_key"`
+		Proxy                  string          `json:"proxy"`
+		InitTimeout            string          `json:"init_timeout"`
+		RequestTimeout         string          `json:"request_timeout"`
+		WarmWorkerLimit        int             `json:"warm_worker_limit"`
+		MaxActiveWorkers       int             `json:"max_active_workers"`
+		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int             `json:"per_account_concurrency"`
+		RoutingStrategy        string          `json:"routing_strategy"`
+		UpstreamChannels       []string        `json:"upstream_channels"`
+		TemporaryChat          bool            `json:"temporary_chat"`
+		IgnoreClientSeed       bool            `json:"ignore_client_seed"`
+		RepeatPromptNonce      *bool           `json:"repeat_prompt_nonce"`
+		MinOutputTokens        *int            `json:"min_output_tokens"`
 		DowngradeGuard         *DowngradeGuard `json:"downgrade_guard"`
-		WAABackend             string   `json:"waa_backend"`
+		WAABackend             string          `json:"waa_backend"`
 	}
 	var value payload
 	if err := json.Unmarshal(data, &value); err != nil {

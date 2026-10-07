@@ -1,9 +1,9 @@
 package api
 
 import (
-	"sync"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 

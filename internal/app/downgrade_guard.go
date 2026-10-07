@@ -82,7 +82,7 @@ func newDowngradeSettings(guard config.DowngradeGuard) *downgradeSettings {
 		fuzzyLow:  guard.FuzzyLow, fuzzyHigh: guard.FuzzyHigh,
 		countTimeout: time.Duration(guard.CountTimeoutMS) * time.Millisecond,
 		fastMode:     guard.FastMode, memory: time.Duration(guard.MemoryMinutes) * time.Minute,
-		maxHold:      time.Duration(guard.MaxHoldMS) * time.Millisecond,
+		maxHold: time.Duration(guard.MaxHoldMS) * time.Millisecond,
 	}
 	for _, model := range guard.Models {
 		if name := normalizeGuardModel(model); name != "" {
@@ -427,14 +427,14 @@ func (meter *downgradeMeter) finalWindow() (int64, time.Duration, bool) {
 
 // downgradeRun 为一次请求判定期间的状态，只在判定 goroutine 内使用
 type downgradeRun struct {
-	gate      *downgradeGate
-	ctx       context.Context
-	out       chan<- aistudio.Event
-	ready     chan<- error
-	signaled  bool
-	gone      bool
-	state     int
-	buffer    []aistudio.Event
+	gate     *downgradeGate
+	ctx      context.Context
+	out      chan<- aistudio.Event
+	ready    chan<- error
+	signaled bool
+	gone     bool
+	state    int
+	buffer   []aistudio.Event
 	// bufferAt 为缓存事件各自的到达时间（与 buffer 一一对应），用于最长延后时限
 	bufferAt []time.Time
 	tail     []aistudio.Event
@@ -447,12 +447,12 @@ type downgradeRun struct {
 	// releasedAt 为判定前第一次把内容发给客户端的时间
 	releasedAt time.Time
 	meter      downgradeMeter
-	counting  chan downgradeCountResult
-	snapshot  downgradeEstimate
-	counted   bool
-	exhausted bool
-	countNote string
-	decision  aistudio.DowngradeDecision
+	counting   chan downgradeCountResult
+	snapshot   downgradeEstimate
+	counted    bool
+	exhausted  bool
+	countNote  string
+	decision   aistudio.DowngradeDecision
 }
 
 func (run *downgradeRun) loop(upstream <-chan aistudio.Event) {

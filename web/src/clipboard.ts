@@ -16,11 +16,9 @@ export async function copyText(text: string): Promise<boolean> {
   area.style.opacity = '0'
   document.body.appendChild(area)
   area.select()
-  let copied = false
   try {
-    copied = document.execCommand('copy')
+    return document.execCommand('copy')
   } finally {
     document.body.removeChild(area)
   }
-  return copied
 }

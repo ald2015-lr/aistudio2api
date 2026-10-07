@@ -229,14 +229,14 @@ type GenerationConfig struct {
 // GenerateRequest 表示供应商无关的生成请求
 type GenerateRequest struct {
 	// MinOutputTokens 为最大输出 token 的下限（服务配置），编码时生效，不超过模型上限；0 表示不调整
-	MinOutputTokens int64 `json:"-"`
-	ID        string           `json:"id"`
-	Model     string           `json:"model"`
-	System    string           `json:"system,omitempty"`
-	Contents  []Content        `json:"contents"`
-	Config    GenerationConfig `json:"config,omitempty"`
-	Tools     Tools            `json:"tools,omitempty"`
-	AccountID string           `json:"account_id,omitempty"`
+	MinOutputTokens int64            `json:"-"`
+	ID              string           `json:"id"`
+	Model           string           `json:"model"`
+	System          string           `json:"system,omitempty"`
+	Contents        []Content        `json:"contents"`
+	Config          GenerationConfig `json:"config,omitempty"`
+	Tools           Tools            `json:"tools,omitempty"`
+	AccountID       string           `json:"account_id,omitempty"`
 	// ImageRoute 内部标记：图像生成模型（由模型目录能力推导）
 	ImageRoute bool `json:"-"`
 	// Stream 为客户端是否要求流式响应：降级判定按此选择缓存方式（流式严格模式在判定前不发出任何内容）

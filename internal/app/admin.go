@@ -142,7 +142,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			Target: admin.workers.PrewarmTarget(), Max: admin.workers.maxActiveValue(),
 			Occupied: admin.workers.occupiedSlotsApprox(),
 			Prewarm:  admin.workers.prewarmState(),
-			WarmIDs: warm, StartingIDs: starting,
+			WarmIDs:  warm, StartingIDs: starting,
 		},
 	}, nil
 }

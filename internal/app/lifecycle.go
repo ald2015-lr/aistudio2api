@@ -487,8 +487,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		PerAccountConcurrency:  value.PerAccountConcurrency, TemporaryChat: value.TemporaryChat,
 		IgnoreClientSeed: value.IgnoreClientSeed, RepeatPromptNonce: value.RepeatPromptNonce,
 		MinOutputTokens: value.MinOutputTokens,
-		RoutingStrategy:  value.RoutingStrategy, UpstreamChannels: value.UpstreamChannels,
-		WAABackend: value.WAABackend,
+		RoutingStrategy: value.RoutingStrategy, UpstreamChannels: value.UpstreamChannels,
+		WAABackend:     value.WAABackend,
 		DowngradeGuard: active.DowngradeGuard,
 	}
 	if value.DowngradeGuard != nil {
