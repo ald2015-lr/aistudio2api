@@ -3348,6 +3348,9 @@ func (service *trackedService) generateWithRetry(
 	copyFiles := false
 	// buildOnly：Playground 返回输入 token 超过上限后，后续尝试只走 Build 通道
 	buildOnly := false
+	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、403、超时等）。
+	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
+	hardFailures := 0
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		request.Contents = originalContents
 		selectionAccountID := requestedAccountID
@@ -3559,7 +3562,9 @@ func (service *trackedService) generateWithRetry(
 				retryable = false
 			}
 		}
+		cooled, switchedToBuild := false, false
 		if cooldown, ok := aistudio.QuotaCooldownForError(err, time.Now()); ok {
+			cooled = true
 			modelAccessScope := lease.CooldownScope(modelID)
 			scopeLabel := modelAccessScope
 			if cooldown.Global {
@@ -3625,6 +3630,7 @@ func (service *trackedService) generateWithRetry(
 		// 改走 Build 再试，同一账号也可以用。Build 也失败时按原错误返回
 		if !buildOnly && lease.Channel() == aistudio.ChannelPlayground && inputTokenLimitError(err) {
 			buildOnly = true
+			switchedToBuild = true
 			retryable = true
 			delete(attempted, request.AccountID)
 			maxAttempts++
@@ -3659,6 +3665,17 @@ func (service *trackedService) generateWithRetry(
 		}
 		if attempt+1 == maxAttempts {
 			break
+		}
+		if !recoverWorker && !cooled && !switchedToBuild {
+			hardFailures++
+			if hardFailures >= generateFailureLimit {
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+					"已连续 %d 次失败，不再换号 | 原因=%s", hardFailures, progressReason(err)))
+				break
+			}
+			if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
+				break
+			}
 		}
 		if recoverWorker {
 			service.requests.log(accountLabel, "WARN", fmt.Sprintf(
@@ -3697,6 +3714,30 @@ func (service *trackedService) generateWithRetry(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
 	)
+}
+
+// generateFailureLimit 为单个请求非额度类失败的换号上限
+const generateFailureLimit = 5
+
+// generateRetryBackoff 返回第 failures 次非额度类失败后换号前的等待时间：200ms 起翻倍，最长 2 秒
+func generateRetryBackoff(failures int) time.Duration {
+	delay := 200 * time.Millisecond
+	for index := 1; index < failures && delay < 2*time.Second; index++ {
+		delay *= 2
+	}
+	return min(delay, 2*time.Second)
+}
+
+// waitRetryBackoff 在换号前退避；请求被取消时返回错误
+func waitRetryBackoff(ctx context.Context, failures int) error {
+	timer := time.NewTimer(generateRetryBackoff(failures))
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 var errStreamClosedBeforeFirstEvent = errors.New("AI Studio stream closed before first event")

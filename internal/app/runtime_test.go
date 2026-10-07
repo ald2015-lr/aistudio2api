@@ -56,3 +56,18 @@ func TestGenerateFileBoundWithoutEligibleAccount(t *testing.T) {
 		t.Fatal("没有收到错误事件")
 	}
 }
+
+// TestGenerateRetryBackoff 非额度类失败的换号退避从 200ms 起翻倍，最长 2 秒
+func TestGenerateRetryBackoff(t *testing.T) {
+	want := []time.Duration{200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, 1600 * time.Millisecond, 2 * time.Second, 2 * time.Second}
+	for index, expected := range want {
+		if got := generateRetryBackoff(index + 1); got != expected {
+			t.Fatalf("第 %d 次失败退避 = %s，期望 %s", index+1, got, expected)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := waitRetryBackoff(ctx, 3); !errors.Is(err, context.Canceled) {
+		t.Fatalf("请求取消时应立即返回取消错误，得到 %v", err)
+	}
+}
