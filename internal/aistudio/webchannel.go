@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -94,6 +95,43 @@ type BidiSession struct {
 	releaseErr  error
 	closeErr    error
 	closeOnce   sync.Once
+	// upstreamEnded 为上游已经结束会话（收到关闭或错误事件）：此时 Close 不再发送 terminate
+	upstreamEnded atomic.Bool
+}
+
+// bidiOutboxLimit、bidiOutboxByteLimit 为等待前向发送的帧数与字节数上限；上游停止接收时拒绝新帧，而不是无限堆积
+const (
+	bidiOutboxLimit     = 512
+	bidiOutboxByteLimit = 32 << 20
+	// bidiForwardTimeout 为单次前向 POST 的超时
+	bidiForwardTimeout = 60 * time.Second
+)
+
+// outboxHasRoom 判断发送队列是否还能再放入一帧 payloadBytes 字节的数据；调用方持有 outboxMu
+func outboxHasRoom(outbox []bidiOutgoing, payloadBytes int) bool {
+	if len(outbox) >= bidiOutboxLimit {
+		return false
+	}
+	total := payloadBytes
+	for _, entry := range outbox {
+		total += len(entry.payload)
+	}
+	return total <= bidiOutboxByteLimit
+}
+
+// bidiMaxFrameUnits 为单个 WebChannel frame 的长度上限（UTF-16 码元）；长度前缀按此值预分配缓冲区
+const bidiMaxFrameUnits = 64 << 20
+
+// bidiReconnectLimit 为 backchannel 连续网络失败的重连次数上限；间隔从 250ms 起翻倍，最长 5 秒
+const bidiReconnectLimit = 8
+
+// bidiReconnectDelay 返回第 failures 次连续失败后的重连间隔
+func bidiReconnectDelay(failures int) time.Duration {
+	delay := 250 * time.Millisecond
+	for index := 1; index < failures && delay < 5*time.Second; index++ {
+		delay *= 2
+	}
+	return min(delay, 5*time.Second)
 }
 
 // bidiForwardBatchLimit 是官网前向通道单次 POST 携带的最大消息数
@@ -343,7 +381,9 @@ func (s *BidiSession) Close() error {
 		return nil
 	}
 	s.closeOnce.Do(func() {
-		if s.ctx.Err() == nil {
+		// 只要上游没有自己结束会话就发送 terminate（独立的 3 秒超时）。原先按 s.ctx 是否已取消判断，
+		// 而客户端断开时 WebSocket 处理函数先取消了 context，terminate 从未发出，上游会话一直占着名额继续生成
+		if !s.upstreamEnded.Load() && s.sid != "" {
 			s.closeErr = s.terminate()
 		}
 		s.cancel()
@@ -602,6 +642,10 @@ func (s *BidiSession) enqueueMessage(ctx context.Context, payload []byte, qualif
 		s.outboxMu.Unlock()
 		return err
 	}
+	if !outboxHasRoom(s.outbox, len(payload)) {
+		s.outboxMu.Unlock()
+		return fmt.Errorf("实时会话发送队列已满（%d 条或 %d MiB 上限）：上游长时间没有接收已发送的帧", bidiOutboxLimit, bidiOutboxByteLimit>>20)
+	}
 	s.outbox = append(s.outbox, entry)
 	s.outboxMu.Unlock()
 	select {
@@ -688,7 +732,8 @@ func (s *BidiSession) postBatch(ctx context.Context, batch []bidiOutgoing) (resu
 			}
 		}
 	}()
-	requestCtx, cancel := context.WithCancel(ctx)
+	// 单次前向 POST 设上限：连接卡住时不再让前向协程永久阻塞、后续帧无限堆积
+	requestCtx, cancel := context.WithTimeout(ctx, bidiForwardTimeout)
 	stopSession := context.AfterFunc(s.ctx, cancel)
 	defer func() {
 		stopSession()
@@ -787,6 +832,7 @@ func (s *BidiSession) runBackchannel(ready chan<- error) {
 		close(s.done)
 	}()
 	first := true
+	failures := 0
 	for s.ctx.Err() == nil {
 		opening := first
 		_, err := s.readBackchannel(first, reportReady)
@@ -794,6 +840,7 @@ func (s *BidiSession) runBackchannel(ready chan<- error) {
 		if err != nil {
 			if errors.Is(err, errBidiWebChannelClosed) {
 				terminalEvent = true
+				s.upstreamEnded.Store(true)
 				return
 			}
 			if s.ctx.Err() != nil {
@@ -801,7 +848,14 @@ func (s *BidiSession) runBackchannel(ready chan<- error) {
 			}
 			var networkErr *bidiBackchannelNetworkError
 			if !opening && errors.As(err, &networkErr) {
-				timer := time.NewTimer(250 * time.Millisecond)
+				// 连续网络失败按指数退避重连，超过上限后结束会话并把错误交给客户端，
+				// 而不是每 250ms 无限重连、客户端只看到一个没有任何事件的会话
+				failures++
+				if failures > bidiReconnectLimit {
+					streamErr = fmt.Errorf("bidi backchannel 连续 %d 次重连失败: %w", failures-1, err)
+					return
+				}
+				timer := time.NewTimer(bidiReconnectDelay(failures))
 				select {
 				case <-timer.C:
 				case <-s.ctx.Done():
@@ -814,6 +868,7 @@ func (s *BidiSession) runBackchannel(ready chan<- error) {
 			streamErr = err
 			return
 		}
+		failures = 0
 	}
 }
 
@@ -1212,7 +1267,7 @@ func readWebChannelFrames(source io.Reader, emit func(json.RawMessage) error) er
 			return err
 		}
 		length, err := strconv.Atoi(strings.TrimSpace(lengthLine))
-		if err != nil || length < 0 {
+		if err != nil || length < 0 || length > bidiMaxFrameUnits {
 			return fmt.Errorf("bidi WebChannel frame 长度无效: %q", strings.TrimSpace(lengthLine))
 		}
 		frame, err := readUTF16Units(reader, length)
