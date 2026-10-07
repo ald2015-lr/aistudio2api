@@ -71,3 +71,19 @@ func TestGenerateRetryBackoff(t *testing.T) {
 		t.Fatalf("请求取消时应立即返回取消错误，得到 %v", err)
 	}
 }
+
+// TestStartGenerateRejectsEmptyRequest 既没有系统提示也没有对话内容时在选号前返回参数错误
+func TestStartGenerateRejectsEmptyRequest(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	pool := aistudio.NewAccountPool(nil, 1)
+	service := &trackedService{
+		lifecycle: ctx, pool: pool, requests: requests,
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+	}
+	_, _, err := service.startGenerate(ctx, aistudio.GenerateRequest{ID: "req-empty", Model: "gemini-test"})
+	if !errors.Is(err, aistudio.ErrInvalidArgument) {
+		t.Fatalf("err = %v，期望参数错误", err)
+	}
+}

@@ -111,7 +111,7 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		binding = append(binding, Content{Role: content.Role, Parts: texts})
 	}
 	if len(steps) == 0 {
-		return nil, nil, false, fmt.Errorf("CreateInteractionStream contents 不能为空")
+		return nil, nil, false, fmt.Errorf("%w: CreateInteractionStream contents 不能为空", ErrInvalidArgument)
 	}
 	return steps, binding, hasModelTurn, nil
 }

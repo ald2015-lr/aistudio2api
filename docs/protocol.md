@@ -1347,7 +1347,9 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 | `/v1/audio/transcriptions` | multipart `file`；`model` 默认 `gemini-3.5-transcribe` | 文本或转录 JSON |
 | `/v1/videos` | `model`、`prompt` | 长任务对象，随后轮询并下载内容 |
 
-Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 对该输入返回 `400 invalid_request_error`。
+Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理：以模型文字消息结尾的历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（见上文分轮修正）。以工具调用结尾的历史仍按缺少工具结果处理。
+
+流式请求在写出响应头前最多等待首个事件 10 秒：首个事件之前出现的参数错误、无可用账号、全部冷却、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；10 秒内没有事件时照常开始推流，之后的错误仍在流内返回。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
 
 四套生成入口共享同一规范请求，输入映射如下：
 

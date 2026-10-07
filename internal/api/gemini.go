@@ -828,6 +828,9 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	hideThought := s.prepareGenerate(r.Context(), &request)
 	request.Stream = stream
 	events, err := s.service.Generate(r.Context(), request)
+	if err == nil && stream {
+		events, err = awaitStreamStart(r.Context(), events)
+	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiRequestError(w, err)

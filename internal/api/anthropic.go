@@ -86,10 +86,6 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "model, messages and max_tokens are required")
 		return
 	}
-	if request.Messages[len(request.Messages)-1].Role == "assistant" {
-		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "This model does not support assistant message prefill. The conversation must end with a user message.")
-		return
-	}
 	messageID := newID("msg")
 	if err := s.decodeAnthropicSearchHistory(&request); err != nil {
 		writeAnthropicInvalid(w, err)
@@ -107,6 +103,9 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// 生成服务在此之前失败时也和官方 API 一样直接返回 HTTP 错误
 		inputTokens := aistudio.EstimatedInputTokens(generateRequest)
 		events, err := s.service.Generate(r.Context(), generateRequest)
+		if err == nil {
+			events, err = awaitStreamStart(r.Context(), events)
+		}
 		if err != nil {
 			if shouldWriteRequestError(r, err) {
 				writeAnthropicRequestError(w, err)

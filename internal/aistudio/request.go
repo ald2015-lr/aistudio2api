@@ -31,7 +31,7 @@ func EncodeCountTokensRequest(request TokenCountRequest) ([]byte, error) {
 		return nil, err
 	}
 	if len(contents) == 0 && request.System == "" {
-		return nil, fmt.Errorf("CountTokens contents 不能为空")
+		return nil, fmt.Errorf("%w: CountTokens contents 不能为空", ErrInvalidArgument)
 	}
 	if request.System != "" || explicitTools || countTokensNeedsGenerateRequest(request.Contents) {
 		length := 2

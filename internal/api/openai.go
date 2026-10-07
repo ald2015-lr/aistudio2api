@@ -172,6 +172,10 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
 	generateRequest.Stream = request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
+	if err == nil && request.Stream {
+		// 首个事件前的错误按非流式返回 HTTP 状态，不再先回 200 再在流里报错
+		events, err = awaitStreamStart(r.Context(), events)
+	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)

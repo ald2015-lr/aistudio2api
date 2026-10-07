@@ -167,6 +167,9 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
 	generateRequest.Stream = request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
+	if err == nil && request.Stream {
+		events, err = awaitStreamStart(r.Context(), events)
+	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)

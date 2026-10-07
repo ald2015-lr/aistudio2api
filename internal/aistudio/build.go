@@ -49,7 +49,7 @@ func EncodeBuildGenerateRequest(request GenerateRequest, defaults GenerationDefa
 		return "", nil, err
 	}
 	if len(contents) == 0 {
-		return "", nil, fmt.Errorf("GenerateContent contents 不能为空")
+		return "", nil, fmt.Errorf("%w: GenerateContent contents 不能为空", ErrInvalidArgument)
 	}
 	body := map[string]any{"contents": contents}
 	if system := strings.TrimSpace(request.System); system != "" {

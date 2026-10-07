@@ -3288,6 +3288,14 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)
+	// 既没有系统提示也没有对话内容（例如消息全被过滤掉）：选号前直接按参数错误返回 400，不占用账号
+	if len(request.Contents) == 0 {
+		err := fmt.Errorf("%w: 请求没有系统提示或对话内容", aistudio.ErrInvalidArgument)
+		api.SetAccessLogError(ctx, err)
+		service.requests.start(request, func() {})
+		service.requests.finish(request.ID, "failed", err)
+		return nil, nil, err
+	}
 	// 降级判定：被拦截的模型准备判定；同一段对话近期被判定为降级、且当时的消息原样都在时，发送前直接拒绝（不换号重试）
 	gate, remembered := service.prepareDowngradeGate(ctx, request, guardContents)
 	if remembered != nil {

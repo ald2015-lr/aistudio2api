@@ -100,6 +100,53 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	return nil
 }
 
+// awaitStreamStart 在写出流式响应头前等待首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
+// HTTP 状态和错误对象（参数错误、无可用账号、全部冷却、降级拒绝等不再变成 200 之后的流内错误）；
+// 心跳间隔内没有事件时照常开始推流，返回的事件流从首个事件开始重放
+func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, error) {
+	timer := time.NewTimer(streamHeartbeatInterval)
+	defer timer.Stop()
+	var first aistudio.Event
+	select {
+	case <-ctx.Done():
+		go drainEvents(events)
+		return nil, ctx.Err()
+	case <-timer.C:
+		return events, nil
+	case event, ok := <-events:
+		if !ok {
+			return nil, errIncompleteStream
+		}
+		if event.Kind == aistudio.EventError {
+			go drainEvents(events)
+			if event.Err != nil {
+				return nil, event.Err
+			}
+			return nil, errUpstreamStream
+		}
+		first = event
+	}
+	replay := make(chan aistudio.Event)
+	go func() {
+		defer close(replay)
+		for event, ok := first, true; ok; event, ok = <-events {
+			select {
+			case replay <- event:
+			case <-ctx.Done():
+				// 客户端已断开：继续读完上游，让生产方正常结束
+				drainEvents(events)
+				return
+			}
+		}
+	}()
+	return replay, nil
+}
+
+func drainEvents(events <-chan aistudio.Event) {
+	for range events {
+	}
+}
+
 func consumeEvents(ctx context.Context, events <-chan aistudio.Event, emit func(aistudio.Event) error) (result generationResult, resultErr error) {
 	return consumeEventsWithHeartbeat(ctx, events, emit, nil)
 }

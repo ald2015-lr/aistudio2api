@@ -230,7 +230,7 @@ func (t *WorkerProtectedTransport) doPrepared(
 
 func bindingPrompt(request GenerateRequest) (string, error) {
 	if len(request.Contents) == 0 {
-		return "", fmt.Errorf("GenerateContent contents 不能为空")
+		return "", fmt.Errorf("%w: GenerateContent contents 不能为空", ErrInvalidArgument)
 	}
 	values := make([]string, 0)
 	for _, content := range request.Contents {
