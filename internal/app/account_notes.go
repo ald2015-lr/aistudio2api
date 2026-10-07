@@ -113,8 +113,5 @@ func (store *disableNotes) save() {
 	if err != nil || path == "" {
 		return
 	}
-	temporary := path + ".tmp"
-	if os.WriteFile(temporary, append(data, '\n'), 0o600) == nil {
-		_ = os.Rename(temporary, path)
-	}
+	_ = writeFileAtomic(path, append(data, '\n'), 0o600)
 }

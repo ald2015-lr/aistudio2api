@@ -169,15 +169,10 @@ func (onboarder *accountOnboarder) saveLocked() {
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(onboarder.path), 0o700); err != nil {
-		return
-	}
-	temporary := onboarder.path + ".tmp"
-	if err := os.WriteFile(temporary, content, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(temporary, onboarder.path); err != nil {
-		_ = os.Remove(temporary)
+	if err := writeFileAtomic(onboarder.path, content, 0o600); err != nil {
+		if onboarder.admin != nil && onboarder.admin.requests != nil {
+			onboarder.admin.requests.log("service", "WARN", "新账户自动处理记录保存失败 | "+err.Error())
+		}
 	}
 }
 

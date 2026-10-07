@@ -93,10 +93,7 @@ func (sharing *quotaSharing) saveLocked() {
 		Models map[string]*quotaSharingStats `json:"models"`
 	}{Models: sharing.models}, "", "  ")
 	if err == nil {
-		temporary := sharing.path + ".tmp"
-		if err = os.WriteFile(temporary, append(data, '\n'), 0o600); err == nil {
-			err = os.Rename(temporary, sharing.path)
-		}
+		err = writeFileAtomic(sharing.path, append(data, '\n'), 0o600)
 	}
 	if err != nil && sharing.requests != nil {
 		sharing.requests.log("service", "WARN", fmt.Sprintf("每日额度通道判定记录保存失败 | 错误=%v", err))
