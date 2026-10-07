@@ -3393,7 +3393,11 @@ func (service *trackedService) generateWithRetry(
 			trace.Note("获取账号失败: " + acquireErr.Error())
 			var ownerCooling *aistudio.AllCoolingError
 			if fileBound && !copyFiles && (errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling)) && requestCtx.Err() == nil {
+				// 文件所属账号不可用：改为把文件复制到其他账号再试一次。这次重试不占用换号次数，
+				// 否则只有一个可调度账号时循环直接结束，既没有错误也没有租约
 				copyFiles = true
+				err = acquireErr
+				maxAttempts++
 				continue
 			}
 			if err == nil || !errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
@@ -3670,6 +3674,10 @@ func (service *trackedService) generateWithRetry(
 		service.requests.log(accountLabel, "WARN", switchMessage)
 		// 换号原因同时写进请求时间线：请求详情里能直接看到每一次失败的原因
 		service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
+	}
+	if err == nil && (lease == nil || source == nil) {
+		// 兜底：循环结束却没有拿到可用的上游流时按没有可用账号结束，不能把空租约交给 forwardEvents
+		err = fmt.Errorf("%w: 模型 %s 没有可用账号", aistudio.ErrNoEligibleAccount, modelID)
 	}
 	if err != nil {
 		if activity != nil {
