@@ -50,3 +50,40 @@ func TestProxyAPIKeyCustomValueKept(t *testing.T) {
 		t.Fatal("EffectiveProxyAPIKey 结果错误")
 	}
 }
+
+// TestDowngradeRejectStatusConfig 降级拒绝返回码默认 400，可设为 503，其他值报错
+func TestDowngradeRejectStatusConfig(t *testing.T) {
+	t.Setenv("DOWNGRADE_REJECT_STATUS", "")
+	os.Unsetenv("DOWNGRADE_REJECT_STATUS")
+	for _, test := range []struct {
+		content string
+		want    int
+		invalid bool
+	}{
+		{content: "", want: DowngradeRejectBlocked},
+		{content: "DOWNGRADE_REJECT_STATUS=503\n", want: DowngradeRejectUnavailable},
+		{content: "DOWNGRADE_REJECT_STATUS=400\n", want: DowngradeRejectBlocked},
+		{content: "DOWNGRADE_REJECT_STATUS=502\n", invalid: true},
+	} {
+		path := filepath.Join(t.TempDir(), ".env")
+		if err := os.WriteFile(path, []byte(test.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err == nil {
+			err = cfg.Validate()
+		}
+		if test.invalid {
+			if err == nil {
+				t.Fatalf("%q 应报错", test.content)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("%q: %v", test.content, err)
+		}
+		if cfg.DowngradeGuard.RejectStatus != test.want {
+			t.Fatalf("%q: RejectStatus = %d", test.content, cfg.DowngradeGuard.RejectStatus)
+		}
+	}
+}

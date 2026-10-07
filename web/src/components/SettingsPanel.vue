@@ -76,13 +76,15 @@ function defaultDowngradeGuard(): DowngradeGuardConfig {
     fast_mode: false,
     memory_minutes: 30,
     max_hold_ms: 0,
+    reject_status: 400,
   }
 }
 
 // cloneDowngradeGuard 深拷贝降级判定设置：表单与已保存的配置不能共用同一个对象，否则修改不会被识别为未保存
 function cloneDowngradeGuard(value: DowngradeGuardConfig | undefined): DowngradeGuardConfig {
   const source = value ?? defaultDowngradeGuard()
-  return { ...source, models: [...(source.models ?? [])] }
+  // 旧版服务端不返回 reject_status，按默认 400 处理
+  return { ...source, models: [...(source.models ?? [])], reject_status: source.reject_status ?? 400 }
 }
 
 // parseModelList 与服务端一致：逗号或空白分隔，去掉 models/ 前缀并去重
@@ -827,6 +829,19 @@ onBeforeUnmount(() => {
               <span class="block text-sm font-medium text-gray-300">{{ t('settings.downgradeFastMode') }}</span>
               <span class="mt-1 block text-xs text-gray-500">{{ t('settings.downgradeFastModeHelp') }}</span>
             </span>
+          </label>
+          <label class="block">
+            <span class="mb-2 block text-sm font-medium text-gray-300">{{
+              t('settings.downgradeRejectStatus')
+            }}</span>
+            <UiSelect
+              v-model="form.downgrade_guard.reject_status"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            >
+              <option :value="400">{{ t('settings.downgradeReject400') }}</option>
+              <option :value="503">{{ t('settings.downgradeReject503') }}</option>
+            </UiSelect>
+            <span class="mt-2 block text-xs text-gray-500">{{ t('settings.downgradeRejectStatusHelp') }}</span>
           </label>
           <label class="block">
             <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeMemory') }}</span>

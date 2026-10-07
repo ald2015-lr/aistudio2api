@@ -211,6 +211,8 @@ export interface DowngradeGuardConfig {
   fast_mode: boolean
   memory_minutes: number
   max_hold_ms: number
+  // reject_status 为因降级拒绝时返回的 HTTP 状态码：400 按内容策略拦截返回，503 按服务暂时不可用返回
+  reject_status: 400 | 503
 }
 
 // DowngradeDecision 为一次降级判定的依据（请求日志的 downgrade 字段）

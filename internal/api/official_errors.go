@@ -77,6 +77,10 @@ func publicErrorFor(err error, model string) publicError {
 	// 措辞用 Google 内容策略拦截的官方说明
 	var downgraded *aistudio.ModelDowngradedError
 	if errors.As(err, &downgraded) {
+		// 服务配置可改为 503：如实说明换了模型，客户端与中转按服务暂时不可用重试或切换渠道
+		if downgraded.HTTPStatus() == http.StatusServiceUnavailable {
+			return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: aistudio.DowngradeUnavailableMessage, Kind: publicKindOverloaded}
+		}
 		return publicError{Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT", Message: aistudio.DowngradePublicMessage, Kind: publicKindBlocked}
 	}
 	if errors.Is(err, context.DeadlineExceeded) {

@@ -387,6 +387,11 @@ const zhCN = {
   'settings.downgradeFastMode': '快速模式',
   'settings.downgradeFastModeHelp':
     '默认是严格模式：流式请求在判定前不发出任何内容（包括思考），判定为降级时直接返回 HTTP 400（设了最长延后时，只有在时限内判定的才能返回 400）。快速模式从一开始就实时转发思考、只缓存正文，被降级时在流中发送官方格式的错误事件。',
+  'settings.downgradeRejectStatus': '拒绝时的返回码',
+  'settings.downgradeReject400': '400：按内容策略拦截返回（默认）',
+  'settings.downgradeReject503': '503：按服务暂时不可用返回',
+  'settings.downgradeRejectStatusHelp':
+    '400 使用 Google 输入被内容策略拦截（PROHIBITED_CONTENT）的官方格式，客户端与中转通常不会重试；503 如实说明上游换用了其他模型、回复已丢弃，客户端与中转可以重试或切换渠道。修改后立即生效。',
   'settings.downgradeMemory': '记住被降级的对话（分钟）',
   'settings.downgradeMemoryHelp':
     '同一段对话在这段时间内再次请求、且当时的消息原样都在时（重新生成、接着往下聊），发送前直接拒绝；用户改过其中任何一条就重新判定。只保存哈希，0 表示不记录。',
@@ -792,6 +797,11 @@ const en: Record<TranslationKey, string> = {
   'settings.downgradeFastMode': 'Fast mode',
   'settings.downgradeFastModeHelp':
     'Strict mode (default): streaming requests send nothing, including thinking, until judged, and downgrades get an HTTP 400 (with a maximum delay set, only verdicts reached within it can return 400). Fast mode streams thinking in real time from the start and holds only the reply text; a downgrade is reported as an official error event in the stream.',
+  'settings.downgradeRejectStatus': 'Status code when rejecting',
+  'settings.downgradeReject400': '400: report as blocked by content policy (default)',
+  'settings.downgradeReject503': '503: report as temporarily unavailable',
+  'settings.downgradeRejectStatusHelp':
+    '400 uses the official format of a Google content-policy block (PROHIBITED_CONTENT), which clients and relays usually do not retry; 503 states that upstream served a different model and the reply was discarded, so clients and relays can retry or switch channels. Takes effect immediately.',
   'settings.downgradeMemory': 'Remember downgraded conversations (minutes)',
   'settings.downgradeMemoryHelp':
     'Within this time, a request for the same conversation that still contains the earlier messages unchanged (regenerate, continue) is rejected before sending; editing any of those messages makes it judged again. Only hashes are stored; 0 disables this.',

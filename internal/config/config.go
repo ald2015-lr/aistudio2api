@@ -54,6 +54,7 @@ var configKeys = [...]string{
 	"DOWNGRADE_FAST_MODE",
 	"DOWNGRADE_MAX_HOLD_MS",
 	"DOWNGRADE_MEMORY_MINUTES",
+	"DOWNGRADE_REJECT_STATUS",
 	"WAA_BACKEND",
 	"AUTO_START",
 	"ADMIN_PASSWORD",
@@ -676,7 +677,16 @@ type DowngradeGuard struct {
 	MaxHoldMS int `json:"max_hold_ms"`
 	// MemoryMinutes 为记住被降级对话的分钟数（DOWNGRADE_MEMORY_MINUTES），0 表示不记录
 	MemoryMinutes int `json:"memory_minutes"`
+	// RejectStatus 为因降级拒绝时返回给客户端的 HTTP 状态码（DOWNGRADE_REJECT_STATUS）：
+	// 400 按 Google 输入被内容策略拦截的格式返回（默认，客户端不会重试）；503 按服务暂时不可用返回，客户端与中转可以重试或切换渠道
+	RejectStatus int `json:"reject_status"`
 }
+
+// 因降级拒绝时可选的 HTTP 状态码
+const (
+	DowngradeRejectBlocked     = 400
+	DowngradeRejectUnavailable = 503
+)
 
 // DefaultDowngradeGuard 返回默认设置：开启、只拦截 gemini-3.1-pro-preview、严格模式（判定前扣住全部内容，被降级时返回 400），
 // 判定窗口 2.5 秒（较长的窗口测速更稳）
@@ -685,7 +695,16 @@ func DefaultDowngradeGuard() DowngradeGuard {
 		Enabled: true, Models: []string{"gemini-3.1-pro-preview"},
 		SpeedThreshold: 190, MinTokens: 150, MinWindowMS: 2500,
 		FuzzyLow: 160, FuzzyHigh: 220, CountTimeoutMS: 1500, MemoryMinutes: 30, MaxHoldMS: 0,
+		RejectStatus: DowngradeRejectBlocked,
 	}
+}
+
+// NormalizeDowngradeRejectStatus 把未设置（0，旧版配置或页面）归为默认的 400
+func NormalizeDowngradeRejectStatus(status int) int {
+	if status == 0 {
+		return DowngradeRejectBlocked
+	}
+	return status
 }
 
 // Equal 判断两份设置是否一致
@@ -693,11 +712,15 @@ func (g DowngradeGuard) Equal(other DowngradeGuard) bool {
 	return g.Enabled == other.Enabled && slices.Equal(g.Models, other.Models) &&
 		g.SpeedThreshold == other.SpeedThreshold && g.MinTokens == other.MinTokens && g.MinWindowMS == other.MinWindowMS &&
 		g.FuzzyLow == other.FuzzyLow && g.FuzzyHigh == other.FuzzyHigh && g.CountTimeoutMS == other.CountTimeoutMS &&
-		g.FastMode == other.FastMode && g.MemoryMinutes == other.MemoryMinutes && g.MaxHoldMS == other.MaxHoldMS
+		g.FastMode == other.FastMode && g.MemoryMinutes == other.MemoryMinutes && g.MaxHoldMS == other.MaxHoldMS &&
+		NormalizeDowngradeRejectStatus(g.RejectStatus) == NormalizeDowngradeRejectStatus(other.RejectStatus)
 }
 
 // Validate 校验设置；关闭时不检查数值（未设置该项的旧配置等同于关闭）
 func (g DowngradeGuard) Validate() error {
+	if status := NormalizeDowngradeRejectStatus(g.RejectStatus); status != DowngradeRejectBlocked && status != DowngradeRejectUnavailable {
+		return fmt.Errorf("DOWNGRADE_REJECT_STATUS 必须是 400 或 503")
+	}
 	if !g.Enabled {
 		return nil
 	}
@@ -752,6 +775,7 @@ func downgradeGuardOrDefault(value *DowngradeGuard) DowngradeGuard {
 	}
 	guard := *value
 	guard.Models = NormalizeModelList(guard.Models)
+	guard.RejectStatus = NormalizeDowngradeRejectStatus(guard.RejectStatus)
 	return guard
 }
 
@@ -768,6 +792,7 @@ func (g DowngradeGuard) envValues() map[string]string {
 		"DOWNGRADE_FAST_MODE":        strconv.FormatBool(g.FastMode),
 		"DOWNGRADE_MEMORY_MINUTES":   strconv.Itoa(g.MemoryMinutes),
 		"DOWNGRADE_MAX_HOLD_MS":      strconv.Itoa(g.MaxHoldMS),
+		"DOWNGRADE_REJECT_STATUS":    strconv.Itoa(NormalizeDowngradeRejectStatus(g.RejectStatus)),
 	}
 }
 
@@ -803,7 +828,14 @@ func loadDowngradeGuard(values map[string]string, guard *DowngradeGuard) error {
 	if err := envInt(values, "DOWNGRADE_MEMORY_MINUTES", &guard.MemoryMinutes); err != nil {
 		return err
 	}
-	return envInt(values, "DOWNGRADE_MAX_HOLD_MS", &guard.MaxHoldMS)
+	if err := envInt(values, "DOWNGRADE_MAX_HOLD_MS", &guard.MaxHoldMS); err != nil {
+		return err
+	}
+	if err := envInt(values, "DOWNGRADE_REJECT_STATUS", &guard.RejectStatus); err != nil {
+		return err
+	}
+	guard.RejectStatus = NormalizeDowngradeRejectStatus(guard.RejectStatus)
+	return nil
 }
 
 func envBool(values map[string]string, key string, target *bool) error {

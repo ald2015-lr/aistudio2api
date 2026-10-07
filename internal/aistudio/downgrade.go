@@ -15,6 +15,10 @@ const DowngradePublicMessage = "Input blocked: The model could not generate outp
 	"If you think this was an error, [send feedback](https://ai.google.dev/gemini-api/docs/troubleshooting). " +
 	"(blockReason: PROHIBITED_CONTENT)"
 
+// DowngradeUnavailableMessage 为按 503 返回因降级拒绝时的说明：如实说明上游换用了其他模型、回复已丢弃，可以重试
+const DowngradeUnavailableMessage = "The upstream served this request with a different model than the one requested, " +
+	"so the response was discarded. Please try again later."
+
 // DowngradeDecision 为一次降级判定的依据：写进管理日志（downgrade 字段）、排查记录与诊断统计
 type DowngradeDecision struct {
 	// Verdict：rejected 因降级拒绝；passed 判定正常；unjudged 正文太少、无法按速度判定，放行
@@ -57,6 +61,8 @@ type DowngradeDecision struct {
 type ModelDowngradedError struct {
 	Model    string
 	Decision DowngradeDecision
+	// Status 为返回给客户端的 HTTP 状态码：400（默认，按内容策略拦截的格式）或 503（服务暂时不可用，可重试）
+	Status int
 }
 
 func (e *ModelDowngradedError) Error() string {
@@ -65,5 +71,8 @@ func (e *ModelDowngradedError) Error() string {
 
 // HTTPStatus 因降级拒绝按请求错误返回 400
 func (e *ModelDowngradedError) HTTPStatus() int {
+	if e.Status == http.StatusServiceUnavailable {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusBadRequest
 }

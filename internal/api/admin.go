@@ -247,6 +247,7 @@ type DowngradeGuardConfig struct {
 	FastMode       bool     `json:"fast_mode"`
 	MemoryMinutes  int      `json:"memory_minutes"`
 	MaxHoldMS      int      `json:"max_hold_ms"`
+	RejectStatus   int      `json:"reject_status"`
 }
 
 // AdminCooldown 表示账户模型冷却

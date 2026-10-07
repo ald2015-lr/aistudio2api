@@ -72,6 +72,7 @@ type downgradeSettings struct {
 	fastMode     bool
 	memory       time.Duration
 	maxHold      time.Duration
+	rejectStatus int
 }
 
 func newDowngradeSettings(guard config.DowngradeGuard) *downgradeSettings {
@@ -82,7 +83,8 @@ func newDowngradeSettings(guard config.DowngradeGuard) *downgradeSettings {
 		fuzzyLow:  guard.FuzzyLow, fuzzyHigh: guard.FuzzyHigh,
 		countTimeout: time.Duration(guard.CountTimeoutMS) * time.Millisecond,
 		fastMode:     guard.FastMode, memory: time.Duration(guard.MemoryMinutes) * time.Minute,
-		maxHold: time.Duration(guard.MaxHoldMS) * time.Millisecond,
+		maxHold:      time.Duration(guard.MaxHoldMS) * time.Millisecond,
+		rejectStatus: config.NormalizeDowngradeRejectStatus(guard.RejectStatus),
 	}
 	for _, model := range guard.Models {
 		if name := normalizeGuardModel(model); name != "" {
@@ -116,6 +118,7 @@ func downgradeGuardToAPI(guard config.DowngradeGuard) *api.DowngradeGuardConfig 
 		SpeedThreshold: guard.SpeedThreshold, MinTokens: guard.MinTokens, MinWindowMS: guard.MinWindowMS,
 		FuzzyLow: guard.FuzzyLow, FuzzyHigh: guard.FuzzyHigh, CountTimeoutMS: guard.CountTimeoutMS,
 		FastMode: guard.FastMode, MemoryMinutes: guard.MemoryMinutes, MaxHoldMS: guard.MaxHoldMS,
+		RejectStatus: config.NormalizeDowngradeRejectStatus(guard.RejectStatus),
 	}
 }
 
@@ -125,6 +128,7 @@ func downgradeGuardFromAPI(value api.DowngradeGuardConfig) config.DowngradeGuard
 		SpeedThreshold: value.SpeedThreshold, MinTokens: value.MinTokens, MinWindowMS: value.MinWindowMS,
 		FuzzyLow: value.FuzzyLow, FuzzyHigh: value.FuzzyHigh, CountTimeoutMS: value.CountTimeoutMS,
 		FastMode: value.FastMode, MemoryMinutes: value.MemoryMinutes, MaxHoldMS: value.MaxHoldMS,
+		RejectStatus: config.NormalizeDowngradeRejectStatus(value.RejectStatus),
 	}
 }
 
@@ -141,7 +145,8 @@ func downgradeGuardSummary(guard config.DowngradeGuard) string {
 	if guard.MaxHoldMS > 0 {
 		hold = fmt.Sprintf("内容最多延后 %.1f 秒", float64(guard.MaxHoldMS)/1000)
 	}
-	return fmt.Sprintf("%s（%s，%s，%.0f tok/s）", strings.Join(guard.Models, ","), mode, hold, guard.SpeedThreshold)
+	return fmt.Sprintf("%s（%s，%s，%.0f tok/s，拒绝返回 %d）", strings.Join(guard.Models, ","), mode, hold, guard.SpeedThreshold,
+		config.NormalizeDowngradeRejectStatus(guard.RejectStatus))
 }
 
 // downgradeGate 为一次被拦截模型请求的降级判定
@@ -205,7 +210,7 @@ func (service *trackedService) prepareDowngradeGate(ctx context.Context, request
 		Basis: fmt.Sprintf("同一段对话 %s前被判定为降级，当时的 %d 条消息原样都在，发送前直接拒绝（记录保留 %s，改过其中任何一条即重新判定）",
 			guardDuration(age), messages, guardDuration(settings.memory)),
 	}
-	return nil, &aistudio.ModelDowngradedError{Model: request.Model, Decision: decision}
+	return nil, &aistudio.ModelDowngradedError{Model: request.Model, Decision: decision, Status: settings.rejectStatus}
 }
 
 // guard 返回本次请求的降级判定（没有时为 nil；nil 的方法都是空操作）
@@ -824,7 +829,7 @@ func (run *downgradeRun) reject(decision aistudio.DowngradeDecision) {
 	run.stopHold()
 	decision.Verdict = verdictRejected
 	decision.Capped = run.capped
-	err := &aistudio.ModelDowngradedError{Model: gate.model, Decision: decision}
+	err := &aistudio.ModelDowngradedError{Model: gate.model, Decision: decision, Status: gate.settings.rejectStatus}
 	gate.setRejected(err)
 	if gate.cancel != nil {
 		gate.cancel()
