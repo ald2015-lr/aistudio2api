@@ -56,18 +56,22 @@ trim() {
 }
 
 # env_value KEY DEFAULT：与程序相同的优先级，进程环境变量优先，其次 .env
+# env_value 读取配置：非空的环境变量优先，其次 .env（与程序解析一致：允许 export 前缀、BOM、引号后的行内注释）
 env_value() {
-    local key="$1" default="${2-}" value="" line
-    if [[ -n "${!key+x}" ]]; then
+    local key="$1" default="${2-}" value="" line quote rest
+    if [[ -n "${!key-}" ]]; then
         value="${!key}"
     elif [[ -f .env ]]; then
-        line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" .env 2>/dev/null | tail -n 1 | tr -d '\r')"
+        line="$(sed '1s/^\xEF\xBB\xBF//' .env 2>/dev/null | grep -E "^[[:space:]]*(export[[:space:]]+)?${key}[[:space:]]*=" | tail -n 1 | tr -d '\r')"
         if [[ -n "$line" ]]; then
             value="$(trim "${line#*=}")"
-            case "$value" in
-                \"*\" | \'*\') value="${value:1:${#value}-2}" ;;
-                *) value="$(trim "${value%% #*}")" ;;
-            esac
+            quote="${value:0:1}"
+            if [[ "$quote" == '"' || "$quote" == "'" ]]; then
+                rest="${value:1}"
+                value="${rest%%"$quote"*}"
+            else
+                value="$(trim "${value%% #*}")"
+            fi
         fi
     fi
     [[ -z "$value" ]] && value="$default"

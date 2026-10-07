@@ -138,8 +138,9 @@ func Load(path string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// 进程环境变量优先于 .env；空值视为未设置，避免 docker compose 的 ${VAR} 在宿主机没有设置时把 .env 里的值清空
 	for _, key := range configKeys {
-		if value, ok := os.LookupEnv(key); ok {
+		if value, ok := os.LookupEnv(key); ok && strings.TrimSpace(value) != "" {
 			values[key] = value
 		}
 	}
@@ -510,9 +511,18 @@ func readEnvFile(path string) (map[string]string, error) {
 
 	scanner := bufio.NewScanner(file)
 	for lineNumber := 1; scanner.Scan(); lineNumber++ {
-		line := strings.TrimSpace(scanner.Text())
+		text := scanner.Text()
+		if lineNumber == 1 {
+			// Windows 记事本保存的 UTF-8 文件开头带 BOM
+			text = strings.TrimPrefix(text, "\ufeff")
+		}
+		line := strings.TrimSpace(text)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
+		}
+		// 兼容 shell 写法 export KEY=value
+		if rest, ok := strings.CutPrefix(line, "export"); ok && rest != "" && (rest[0] == ' ' || rest[0] == '\t') {
+			line = strings.TrimSpace(rest)
 		}
 		key, raw, ok := strings.Cut(line, "=")
 		if !ok {
@@ -547,18 +557,35 @@ func parseEnvValue(value string) (string, error) {
 	if value == "" {
 		return "", nil
 	}
-	if value[0] == '\'' {
-		if len(value) < 2 || value[len(value)-1] != '\'' {
+	switch value[0] {
+	case '\'':
+		closing := strings.IndexByte(value[1:], '\'')
+		if closing < 0 {
 			return "", fmt.Errorf("单引号未闭合")
 		}
-		return value[1 : len(value)-1], nil
-	}
-	if value[0] == '"' {
-		parsed, err := strconv.Unquote(value)
-		if err != nil {
-			return "", fmt.Errorf("双引号值无效")
+		if err := checkEnvValueTail(value[closing+2:]); err != nil {
+			return "", err
 		}
-		return parsed, nil
+		return value[1 : closing+1], nil
+	case '"':
+		// 双引号内只把 \\ 与 \" 当作转义，其余反斜杠原样保留：Windows 路径 "D:\accounts" 不会被当成转义
+		var builder strings.Builder
+		for index := 1; index < len(value); index++ {
+			character := value[index]
+			switch {
+			case character == '\\' && index+1 < len(value) && (value[index+1] == '\\' || value[index+1] == '"'):
+				builder.WriteByte(value[index+1])
+				index++
+			case character == '"':
+				if err := checkEnvValueTail(value[index+1:]); err != nil {
+					return "", err
+				}
+				return builder.String(), nil
+			default:
+				builder.WriteByte(character)
+			}
+		}
+		return "", fmt.Errorf("双引号未闭合")
 	}
 	if index := strings.Index(value, " #"); index >= 0 {
 		value = strings.TrimSpace(value[:index])
@@ -566,12 +593,30 @@ func parseEnvValue(value string) (string, error) {
 	return value, nil
 }
 
+// checkEnvValueTail 校验引号值之后的内容：只允许空白与行内注释
+func checkEnvValueTail(tail string) error {
+	tail = strings.TrimSpace(tail)
+	if tail == "" || strings.HasPrefix(tail, "#") {
+		return nil
+	}
+	return fmt.Errorf("引号值之后只能是注释")
+}
+
+// formatEnvValue 写回 .env 时按需加双引号，只转义反斜杠与双引号（与 parseEnvValue 对应）；
+// 换行等控制字符不是合法的配置值，写回时去掉
 func formatEnvValue(value string) string {
+	value = strings.Map(func(character rune) rune {
+		if character == '\n' || character == '\r' {
+			return -1
+		}
+		return character
+	}, value)
 	if value == "" {
 		return ""
 	}
-	if strings.ContainsAny(value, " \t\r\n#\"'") {
-		return strconv.Quote(value)
+	if strings.ContainsAny(value, " \t#\"'\\") {
+		escaped := strings.ReplaceAll(strings.ReplaceAll(value, "\\", "\\\\"), "\"", "\\\"")
+		return "\"" + escaped + "\""
 	}
 	return value
 }
