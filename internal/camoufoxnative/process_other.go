@@ -10,9 +10,11 @@ import (
 	"syscall"
 )
 
-// configureBrowserProcess 将 Camoufox 隔离到独立进程组
+// configureBrowserProcess 将 Camoufox 隔离到独立进程组；Linux 上服务进程退出（包括崩溃、被 SIGKILL）时
+// 由内核结束浏览器，不留下孤儿进程
 func configureBrowserProcess(command *exec.Cmd, _ bool) {
 	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setParentDeathSignal(command.SysProcAttr)
 }
 
 // attachBrowserProcess 在非 Windows 平台由进程组负责回收
