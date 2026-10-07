@@ -1631,6 +1631,11 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
+	if l.authRefreshedSinceLease() {
+		// 本租约开始后账户已续签：这些 Cookie 来自续签前的浏览器会话，写回会覆盖刚续签的登录态，
+		// 让账户卡在需要登录。旧浏览器会随续签被重建，直接丢弃
+		return nil
+	}
 	state, err := LoadStorageState(l.account.StoragePath)
 	if err != nil {
 		return err
@@ -1714,6 +1719,13 @@ func (l *AccountLease) ReplaceResource(previousResourceID string, resourceID str
 	return l.pool.replaceResource(previousResourceID, resourceID, l.account.ID, kind)
 }
 
+// authRefreshedSinceLease 判断本租约开始（或最近一次采用续签结果）之后账户是否又完成了续签；调用方持有 storageMu
+func (l *AccountLease) authRefreshedSinceLease() bool {
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+	return l.authGeneration != l.account.authGeneration
+}
+
 // MergeSetCookieHeaders 将响应 Cookie 合并到账户最新持久状态
 func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string, now time.Time) error {
 	if l == nil || l.account == nil || l.pool == nil {
@@ -1726,6 +1738,10 @@ func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
+	if l.authRefreshedSinceLease() {
+		// 响应属于续签前的会话，合并它的 Set-Cookie 会用旧会话的轮换值覆盖新登录态
+		return nil
+	}
 	state, err := LoadStorageState(l.account.StoragePath)
 	if err != nil {
 		return err
