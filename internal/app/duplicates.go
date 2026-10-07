@@ -360,9 +360,11 @@ func applyPromptNonce(request aistudio.GenerateRequest, nonce string) (aistudio.
 			}
 		}
 		parts := append([]aistudio.Part(nil), content.Parts...)
-		if last := len(parts) - 1; last >= 0 && isPlainTextPart(parts[last]) {
+		if last := len(parts) - 1; last >= 0 && isPlainTextPart(parts[last]) && !endsWithURL(parts[last].Text) {
 			parts[last].Text += nonce
 		} else {
+			// 末尾是链接时单独作为一个文本 part：直接拼在后面会被当成链接的一部分，
+			// 例如 YouTube 链接提取时零宽字符会进入视频 ID，URL Context 读到的也是错误地址
 			parts = append(parts, aistudio.Part{Text: nonce})
 		}
 		contents := append([]aistudio.Content(nil), request.Contents...)
@@ -371,6 +373,16 @@ func applyPromptNonce(request aistudio.GenerateRequest, nonce string) (aistudio.
 		return request, true
 	}
 	return request, false
+}
+
+// endsWithURL 判断文本最后一个以空白分隔的片段是否为链接
+func endsWithURL(text string) bool {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false
+	}
+	last := strings.ToLower(fields[len(fields)-1])
+	return strings.Contains(last, "http://") || strings.Contains(last, "https://")
 }
 
 func isPlainTextPart(part aistudio.Part) bool {
