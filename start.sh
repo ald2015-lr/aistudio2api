@@ -141,7 +141,18 @@ pid_by_path() {
     have pgrep || return 1
     local pid
     pid="$(pgrep -f -- "^${BIN}( |\$)" 2>/dev/null | head -n 1)"
-    [[ -n "$pid" ]] && printf '%s' "$pid"
+    if [[ -n "$pid" ]]; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    # 按 README 用 ./aistudio2api 直接启动的实例命令行是相对路径：按进程名查找，再用工作目录确认是本目录的实例
+    for pid in $(pgrep -x -- "$APP_NAME" 2>/dev/null); do
+        if [[ "$(readlink "/proc/$pid/cwd" 2>/dev/null)" == "$APP_DIR" ]]; then
+            printf '%s' "$pid"
+            return 0
+        fi
+    done
+    return 1
 }
 
 find_pid() {
@@ -156,10 +167,25 @@ find_pid() {
     pid_by_path
 }
 
+# owned_by_app PID：沿父进程链向上查找，存在仍在运行的 aistudio2api 进程（主程序或 setup --login）时返回 0
+owned_by_app() {
+    local pid="$1" depth parent
+    for depth in 1 2 3 4 5 6 7 8; do
+        parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        [[ -z "$parent" || "$parent" == 0 || "$parent" == 1 ]] && return 1
+        [[ "$(ps -p "$parent" -o comm= 2>/dev/null)" == "$APP_NAME" ]] && return 0
+        pid="$parent"
+    done
+    return 1
+}
+
 kill_orphan_camoufox() {
     have pgrep || return 0
-    local pids
-    pids="$(pgrep -f -- "^$APP_DIR/runtime/camoufox/" 2>/dev/null | tr '\n' ' ')"
+    local pids="" pid
+    # 只清理没有存活 aistudio2api 父进程的 Camoufox：同目录另一个实例或正在进行的 setup --login 的浏览器不受影响
+    for pid in $(pgrep -f -- "^$APP_DIR/runtime/camoufox/" 2>/dev/null); do
+        owned_by_app "$pid" || pids+="$pid "
+    done
     pids="$(trim "$pids")"
     [[ -z "$pids" ]] && return 0
     warn "清理残留的 Camoufox 进程：$pids"
@@ -393,6 +419,7 @@ start() {
     fi
     if [[ ! -f .env && -f .env.example ]]; then
         cp .env.example .env
+        chmod 600 .env
         warn "未找到 .env，已从 .env.example 复制；修改后执行 ./start.sh restart"
     fi
     check_api_key

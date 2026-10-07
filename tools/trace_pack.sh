@@ -24,7 +24,7 @@ if [ -d "$TRACE_DIR" ]; then
   [ "$count" -gt 0 ] && cp "$TRACE_DIR"/*.json "$BUNDLE"/
 fi
 echo "排查记录：$count 个（$TRACE_DIR，程序只保留最近 100 个）"
-curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
+curl -s -m 30 --noproxy '*' -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
 if [ -f "$LOG" ]; then
   cat "$LOG.1" "$LOG" 2>/dev/null | grep -F "重复回复" | tail -n 2000 > "$BUNDLE/duplicate-log.jsonl"
 fi
@@ -62,18 +62,26 @@ PY
 python3 - "$BUNDLE" <<'PY'
 import hashlib, os, re, sys
 root = sys.argv[1]
-email = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
+# 每个包随机盐：同一包内代号一致，拿到包的人无法用猜测的邮箱比对代号
+ALIAS_SALT = os.urandom(16)
+# 邮箱（含 URL 编码的 %40 形式）
+email = re.compile(r"[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 rules = [
     (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+:[^\s/@\"']+@"), r"\1<账号>:<密码>@"),
     (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|admin_token)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
     # 管理令牌（启动日志里的登录地址、X-Admin-Token 请求头）
     (re.compile(r"(?i)(admin_token=|x-admin-token:\s*)[0-9a-f]{16,}"), r"\1<已隐藏>"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{30,}"), "<API Key 已隐藏>"),
-    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}"), r"\1<令牌已隐藏>"),
-    (re.compile(r"(?i)((?:SAPISID|APISID|SSID|HSID|SID|__Secure-[A-Za-z0-9-]+|NID)=)[^;\s\"']+"), r"\1<已隐藏>"),
+    (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-+/=]{8,}"), r"\1<令牌已隐藏>"),
+    (re.compile(r"(?i)(basic\s+)[A-Za-z0-9+/=]{8,}"), r"\1<凭据已隐藏>"),
+    # 各类 API Key 请求头与 JSON 字段（x-goog-api-key、x-api-key、api_key、proxy_api_key）
+    (re.compile(r"(?i)((?:x-goog-api-key|x-api-key|proxy_api_key|api_key|apikey)[\"']?\s*[:=]\s*[\"']?)[^\"'\s,&<>]+"), r"\1<已隐藏>"),
+    (re.compile(r"(?i)((?:SAPISID|APISID|SSID|HSID|SIDCC|SID|__Secure-[A-Za-z0-9-]+|NID)=)[^;\s\"']+"), r"\1<已隐藏>"),
+    # JSON 形式保存的 Cookie（storage-state 结构：{"name":"SAPISID","value":"..."}）
+    (re.compile(r"(?i)(\"name\"\s*:\s*\"(?:SAPISID|APISID|SSID|HSID|SIDCC|SID|__Secure-[^\"]+|NID)\"\s*,\s*\"value\"\s*:\s*\")[^\"]*"), r"\1<已隐藏>"),
 ]
 def alias(match):
-    return "acct-" + hashlib.sha256(match.group(0).lower().encode()).hexdigest()[:8]
+    return "acct-" + hashlib.sha256(ALIAS_SALT + match.group(0).lower().encode()).hexdigest()[:8]
 for name in os.listdir(root):
     path = os.path.join(root, name)
     try:
