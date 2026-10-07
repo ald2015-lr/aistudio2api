@@ -132,11 +132,21 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	if err != nil {
 		return fmt.Errorf("监听 %s: %w", cfg.ListenAddr, err)
 	}
+	// 管理令牌：控制面与管理页面不再按来源是否为本机放行，必须携带令牌（或 ADMIN_PASSWORD）
+	tokenPath := adminTokenPath(manager.configPath)
+	adminToken, err := loadAdminToken(tokenPath)
+	if adminToken == "" {
+		listener.Close()
+		return err
+	}
+	if err != nil {
+		manager.requests.log("service", "WARN", "管理令牌保存失败，本次运行使用临时令牌，重启后需要重新打开带令牌的地址 | "+err.Error())
+	}
 	// stopping 在开始优雅退出时关闭，让管理页的实时事件流主动结束，不拖住退出等待
 	stopping := make(chan struct{})
 	apiHandler := api.NewHandler(manager, api.Config{
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
-		Admin: manager, AdminPassword: cfg.AdminPassword, Stopping: stopping,
+		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
 	})
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")
@@ -150,7 +160,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 			" | 默认密钥随源码公开，对外监听时请在服务配置中改为自定义密钥")
 	}
 	server := &http.Server{
-		Handler:           rootHandler(apiHandler, cfg.AdminPassword),
+		Handler:           rootHandler(apiHandler, cfg.AdminPassword, adminToken),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 	}
@@ -175,9 +185,11 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	}()
 
 	address := browserAddress(listener.Addr().String())
+	adminURL := "http://" + address + "/?admin_token=" + adminToken
 	manager.requests.log("service", "INFO", "管理服务就绪 | 地址=http://"+address)
+	manager.requests.log("service", "INFO", "管理页面登录地址（打开一次后浏览器记住登录；令牌保存在 "+tokenPath+"）| "+adminURL)
 	if options.openUI {
-		if err := openBrowser("http://" + address); err != nil {
+		if err := openBrowser(adminURL); err != nil {
 			manager.requests.log("service", "WARN", "管理页面打开失败 | "+err.Error())
 		} else {
 			manager.requests.log("service", "INFO", "管理页面已打开 | 地址=http://"+address)
@@ -213,14 +225,14 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 }
 
 // rootHandler 将公开 API 与内嵌管理端挂载到同一服务
-func rootHandler(apiHandler http.Handler, adminPassword string) http.Handler {
+func rootHandler(apiHandler http.Handler, adminPassword string, adminToken string) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/health", apiHandler)
 	root.Handle("/api/", apiHandler)
 	root.Handle("/v1/", apiHandler)
 	root.Handle("/v1beta/", apiHandler)
 	root.Handle("/trace/", apiHandler)
-	root.Handle("/", api.AdminPageMiddleware(adminPassword, webui.Handler()))
+	root.Handle("/", api.AdminPageMiddleware(adminPassword, adminToken, webui.Handler()))
 	return securityHeaders(root)
 }
 

@@ -8,6 +8,8 @@ MINUTES="${MINUTES:-30}"
 LOG="$APP_DIR/logs/aistudio2api.log"
 PORT="$(grep -E '^LISTEN_ADDR=' "$APP_DIR/.env" 2>/dev/null | tail -n 1 | sed 's/.*://; s/["[:space:]]//g')"
 API="http://127.0.0.1:${PORT:-2048}"
+# 控制面 /api/ 必须携带管理令牌（程序目录下的 .admin-token）
+ADMIN_TOKEN="$(tr -cd '0-9a-fA-F' < "$APP_DIR/.admin-token" 2>/dev/null)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 NAME="aistudio-report-$STAMP"
 OUT_DIR="$APP_DIR/reports"
@@ -23,12 +25,12 @@ echo "  1/6 运行诊断"
 MINUTES="$MINUTES" APP_DIR="$APP_DIR" bash "$APP_DIR/tools/diag_slow.sh" > "$BUNDLE/diag.txt" 2>&1
 
 echo "  2/6 读取服务状态与程序快照"
-curl -s -m 30 "$API/api/status" > "$BUNDLE/status.json" 2>/dev/null
-curl -s -m 30 "$API/api/cooldowns" > "$BUNDLE/cooldowns.json" 2>/dev/null
-curl -s -m 30 "$API/api/onboarding" > "$BUNDLE/onboarding.json" 2>/dev/null
-curl -s -m 30 "$API/api/debug/goroutines" > "$BUNDLE/goroutines.txt" 2>/dev/null
-curl -s -m 30 "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
-curl -s -m 30 "$API/api/debug/perf" > "$BUNDLE/perf.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/status" > "$BUNDLE/status.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/cooldowns" > "$BUNDLE/cooldowns.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/onboarding" > "$BUNDLE/onboarding.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/goroutines" > "$BUNDLE/goroutines.txt" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/perf" > "$BUNDLE/perf.json" 2>/dev/null
 
 echo "  3/6 收集系统信息"
 {
@@ -51,7 +53,8 @@ echo "  3/6 收集系统信息"
 
 echo "  4/6 读取配置与版本（隐藏密钥）"
 if [ -f "$APP_DIR/.env" ]; then
-  sed -E 's/^(PROXY_API_KEY|ADMIN_PASSWORD)=.+/\1=<已隐藏>/' "$APP_DIR/.env" > "$BUNDLE/config.txt"
+  # 与程序的 .env 解析一致：键名前后允许空白与 export 前缀
+  sed -E 's/^([[:space:]]*(export[[:space:]]+)?(PROXY_API_KEY|ADMIN_PASSWORD)[[:space:]]*=).*/\1<已隐藏>/' "$APP_DIR/.env" > "$BUNDLE/config.txt"
 fi
 {
   ls -l --time-style=full-iso "$APP_DIR/aistudio2api" 2>/dev/null
@@ -107,7 +110,9 @@ rules = [
     # 代理地址中的账号密码
     (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+:[^\s/@\"']+@"), r"\1<账号>:<密码>@"),
     # 查询参数中的 key/token 先整体隐藏，再处理其他位置出现的谷歌 API Key 与 Bearer 令牌
-    (re.compile(r"(?i)([?&](?:key|token|access_token|api_key)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
+    (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|admin_token)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
+    # 管理令牌（启动日志里的登录地址、X-Admin-Token 请求头）
+    (re.compile(r"(?i)(admin_token=|x-admin-token:\s*)[0-9a-f]{16,}"), r"\1<已隐藏>"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{30,}"), "<API Key 已隐藏>"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}"), r"\1<令牌已隐藏>"),
     # Cookie 值（如 SAPISID、__Secure-*）

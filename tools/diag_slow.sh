@@ -6,6 +6,8 @@ MINUTES="${MINUTES:-30}"
 LOG="$APP_DIR/logs/aistudio2api.log"
 PORT="$(grep -E '^LISTEN_ADDR=' "$APP_DIR/.env" 2>/dev/null | tail -n 1 | sed 's/.*://; s/["[:space:]]//g')"
 API="http://127.0.0.1:${PORT:-2048}"
+# 控制面 /api/ 必须携带管理令牌（程序目录下的 .admin-token）
+ADMIN_TOKEN="$(tr -cd '0-9a-fA-F' < "$APP_DIR/.admin-token" 2>/dev/null)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 section() { printf '\n==================== %s ====================\n' "$1"; }
@@ -47,15 +49,15 @@ ps -eo pcpu=,rss=,comm= | awk '$3 !~ /^(aistudio2api|camoufox-bin|Web|WebExtensi
 
 section "2. 服务状态"
 # 状态接口 1.5 秒还没返回时，趁它卡着抓一次程序快照，看它在等什么、谁占着锁
-( curl -s -m 20 -o "$WORK/status.json" -w '%{time_total}' "$API/api/status" > "$WORK/status_time" 2>/dev/null ) &
+( curl -s -m 20 -o "$WORK/status.json" -w '%{time_total}' -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/status" > "$WORK/status_time" 2>/dev/null ) &
 status_pid=$!
 sleep 1.5
 if kill -0 "$status_pid" 2>/dev/null; then
-  curl -s -m 15 "$API/api/debug/goroutines" > "$WORK/g_status.txt" 2>/dev/null
+  curl -s -m 15 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/goroutines" > "$WORK/g_status.txt" 2>/dev/null
 fi
 wait "$status_pid" 2>/dev/null
 status_time="$(cat "$WORK/status_time" 2>/dev/null)"
-curl -s -m 20 "$API/api/cooldowns" > "$WORK/cooldowns.json"
+curl -s -m 20 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/cooldowns" > "$WORK/cooldowns.json"
 if [ -s "$WORK/g_status.txt" ]; then
 python3 - "$WORK/g_status.txt" > "$WORK/locks.txt" <<'PY'
 import re, sys, collections
@@ -743,9 +745,9 @@ else
 fi
 
 section "4b. 账户池锁与浏览器命令（实时采样 5 秒）"
-curl -s -m 10 "$API/api/debug/perf" > "$WORK/perf1.json" 2>/dev/null
+curl -s -m 10 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/perf" > "$WORK/perf1.json" 2>/dev/null
 sleep 5
-curl -s -m 10 "$API/api/debug/perf" > "$WORK/perf2.json" 2>/dev/null
+curl -s -m 10 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/perf" > "$WORK/perf2.json" 2>/dev/null
 python3 - "$WORK/perf1.json" "$WORK/perf2.json" <<'PY'
 import json, sys
 try:
@@ -804,7 +806,7 @@ if busy >= 50:
 PY
 
 section "5. 程序此刻在等什么"
-if [ -n "$GOROUTINE_FILE" ]; then cp "$GOROUTINE_FILE" "$WORK/g.txt"; else curl -s -m 10 "$API/api/debug/goroutines" > "$WORK/g.txt"; fi
+if [ -n "$GOROUTINE_FILE" ]; then cp "$GOROUTINE_FILE" "$WORK/g.txt"; else curl -s -m 10 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/goroutines" > "$WORK/g.txt"; fi
 if [ -s "$WORK/g.txt" ]; then
   awk 'BEGIN { RS = "" }
   {

@@ -97,7 +97,7 @@ probe_host() {
     esac
 }
 
-# 控制面 /api/ 只接受回环请求，探测地址是回环时才能查询生成服务状态
+# 本机探测地址是回环时才能查询生成服务状态
 probe_is_loopback() {
     case "$(probe_host)" in
         127.0.0.1 | "[::1]") return 0 ;;
@@ -112,10 +112,16 @@ listen_is_public() {
     esac
 }
 
+# admin_token 读取程序生成的管理令牌（控制面 /api/ 必须携带）
+admin_token() {
+    [[ -f "$APP_DIR/.admin-token" ]] || return 0
+    tr -cd '0-9a-fA-F' <"$APP_DIR/.admin-token"
+}
+
 http_get() {
     have curl || return 1
     # --noproxy：服务器上常全局设置 http_proxy，本机探测不能走代理
-    curl -fsS -m 3 --noproxy '*' "http://$(probe_host):$(listen_port)$1" 2>/dev/null
+    curl -fsS -m 3 --noproxy '*' -H "X-Admin-Token: $(admin_token)" "http://$(probe_host):$(listen_port)$1" 2>/dev/null
 }
 
 service_state() {
@@ -216,14 +222,18 @@ api_hint() {
 }
 
 admin_hint() {
+    local token pw
+    token="$(admin_token)"
+    if [[ -n "$token" ]]; then
+        info "管理页面：http://$(probe_host):$(listen_port)/?admin_token=$token（打开一次后浏览器记住登录；令牌保存在 .admin-token，删除后重启即更换）"
+    fi
     listen_is_public || return 0
-    local pw
     pw="$(env_value ADMIN_PASSWORD "")"
     if [[ -n "$pw" ]]; then
-        info "管理页面：$(api_hint | sed 's#/v1$##')（浏览器弹出登录框：用户名随意，密码为 .env 中的 ADMIN_PASSWORD）"
+        info "远程管理：$(api_hint | sed 's#/v1$##')（浏览器弹出登录框：用户名随意，密码为 .env 中的 ADMIN_PASSWORD；也可以用上面的令牌地址并把主机换成服务器 IP）"
         ((${#pw} >= 12)) || warn "ADMIN_PASSWORD 少于 12 位，暴露在外网时建议使用更长的随机密码"
     else
-        info "管理页面仅限本机访问；在 .env 设置 ADMIN_PASSWORD 后可从外网直接打开"
+        info "远程管理：把上面令牌地址中的主机换成服务器 IP 打开，或在 .env 设置 ADMIN_PASSWORD 用密码登录；未配置 HTTPS 时令牌与密码均为明文传输"
     fi
 }
 

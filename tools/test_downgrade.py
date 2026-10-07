@@ -236,12 +236,28 @@ def request_once(fmt, args, model, body, agent):
     return result
 
 
+def admin_headers():
+    """控制面 /api/ 必须携带管理令牌：优先读环境变量 ADMIN_TOKEN，其次读程序目录（脚本上一级）或当前目录的 .admin-token"""
+    token = os.environ.get("ADMIN_TOKEN", "").strip()
+    if not token:
+        here = os.path.dirname(os.path.abspath(__file__))
+        for candidate in (os.path.join(here, "..", ".admin-token"), ".admin-token"):
+            try:
+                with open(candidate, encoding="utf-8") as file:
+                    token = file.read().strip()
+                    break
+            except OSError:
+                continue
+    return {"X-Admin-Token": token} if token else {}
+
+
 def trace_summary(base, agent):
     """按本次请求独有的 User-Agent 找到对应的排查记录（别的请求同时走 /trace 也不会认错），返回自动结论；
     记录在响应结束后才写出，最多等 6 秒"""
     for _ in range(6):
         try:
-            with urllib.request.urlopen(f"{base.rstrip('/')}/api/debug/traces", timeout=10) as response:
+            request = urllib.request.Request(f"{base.rstrip('/')}/api/debug/traces", headers=admin_headers())
+            with urllib.request.urlopen(request, timeout=10) as response:
                 files = json.load(response).get("files") or []
         except Exception as error:
             return f"（读取排查记录失败：{error}；可在服务器上运行 ./start.sh trace 查看）"

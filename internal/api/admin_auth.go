@@ -75,27 +75,6 @@ func (limiter *adminLoginLimiter) success(ip string) {
 	limiter.mu.Unlock()
 }
 
-// forwardedHeaders 为反向代理转发时会附带的来源头
-var forwardedHeaders = []string{"X-Forwarded-For", "X-Real-IP", "Forwarded", "X-Forwarded-Host"}
-
-// proxied 判断请求是否经过反向代理转发
-func proxied(r *http.Request) bool {
-	for _, name := range forwardedHeaders {
-		if r.Header.Get(name) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// isLoopbackRequest 判断请求确实由本机直接发出：来源与 Host 都是回环地址，且没有反向代理转发头。
-// 经本机 nginx 等反代转发的外网请求来源同样是 127.0.0.1，若反代没有改写 Host，
-// 只看来源和 Host 会被当作本机请求而绕过管理密码，所以带转发头的请求一律按远程处理
-func isLoopbackRequest(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	return err == nil && net.ParseIP(host).IsLoopback() && loopbackHost(r.Host) && !proxied(r)
-}
-
 // requestRemoteIP 返回请求来源 IP；直连来源是本机反代时取反代传来的真实客户端地址，
 // 避免所有外网请求共用 127.0.0.1 的错误计数，被他人故意输错密码连带封禁
 func requestRemoteIP(r *http.Request) string {
@@ -141,39 +120,107 @@ func checkAdminPassword(w http.ResponseWriter, r *http.Request, password string)
 	return false
 }
 
+// 管理令牌：启动时生成并保存在 .admin-token。浏览器用带 admin_token 参数的地址打开一次管理页面后，
+// 服务写入 HttpOnly、SameSite=Strict 的 Cookie，之后同源的页面、/api/ 请求与事件流自动携带；
+// 脚本在 X-Admin-Token 请求头中携带令牌
+const (
+	AdminTokenCookie = "aistudio2api_admin"
+	adminTokenHeader = "X-Admin-Token"
+	adminTokenQuery  = "admin_token"
+	// adminTokenCookieMaxAge 为浏览器记住登录的时长（浏览器允许的上限约 400 天）
+	adminTokenCookieMaxAge = 400 * 24 * 60 * 60
+)
+
+// hasAdminToken 判断请求是否携带正确的管理令牌（请求头或 Cookie）
+func hasAdminToken(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	candidates := []string{strings.TrimSpace(r.Header.Get(adminTokenHeader))}
+	if cookie, err := r.Cookie(AdminTokenCookie); err == nil {
+		candidates = append(candidates, cookie.Value)
+	}
+	for _, candidate := range candidates {
+		if candidate != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // adminAccessMiddleware 控制面访问控制
 //
-// 本机回环请求直接放行；设置 ADMIN_PASSWORD 时，远程请求通过 HTTP Basic 认证后放行；
-// 未设置时拒绝远程请求，保持原有行为。
-func adminAccessMiddleware(password string, next http.Handler) http.Handler {
+// 携带管理令牌的请求放行；设置 ADMIN_PASSWORD 时也可以用 HTTP Basic 认证。
+// 回环来源不再无条件放行：反向代理（例如默认配置的 nginx proxy_pass）转发的外网请求来源同样是本机，
+// 且不一定带转发头，按来源判断会把这些请求当作本机请求
+func adminAccessMiddleware(password string, token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isLoopbackRequest(r) {
+		if hasAdminToken(r, token) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if password == "" {
-			writeAdminError(w, http.StatusForbidden, "control_plane_forbidden",
-				"Control plane is only available from loopback; set ADMIN_PASSWORD to enable remote management")
+		if password != "" {
+			if checkAdminPassword(w, r, password) {
+				next.ServeHTTP(w, r)
+			}
 			return
 		}
-		if checkAdminPassword(w, r, password) {
-			next.ServeHTTP(w, r)
-		}
+		writeAdminError(w, http.StatusUnauthorized, "admin_token_required",
+			"需要管理令牌：用启动日志中带 admin_token 参数的地址打开管理页面，或在请求头 X-Admin-Token 中携带 .admin-token 文件的内容")
 	})
 }
 
 // AdminPageMiddleware 管理页面静态资源的访问控制
 //
-// 设置 ADMIN_PASSWORD 时远程打开页面先要求认证，浏览器弹出登录框后会为同源的
-// /api/ 请求与事件流自动携带凭据；未设置时保持原行为。
-func AdminPageMiddleware(password string, next http.Handler) http.Handler {
+// 带正确 admin_token 参数的请求写入登录 Cookie 后跳转到去掉参数的地址；携带令牌的请求直接放行；
+// 设置 ADMIN_PASSWORD 时浏览器弹出登录框，认证后同源的 /api/ 请求与事件流自动携带凭据
+func AdminPageMiddleware(password string, token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if password == "" || isLoopbackRequest(r) {
+		if value := r.URL.Query().Get(adminTokenQuery); value != "" && token != "" &&
+			subtle.ConstantTimeCompare([]byte(strings.TrimSpace(value)), []byte(token)) == 1 {
+			http.SetCookie(w, &http.Cookie{
+				Name: AdminTokenCookie, Value: token, Path: "/", MaxAge: adminTokenCookieMaxAge,
+				HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil,
+			})
+			target := *r.URL
+			query := target.Query()
+			query.Del(adminTokenQuery)
+			target.RawQuery = query.Encode()
+			http.Redirect(w, r, target.RequestURI(), http.StatusSeeOther)
+			return
+		}
+		if hasAdminToken(r, token) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if checkAdminPassword(w, r, password) {
-			next.ServeHTTP(w, r)
+		if password != "" {
+			if checkAdminPassword(w, r, password) {
+				next.ServeHTTP(w, r)
+			}
+			return
 		}
+		writeAdminLoginPage(w)
 	})
 }
+
+// writeAdminLoginPage 返回说明如何获取管理令牌的页面
+func writeAdminLoginPage(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusUnauthorized)
+	_, _ = w.Write([]byte(adminLoginPage))
+}
+
+const adminLoginPage = `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>需要管理令牌</title>
+<style>body{margin:0;background:#0d1117;color:#c9d1d9;font:15px/1.7 system-ui,sans-serif}main{max-width:640px;margin:12vh auto;padding:0 16px}
+h1{font-size:20px;color:#fff}code{background:#161b22;border:1px solid #30363d;border-radius:4px;padding:1px 6px}</style></head>
+<body><main>
+<h1>需要管理令牌</h1>
+<p>管理页面需要令牌才能打开。服务启动时会在日志中打印带令牌的地址（<code>/?admin_token=…</code>），用它打开一次后浏览器会记住登录。</p>
+<p>令牌保存在程序目录的 <code>.admin-token</code> 文件中；Linux 上也可以运行 <code>./start.sh status</code> 查看完整地址。设置 <code>ADMIN_PASSWORD</code> 后也可以用密码登录。</p>
+<h1 lang="en">Admin token required</h1>
+<p lang="en">Open the address with <code>?admin_token=…</code> printed in the startup log once; the browser then remembers the login. The token is stored in the <code>.admin-token</code> file next to the program.</p>
+</main></body></html>
+`

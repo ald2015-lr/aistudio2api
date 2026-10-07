@@ -5,6 +5,8 @@
 APP_DIR="${APP_DIR:-$(cd "$(dirname "$0")/.." 2>/dev/null && [ -f start.sh ] && pwd || echo /www/wwwroot/Chat2API/build)}"
 PORT="$(grep -E '^LISTEN_ADDR=' "$APP_DIR/.env" 2>/dev/null | tail -n 1 | sed 's/.*://; s/["[:space:]]//g')"
 API="http://127.0.0.1:${PORT:-2048}"
+# 控制面 /api/ 必须携带管理令牌（程序目录下的 .admin-token）
+ADMIN_TOKEN="$(tr -cd '0-9a-fA-F' < "$APP_DIR/.admin-token" 2>/dev/null)"
 TRACE_DIR="$APP_DIR/logs/trace"
 LOG="$APP_DIR/logs/aistudio2api.log"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -22,7 +24,7 @@ if [ -d "$TRACE_DIR" ]; then
   [ "$count" -gt 0 ] && cp "$TRACE_DIR"/*.json "$BUNDLE"/
 fi
 echo "排查记录：$count 个（$TRACE_DIR，程序只保留最近 100 个）"
-curl -s -m 30 "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
+curl -s -m 30 -H "X-Admin-Token: $ADMIN_TOKEN" "$API/api/debug/duplicates" > "$BUNDLE/duplicates.json" 2>/dev/null
 if [ -f "$LOG" ]; then
   cat "$LOG.1" "$LOG" 2>/dev/null | grep -F "重复回复" | tail -n 2000 > "$BUNDLE/duplicate-log.jsonl"
 fi
@@ -63,7 +65,9 @@ root = sys.argv[1]
 email = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 rules = [
     (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+:[^\s/@\"']+@"), r"\1<账号>:<密码>@"),
-    (re.compile(r"(?i)([?&](?:key|token|access_token|api_key)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
+    (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|admin_token)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
+    # 管理令牌（启动日志里的登录地址、X-Admin-Token 请求头）
+    (re.compile(r"(?i)(admin_token=|x-admin-token:\s*)[0-9a-f]{16,}"), r"\1<已隐藏>"),
     (re.compile(r"AIza[0-9A-Za-z_\-]{30,}"), "<API Key 已隐藏>"),
     (re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{16,}"), r"\1<令牌已隐藏>"),
     (re.compile(r"(?i)((?:SAPISID|APISID|SSID|HSID|SID|__Secure-[A-Za-z0-9-]+|NID)=)[^;\s\"']+"), r"\1<已隐藏>"),

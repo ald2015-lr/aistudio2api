@@ -419,7 +419,7 @@ cp .env.example .env
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 | `AUTO_START` | `true` | Start the generation service automatically when the management process starts, retrying transient failures from 5 seconds up to 1 minute apart; `false` keeps it `STOPPED` until started from the management page |
-| `ADMIN_PASSWORD` | empty | When set, the management page can be opened remotely with HTTP Basic authentication (any username, this value as password); 10 failures within 10 minutes block the IP for 15 minutes; when empty, management stays loopback-only. Use HTTPS, since plain HTTP sends the password in clear text |
+| `ADMIN_PASSWORD` | empty | When set, the management page can also be opened with HTTP Basic authentication (any username, this value as password); 10 failures within 10 minutes block the IP for 15 minutes. Without it, only the admin token works. The management page and `/api/` always require the admin token stored in `.admin-token`: open the `http://127.0.0.1:2048/?admin_token=<token>` address printed in the startup log once and the browser remembers the login; scripts send it in the `X-Admin-Token` header. Use HTTPS, since plain HTTP sends the token and password in clear text |
 
 The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls concurrent prewarming, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 

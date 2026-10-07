@@ -35,3 +35,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.bak
+
+# 管理令牌
+/.admin-token

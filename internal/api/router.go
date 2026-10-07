@@ -17,6 +17,8 @@ type Config struct {
 	APIKeyFunc    func() string
 	Admin         AdminService
 	AdminPassword string
+	// AdminToken 为管理令牌：控制面请求必须携带（或通过 ADMIN_PASSWORD 认证）
+	AdminToken string
 	// Stopping 在服务开始优雅退出时关闭；管理页实时事件流据此主动结束，不拖住退出等待
 	Stopping <-chan struct{}
 	// TraceDir 为 /trace/ 排查路由写记录的目录，空值为 logs/trace
@@ -85,7 +87,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	root.Handle("/v1beta/", publicChain)
 	// 排查路由：与主路由完全相同的处理链，额外为每个 POST 请求写完整排查记录（见 trace.go）
 	root.Handle("/trace/", s.traceEntry(publicChain))
-	root.Handle("/api/", adminAccessMiddleware(config.AdminPassword, sameOriginMiddleware(control)))
+	root.Handle("/api/", adminAccessMiddleware(config.AdminPassword, config.AdminToken, sameOriginMiddleware(control)))
 	return root
 }
 

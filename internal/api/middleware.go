@@ -537,17 +537,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func loopbackMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil || !net.ParseIP(host).IsLoopback() || !loopbackHost(r.Host) {
-			writeAdminError(w, http.StatusForbidden, "control_plane_forbidden", "Control plane is only available from loopback")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 // loopbackHost 判断 Host 或 Origin 主机名是否为 localhost 或回环地址
 func loopbackHost(host string) bool {
 	name := host
