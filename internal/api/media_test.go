@@ -35,3 +35,30 @@ func TestGeminiInlineDataCompatibility(t *testing.T) {
 		})
 	}
 }
+
+// gifWithCanvas 构造逻辑画布为 width×height、首帧为 1×1 的最小 GIF
+func gifWithCanvas(width, height uint16) []byte {
+	return []byte{'G', 'I', 'F', '8', '9', 'a',
+		byte(width), byte(width >> 8), byte(height), byte(height >> 8), 0x80, 0, 0,
+		0, 0, 0, 0xff, 0xff, 0xff,
+		',', 0, 0, 0, 0, 1, 0, 1, 0, 0,
+		2, 2, 0x44, 0x01, 0,
+		';'}
+}
+
+// TestNormalizeImagePayloadRejectsHugeGIFCanvas 头部声明超大画布的 GIF 原样返回，不按画布分配内存
+func TestNormalizeImagePayloadRejectsHugeGIFCanvas(t *testing.T) {
+	data := gifWithCanvas(65535, 65535)
+	mime, output := normalizeImagePayload("image/gif", data)
+	if mime != "image/gif" || !bytes.Equal(output, data) {
+		t.Fatalf("超大画布 GIF 应原样返回，得到 mime=%s len=%d", mime, len(output))
+	}
+}
+
+// TestNormalizeImagePayloadConvertsSmallGIF 正常尺寸的 GIF 仍按逻辑画布转为 PNG
+func TestNormalizeImagePayloadConvertsSmallGIF(t *testing.T) {
+	mime, output := normalizeImagePayload("image/gif", gifWithCanvas(4, 3))
+	if mime != "image/png" || !bytes.HasPrefix(output, []byte("\x89PNG")) {
+		t.Fatalf("应转换为 PNG，得到 mime=%s", mime)
+	}
+}

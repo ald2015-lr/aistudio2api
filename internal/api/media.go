@@ -292,15 +292,20 @@ func decodeBase64Flexible(s string) ([]byte, error) {
 	return encoding.DecodeString(s)
 }
 
-// normalizeImagePayload 将 GIF 首帧按逻辑画布转换为 PNG 图片
+// maxGIFCanvasPixels 为 GIF 转 PNG 时允许的逻辑画布像素上限（4096×4096，约 64MB RGBA）。
+// GIF 头部声明的画布尺寸不受文件大小约束：35 字节的文件就能声明 65535×65535，按画布分配会耗尽内存
+const maxGIFCanvasPixels = 4096 * 4096
+
+// normalizeImagePayload 将 GIF 首帧按逻辑画布转换为 PNG 图片；画布超过上限时原样返回，由上游处理
 func normalizeImagePayload(mimeType string, data []byte) (string, []byte) {
 	lowerMIME := strings.ToLower(strings.TrimSpace(mimeType))
 	if lowerMIME == "image/gif" || (len(data) >= 3 && string(data[:3]) == "GIF") {
+		// 先只读头部检查画布尺寸，再解码帧：解码器按帧尺寸分配，帧又必须落在画布内
+		config, err := gif.DecodeConfig(bytes.NewReader(data))
+		if err != nil || config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxGIFCanvasPixels {
+			return mimeType, data
+		}
 		if img, err := gif.Decode(bytes.NewReader(data)); err == nil {
-			config, err := gif.DecodeConfig(bytes.NewReader(data))
-			if err != nil {
-				return mimeType, data
-			}
 			canvas := image.NewNRGBA(image.Rect(0, 0, config.Width, config.Height))
 			transparent := false
 			for _, entry := range img.(*image.Paletted).Palette {

@@ -17,7 +17,25 @@ var schemaTypeCodes = map[string]int64{
 	"object":  6,
 }
 
+// maxSchemaDepth 为 JSON Schema 的最大嵌套层数；实际工具 schema 很少超过十几层
+const maxSchemaDepth = 64
+
+// maxSchemaBytes 为单个 JSON Schema 的大小上限
+const maxSchemaBytes = 1 << 20
+
+// encodeJSONSchema 把 JSON Schema 转换为 AI Studio 的 Schema 数组
 func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
+	if len(raw) > maxSchemaBytes {
+		return nil, fmt.Errorf("schema 超过 %d 字节上限", maxSchemaBytes)
+	}
+	return encodeSchemaNode(raw, 0)
+}
+
+// encodeSchemaNode 转换一个 schema 节点；depth 为当前嵌套层数
+func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
+	if depth > maxSchemaDepth {
+		return nil, fmt.Errorf("schema 嵌套超过 %d 层", maxSchemaDepth)
+	}
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
 		return nil, fmt.Errorf("schema 必须是 JSON object")
@@ -85,7 +103,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 		wire = setWireField(wire, 4, values)
 	}
 	if value, ok := schema["items"]; ok {
-		items, err := encodeJSONSchema(value)
+		items, err := encodeSchemaNode(value, depth+1)
 		if err != nil {
 			return nil, fmt.Errorf("schema.items: %w", err)
 		}
@@ -122,7 +140,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 		sort.Strings(names)
 		entries := make([]any, 0, len(names))
 		for _, name := range names {
-			property, err := encodeJSONSchema(properties[name])
+			property, err := encodeSchemaNode(properties[name], depth+1)
 			if err != nil {
 				return nil, fmt.Errorf("schema.properties.%s: %w", name, err)
 			}
@@ -177,7 +195,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 		{name: "allOf", index: 18},
 	} {
 		if value, ok := schema[field.name]; ok {
-			variants, err := encodeSchemaVariants(value, field.name)
+			variants, err := encodeSchemaVariants(value, field.name, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -187,7 +205,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 		}
 	}
 	if value, ok := schema["not"]; ok {
-		notSchema, err := encodeJSONSchema(value)
+		notSchema, err := encodeSchemaNode(value, depth+1)
 		if err != nil {
 			return nil, fmt.Errorf("schema.not: %w", err)
 		}
@@ -290,34 +308,15 @@ func normalizeNullableVariants(schema map[string]json.RawMessage) error {
 	return nil
 }
 
-// normalizeConstAndMetadata 将字符串常量和说明字段转换为可发送结构
+// normalizeConstAndMetadata 将当前节点及其直接组合子节点（anyOf、oneOf、allOf）的字符串常量和说明字段
+// 转换为可发送结构。
+//
+// 只处理一层：后续的 nullable 与隐式类型规范化只检查直接子节点的 type；更深的子节点在各自编码时再规范化。
+// 原先这里递归规范化整棵子树，而每个子节点编码时又再递归一次，嵌套 anyOf 的耗时随层数按立方增长，
+// 几 KB 的工具 schema 就要数十秒 CPU
 func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
-	delete(schema, "title")
-	delete(schema, "$id")
-	delete(schema, "$comment")
-	if raw, ok := schema["const"]; ok {
-		var decoded any
-		if err := json.Unmarshal(raw, &decoded); err != nil {
-			return fmt.Errorf("schema.const 必须是字符串")
-		}
-		value, ok := decoded.(string)
-		if !ok {
-			return fmt.Errorf("schema.const 只支持字符串")
-		}
-		if rawType, exists := schema["type"]; exists {
-			typeName, err := schemaString(rawType, "type")
-			if err != nil || !strings.EqualFold(typeName, "string") {
-				return fmt.Errorf("schema.const 只支持 string 类型")
-			}
-		} else {
-			schema["type"] = json.RawMessage(`"string"`)
-		}
-		enum, err := json.Marshal([]string{value})
-		if err != nil {
-			return err
-		}
-		schema["enum"] = enum
-		delete(schema, "const")
+	if err := normalizeSchemaConst(schema); err != nil {
+		return err
 	}
 	for _, name := range []string{"anyOf", "oneOf", "allOf"} {
 		raw, ok := schema[name]
@@ -333,7 +332,7 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 			if err := json.Unmarshal(variant, &subSchema); err != nil || subSchema == nil {
 				return fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
 			}
-			if err := normalizeConstAndMetadata(subSchema); err != nil {
+			if err := normalizeSchemaConst(subSchema); err != nil {
 				return fmt.Errorf("schema.%s[%d]: %w", name, index, err)
 			}
 			encoded, err := json.Marshal(subSchema)
@@ -348,6 +347,40 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 		}
 		schema[name] = encoded
 	}
+	return nil
+}
+
+// normalizeSchemaConst 删除说明字段，并把字符串 const 转换为单值 enum
+func normalizeSchemaConst(schema map[string]json.RawMessage) error {
+	delete(schema, "title")
+	delete(schema, "$id")
+	delete(schema, "$comment")
+	raw, ok := schema["const"]
+	if !ok {
+		return nil
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return fmt.Errorf("schema.const 必须是字符串")
+	}
+	value, ok := decoded.(string)
+	if !ok {
+		return fmt.Errorf("schema.const 只支持字符串")
+	}
+	if rawType, exists := schema["type"]; exists {
+		typeName, err := schemaString(rawType, "type")
+		if err != nil || !strings.EqualFold(typeName, "string") {
+			return fmt.Errorf("schema.const 只支持 string 类型")
+		}
+	} else {
+		schema["type"] = json.RawMessage(`"string"`)
+	}
+	enum, err := json.Marshal([]string{value})
+	if err != nil {
+		return err
+	}
+	schema["enum"] = enum
+	delete(schema, "const")
 	return nil
 }
 
@@ -446,14 +479,14 @@ func schemaNumber(raw json.RawMessage, name string) (float64, error) {
 	return value, nil
 }
 
-func encodeSchemaVariants(raw json.RawMessage, name string) ([]any, error) {
+func encodeSchemaVariants(raw json.RawMessage, name string, depth int) ([]any, error) {
 	var variants []json.RawMessage
 	if err := json.Unmarshal(raw, &variants); err != nil {
 		return nil, fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
 	}
 	encoded := make([]any, 0, len(variants))
 	for index, variant := range variants {
-		wire, err := encodeJSONSchema(variant)
+		wire, err := encodeSchemaNode(variant, depth)
 		if err != nil {
 			return nil, fmt.Errorf("schema.%s[%d]: %w", name, index, err)
 		}
