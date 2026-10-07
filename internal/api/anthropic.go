@@ -666,9 +666,7 @@ func anthropicUsage(usage *aistudio.Usage) map[string]any {
 func writeAnthropicModels(w http.ResponseWriter, models []aistudio.Model) {
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		data = append(data, map[string]any{
-			"id": model.ID, "type": "model", "display_name": model.Name, "created_at": "1970-01-01T00:00:00Z",
-		})
+		data = append(data, anthropicModelObject(model))
 	}
 	response := map[string]any{"data": data, "has_more": false, "first_id": nil, "last_id": nil}
 	if len(models) > 0 {
@@ -676,6 +674,10 @@ func writeAnthropicModels(w http.ResponseWriter, models []aistudio.Model) {
 		response["last_id"] = models[len(models)-1].ID
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func anthropicModelObject(model aistudio.Model) map[string]any {
+	return map[string]any{"id": model.ID, "type": "model", "display_name": model.Name, "created_at": "1970-01-01T00:00:00Z"}
 }
 
 type anthropicStreamWriter struct {

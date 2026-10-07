@@ -289,7 +289,9 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 			config.ResponseMIMEType = "application/json"
 		case "json_schema":
 			config.ResponseMIMEType = "application/json"
-			config.ResponseSchema = text.Format.Schema
+			if geminiRawObjectPresent(text.Format.Schema) {
+				config.ResponseSchema = text.Format.Schema
+			}
 		case "", "text":
 		default:
 			return aistudio.GenerateRequest{}, nil, fmt.Errorf("unsupported text format %q", text.Format.Type)

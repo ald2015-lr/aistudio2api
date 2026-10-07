@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -28,6 +29,9 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 	if len(raw) > maxSchemaBytes {
 		return nil, fmt.Errorf("schema 超过 %d 字节上限", maxSchemaBytes)
 	}
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		raw = json.RawMessage(emptyFunctionParameters)
+	}
 	return encodeSchemaNode(raw, 0)
 }
 
@@ -40,6 +44,11 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
 		return nil, fmt.Errorf("schema 必须是 JSON object")
 	}
+	cleanNullFields(schema)
+	if err := normalizeNot(schema); err != nil {
+		return nil, err
+	}
+	normalizeBooleanItems(schema)
 	if err := normalizeConstAndMetadata(schema); err != nil {
 		return nil, err
 	}
@@ -132,6 +141,11 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		var properties map[string]json.RawMessage
 		if err := json.Unmarshal(value, &properties); err != nil || properties == nil {
 			return nil, fmt.Errorf("schema.properties 必须是 JSON object")
+		}
+		if removed := normalizeBooleanProperties(properties); len(removed) > 0 {
+			if err := dropRequired(schema, removed); err != nil {
+				return nil, err
+			}
 		}
 		names := make([]string, 0, len(properties))
 		for name := range properties {
@@ -539,4 +553,140 @@ func normalizeFunctionParameters(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(emptyFunctionParameters)
 	}
 	return json.RawMessage(trimmed)
+}
+
+// cleanNullFields 删除值为显式 null 的字段（const 除外）。SDK 生成的 schema 常把未设置的可选字段写成 null，
+// 例如 "description": null、"items": null、"minItems": null，按缺省处理
+func cleanNullFields(schema map[string]json.RawMessage) {
+	for name, value := range schema {
+		if name != "const" && isJSONLiteral(value, "null") {
+			delete(schema, name)
+		}
+	}
+}
+
+// normalizeNot 把 not 约束规范为可编码的形式。只处理当前节点，子 schema 在各自编码时再规范化。
+//
+// not 为 null、false、"" 或清理后为空的对象时不限制任何值，直接删除；not 为 true 时本应禁止所有值，
+// 这样的 schema 无法满足，按宽松处理删除，避免整个请求失败；not:{"type":"null"} 等价于不可为 null；
+// 字符串、数字等标量或数组写法按排除这些值处理，转换为 not+enum
+func normalizeNot(schema map[string]json.RawMessage) error {
+	raw, ok := schema["not"]
+	if !ok {
+		return nil
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || isJSONLiteral(trimmed, "null") || isJSONLiteral(trimmed, "false") ||
+		isJSONLiteral(trimmed, "true") || bytes.Equal(trimmed, []byte(`""`)) {
+		delete(schema, "not")
+		return nil
+	}
+	switch trimmed[0] {
+	case '{':
+		var sub map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &sub); err != nil || sub == nil {
+			return fmt.Errorf("schema.not 必须是 JSON object")
+		}
+		cleanNullFields(sub)
+		if len(sub) == 0 {
+			delete(schema, "not")
+			return nil
+		}
+		if len(sub) == 1 {
+			if typeName, err := schemaString(sub["type"], "type"); err == nil && strings.EqualFold(typeName, "null") {
+				delete(schema, "not")
+				schema["nullable"] = json.RawMessage("false")
+			}
+		}
+		return nil
+	case '[':
+		var values []any
+		if err := json.Unmarshal(trimmed, &values); err != nil {
+			return fmt.Errorf("schema.not 必须是 JSON object")
+		}
+		return setNotEnum(schema, values)
+	default:
+		var value any
+		if err := json.Unmarshal(trimmed, &value); err != nil {
+			return fmt.Errorf("schema.not 必须是 JSON object")
+		}
+		return setNotEnum(schema, []any{value})
+	}
+}
+
+func setNotEnum(schema map[string]json.RawMessage, values []any) error {
+	encoded, err := json.Marshal(map[string]any{"enum": values})
+	if err != nil {
+		return err
+	}
+	schema["not"] = encoded
+	return nil
+}
+
+// normalizeBooleanItems 处理布尔形式的 items：true 不限制元素，按空 schema 处理；
+// false 不允许任何元素，删除 items 并设 maxItems=0，元素定义交给 normalizeImplicitType 补齐
+// （AI Studio 要求数组带 items）
+func normalizeBooleanItems(schema map[string]json.RawMessage) {
+	value, ok := schema["items"]
+	if !ok {
+		return
+	}
+	switch {
+	case isJSONLiteral(value, "true"):
+		schema["items"] = json.RawMessage(`{}`)
+	case isJSONLiteral(value, "false"):
+		delete(schema, "items")
+		schema["maxItems"] = json.RawMessage("0")
+	}
+}
+
+// normalizeBooleanProperties 处理布尔或 null 形式的属性 schema，返回被删除的属性名：
+// true 与 null 不限制取值，按空 schema 处理；false 表示不允许出现该属性，直接删除
+func normalizeBooleanProperties(properties map[string]json.RawMessage) []string {
+	var removed []string
+	for name, value := range properties {
+		switch {
+		case isJSONLiteral(value, "true"), isJSONLiteral(value, "null"):
+			properties[name] = json.RawMessage(`{}`)
+		case isJSONLiteral(value, "false"):
+			delete(properties, name)
+			removed = append(removed, name)
+		}
+	}
+	return removed
+}
+
+// dropRequired 从 required 中去掉已删除的属性，避免 required 引用不存在的属性
+func dropRequired(schema map[string]json.RawMessage, removed []string) error {
+	raw, ok := schema["required"]
+	if !ok {
+		return nil
+	}
+	required, err := schemaStrings(raw, "required")
+	if err != nil {
+		return err
+	}
+	kept := required[:0]
+	for _, name := range required {
+		drop := false
+		for _, gone := range removed {
+			if name == gone {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			kept = append(kept, name)
+		}
+	}
+	encoded, err := json.Marshal(kept)
+	if err != nil {
+		return err
+	}
+	schema["required"] = encoded
+	return nil
+}
+
+func isJSONLiteral(raw json.RawMessage, literal string) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte(literal))
 }

@@ -263,7 +263,7 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 
 | 协议 | 端点 |
 | --- | --- |
-| OpenAI Chat | `GET /v1/models`、`POST /v1/chat/completions` |
+| OpenAI Chat | `GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | OpenAI Files | `POST /v1/files`、`GET/DELETE /v1/files/{file}`、`GET /v1/files/{file}/content` |
 | OpenAI 媒体 | `POST /v1/images/generations`、`POST /v1/audio/speech`、`POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content` |

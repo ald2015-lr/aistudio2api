@@ -89,35 +89,67 @@ func (s *server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 	}
 	data := make([]map[string]any, 0, len(models))
 	for _, model := range models {
-		item := map[string]any{
-			"id":                           model.ID,
-			"object":                       "model",
-			"created":                      0,
-			"owned_by":                     "google",
-			"name":                         model.Name,
-			"description":                  model.Description,
-			"supported_generation_methods": model.Methods,
-			"input_token_limit":            model.InputTokenLimit,
-			"output_token_limit":           model.OutputTokenLimit,
-		}
-		if len(model.Capabilities) > 0 {
-			item["capabilities"] = model.Capabilities
-		}
-		if len(model.CapabilityOptions) > 0 {
-			item["capability_options"] = model.CapabilityOptions
-		}
-		if len(model.AccessModes) > 0 {
-			item["access_modes"] = model.AccessModes
-		}
-		if len(model.Channels) > 0 {
-			item["channels"] = model.Channels
-		}
-		if model.Paid {
-			item["paid"] = true
-		}
-		data = append(data, item)
+		data = append(data, openAIModelObject(model))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
+}
+
+// handleOpenAIModel 查询单个模型（OpenAI/Anthropic SDK 的 models.retrieve）；带 Anthropic-Version 时返回 Anthropic 格式
+func (s *server) handleOpenAIModel(w http.ResponseWriter, r *http.Request) {
+	anthropic := r.Header.Get("Anthropic-Version") != ""
+	models, err := s.service.Models(r.Context())
+	if err != nil {
+		if shouldWriteRequestError(r, err) {
+			if anthropic {
+				writeAnthropicRequestError(w, err)
+			} else {
+				writeOpenAIRequestError(w, err)
+			}
+		}
+		return
+	}
+	modelID := strings.TrimPrefix(r.PathValue("model"), "models/")
+	model, ok := lookupPublicModel(models, modelID)
+	switch {
+	case !ok && anthropic:
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "model: "+modelID)
+	case !ok:
+		writeOpenAIError(w, http.StatusNotFound, "model_not_found", fmt.Sprintf("The model '%s' does not exist or you do not have access to it.", modelID))
+	case anthropic:
+		writeJSON(w, http.StatusOK, anthropicModelObject(model))
+	default:
+		writeJSON(w, http.StatusOK, openAIModelObject(model))
+	}
+}
+
+func openAIModelObject(model aistudio.Model) map[string]any {
+	item := map[string]any{
+		"id":                           model.ID,
+		"object":                       "model",
+		"created":                      0,
+		"owned_by":                     "google",
+		"name":                         model.Name,
+		"description":                  model.Description,
+		"supported_generation_methods": model.Methods,
+		"input_token_limit":            model.InputTokenLimit,
+		"output_token_limit":           model.OutputTokenLimit,
+	}
+	if len(model.Capabilities) > 0 {
+		item["capabilities"] = model.Capabilities
+	}
+	if len(model.CapabilityOptions) > 0 {
+		item["capability_options"] = model.CapabilityOptions
+	}
+	if len(model.AccessModes) > 0 {
+		item["access_modes"] = model.AccessModes
+	}
+	if len(model.Channels) > 0 {
+		item["channels"] = model.Channels
+	}
+	if model.Paid {
+		item["paid"] = true
+	}
+	return item
 }
 
 func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -600,7 +632,10 @@ func (request chatRequest) generationConfig() (aistudio.GenerationConfig, error)
 			config.ResponseMIMEType = "application/json"
 		case "json_schema":
 			config.ResponseMIMEType = "application/json"
-			config.ResponseSchema = format.JSONSchema.Schema
+			// schema 为 null 时按未设置处理，只保留 JSON 模式
+			if geminiRawObjectPresent(format.JSONSchema.Schema) {
+				config.ResponseSchema = format.JSONSchema.Schema
+			}
 		case "", "text":
 		default:
 			return config, fmt.Errorf("unsupported response_format type %q", format.Type)

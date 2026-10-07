@@ -255,6 +255,28 @@ func expandModelAliases(models []aistudio.Model) []aistudio.Model {
 	return expanded
 }
 
+// lookupPublicModel 按单模型查询的名称查找模型：先匹配列表中的正式 ID 与后缀别名，再匹配目录别名，
+// 最后解析列表里没有展开的后缀组合（如 -nothinking-online）。目录别名返回对应的正式模型，后缀组合返回请求的名称
+func lookupPublicModel(models []aistudio.Model, name string) (aistudio.Model, bool) {
+	for _, model := range expandModelAliases(models) {
+		if model.ID == name {
+			return model, true
+		}
+	}
+	for _, model := range models {
+		for _, alias := range model.CapabilityOptions["aliases"] {
+			if alias == name {
+				return model, true
+			}
+		}
+	}
+	if model, alias, ok := resolveModelAlias(models, name); ok && alias.base != name && isTextChatModel(model) {
+		model.ID = name
+		return model, true
+	}
+	return aistudio.Model{}, false
+}
+
 // withHiddenReasoning 在 -nothinking 时丢弃思维链文本，保留思考签名与用量，
 // 多轮工具调用所需的签名不会丢失
 func withHiddenReasoning(ctx context.Context, events <-chan aistudio.Event, hide bool) <-chan aistudio.Event {

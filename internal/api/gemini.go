@@ -241,11 +241,9 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	for _, model := range expandModelAliases(models) {
-		if model.ID == modelID {
-			writeJSON(w, http.StatusOK, geminiModelObject(model))
-			return
-		}
+	if model, ok := lookupPublicModel(models, modelID); ok {
+		writeJSON(w, http.StatusOK, geminiModelObject(model))
+		return
 	}
 	writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("model %q is unavailable", modelID))
 }
@@ -391,7 +389,6 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		MaxOutputTokens:  request.GenerationConfig.MaxOutputTokens,
 		StopSequences:    normalizeStopSequences(request.GenerationConfig.StopSequences),
 		ResponseMIMEType: request.GenerationConfig.ResponseMIMEType,
-		ResponseSchema:   request.GenerationConfig.ResponseSchema,
 		Seed:             request.GenerationConfig.Seed,
 	}
 	config.ResponseModalities, err = mapGeminiResponseModalities(request.GenerationConfig.ResponseModalities)
@@ -409,7 +406,11 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	if err != nil {
 		return aistudio.GenerateRequest{}, err
 	}
-	if len(request.GenerationConfig.ResponseJSONSchema) > 0 {
+	// responseSchema/responseJsonSchema 写成 null 时按未设置处理，只保留 JSON 模式
+	if geminiRawObjectPresent(request.GenerationConfig.ResponseSchema) {
+		config.ResponseSchema = request.GenerationConfig.ResponseSchema
+	}
+	if geminiRawObjectPresent(request.GenerationConfig.ResponseJSONSchema) {
 		config.ResponseSchema = request.GenerationConfig.ResponseJSONSchema
 	}
 	if request.GenerationConfig.ThinkingConfig != nil {

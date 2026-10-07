@@ -816,6 +816,13 @@ Schema 归一化规则：
 | 输入结构 | 编码结果 |
 | --- | --- |
 | `$schema`、`default`、`additionalProperties`、`exclusiveMinimum`、`propertyNames`、`prefixItems` | 从 wire schema 中省略 |
+| 顶层 schema 为空或 `null` | 按没有参数的 object 编码；`response_format` 等结构化输出的 `schema: null` 按未设置处理，只保留 JSON 模式 |
+| 值为显式 `null` 的字段（`const` 除外） | 按缺省处理 |
+| `items: true` / `items: false` | `true` 不限制元素；`false` 编码为 `maxItems=0`，元素类型按缺省补齐 |
+| `properties` 中的 `true` / `null` / `false` | `true` 与 `null` 按开放节点处理；`false` 删除该属性并同步移出 `required` |
+| `not` 为 `null`、`false`、`true`、`""`、空对象 | 删除；`true` 本应禁止所有值，按宽松处理 |
+| `not: {"type":"null"}` | `nullable=false` |
+| `not` 为字符串或数组 | 转为 `not: {"enum": [...]}` |
 | `type: [T, "null"]` | 根类型 `T` 与 `nullable=true` |
 | `anyOf` / `oneOf` 的 null 分支 | 移除 null 分支并设置 `nullable=true` |
 | 多个非 null `type` | 首项作为根类型，完整类型集合写入 `anyOf` |
@@ -1058,7 +1065,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 | 协议 | 端点 |
 | --- | --- |
-| OpenAI Chat | `GET /v1/models`、`POST /v1/chat/completions` |
+| OpenAI Chat | `GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
 | OpenAI 媒体 | `POST /v1/images/generations`、`POST /v1/audio/speech`、`POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content` |
 | Anthropic | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
@@ -1257,6 +1264,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 | --- | --- |
 | OpenAI | `GET /v1/models` 返回 OpenAI model list |
 | Anthropic | `GET /v1/models` 携带 `Anthropic-Version` 时返回 Anthropic model list |
+| 单模型查询 | `GET /v1/models/{model}` 按正式 ID、`models/` 前缀、目录别名或后缀别名查找，携带 `Anthropic-Version` 时返回 Anthropic model 对象；不存在时 OpenAI 返回 404 `model_not_found`，Anthropic 返回 404 `not_found_error`。`GET /v1beta/models/{model}` 规则相同，返回 Gemini 格式 |
 | Gemini | 模型名称使用 `models/<ID>` |
 | 多账户同模型 | generation methods 与能力选项取并集 |
 | 多账户 token limit | 输入和输出上限分别取正数最小值 |
