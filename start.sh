@@ -187,8 +187,10 @@ check_camoufox_deps() {
 
 check_api_key() {
     listen_is_public || return 0
-    [[ -n "$(env_value PROXY_API_KEY "")" ]] && return 0
-    warn "LISTEN_ADDR=$(listen_addr) 对外监听，但 PROXY_API_KEY 为空：任何人都能调用 API、消耗你的账号额度！"
+    local key
+    key="$(env_value PROXY_API_KEY "")"
+    [[ -n "$key" && "$key" != "sk-onechat-fun-fun" ]] && return 0
+    warn "LISTEN_ADDR=$(listen_addr) 对外监听，但 PROXY_API_KEY 未设置或为公开的默认密钥 sk-onechat-fun-fun：知道默认密钥的人都能调用 API、消耗你的账号额度！"
     warn "建议在 .env 中设置，例如：PROXY_API_KEY=$(head -c 24 /dev/urandom | base64 | tr -d '/+=\n')"
 }
 

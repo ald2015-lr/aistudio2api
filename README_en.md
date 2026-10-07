@@ -201,7 +201,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | Anthropic Messages | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 | Gemini | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 
-Read model names from `GET /v1/models` or `GET /v1beta/models`. When `PROXY_API_KEY` is empty, only pages on this machine can call the API from a browser; web clients and some desktop clients need `PROXY_API_KEY` set.
+Read model names from `GET /v1/models` or `GET /v1beta/models`. Every API call must send `PROXY_API_KEY` (default `sk-onechat-fun-fun`, editable in the Settings page). With the default key, only pages on this machine can call the API from a browser; web clients need a custom key.
 
 For Cherry Studio:
 
@@ -406,7 +406,7 @@ cp .env.example .env
 | --- | --- | --- |
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
-| `PROXY_API_KEY` | empty | Public API key |
+| `PROXY_API_KEY` | `sk-onechat-fun-fun` | Public API key; every API call must send it, and an empty value means the default. The default key is public in the source code, so set your own key before listening on a public address |
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |

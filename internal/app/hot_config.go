@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -22,7 +21,7 @@ type apiKeyHolder struct {
 
 func newAPIKeyHolder(key string) *apiKeyHolder {
 	holder := &apiKeyHolder{}
-	key = strings.TrimSpace(key)
+	key = config.EffectiveProxyAPIKey(key)
 	holder.value.Store(&key)
 	return holder
 }
@@ -38,7 +37,7 @@ func (holder *apiKeyHolder) get() string {
 }
 
 func (holder *apiKeyHolder) set(key string) {
-	key = strings.TrimSpace(key)
+	key = config.EffectiveProxyAPIKey(key)
 	holder.value.Store(&key)
 }
 
@@ -49,7 +48,7 @@ func (manager *runtimeManager) activeAPIKey() string {
 
 // applyAPIKey 立即切换公开 API 密钥，无需重启管理进程
 func (manager *runtimeManager) applyAPIKey(key string) {
-	key = strings.TrimSpace(key)
+	key = config.EffectiveProxyAPIKey(key)
 	if key == manager.apiKey.get() {
 		return
 	}

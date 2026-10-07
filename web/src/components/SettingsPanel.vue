@@ -95,6 +95,8 @@ function parseModelList(value: string): string[] {
   return models
 }
 const SAVE_DELAY_MS = 800
+// DEFAULT_API_KEY 与服务端 config.DefaultProxyAPIKey 一致：留空保存时服务端使用该默认密钥
+const DEFAULT_API_KEY = 'sk-onechat-fun-fun'
 const APPLY_DELAY_SECONDS = 5
 const AUTO_APPLY_KEY = 'aistudio2api_settings_auto_apply'
 const DURATION_PATTERN = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/
@@ -298,6 +300,8 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
   try {
     const saved = await api.saveConfig(payload(includeBlurFields))
     savedConfig.value = saved
+    // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
+    if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
     saveError.value = ''
     emit('saved', saved)
     if (saved.service_restart_required && props.running && autoApply.value && !applying.value) {
@@ -511,6 +515,7 @@ onBeforeUnmount(() => {
             <input
               v-model="form.proxy_api_key"
               :type="revealKey ? 'text' : 'password'"
+              :placeholder="DEFAULT_API_KEY"
               class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
               autocomplete="new-password"
               @change="commitBlurField"
@@ -524,6 +529,9 @@ onBeforeUnmount(() => {
             </button>
           </div>
           <span class="mt-1 block text-xs text-gray-500">{{ t('settings.apiKeyHot') }}</span>
+          <span class="mt-1 block text-xs text-gray-500">{{
+            tf('settings.apiKeyDefault', { key: DEFAULT_API_KEY })
+          }}</span>
         </label>
       </div>
 

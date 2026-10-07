@@ -361,6 +361,8 @@ const zhCN = {
   'settings.savedStopped': '已保存，下次启动生成服务时生效',
   'settings.saveAndApply': '保存并应用',
   'settings.apiKeyHot': '保存后立即生效，无需重启',
+  'settings.apiKeyDefault':
+    '调用 API 必须携带此密钥；留空保存即使用默认密钥 {key}。默认密钥随源码公开，对外监听时请改为自定义密钥',
   'settings.invalidRequired': '{field}不能为空',
   'settings.invalidNumber': '{field}必须是正整数',
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
@@ -764,6 +766,8 @@ const en: Record<TranslationKey, string> = {
   'settings.savedStopped': 'Saved; applies the next time the generation service starts',
   'settings.saveAndApply': 'Save and apply',
   'settings.apiKeyHot': 'Takes effect immediately after saving, no restart needed',
+  'settings.apiKeyDefault':
+    'Every API call must send this key; saving it empty uses the default key {key}. The default key is public in the source code, so set your own key before listening on a public address',
   'settings.invalidRequired': '{field} is required',
   'settings.invalidNumber': '{field} must be a positive integer',
   'settings.invalidDuration': '{field} must be a duration such as 30s, 2m or 1h30m',

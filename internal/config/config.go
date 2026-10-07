@@ -97,11 +97,24 @@ type Config struct {
 	AdminPassword  string         `json:"-"`
 }
 
+// DefaultProxyAPIKey 为没有设置 PROXY_API_KEY 时使用的公开 API 密钥。公开 API 始终要求密钥，
+// 留空不再表示免密钥访问
+const DefaultProxyAPIKey = "sk-onechat-fun-fun"
+
+// EffectiveProxyAPIKey 返回实际生效的公开 API 密钥：空值使用默认密钥
+func EffectiveProxyAPIKey(value string) string {
+	if key := strings.TrimSpace(value); key != "" {
+		return key
+	}
+	return DefaultProxyAPIKey
+}
+
 // Default 返回可直接启动的默认配置
 func Default() Config {
 	return Config{
 		AuthStates:             defaultAuthStates,
 		ListenAddr:             defaultListenAddr,
+		ProxyAPIKey:            DefaultProxyAPIKey,
 		InitTimeout:            defaultInitTimeout,
 		RequestTimeout:         defaultRequestTimeout,
 		WarmWorkerLimit:        defaultWarmWorkerLimit,
@@ -138,7 +151,7 @@ func Load(path string) (Config, error) {
 		cfg.ListenAddr = strings.TrimSpace(value)
 	}
 	if value, ok := values["PROXY_API_KEY"]; ok {
-		cfg.ProxyAPIKey = strings.TrimSpace(value)
+		cfg.ProxyAPIKey = EffectiveProxyAPIKey(value)
 	}
 	if value, ok := values["PROXY"]; ok {
 		cfg.Proxy = strings.TrimSpace(value)
@@ -432,7 +445,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	parsed := Config{
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
-		ProxyAPIKey:            strings.TrimSpace(value.ProxyAPIKey),
+		ProxyAPIKey:            EffectiveProxyAPIKey(value.ProxyAPIKey),
 		Proxy:                  strings.TrimSpace(value.Proxy),
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,

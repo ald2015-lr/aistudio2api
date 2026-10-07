@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 type accessLogContextKey struct{}
@@ -561,10 +562,11 @@ func loopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// browserOriginMiddleware 在未配置 API key 时拒绝外部网页与 null 来源的浏览器请求
+// browserOriginMiddleware 在没有配置自定义 API key 时拒绝外部网页与 null 来源的浏览器请求。
+// 默认密钥随源码公开，等同于没有密钥：任何网页都能在用户浏览器里带着它调用本机接口，因此仍按来源拦截
 func browserOriginMiddleware(requiredKey func() string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if requiredKey() != "" {
+		if key := requiredKey(); key != "" && key != config.DefaultProxyAPIKey {
 			next.ServeHTTP(w, r)
 			return
 		}

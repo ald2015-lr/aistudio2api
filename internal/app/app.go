@@ -141,6 +141,14 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")
 	}
+	if cfg.ProxyAPIKey == config.DefaultProxyAPIKey {
+		level := "INFO"
+		if !loopbackListenAddr(cfg.ListenAddr) {
+			level = "WARN"
+		}
+		manager.requests.log("service", level, "公开 API 正在使用默认密钥 "+config.DefaultProxyAPIKey+
+			" | 默认密钥随源码公开，对外监听时请在服务配置中改为自定义密钥")
+	}
 	server := &http.Server{
 		Handler:           rootHandler(apiHandler, cfg.AdminPassword),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -226,6 +234,19 @@ func securityHeaders(next http.Handler) http.Handler {
 		header.Set("Referrer-Policy", "no-referrer")
 		next.ServeHTTP(w, r)
 	})
+}
+
+// loopbackListenAddr 判断监听地址是否只绑定本机回环地址
+func loopbackListenAddr(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // browserAddress 将通配监听地址转换为本机可访问地址

@@ -272,7 +272,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | 不带后缀 | 思考强度设为最高；客户端显式传了 `reasoning_effort`、`thinking` 等思考参数时以客户端为准 |
 | `-128` | 最低思考：支持思考等级的模型用最低等级，只支持思考预算的模型用 128 token |
 | `-nothinking` | 模型照常思考，但不返回思维链（保留多轮工具调用需要的思考签名） |
-| `-online` | 开启 Google 搜索（模型支持时） |`PROXY_API_KEY` 为空时，浏览器中只有本机页面可以直接调用接口；网页版客户端和部分桌面客户端需要设置 `PROXY_API_KEY`。
+| `-online` | 开启 Google 搜索（模型支持时） |调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。
 
 以 Cherry Studio 为例：
 
@@ -477,7 +477,7 @@ cp .env.example .env
 | --- | --- | --- |
 | `AISTUDIO_AUTH_STATES` | `auth` | 账户文件、目录或多个逗号分隔路径 |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | 管理页面与 API 监听地址 |
-| `PROXY_API_KEY` | 空 | 公开 API key |
+| `PROXY_API_KEY` | `sk-onechat-fun-fun` | 公开 API key；调用 API 必须携带，留空即使用默认值。默认密钥随源码公开，对外监听时务必改为自定义密钥 |
 | `PROXY` | 空 | Chrome 导入、登录和账户默认使用的 HTTP、HTTPS 或 SOCKS5 代理 |
 | `INIT_TIMEOUT` | `2m` | 单账户 WAA 初始化超时 |
 | `REQUEST_TIMEOUT` | `5m` | 单次请求最大执行时间 |
