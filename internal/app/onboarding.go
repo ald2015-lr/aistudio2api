@@ -123,8 +123,10 @@ func (onboarder *accountOnboarder) load() {
 			if validateOnboardingPolicy(file.Policy) == nil {
 				onboarder.policy = file.Policy
 			}
+			// 记录按账户 ID（目录名）原样保存与查找；原先读取时转成小写，与原样的账户 ID 对不上，
+			// 大小写混合的目录每次重启都会被重新加入队列
 			for id, record := range file.Accounts {
-				onboarder.records[strings.ToLower(strings.TrimSpace(id))] = record
+				onboarder.records[strings.TrimSpace(id)] = record
 			}
 		} else {
 			onboarder.admin.requests.log("auth", "WARN", "新账户自动处理记录损坏，已重新建立基线 | 错误="+err.Error())

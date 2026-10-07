@@ -336,6 +336,9 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie | 账户="+summary.ID)
 	case accountDisableNotes.manual(summary.ID):
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户是手动停用的，保持停用 | 账户="+summary.ID)
+	case !accountDisableNotes.automatic(summary.ID):
+		// 没有停用原因记录（升级前停用、手工改 account.json 停用、记录丢失）：按手动停用处理，不自动启用
+		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户停用原因未记录，按手动停用处理，保持停用 | 账户="+summary.ID)
 	case admin.onboard.requeue(summary.ID):
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，停用账户已重新加入新账户自动处理，验证通过后启用 | 账户="+summary.ID)
 	}

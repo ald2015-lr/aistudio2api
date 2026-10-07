@@ -84,6 +84,14 @@ func (store *disableNotes) manual(accountID string) bool {
 	return exists && !note.Auto
 }
 
+// automatic 判断账户是否有记录且为自动停用（新账户自动处理验证未通过等）；没有记录时返回 false
+func (store *disableNotes) automatic(accountID string) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	note, exists := store.notes[accountID]
+	return exists && note.Auto
+}
+
 // message 返回停用账户在管理页显示的原因
 func (store *disableNotes) message(accountID string) string {
 	store.mu.Lock()
