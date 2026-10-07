@@ -51,6 +51,8 @@ const (
 	// downgradeMemoryPerKey、downgradeMemoryLimit 为对话记录的条数上限（同一开头的对话 / 全部）
 	downgradeMemoryPerKey = 16
 	downgradeMemoryLimit  = 20000
+	// downgradeMemoryMinMessages 为记录被降级对话所需的最少消息条数
+	downgradeMemoryMinMessages = 2
 )
 
 const (
@@ -192,7 +194,8 @@ func (service *trackedService) prepareDowngradeGate(ctx context.Context, request
 			gate.mode = gateModeFast
 		}
 	}
-	gate.inputChars, gate.hasMedia = guardInputSize(request.System, contents, request.Tools)
+	// 字数按实际发往上游的内容（含随机后缀）计算：上游输入 token 数包含后缀，分母不含后缀会让短提示词的比例被放大数倍
+	gate.inputChars, gate.hasMedia = guardInputSize(request.System, request.Contents, request.Tools)
 	if settings.memory <= 0 || len(contents) == 0 {
 		return gate, nil
 	}
@@ -297,9 +300,15 @@ func (gate *downgradeGate) record(decision aistudio.DowngradeDecision, final boo
 	gate.service.recordDowngradeDecision(gate.clientCtx, gate.requestID, gate.label(), gate.model, decision, final)
 }
 
-// remember 记住被判定为降级的对话：同一段对话在保留期内再次请求、且这些消息原样都在时发送前直接拒绝
+// remember 记住被判定为降级的对话：同一段对话在保留期内再次请求、且这些消息原样都在时发送前直接拒绝。
+// 只有一条消息的对话不记录：记录以"系统提示 + 第一条消息"识别，单条消息的记录会拒绝之后所有以同一句话开头的对话
+// （例如角色卡固定的开场白），一次误判就会波及其他用户
 func (gate *downgradeGate) remember() {
-	if gate.settings.memory <= 0 || gate.memoryKey == "" || len(gate.contents) == 0 {
+	if gate.settings.memory <= 0 || gate.memoryKey == "" || len(gate.contents) < downgradeMemoryMinMessages {
+		return
+	}
+	if gate.clientCtx != nil && gate.clientCtx.Err() != nil {
+		// 客户端已断开时的判定基于截断的数据，不作为记录依据
 		return
 	}
 	conversationMemory.remember(gate.memoryKey, len(gate.contents),
@@ -367,6 +376,9 @@ type downgradeMeter struct {
 	promptTokens int64
 	servedModel  string
 	finalOutput  int64
+	// nonTextOutput 为回复包含正文以外的输出（函数调用、代码、媒体）：最终用量里的输出 token 包含这些部分，
+	// 不能再除以只按正文计算的时间窗口
+	nonTextOutput bool
 }
 
 func (meter *downgradeMeter) observe(event aistudio.Event, now time.Time, collectText bool) {
@@ -381,6 +393,10 @@ func (meter *downgradeMeter) observe(event aistudio.Event, now time.Time, collec
 	}
 	if event.Kind == aistudio.EventUsage && event.Usage != nil {
 		meter.finalOutput = event.Usage.OutputTokens
+	}
+	switch event.Kind {
+	case aistudio.EventToolCall, aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult, aistudio.EventMedia:
+		meter.nonTextOutput = true
 	}
 	if event.Kind != aistudio.EventText || event.Text == "" {
 		return
@@ -418,12 +434,12 @@ func (meter *downgradeMeter) observe(event aistudio.Event, now time.Time, collec
 func (meter *downgradeMeter) finalWindow() (int64, time.Duration, bool) {
 	if !meter.exactBaseAt.IsZero() {
 		total := meter.exactTokens
-		if meter.finalOutput > total {
+		if meter.finalOutput > total && !meter.nonTextOutput {
 			total = meter.finalOutput
 		}
 		return total - meter.exactBase, meter.lastTextAt.Sub(meter.exactBaseAt), true
 	}
-	if !meter.charBaseAt.IsZero() && meter.finalOutput > 0 && meter.totalChars > 0 {
+	if !meter.charBaseAt.IsZero() && meter.finalOutput > 0 && meter.totalChars > 0 && !meter.nonTextOutput {
 		tokens := int64(float64(meter.finalOutput) * float64(meter.windowChars) / float64(meter.totalChars))
 		return tokens, meter.lastTextAt.Sub(meter.charBaseAt), true
 	}
@@ -685,7 +701,11 @@ func (run *downgradeRun) evaluate(now time.Time) {
 	case estimate.speed < settings.fuzzyLow:
 		run.concludeEstimate(estimate, fmt.Sprintf("，低于模糊区间下限 %.0f", settings.fuzzyLow), false, now)
 	case estimate.speed > settings.fuzzyHigh && !upper:
-		run.concludeEstimate(estimate, fmt.Sprintf("，高于模糊区间上限 %.0f", settings.fuzzyHigh), true, now)
+		// 估算比例受系统提示与回复语言差异影响很大（中文约 0.6 token/字，英文约 0.17），偏高的估算先用 CountTokens 确认
+		if run.startCount(estimate) {
+			return
+		}
+		run.concludeEstimate(estimate, fmt.Sprintf("，高于模糊区间上限 %.0f（没有调用 CountTokens）", settings.fuzzyHigh), true, now)
 	default:
 		if run.startCount(estimate) {
 			return
@@ -755,7 +775,7 @@ func (run *downgradeRun) countDone(result downgradeCountResult) {
 		decision.EstimatedSpeed, decision.Speed = estimate.speed, speed
 		decision.Tokens, decision.WindowMS = result.tokens, guardMS(estimate.window)
 		decision.CountTokensMS = guardMS(result.elapsed)
-		decision.Basis = run.estimateBasis(estimate) + fmt.Sprintf("，落在模糊区间 → CountTokens 精确 %d token（用时 %d ms）= %.0f tok/s %s 阈值 %.0f",
+		decision.Basis = run.estimateBasis(estimate) + fmt.Sprintf(" → CountTokens 精确 %d token（用时 %d ms）= %.0f tok/s %s 阈值 %.0f",
 			result.tokens, result.elapsed.Milliseconds(), speed, guardCompare(speed, settings.threshold), settings.threshold)
 		run.conclude(decision, speed >= settings.threshold, now)
 		return
@@ -775,7 +795,7 @@ func (run *downgradeRun) countDone(result downgradeCountResult) {
 	decision.EstimatedSpeed, decision.Speed = estimate.speed, estimate.speed
 	decision.Tokens, decision.WindowMS = int64(estimate.tokens+0.5), guardMS(estimate.window)
 	decision.CountTokensMS, decision.CountTokensError = guardMS(result.elapsed), reason
-	decision.Basis = run.estimateBasis(estimate) + fmt.Sprintf("，落在模糊区间 → CountTokens 失败（%s），按估算 %s 阈值 %.0f",
+	decision.Basis = run.estimateBasis(estimate) + fmt.Sprintf(" → CountTokens 失败（%s），按估算 %s 阈值 %.0f",
 		reason, guardCompare(estimate.speed, settings.threshold), settings.threshold)
 	run.conclude(decision, estimate.speed >= settings.threshold, now)
 }
@@ -866,6 +886,16 @@ func (run *downgradeRun) upstreamFailed(event aistudio.Event) {
 func (run *downgradeRun) finish() {
 	gate := run.gate
 	now := time.Now()
+	if run.ctx.Err() != nil {
+		// 客户端已断开（例如用户点了停止）：上游流是被取消的，数据是截断的，不判定也不记录对话
+		if run.state == runPending {
+			decision := run.newDecision("client_gone")
+			decision.Verdict = verdictUnjudged
+			decision.Basis = gate.channelTitle() + " · 客户端在判定前断开，回复被截断，不判定"
+			run.pass(decision, now)
+		}
+		return
+	}
 	switch run.state {
 	case runPending:
 		decision, downgraded, judged := run.finalDecision()

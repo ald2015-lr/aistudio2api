@@ -394,7 +394,7 @@ const zhCN = {
     '400 使用 Google 输入被内容策略拦截（PROHIBITED_CONTENT）的官方格式，客户端与中转通常不会重试；503 如实说明上游换用了其他模型、回复已丢弃，客户端与中转可以重试或切换渠道。修改后立即生效。',
   'settings.downgradeMemory': '记住被降级的对话（分钟）',
   'settings.downgradeMemoryHelp':
-    '同一段对话在这段时间内再次请求、且当时的消息原样都在时（重新生成、接着往下聊），发送前直接拒绝；用户改过其中任何一条就重新判定。只保存哈希，0 表示不记录。',
+    '同一段对话在这段时间内再次请求、且当时的消息原样都在时（重新生成、接着往下聊），发送前直接拒绝；用户改过其中任何一条就重新判定。只有一条消息的对话、以及客户端中途断开的请求不记录。只保存哈希，0 表示不记录。',
   'settings.downgradeMaxHold': '最长延后（毫秒）',
   'settings.downgradeMaxHoldHelp':
     '默认 0 表示不限：判定前扣住整个思考过程，被降级时一定返回 HTTP 400，但首字要晚整个思考时长。设为正数（例如 3000）时，内容最多被延后这么久：到时限还没判定就先返回 200 并发出已缓存的思考，正文继续缓存，之后判定为降级只能在流中发送错误事件；正文缓存到时限仍未判定则放行，结束时照常复核并统计漏判。',
@@ -804,7 +804,7 @@ const en: Record<TranslationKey, string> = {
     '400 uses the official format of a Google content-policy block (PROHIBITED_CONTENT), which clients and relays usually do not retry; 503 states that upstream served a different model and the reply was discarded, so clients and relays can retry or switch channels. Takes effect immediately.',
   'settings.downgradeMemory': 'Remember downgraded conversations (minutes)',
   'settings.downgradeMemoryHelp':
-    'Within this time, a request for the same conversation that still contains the earlier messages unchanged (regenerate, continue) is rejected before sending; editing any of those messages makes it judged again. Only hashes are stored; 0 disables this.',
+    'Within this time, a request for the same conversation that still contains the earlier messages unchanged (regenerate, continue) is rejected before sending; editing any of those messages makes it judged again. Single-message conversations and requests the client abandoned are not remembered. Only hashes are stored; 0 disables this.',
   'settings.downgradeMaxHold': 'Maximum delay (ms)',
   'settings.downgradeMaxHoldHelp':
     'The default 0 means no limit: all thinking is held until the verdict, so downgrades always get an HTTP 400, but the first token arrives only after the whole thinking phase. With a positive value (for example 3000), content is held at most this long: if there is no verdict in time, the 200 response starts and the held thinking is sent while the reply text stays held, and a later downgrade verdict can only be reported as an error event in the stream. Reply text held this long without a verdict is released, then rechecked at the end and counted as a miss if it was downgraded.',
