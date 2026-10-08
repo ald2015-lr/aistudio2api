@@ -103,14 +103,14 @@ type AccountsNotReadyError struct {
 	Reasons []string
 	// Cause 为触发该错误的内部原因（如账户 runtime 被其他进程占用），可为空
 	Cause error
-	// Pool 为请求限定的号池；限定号池时错误原因里写明号池（如 Ultra 号池没有可用账户）
+	// Pool 为请求限定的号池；Ultra 号池的错误原因前写明 Ultra 号池（普通号池的措辞与不分号池时相同）
 	Pool PoolScope
 }
 
 func (e *AccountsNotReadyError) Error() string {
 	message := ErrNoEligibleAccount.Error() + "："
-	if label := e.Pool.Label(); label != "" {
-		message += label + "："
+	if e.Pool == PoolScopeUltra {
+		message += e.Pool.Label() + "："
 	}
 	message += strings.Join(e.Reasons, "；")
 	if e.Cause != nil {
@@ -151,6 +151,8 @@ const (
 	emptyPoolReason = "账户池中没有账户"
 	// emptyUltraPoolReason 为 Ultra 号池中没有任何账户时的原因
 	emptyUltraPoolReason = "没有权益为 Ultra 的账户"
+	// emptyNormalPoolReason 为账户都是 Ultra 账户、独占模式下普通路径没有可用账户时的原因
+	emptyNormalPoolReason = "账户都是 Ultra 账户，ULTRA_EXCLUSIVE=true 时只服务 /ultra 前缀的请求"
 )
 
 // accountStateLabels 为不可调度账户状态的中文说明
@@ -1338,16 +1340,20 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 		return &AccountsNotReadyError{Reasons: reasons, Pool: selection.Pool}
 	}
 	if !p.hasAccountLocked(selection.Pool) {
-		return emptyPoolError(selection.Pool)
+		return p.emptyPoolErrorLocked(selection.Pool)
 	}
 	return ErrNoEligibleAccount
 }
 
-// emptyPoolError 返回号池中没有任何账户时的号池暂时不可调度错误；Ultra 号池为空说明没有权益为 Ultra 的账户
-func emptyPoolError(scope PoolScope) *AccountsNotReadyError {
+// emptyPoolErrorLocked 返回号池中没有任何账户时的号池暂时不可调度错误：Ultra 号池为空说明没有权益为 Ultra 的账户；
+// 普通号池为空而账户池不为空，说明账户都是 Ultra 账户、独占模式下普通路径不能使用。调用方持有 p.mu
+func (p *AccountPool) emptyPoolErrorLocked(scope PoolScope) *AccountsNotReadyError {
 	reason := emptyPoolReason
-	if scope == PoolScopeUltra {
+	switch {
+	case scope == PoolScopeUltra:
 		reason = emptyUltraPoolReason
+	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll):
+		reason = emptyNormalPoolReason
 	}
 	return &AccountsNotReadyError{Reasons: []string{reason}, Pool: scope}
 }
@@ -1373,7 +1379,7 @@ func (p *AccountPool) hasAccountLocked(scope PoolScope) bool {
 // 这时无法判断模型是否存在，属于号池一侧的暂时性原因，不能按模型不存在返回
 func (p *AccountPool) catalogMissingErrorLocked(scope PoolScope) error {
 	if !p.hasAccountLocked(scope) {
-		return emptyPoolError(scope)
+		return p.emptyPoolErrorLocked(scope)
 	}
 	reasons := []string{"账户模型目录尚未加载"}
 	var notReady *AccountsNotReadyError

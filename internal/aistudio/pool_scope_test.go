@@ -367,3 +367,28 @@ func TestPoolScopeTierChangeMovesAccount(t *testing.T) {
 		t.Fatal("UltraAccountIDs 应包含升级后的账户")
 	}
 }
+
+// TestNormalPoolErrors 没有 Ultra 账户时普通号池的错误与不分号池时完全相同；账户都是 Ultra 账户时说明独占模式不能使用
+func TestNormalPoolErrors(t *testing.T) {
+	selection := AccountSelection{ModelID: scopeSharedModel, Method: "generateContent"}
+	pool := scopeTestPool(t, map[string]BenefitTier{scopeNormalA: BenefitTierFree})
+	if err := pool.MarkAuthRequired(scopeNormalA, "Cookie 失效"); err != nil {
+		t.Fatal(err)
+	}
+	_, scoped := pool.AcquireFor(scopeContext(PoolScopeNormal), selection)
+	_, unscoped := pool.AcquireFor(context.Background(), selection)
+	if scoped == nil || unscoped == nil || scoped.Error() != unscoped.Error() {
+		t.Fatalf("普通号池的错误 %v 应与不分号池时 %v 相同", scoped, unscoped)
+	}
+	empty := NewAccountPool(nil, 1)
+	if got, want := empty.NoEligibleError(AccountSelection{Pool: PoolScopeNormal}).Error(), empty.NoEligibleError(AccountSelection{}).Error(); got != want {
+		t.Fatalf("空号池的错误 %q 应与不分号池时 %q 相同", got, want)
+	}
+
+	onlyUltra := scopeTestPool(t, map[string]BenefitTier{scopeUltraA: BenefitTierUltra})
+	_, err := onlyUltra.AcquireFor(scopeContext(PoolScopeNormal), selection)
+	var notReady *AccountsNotReadyError
+	if !errors.As(err, &notReady) || !strings.Contains(err.Error(), emptyNormalPoolReason) || strings.Contains(err.Error(), "Ultra 号池：") {
+		t.Fatalf("账户都是 Ultra 账户时普通路径：err = %v，期望说明独占模式的 503", err)
+	}
+}

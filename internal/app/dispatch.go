@@ -25,14 +25,14 @@ func newDispatchQueue() *dispatchQueue {
 	return &dispatchQueue{queues: make(map[string][]*dispatchWaiter)}
 }
 
-// dispatchKey 返回可互相替代的请求共用的队列键
+// dispatchKey 返回可互相替代的请求共用的队列键；号池不同的请求分开排队，Ultra 请求不会排在普通请求之后，反之亦然
 func dispatchKey(selection aistudio.AccountSelection) string {
 	allowed := slices.Clone(selection.AllowedAccountIDs)
 	slices.Sort(allowed)
 	return strings.Join([]string{
 		selection.ModelID, selection.Method, selection.Capability, selection.AccountID, selection.ResourceID,
 		strings.Join(allowed, ","), strconv.FormatBool(selection.PlaygroundOnly),
-		strconv.FormatBool(selection.BuildOnly), strconv.FormatBool(selection.PlaygroundFirst),
+		strconv.FormatBool(selection.BuildOnly), strconv.FormatBool(selection.PlaygroundFirst), selection.Pool.String(),
 	}, "\x00")
 }
 

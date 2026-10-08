@@ -308,6 +308,42 @@ func TestUltraRequestWaitsForUltraCapacity(t *testing.T) {
 	}
 }
 
+// TestDispatchKeySeparatesPools 号池不同的请求分开排队：Ultra 请求等待 Ultra 分区时不会挡住普通请求的队首
+func TestDispatchKeySeparatesPools(t *testing.T) {
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"}
+	keys := map[string]aistudio.PoolScope{}
+	for _, pool := range []aistudio.PoolScope{aistudio.PoolScopeAll, aistudio.PoolScopeNormal, aistudio.PoolScopeUltra} {
+		selection.Pool = pool
+		key := dispatchKey(selection)
+		if other, exists := keys[key]; exists {
+			t.Fatalf("号池 %q 与 %q 共用队列键", pool.String(), other.String())
+		}
+		keys[key] = pool
+	}
+	queue := newDispatchQueue()
+	selection.Pool = aistudio.PoolScopeUltra
+	ultra := queue.join(dispatchKey(selection))
+	<-ultra.wake
+	selection.Pool = aistudio.PoolScopeNormal
+	normal := queue.join(dispatchKey(selection))
+	<-normal.wake
+	select {
+	case <-ultra.wake:
+		t.Fatal("普通请求排队不应唤醒 Ultra 队列")
+	default:
+	}
+	queue.wakeHeads()
+	for name, waiter := range map[string]*dispatchWaiter{"Ultra": ultra, "普通": normal} {
+		select {
+		case <-waiter.wake:
+		default:
+			t.Fatalf("%s 请求是自己队列的队首，应被唤醒", name)
+		}
+	}
+	queue.leave(ultra)
+	queue.leave(normal)
+}
+
 // TestStatusShowsWorkerPartitions 管理页状态分别显示普通分区与 Ultra 分区的 Worker 计数，以及 Ultra 账户计数
 func TestStatusShowsWorkerPartitions(t *testing.T) {
 	manager, pool, requests := partitionTestManager(t, []string{partitionNormalA, partitionNormalB}, []string{partitionUltraA}, 2, 4, 1, 3)
