@@ -1246,7 +1246,8 @@ func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID
 			continue
 		}
 		account.startupMu.Unlock()
-		// 锁被占用说明正在处理请求，不可能是空闲 Worker，直接跳过而不是排队等待
+		// 锁被占用说明该账户的 Worker 正在关闭、发布或核对（WAA proof 在锁外生成，请求占用由下方的租约活动判断），
+		// 直接跳过而不是排队等待
 		if !account.mu.TryLock() {
 			continue
 		}
