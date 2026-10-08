@@ -135,6 +135,14 @@ func TestEncodeJSONSchemaBooleanSubschemas(t *testing.T) {
 	if got != `[5,null,null,null,null,[1],null,null,null,null,null,null,null,null,null,null,null,null,null,null,0]` {
 		t.Fatalf("items:false 编码为 %s", got)
 	}
+	// 封闭元组：items:false 只禁止 prefixItems 之外的元素
+	got = mustEncodeSchema(t, `{"type":"array","prefixItems":[{"type":"string"},{"type":"integer"}],"items":false}`)
+	if !strings.HasSuffix(got, `,2]`) || !strings.Contains(got, `[1]`) || !strings.Contains(got, `[3]`) {
+		t.Fatalf("封闭元组编码为 %s", got)
+	}
+	if _, err := encodeJSONSchema(json.RawMessage(`{"type":"array","items":false,"minItems":1}`)); err == nil {
+		t.Fatal("items:false 且 minItems>0 应返回错误")
+	}
 	// properties 中 true/null 按开放节点处理，false 删除并同步 required
 	got = mustEncodeSchema(t, `{"type":"object","properties":{"allow":true,"empty":null,"deny":false,"name":{"type":"string"}},"required":["deny","name"]}`)
 	want := `[6,null,null,null,null,null,[["allow",[1]],["empty",[1]],["name",[1]]],["name"]]`

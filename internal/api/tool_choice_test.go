@@ -74,6 +74,11 @@ func TestResponsesNamespaceAndOptions(t *testing.T) {
 	if search := generate.Tools.GoogleSearch; search == nil || search.ContextSize != "high" || search.AllowedDomains[0] != "go.dev" {
 		t.Fatalf("搜索偏好=%+v", generate.Tools.GoogleSearch)
 	}
+	var unnamed responsesRequest
+	decodeInto(t, `{"model":"m","input":"hi","tools":[{"type":"namespace","name":"docs","tools":[{"type":"function","name":""}]}]}`, &unnamed)
+	if _, _, err := unnamed.toGenerateRequest("id"); err == nil {
+		t.Fatal("命名空间内缺少函数名应返回错误")
+	}
 	item := responseFunctionCall(aistudio.FunctionCall{ID: "c2", Name: "docs.search", Arguments: json.RawMessage(`{}`)}, request.Tools)
 	if item["namespace"] != "docs" || item["name"] != "search" {
 		t.Fatalf("输出项=%v", item)
@@ -111,11 +116,17 @@ func TestAnthropicToolCompatibility(t *testing.T) {
 	if config.Mode != "required" || config.AllowedFunctionNames[0] != "get_weather" || config.ParallelCalls == nil || *config.ParallelCalls {
 		t.Fatalf("tool config=%+v", config)
 	}
-	if !generate.Tools.Functions[0].Strict || !generate.Config.HideThinking || generate.Config.ReasoningEffort != "none" {
+	if !generate.Tools.Functions[0].Strict || !generate.Config.HideThinking || generate.Config.ReasoningEffort != "minimal" {
 		t.Fatalf("functions=%+v config=%+v", generate.Tools.Functions, generate.Config)
 	}
 	if search := generate.Tools.GoogleSearch; search == nil || search.AllowedDomains[0] != "go.dev" || !strings.Contains(string(search.UserLocation), "Paris") {
 		t.Fatalf("搜索偏好=%+v", generate.Tools.GoogleSearch)
+	}
+	// output_config 不带 effort 时不能把关闭思考覆盖回默认强度
+	var withOutput anthropicRequest
+	decodeInto(t, `{"model":"m","max_tokens":16,"thinking":{"type":"disabled"},"output_config":{},"messages":[{"role":"user","content":"hi"}]}`, &withOutput)
+	if generate, err := withOutput.toGenerateRequest("id"); err != nil || generate.Config.ReasoningEffort != "minimal" || !generate.Config.HideThinking {
+		t.Fatalf("output_config 覆盖了关闭思考: %+v %v", generate.Config, err)
 	}
 	if choice, err := anthropicToolChoice(json.RawMessage(`{"type":"any"}`)); err != nil || choice.Mode != "required" {
 		t.Fatalf("any: %+v %v", choice, err)

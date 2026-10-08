@@ -3318,13 +3318,19 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)
-	// 既没有系统提示也没有对话内容（例如消息全被过滤掉）：选号前直接按参数错误返回 400，不占用账号
+	// 选号前就能判断的参数错误直接返回 400，不占用账号：既没有系统提示也没有对话内容（例如消息全被过滤掉），
+	// 或者工具选择本身不成立（指定了未声明的函数、要求调用却没有工具）
+	var invalid error
 	if len(request.Contents) == 0 {
-		err := fmt.Errorf("%w: 请求没有系统提示或对话内容", aistudio.ErrInvalidArgument)
-		api.SetAccessLogError(ctx, err)
+		invalid = fmt.Errorf("%w: 请求没有系统提示或对话内容", aistudio.ErrInvalidArgument)
+	} else if err := aistudio.ValidateToolChoice(request.Tools); err != nil {
+		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
+	}
+	if invalid != nil {
+		api.SetAccessLogError(ctx, invalid)
 		service.requests.start(request, func() {})
-		service.requests.finish(request.ID, "failed", err)
-		return nil, nil, err
+		service.requests.finish(request.ID, "failed", invalid)
+		return nil, nil, invalid
 	}
 	// 降级判定：被拦截的模型准备判定；同一段对话近期被判定为降级、且当时的消息原样都在时，发送前直接拒绝（不换号重试）
 	gate, remembered := service.prepareDowngradeGate(ctx, request, guardContents)

@@ -32,6 +32,36 @@ type toolContract struct {
 	serverSide bool
 }
 
+// ValidateToolChoice 检查工具选择本身是否成立（函数重名、指定了未声明的函数、要求调用却没有工具）。
+// 不需要账号，可以在选号前调用：原先只在拿到账号之后检查，账号全部冷却或未就绪时，
+// 参数错误会被报成 429/503 而不是 400
+func ValidateToolChoice(tools Tools) error {
+	config := tools.ToolConfig
+	if config.Mode == "none" {
+		return nil
+	}
+	names := make(map[string]bool, len(tools.Functions))
+	for _, declaration := range tools.Functions {
+		if len(config.AllowedFunctionNames) > 0 && !slices.Contains(config.AllowedFunctionNames, declaration.Name) {
+			continue
+		}
+		if names[declaration.Name] {
+			return fmt.Errorf("function %q 重复", declaration.Name)
+		}
+		names[declaration.Name] = true
+	}
+	for _, name := range config.AllowedFunctionNames {
+		if !names[name] {
+			return fmt.Errorf("tool choice 引用了未声明函数 %q", name)
+		}
+	}
+	serverSide := len(config.AllowedFunctionNames) == 0 && (len(tools.Google) > 0 || tools.GoogleSearch != nil)
+	if config.Mode == "required" && len(names) == 0 && !serverSide {
+		return fmt.Errorf("required tool choice 需要至少一个工具")
+	}
+	return nil
+}
+
 // prepareToolRequest 把工具选择与约束转换为共同生成请求，返回需要在事件流上核对的契约（不需要时为 nil）。
 //
 // Build 通道按 functionCallingConfig 原生执行必须调用与指定函数；Playground 没有对应字段，
@@ -40,6 +70,9 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 	config := request.Tools.ToolConfig
 	if config.Mode == "none" {
 		return request, nil, nil
+	}
+	if err := ValidateToolChoice(request.Tools); err != nil {
+		return request, nil, err
 	}
 	var hints []string
 	if search := request.Tools.GoogleSearch; search != nil {
@@ -63,9 +96,6 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 		if len(config.AllowedFunctionNames) > 0 && !slices.Contains(config.AllowedFunctionNames, declaration.Name) {
 			continue
 		}
-		if contract.names[declaration.Name] {
-			return request, nil, fmt.Errorf("function %q 重复", declaration.Name)
-		}
 		if config.Mode == "validated" {
 			declaration.Strict = true
 		}
@@ -82,15 +112,7 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 		}
 		contract.schemas[declaration.Name] = schema
 	}
-	for _, name := range config.AllowedFunctionNames {
-		if !contract.names[name] {
-			return request, nil, fmt.Errorf("tool choice 引用了未声明函数 %q", name)
-		}
-	}
 	contract.serverSide = len(config.AllowedFunctionNames) == 0 && (len(request.Tools.Google) > 0 || request.Tools.GoogleSearch != nil)
-	if contract.required && len(functions) == 0 && !contract.serverSide {
-		return request, nil, fmt.Errorf("required tool choice 需要至少一个工具")
-	}
 	if len(config.AllowedFunctionNames) > 0 || config.Mode == "validated" {
 		// 指定函数时只发送被选中的函数，上游只能调用它们
 		request.Tools.Functions = functions

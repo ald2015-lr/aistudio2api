@@ -1401,7 +1401,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Gemini `googleSearchRetrieval` | 仅接受空对象；`dynamicRetrievalConfig` 返回 `400 INVALID_ARGUMENT` |
 | Anthropic `thinking` | `enabled` 携带 `budget_tokens`，支持 thinking budget 的模型直接写入预算，只支持 thinking level 的模型按 0、1024、8192 以内与更大预算分别使用 minimal、low、medium、high；`adaptive` 使用模型默认思考 |
 | Anthropic thinking capability | 模型既不支持 thinking budget 也不支持 thinking level 时形成 `invalid_request_error`；非流式返回 HTTP 400，流式返回 Anthropic error event |
-| Anthropic thinking type | `disabled` 按最低思考强度生成，不返回思考正文（保留思考签名）；未知 type 返回 `400 invalid_request_error` |
+| Anthropic thinking type | `disabled` 按最低思考强度（minimal）生成，不返回思考正文（保留思考签名），优先于 `output_config.effort`；未知 type 返回 `400 invalid_request_error` |
 
 ### OpenAI Chat Completions
 

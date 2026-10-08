@@ -235,13 +235,15 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	if request.Thinking != nil && request.Thinking.Type == "enabled" {
 		config.ThinkingBudget = request.Thinking.BudgetTokens
 	}
-	// 关闭思考：AI Studio 的思考模型不能完全关闭，按最低强度生成，不返回思考正文（保留签名）
-	if request.Thinking != nil && request.Thinking.Type == "disabled" {
-		config.ReasoningEffort = "none"
-		config.HideThinking = true
-	}
-	if request.OutputConfig != nil {
+	if request.OutputConfig != nil && strings.TrimSpace(request.OutputConfig.Effort) != "" {
 		config.ReasoningEffort = request.OutputConfig.Effort
+	}
+	// 关闭思考：AI Studio 的思考模型不能完全关闭（只支持思考预算的模型预算为 0 会被拒绝），
+	// 按最低强度生成，不返回思考正文（保留签名）；优先于 output_config.effort
+	if request.Thinking != nil && request.Thinking.Type == "disabled" {
+		config.ReasoningEffort = "minimal"
+		config.ThinkingBudget = nil
+		config.HideThinking = true
 	}
 	return aistudio.GenerateRequest{
 		ID: id, Model: request.Model, System: system, Contents: contents, Config: config, Tools: tools,

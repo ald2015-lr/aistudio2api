@@ -61,7 +61,9 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if err := normalizeNot(schema); err != nil {
 		return nil, err
 	}
-	normalizeBooleanItems(schema)
+	if err := normalizeBooleanItems(schema); err != nil {
+		return nil, err
+	}
 	if err := normalizeConstAndMetadata(schema); err != nil {
 		return nil, err
 	}
@@ -637,20 +639,33 @@ func setNotEnum(schema map[string]json.RawMessage, values []any) error {
 }
 
 // normalizeBooleanItems 处理布尔形式的 items：true 不限制元素，按空 schema 处理；
-// false 不允许任何元素，删除 items 并设 maxItems=0，元素定义交给 normalizeImplicitType 补齐
-// （AI Studio 要求数组带 items）
-func normalizeBooleanItems(schema map[string]json.RawMessage) {
+// false 不允许 prefixItems 之外的元素：删除 items 并把 maxItems 设为 prefixItems 的长度（没有时为 0），
+// 元素定义交给 normalizeImplicitType 补齐（AI Studio 要求数组带 items）。
+// 没有 prefixItems 却要求 minItems>0 的 schema 无法满足，返回错误（工具参数会改用降级编码）
+func normalizeBooleanItems(schema map[string]json.RawMessage) error {
 	value, ok := schema["items"]
 	if !ok {
-		return
+		return nil
 	}
 	switch {
 	case isJSONLiteral(value, "true"):
 		schema["items"] = json.RawMessage(`{}`)
 	case isJSONLiteral(value, "false"):
+		var prefix []json.RawMessage
+		if raw, ok := schema["prefixItems"]; ok {
+			if err := json.Unmarshal(raw, &prefix); err != nil {
+				return fmt.Errorf("schema.prefixItems 必须是 JSON 数组")
+			}
+		}
+		if raw, ok := schema["minItems"]; ok && len(prefix) == 0 {
+			if minimum, err := schemaInteger(raw, "minItems"); err == nil && minimum > 0 {
+				return fmt.Errorf("schema.items 为 false 时 minItems 不能大于 0")
+			}
+		}
 		delete(schema, "items")
-		schema["maxItems"] = json.RawMessage("0")
+		schema["maxItems"] = json.RawMessage(strconv.Itoa(len(prefix)))
 	}
+	return nil
 }
 
 // normalizeBooleanProperties 处理布尔或 null 形式的属性 schema，返回被删除的属性名：

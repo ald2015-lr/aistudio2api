@@ -126,3 +126,25 @@ func TestTryReserveVictim(t *testing.T) {
 		t.Fatal("释放后应可再次标记")
 	}
 }
+
+// TestStartGenerateRejectsInvalidToolChoice 工具选择不成立时在选号前返回参数错误，不会因账号冷却报成 429/503
+func TestStartGenerateRejectsInvalidToolChoice(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	service := &trackedService{
+		lifecycle: ctx, pool: aistudio.NewAccountPool(nil, 1), requests: requests,
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+	}
+	request := aistudio.GenerateRequest{
+		ID: "req-tool", Model: "gemini-test",
+		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
+		Tools: aistudio.Tools{
+			Functions:  []aistudio.FunctionDeclaration{{Name: "get_weather"}},
+			ToolConfig: aistudio.ToolConfig{Mode: "required", AllowedFunctionNames: []string{"missing"}},
+		},
+	}
+	if _, _, err := service.startGenerate(ctx, request); !errors.Is(err, aistudio.ErrInvalidArgument) {
+		t.Fatalf("err = %v，期望参数错误", err)
+	}
+}

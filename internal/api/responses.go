@@ -416,6 +416,9 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 				if inner.Type != "function" {
 					return aistudio.Tools{}, fmt.Errorf("namespace %q tool type %q is not supported", tool.Name, inner.Type)
 				}
+				if inner.Name == "" {
+					return aistudio.Tools{}, fmt.Errorf("function tool name is required")
+				}
 				inner.Name = tool.Name + "." + inner.Name
 				if err := addFunction(inner); err != nil {
 					return aistudio.Tools{}, err
