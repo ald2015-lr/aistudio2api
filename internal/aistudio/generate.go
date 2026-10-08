@@ -851,14 +851,20 @@ func (c *Client) truncateRequest(ctx context.Context, request GenerateRequest, l
 		}
 		estimate := EstimatedInputTokens(request)
 		excess := max(estimate*(count.InputTokens-limit)/count.InputTokens, 1)
+		// 本地估算会低估媒体等内容：删到只剩最新一轮时交给下一次权威计数判断，本轮没删掉任何内容才报错
 		var removed int64
+		dropped := false
 		for removed < excess {
 			start := nextConversationTurn(request.Contents)
 			if start < 0 {
-				return request, fmt.Errorf("%w: 最新一轮对话已超过模型上下文窗口 %d", ErrInvalidArgument, limit)
+				if !dropped {
+					return request, fmt.Errorf("%w: 最新一轮对话已超过模型上下文窗口 %d", ErrInvalidArgument, limit)
+				}
+				break
 			}
 			removed += localContentsTokens(request.Contents[:start])
 			request.Contents = request.Contents[start:]
+			dropped = true
 		}
 	}
 	return request, nil

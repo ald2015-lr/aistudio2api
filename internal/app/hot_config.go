@@ -69,6 +69,8 @@ func (manager *runtimeManager) RestartService(ctx context.Context) (api.AdminSta
 	if status.State == "STOPPED" {
 		return status, nil
 	}
+	// 等待期间用户按了停止或进程开始退出时不再重启：原先等完之后照常停止再启动，把用户的停止覆盖掉
+	stops := manager.intent.stops.Load()
 	if active := manager.requests.count(); active > 0 {
 		manager.requests.log("service", "INFO", "应用新配置 | 等待进行中的请求结束")
 	}
@@ -82,13 +84,20 @@ func (manager *runtimeManager) RestartService(ctx context.Context) (api.AdminSta
 		case <-timer.C:
 		}
 	}
+	manager.mu.RLock()
+	abort := manager.shuttingDown || manager.intent.stops.Load() != stops || !manager.intent.running.Load()
+	manager.mu.RUnlock()
+	if abort {
+		return manager.Status(ctx)
+	}
 	// 进入重启后不再受页面请求取消影响，避免停在已停止状态
 	detached := context.WithoutCancel(ctx)
 	manager.requests.log("service", "INFO", "应用新配置 | 重启生成服务")
-	if _, err := manager.StopService(detached); err != nil {
+	// 重启内部的停止不改变用户期望的运行状态；随后的启动不会覆盖期间用户按下的停止
+	if _, err := manager.stopCurrent(detached); err != nil {
 		return api.AdminStatus{}, err
 	}
-	return manager.StartService(detached)
+	return manager.startService(detached, false)
 }
 
 // ---------- 配置热更新 ----------

@@ -224,6 +224,18 @@ func (manager *runtimeManager) StopService(ctx context.Context) (api.AdminStatus
 	return current.admin.StopService(ctx)
 }
 
+// stopCurrent 停止当前生成服务但不改变用户期望的运行状态（应用配置时的重启）
+func (manager *runtimeManager) stopCurrent(ctx context.Context) (api.AdminStatus, error) {
+	manager.mu.RLock()
+	cancel := manager.startCancel
+	current := manager.current
+	manager.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	return current.admin.StopService(ctx)
+}
+
 // Close 释放当前生成服务；在锁外关闭，关闭期间仍在收尾的请求可以照常记录访问日志
 func (manager *runtimeManager) Close() error {
 	return manager.generation().Close()

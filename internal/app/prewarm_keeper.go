@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
@@ -259,7 +260,7 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 
 // retryPendingCleanup 重试清理失败的账户：关闭失败的浏览器或释放失败的运行时租约会让账户停在“待清理”状态，
 // 之后每次 ensureWorker 都失败，替换与回收也跳过它，原先要等停止再启动服务才会恢复。
-// 按账户退避重试（30 秒起翻倍，最长 10 分钟）；账户正被使用时跳过，下一轮再试
+// 按账户退避重试（30 秒起翻倍，最长 10 分钟）；账户正在启动或持有锁时跳过，下一轮再试
 func (manager *accountWorkerManager) retryPendingCleanup() {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
@@ -276,10 +277,16 @@ func (manager *accountWorkerManager) retryPendingCleanup() {
 			account.startupMu.Unlock()
 			continue
 		}
-		// 只重试明确记录下来的清理失败；正在正常关闭（WorkerClosing）的 Worker 不在这里重复关闭
-		failedCleanup := account.cleanupWorker != nil || account.cleanupLease != nil || account.worker == nil && account.runtimeLease != nil
-		if failedCleanup && !now.Before(account.cleanupRetryAt) {
-			if err := manager.closeAccountWorker(account); err != nil {
+		// 主 Worker 只在持有 account.mu 时关闭，这里看到 WorkerClosing 只能是之前的 Close 失败（浏览器关不掉），需要重关；
+		// 否则只清理残留的替换 Worker 与租约，健康的主 Worker 可能正被请求使用，不能一并关闭
+		stuckMain := account.worker != nil && account.worker.State().Phase == aistudio.WorkerClosing
+		leftovers := account.cleanupWorker != nil || account.cleanupLease != nil || account.worker == nil && account.runtimeLease != nil
+		if (stuckMain || leftovers) && !now.Before(account.cleanupRetryAt) {
+			retry := manager.closeCleanupLeftovers
+			if stuckMain {
+				retry = manager.closeAccountWorker
+			}
+			if err := retry(account); err != nil {
 				account.cleanupBackoff = min(max(account.cleanupBackoff*2, cleanupRetryFirst), cleanupRetryMax)
 				account.cleanupRetryAt = now.Add(account.cleanupBackoff)
 				manager.requests.log(account.label, "WARN", fmt.Sprintf(

@@ -1154,15 +1154,8 @@ func (manager *accountWorkerManager) idleWarmVictim(excludeID string) string {
 	return manager.idleWarmVictimFor(excludeID, "", false)
 }
 
-// reserveVictim 标记已被某次替换选中的旧 Worker，避免并行替换选中同一个
-func (manager *accountWorkerManager) reserveVictim(accountID string) {
-	manager.victimMu.Lock()
-	manager.victims[accountID] = struct{}{}
-	manager.victimMu.Unlock()
-}
-
 // tryReserveVictim 在旧 Worker 尚未被其他替换选中时标记它，返回是否标记成功。
-// 冷却轮换不经过 rebalanceMu，用它与 ensureWorker 的替换互斥，避免同一个 Worker 被两边同时淘汰
+// ensureWorker 的替换与不经过 rebalanceMu 的冷却轮换都用它原子检查并标记，避免同一个 Worker 被两边同时淘汰
 func (manager *accountWorkerManager) tryReserveVictim(accountID string) bool {
 	manager.victimMu.Lock()
 	defer manager.victimMu.Unlock()
@@ -1354,6 +1347,10 @@ func (manager *accountWorkerManager) ensureWorker(
 		} else {
 			victim = manager.idleWarmVictimFor(accountID, modelID, true)
 		}
+		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
+		if victim != "" && !manager.tryReserveVictim(victim) {
+			victim = ""
+		}
 		if victim == "" {
 			manager.rebalanceMu.Unlock()
 			if !waitForOpening {
@@ -1364,7 +1361,6 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			continue
 		}
-		manager.reserveVictim(victim)
 		defer func() { manager.releaseVictim(victim) }()
 		opening := make(chan struct{})
 		manager.openings[accountID] = opening
@@ -1387,8 +1383,8 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			if victim == "" {
 				victim = manager.idleWarmVictimFor(accountID, modelID, false)
-				if victim != "" {
-					manager.reserveVictim(victim)
+				if victim != "" && !manager.tryReserveVictim(victim) {
+					victim = ""
 				}
 			}
 			if victim == "" {
@@ -1772,6 +1768,12 @@ func (manager *accountWorkerManager) closeAccountWorker(account *accountWorker) 
 			account.generation.Add(1)
 		}
 	}
+	return errors.Join(append(closeErrors, manager.closeCleanupLeftovers(account))...)
+}
+
+// closeCleanupLeftovers 只关闭之前清理失败留下的替换 Worker 与租约，不动当前主 Worker（调用方持有 account.mu）
+func (manager *accountWorkerManager) closeCleanupLeftovers(account *accountWorker) error {
+	var closeErrors []error
 	if account.cleanupWorker != nil {
 		if closeErr := account.cleanupWorker.Close(); closeErr != nil {
 			closeErrors = append(closeErrors, closeErr)
