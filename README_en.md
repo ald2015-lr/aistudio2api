@@ -411,6 +411,7 @@ cp .env.example .env
 | `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |
+| `FIRST_EVENT_TIMEOUT` | `0` (disabled) | How long each attempt waits for its first upstream event after sending upstream; on timeout only that attempt is abandoned and the request retries on another account, returning 504 when no retry is possible. Must be shorter than `REQUEST_TIMEOUT`; models that think for a long time may take a while to emit their first event, so leave plenty of headroom |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
 | `WARM_STARTUP_CONCURRENCY` | `2` | Accounts initialized concurrently during prewarming |

@@ -97,6 +97,7 @@ func newRuntime(
 		return nil, nil, nil, errors.Join(err, workers.Close())
 	}
 	service := newTrackedService(lifecycle, pooled, pool, requests, workers, cfg.RequestTimeout)
+	service.firstEventTimeout.Store(int64(cfg.FirstEventTimeout))
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
@@ -2000,6 +2001,8 @@ type trackedService struct {
 	modelAccessPublishPending atomic.Bool
 	// minOutputTokens 为最大输出 token 的下限（MIN_OUTPUT_TOKENS，可热更新）
 	minOutputTokens atomic.Int64
+	// firstEventTimeout 为每次尝试等待首个上游事件的上限（FIRST_EVENT_TIMEOUT，0 为关闭，可热更新）
+	firstEventTimeout atomic.Int64
 	// downgradeGuard 为降级判定的生效设置（服务配置页修改后立即替换，见 downgrade_guard.go）
 	downgradeGuard     atomic.Pointer[downgradeSettings]
 	timeout            atomic.Int64
@@ -3397,6 +3400,8 @@ func (service *trackedService) generateWithRetry(
 	var source <-chan aistudio.Event
 	var first aistudio.Event
 	var activity *upstreamActivity
+	// finishAttempt 为成功尝试的上下文取消函数，事件流转发结束后调用
+	var finishAttempt context.CancelCauseFunc
 	var temporaryCopies *aistudio.TemporaryFileCopies
 	var err error
 	originalContents := request.Contents
@@ -3483,7 +3488,9 @@ func (service *trackedService) generateWithRetry(
 		service.requests.markRunning(request.ID, request.AccountID, accountLabel)
 		service.requests.markChannel(request.ID, string(lease.Channel()))
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "等待上游响应")
-		attemptCtx := aistudio.ContextWithAccountLease(requestCtx, lease)
+		// 每次尝试有自己的上下文：首事件超时只取消这一次尝试，请求本身继续换号重试
+		attemptCtx, cancelAttempt := context.WithCancelCause(aistudio.ContextWithAccountLease(requestCtx, lease))
+		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
 		if resourceID != "" {
@@ -3536,6 +3543,10 @@ func (service *trackedService) generateWithRetry(
 		attemptCtx = aistudio.ContextWithStreamActivityObserver(attemptCtx, activity.observe)
 		// 阶段切换写入请求进度日志，便于把"分到账号 → 首字"拆成生成 proof、等上游响应头、响应头到首字三段
 		attemptCtx = aistudio.ContextWithRequestPhaseObserver(attemptCtx, func(phase aistudio.RequestPhase) {
+			if phase == aistudio.RequestPhaseSendingUpstream {
+				// 首事件超时从向上游发送时开始计（WAA proof 排队与生成不计入）
+				firstEvent.start()
+			}
 			if !prepareTiming.observeChanged(phase) {
 				return
 			}
@@ -3582,9 +3593,11 @@ func (service *trackedService) generateWithRetry(
 			))
 		}
 		if err == nil {
+			// 没有报告发送阶段的通道从拿到事件流时开始计
+			firstEvent.start()
 			upstreamStartedAt := time.Now()
 			firstEventDelayed := false
-			first, err = firstGenerateEvent(requestCtx, source, func() {
+			first, err = firstGenerateEvent(attemptCtx, source, func() {
 				firstEventDelayed = true
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 					"上游首事件等待 | 已等待=%s | 模型=%s | %s",
@@ -3597,17 +3610,31 @@ func (service *trackedService) generateWithRetry(
 					time.Since(upstreamStartedAt).Round(time.Millisecond), first.Kind, modelID,
 				))
 			}
-			if err == nil {
-				api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
-				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
-				service.quota.attemptSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
-				api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
-				temporaryCopies = attemptCopies
-				service.forbidden.reset(request.AccountID)
-				trace.FinishAttempt(nil)
-				break
-			}
 		}
+		// 停止计时。计时已到时本次尝试的上下文已取消：即使恰好收到了首事件也按超时处理（还没有向客户端输出任何内容），
+		// 读完事件流确认上游 goroutine 退出后再释放租约；上游先返回的真实错误保留原样
+		if timeoutErr := firstEvent.stop(); timeoutErr != nil && requestCtx.Err() == nil && (err == nil || errors.Is(err, context.Canceled)) {
+			err = timeoutErr
+			if !drainAttemptEvents(source, attemptDrainTimeout) {
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "首事件超时后上游事件流未及时结束，继续换号")
+			}
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+				"上游首事件超时 | 超时=%s | 模型=%s | %s", firstEvent.timeout, modelID, activity.logFields(time.Now()),
+			))
+		}
+		if err == nil {
+			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
+			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
+			service.quota.attemptSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
+			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
+			temporaryCopies = attemptCopies
+			service.forbidden.reset(request.AccountID)
+			trace.FinishAttempt(nil)
+			// 成功尝试的上下文在事件流转发结束后才取消
+			finishAttempt = cancelAttempt
+			break
+		}
+		cancelAttempt(nil)
 		if attemptCopies != nil {
 			err = errors.Join(err, attemptCopies.Cleanup())
 		}
@@ -3741,6 +3768,9 @@ func (service *trackedService) generateWithRetry(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
 	)
+	if finishAttempt != nil {
+		finishAttempt(nil)
+	}
 }
 
 // channelFallback 返回判断“同一账号能否换通道重试”用的选号条件：去掉 PlaygroundFirst（降级判定的通道偏好，
@@ -3823,6 +3853,94 @@ func waitRetryBackoff(ctx context.Context, failures int) error {
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+}
+
+// attemptDrainTimeout 为首事件超时取消尝试后等待上游事件流结束的上限
+const attemptDrainTimeout = 5 * time.Second
+
+// firstEventTimeoutError 表示本次尝试在首事件超时内没有收到任何上游事件。按上游超时处理：
+// 满足 context.DeadlineExceeded（换号重试；不能再换号时对外 504），不额外冷却或标记账号
+type firstEventTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *firstEventTimeoutError) Error() string {
+	return fmt.Sprintf("上游首事件超时：%s 内没有收到上游事件", e.timeout)
+}
+
+func (e *firstEventTimeoutError) Unwrap() error {
+	return context.DeadlineExceeded
+}
+
+// firstEventDeadline 为一次尝试的首事件超时计时（FIRST_EVENT_TIMEOUT，0 为关闭）：开始向上游发送时启动，
+// 收到首事件或尝试结束时停止；到时只取消本次尝试的上下文
+type firstEventDeadline struct {
+	timeout time.Duration
+	cancel  context.CancelCauseFunc
+	mu      sync.Mutex
+	timer   *time.Timer
+	stopped bool
+	fired   *firstEventTimeoutError
+}
+
+func newFirstEventDeadline(timeout time.Duration, cancel context.CancelCauseFunc) *firstEventDeadline {
+	return &firstEventDeadline{timeout: timeout, cancel: cancel}
+}
+
+// start 开始计时；未启用、已开始或已停止时不做任何事
+func (deadline *firstEventDeadline) start() {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	if deadline.timeout <= 0 || deadline.timer != nil || deadline.stopped {
+		return
+	}
+	deadline.timer = time.AfterFunc(deadline.timeout, deadline.expire)
+}
+
+func (deadline *firstEventDeadline) expire() {
+	deadline.mu.Lock()
+	if deadline.stopped {
+		deadline.mu.Unlock()
+		return
+	}
+	deadline.stopped = true
+	deadline.fired = &firstEventTimeoutError{timeout: deadline.timeout}
+	err := deadline.fired
+	deadline.mu.Unlock()
+	deadline.cancel(err)
+}
+
+// stop 停止计时，返回已经触发的超时错误（没有触发时为 nil）。停止与触发互斥：stop 返回 nil 后本次尝试不会再被取消
+func (deadline *firstEventDeadline) stop() error {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	deadline.stopped = true
+	if deadline.timer != nil {
+		deadline.timer.Stop()
+	}
+	if deadline.fired == nil {
+		return nil
+	}
+	return deadline.fired
+}
+
+// drainAttemptEvents 读完已取消尝试的事件流，确认上游 goroutine 已经退出；超过 limit 仍未结束时返回 false
+func drainAttemptEvents(source <-chan aistudio.Event, limit time.Duration) bool {
+	if source == nil {
+		return true
+	}
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	for {
+		select {
+		case _, ok := <-source:
+			if !ok {
+				return true
+			}
+		case <-timer.C:
+			return false
+		}
 	}
 }
 

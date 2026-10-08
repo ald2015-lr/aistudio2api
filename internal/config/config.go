@@ -33,6 +33,7 @@ var configKeys = [...]string{
 	"PROXY",
 	"INIT_TIMEOUT",
 	"REQUEST_TIMEOUT",
+	"FIRST_EVENT_TIMEOUT",
 	"WARM_WORKER_LIMIT",
 	"MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
@@ -91,6 +92,9 @@ type Config struct {
 	RepeatPromptNonce bool `json:"repeat_prompt_nonce"`
 	// MinOutputTokens 为最大输出 token 的下限：客户端设置的更小值会提高到它（不超过模型上限）；0 表示不调整
 	MinOutputTokens int `json:"min_output_tokens"`
+	// FirstEventTimeout 为每次尝试等待首个上游事件的上限：超时只取消这一次尝试并按超时换号重试；0 表示关闭（默认），
+	// 思考很长的模型可能很久才有第一个事件
+	FirstEventTimeout time.Duration `json:"-"`
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
@@ -166,6 +170,12 @@ func Load(path string) (Config, error) {
 	}
 	if value, ok := values["REQUEST_TIMEOUT"]; ok {
 		cfg.RequestTimeout, err = parsePositiveDuration("REQUEST_TIMEOUT", value)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	if value, ok := values["FIRST_EVENT_TIMEOUT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.FirstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value)
 		if err != nil {
 			return Config{}, err
 		}
@@ -258,6 +268,7 @@ func (c Config) Save(path string) error {
 		"PROXY":                    c.Proxy,
 		"INIT_TIMEOUT":             c.InitTimeout.String(),
 		"REQUEST_TIMEOUT":          c.RequestTimeout.String(),
+		"FIRST_EVENT_TIMEOUT":      c.FirstEventTimeout.String(),
 		"WARM_WORKER_LIMIT":        strconv.Itoa(c.WarmWorkerLimit),
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
@@ -302,6 +313,12 @@ func (c Config) Validate() error {
 	}
 	if c.RequestTimeout <= 0 {
 		return fmt.Errorf("REQUEST_TIMEOUT 必须是正数时长")
+	}
+	if c.FirstEventTimeout < 0 {
+		return fmt.Errorf("FIRST_EVENT_TIMEOUT 必须是 0 或正数时长")
+	}
+	if c.FirstEventTimeout > 0 && c.FirstEventTimeout >= c.RequestTimeout {
+		return fmt.Errorf("FIRST_EVENT_TIMEOUT 必须小于 REQUEST_TIMEOUT")
 	}
 	if c.WarmWorkerLimit <= 0 {
 		return fmt.Errorf("WARM_WORKER_LIMIT 必须是正整数")
@@ -375,6 +392,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Proxy                  string         `json:"proxy"`
 		InitTimeout            string         `json:"init_timeout"`
 		RequestTimeout         string         `json:"request_timeout"`
+		FirstEventTimeout      string         `json:"first_event_timeout"`
 		WarmWorkerLimit        int            `json:"warm_worker_limit"`
 		MaxActiveWorkers       int            `json:"max_active_workers"`
 		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
@@ -395,6 +413,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		Proxy:                  c.Proxy,
 		InitTimeout:            c.InitTimeout.String(),
 		RequestTimeout:         c.RequestTimeout.String(),
+		FirstEventTimeout:      c.FirstEventTimeout.String(),
 		WarmWorkerLimit:        c.WarmWorkerLimit,
 		MaxActiveWorkers:       c.MaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
@@ -419,6 +438,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		Proxy                  string          `json:"proxy"`
 		InitTimeout            string          `json:"init_timeout"`
 		RequestTimeout         string          `json:"request_timeout"`
+		FirstEventTimeout      string          `json:"first_event_timeout"`
 		WarmWorkerLimit        int             `json:"warm_worker_limit"`
 		MaxActiveWorkers       int             `json:"max_active_workers"`
 		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
@@ -444,6 +464,13 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
+	// 旧版数据没有该字段时按关闭处理
+	var firstEventTimeout time.Duration
+	if strings.TrimSpace(value.FirstEventTimeout) != "" {
+		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
+			return err
+		}
+	}
 	parsed := Config{
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
@@ -451,6 +478,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		Proxy:                  strings.TrimSpace(value.Proxy),
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,
+		FirstEventTimeout:      firstEventTimeout,
 		WarmWorkerLimit:        value.WarmWorkerLimit,
 		MaxActiveWorkers:       value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
@@ -625,6 +653,15 @@ func parsePositiveDuration(key string, value string) (time.Duration, error) {
 	duration, err := time.ParseDuration(strings.TrimSpace(value))
 	if err != nil || duration <= 0 {
 		return 0, fmt.Errorf("%s 必须是正数时长，例如 30s 或 5m", key)
+	}
+	return duration, nil
+}
+
+// parseOptionalDuration 解析可以为 0 的时长（0 表示关闭），例如 FIRST_EVENT_TIMEOUT
+func parseOptionalDuration(key string, value string) (time.Duration, error) {
+	duration, err := time.ParseDuration(strings.TrimSpace(value))
+	if err != nil || duration < 0 {
+		return 0, fmt.Errorf("%s 必须是 0 或正数时长，例如 0、30s 或 2m", key)
 	}
 	return duration, nil
 }

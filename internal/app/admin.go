@@ -753,6 +753,13 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	autoStart := saved.AutoStart
 	adminPassword := saved.AdminPassword
+	// 首事件超时：旧版页面保存时不带该字段，沿用现值
+	firstEventTimeout := saved.FirstEventTimeout
+	if strings.TrimSpace(value.FirstEventTimeout) != "" {
+		if firstEventTimeout, err = time.ParseDuration(strings.TrimSpace(value.FirstEventTimeout)); err != nil {
+			return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("FIRST_EVENT_TIMEOUT 无效: %w", err))
+		}
+	}
 	downgradeGuard := saved.DowngradeGuard
 	// 降级判定设置：旧版页面保存时不带该字段，沿用现值
 	if value.DowngradeGuard != nil {
@@ -760,7 +767,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
-		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout,
+		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
@@ -1356,7 +1363,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
 		Proxy: cfg.Proxy, InitTimeout: cfg.InitTimeout.String(), RequestTimeout: cfg.RequestTimeout.String(),
-		WarmWorkerLimit: cfg.WarmWorkerLimit, MaxActiveWorkers: cfg.MaxActiveWorkers,
+		FirstEventTimeout: cfg.FirstEventTimeout.String(), WarmWorkerLimit: cfg.WarmWorkerLimit, MaxActiveWorkers: cfg.MaxActiveWorkers,
 		WarmStartupConcurrency: cfg.WarmStartupConcurrency,
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
 		RoutingStrategy:        cfg.RoutingStrategy,

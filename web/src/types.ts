@@ -248,6 +248,8 @@ export interface ServiceConfig {
   proxy: string
   init_timeout: string
   request_timeout: string
+  // first_event_timeout 为每次尝试等待首个上游事件的上限，0s 表示关闭
+  first_event_timeout: string
   warm_worker_limit: number
   max_active_workers: number
   warm_startup_concurrency: number

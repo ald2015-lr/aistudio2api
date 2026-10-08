@@ -144,6 +144,7 @@ func requiresRebuild(saved config.Config, active config.Config) bool {
 // liveFieldsEqual 判断可热更新的字段是否一致
 func liveFieldsEqual(saved config.Config, active config.Config) bool {
 	return saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
+		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
@@ -175,6 +176,7 @@ func (manager *runtimeManager) applyLiveConfig() {
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
 	admin.workers.applyLiveSettings(saved)
 	admin.service.timeout.Store(int64(saved.RequestTimeout))
+	admin.service.firstEventTimeout.Store(int64(saved.FirstEventTimeout))
 	admin.service.ignoreSeed.Store(saved.IgnoreClientSeed)
 	admin.service.repeatNonce.Store(saved.RepeatPromptNonce)
 	admin.service.minOutputTokens.Store(int64(saved.MinOutputTokens))
@@ -183,9 +185,9 @@ func (manager *runtimeManager) applyLiveConfig() {
 	manager.mu.Unlock()
 
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 忽略客户端 seed=%t | 降级判定=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.WarmStartupConcurrency,
-		saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.IgnoreClientSeed,
+		saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout, saved.IgnoreClientSeed,
 		downgradeGuardSummary(saved.DowngradeGuard),
 	))
 	admin.service.prewarmIfRunning()

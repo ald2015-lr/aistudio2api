@@ -26,6 +26,7 @@ type EditableKey =
   | 'proxy'
   | 'init_timeout'
   | 'request_timeout'
+  | 'first_event_timeout'
   | 'warm_worker_limit'
   | 'max_active_workers'
   | 'warm_startup_concurrency'
@@ -46,6 +47,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'proxy',
   'init_timeout',
   'request_timeout',
+  'first_event_timeout',
   'warm_worker_limit',
   'max_active_workers',
   'warm_startup_concurrency',
@@ -123,6 +125,7 @@ const form = reactive<ServiceConfig>({
   proxy: '',
   init_timeout: '2m',
   request_timeout: '5m',
+  first_event_timeout: '0s',
   warm_worker_limit: 5,
   max_active_workers: 10,
   warm_startup_concurrency: 2,
@@ -201,8 +204,9 @@ const DURATION_UNITS: Record<string, number> = {
   h: 3_600_000,
 }
 
-// durationMillis 把 Go 时长写法（如 3m、1m30s、90s）换算为毫秒；无法解析时返回 NaN
+// durationMillis 把 Go 时长写法（如 3m、1m30s、90s）换算为毫秒；无法解析时返回 NaN。单独的 0 与 Go 一致按 0 处理
 function durationMillis(value: string): number {
+  if (value.trim() === '0') return 0
   const parts = value.trim().matchAll(/(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g)
   let total = 0
   let matched = ''
@@ -233,6 +237,14 @@ function validate(value: ServiceConfig): string {
   ]
   for (const [duration, key] of durations) {
     if (!isDuration(duration)) return tf('settings.invalidDuration', { field: label(key) })
+  }
+  // 首事件超时可以为 0（关闭），开启时必须小于请求超时
+  const firstEvent = durationMillis(value.first_event_timeout)
+  if (
+    Number.isNaN(firstEvent) ||
+    (firstEvent > 0 && firstEvent >= durationMillis(value.request_timeout))
+  ) {
+    return t('settings.invalidFirstEventTimeout')
   }
   const numbers: [unknown, TranslationKey][] = [
     [value.warm_worker_limit, 'settings.warmWorkerLimit'],
@@ -323,7 +335,7 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
     // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
     if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
     // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s），时长相同时表单同步显示，避免一直提示未保存
-    for (const key of ['init_timeout', 'request_timeout'] as const) {
+    for (const key of ['init_timeout', 'request_timeout', 'first_event_timeout'] as const) {
       if (form[key] !== saved[key] && durationMillis(form[key]) === durationMillis(saved[key])) {
         form[key] = saved[key]
       }
@@ -600,6 +612,18 @@ onBeforeUnmount(() => {
           />
         </label>
       </div>
+
+      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.firstEventTimeout') }}</span>
+        <input
+          v-model.trim="form.first_event_timeout"
+          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          placeholder="0s"
+          required
+          autocomplete="off"
+        />
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.firstEventTimeoutHelp') }}</span>
+      </label>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-4">
         <label class="block">

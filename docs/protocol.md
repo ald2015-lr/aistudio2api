@@ -1148,6 +1148,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | 字段 | 读写与生效时机 |
 | --- | --- |
 | `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
+| `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值；下一次启动生成服务时使用 |
 | `temporary_chat` | 保存值；下一次启动生成服务时使用 |
 | `listen_addr`、`proxy_api_key` | 保存值；下一管理进程使用 |

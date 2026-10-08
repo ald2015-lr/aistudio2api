@@ -478,12 +478,13 @@ func (manager *runtimeManager) decorateRuntimeConfig(value api.RuntimeConfig, ac
 func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dataConfigOverrides) bool {
 	initTimeout, initErr := time.ParseDuration(value.InitTimeout)
 	requestTimeout, requestErr := time.ParseDuration(value.RequestTimeout)
-	if initErr != nil || requestErr != nil {
+	firstEventTimeout, firstEventErr := time.ParseDuration(value.FirstEventTimeout)
+	if initErr != nil || requestErr != nil || firstEventErr != nil {
 		return false
 	}
 	saved := config.Config{
 		AuthStates: value.AuthStates, Proxy: value.Proxy,
-		InitTimeout: initTimeout, RequestTimeout: requestTimeout,
+		InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency, TemporaryChat: value.TemporaryChat,
@@ -499,6 +500,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
 		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
+		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.TemporaryChat == active.TemporaryChat &&

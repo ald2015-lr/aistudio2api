@@ -146,6 +146,9 @@ const zhCN = {
   'settings.proxy': '默认代理',
   'settings.initTimeout': '初始化超时',
   'settings.requestTimeout': '请求超时',
+  'settings.firstEventTimeout': '首事件超时',
+  'settings.firstEventTimeoutHelp':
+    '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
   'settings.warmWorkerLimit': '常驻 Worker 数',
   'settings.maxActiveWorkers': '峰值 Worker 上限',
   'settings.warmStartupConcurrency': '启动预热并发',
@@ -370,6 +373,7 @@ const zhCN = {
   'settings.invalidRequired': '{field}不能为空',
   'settings.invalidNumber': '{field}必须是正整数',
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
+  'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
   'settings.invalidListen': '监听地址格式应为 主机:端口',
   'settings.invalidMaxWorkers': '峰值 Worker 上限不能小于常驻 Worker 数',
   'settings.invalidWarmConcurrency': '启动预热并发应在 1 到常驻 Worker 数之间',
@@ -553,6 +557,9 @@ const en: Record<TranslationKey, string> = {
   'settings.proxy': 'Default proxy',
   'settings.initTimeout': 'Init timeout',
   'settings.requestTimeout': 'Request timeout',
+  'settings.firstEventTimeout': 'First event timeout',
+  'settings.firstEventTimeoutHelp':
+    'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
   'settings.warmWorkerLimit': 'Resident workers',
   'settings.maxActiveWorkers': 'Active worker limit',
   'settings.warmStartupConcurrency': 'Startup prewarm concurrency',
@@ -783,6 +790,8 @@ const en: Record<TranslationKey, string> = {
   'settings.invalidRequired': '{field} is required',
   'settings.invalidNumber': '{field} must be a positive integer',
   'settings.invalidDuration': '{field} must be a duration such as 30s, 2m or 1h30m',
+  'settings.invalidFirstEventTimeout':
+    'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',
   'settings.invalidListen': 'Listen address must be host:port',
   'settings.invalidMaxWorkers': 'Peak worker limit cannot be lower than the resident worker count',
   'settings.invalidWarmConcurrency': 'Warm-up concurrency must be between 1 and the resident worker count',

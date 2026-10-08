@@ -219,6 +219,7 @@ type RuntimeConfig struct {
 	Proxy                     string   `json:"proxy"`
 	InitTimeout               string   `json:"init_timeout"`
 	RequestTimeout            string   `json:"request_timeout"`
+	FirstEventTimeout         string   `json:"first_event_timeout"`
 	WarmWorkerLimit           int      `json:"warm_worker_limit"`
 	MaxActiveWorkers          int      `json:"max_active_workers"`
 	WarmStartupConcurrency    int      `json:"warm_startup_concurrency"`
