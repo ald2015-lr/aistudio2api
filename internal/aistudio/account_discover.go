@@ -207,7 +207,9 @@ const selectionRefreshInterval = 3 * time.Second
 // 用于感知其他进程改动的冷却。高并发时每个排队请求每秒都会触发一次，几百个账户就是每秒成千上万次文件操作，
 // 并与账户池锁激烈竞争；单进程部署时内存状态本就是最新的，因此同一模型最多每 3 秒刷新一次
 func (p *AccountPool) refreshSelectionRuntimesThrottled(ctx context.Context, selection AccountSelection) error {
-	key := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/") + "|" + strings.TrimSpace(selection.AccountID)
+	// 各号池只刷新自己的账户，限频按号池分开，避免 Ultra 请求的刷新挡住普通号池的刷新
+	key := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/") + "|" + strings.TrimSpace(selection.AccountID) +
+		"|" + selection.Pool.String()
 	now := time.Now()
 	p.selectionRefreshMu.Lock()
 	if last, ok := p.selectionRefreshAt[key]; ok && now.Sub(last) < selectionRefreshInterval {
