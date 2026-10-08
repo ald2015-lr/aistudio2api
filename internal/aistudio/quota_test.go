@@ -174,3 +174,31 @@ func TestStreamErrorsKeepQuotaMetadata(t *testing.T) {
 		t.Fatal("未识别的状态码应返回协议证据错误")
 	}
 }
+
+// TestQuotaFailureAndBareStatus Gemini API 形状的 429 只在 QuotaFailure 里给出额度周期时仍判定为每日限额；
+// 没有 message 的状态保留状态码与详情
+func TestQuotaFailureAndBareStatus(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	payload := `[8,"You exceeded your current quota, please check your plan and billing details.",[["type.googleapis.com/google.rpc.QuotaFailure",[[[null,null,null,"generativelanguage.googleapis.com/generate_content_free_tier_requests","GenerateRequestsPerDayPerProjectPerModel-FreeTier"]]]],["type.googleapis.com/google.rpc.RetryInfo",[[16]]]]]`
+	err := DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(payload))
+	if err.Metadata["quota_id"] != "GenerateRequestsPerDayPerProjectPerModel-FreeTier" || err.RetryDelay != 16*time.Second {
+		t.Fatalf("RPC error=%+v", err)
+	}
+	cooldown, ok := QuotaCooldownForError(err, now)
+	if !ok || cooldown.Kind != DailyQuotaKind || cooldown.Global || !cooldown.Until.Equal(nextQuotaDay(now)) {
+		t.Fatalf("cooldown=%+v", cooldown)
+	}
+
+	bare := DecodeRPCError("ProxyStreamedCall", http.StatusTooManyRequests, []byte(
+		`[8,null,[["type.googleapis.com/google.rpc.ErrorInfo",["RATE_LIMIT_EXCEEDED","googleapis.com",[["quota_limit","GenerateRequestsPerDayPerProjectPerModel"]]]]]]`,
+	))
+	if bare.Code != 8 || bare.Metadata["quota_limit"] == "" || bare.Message != http.StatusText(http.StatusTooManyRequests) {
+		t.Fatalf("无 message 的状态=%+v", bare)
+	}
+	if only := DecodeRPCError("ProxyStreamedCall", http.StatusNotImplemented, []byte(`[12]`)); only.Code != 12 {
+		t.Fatalf("只有状态码=%+v", only)
+	}
+	if wrapped := DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(`[null,[8]]`)); wrapped.Code != 8 {
+		t.Fatalf("封装只有状态码=%+v", wrapped)
+	}
+}

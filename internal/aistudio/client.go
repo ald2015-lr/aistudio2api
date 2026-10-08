@@ -240,13 +240,15 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 		return rpcError
 	}
 	root, err := rawArray(value, "$", value)
-	if err != nil || len(root) < 2 || isJSONNull(root[1]) {
+	if err != nil || len(root) == 0 {
 		return rpcError
 	}
+	// 两种形状：独立状态 [code, message, details]，以及流式封装 [null, [code, message, details]]。
+	// 状态可以没有 message（[8,null,details]、[12]），这时仍要保留状态码与详情
 	provider, providerPath := root, "$"
-	if bytes.HasPrefix(bytes.TrimSpace(root[1]), []byte("[")) {
+	if len(root) > 1 && bytes.HasPrefix(bytes.TrimSpace(root[1]), []byte("[")) {
 		provider, err = rawArray(root[1], "$[1]", value)
-		if err != nil || len(provider) < 2 {
+		if err != nil || len(provider) == 0 {
 			return rpcError
 		}
 		providerPath = "$[1]"
@@ -254,8 +256,10 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 	if code, err := rawInt64(provider[0], providerPath+"[0]", value); err == nil {
 		rpcError.Code = code
 	}
-	if message, err := rawString(provider[1], providerPath+"[1]", value); err == nil && message != "" {
-		rpcError.Message = message
+	if len(provider) > 1 && !isJSONNull(provider[1]) {
+		if message, err := rawString(provider[1], providerPath+"[1]", value); err == nil && message != "" {
+			rpcError.Message = message
+		}
 	}
 	if len(provider) > 2 && !isJSONNull(provider[2]) {
 		decodeRPCErrorMetadata(rpcError, provider[2])
@@ -281,6 +285,10 @@ func decodeRPCErrorMetadata(rpcError *RPCError, raw json.RawMessage) {
 			if json.Unmarshal(detail[1], &info) == nil && len(info) > 0 {
 				rpcError.RetryDelay = max(rpcError.RetryDelay, decodeRPCRetryDuration(info[0]))
 			}
+			continue
+		}
+		if typeURL == "type.googleapis.com/google.rpc.QuotaFailure" {
+			decodeRPCQuotaFailure(rpcError, detail[1])
 			continue
 		}
 		if typeURL != "type.googleapis.com/google.rpc.ErrorInfo" {
@@ -356,4 +364,41 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 		return 0
 	}
 	return delay
+}
+
+// decodeRPCQuotaFailure 读取 google.rpc.QuotaFailure 中第一个违规项的 quota_metric 与 quota_id（数组协议下标 3、4）。
+// Gemini API 形状的 429 只在这里给出额度周期（如 GenerateRequestsPerDayPerProjectPerModel-FreeTier），
+// 文案只是通用的 "You exceeded your current quota"；ErrorInfo 已给出的字段不覆盖
+func decodeRPCQuotaFailure(rpcError *RPCError, raw json.RawMessage) {
+	var failure []json.RawMessage
+	if json.Unmarshal(raw, &failure) != nil || len(failure) == 0 {
+		return
+	}
+	var violations [][]json.RawMessage
+	if json.Unmarshal(failure[0], &violations) != nil {
+		return
+	}
+	for _, violation := range violations {
+		fields := map[string]int{"quota_metric": 3, "quota_id": 4}
+		found := false
+		for key, index := range fields {
+			if len(violation) <= index {
+				continue
+			}
+			var value string
+			if json.Unmarshal(violation[index], &value) != nil || value == "" {
+				continue
+			}
+			found = true
+			if rpcError.Metadata == nil {
+				rpcError.Metadata = make(map[string]string)
+			}
+			if rpcError.Metadata[key] == "" {
+				rpcError.Metadata[key] = value
+			}
+		}
+		if found {
+			return
+		}
+	}
 }
