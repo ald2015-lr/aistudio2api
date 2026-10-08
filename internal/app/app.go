@@ -253,7 +253,8 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	}
 }
 
-// rootHandler 将公开 API 与内嵌管理端挂载到同一服务
+// rootHandler 将公开 API 与内嵌管理端挂载到同一服务；/trace/ 与 /ultra/ 和 /v1 一样交给公开 API（只校验 API key），
+// 不经过管理页面的令牌校验
 func rootHandler(apiHandler http.Handler, adminPassword string, adminToken string) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/health", apiHandler)
@@ -261,6 +262,7 @@ func rootHandler(apiHandler http.Handler, adminPassword string, adminToken strin
 	root.Handle("/v1/", apiHandler)
 	root.Handle("/v1beta/", apiHandler)
 	root.Handle("/trace/", apiHandler)
+	root.Handle("/ultra/", apiHandler)
 	root.Handle("/", api.AdminPageMiddleware(adminPassword, adminToken, webui.Handler()))
 	return securityHeaders(root)
 }
