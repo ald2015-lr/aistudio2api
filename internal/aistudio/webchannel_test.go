@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -95,3 +96,19 @@ func TestOutboxHasRoom(t *testing.T) {
 		t.Fatal("字节数超过上限时应拒绝")
 	}
 }
+
+// TestWebChannelErrorsRedactCredentials 网络错误不带出握手 URL 中的 $httpHeaders（Authorization）
+func TestWebChannelErrorsRedactCredentials(t *testing.T) {
+	session := &BidiSession{client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	})}}
+	request, _ := http.NewRequest(http.MethodPost, bidiWebChannelURL+"?$httpHeaders=Authorization%3ASAPISIDHASH+secret&SID=abc", nil)
+	_, err := session.do(request)
+	if err == nil || strings.Contains(err.Error(), "SAPISIDHASH") || strings.Contains(err.Error(), "SID=abc") {
+		t.Fatalf("错误中带出了凭据: %v", err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }

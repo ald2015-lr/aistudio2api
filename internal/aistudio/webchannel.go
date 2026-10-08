@@ -574,7 +574,7 @@ func (s *BidiSession) handshake(ctx context.Context, protocolHeaders http.Header
 	}
 	request.Header = s.cloneHeaders()
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response, err := s.client.Do(request)
+	response, err := s.do(request)
 	if err != nil {
 		return fmt.Errorf("执行 bidi WebChannel handshake: %w", err)
 	}
@@ -769,7 +769,7 @@ func (s *BidiSession) postBatch(ctx context.Context, batch []bidiOutgoing) (resu
 	}
 	request.Header = s.cloneHeaders()
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response, err := s.client.Do(request)
+	response, err := s.do(request)
 	if err != nil {
 		return fmt.Errorf("执行 bidi WebChannel message: %w", err)
 	}
@@ -897,7 +897,7 @@ func (s *BidiSession) readBackchannel(first bool, ready func(error)) (int, error
 		return 0, fmt.Errorf("创建 bidi WebChannel backchannel: %w", err)
 	}
 	request.Header = s.cloneHeaders()
-	response, err := s.client.Do(request)
+	response, err := s.do(request)
 	if err != nil {
 		if first {
 			ready(err)
@@ -1145,7 +1145,7 @@ func (s *BidiSession) terminate() error {
 	}
 	request.Header = s.cloneHeaders()
 	request.Header.Set("Content-Type", "text/plain;charset=UTF-8")
-	response, err := s.client.Do(request)
+	response, err := s.do(request)
 	if err != nil {
 		return fmt.Errorf("执行 bidi WebChannel terminate: %w", err)
 	}
@@ -1201,6 +1201,25 @@ func webChannelHeaders(protocolHeaders http.Header) http.Header {
 		}
 	}
 	return headers
+}
+
+// do 发送 WebChannel 请求。握手 URL 的 $httpHeaders 携带 Authorization（SAPISIDHASH），其他请求的查询串携带会话 ID；
+// 网络错误（*url.Error）的文本包含完整 URL，会进入日志与冷却原因（runtime-state.json），这里去掉查询串
+func (s *BidiSession) do(request *http.Request) (*http.Response, error) {
+	response, err := s.client.Do(request)
+	var urlError *url.Error
+	if errors.As(err, &urlError) {
+		urlError.URL = redactURLQuery(urlError.URL)
+	}
+	return response, err
+}
+
+// redactURLQuery 去掉 URL 的查询串与片段
+func redactURLQuery(raw string) string {
+	if index := strings.IndexAny(raw, "?#"); index >= 0 {
+		return raw[:index] + "?<redacted>"
+	}
+	return raw
 }
 
 func webChannelAuthHeaders(headers http.Header) string {
