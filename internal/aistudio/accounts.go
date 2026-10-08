@@ -1,12 +1,14 @@
 package aistudio
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/mail"
 	"os"
@@ -2842,27 +2844,32 @@ func writeAccountConfig(filePath string, value AccountConfig) error {
 	return atomicWriteFile(filePath, append(data, '\n'), 0o600)
 }
 
+// readRuntime 读取账户运行态（冷却、资源绑定、模型资格等缓存）。
+//
+// 运行态只是缓存，不能因为它让账户不可用：未知字段（新版本写入或回退版本）直接忽略；
+// 文件损坏时备份为 runtime-state.json.corrupt 并按空运行态继续，下一次写入时重建。
+// 原先严格解析，一个账户的坏文件会让轮询到它的请求和全部候选的分类都失败，启动时还会直接丢掉该账户
 func readRuntime(filePath string) (accountRuntimeState, error) {
-	value := accountRuntimeState{
-		Cooldowns:   make(map[string]CooldownState),
-		Resources:   make(map[string]ResourceBinding),
-		ModelAccess: make(map[string]ModelAccess),
-	}
-	file, err := os.Open(filePath)
+	value := emptyRuntimeState()
+	data, err := os.ReadFile(filePath)
 	if os.IsNotExist(err) {
 		return value, nil
 	}
 	if err != nil {
 		return accountRuntimeState{}, fmt.Errorf("读取 %s: %w", runtimeStateName, err)
 	}
-	defer file.Close()
-	decoder := json.NewDecoder(file)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&value); err != nil {
-		return accountRuntimeState{}, fmt.Errorf("解析 %s: %w", runtimeStateName, err)
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decodeErr := decoder.Decode(&value)
+	if decodeErr == nil {
+		decodeErr = ensureJSONEnd(decoder)
 	}
-	if err := ensureJSONEnd(decoder); err != nil {
-		return accountRuntimeState{}, fmt.Errorf("解析 %s: %w", runtimeStateName, err)
+	if decodeErr != nil {
+		backup := filePath + ".corrupt"
+		if renameErr := os.Rename(filePath, backup); renameErr != nil {
+			return accountRuntimeState{}, fmt.Errorf("解析 %s: %w（备份失败: %v）", runtimeStateName, decodeErr, renameErr)
+		}
+		slog.Warn("账户运行态文件损坏，已备份并按空运行态继续", "file", filePath, "backup", backup, "error", decodeErr)
+		return emptyRuntimeState(), nil
 	}
 	if value.Cooldowns == nil {
 		value.Cooldowns = make(map[string]CooldownState)
@@ -2874,6 +2881,14 @@ func readRuntime(filePath string) (accountRuntimeState, error) {
 		value.ModelAccess = make(map[string]ModelAccess)
 	}
 	return value, nil
+}
+
+func emptyRuntimeState() accountRuntimeState {
+	return accountRuntimeState{
+		Cooldowns:   make(map[string]CooldownState),
+		Resources:   make(map[string]ResourceBinding),
+		ModelAccess: make(map[string]ModelAccess),
+	}
 }
 
 func writeRuntime(filePath string, value accountRuntimeState) error {

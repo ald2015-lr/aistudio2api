@@ -60,6 +60,9 @@ type AccountLoginSummary struct {
 	Enabled     bool
 	State       AccountState
 	StoragePath string
+	Directory   string
+	// FilesMissing 表示账户曾因文件缺失被标为不可用（例如整体替换账户目录期间被访问）
+	FilesMissing bool
 }
 
 // LoginSummaries 一次加锁返回全部账户的轻量状态
@@ -74,7 +77,8 @@ func (p *AccountPool) LoginSummaries() []AccountLoginSummary {
 		}
 		summaries = append(summaries, AccountLoginSummary{
 			ID: account.ID, Enabled: account.Config.Enabled, State: accountStateLocked(account, now),
-			StoragePath: account.StoragePath,
+			StoragePath: account.StoragePath, Directory: account.Directory,
+			FilesMissing: account.State == AccountUnavailable && account.stateMessage == ErrAccountNotFound.Error(),
 		})
 	}
 	return summaries

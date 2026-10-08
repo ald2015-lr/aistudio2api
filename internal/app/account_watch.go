@@ -58,6 +58,8 @@ type accountWatcher struct {
 	loginPending map[string]struct{}
 	// refreshing 为真时上一批登录状态更新仍在后台载入
 	refreshing atomic.Bool
+	// recoverAt 为文件缺失后又恢复的账户下一次重新同步的时间，避免同步失败时每轮扫描都重试
+	recoverAt map[string]time.Time
 }
 
 // watchAccountDirectories 在生成服务实例的生命周期内持续扫描账户目录
@@ -144,6 +146,7 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	if len(imported) > 0 {
 		go watcher.admin.syncImportedCatalogs(ctx, imported)
 	}
+	watcher.recoverRestored(ctx, summaries, present, now)
 	if watcher.detachMissing(summaries, present) {
 		changed = true
 	}
@@ -151,6 +154,43 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	watcher.startLoginRefresh(ctx, known)
 	if changed {
 		watcher.admin.syncModelCache()
+	}
+}
+
+// accountRecoverRetry 为恢复账户的模型目录同步失败后再次尝试的间隔
+const accountRecoverRetry = time.Minute
+
+// recoverRestored 让文件缺失时被标为不可用的账户在文件恢复后重新同步模型目录，同步成功即恢复可调度。
+// 原先“不可用”只能靠重启服务或管理操作解除：整体替换账户目录时，复制期间被访问到的账户会一直不可用
+func (watcher *accountWatcher) recoverRestored(
+	ctx context.Context,
+	summaries []aistudio.AccountLoginSummary,
+	present map[string]struct{},
+	now time.Time,
+) {
+	if watcher.recoverAt == nil {
+		watcher.recoverAt = make(map[string]time.Time)
+	}
+	var restored []*aistudio.Account
+	for _, summary := range summaries {
+		if !summary.FilesMissing {
+			delete(watcher.recoverAt, summary.ID)
+			continue
+		}
+		if _, exists := present[summary.ID]; !exists || !summary.Enabled || now.Before(watcher.recoverAt[summary.ID]) ||
+			!accountFilesSettled(summary.Directory, now) {
+			continue
+		}
+		account, err := watcher.admin.pool.Account(summary.ID)
+		if err != nil {
+			continue
+		}
+		watcher.recoverAt[summary.ID] = now.Add(accountRecoverRetry)
+		restored = append(restored, account)
+		watcher.admin.requests.log("auth", "INFO", "账户文件已恢复，重新同步模型目录 | 账户="+account.Config.Label)
+	}
+	if len(restored) > 0 {
+		go watcher.admin.syncImportedCatalogs(ctx, restored)
 	}
 }
 
