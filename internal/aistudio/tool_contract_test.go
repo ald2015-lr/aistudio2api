@@ -159,6 +159,18 @@ func TestSearchOptionsBecomeHints(t *testing.T) {
 	}
 }
 
+// TestBlockedDomainsBecomeHint 排除的域名同样以系统指令提示传给上游（-site: 查询，软约束）
+func TestBlockedDomainsBecomeHint(t *testing.T) {
+	request, _, err := prepareToolRequest(GenerateRequest{Tools: Tools{
+		Google:       []string{"google_search"},
+		GoogleSearch: &GoogleSearchOptions{WebSearch: true, BlockedDomains: []string{"spam.example", "ads.example"}},
+	}})
+	if err != nil || !strings.Contains(request.System, "-site:") || !strings.Contains(request.System, "spam.example, ads.example") ||
+		strings.Contains(request.System, "Restrict web searches") {
+		t.Fatalf("system=%q err=%v", request.System, err)
+	}
+}
+
 // TestFunctionDeclarationSchemaFallback Playground 无法编码的参数 Schema 降级为层级与类型，完整 Schema 附在说明里
 func TestFunctionDeclarationSchemaFallback(t *testing.T) {
 	raw := `{"type":"object","$defs":{"id":{"type":"string"}},"properties":{"id":{"$ref":"#/$defs/id"},"tags":{"type":"array","uniqueItems":true,"items":{"type":"string"}},"count":{"const":3},"level":{"enum":[1,2,3]}},"required":["id"]}`

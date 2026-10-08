@@ -731,7 +731,7 @@ Anthropic 接受的具体 server tool type 为：
 
 编码器将全部函数声明合并为一个 Tool entry；Google Search 与 Image Search 合并为一个 search entry 并分别占用 `searchTypes` 索引 `0/1`；Code Execution、URL Context 与 Maps 各占一个 entry。Google Maps 与 Code Execution/URL Context 构成互斥工具组，每个请求选择其中一组。
 
-Anthropic server tool 的 `name` 必须分别为 `web_search`、`image_search`、`web_fetch`、`code_execution`、`url_context` 或 `google_maps`。这些定义接受 `type` 与对应 `name`；额外选项、`description` 或 `input_schema` 返回 `400 invalid_request_error`。
+Anthropic server tool 的 `name` 必须分别为 `web_search`、`image_search`、`web_fetch`、`code_execution`、`url_context` 或 `google_maps`。这些定义接受 `type` 与对应 `name`，各 type 的文档化选项见 Anthropic Messages 一节，其余选项与 custom tool 一样忽略；`description` 或 `input_schema` 返回 `400 invalid_request_error`。
 
 函数 JSON Struct 使用 protobuf `Struct/Value` 数组：map 为 `[[[key,value],...]]`；Value oneof 索引 `0..5` 分别表示 null、number、string、bool、Struct、ListValue。对象键排序后编码。
 
@@ -1663,9 +1663,9 @@ custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`；`st
 | `url_context` | `url_context` |
 | `google_maps` | `google_maps` |
 
-`web_search_20250305` 接受 `max_uses`，调用次数由上游决定；`allowed_domains` 与 `user_location` 以系统指令提示传给上游（软约束）。
+`web_search_20250305` 接受 `max_uses`，调用次数由上游决定，忽略；`allowed_domains`（`site:` 查询）、`blocked_domains`（`-site:` 查询）与 `user_location` 以系统指令提示传给上游（软约束）；`allowed_domains` 与 `blocked_domains` 同时非空时返回 `invalid_request_error`。`web_fetch_20250910` 的 `max_uses`、`citations`、`max_content_tokens` 上游没有对应参数，忽略；`allowed_domains`、`blocked_domains` 是显式的抓取范围限制，URL Context 无法遵守，非空时返回 `invalid_request_error`，不悄悄放开限制。
 
-server tool 只接受对应 `type`、`name` 与 `cache_control`（忽略）。`description`、`input_schema` 或其他 option 返回 `invalid_request_error`。tool choice 接受省略、`{"type":"auto"}`、`{"type":"none"}`、`{"type":"any"}` 与 `{"type":"tool","name"}`，以及 `disable_parallel_tool_use`。
+server tool 的 `cache_control`、`defer_loading` 等只影响 Anthropic 自身缓存与加载的字段以及未知字段忽略，与 custom tool 一致；`description` 或 `input_schema` 返回 `invalid_request_error`。tool choice 接受省略、`{"type":"auto"}`、`{"type":"none"}`、`{"type":"any"}` 与 `{"type":"tool","name"}`，以及 `disable_parallel_tool_use`。
 
 非流式响应：
 

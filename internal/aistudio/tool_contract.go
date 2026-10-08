@@ -86,6 +86,9 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 		if len(search.AllowedDomains) > 0 {
 			hints = append(hints, "Restrict web searches to these domains using site: queries: "+strings.Join(search.AllowedDomains, ", "))
 		}
+		if len(search.BlockedDomains) > 0 {
+			hints = append(hints, "Exclude these domains from web searches using -site: queries and do not cite them: "+strings.Join(search.BlockedDomains, ", "))
+		}
 	}
 	contract := &toolContract{
 		required: config.Mode == "required",

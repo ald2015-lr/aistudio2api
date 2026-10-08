@@ -164,10 +164,11 @@ type GoogleSearchOptions struct {
 	WebSearch   bool                   `json:"web_search,omitempty"`
 	ImageSearch bool                   `json:"image_search,omitempty"`
 	TimeRange   *GoogleSearchTimeRange `json:"time_range,omitempty"`
-	// ContextSize、UserLocation、AllowedDomains 为客户端的搜索偏好，上游没有对应字段，以系统指令提示的方式传入
+	// ContextSize、UserLocation、AllowedDomains、BlockedDomains 为客户端的搜索偏好，上游没有对应字段，以系统指令提示的方式传入
 	ContextSize    string          `json:"context_size,omitempty"`
 	UserLocation   json.RawMessage `json:"user_location,omitempty"`
 	AllowedDomains []string        `json:"allowed_domains,omitempty"`
+	BlockedDomains []string        `json:"blocked_domains,omitempty"`
 }
 
 // Tools 表示一次请求启用的工具

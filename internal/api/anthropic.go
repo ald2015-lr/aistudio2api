@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -431,18 +430,15 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 		typeName := strings.ToLower(tool.Type)
 		switch {
 		case typeName == "web_search_20250305":
-			delete(tool.Options, "max_uses")
-			location, domains := tool.Options["user_location"], tool.Options["allowed_domains"]
-			delete(tool.Options, "user_location")
-			delete(tool.Options, "allowed_domains")
 			if err := validateAnthropicServerTool(tool, "web_search"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			if rawJSONConfigured(location) || rawJSONConfigured(domains) {
-				var filters json.RawMessage
-				if rawJSONConfigured(domains) {
-					filters, _ = json.Marshal(map[string]json.RawMessage{"allowed_domains": domains})
-				}
+			// max_uses：搜索次数由上游决定，没有对应参数，忽略。
+			// allowed_domains、blocked_domains（site: / -site: 查询）与 user_location 以系统指令提示传给上游（软约束）
+			location := tool.Options["user_location"]
+			allowed, blocked := tool.Options["allowed_domains"], tool.Options["blocked_domains"]
+			if rawJSONConfigured(location) || rawJSONConfigured(allowed) || rawJSONConfigured(blocked) {
+				filters, _ := json.Marshal(map[string]json.RawMessage{"allowed_domains": allowed, "blocked_domains": blocked})
 				search, err := mapSearchOptions("", location, filters)
 				if err != nil {
 					return aistudio.Tools{}, err
@@ -458,6 +454,17 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 		case typeName == "web_fetch_20250910":
 			if err := validateAnthropicServerTool(tool, "web_fetch"); err != nil {
 				return aistudio.Tools{}, err
+			}
+			// allowed_domains、blocked_domains 是客户端显式限定的抓取范围，URL Context 没有对应参数，
+			// 忽略会悄悄放开限制，所以返回 400；max_uses、citations、max_content_tokens 上游没有对应参数，忽略
+			for _, field := range []string{"allowed_domains", "blocked_domains"} {
+				domains, err := searchDomainList(tool.Options[field], field)
+				if err != nil {
+					return aistudio.Tools{}, err
+				}
+				if len(domains) > 0 {
+					return aistudio.Tools{}, fmt.Errorf("tool type %q option %q is not supported", tool.Type, field)
+				}
 			}
 			mapped.Google = appendUnique(mapped.Google, "url_context")
 		case typeName == "code_execution_20250522", typeName == "code_execution_20250825":
@@ -505,6 +512,8 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 	return mapped, nil
 }
 
+// validateAnthropicServerTool 校验 server tool 的 name 与不应出现的 custom tool 字段。其他字段（cache_control、
+// defer_loading 等只影响 Anthropic 自身缓存与加载的字段，以及未知字段）与 custom tool 一样忽略，各 type 的文档化字段由调用方处理
 func validateAnthropicServerTool(tool anthropicTool, name string) error {
 	if tool.Name != name {
 		return fmt.Errorf("tool type %q requires name %q", tool.Type, name)
@@ -512,17 +521,7 @@ func validateAnthropicServerTool(tool anthropicTool, name string) error {
 	if tool.Description != "" || rawJSONConfigured(tool.InputSchema) {
 		return fmt.Errorf("tool type %q does not accept description or input_schema", tool.Type)
 	}
-	// cache_control 只影响 Anthropic 的提示缓存，忽略
-	delete(tool.Options, "cache_control")
-	if len(tool.Options) == 0 {
-		return nil
-	}
-	fields := make([]string, 0, len(tool.Options))
-	for field := range tool.Options {
-		fields = append(fields, field)
-	}
-	sort.Strings(fields)
-	return fmt.Errorf("tool type %q has unsupported option %q", tool.Type, fields[0])
+	return nil
 }
 
 func anthropicToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
