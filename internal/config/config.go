@@ -58,6 +58,7 @@ var configKeys = [...]string{
 	"DOWNGRADE_REJECT_STATUS",
 	"WAA_BACKEND",
 	"AUTO_START",
+	"REQUEST_BODY_LOG",
 	"ADMIN_PASSWORD",
 }
 
@@ -99,7 +100,9 @@ type Config struct {
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
 	AutoStart      bool           `json:"auto_start"`
-	AdminPassword  string         `json:"-"`
+	// RequestBodyLog 为真时用量账本同时保存公开 API POST 请求与响应的截断正文（明文保存在本机，默认关闭）
+	RequestBodyLog bool   `json:"request_body_log"`
+	AdminPassword  string `json:"-"`
 }
 
 // DefaultProxyAPIKey 为没有设置 PROXY_API_KEY 时使用的公开 API 密钥。公开 API 始终要求密钥，
@@ -247,6 +250,12 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("AUTO_START 必须是 true 或 false")
 		}
 	}
+	if value, ok := values["REQUEST_BODY_LOG"]; ok && strings.TrimSpace(value) != "" {
+		cfg.RequestBodyLog, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("REQUEST_BODY_LOG 必须是 true 或 false")
+		}
+	}
 	if value, ok := values["ADMIN_PASSWORD"]; ok {
 		cfg.AdminPassword = strings.TrimSpace(value)
 	}
@@ -281,6 +290,7 @@ func (c Config) Save(path string) error {
 		"MIN_OUTPUT_TOKENS":        strconv.Itoa(c.MinOutputTokens),
 		"WAA_BACKEND":              c.WAABackend,
 		"AUTO_START":               strconv.FormatBool(c.AutoStart),
+		"REQUEST_BODY_LOG":         strconv.FormatBool(c.RequestBodyLog),
 		"ADMIN_PASSWORD":           c.AdminPassword,
 	}
 	for key, value := range c.DowngradeGuard.envValues() {

@@ -3598,8 +3598,10 @@ func (service *trackedService) generateWithRetry(
 		attempted[request.AccountID] = struct{}{}
 		accountLabel := lease.Account().Config.Label
 		trace.StartAttempt(accountLabel, string(lease.Channel()))
+		attemptStartedAt := time.Now()
 		api.SetAccessLogChannel(requestCtx, string(lease.Channel()))
 		api.SetAccessLogTarget(requestCtx, modelID, accountLabel)
+		api.MarkAccessLogScheduled(requestCtx)
 		service.requests.markRunning(request.ID, request.AccountID, accountLabel)
 		service.requests.markChannel(request.ID, string(lease.Channel()))
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "等待上游响应")
@@ -3757,6 +3759,10 @@ func (service *trackedService) generateWithRetry(
 			err = errors.Join(err, attemptCopies.Cleanup())
 		}
 		trace.FinishAttempt(err)
+		api.AddAccessLogAttempt(requestCtx, api.RequestAttempt{
+			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
+			DurationMS: time.Since(attemptStartedAt).Milliseconds(),
+		})
 		workerFailed := service.workers.WorkerFailed(request.AccountID)
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)

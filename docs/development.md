@@ -97,6 +97,8 @@ web/                     Vue 3、TypeScript、Vite 和 Tailwind CSS 源码
 docs/                    开发流程与私有协议说明
 auth/                    每账户配置、认证状态和可恢复运行状态
 runtime/camoufox/        Release 使用的 Camoufox 运行时
+runtime/requests.db      用量账本（SQLite，纯 Go 驱动），保留 90 天
+internal/requestdb/      用量账本的写入、汇总与查询
 ```
 
 主依赖方向：
@@ -161,6 +163,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `WAA_BACKEND` | WAA 后端 `camoufox` 或 `go` | `camoufox` |
 | `TEMPORARY_CHAT` | WAA 预热页是否使用临时对话 | `false` |
 | `AUTO_START` | 管理进程启动后自动启动生成服务。生成服务期望运行却停在 STOPPED（启动失败或意外停止）时由监督协程自动重新启动：一般失败按 5 秒起、上限 1 分钟退避，没有可用账户时上限 5 分钟；手动停止后不再自动启动 | `true` |
+| `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值，修改后重启程序生效 | `false` |
 | `ADMIN_PASSWORD` | 远程管理密码；非空时非回环请求经 HTTP Basic 认证后可访问管理页面与 `/api/`，同一 IP 10 分钟内错 10 次封禁 15 分钟；管理进程重启后生效 | 空 |
 
 `LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT` 可以为 `0`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`。全局代理 URL 使用 `http`、`https` 或 `socks5` 纯 origin 形状。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。

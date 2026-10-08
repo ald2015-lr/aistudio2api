@@ -742,7 +742,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err))
 	}
-	// 管理页面不编辑 AUTO_START 与 ADMIN_PASSWORD，保存时沿用 .env 中的现值，避免被整体重写抹掉。
+	// 管理页面不编辑 AUTO_START、REQUEST_BODY_LOG 与 ADMIN_PASSWORD，保存时沿用 .env 中的现值，避免被整体重写抹掉。
 	// 现有 .env 读不出来时不保存：原先按默认值继续，会用空的 ADMIN_PASSWORD 与默认降级判定设置覆盖写盘
 	saved, loadErr := config.Load(admin.configPath)
 	if loadErr != nil {
@@ -752,6 +752,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		}
 	}
 	autoStart := saved.AutoStart
+	requestBodyLog := saved.RequestBodyLog
 	adminPassword := saved.AdminPassword
 	// 首事件超时：旧版页面保存时不带该字段，沿用现值
 	firstEventTimeout := saved.FirstEventTimeout
@@ -779,6 +780,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		MinOutputTokens:        value.MinOutputTokens,
 		WAABackend:             value.WAABackend,
 		AutoStart:              autoStart,
+		RequestBodyLog:         requestBodyLog,
 		AdminPassword:          adminPassword,
 		DowngradeGuard:         downgradeGuard,
 	}

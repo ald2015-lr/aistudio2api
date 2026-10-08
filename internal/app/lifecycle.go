@@ -10,6 +10,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
 // managedService 表示可整体替换的生成服务
@@ -73,6 +74,8 @@ type runtimeManager struct {
 	intent           *serviceIntent
 	// shuttingDown 在进程退出时置为 true（由 mu 保护），之后不再启动生成服务
 	shuttingDown bool
+	// ledger 为用量账本，在开始接收请求之前设置、之后不再改变；打开失败时为 nil（方法对 nil 安全）
+	ledger *requestdb.Store
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。
@@ -460,9 +463,22 @@ func (manager *runtimeManager) RecordAccessStart(entry api.AccessLog) {
 	manager.generation().admin.RecordAccessStart(entry)
 }
 
-// RecordAccessLog 记录公开 API 请求结果
+// RecordAccessLog 记录公开 API 请求结果，通过 API key 校验的 POST 请求同时写入用量账本。
+// 与 RecordAccessStart 一样只取实例快照、不持锁；账本只是排队，不等待落盘
 func (manager *runtimeManager) RecordAccessLog(entry api.AccessLog) {
 	manager.generation().admin.RecordAccessLog(entry)
+	if ledgerEntry(entry) {
+		manager.ledger.Record(requestRow(entry, time.Now().UTC()))
+	}
+}
+
+// requestLedger 返回交给 API 路由的账本：账本没有打开时返回 nil 接口值。
+// 直接把 nil 的 *requestdb.Store 赋给接口会得到非 nil 的接口，路由会注册用量接口并在请求时解引用空指针
+func (manager *runtimeManager) requestLedger() api.RequestLedger {
+	if manager.ledger == nil {
+		return nil
+	}
+	return manager.ledger
 }
 
 // decorateRuntimeConfig 标记配置所属的进程级与生成服务生效时机

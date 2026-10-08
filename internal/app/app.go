@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 	"github.com/Mag1cFall/AIStudio2API/internal/setup"
 	"github.com/Mag1cFall/AIStudio2API/internal/webui"
 )
@@ -72,9 +74,28 @@ func runCommand(args []string) error {
 		}
 		return err
 	}
+	ledger := openRequestLedger(manager, filepath.Join("runtime", "requests.db"), cfg.RequestBodyLog)
 	serveErr := runServer(ctx, cfg, options, manager)
 	cancelLifecycle()
-	return errors.Join(serveErr, manager.Close())
+	// 账本最后关闭：关闭前写完已排队的记录
+	return errors.Join(serveErr, manager.Close(), ledger.Close())
+}
+
+// openRequestLedger 打开用量账本并交给管理器；打开失败只写 WARN，本次运行不记录用量，服务照常启动
+func openRequestLedger(manager *runtimeManager, path string, bodyCapture bool) *requestdb.Store {
+	ledger, err := requestdb.Open(path, func(level, message string) {
+		manager.requests.log("service", level, message)
+	})
+	if err != nil {
+		manager.requests.log("service", "WARN", "请求账本打开失败，本次运行不记录用量 | 路径="+path+" | 错误="+err.Error())
+		return nil
+	}
+	ledger.SetBodyCapture(bodyCapture)
+	if bodyCapture {
+		manager.requests.log("service", "INFO", "请求正文记录已开启（REQUEST_BODY_LOG=true）| 正文以明文保存在 "+path)
+	}
+	manager.ledger = ledger
+	return ledger
 }
 
 // shutdownGrace 返回退出时等待进行中请求完成的最长时间，可用 SHUTDOWN_GRACE 调整（如 90s；默认 60s）
@@ -151,6 +172,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	apiHandler := api.NewHandler(manager, api.Config{
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
 		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
+		Ledger: manager.requestLedger(),
 	})
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")

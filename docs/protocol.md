@@ -1101,6 +1101,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
+| 用量账本 | `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv`、`GET /api/requests/{id}/body`（账本打开失败时不注册） |
 
 管理 API 使用 DTO（data transfer object）表示请求、响应和事件对象。端点结果：
 
@@ -1122,6 +1123,9 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |
 | `GET /api/events` | 200 SSE | `{"type":"<TYPE>","data":<DTO>}` |
+| `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state` 筛选 |
+| `GET /api/usage/records`、`records.csv` | 200 | `{"items":[UsageRecord,...],"next_cursor"?}` 或带 BOM 的 UTF-8 CSV；另接受 `status`、`q`（请求 ID、错误或回复指纹）、`cursor`、`limit`（1 到 200） |
+| `GET /api/requests/{id}/body` | 200 / 404 | `RequestBody`；只在 `REQUEST_BODY_LOG=true` 时保存 |
 
 管理 DTO 字段：
 

@@ -23,6 +23,8 @@ type Config struct {
 	Stopping <-chan struct{}
 	// TraceDir 为 /trace/ 排查路由写记录的目录，空值为 logs/trace
 	TraceDir string
+	// Ledger 为用量账本；为 nil 时不注册用量接口、不记录正文。必须是 nil 接口值，不能是包着 nil 指针的接口
+	Ledger RequestLedger
 }
 
 type server struct {
@@ -81,10 +83,15 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	if config.Admin != nil {
 		s.registerAdmin(control)
 	}
+	if config.Ledger != nil {
+		s.registerLedger(control)
+	}
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey, authMiddleware(config.currentAPIKey, traceCaptureMiddleware(public))))
+	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文
+	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey,
+		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, public)))))
 	publicChain := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
 	root.Handle("/v1/", publicChain)
 	root.Handle("/v1beta/", publicChain)

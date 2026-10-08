@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,15 @@ type accessLogMetadata struct {
 	maxOutputTokens string
 	seed            string
 	requestID       string
+	// startedAt 为请求进入服务的时间；queueWait 为进入服务到取得最终执行账户的时间
+	startedAt time.Time
+	queueWait time.Duration
+	// proof 为等待并生成 WAA proof 的累计时间
+	proof time.Duration
+	// attempts 为最终结果之前未成功的上游尝试
+	attempts []RequestAttempt
+	// authorized 表示请求已通过公开 API key 校验，只有这类请求写入用量账本
+	authorized bool
 }
 
 type accessLogSnapshot struct {
@@ -82,6 +92,10 @@ type accessLogSnapshot struct {
 	maxOutputTokens string
 	seed            string
 	requestID       string
+	queueWait       time.Duration
+	proof           time.Duration
+	attempts        []RequestAttempt
+	authorized      bool
 }
 
 type accessLogResponseWriter struct {
@@ -318,7 +332,10 @@ func (metadata *accessLogMetadata) setGenerationInput(request aistudio.GenerateR
 		}
 	}
 	metadata.mu.Lock()
-	metadata.requestID = strings.TrimSpace(request.ID)
+	// 生成请求没有 ID 时保留请求日志生成的 ID：账本按 ID 去重，空 ID 的记录会互相覆盖
+	if id := strings.TrimSpace(request.ID); id != "" {
+		metadata.requestID = id
+	}
 	metadata.inputMessages = len(request.Contents)
 	metadata.inputTextChars = textChars
 	metadata.inputMedia = media
@@ -354,9 +371,56 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 		inputMedia: metadata.inputMedia, inputMediaBytes: metadata.inputMediaBytes, inputFiles: metadata.inputFiles,
 		temperature: metadata.temperature, topP: metadata.topP, topK: metadata.topK,
 		thinking: metadata.thinking, maxOutputTokens: metadata.maxOutputTokens, seed: metadata.seed, requestID: metadata.requestID,
+		queueWait: metadata.queueWait, proof: metadata.proof,
+		attempts: slices.Clone(metadata.attempts), authorized: metadata.authorized,
 	}
 	metadata.mu.Unlock()
 	return snapshot
+}
+
+// id 返回请求日志使用的请求 ID
+func (metadata *accessLogMetadata) id() string {
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	return metadata.requestID
+}
+
+// MarkAccessLogScheduled 记录请求从进入服务到取得本次执行账户的排队时间（换号重试时以最后一次为准）
+func MarkAccessLogScheduled(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		if !metadata.startedAt.IsZero() {
+			metadata.queueWait = time.Since(metadata.startedAt)
+		}
+		metadata.mu.Unlock()
+	}
+}
+
+// markAccessLogAuthorized 标记请求已通过公开 API key 校验
+func markAccessLogAuthorized(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.authorized = true
+		metadata.mu.Unlock()
+	}
+}
+
+// AddAccessLogAttempt 追加一次未成功的上游尝试
+func AddAccessLogAttempt(ctx context.Context, attempt RequestAttempt) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.attempts = append(metadata.attempts, attempt)
+		metadata.mu.Unlock()
+	}
+}
+
+// AddAccessLogProof 累计请求等待并生成 WAA proof 的时间
+func AddAccessLogProof(ctx context.Context, duration time.Duration) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.proof += duration
+		metadata.mu.Unlock()
+	}
 }
 
 // SetAccessLogFirstEvent 写入首个上游语义事件耗时
@@ -477,7 +541,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径
 			path = tracePrefix + path
 		}
-		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, requestID: newID("req")}
+		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, requestID: newID("req"), startedAt: started}
 		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}
 		request := r.WithContext(context.WithValue(r.Context(), accessLogContextKey{}, metadata))
 		next.ServeHTTP(writer, request)
@@ -503,6 +567,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		if admin != nil {
 			admin.RecordAccessLog(AccessLog{
 				Status: status, Latency: time.Since(started), FirstEvent: snapshot.firstEvent,
+				QueueWait: snapshot.queueWait, Proof: snapshot.proof,
 				UpstreamBytes: snapshot.upstreamBytes, Usage: snapshot.usage, ToolCalls: snapshot.toolCalls,
 				InputMessages: snapshot.inputMessages, InputTextChars: snapshot.inputTextChars,
 				InputMedia: snapshot.inputMedia, InputMediaBytes: snapshot.inputMediaBytes, InputFiles: snapshot.inputFiles,
@@ -512,7 +577,8 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				Method:    r.Method, Path: path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade,
-				Canceled: snapshot.canceled, Generation: snapshot.generation,
+				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
+				Authorized: snapshot.authorized,
 			})
 		}
 	})
@@ -634,6 +700,8 @@ func authMiddleware(requiredKey func() string, next http.Handler) http.Handler {
 			writeAuthError(w, r)
 			return
 		}
+		// 只有真正校验过密钥的请求才标记：没有配置密钥（只在测试中出现）时不算通过校验，不写入用量账本
+		markAccessLogAuthorized(r.Context())
 		next.ServeHTTP(w, r)
 	})
 }

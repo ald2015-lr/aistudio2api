@@ -103,8 +103,11 @@ type RequestLog struct {
 	InputFiles      int                         `json:"input_files,omitempty"`
 	Parameters      map[string]string           `json:"parameters,omitempty"`
 	FirstEventMS    float64                     `json:"first_event_ms,omitempty"`
-	UpstreamBytes   int64                       `json:"upstream_bytes,omitempty"`
-	Channel         string                      `json:"channel,omitempty"`
+	// QueueMS 为进入服务到取得最终执行账户的时间，ProofMS 为等待并生成 WAA proof 的累计时间
+	QueueMS       float64 `json:"queue_ms,omitempty"`
+	ProofMS       float64 `json:"proof_ms,omitempty"`
+	UpstreamBytes int64   `json:"upstream_bytes,omitempty"`
+	Channel       string  `json:"channel,omitempty"`
 }
 
 // RequestLogUsage 区分输入、思考、回复与端到端输出速率
@@ -122,6 +125,8 @@ type AccessLog struct {
 	Status          int
 	Latency         time.Duration
 	FirstEvent      time.Duration
+	QueueWait       time.Duration
+	Proof           time.Duration
 	UpstreamBytes   int64
 	Usage           *aistudio.Usage
 	ToolCalls       int
@@ -149,6 +154,10 @@ type AccessLog struct {
 	Error           string
 	Canceled        bool
 	Generation      bool
+	// Attempts 为最终结果之前未成功的上游尝试
+	Attempts []RequestAttempt
+	// Authorized 表示请求通过了公开 API key 校验
+	Authorized bool
 }
 
 // AdminAccountCounts 表示账户状态计数
