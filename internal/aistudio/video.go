@@ -251,7 +251,7 @@ func (s *PooledService) GenerateVideo(ctx context.Context, request VideoRequest)
 	selection := AccountSelection{
 		ModelID: modelID, Method: "predictLongRunning", AccountID: requestedAccountID, ResourceID: resourceID,
 	}
-	maxAttempts := accountAttemptLimit(s.pool, selection.AccountID != "" || selection.ResourceID != "")
+	maxAttempts := accountAttemptLimit(ctx, s.pool, selection.AccountID != "" || selection.ResourceID != "")
 	recoveryAccountID := ""
 	var operation VideoOperation
 	var generateErr error

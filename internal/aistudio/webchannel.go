@@ -173,7 +173,7 @@ func (s *PooledService) OpenBidi(ctx context.Context, request BidiRequest) (*Bid
 		pinned = true
 	}
 	baseAccountID := selection.AccountID
-	maxAttempts := accountAttemptLimit(s.pool, pinned)
+	maxAttempts := accountAttemptLimit(ctx, s.pool, pinned)
 	recoveryAccountID := ""
 	var requestErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {

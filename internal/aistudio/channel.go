@@ -284,12 +284,12 @@ func (p *AccountPool) hasPlaygroundModelLocked(modelID string) bool {
 	return exists
 }
 
-func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
+func (p *AccountPool) hasBuildModelLocked(modelID string, method string, scope PoolScope) bool {
 	if !p.channelEnabledLocked(ChannelBuild) {
 		return false
 	}
 	for _, account := range p.accounts {
-		if account == nil {
+		if account == nil || !scope.allows(account) {
 			continue
 		}
 		for _, model := range account.buildModels {
@@ -301,8 +301,8 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string) bool {
 	return false
 }
 
-// modelChannelsLocked 返回至少一个启用账户可以调用模型的通道
-func (p *AccountPool) modelChannelsLocked(model Model) []string {
+// modelChannelsInLocked 返回号池内至少一个启用账户可以调用模型的通道
+func (p *AccountPool) modelChannelsInLocked(model Model, scope PoolScope) []string {
 	selection := AccountSelection{ModelID: model.ID}
 	if hasMethod(model, "generateContent") {
 		selection.Method = "generateContent"
@@ -310,7 +310,7 @@ func (p *AccountPool) modelChannelsLocked(model Model) []string {
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {
 		for _, account := range p.accounts {
-			if account != nil && account.Config.Enabled && p.channelSupportsLocked(account, channel, selection) {
+			if account != nil && account.Config.Enabled && scope.allows(account) && p.channelSupportsLocked(account, channel, selection) {
 				channels = append(channels, string(channel))
 				break
 			}

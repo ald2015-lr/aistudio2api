@@ -2499,9 +2499,9 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	service.lifecycleMu.Unlock()
 }
 
-// Models 返回启用账户具有模型资格的公开目录
-func (service *trackedService) Models(context.Context) ([]aistudio.Model, error) {
-	return service.pool.EligibleModels(service.modelSnapshot()), nil
+// Models 返回请求号池内启用账户具有模型资格的公开目录：/ultra 只列 Ultra 号池账户可用的模型
+func (service *trackedService) Models(ctx context.Context) ([]aistudio.Model, error) {
+	return service.pool.EligibleModelsIn(aistudio.PoolScopeFromContext(ctx), service.modelSnapshot()), nil
 }
 
 // catalogModels 返回管理页使用的完整目录与各模型可用通道
@@ -2912,7 +2912,7 @@ func (service *trackedService) observedDataRequestContext(
 
 // CountTokens 返回上游权威输入 token 数
 func (service *trackedService) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, request.Model)
 	if err != nil {
 		return aistudio.TokenCount{}, err
@@ -2926,7 +2926,7 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 // GenerateVideo 创建一个 Veo 长任务
 func (service *trackedService) GenerateVideo(ctx context.Context, request aistudio.VideoRequest) (aistudio.VideoOperation, error) {
 	api.SetAccessLogTarget(ctx, request.Model, "")
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
@@ -3071,6 +3071,8 @@ func (closer *trackedMediaReadCloser) Close() error {
 }
 
 func (service *trackedService) acquireWarmLease(ctx context.Context, selection aistudio.AccountSelection) (*aistudio.AccountLease, error) {
+	// 号池写进选择条件：分类、选号、等待队列与没有账户时的错误都只看请求的号池
+	selection = aistudio.ScopedSelection(ctx, selection)
 	fixedAccount := strings.TrimSpace(selection.AccountID) != "" || strings.TrimSpace(selection.ResourceID) != ""
 	failedWorkers := make(map[string]struct{})
 	var promoteFailure error
@@ -3440,7 +3442,7 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	trace.AddParameters("发往上游（seed 与随机后缀处理后）", request)
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
 	// 选号前就能判断的参数错误直接返回 400，不占用账号：既没有系统提示也没有对话内容（例如消息全被过滤掉），
 	// 工具选择本身不成立（指定了未声明的函数、要求调用却没有工具），停止序列超限，或媒体分辨率不是可用的枚举名
 	var invalid error
@@ -3504,13 +3506,15 @@ func (service *trackedService) generateWithRetry(
 	diag *generationDiagnostics,
 ) {
 	trace := aistudio.TraceFromContext(requestCtx)
+	// scope 为请求可以使用的号池：换号、文件复制与通道回退都只在这个号池内进行
+	scope := aistudio.PoolScopeFromContext(requestCtx)
 	maxAttempts := 1
 	requestedAccountID := strings.TrimSpace(request.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	unbound := requestedAccountID == "" && resourceID == ""
 	fileBound := requestedAccountID == "" && resourceID != ""
 	if unbound || fileBound {
-		_, eligible := service.pool.EnabledAccounts()
+		_, eligible := service.pool.EnabledAccountsIn(scope)
 		if eligible > 1 {
 			maxAttempts = eligible
 		}
@@ -3547,7 +3551,7 @@ func (service *trackedService) generateWithRetry(
 		}
 		selection := aistudio.AccountSelection{
 			ModelID: modelID, Method: "generateContent",
-			AccountID: selectionAccountID, ResourceID: selectionResourceID,
+			AccountID: selectionAccountID, ResourceID: selectionResourceID, Pool: scope,
 		}
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
 			selection.PlaygroundOnly = true
@@ -3560,7 +3564,7 @@ func (service *trackedService) generateWithRetry(
 			selection.PlaygroundFirst = true
 		}
 		if (unbound || fileBound) && len(attempted) > 0 {
-			enabled, _ := service.pool.EnabledAccounts()
+			enabled, _ := service.pool.EnabledAccountsIn(scope)
 			for _, accountID := range enabled {
 				if _, exists := attempted[accountID]; !exists {
 					selection.AllowedAccountIDs = append(selection.AllowedAccountIDs, accountID)

@@ -13,7 +13,7 @@ import (
 // OpenBidi 将实时会话绑定到当前生成服务生命周期
 func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.BidiRequest) (*aistudio.BidiSession, error) {
 	api.SetAccessLogTarget(ctx, request.Model, "")
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
 	requestCtx, cancel, err := service.bidiRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
@@ -88,6 +88,7 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 	modelID := strings.TrimPrefix(strings.TrimSpace(model), "models/")
 	selection := aistudio.AccountSelection{
 		ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "bidiGenerateContent",
+		Pool: aistudio.PoolScopeFromContext(ctx),
 	}
 	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
 	if err != nil {

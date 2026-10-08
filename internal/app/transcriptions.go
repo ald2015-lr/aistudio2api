@@ -18,7 +18,7 @@ func (service *trackedService) Transcribe(
 	api.SetAccessLogTarget(ctx, request.Model, "")
 	api.SetAccessLogGenerationConfig(ctx, request.Config)
 	api.StartAccessLog(ctx)
-	request.Model = service.pool.CanonicalModelID(request.Model)
+	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
@@ -121,6 +121,7 @@ func (service *trackedService) transcriptionCandidates(ctx context.Context, mode
 	selection := aistudio.AccountSelection{
 		ModelID: modelID, ModelAccessScope: modelID,
 		Method: "generateContent", Capability: "transcription_output",
+		Pool: aistudio.PoolScopeFromContext(ctx),
 	}
 	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
 	if err != nil {

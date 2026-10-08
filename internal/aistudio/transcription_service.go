@@ -79,7 +79,7 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 		ModelID: modelID, ModelAccessScope: modelID, Method: "generateContent", Capability: "transcription_output",
 	}
 	_, pinned := AccountLeaseFromContext(ctx)
-	maxAttempts := accountAttemptLimit(s.pool, pinned)
+	maxAttempts := accountAttemptLimit(ctx, s.pool, pinned)
 	attempted := make(map[string]struct{}, maxAttempts)
 	var result TranscriptionResult
 	var requestErr error

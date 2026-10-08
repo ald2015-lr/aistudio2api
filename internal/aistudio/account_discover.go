@@ -141,6 +141,8 @@ func (p *AccountPool) ClassifyCandidatesCached(
 type BootstrapSummary struct {
 	// Available 为启用、就绪或忙碌且有 WAA 初始化模型的账户数（与 Status 的状态推导一致）
 	Available int
+	// UltraAvailable 为 Available 中属于 Ultra 号池的账户数（Ultra Worker 分区的预热目标上限）
+	UltraAvailable int
 	// ModelIDs 为全部账户出现过的初始化模型，去重并按首次出现顺序排列
 	ModelIDs []string
 }
@@ -174,6 +176,9 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		// 与 Status 共用状态推导：需要登录的账户即使还有未结束的租约也不计入可预热
 		if state := accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
 			summary.Available++
+			if account.BenefitTier == BenefitTierUltra {
+				summary.UltraAvailable++
+			}
 		}
 	}
 	return summary
@@ -225,9 +230,15 @@ type AccountStateCounts struct {
 // StateCounts 一次加锁统计各状态账户数，不构建完整状态。
 // 状态接口每几秒被管理页调用一次；账户上千时构建完整状态（逐个排序模型、拷贝冷却表）会长时间占用账户池锁
 func (p *AccountPool) StateCounts() AccountStateCounts {
-	var counts AccountStateCounts
+	counts, _ := p.PoolStateCounts()
+	return counts
+}
+
+// PoolStateCounts 一次加锁统计全部账户与其中 Ultra 号池账户的各状态数量
+func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts) {
+	var counts, ultra AccountStateCounts
 	if p == nil {
-		return counts
+		return counts, ultra
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -236,19 +247,28 @@ func (p *AccountPool) StateCounts() AccountStateCounts {
 		if account == nil {
 			continue
 		}
-		counts.Total++
-		switch accountStateLocked(account, now) {
-		case AccountReady:
-			counts.Ready++
-		case AccountBusy:
-			counts.Busy++
-		case AccountCooldown:
-			counts.Cooldown++
-		case AccountAuthRequired:
-			counts.AuthRequired++
+		state := accountStateLocked(account, now)
+		counts.add(state)
+		if account.BenefitTier == BenefitTierUltra {
+			ultra.add(state)
 		}
 	}
-	return counts
+	return counts, ultra
+}
+
+// add 计入一个账户的对外状态
+func (counts *AccountStateCounts) add(state AccountState) {
+	counts.Total++
+	switch state {
+	case AccountReady:
+		counts.Ready++
+	case AccountBusy:
+		counts.Busy++
+	case AccountCooldown:
+		counts.Cooldown++
+	case AccountAuthRequired:
+		counts.AuthRequired++
+	}
 }
 
 // StatusOf 返回单个账户的状态，只构建这一个账户
@@ -347,9 +367,9 @@ func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, min
 	return result
 }
 
-// SpareAccounts 统计可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型，
+// SpareAccounts 统计号池内可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型，
 // 并且没有在任一指定模型上长时间不可用，一次加锁
-func (p *AccountPool) SpareAccounts(exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration) int {
+func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration) int {
 	if p == nil {
 		return 0
 	}
@@ -358,7 +378,7 @@ func (p *AccountPool) SpareAccounts(exclude map[string]struct{}, modelIDs []stri
 	now := time.Now()
 	spare := 0
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
 			continue
 		}
 		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModels(account)) == 0 {

@@ -326,10 +326,12 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 	maxAttempts := 1
 	var candidateAccountIDs []string
 	if automatic {
-		candidateAccountIDs = s.pool.fileUploadAccountIDs()
+		// 只在请求的号池内选上传账户：/ultra 上传的文件绑定 Ultra 号池账户，之后也只能经 /ultra 使用
+		scope := PoolScopeFromContext(ctx)
+		candidateAccountIDs = s.pool.fileUploadAccountIDs(scope)
 		if len(candidateAccountIDs) == 0 {
 			// 上传不限模型，任何就绪账户都能承担：一个都没有时是号池一侧的原因（需要重新登录、已停用或号池为空）
-			return FileRef{}, s.pool.NoEligibleError(AccountSelection{})
+			return FileRef{}, s.pool.NoEligibleError(AccountSelection{Pool: scope})
 		}
 		maxAttempts = len(candidateAccountIDs)
 	}
@@ -395,12 +397,12 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 	return file, uploadErr
 }
 
-func (p *AccountPool) fileUploadAccountIDs() []string {
+func (p *AccountPool) fileUploadAccountIDs(scope PoolScope) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	available := make([]string, 0, len(p.accounts))
 	busy := make([]string, 0, len(p.accounts))
-	indices, _ := p.selectionIndicesLocked(AccountSelection{})
+	indices, _ := p.selectionIndicesLocked(AccountSelection{Pool: scope})
 	for _, index := range indices {
 		account := p.accounts[index]
 		if account == nil || !account.Config.Enabled || account.State != AccountReady {
@@ -486,6 +488,9 @@ func (p *AccountPool) FileMetadata(ctx context.Context, fileID string) (FileMeta
 	account := p.byID[accountID]
 	if account == nil {
 		return FileMetadata{}, fmt.Errorf("资源账户不存在: %s", accountID)
+	}
+	if err := p.resourcePoolErrorLocked(PoolScopeFromContext(ctx), fileID, accountID); err != nil {
+		return FileMetadata{}, err
 	}
 	binding, exists := account.runtime.Resources[fileID]
 	if !exists || binding.Kind != "drive-file" || binding.Name == "" || binding.MIME == "" || binding.Size <= 0 || binding.Purpose == "" {
@@ -860,6 +865,10 @@ func (p *AccountPool) fileReferenceMetadata(ctx context.Context, fileID, targetI
 	if account == nil {
 		return "", FileMetadata{}, fmt.Errorf("资源账户不存在: %s", owner)
 	}
+	// 跨账户复制文件要用文件所属账户下载：所属账户不在请求的号池时拒绝，不能借用池外账户
+	if err := p.resourcePoolErrorLocked(PoolScopeFromContext(ctx), fileID, owner); err != nil {
+		return "", FileMetadata{}, err
+	}
 	binding, exists := account.runtime.Resources[fileID]
 	if exists && owner == targetID && binding.Kind == "video-file" {
 		return owner, FileMetadata{}, nil
@@ -1203,6 +1212,10 @@ func (pool *AccountPool) ResourceIDForContents(ctx context.Context, contents []C
 			accountID, exists := pool.resources[id]
 			if !exists {
 				return "", &fileReferenceNotFoundError{fileID: id}
+			}
+			// 引用的每个文件都必须属于请求号池内的账户，否则直接拒绝（不复制、不借用池外账户）
+			if err := pool.resourcePoolErrorLocked(PoolScopeFromContext(ctx), id, accountID); err != nil {
+				return "", err
 			}
 			account := pool.byID[accountID]
 			binding, bound := account.runtime.Resources[id]

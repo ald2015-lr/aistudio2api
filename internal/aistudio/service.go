@@ -515,7 +515,7 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	var count TokenCount
 	var requestErr error
-	for attempt := 0; attempt < accountAttemptLimit(s.pool, false); attempt++ {
+	for attempt := 0; attempt < accountAttemptLimit(ctx, s.pool, false); attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
@@ -582,7 +582,7 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		pinned = true
 	}
 	var requestErr error
-	for attempt := 0; attempt < accountAttemptLimit(s.pool, pinned); attempt++ {
+	for attempt := 0; attempt < accountAttemptLimit(ctx, s.pool, pinned); attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
@@ -624,16 +624,12 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	return nil, requestErr
 }
 
-func accountAttemptLimit(pool *AccountPool, pinned bool) int {
+// accountAttemptLimit 返回不固定账户请求的换号上限：请求号池内启用且就绪或忙碌的账户数
+func accountAttemptLimit(ctx context.Context, pool *AccountPool, pinned bool) int {
 	if pinned {
 		return 1
 	}
-	eligible := 0
-	for _, status := range pool.Status() {
-		if status.Enabled && (status.State == AccountReady || status.State == AccountBusy) {
-			eligible++
-		}
-	}
+	eligible := pool.attemptCandidatesIn(PoolScopeFromContext(ctx))
 	if eligible > 0 {
 		return eligible
 	}

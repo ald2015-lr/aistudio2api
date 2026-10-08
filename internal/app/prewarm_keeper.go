@@ -208,7 +208,7 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	for _, accountID := range workers.OpeningAccountIDs() {
 		occupied[accountID] = struct{}{}
 	}
-	limit := min(workers.warmConcurrencyValue(), service.pool.SpareAccounts(occupied, hot, rotationMinRemaining))
+	limit := min(workers.warmConcurrencyValue(), service.pool.SpareAccounts(aistudio.PoolScopeAll, occupied, hot, rotationMinRemaining))
 	if limit <= 0 {
 		return
 	}

@@ -103,10 +103,16 @@ type AccountsNotReadyError struct {
 	Reasons []string
 	// Cause 为触发该错误的内部原因（如账户 runtime 被其他进程占用），可为空
 	Cause error
+	// Pool 为请求限定的号池；限定号池时错误原因里写明号池（如 Ultra 号池没有可用账户）
+	Pool PoolScope
 }
 
 func (e *AccountsNotReadyError) Error() string {
-	message := ErrNoEligibleAccount.Error() + "：" + strings.Join(e.Reasons, "；")
+	message := ErrNoEligibleAccount.Error() + "："
+	if label := e.Pool.Label(); label != "" {
+		message += label + "："
+	}
+	message += strings.Join(e.Reasons, "；")
 	if e.Cause != nil {
 		message += ": " + e.Cause.Error()
 	}
@@ -143,6 +149,8 @@ const (
 	leaseReplacedReason = "候选账户在调度期间被移除或替换"
 	// emptyPoolReason 为账户池中没有任何账户时的原因
 	emptyPoolReason = "账户池中没有账户"
+	// emptyUltraPoolReason 为 Ultra 号池中没有任何账户时的原因
+	emptyUltraPoolReason = "没有权益为 Ultra 的账户"
 )
 
 // accountStateLabels 为不可调度账户状态的中文说明
@@ -241,18 +249,22 @@ type Account struct {
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
 type AccountStatus struct {
-	ID          string                   `json:"id"`
-	Label       string                   `json:"label"`
-	State       AccountState             `json:"state"`
-	Enabled     bool                     `json:"enabled"`
-	Proxy       string                   `json:"proxy"`
-	Locale      string                   `json:"locale"`
-	Timezone    string                   `json:"timezone"`
-	Models      []string                 `json:"models"`
-	BenefitTier string                   `json:"benefit_tier"`
-	Cooldowns   map[string]CooldownState `json:"-"`
-	LastUsed    *time.Time               `json:"last_used,omitempty"`
-	Message     string                   `json:"message,omitempty"`
+	ID          string       `json:"id"`
+	Label       string       `json:"label"`
+	State       AccountState `json:"state"`
+	Enabled     bool         `json:"enabled"`
+	Proxy       string       `json:"proxy"`
+	Locale      string       `json:"locale"`
+	Timezone    string       `json:"timezone"`
+	Models      []string     `json:"models"`
+	BenefitTier string       `json:"benefit_tier"`
+	// BenefitTierKnown 表示账户权益已经从官网读取过（运行态里有目录指纹）；尚未读取的账户按 Free 显示，属于普通号池
+	BenefitTierKnown bool `json:"benefit_tier_known"`
+	// Pool 为账户当前所属的号池：ultra 或 normal
+	Pool      string                   `json:"pool"`
+	Cooldowns map[string]CooldownState `json:"-"`
+	LastUsed  *time.Time               `json:"last_used,omitempty"`
+	Message   string                   `json:"message,omitempty"`
 }
 
 // AccountSelection 描述账户调度所需的能力或粘性条件
@@ -270,6 +282,8 @@ type AccountSelection struct {
 	// PlaygroundFirst 只用 Playground 通道选号（降级判定：该通道每块都带累计正文数，判定最准）；
 	// 没有可用的 Playground 账号时由调用方去掉该标记重新选号，退回其他通道
 	PlaygroundFirst bool
+	// Pool 为可以使用的号池；不限号池时由 AcquireFor 等入口取 context 中请求的号池（见 PoolScope）
+	Pool PoolScope
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -779,7 +793,7 @@ func (p *AccountPool) CatalogModels(models []Model) []Model {
 	defer p.mu.Unlock()
 	catalog := make([]Model, len(models))
 	for index, model := range models {
-		model.Channels = p.modelChannelsLocked(model)
+		model.Channels = p.modelChannelsInLocked(model, PoolScopeAll)
 		catalog[index] = model
 	}
 	return catalog
@@ -787,44 +801,12 @@ func (p *AccountPool) CatalogModels(models []Model) []Model {
 
 // EligibleModels 返回至少一个启用账户具有模型资格的目录项
 func (p *AccountPool) EligibleModels(models []Model) []Model {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	eligible := make([]Model, 0, len(models))
-	for _, model := range models {
-		if channels := p.modelChannelsLocked(model); len(channels) > 0 {
-			model.Channels = channels
-			eligible = append(eligible, model)
-		}
-	}
-	return eligible
+	return p.EligibleModelsIn(PoolScopeAll, models)
 }
 
 // CanonicalModelID 把实时目录中的模型别名换成上游接受的正式模型 ID
 func (p *AccountPool) CanonicalModelID(modelID string) string {
-	trimmed := strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
-	if p == nil || trimmed == "" {
-		return modelID
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	canonical := ""
-	for _, account := range p.accounts {
-		if account == nil {
-			continue
-		}
-		for _, model := range account.Models {
-			if model.ID == trimmed {
-				return modelID
-			}
-			if canonical == "" && modelMatchesID(model, trimmed) {
-				canonical = model.ID
-			}
-		}
-	}
-	if canonical == "" {
-		return modelID
-	}
-	return canonical
+	return p.CanonicalModelIDIn(PoolScopeAll, modelID)
 }
 
 func modelMatchesID(model Model, modelID string) bool {
@@ -1133,6 +1115,7 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 	if p == nil {
 		return nil, PoolNotReady(poolMissingReason, nil)
 	}
+	selection = ScopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, err
@@ -1223,6 +1206,7 @@ func (p *AccountPool) TryAcquireFor(ctx context.Context, selection AccountSelect
 	if p == nil {
 		return nil, false, PoolNotReady(poolMissingReason, nil)
 	}
+	selection = ScopedSelection(ctx, selection)
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, false, err
@@ -1298,6 +1282,12 @@ func (p *AccountPool) refreshAndValidateLease(
 		if owner, exists := p.resources[resourceID]; !exists || owner != account.ID {
 			return false, ErrResourceNotFound
 		}
+		if err := p.resourcePoolErrorLocked(selection.Pool, resourceID, account.ID); err != nil {
+			return false, err
+		}
+	} else if !selection.Pool.allows(account) {
+		// 刷新运行态期间账户权益变化、已不属于请求的号池：放弃这个账户重新选号
+		return false, nil
 	}
 	if selection.ModelID != "" && !p.channelSupportsLocked(account, lease.Channel(), selection) {
 		return false, nil
@@ -1325,7 +1315,7 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	var reasons []string
 	for _, account := range p.accounts {
-		if account == nil || account.Config.Enabled && account.State == AccountReady {
+		if account == nil || account.Config.Enabled && account.State == AccountReady || !selection.Pool.allows(account) {
 			continue
 		}
 		if selection.ModelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
@@ -1345,12 +1335,21 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 		reasons = append(reasons, reason)
 	}
 	if len(reasons) > 0 {
-		return &AccountsNotReadyError{Reasons: reasons}
+		return &AccountsNotReadyError{Reasons: reasons, Pool: selection.Pool}
 	}
-	if !p.hasAccountLocked() {
-		return PoolNotReady(emptyPoolReason, nil)
+	if !p.hasAccountLocked(selection.Pool) {
+		return emptyPoolError(selection.Pool)
 	}
 	return ErrNoEligibleAccount
+}
+
+// emptyPoolError 返回号池中没有任何账户时的号池暂时不可调度错误；Ultra 号池为空说明没有权益为 Ultra 的账户
+func emptyPoolError(scope PoolScope) *AccountsNotReadyError {
+	reason := emptyPoolReason
+	if scope == PoolScopeUltra {
+		reason = emptyUltraPoolReason
+	}
+	return &AccountsNotReadyError{Reasons: []string{reason}, Pool: scope}
 }
 
 // NoCandidateError 返回候选分组为空时的错误：有账户在冷却时按全部冷却（429，带最早恢复时间），否则同 NoEligibleError
@@ -1361,9 +1360,9 @@ func (p *AccountPool) NoCandidateError(selection AccountSelection, groups Accoun
 	return p.NoEligibleError(selection)
 }
 
-func (p *AccountPool) hasAccountLocked() bool {
+func (p *AccountPool) hasAccountLocked(scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account != nil {
+		if account != nil && scope.allows(account) {
 			return true
 		}
 	}
@@ -1372,16 +1371,16 @@ func (p *AccountPool) hasAccountLocked() bool {
 
 // catalogMissingErrorLocked 号池里还没有任何账户的模型目录：号池为空、启动阶段目录仍在同步，或账户都需要重新登录。
 // 这时无法判断模型是否存在，属于号池一侧的暂时性原因，不能按模型不存在返回
-func (p *AccountPool) catalogMissingErrorLocked() error {
-	if !p.hasAccountLocked() {
-		return PoolNotReady(emptyPoolReason, nil)
+func (p *AccountPool) catalogMissingErrorLocked(scope PoolScope) error {
+	if !p.hasAccountLocked(scope) {
+		return emptyPoolError(scope)
 	}
 	reasons := []string{"账户模型目录尚未加载"}
 	var notReady *AccountsNotReadyError
-	if errors.As(p.noEligibleErrorLocked(AccountSelection{}), &notReady) {
+	if errors.As(p.noEligibleErrorLocked(AccountSelection{Pool: scope}), &notReady) {
 		reasons = append(reasons, notReady.Reasons...)
 	}
-	return &AccountsNotReadyError{Reasons: reasons}
+	return &AccountsNotReadyError{Reasons: reasons, Pool: scope}
 }
 
 func (p *AccountPool) markStaleAccountUnavailable(account *Account) {
@@ -1405,16 +1404,16 @@ func (p *AccountPool) validateSelectionLocked(selection AccountSelection) error 
 	if modelID == "" {
 		return nil
 	}
-	if !p.hasModelCatalogLocked() {
-		return p.catalogMissingErrorLocked()
+	if !p.hasModelCatalogLocked(selection.Pool) {
+		return p.catalogMissingErrorLocked(selection.Pool)
 	}
-	if !p.hasModelLocked(modelID) {
+	if !p.hasModelLocked(modelID, selection.Pool) {
 		return fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
 	}
-	if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method) {
+	if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method, selection.Pool) {
 		return fmt.Errorf("%w: 模型 %s 不支持 %s", ErrModelNotFound, modelID, selection.Method)
 	}
-	if selection.Capability != "" && !p.hasModelCapabilityLocked(modelID, selection.Capability) {
+	if selection.Capability != "" && !p.hasModelCapabilityLocked(modelID, selection.Capability, selection.Pool) {
 		return fmt.Errorf("%w: 模型 %s 不支持 %s", ErrModelNotFound, modelID, selection.Capability)
 	}
 	return nil
@@ -2501,8 +2500,11 @@ func accountStatusLocked(account *Account, now time.Time) AccountStatus {
 		Timezone:    account.Config.Timezone,
 		Models:      models,
 		BenefitTier: account.BenefitTier.String(),
-		Cooldowns:   cloneCooldowns(account.runtime.Cooldowns),
-		Message:     account.stateMessage,
+		// 权益来自目录同步：保存过目录指纹才算已经读取
+		BenefitTierKnown: account.runtime.CatalogFingerprint != "",
+		Pool:             PoolOfTier(account.BenefitTier).String(),
+		Cooldowns:        cloneCooldowns(account.runtime.Cooldowns),
+		Message:          account.stateMessage,
 	}
 	if !account.LastUsed.IsZero() {
 		status.LastUsed = timePointer(account.LastUsed)
@@ -2519,6 +2521,7 @@ func (p *AccountPool) ClassifyCandidates(
 	if p == nil {
 		return AccountCandidateGroups{}, PoolNotReady(poolMissingReason, nil)
 	}
+	selection = ScopedSelection(ctx, selection)
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
@@ -2551,13 +2554,13 @@ func (p *AccountPool) classifyCandidatesLocked(
 ) (AccountCandidateGroups, error) {
 	modelID := selection.ModelID
 	if modelID != "" {
-		if !p.hasModelCatalogLocked() {
-			return AccountCandidateGroups{}, p.catalogMissingErrorLocked()
+		if !p.hasModelCatalogLocked(selection.Pool) {
+			return AccountCandidateGroups{}, p.catalogMissingErrorLocked(selection.Pool)
 		}
-		if !p.hasModelLocked(modelID) {
+		if !p.hasModelLocked(modelID, selection.Pool) {
 			return AccountCandidateGroups{}, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
 		}
-		if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method) {
+		if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method, selection.Pool) {
 			return AccountCandidateGroups{}, fmt.Errorf("%w: 模型 %s 不支持 %s", ErrModelNotFound, modelID, selection.Method)
 		}
 	}
@@ -2672,9 +2675,9 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	return nil, earliest, waitable, nil
 }
 
-func (p *AccountPool) hasModelLocked(modelID string) bool {
+func (p *AccountPool) hasModelLocked(modelID string, scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account == nil {
+		if account == nil || !scope.allows(account) {
 			continue
 		}
 		for _, model := range account.Models {
@@ -2683,21 +2686,21 @@ func (p *AccountPool) hasModelLocked(modelID string) bool {
 			}
 		}
 	}
-	return p.hasBuildModelLocked(modelID, "")
+	return p.hasBuildModelLocked(modelID, "", scope)
 }
 
-func (p *AccountPool) hasModelCatalogLocked() bool {
+func (p *AccountPool) hasModelCatalogLocked(scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account != nil && len(account.Models) > 0 {
+		if account != nil && len(account.Models) > 0 && scope.allows(account) {
 			return true
 		}
 	}
 	return false
 }
 
-func (p *AccountPool) hasModelMethodLocked(modelID string, method string) bool {
+func (p *AccountPool) hasModelMethodLocked(modelID string, method string, scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account == nil {
+		if account == nil || !scope.allows(account) {
 			continue
 		}
 		for _, model := range account.Models {
@@ -2706,12 +2709,12 @@ func (p *AccountPool) hasModelMethodLocked(modelID string, method string) bool {
 			}
 		}
 	}
-	return p.hasBuildModelLocked(modelID, method)
+	return p.hasBuildModelLocked(modelID, method, scope)
 }
 
-func (p *AccountPool) hasModelCapabilityLocked(modelID string, capability string) bool {
+func (p *AccountPool) hasModelCapabilityLocked(modelID string, capability string, scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account == nil {
+		if account == nil || !scope.allows(account) {
 			continue
 		}
 		for _, model := range account.Models {
@@ -2800,6 +2803,10 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		if accountID != "" && accountID != owner {
 			return nil, fmt.Errorf("资源 %s 绑定账户 %s", selection.ResourceID, owner)
 		}
+		// 资源绑定在号池之外的账户上：直接拒绝，不能改用池外账户
+		if err := p.resourcePoolErrorLocked(selection.Pool, selection.ResourceID, owner); err != nil {
+			return nil, err
+		}
 		accountID = owner
 	}
 	if accountID != "" {
@@ -2809,6 +2816,9 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 					if _, exists := allowed[accountID]; !exists {
 						return nil, ErrNoEligibleAccount
 					}
+				}
+				if !selection.Pool.allows(account) {
+					return nil, ErrNoEligibleAccount
 				}
 				return []int{index}, nil
 			}
@@ -2820,7 +2830,7 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 	indices := make([]int, 0, len(sorted))
 	for _, index := range sorted {
 		account := p.accounts[index]
-		if account == nil {
+		if account == nil || !selection.Pool.allows(account) {
 			continue
 		}
 		if allowed != nil {
@@ -2883,22 +2893,7 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 
 // EnabledAccounts 返回已启用账户 ID 与其中 ready 或 busy 的账户数量
 func (p *AccountPool) EnabledAccounts() ([]string, int) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	now := time.Now()
-	ids := make([]string, 0, len(p.accounts))
-	schedulable := 0
-	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled {
-			continue
-		}
-		ids = append(ids, account.ID)
-		_, cooling := accountCooldown(account, "", now)
-		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 || account.State == AccountReady && !cooling {
-			schedulable++
-		}
-	}
-	return ids, schedulable
+	return p.EnabledAccountsIn(PoolScopeAll)
 }
 
 // Activity 返回账户是否存在活动租约或独占操作及最近使用时间
@@ -3389,7 +3384,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 	p.mu.Lock()
 	accounts := make([]*Account, 0, len(p.accounts))
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || !selection.Pool.allows(account) {
 			continue
 		}
 		if requestedAccountID != "" && account.ID != requestedAccountID {
