@@ -478,6 +478,7 @@ cp .env.example .env
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
+| `STREAM_PLAYGROUND_MODELS` | empty | Comma-separated models whose streaming requests go to Playground first. Models that need a subscription return the whole reply at once on the Build channel; streaming requests for the listed models use Playground first and stream chunk by chunk, switching to Build immediately when every Playground account is busy instead of waiting for Playground. Empty lets Playground and Build rotate as usual; non-streaming requests are not affected. Service Configuration in the management UI lists the catalog models that need a subscription and are available on Playground; changes apply immediately |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 | `AUTO_START` | `true` | Start the generation service automatically when the management process starts, retrying transient failures from 5 seconds up to 1 minute apart; `false` keeps it `STOPPED` until started from the management page |

@@ -179,6 +179,11 @@ const zhCN = {
   'settings.upstreamChannels': '上游通道',
   'settings.upstreamChannelsHelp':
     'Playground 与 Build 是同一账户的两份独立额度，同时启用时按账户与通道组合调度，一个通道冷却后由另一个通道继续；至少启用一个。',
+  'settings.streamPlaygroundModels': '流式优先 Playground 的模型',
+  'settings.streamPlaygroundModelsHelp':
+    '需要订阅权益的模型在 Build 通道只能一次性返回整段回复，流式输出会在最后一次性出现。列表中的模型的流式请求先用 Playground（逐块返回）；Playground 账号都在忙时立即改用 Build，不排队等待 Playground。逗号分隔的模型 ID；留空时 Playground 与 Build 照常轮询（默认）。非流式请求不受影响，降级判定拦截的模型按降级判定处理。修改后立即生效。',
+  'settings.streamPlaygroundModelsHint':
+    '目录中需要订阅权益、可经 Playground 调用的模型（点击加入）：',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': '通道',
@@ -777,6 +782,11 @@ const en: Record<TranslationKey, string> = {
   'settings.upstreamChannels': 'Upstream channels',
   'settings.upstreamChannelsHelp':
     'Playground and Build are two independent quotas of the same account. With both enabled, requests are scheduled per account and channel, and the other channel continues when one cools down. Enable at least one.',
+  'settings.streamPlaygroundModels': 'Models that stream via Playground first',
+  'settings.streamPlaygroundModelsHelp':
+    'Models that need a subscription return the whole reply at once on the Build channel, so streamed output appears all at once at the end. Streaming requests for the listed models use Playground first (streamed chunk by chunk) and switch to Build immediately when every Playground account is busy, without waiting for Playground. Comma-separated model IDs; leave empty to let Playground and Build rotate as usual (default). Non-streaming requests are not affected, and models covered by the downgrade guard follow the downgrade guard. Changes apply immediately.',
+  'settings.streamPlaygroundModelsHint':
+    'Catalog models that need a subscription and are available on Playground (click to add):',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': 'Channel',

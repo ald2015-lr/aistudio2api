@@ -295,6 +295,8 @@ type Model struct {
 	AccessModes       []int64             `json:"access_modes,omitempty"`
 	Paid              bool                `json:"paid,omitempty"`
 	Channels          []string            `json:"channels,omitempty"`
+	// BuildUnary 只在管理页目录中设置：模型需要订阅权益，在 Build 通道只能一次性返回整段回复（见 BuildUsesUnary）
+	BuildUnary bool `json:"build_unary,omitempty"`
 }
 
 // Usage 表示一次生成的 token 用量

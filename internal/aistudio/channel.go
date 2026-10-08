@@ -60,6 +60,13 @@ func (p *AccountPool) BuildEnabled() bool {
 	return p.channelEnabledLocked(ChannelBuild)
 }
 
+// PlaygroundEnabled 返回 Playground 通道是否启用
+func (p *AccountPool) PlaygroundEnabled() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.channelEnabledLocked(ChannelPlayground)
+}
+
 // Channel 返回租约本次使用的上游通道
 func (l *AccountLease) Channel() Channel {
 	if l == nil || l.channel == "" {
@@ -159,9 +166,22 @@ func (p *AccountPool) accountChannelCooldownLocked(account *Account, selection A
 	return earliest, !earliest.IsZero()
 }
 
-// channelCandidatesLocked 按账户 ID 与通道顺序展开候选，轮询策略从上次选中组合之后开始
+// channelCandidatesLocked 按账户 ID 与通道顺序展开候选，轮询策略从上次选中组合之后开始；
+// PreferPlayground 时每个账户先 Playground，轮询从上次选中账户之后开始，不在同一账户的通道之间轮询
 func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSelection) []channelCandidate {
 	channels := p.selectionChannelsLocked(selection)
+	preferPlayground := selection.PreferPlayground && len(channels) > 1 && slices.Contains(channels, ChannelPlayground)
+	if preferPlayground && channels[0] != ChannelPlayground {
+		// 通道顺序是账户池共用的切片，另建一份
+		ordered := make([]Channel, 0, len(channels))
+		ordered = append(ordered, ChannelPlayground)
+		for _, channel := range channels {
+			if channel != ChannelPlayground {
+				ordered = append(ordered, channel)
+			}
+		}
+		channels = ordered
+	}
 	candidates := make([]channelCandidate, 0, len(indices)*len(channels))
 	for _, index := range indices {
 		for _, channel := range channels {
@@ -191,7 +211,7 @@ func (p *AccountPool) channelCandidatesLocked(indices []int, selection AccountSe
 		if account != lastAccount {
 			return account > lastAccount
 		}
-		return lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
+		return !preferPlayground && lastChannel != "" && rank(candidates[position].channel) > rank(lastChannel)
 	})
 	return append(candidates[start:], candidates[:start]...)
 }

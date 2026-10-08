@@ -67,6 +67,23 @@ func (slots *startupSlots) acquire(
 	slots.leaveLocked(background)
 	slots.active++
 	slots.mu.Unlock()
+	return slots.releaser(), nil
+}
+
+// tryAcquire 不排队地取得一个按需冷启动名额（与 acquire 的按需启动一样多保留 1 个）：名额已满时返回 false，
+// 不计入排队数，也不让后台启动为它让行
+func (slots *startupSlots) tryAcquire(capacity func() int) (func(), bool) {
+	slots.mu.Lock()
+	defer slots.mu.Unlock()
+	if slots.active >= max(capacity(), 1)+1 {
+		return nil, false
+	}
+	slots.active++
+	return slots.releaser(), true
+}
+
+// releaser 返回释放一个已占用名额的函数（重复调用只释放一次）
+func (slots *startupSlots) releaser() func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -75,7 +92,7 @@ func (slots *startupSlots) acquire(
 			slots.broadcastLocked()
 			slots.mu.Unlock()
 		})
-	}, nil
+	}
 }
 
 // leaveLocked 结束一次申请；按需启动全部离开时唤醒为它们让行的后台启动
@@ -123,11 +140,31 @@ func backgroundStartup(ctx context.Context) bool {
 	return background
 }
 
+type immediateStartupKey struct{}
+
+// withImmediateStartup 标记不等待选号（acquireWarmLeaseNow）发起的现场启动：冷启动名额已满或分区没有空槽时立即按容量已满返回，
+// 不排队等名额，也不替换其他账号的空闲 Worker
+func withImmediateStartup(ctx context.Context) context.Context {
+	return context.WithValue(ctx, immediateStartupKey{}, true)
+}
+
+func immediateStartup(ctx context.Context) bool {
+	immediate, _ := ctx.Value(immediateStartupKey{}).(bool)
+	return immediate
+}
+
 // acquireStartupSlot 为一次浏览器冷启动取得名额。纯 Go 后端不启动浏览器，只受活动 Worker 上限约束，不占名额。
 // 后台启动等待名额时到期按槽位已满返回（预热本轮不再启动新的，稍后重试），不记为账户预热失败
 func (manager *accountWorkerManager) acquireStartupSlot(ctx context.Context, label string, executablePath string) (func(), error) {
 	if executablePath == "" {
 		return func() {}, nil
+	}
+	if immediateStartup(ctx) {
+		release, ok := manager.startupSlots.tryAcquire(manager.warmConcurrencyValue)
+		if !ok {
+			return nil, fmt.Errorf("%w: 冷启动名额已满", errAccountWorkerCapacity)
+		}
+		return release, nil
 	}
 	background := backgroundStartup(ctx)
 	release, err := manager.startupSlots.acquire(ctx, manager.warmConcurrencyValue, background, func(active int, limit int) {

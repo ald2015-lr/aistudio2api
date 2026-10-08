@@ -518,7 +518,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		WAABackend:     value.WAABackend,
 		DowngradeGuard: active.DowngradeGuard,
 		UltraExclusive: active.UltraExclusive, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
-		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers,
+		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -531,6 +531,9 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	}
 	if value.UltraMaxActiveWorkers != nil {
 		saved.UltraMaxActiveWorkers = *value.UltraMaxActiveWorkers
+	}
+	if value.StreamPlaygroundModels != nil {
+		saved.StreamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
 	}
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
@@ -545,7 +548,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.MinOutputTokens == active.MinOutputTokens &&
 		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.WAABackend == active.WAABackend &&
-		saved.DowngradeGuard.Equal(active.DowngradeGuard)
+		saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
+		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels)
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

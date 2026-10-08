@@ -62,7 +62,7 @@ https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.appl
 ["/v1beta/models/<MODEL_ID>:generateContent", "<GEMINI_API_JSON>", "<WAA_PROOF>", "POST"]
 ```
 
-模型的 AccessModes 非空且 Free 权益不能使用时（需要 Pro、Ultra 等订阅），生成经 `ProxyUnaryCall` 与 `:generateContent`；其余模型经 `ProxyStreamedCall` 与 `:streamGenerateContent`。`ProxyUnaryCall` 在整段回复生成完后一次返回，不能逐块输出，因此这类模型的流式请求优先选 Playground 通道（`GenerateContent` 携带权益头、逐块返回）；没有可用的 Playground 账号（不支持该模型或全部冷却）时才退回 Build，此时流式请求会在结束时一次收到全部内容。
+模型的 AccessModes 非空且 Free 权益不能使用时（需要 Pro、Ultra 等订阅），生成经 `ProxyUnaryCall` 与 `:generateContent`；其余模型经 `ProxyStreamedCall` 与 `:streamGenerateContent`。`ProxyUnaryCall` 在整段回复生成完后一次返回，不能逐块输出：这类模型的流式请求落到 Build 通道时，客户端会在结束时一次收到全部内容。需要逐块输出时，把模型加入 `STREAM_PLAYGROUND_MODELS`（见“调度与冷却”），其流式请求先用 Playground 通道（`GenerateContent` 携带权益头、逐块返回），Playground 繁忙时立即改用 Build。管理页目录的 `build_unary` 标出这类模型，服务配置页据此列出可以加入的模型（只列同时可经 Playground 调用的）。
 
 ### 请求头
 
@@ -148,6 +148,13 @@ Build 目录保存在账户内存中，不写入 `runtime-state.json`。读取�
 - 一个通道返回额度错误后写入该通道冷却；同一账户另一通道可用时，请求在同一账户的另一通道重试，不计为已尝试账户
 - 全部候选组合冷却时，最早恢复时间在 1 分钟内的请求排队等待，更晚的请求返回 HTTP 429 `rate_limit_exceeded`，消息给出最早恢复时间
 - 生成成功在该通道的 scope（`<模型>` 或 `build:<模型>`）上写入 `verified`
+
+`STREAM_PLAYGROUND_MODELS`（逗号分隔的模型 ID，默认为空）列出流式请求优先走 Playground 的模型。为空时两个通道按上表照常轮询。请求的模型（别名已解析为规范 ID，按降级判定的规则整理：去空白、去 `models/` 前缀、不分大小写）在列表中、请求为流式、两个通道都启用，且请求没有指定账号、没有绑定文件、不限定只走某个通道时，每次尝试：
+
+1. 先不等待地取 Playground 账号（`acquireWarmLeaseNow`）：空闲的热 Worker 账号直接使用；没有时，所在 Worker 分区有空槽且冷启动名额空闲的备用账号现场启动 Worker；不加入调度等待队列，不等账号空闲、Worker 启动或替换、冷却结束
+2. 没有立即可用的 Playground 账号（全部忙碌、达到单账户并发或 Worker 容量上限、冷却、不支持该模型）时写入请求进度（忙碌、容量已满或冷却中为“Playground 繁忙，改用其他通道”，不支持该模型或全部冷却超过 1 分钟为“Playground 没有可用账号，改用其他通道”）与 trace 记录，立即按默认条件在全部启用通道中选号，这一步照常排队等待。两个通道共用账户并发，排队等到的账户空闲时它的 Playground 同样空闲：这一步每个账户先 Playground 后 Build，轮询只在账户之间推进，账户的 Playground 冷却或不支持该模型时才用它的 Build；第 1 步现场启动 Worker 失败的账号这一步不再启动，候选用尽时按启动失败原因返回
+
+换号重试的每次尝试都按同样的规则选号，号池（`/ultra`）限制不变。非流式请求与不在列表中的模型不受影响。降级判定拦截的模型沿用降级判定自己的 Playground 优先：等待 Playground 账号，只有 Playground 没有可用账号时才改用其他通道；模型同时在两个列表中时按降级判定处理。设置可在管理页“服务配置”或 `PUT /api/config` 的 `stream_playground_models` 修改，保存后立即生效。
 
 ### 附件与文件引用
 

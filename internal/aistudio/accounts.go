@@ -291,6 +291,9 @@ type AccountSelection struct {
 	// PlaygroundFirst 只用 Playground 通道选号（降级判定：该通道每块都带累计正文数，判定最准）；
 	// 没有可用的 Playground 账号时由调用方去掉该标记重新选号，退回其他通道
 	PlaygroundFirst bool
+	// PreferPlayground 只调整候选顺序，不限定通道：每个账户先 Playground 后其他通道，轮询只在账户之间进行
+	// （流式优先 Playground 的请求改为不限通道选号时使用：两个通道共用账户并发，账户空闲时它的 Playground 同样空闲）
+	PreferPlayground bool
 	// Pool 为可以使用的号池；不限号池时由 AcquireFor 等入口取 context 中请求的号池（见 PoolScope）
 	Pool PoolScope
 }

@@ -204,6 +204,8 @@ export interface Model {
   access_modes?: number[]
   paid?: boolean
   channels?: UpstreamChannel[]
+  // build_unary 为真表示模型需要订阅权益，在 Build 通道只能一次性返回整段回复
+  build_unary?: boolean
 }
 
 export type UpstreamChannel = 'playground' | 'build'
@@ -295,6 +297,8 @@ export interface ServiceConfig {
   per_account_concurrency: number
   routing_strategy: 'round-robin' | 'fill-first'
   upstream_channels: UpstreamChannel[]
+  // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段
+  stream_playground_models?: string[]
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   ignore_client_seed: boolean

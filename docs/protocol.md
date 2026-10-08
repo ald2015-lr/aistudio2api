@@ -1308,9 +1308,12 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
   "capabilities": {"thinking": true, "capability_code_25": true},
   "capability_options": {"aliases": ["gemini-example-latest"]},
   "access_modes": [3, 4],
-  "paid": true
+  "paid": true,
+  "build_unary": true
 }
 ```
+
+`build_unary` 只出现在管理目录（`GET /api/models` 与管理事件流的 `models` 事件）：模型需要订阅权益、在 Build 通道只能一次性返回整段回复时为 `true`。服务配置页据此列出可以加入 `STREAM_PLAYGROUND_MODELS` 的模型（只列 `channels` 同时含 `playground` 与 `build` 的模型），见 [Build 通道](build.md)。
 
 OpenAI `GET /v1/models`：
 
@@ -1351,7 +1354,7 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 
 `GET /v1beta/models/{model}` 只按 canonical model ID 查找；生成、计数、视频、转录与 Bidi 同时接受 canonical ID 和 `capability_options.aliases` 中的 alias；alias 在调度和发送上游前换成对应的 canonical ID。
 
-管理模型中的 `description`、token limits、capabilities、capability options、access modes 与 false `paid` 使用 `omitempty`；OpenAI 和 Gemini 响应始终包含身份、methods 与 token limits，并在 map/slice 非空或 `paid=true` 时增加对应扩展字段。
+管理模型中的 `description`、token limits、capabilities、capability options、access modes、false `paid` 与 false `build_unary` 使用 `omitempty`；OpenAI 和 Gemini 响应始终包含身份、methods 与 token limits，并在 map/slice 非空或 `paid=true` 时增加对应扩展字段。
 
 管理目录合并全部账户的上游实时模型集合，并按 ID 排序。公开目录保留至少一个启用账户具有访问资格、且当前公开协议承载其调用方法的模型；启用 Build 通道时同时包含 Build 独有的可生成模型，`channels` 列出可调用该模型的通道，见 [Build 通道](build.md)。短期冷却和忙碌状态由请求调度处理。多账户同 ID 的 methods、capabilities、capability options 和 access modes 取并集，`paid` 取逻辑 OR，正数 token limit 取最小值。调度使用上游 methods、capabilities、access modes、账户权益和当前运行状态。
 

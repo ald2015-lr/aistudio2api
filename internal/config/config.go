@@ -46,6 +46,7 @@ var configKeys = [...]string{
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
+	"STREAM_PLAYGROUND_MODELS",
 	"TEMPORARY_CHAT",
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
@@ -91,7 +92,10 @@ type Config struct {
 	PerAccountConcurrency  int           `json:"per_account_concurrency"`
 	RoutingStrategy        string        `json:"routing_strategy"`
 	UpstreamChannels       []string      `json:"upstream_channels"`
-	TemporaryChat          bool          `json:"temporary_chat"`
+	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
+	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
+	StreamPlaygroundModels []string `json:"stream_playground_models"`
+	TemporaryChat          bool     `json:"temporary_chat"`
 	// IgnoreClientSeed 为真时忽略客户端传入的 seed，每次请求都使用随机种子
 	IgnoreClientSeed bool `json:"ignore_client_seed"`
 	// RepeatPromptNonce 为真时，在最后一条用户消息末尾加入不可见随机后缀（客户端指定 seed 或温度为 0 时除外）。
@@ -247,6 +251,9 @@ func Load(path string) (Config, error) {
 	if value, ok := values["UPSTREAM_CHANNELS"]; ok {
 		cfg.UpstreamChannels = ParseUpstreamChannels(value)
 	}
+	if value, ok := values["STREAM_PLAYGROUND_MODELS"]; ok {
+		cfg.StreamPlaygroundModels = ParseModelList(value)
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -321,6 +328,7 @@ func (c Config) Save(path string) error {
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
+		"STREAM_PLAYGROUND_MODELS": strings.Join(c.StreamPlaygroundModels, ","),
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
@@ -397,6 +405,9 @@ func (c Config) Validate() error {
 	if err := validateUpstreamChannels(c.UpstreamChannels); err != nil {
 		return err
 	}
+	if err := validateModelList("STREAM_PLAYGROUND_MODELS", c.StreamPlaygroundModels); err != nil {
+		return err
+	}
 	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
 		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
 	}
@@ -458,6 +469,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PerAccountConcurrency  int            `json:"per_account_concurrency"`
 		RoutingStrategy        string         `json:"routing_strategy"`
 		UpstreamChannels       []string       `json:"upstream_channels"`
+		StreamPlaygroundModels []string       `json:"stream_playground_models"`
 		TemporaryChat          bool           `json:"temporary_chat"`
 		IgnoreClientSeed       bool           `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool           `json:"repeat_prompt_nonce"`
@@ -482,6 +494,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
+		StreamPlaygroundModels: c.StreamPlaygroundModels,
 		TemporaryChat:          c.TemporaryChat,
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
@@ -510,6 +523,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PerAccountConcurrency  int             `json:"per_account_concurrency"`
 		RoutingStrategy        string          `json:"routing_strategy"`
 		UpstreamChannels       []string        `json:"upstream_channels"`
+		StreamPlaygroundModels []string        `json:"stream_playground_models"`
 		TemporaryChat          bool            `json:"temporary_chat"`
 		IgnoreClientSeed       bool            `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool           `json:"repeat_prompt_nonce"`
@@ -553,6 +567,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
+		StreamPlaygroundModels: NormalizeModelList(value.StreamPlaygroundModels),
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,
@@ -926,6 +941,21 @@ func ParseModelList(value string) []string {
 // NormalizeModelList 整理模型列表：去空白、去 models/ 前缀、去重
 func NormalizeModelList(models []string) []string {
 	return ParseModelList(strings.Join(models, ","))
+}
+
+// validateModelList 校验已整理的模型列表：每项非空、不含空白与分隔符、不重复（ParseModelList 与 NormalizeModelList 的结果总能通过）
+func validateModelList(key string, models []string) error {
+	seen := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if model == "" || strings.ContainsAny(model, ", \t\r\n，") {
+			return fmt.Errorf("%s 的模型 ID %q 无效：不能为空，也不能包含空白或逗号", key, model)
+		}
+		if _, exists := seen[model]; exists {
+			return fmt.Errorf("%s 模型 %s 重复", key, model)
+		}
+		seen[model] = struct{}{}
+	}
+	return nil
 }
 
 func downgradeGuardOrDefault(value *DowngradeGuard) DowngradeGuard {

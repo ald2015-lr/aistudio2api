@@ -271,6 +271,9 @@ type RuntimeConfig struct {
 	UltraExclusive        *bool `json:"ultra_exclusive,omitempty"`
 	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
 	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
+	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS），读取时总是返回（可以为空数组）；
+	// 保存时没有该字段（旧版页面）则沿用现值
+	StreamPlaygroundModels *[]string `json:"stream_playground_models,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '@/api'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
-import type { DowngradeGuardConfig, ServiceConfig, UpstreamChannel } from '@/types'
+import type { DowngradeGuardConfig, Model, ServiceConfig, UpstreamChannel } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import { readStorage, writeStorage } from '@/storage'
@@ -12,6 +12,7 @@ const props = defineProps<{
   loading: boolean
   error: string
   running: boolean
+  models: Model[]
 }>()
 
 const emit = defineEmits<{
@@ -36,6 +37,7 @@ type EditableKey =
   | 'per_account_concurrency'
   | 'routing_strategy'
   | 'upstream_channels'
+  | 'stream_playground_models'
   | 'waa_backend'
   | 'temporary_chat'
   | 'ignore_client_seed'
@@ -60,6 +62,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'per_account_concurrency',
   'routing_strategy',
   'upstream_channels',
+  'stream_playground_models',
   'waa_backend',
   'temporary_chat',
   'ignore_client_seed',
@@ -141,6 +144,7 @@ const form = reactive<ServiceConfig>({
   per_account_concurrency: 2,
   routing_strategy: 'round-robin',
   upstream_channels: ['playground', 'build'],
+  stream_playground_models: [],
   waa_backend: 'camoufox',
   temporary_chat: false,
   ignore_client_seed: false,
@@ -157,6 +161,45 @@ function onGuardModelsInput(event: Event): void {
   const value = (event.target as HTMLInputElement).value
   guardModelsText.value = value
   form.downgrade_guard.models = parseModelList(value)
+}
+
+// 流式优先 Playground 的模型输入框同样单独保存文字
+const streamModelsText = ref('')
+
+function onStreamModelsInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value
+  streamModelsText.value = value
+  form.stream_playground_models = parseModelList(value)
+}
+
+// subscriptionModels 为目录中需要订阅权益、可经 Build 调用（在 Build 通道一次性返回整段回复）且可经 Playground 流式调用的模型，
+// 提示可以加入列表；只有 Build 能调用的模型加入列表也不会改走 Playground，不列出
+const subscriptionModels = computed(() =>
+  parseModelList(
+    props.models
+      .filter((model) => {
+        const channels = model.channels ?? []
+        return (
+          model.build_unary === true &&
+          channels.includes('build') &&
+          channels.includes('playground')
+        )
+      })
+      .map((model) => model.id)
+      .join(','),
+  ),
+)
+
+// 服务端匹配列表时不分大小写，这里同样不分大小写，避免加入只差大小写的重复项
+function streamModelListed(model: string): boolean {
+  const name = model.toLowerCase()
+  return (form.stream_playground_models ?? []).some((item) => item.toLowerCase() === name)
+}
+
+function addStreamModel(model: string): void {
+  if (streamModelListed(model)) return
+  form.stream_playground_models = [...(form.stream_playground_models ?? []), model]
+  streamModelsText.value = form.stream_playground_models.join(', ')
 }
 let saveTimer: number | undefined
 let countdownTimer: number | undefined
@@ -447,6 +490,8 @@ watch(
       Object.assign(form, config)
       form.downgrade_guard = cloneDowngradeGuard(config.downgrade_guard)
       guardModelsText.value = form.downgrade_guard.models.join(', ')
+      form.stream_playground_models = [...(config.stream_playground_models ?? [])]
+      streamModelsText.value = form.stream_playground_models.join(', ')
     }
     savedConfig.value = config
   },
@@ -798,6 +843,39 @@ onBeforeUnmount(() => {
           t('settings.upstreamChannelsHelp')
         }}</span>
       </fieldset>
+
+      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.streamPlaygroundModels')
+          }}</span>
+          <input
+            :value="streamModelsText"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            type="text"
+            spellcheck="false"
+            autocomplete="off"
+            @input="onStreamModelsInput"
+          />
+        </label>
+        <span class="mt-2 block text-xs text-gray-500">{{
+          t('settings.streamPlaygroundModelsHelp')
+        }}</span>
+        <div v-if="subscriptionModels.length > 0" class="mt-3 flex flex-wrap items-center gap-2">
+          <span class="text-xs text-gray-500">{{ t('settings.streamPlaygroundModelsHint') }}</span>
+          <button
+            v-for="model in subscriptionModels"
+            :key="model"
+            class="btn btn-sm font-mono"
+            type="button"
+            :disabled="streamModelListed(model)"
+            @click="addStreamModel(model)"
+          >
+            <UiIcon v-if="streamModelListed(model)" name="check" :size="12" />
+            {{ model }}
+          </button>
+        </div>
+      </div>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <input v-model="form.temporary_chat" class="h-4 w-4 accent-blue-500" type="checkbox" />

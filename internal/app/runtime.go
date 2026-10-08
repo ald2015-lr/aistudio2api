@@ -107,6 +107,7 @@ func newRuntime(
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
 	service.setDowngradeGuard(cfg.DowngradeGuard)
+	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	accountDisableNotes.load(store.PrimaryDirectory())
@@ -1419,6 +1420,11 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			return preparer, err
 		}
+		// 不等待的选号（acquireWarmLeaseNow）只在分区有空槽时现场启动：替换空闲 Worker 要等旧 Worker 让出，按容量已满返回
+		if immediateStartup(ctx) {
+			manager.rebalanceMu.Unlock()
+			return nil, errAccountWorkerCapacity
+		}
 		// 同分区有 Worker 正在启动时只淘汰冷却中的空闲 Worker
 		victim := manager.idleWarmVictimFor(accountID, modelID, manager.openingIn(partition, ultra), partition)
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
@@ -2181,6 +2187,9 @@ type trackedService struct {
 	modelChangeMu      sync.Mutex
 	modelRevision      uint64
 	modelApplied       uint64
+
+	// streamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS，可热更新，见 stream_channel.go）
+	streamPlaygroundModels atomic.Pointer[map[string]struct{}]
 }
 
 type modelCatalogService interface {
@@ -2561,27 +2570,14 @@ func (service *trackedService) Models(ctx context.Context) ([]aistudio.Model, er
 	return service.pool.EligibleModelsIn(aistudio.PoolScopeFromContext(ctx), service.modelSnapshot()), nil
 }
 
-// catalogModels 返回管理页使用的完整目录与各模型可用通道
+// catalogModels 返回管理页使用的完整目录与各模型可用通道；BuildUnary 标出在 Build 通道只能一次性返回整段回复的模型
+// （需要订阅权益），服务配置页据此提示哪些模型适合加入 STREAM_PLAYGROUND_MODELS
 func (service *trackedService) catalogModels() []aistudio.Model {
-	return service.pool.CatalogModels(service.modelSnapshot())
-}
-
-// streamPrefersPlayground 判断流式请求是否应优先走 Playground：模型在 Build 通道只能一次性返回整段回复
-func (service *trackedService) streamPrefersPlayground(request aistudio.GenerateRequest, modelID string) bool {
-	return request.Stream && service.modelBuildUnary(modelID)
-}
-
-// modelBuildUnary 判断模型在 Build 通道是否只能一次性返回（需要订阅权益的模型）；目录里没有该模型时返回 false
-func (service *trackedService) modelBuildUnary(modelID string) bool {
-	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
-	service.modelsMu.RLock()
-	defer service.modelsMu.RUnlock()
-	for _, model := range service.models {
-		if strings.TrimPrefix(model.ID, "models/") == modelID {
-			return aistudio.BuildUsesUnary(model)
-		}
+	models := service.pool.CatalogModels(service.modelSnapshot())
+	for index := range models {
+		models[index].BuildUnary = aistudio.BuildUsesUnary(models[index])
 	}
-	return false
+	return models
 }
 
 func (service *trackedService) modelSnapshot() []aistudio.Model {
@@ -3145,15 +3141,59 @@ func (closer *trackedMediaReadCloser) Close() error {
 	return closer.err
 }
 
+// acquireWarmLease 按选择条件取得账号租约：没有立即可用的账号时排进调度等待队列，等账号空闲、Worker 启动或冷却结束
 func (service *trackedService) acquireWarmLease(ctx context.Context, selection aistudio.AccountSelection) (*aistudio.AccountLease, error) {
+	return service.acquireLease(ctx, selection, false, nil)
+}
+
+// acquireWarmLeaseNow 与 acquireWarmLease 相同，但不等待：只接受现在就能取得的租约，包括空闲的热 Worker 账号，以及所在分区有空槽、
+// 冷启动名额空闲时现场冷启动的备用账号；不排进调度等待队列，不等账号空闲、Worker 启动或替换、冷却结束。
+// 没有立即可用的账号时返回 *noImmediateLeaseError；没有账号支持、全部冷却超过排队上限、启动失败等错误与 acquireWarmLease 相同。
+// failures 不为 nil 时记下现场启动失败的账号，调用方随后改用其他条件选号时交给 acquireLease，不再启动这些账号
+func (service *trackedService) acquireWarmLeaseNow(
+	ctx context.Context, selection aistudio.AccountSelection, failures *workerStartupFailures,
+) (*aistudio.AccountLease, error) {
+	return service.acquireLease(ctx, selection, true, failures)
+}
+
+// workerStartupFailures 记录选号中现场启动 Worker 失败的账号与最后一次失败原因：这些账号不再作为候选，候选用尽时按启动失败原因返回。
+// 默认每次选号各用一份；流式优先 Playground 的不等待选号与随后不限通道的选号共用一份，同一次尝试里不会把启动失败的账号再启动一次
+type workerStartupFailures struct {
+	accounts map[string]struct{}
+	last     error
+}
+
+func newWorkerStartupFailures() *workerStartupFailures {
+	return &workerStartupFailures{accounts: make(map[string]struct{})}
+}
+
+// noImmediateLeaseError 表示不等待的选号（acquireWarmLeaseNow）没有立即可用的账号；reason 说明原因（账号忙碌、Worker 容量已满等）
+type noImmediateLeaseError struct {
+	reason string
+}
+
+func (err *noImmediateLeaseError) Error() string {
+	return "没有立即可用的账号：" + err.reason
+}
+
+// acquireLease 为 acquireWarmLease 与 acquireWarmLeaseNow 的实现；immediate 为真时每个需要等待的地方都改为返回 *noImmediateLeaseError，
+// 从不加入调度等待队列，取得的租约在启动 Worker 失败时照常释放。failures 为 nil 时只记在本次选号内
+func (service *trackedService) acquireLease(
+	ctx context.Context, selection aistudio.AccountSelection, immediate bool, failures *workerStartupFailures,
+) (*aistudio.AccountLease, error) {
 	// 号池写进选择条件：分类、选号、等待队列与没有账户时的错误都只看请求的号池
 	selection = aistudio.ScopedSelection(ctx, selection)
 	fixedAccount := strings.TrimSpace(selection.AccountID) != "" || strings.TrimSpace(selection.ResourceID) != ""
-	failedWorkers := make(map[string]struct{})
-	var promoteFailure error
+	if failures == nil {
+		failures = newWorkerStartupFailures()
+	}
+	failedWorkers := failures.accounts
 	var waiter *dispatchWaiter
 	defer func() { service.workers.dispatch.leave(waiter) }()
-	wait := func(delay time.Duration) error {
+	wait := func(delay time.Duration, reason string) error {
+		if immediate {
+			return &noImmediateLeaseError{reason: reason}
+		}
 		if waiter == nil {
 			waiter = service.workers.dispatch.join(dispatchKey(selection))
 		}
@@ -3195,7 +3235,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			}
 		}
 		if len(groups.StandbyReady) == 0 && opening {
-			if err := wait(schedulingRecheck); err != nil {
+			if err := wait(schedulingRecheck, "Worker 正在启动"); err != nil {
 				return nil, err
 			}
 			continue
@@ -3203,16 +3243,18 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)
-		if len(groups.StandbyReady) > 0 && warmCandidates > 0 && !fixedAccount {
+		// 不等待的选号不做后台扩容再排队，直接按下面的现场启动处理：分区有空槽时现场冷启动，否则返回没有立即可用的账号
+		if len(groups.StandbyReady) > 0 && warmCandidates > 0 && !fixedAccount && !immediate {
 			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
 				service.workers.expandInBackground(accountID, selection.ModelID)
-				if err := wait(schedulingRecheck); err != nil {
+				if err := wait(schedulingRecheck, "Worker 正在扩容"); err != nil {
 					return nil, err
 				}
 				continue
 			}
 		}
-		if accountID := capacity.promotable(groups.StandbyReady, warmCandidates == 0); accountID != "" {
+		// 替换空闲 Worker 要等旧 Worker 让出，不等待的选号只在分区有空槽时现场启动
+		if accountID := capacity.promotable(groups.StandbyReady, warmCandidates == 0 && !immediate); accountID != "" {
 			candidate := selection
 			candidate.AccountID = accountID
 			lease, _, acquireErr := service.pool.TryAcquireFor(ctx, candidate)
@@ -3223,14 +3265,18 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 				return nil, acquireErr
 			}
 			if lease == nil {
-				if err := wait(schedulingRecheck); err != nil {
+				if err := wait(schedulingRecheck, "账号忙碌"); err != nil {
 					return nil, err
 				}
 				continue
 			}
 			workersChanged := service.workers.schedulingChanged()
 			// 带上刚取得的租约：启动阶段确认登录失效时在这个租约内恢复认证，不另取租约
-			_, promoteErr := service.workers.promote(aistudio.ContextWithAccountLease(ctx, lease), accountID, selection.ModelID)
+			promoteCtx := aistudio.ContextWithAccountLease(ctx, lease)
+			if immediate {
+				promoteCtx = withImmediateStartup(promoteCtx)
+			}
+			_, promoteErr := service.workers.promote(promoteCtx, accountID, selection.ModelID)
 			if promoteErr == nil {
 				return lease, nil
 			}
@@ -3241,6 +3287,9 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 				continue
 			}
 			if errors.Is(promoteErr, errAccountWorkerCapacity) {
+				if immediate {
+					return nil, &noImmediateLeaseError{reason: "Worker 容量已满"}
+				}
 				if err := waitScheduling(ctx, workersChanged, schedulingRecheck); err != nil {
 					return nil, err
 				}
@@ -3250,11 +3299,11 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 				return nil, promoteErr
 			}
 			failedWorkers[accountID] = struct{}{}
-			promoteFailure = promoteErr
+			failures.last = promoteErr
 			continue
 		}
 		if len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
-			if err := wait(schedulingRecheck); err != nil {
+			if err := wait(schedulingRecheck, "账号全部忙碌"); err != nil {
 				return nil, err
 			}
 			continue
@@ -3264,18 +3313,18 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			if remaining > cooldownQueueLimit {
 				return nil, &aistudio.AllCoolingError{ModelID: selection.ModelID, Until: groups.EarliestCooldown}
 			}
-			if err := wait(min(remaining, schedulingRecheck)); err != nil {
+			if err := wait(min(remaining, schedulingRecheck), "账号冷却中"); err != nil {
 				return nil, err
 			}
 			continue
 		}
 		if candidates > 0 {
-			if err := wait(schedulingRecheck); err != nil {
+			if err := wait(schedulingRecheck, "没有空闲的 Worker 槽位"); err != nil {
 				return nil, err
 			}
 			continue
 		}
-		if promoteFailure != nil {
+		if promoteFailure := failures.last; promoteFailure != nil {
 			// 候选因启动时登录失效退出调度：按账户需要重新登录返回（503，列出账户与原因），并保留启动失败原因
 			var notReady *aistudio.AccountsNotReadyError
 			if noEligible := service.pool.NoEligibleError(selection); aistudio.DefinitiveAuthenticationFailure(promoteFailure) &&
@@ -3628,11 +3677,6 @@ func (service *trackedService) generateWithRetry(
 		if diag.guard() != nil && !selection.BuildOnly && !selection.PlaygroundOnly {
 			selection.PlaygroundFirst = true
 		}
-		// 需要订阅权益的模型在 Build 通道只能经单次代理调用，整段回复生成完才一次返回：
-		// 流式请求优先走 Playground 逐块输出，没有可用的 Playground 账号时再退回 Build
-		if !selection.BuildOnly && !selection.PlaygroundOnly && service.streamPrefersPlayground(request, modelID) {
-			selection.PlaygroundFirst = true
-		}
 		if (unbound || fileBound) && len(attempted) > 0 {
 			enabled, _ := service.pool.EnabledAccountsIn(scope)
 			for _, accountID := range enabled {
@@ -3641,11 +3685,18 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		nextLease, acquireErr := service.acquireWarmLease(requestCtx, selection)
+		var nextLease *aistudio.AccountLease
+		var acquireErr error
+		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
+		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
+		if service.streamPrefersPlayground(request, selection) {
+			nextLease, acquireErr = service.acquireStreamPlaygroundLease(requestCtx, request.ID, selection)
+		} else {
+			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
+		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && playgroundUnavailable(acquireErr) {
-			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道。降级判定在 Build 通道按估算 + CountTokens 判定；
-			// 需要订阅权益的模型在 Build 通道一次性返回整段回复
-			trace.Note("优先 Playground：该通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
+			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定
+			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
 			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
 		}

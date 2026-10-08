@@ -616,6 +616,7 @@ onUnmounted(() => {
         :loading="loading.config"
         :error="errors.config"
         :running="serviceState === 'running' || serviceState === 'launching'"
+        :models="models"
         @saved="config = $event"
         @notice="showNotice"
       />

@@ -789,6 +789,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.UltraMaxActiveWorkers != nil {
 		ultraMax = *value.UltraMaxActiveWorkers
 	}
+	// 流式优先 Playground 的模型：旧版页面保存时不带该字段，沿用现值；空数组表示清空
+	streamPlaygroundModels := saved.StreamPlaygroundModels
+	if value.StreamPlaygroundModels != nil {
+		streamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
 		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
@@ -798,6 +803,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
+		StreamPlaygroundModels: streamPlaygroundModels,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
@@ -1386,6 +1392,7 @@ func buildVersion() string {
 }
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
+	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
@@ -1404,6 +1411,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraExclusive:         &cfg.UltraExclusive,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
+		StreamPlaygroundModels: &streamPlaygroundModels,
 	}
 }
 
