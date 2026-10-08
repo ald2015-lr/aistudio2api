@@ -73,7 +73,8 @@ type runtimeManager struct {
 	startCancel      context.CancelFunc
 	apiKey           *apiKeyHolder
 	intent           *serviceIntent
-	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 账户，保存配置后立即生效
+	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 账户，保存配置后立即生效，
+	// 启动生成服务时按新读取的配置同步
 	ultraExclusive atomic.Bool
 	// shuttingDown 在进程退出时置为 true（由 mu 保护），之后不再启动生成服务
 	shuttingDown bool
@@ -187,6 +188,8 @@ func (manager *runtimeManager) startService(ctx context.Context, user bool) (api
 	current = manager.current
 	manager.current = next
 	manager.mu.Unlock()
+	// 独占设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
+	manager.applyUltraExclusive(cfg.UltraExclusive)
 
 	current.cancelLifecycle()
 	status, startErr := next.admin.StartService(launchCtx)
@@ -429,11 +432,9 @@ func (manager *runtimeManager) UpdateRuntimeConfig(ctx context.Context, value ap
 	if err != nil {
 		return updated, err
 	}
-	// API 密钥与 Ultra 独占设置保存后立即生效；Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
+	// API 密钥与 Ultra 独占设置保存后立即生效（独占设置在 applyLiveConfig 中按读取到的配置应用）；
+	// Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
 	manager.applyAPIKey(updated.APIKey)
-	if updated.UltraExclusive != nil {
-		manager.applyUltraExclusive(*updated.UltraExclusive)
-	}
 	manager.applyLiveConfig()
 	return manager.decorateCurrent(updated), nil
 }

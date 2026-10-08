@@ -156,7 +156,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
 | `WARM_WORKER_LIMIT` | 普通分区（权益不是 Ultra 的账户）的常驻预热账户数，可热更新 | `5` |
 | `MAX_ACTIVE_WORKERS` | 普通分区的活动 Worker 容量上限，必须不小于热池目标，可热更新；浏览器总数最多为两个分区上限之和 | `10` |
-| `ULTRA_EXCLUSIVE` | `true` 时 Ultra 账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户；保存后立即生效 | `true` |
+| `ULTRA_EXCLUSIVE` | `true` 时 Ultra 账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户；保存后立即生效，手动改 `.env` 后停止再启动生成服务时按重新读取的值生效（进程环境变量优先） | `true` |
 | `ULTRA_WARM_WORKER_LIMIT` | Ultra 分区（权益为 Ultra 的账户）的常驻预热账户数，`0` 表示只按需启动，可热更新 | `2` |
 | `ULTRA_MAX_ACTIVE_WORKERS` | Ultra 分区的活动 Worker 容量上限，至少为 1 且不小于 `ULTRA_WARM_WORKER_LIMIT`，可热更新 | `5` |
 | `WARM_STARTUP_CONCURRENCY` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，按需冷启动另保留 1 个名额并优先，可热更新；`WAA_BACKEND=go` 不受此限 | `2` |

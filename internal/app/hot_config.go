@@ -178,6 +178,8 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.overrides.Apply(&saved)
+	// 独占设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
+	manager.applyUltraExclusive(saved.UltraExclusive)
 
 	manager.mu.Lock()
 	generation := manager.current

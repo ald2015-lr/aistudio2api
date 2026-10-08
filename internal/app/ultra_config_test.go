@@ -149,6 +149,76 @@ func TestUltraSettingsHotReload(t *testing.T) {
 	}
 }
 
+// TestUltraExclusiveFollowsEffectiveConfig 公开 API 使用的独占设置总是与生效配置一致：手动改过 .env 后停止再启动，
+// 新生成服务读到的 ULTRA_EXCLUSIVE 立即生效；进程环境变量覆盖 .env 时，保存配置后生效的是读取配置时显示的值
+func TestUltraExclusiveFollowsEffectiveConfig(t *testing.T) {
+	t.Run("启动时读取 .env", func(t *testing.T) {
+		clearAppConfigEnv(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		path := filepath.Join(t.TempDir(), ".env")
+		cfg := config.Default()
+		if err := cfg.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		manager := &runtimeManager{
+			lifecycle: ctx, requests: newRequestRegistry(ctx), intent: &serviceIntent{}, configPath: path,
+			activeManagement: cfg, apiKey: newAPIKeyHolder(cfg.ProxyAPIKey), current: restartTestGeneration("STOPPED"),
+			factory: func(_ context.Context, _ context.Context, next config.Config, _ *requestRegistry) (*runtimeGeneration, error) {
+				generation := restartTestGeneration("STOPPED")
+				generation.config = next
+				return generation, nil
+			},
+		}
+		manager.current.config = cfg
+		manager.ultraExclusive.Store(cfg.UltraExclusive)
+		edited := cfg
+		edited.UltraExclusive = false
+		if err := edited.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manager.StartService(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if manager.current.config.UltraExclusive {
+			t.Fatal("新生成服务应读到 ULTRA_EXCLUSIVE=false")
+		}
+		if manager.activeUltraExclusive() {
+			t.Fatal("生成服务配置 ULTRA_EXCLUSIVE=false，公开 API 仍按独占划分号池")
+		}
+	})
+	t.Run("环境变量覆盖 .env", func(t *testing.T) {
+		clearAppConfigEnv(t)
+		t.Setenv("ULTRA_EXCLUSIVE", "true")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		path := filepath.Join(t.TempDir(), ".env")
+		cfg := config.Default()
+		if err := cfg.Save(path); err != nil {
+			t.Fatal(err)
+		}
+		requests := newRequestRegistry(ctx)
+		manager := &runtimeManager{
+			lifecycle: ctx, configPath: path, activeManagement: cfg, requests: requests, apiKey: newAPIKeyHolder(cfg.ProxyAPIKey),
+			intent: &serviceIntent{}, current: &runtimeGeneration{admin: &runtimeAdmin{configPath: path, requests: requests}, config: cfg},
+		}
+		manager.ultraExclusive.Store(cfg.UltraExclusive)
+		value := runtimeConfigDTO(cfg)
+		exclusive := false
+		value.UltraExclusive = &exclusive
+		if _, err := manager.UpdateRuntimeConfig(ctx, value); err != nil {
+			t.Fatal(err)
+		}
+		read, err := manager.RuntimeConfig(ctx)
+		if err != nil || read.UltraExclusive == nil {
+			t.Fatalf("读取配置失败: %v", err)
+		}
+		if !*read.UltraExclusive || manager.activeUltraExclusive() != *read.UltraExclusive {
+			t.Fatalf("读取配置显示 ULTRA_EXCLUSIVE=%t，公开 API 实际使用的独占设置=%t", *read.UltraExclusive, manager.activeUltraExclusive())
+		}
+	})
+}
+
 func clearAppConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{"ULTRA_EXCLUSIVE", "ULTRA_WARM_WORKER_LIMIT", "ULTRA_MAX_ACTIVE_WORKERS", "WARM_WORKER_LIMIT", "MAX_ACTIVE_WORKERS"} {
