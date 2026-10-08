@@ -189,6 +189,25 @@ func TestQuotaFailureAndBareStatus(t *testing.T) {
 		t.Fatalf("cooldown=%+v", cooldown)
 	}
 
+	// 免费层 "limit: 0" 的 429 把分钟违规项排在每日违规项之前：应按每日限额冷却
+	multi := DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(`[8,"You exceeded your current quota.",[["type.googleapis.com/google.rpc.QuotaFailure",[[`+
+		`[null,null,null,"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count","GenerateContentInputTokensPerModelPerMinute-FreeTier"],`+
+		`[null,null,null,"generativelanguage.googleapis.com/generate_content_free_tier_requests","GenerateRequestsPerDayPerProjectPerModel-FreeTier"]`+
+		`]]],["type.googleapis.com/google.rpc.RetryInfo",[[29]]]]]`))
+	if cooldown, ok := QuotaCooldownForError(multi, now); !ok || cooldown.Kind != DailyQuotaKind || !cooldown.Until.Equal(nextQuotaDay(now)) {
+		t.Fatalf("多个违规项含每日限额 metadata=%v cooldown=%+v", multi.Metadata, cooldown)
+	}
+	minutes := DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(`[8,"You exceeded your current quota.",[["type.googleapis.com/google.rpc.QuotaFailure",[[`+
+		`[null,null,null,"generativelanguage.googleapis.com/generate_content_free_tier_input_token_count","GenerateContentInputTokensPerModelPerMinute-FreeTier"],`+
+		`[null,null,null,"generativelanguage.googleapis.com/generate_content_free_tier_requests","GenerateRequestsPerMinutePerProjectPerModel-FreeTier"]`+
+		`]]]]]`))
+	if minutes.Metadata["quota_id"] != "GenerateContentInputTokensPerModelPerMinute-FreeTier" {
+		t.Fatalf("没有每日违规项时应取第一个: %v", minutes.Metadata)
+	}
+	if cooldown, ok := QuotaCooldownForError(minutes, now); !ok || cooldown.Kind != "分钟限额" {
+		t.Fatalf("只有分钟违规项 cooldown=%+v", cooldown)
+	}
+
 	bare := DecodeRPCError("ProxyStreamedCall", http.StatusTooManyRequests, []byte(
 		`[8,null,[["type.googleapis.com/google.rpc.ErrorInfo",["RATE_LIMIT_EXCEEDED","googleapis.com",[["quota_limit","GenerateRequestsPerDayPerProjectPerModel"]]]]]]`,
 	))

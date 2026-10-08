@@ -283,16 +283,11 @@ function validate(value: ServiceConfig): string {
   return ''
 }
 
-// payload 构造保存内容；自动保存时失焦字段沿用已保存的值，避免把输入到一半的内容写进去
+// payload 构造保存内容；自动保存时所有失焦字段沿用已保存的值，避免把输入到一半的内容写进去
 function payload(includeBlurFields: boolean): ServiceConfig {
   const base = savedConfig.value
   if (includeBlurFields || base === null) return { ...form }
-  return {
-    ...form,
-    auth_states: base.auth_states,
-    listen_addr: base.listen_addr,
-    proxy_api_key: base.proxy_api_key,
-  }
+  return { ...form, ...Object.fromEntries(BLUR_KEYS.map((key) => [key, base[key]])) }
 }
 
 function cancelCountdown(): void {

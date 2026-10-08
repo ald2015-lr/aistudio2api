@@ -120,6 +120,22 @@ func TestAdminLimiterGlobalCap(t *testing.T) {
 	}
 }
 
+// TestAdminLimiterLoopbackSource 同机反向代理后的客户端共用回环来源计数：按单来源上限输错不会让所有人被封禁
+func TestAdminLimiterLoopbackSource(t *testing.T) {
+	limiter := &adminLoginLimiter{entries: make(map[string]*adminLoginEntry)}
+	now := time.Now()
+	for range adminAuthMaxFailures {
+		limiter.fail("127.0.0.1", now)
+		limiter.fail("203.0.113.66", now)
+	}
+	if limiter.blocked("127.0.0.1", now) {
+		t.Fatal("回环来源达到单来源上限时不应封禁")
+	}
+	if !limiter.blocked("203.0.113.66", now) {
+		t.Fatal("普通来源达到单来源上限时应封禁")
+	}
+}
+
 // TestSameOriginRejectsCrossSite 跨站浏览器请求、非 http(s) 或带用户信息的 Origin 被拒绝，非浏览器请求放行
 func TestSameOriginRejectsCrossSite(t *testing.T) {
 	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })

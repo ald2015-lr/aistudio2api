@@ -366,9 +366,11 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return delay
 }
 
-// decodeRPCQuotaFailure 读取 google.rpc.QuotaFailure 中第一个违规项的 quota_metric 与 quota_id（数组协议下标 3、4）。
+// decodeRPCQuotaFailure 读取 google.rpc.QuotaFailure 违规项的 quota_metric 与 quota_id（数组协议下标 3、4）。
 // Gemini API 形状的 429 只在这里给出额度周期（如 GenerateRequestsPerDayPerProjectPerModel-FreeTier），
-// 文案只是通用的 "You exceeded your current quota"；ErrorInfo 已给出的字段不覆盖
+// 文案只是通用的 "You exceeded your current quota"；ErrorInfo 已给出的字段不覆盖。
+// 常见的免费层 429 同时列出分钟和每日违规项且分钟在前：有每日违规项时取它，否则取第一个，
+// 避免每日额度已耗尽的账户按分钟限额冷却后整天被反复选中
 func decodeRPCQuotaFailure(rpcError *RPCError, raw json.RawMessage) {
 	var failure []json.RawMessage
 	if json.Unmarshal(raw, &failure) != nil || len(failure) == 0 {
@@ -378,27 +380,32 @@ func decodeRPCQuotaFailure(rpcError *RPCError, raw json.RawMessage) {
 	if json.Unmarshal(failure[0], &violations) != nil {
 		return
 	}
+	var chosen map[string]string
 	for _, violation := range violations {
-		fields := map[string]int{"quota_metric": 3, "quota_id": 4}
-		found := false
-		for key, index := range fields {
-			if len(violation) <= index {
-				continue
-			}
+		fields := make(map[string]string, 2)
+		for key, index := range map[string]int{"quota_metric": 3, "quota_id": 4} {
 			var value string
-			if json.Unmarshal(violation[index], &value) != nil || value == "" {
-				continue
-			}
-			found = true
-			if rpcError.Metadata == nil {
-				rpcError.Metadata = make(map[string]string)
-			}
-			if rpcError.Metadata[key] == "" {
-				rpcError.Metadata[key] = value
+			if len(violation) > index && json.Unmarshal(violation[index], &value) == nil && value != "" {
+				fields[key] = value
 			}
 		}
-		if found {
-			return
+		if len(fields) == 0 {
+			continue
+		}
+		daily := dailyQuotaEvidence(strings.ToLower(fields["quota_metric"] + " " + fields["quota_id"]))
+		if chosen == nil || daily {
+			chosen = fields
+		}
+		if daily {
+			break
+		}
+	}
+	for key, value := range chosen {
+		if rpcError.Metadata == nil {
+			rpcError.Metadata = make(map[string]string)
+		}
+		if rpcError.Metadata[key] == "" {
+			rpcError.Metadata[key] = value
 		}
 	}
 }

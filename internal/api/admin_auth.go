@@ -47,7 +47,7 @@ func (limiter *adminLoginLimiter) blocked(ip string, now time.Time) bool {
 	return ok && now.Before(entry.blockedUntil)
 }
 
-// fail 记录一次密码错误，窗口内达到上限后封禁该 IP
+// fail 记录一次密码错误，窗口内达到上限后封禁该来源
 func (limiter *adminLoginLimiter) fail(ip string, now time.Time) {
 	limiter.mu.Lock()
 	defer limiter.mu.Unlock()
@@ -68,16 +68,16 @@ func (limiter *adminLoginLimiter) fail(ip string, now time.Time) {
 		entry = &adminLoginEntry{windowStart: now}
 		limiter.entries[ip] = entry
 	}
-	if now.Sub(entry.windowStart) > adminAuthWindow {
-		entry.failures = 0
-		entry.windowStart = now
+	entry.record(now, sourceFailureLimit(ip))
+}
+
+// sourceFailureLimit 返回单个来源的错误上限。回环来源通常是同机反向代理，后面的全部客户端共用这一个计数，
+// 按单来源上限计时任何人输错 10 次就会让所有人 15 分钟无法用密码登录，因此改按全部来源合计的上限计
+func sourceFailureLimit(ip string) int {
+	if parsed := net.ParseIP(ip); parsed != nil && parsed.IsLoopback() {
+		return adminAuthGlobalMaxFailures
 	}
-	entry.failures++
-	if entry.failures >= adminAuthMaxFailures {
-		entry.blockedUntil = now.Add(adminAuthBlock)
-		entry.failures = 0
-		entry.windowStart = now
-	}
+	return adminAuthMaxFailures
 }
 
 // record 在窗口内累计一次错误，达到上限时开始封禁
@@ -103,8 +103,8 @@ func (limiter *adminLoginLimiter) success(ip string) {
 
 // requestRemoteIP 返回限速使用的来源地址：只取连接的对端地址，不信任 X-Real-IP / X-Forwarded-For。
 // 这些头可以由客户端伪造（反向代理通常把客户端发来的 X-Forwarded-For 原样保留在前面），
-// 信任它们时每次换一个伪造地址就能绕过单来源限速。反向代理后面的客户端因此共用一个计数，
-// 与全部来源合计上限的效果相同；管理令牌不受密码限速影响
+// 信任它们时每次换一个伪造地址就能绕过单来源限速。同机反向代理后面的客户端因此共用一个回环来源计数，
+// 该计数按全部来源合计的上限封禁（见 sourceFailureLimit）；管理令牌不受密码限速影响
 func requestRemoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

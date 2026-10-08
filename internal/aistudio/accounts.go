@@ -875,7 +875,7 @@ func (p *AccountPool) Add(account *Account) (resultErr error) {
 		if err := validatePersistentAccountFiles(account); err != nil {
 			return err
 		}
-		runtimeState, err := readRuntime(account.RuntimePath)
+		runtimeState, err := readRuntimeOrEmpty(account.RuntimePath)
 		if err != nil {
 			return err
 		}
@@ -2786,7 +2786,7 @@ func loadAccount(directory string) (*Account, error) {
 		return nil, fmt.Errorf("账户 %s: %w", id, err)
 	}
 	runtimePath := filepath.Join(directory, runtimeStateName)
-	runtimeState, err := readRuntime(runtimePath)
+	runtimeState, err := readRuntimeOrEmpty(runtimePath)
 	if err != nil {
 		return nil, fmt.Errorf("账户 %s: %w", id, err)
 	}
@@ -2852,7 +2852,7 @@ func writeAccountConfig(filePath string, value AccountConfig) error {
 // readRuntime 读取账户运行态（冷却、资源绑定、模型资格等缓存）。
 //
 // 运行态只是缓存，不能因为它让账户不可用：未知字段（新版本写入或回退版本）直接忽略；
-// 文件损坏时备份为 runtime-state.json.corrupt 并按空运行态继续，下一次写入时重建。
+// 文件损坏时返回 errRuntimeCorrupt，由 readRuntimeOrEmpty / readRuntimeLocked 决定按空运行态继续还是备份并用内存运行态重写。
 // 原先严格解析，一个账户的坏文件会让轮询到它的请求和全部候选的分类都失败，启动时还会直接丢掉该账户
 func readRuntime(filePath string) (accountRuntimeState, error) {
 	value := emptyRuntimeState()
@@ -2869,12 +2869,7 @@ func readRuntime(filePath string) (accountRuntimeState, error) {
 		decodeErr = ensureJSONEnd(decoder)
 	}
 	if decodeErr != nil {
-		backup := filePath + ".corrupt"
-		if renameErr := os.Rename(filePath, backup); renameErr != nil {
-			return accountRuntimeState{}, fmt.Errorf("解析 %s: %w（备份失败: %v）", runtimeStateName, decodeErr, renameErr)
-		}
-		slog.Warn("账户运行态文件损坏，已备份并按空运行态继续", "file", filePath, "backup", backup, "error", decodeErr)
-		return emptyRuntimeState(), nil
+		return accountRuntimeState{}, fmt.Errorf("解析 %s: %w: %w", runtimeStateName, errRuntimeCorrupt, decodeErr)
 	}
 	if value.Cooldowns == nil {
 		value.Cooldowns = make(map[string]CooldownState)
@@ -2886,6 +2881,38 @@ func readRuntime(filePath string) (accountRuntimeState, error) {
 		value.ModelAccess = make(map[string]ModelAccess)
 	}
 	return value, nil
+}
+
+// errRuntimeCorrupt 表示运行态文件无法解析（手工编辑出错或其他版本写入了不兼容的字段）
+var errRuntimeCorrupt = errors.New("运行态文件损坏")
+
+// readRuntimeOrEmpty 用于加载账户（还没有内存运行态、也未持有运行态文件锁）：文件损坏时按空运行态继续，不让账户失败；
+// 不改名备份，避免与其他进程持锁写入竞争，之后第一次持锁读写时再备份并重写
+func readRuntimeOrEmpty(filePath string) (accountRuntimeState, error) {
+	value, err := readRuntime(filePath)
+	if errors.Is(err, errRuntimeCorrupt) {
+		slog.Warn("账户运行态文件损坏，按空运行态继续", "file", filePath, "error", err)
+		return emptyRuntimeState(), nil
+	}
+	return value, err
+}
+
+// readRuntimeLocked 在持有运行态文件锁时读取：文件损坏时备份为 .corrupt 并用内存中的运行态重写，
+// 不用空运行态替换内存里仍然正确的资源绑定与冷却
+func readRuntimeLocked(filePath string, memory accountRuntimeState) (accountRuntimeState, error) {
+	value, err := readRuntime(filePath)
+	if !errors.Is(err, errRuntimeCorrupt) {
+		return value, err
+	}
+	backup := filePath + ".corrupt"
+	if renameErr := os.Rename(filePath, backup); renameErr != nil {
+		return accountRuntimeState{}, fmt.Errorf("%w（备份失败: %v）", err, renameErr)
+	}
+	if writeErr := writeRuntime(filePath, memory); writeErr != nil {
+		return accountRuntimeState{}, writeErr
+	}
+	slog.Warn("账户运行态文件损坏，已备份并按内存中的运行态重写", "file", filePath, "backup", backup, "error", err)
+	return memory, nil
 }
 
 func emptyRuntimeState() accountRuntimeState {
@@ -2953,7 +2980,7 @@ func (p *AccountPool) updateRuntimeContext(
 	if account.RuntimePath == "" {
 		current.BenefitTier = account.BenefitTier
 	} else {
-		current, err = readRuntime(account.RuntimePath)
+		current, err = readRuntimeLocked(account.RuntimePath, current)
 		if err != nil {
 			return false, err
 		}
@@ -3113,7 +3140,7 @@ func (p *AccountPool) refreshAccountRuntime(ctx context.Context, account *Accoun
 	if account.RuntimePath == "" {
 		current.BenefitTier = account.BenefitTier
 	} else {
-		current, err = readRuntime(account.RuntimePath)
+		current, err = readRuntimeLocked(account.RuntimePath, current)
 		if err != nil {
 			return err
 		}

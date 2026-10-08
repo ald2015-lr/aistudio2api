@@ -140,6 +140,11 @@ func TestEncodeJSONSchemaBooleanSubschemas(t *testing.T) {
 	if !strings.HasSuffix(got, `,2]`) || !strings.Contains(got, `[1]`) || !strings.Contains(got, `[3]`) {
 		t.Fatalf("封闭元组编码为 %s", got)
 	}
+	// 客户端给出的 maxItems 更小时保留，不被 prefixItems 长度放宽
+	got = mustEncodeSchema(t, `{"type":"array","prefixItems":[{"type":"string"},{"type":"integer"},{"type":"boolean"}],"items":false,"maxItems":1}`)
+	if !strings.HasSuffix(got, `,1]`) {
+		t.Fatalf("封闭元组 maxItems=1 编码为 %s", got)
+	}
 	if _, err := encodeJSONSchema(json.RawMessage(`{"type":"array","items":false,"minItems":1}`)); err == nil {
 		t.Fatal("items:false 且 minItems>0 应返回错误")
 	}

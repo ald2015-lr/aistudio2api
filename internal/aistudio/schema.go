@@ -663,7 +663,14 @@ func normalizeBooleanItems(schema map[string]json.RawMessage) error {
 			}
 		}
 		delete(schema, "items")
-		schema["maxItems"] = json.RawMessage(strconv.Itoa(len(prefix)))
+		// 只收紧不放宽：客户端已给出更小的 maxItems 时保留
+		maximum := int64(len(prefix))
+		if raw, ok := schema["maxItems"]; ok {
+			if existing, err := schemaInteger(raw, "maxItems"); err == nil {
+				maximum = min(maximum, existing)
+			}
+		}
+		schema["maxItems"] = json.RawMessage(strconv.FormatInt(maximum, 10))
 	}
 	return nil
 }

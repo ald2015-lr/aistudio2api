@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -111,11 +112,12 @@ func TestStaleLeaseDoesNotOverwriteRefreshedCookies(t *testing.T) {
 	}
 }
 
-// TestReadRuntimeTolerant 运行态文件含未知字段时照常读取；损坏时备份并按空运行态继续，不让账户失败
+// TestReadRuntimeTolerant 运行态文件含未知字段时照常读取；损坏时加载账户按空运行态继续且不移动文件，
+// 持锁读写时备份并用内存中的运行态重写
 func TestReadRuntimeTolerant(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, runtimeStateName)
-	if err := os.WriteFile(path, []byte(`{"benefit_tier":"pro","future_field":1}`), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"cooldowns":{},"future_field":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	state, err := readRuntime(path)
@@ -125,15 +127,29 @@ func TestReadRuntimeTolerant(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"cooldowns":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	state, err = readRuntime(path)
+	if _, err := readRuntime(path); !errors.Is(err, errRuntimeCorrupt) {
+		t.Fatalf("损坏文件应返回 errRuntimeCorrupt: %v", err)
+	}
+	state, err = readRuntimeOrEmpty(path)
 	if err != nil || state.Cooldowns == nil || len(state.Cooldowns) != 0 {
-		t.Fatalf("损坏文件: state=%+v err=%v", state, err)
+		t.Fatalf("加载时损坏文件: state=%+v err=%v", state, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("未持锁时不应移动损坏文件: %v", err)
+	}
+
+	memory := emptyRuntimeState()
+	memory.Resources["files/abc"] = ResourceBinding{}
+	state, err = readRuntimeLocked(path, memory)
+	if err != nil || len(state.Resources) != 1 {
+		t.Fatalf("持锁时应沿用内存运行态: state=%+v err=%v", state, err)
 	}
 	if _, err := os.Stat(path + ".corrupt"); err != nil {
 		t.Fatalf("损坏文件没有备份: %v", err)
 	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("损坏文件应被移走: %v", err)
+	rewritten, err := readRuntime(path)
+	if err != nil || len(rewritten.Resources) != 1 {
+		t.Fatalf("应按内存运行态重写文件: state=%+v err=%v", rewritten, err)
 	}
 }
 
@@ -181,5 +197,36 @@ func TestStaleLeaseDoesNotOverwriteSavedLogin(t *testing.T) {
 	}
 	if got := diskSAPISID(t, stale.Account().StoragePath); got != "RELOGIN" {
 		t.Fatalf("重新登录后的 SAPISID 被旧租约覆盖为 %q", got)
+	}
+}
+
+// TestCorruptRuntimeKeepsInMemoryBindings 运行中运行态文件损坏时保留内存里正确的资源绑定，并把文件重写回来
+func TestCorruptRuntimeKeepsInMemoryBindings(t *testing.T) {
+	pool := testPoolWithAccount(t, "alice@example.com")
+	if err := pool.BindResource("files/abc", "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	account, err := pool.Account("alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(account.RuntimePath, []byte(`{"resources":{"files/abc":{`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := pool.AcquireAccount(context.Background(), "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	pool.mu.Lock()
+	owner := pool.resources["files/abc"]
+	pool.mu.Unlock()
+	if owner != "alice@example.com" {
+		t.Fatalf("读到损坏的运行态文件后内存绑定丢失 owner=%q", owner)
+	}
+	if state, err := readRuntime(account.RuntimePath); err != nil || len(state.Resources) != 1 {
+		t.Fatalf("运行态文件应按内存重写: state=%+v err=%v", state, err)
 	}
 }
