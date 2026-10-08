@@ -1259,7 +1259,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 
 按需热替换先启动 pending Worker（正在启动、尚未发布的替代 Worker），再关闭旧 Worker；旧实例成功退出后，替代 Worker 才成为当前 Worker。旧实例关闭和替代 Worker 回收同时失败时，两者都保留等待再次清理，并各占一个活动容量槽；达到容量上限后停止新建 Worker。完整生成服务 Stop/Start 的顺序为：Start 创建新生成服务实例前先重试停止旧实例，旧 PID 未退出时返回停止错误并保留原实例。
 
-管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker 并在原账户重放一次。候选耗尽且没有符合方法、能力与权益的账户时返回 HTTP 400：OpenAI code 为 `account_required`，Anthropic type 为 `invalid_request_error`，Gemini status 为 `INVALID_ARGUMENT`。支持请求的账户都处于需要重新登录、不可用或已停用状态时返回 HTTP 503，错误消息逐个列出账户、状态与原因：OpenAI code 为 `account_unavailable`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`。
+管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker 并在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。
 
 模型目录重试的 pending 集合保存等待再次同步的账户 ID。启动期全账户 fan-out、以及新增、登录或验证后的单账户同步，遇到任意错误或成功返回空目录时加入；返回非空目录时移除；删除账户同时移除。全账户后台同步结束后启动单个 30 秒 ticker（Go 定时器），每次对排序后的待重试账户列表再次并发 fan-out，并在任务开始时复核该 ID 仍在 pending 集合中。错误或空目录继续保留；每个非空成功立即更新账户缓存与公共目录快照、发布 `accounts` 和 `models`，并在 `RUNNING` 状态触发 Worker 预热。批次结束时，`auth_required` 集合发生变化会补发当前账户与模型快照；即时单账户同步无论成功或失败都立即发布当前快照。
 

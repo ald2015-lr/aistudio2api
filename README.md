@@ -599,8 +599,8 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 | 输入超过模型 token 上限等参数错误 | 400 | 谷歌原文（去掉 `[original: …]`、`(qos=…)` 等内部标记）；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头 |
 | 输入被安全策略拦截 | 400 | 如 `Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)` |
 | 模型不存在或没有账号能提供 | 404 | `models/<模型> is not found for API version v1beta, …` |
-| 号池全部冷却、上游限流 | 429 | `Resource has been exhausted (e.g. check quota).` |
-| 号池内部的账号认证、权限、目录问题，服务未就绪或重启中 | 503 | `The service is currently unavailable.` |
+| 号池全部冷却、上游限流 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数） |
+| 号池内部的账号认证（需要重新登录）、停用、占用、权限、目录问题，号池为空，服务未就绪或重启中 | 503 | `The service is currently unavailable.` |
 | 上游过载 | 503 | `The model is overloaded. Please try again later.` |
 | 超时 | 504 | `Deadline expired before operation could complete.` |
 | 其他内部错误 | 500 | `An internal error has occurred. …` |

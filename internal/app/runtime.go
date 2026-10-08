@@ -3106,7 +3106,8 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			return nil, promoteFailure
 		}
 		if runtimeBusyErr != nil {
-			return nil, runtimeBusyErr
+			// 候选账户的 runtime 都被其他进程占用：号池一侧的暂时性原因，按 503 返回
+			return nil, aistudio.PoolNotReady("候选账户被其他进程占用", runtimeBusyErr)
 		}
 		return nil, service.pool.NoEligibleError(selection)
 	}
@@ -3715,8 +3716,8 @@ func (service *trackedService) generateWithRetry(
 		service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
 	}
 	if err == nil && (lease == nil || source == nil) {
-		// 兜底：循环结束却没有拿到可用的上游流时按没有可用账号结束，不能把空租约交给 forwardEvents
-		err = fmt.Errorf("%w: 模型 %s 没有可用账号", aistudio.ErrNoEligibleAccount, modelID)
+		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents
+		err = aistudio.PoolNotReady(fmt.Sprintf("模型 %s 换号结束时没有可用账号", modelID), nil)
 	}
 	if err != nil {
 		if activity != nil {

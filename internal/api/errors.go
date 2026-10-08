@@ -103,6 +103,8 @@ func statusFromError(err error) int {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}
+	// 号池暂时不可调度（503）与全部冷却（429，经 HTTPStatus）都是服务端原因；
+	// 其余 ErrNoEligibleAccount 表示没有账户能处理该请求，属于请求本身的原因
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {
 		return http.StatusServiceUnavailable

@@ -187,8 +187,8 @@ func (metadata *accessLogMetadata) setRequestError(err error) {
 	if metadata.canceled {
 		metadata.failureStatus = 499
 	} else {
-		// 与返回给客户端的状态码一致（号池内部的 401/403 等已按官方格式改为 503）
-		metadata.failureStatus = publicErrorFor(err, "").Status
+		// 与返回给客户端的状态码一致（号池内部的 401/403 等已按官方格式改为 503；指明模型时没有账户支持按 404）
+		metadata.failureStatus = publicErrorFor(err, metadata.model).Status
 	}
 	metadata.mu.Unlock()
 }

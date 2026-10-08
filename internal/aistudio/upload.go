@@ -328,7 +328,8 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 	if automatic {
 		candidateAccountIDs = s.pool.fileUploadAccountIDs()
 		if len(candidateAccountIDs) == 0 {
-			return FileRef{}, ErrNoEligibleAccount
+			// 上传不限模型，任何就绪账户都能承担：一个都没有时是号池一侧的原因（需要重新登录、已停用或号池为空）
+			return FileRef{}, s.pool.NoEligibleError(AccountSelection{})
 		}
 		maxAttempts = len(candidateAccountIDs)
 	}

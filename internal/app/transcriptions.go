@@ -118,14 +118,11 @@ func (service *trackedService) Transcribe(
 
 func (service *trackedService) transcriptionCandidates(ctx context.Context, model string) ([]string, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(model), "models/")
-	groups, err := service.pool.ClassifyCandidates(
-		ctx,
-		aistudio.AccountSelection{
-			ModelID: modelID, ModelAccessScope: modelID,
-			Method: "generateContent", Capability: "transcription_output",
-		},
-		service.workers.WarmAccountIDs(),
-	)
+	selection := aistudio.AccountSelection{
+		ModelID: modelID, ModelAccessScope: modelID,
+		Method: "generateContent", Capability: "transcription_output",
+	}
+	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +135,8 @@ func (service *trackedService) transcriptionCandidates(ctx context.Context, mode
 	candidates = append(candidates, service.pool.OrderCandidates(groups.WarmBusy, modelID)...)
 	candidates = append(candidates, service.pool.OrderCandidates(groups.StandbyBusy, modelID)...)
 	if len(candidates) == 0 {
-		return nil, aistudio.ErrNoEligibleAccount
+		// 区分原因：全部冷却按 429，账户都不可调度按 503，没有账户支持该模型才按请求本身的原因
+		return nil, service.pool.NoCandidateError(selection, groups)
 	}
 	return candidates, nil
 }

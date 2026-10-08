@@ -56,7 +56,9 @@ var (
 	ErrInvalidArgument = errors.New("AI Studio 请求参数无效")
 	// ErrModelNotFound 表示实时目录中不存在请求模型
 	ErrModelNotFound = errors.New("AI Studio 实时目录中没有请求模型")
-	// ErrNoEligibleAccount 表示没有账户具备请求所需能力
+	// ErrNoEligibleAccount 表示号池中没有任何账户能处理请求的模型、方法、能力、通道或绑定资源，属于请求本身的原因，
+	// 对外按 4xx 返回。号池一侧的暂时性原因（账户需要重新登录、已停用、被占用，号池为空或模型目录尚未加载）
+	// 返回 AccountsNotReadyError，全部冷却返回 AllCoolingError；前者同样满足 errors.Is(err, ErrNoEligibleAccount)
 	ErrNoEligibleAccount = errors.New("没有符合条件的 AI Studio 账户")
 	// ErrAccountNotFound 表示稳定账户 ID 不存在
 	ErrAccountNotFound = errors.New("账户不存在")
@@ -79,6 +81,11 @@ func (e *AllCoolingError) Error() string {
 	return fmt.Sprintf("模型 %s 的可用账户均在冷却，最早恢复时间 %s", e.ModelID, e.Until.Local().Format(time.RFC3339))
 }
 
+// RetryAt 返回最早恢复时间，供对外错误写 Retry-After
+func (e *AllCoolingError) RetryAt() time.Time {
+	return e.Until
+}
+
 // HTTPStatus 返回额度耗尽对应的公开状态码
 func (e *AllCoolingError) HTTPStatus() int {
 	return http.StatusTooManyRequests
@@ -89,18 +96,54 @@ func (e *AllCoolingError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
-// AccountsNotReadyError 表示支持请求的账户都处于不可调度状态
+// AccountsNotReadyError 表示号池暂时无法调度请求：支持请求的账户都需要重新登录、不可用、已停用或被其他进程占用，
+// 或者号池为空、模型目录尚未加载、候选账户在调度期间被移除。这些是号池一侧的原因，对外按 503 返回，
+// 不能让客户端当成自己的请求错误
 type AccountsNotReadyError struct {
 	Reasons []string
+	// Cause 为触发该错误的内部原因（如账户 runtime 被其他进程占用），可为空
+	Cause error
 }
 
 func (e *AccountsNotReadyError) Error() string {
-	return ErrNoEligibleAccount.Error() + "：" + strings.Join(e.Reasons, "；")
+	message := ErrNoEligibleAccount.Error() + "：" + strings.Join(e.Reasons, "；")
+	if e.Cause != nil {
+		message += ": " + e.Cause.Error()
+	}
+	return message
 }
 
-func (e *AccountsNotReadyError) Unwrap() error {
-	return ErrNoEligibleAccount
+// Unwrap 同时保留无账户哨兵与内部原因，调用方仍可用 errors.Is(err, ErrNoEligibleAccount) 判断“没有可用账户”
+func (e *AccountsNotReadyError) Unwrap() []error {
+	if e.Cause == nil {
+		return []error{ErrNoEligibleAccount}
+	}
+	return []error{ErrNoEligibleAccount, e.Cause}
 }
+
+// HTTPStatus 返回号池暂时不可调度对应的公开状态码
+func (e *AccountsNotReadyError) HTTPStatus() int {
+	return http.StatusServiceUnavailable
+}
+
+// ErrorCode 返回 OpenAI 兼容的账户不可用错误代码
+func (e *AccountsNotReadyError) ErrorCode() string {
+	return "account_unavailable"
+}
+
+// PoolNotReady 返回号池一侧暂时无法调度的无账户错误
+func PoolNotReady(reason string, cause error) *AccountsNotReadyError {
+	return &AccountsNotReadyError{Reasons: []string{reason}, Cause: cause}
+}
+
+const (
+	// poolMissingReason 为账户池未初始化时的原因
+	poolMissingReason = "账户池未初始化"
+	// leaseReplacedReason 为候选账户在调度期间被移除或替换时的原因
+	leaseReplacedReason = "候选账户在调度期间被移除或替换"
+	// emptyPoolReason 为账户池中没有任何账户时的原因
+	emptyPoolReason = "账户池中没有账户"
+)
 
 // accountStateLabels 为不可调度账户状态的中文说明
 var accountStateLabels = map[AccountState]string{
@@ -1088,7 +1131,7 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 // AcquireFor 按模型方法账户或资源粘性获取账户槽位
 func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, error) {
 	if p == nil {
-		return nil, ErrNoEligibleAccount
+		return nil, PoolNotReady(poolMissingReason, nil)
 	}
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
@@ -1178,7 +1221,7 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 // TryAcquireFor 尝试获取账户槽位并立即返回当前结果
 func (p *AccountPool) TryAcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, bool, error) {
 	if p == nil {
-		return nil, false, ErrNoEligibleAccount
+		return nil, false, PoolNotReady(poolMissingReason, nil)
 	}
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
@@ -1236,7 +1279,7 @@ func (p *AccountPool) refreshAndValidateLease(
 	selection AccountSelection,
 ) (bool, error) {
 	if lease == nil || lease.account == nil {
-		return false, ErrNoEligibleAccount
+		return false, PoolNotReady(leaseReplacedReason, nil)
 	}
 	if lease.refreshRuntime {
 		if err := p.refreshAccountRuntime(ctx, lease.account); err != nil {
@@ -1248,7 +1291,7 @@ func (p *AccountPool) refreshAndValidateLease(
 	defer p.mu.Unlock()
 	account := lease.account
 	if p.byID[account.ID] != account {
-		return false, ErrNoEligibleAccount
+		return false, PoolNotReady(leaseReplacedReason, nil)
 	}
 	lease.modelAccessGeneration = account.modelAccessGeneration
 	if resourceID := strings.TrimSpace(selection.ResourceID); resourceID != "" {
@@ -1267,10 +1310,11 @@ func (p *AccountPool) refreshAndValidateLease(
 	return true, nil
 }
 
-// NoEligibleError 返回列出候选账户不可调度原因的无账户错误
+// NoEligibleError 返回没有可调度账户时的错误：支持请求的账户都不可调度（或号池为空）时为列出原因的
+// AccountsNotReadyError（503）；号池中没有任何账户支持请求时为 ErrNoEligibleAccount（请求本身的原因）
 func (p *AccountPool) NoEligibleError(selection AccountSelection) error {
 	if p == nil {
-		return ErrNoEligibleAccount
+		return PoolNotReady(poolMissingReason, nil)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1300,8 +1344,42 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 		}
 		reasons = append(reasons, reason)
 	}
-	if len(reasons) == 0 {
-		return ErrNoEligibleAccount
+	if len(reasons) > 0 {
+		return &AccountsNotReadyError{Reasons: reasons}
+	}
+	if !p.hasAccountLocked() {
+		return PoolNotReady(emptyPoolReason, nil)
+	}
+	return ErrNoEligibleAccount
+}
+
+// NoCandidateError 返回候选分组为空时的错误：有账户在冷却时按全部冷却（429，带最早恢复时间），否则同 NoEligibleError
+func (p *AccountPool) NoCandidateError(selection AccountSelection, groups AccountCandidateGroups) error {
+	if !groups.EarliestCooldown.IsZero() {
+		return &AllCoolingError{ModelID: strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/"), Until: groups.EarliestCooldown}
+	}
+	return p.NoEligibleError(selection)
+}
+
+func (p *AccountPool) hasAccountLocked() bool {
+	for _, account := range p.accounts {
+		if account != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// catalogMissingErrorLocked 号池里还没有任何账户的模型目录：号池为空、启动阶段目录仍在同步，或账户都需要重新登录。
+// 这时无法判断模型是否存在，属于号池一侧的暂时性原因，不能按模型不存在返回
+func (p *AccountPool) catalogMissingErrorLocked() error {
+	if !p.hasAccountLocked() {
+		return PoolNotReady(emptyPoolReason, nil)
+	}
+	reasons := []string{"账户模型目录尚未加载"}
+	var notReady *AccountsNotReadyError
+	if errors.As(p.noEligibleErrorLocked(AccountSelection{}), &notReady) {
+		reasons = append(reasons, notReady.Reasons...)
 	}
 	return &AccountsNotReadyError{Reasons: reasons}
 }
@@ -1328,7 +1406,7 @@ func (p *AccountPool) validateSelectionLocked(selection AccountSelection) error 
 		return nil
 	}
 	if !p.hasModelCatalogLocked() {
-		return ErrNoEligibleAccount
+		return p.catalogMissingErrorLocked()
 	}
 	if !p.hasModelLocked(modelID) {
 		return fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
@@ -2363,7 +2441,7 @@ func (p *AccountPool) ClassifyCandidates(
 	warmAccountIDs []string,
 ) (AccountCandidateGroups, error) {
 	if p == nil {
-		return AccountCandidateGroups{}, ErrNoEligibleAccount
+		return AccountCandidateGroups{}, PoolNotReady(poolMissingReason, nil)
 	}
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if selection.ResourceID != "" {
@@ -2398,7 +2476,7 @@ func (p *AccountPool) classifyCandidatesLocked(
 	modelID := selection.ModelID
 	if modelID != "" {
 		if !p.hasModelCatalogLocked() {
-			return AccountCandidateGroups{}, ErrNoEligibleAccount
+			return AccountCandidateGroups{}, p.catalogMissingErrorLocked()
 		}
 		if !p.hasModelLocked(modelID) {
 			return AccountCandidateGroups{}, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)

@@ -302,7 +302,11 @@ func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 		if len(failures) > 0 {
 			return nil, errors.Join(failures...)
 		}
-		return nil, ErrNoEligibleAccount
+		// 没有可刷新目录的账户（都需要重新登录、已停用或号池为空）属于号池一侧的原因
+		if len(targets) == 0 {
+			return nil, s.pool.NoEligibleError(AccountSelection{})
+		}
+		return nil, PoolNotReady("账户模型目录尚未加载", nil)
 	}
 	return models, nil
 }

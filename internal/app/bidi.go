@@ -86,13 +86,10 @@ func (preparer *accountWorkerPreparer) WorkerGeneration() uint64 {
 
 func (service *trackedService) bidiCandidates(ctx context.Context, model string, modelAccessScope string) ([]string, error) {
 	modelID := strings.TrimPrefix(strings.TrimSpace(model), "models/")
-	groups, err := service.pool.ClassifyCandidates(
-		ctx,
-		aistudio.AccountSelection{
-			ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "bidiGenerateContent",
-		},
-		service.workers.WarmAccountIDs(),
-	)
+	selection := aistudio.AccountSelection{
+		ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "bidiGenerateContent",
+	}
+	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +102,8 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 	candidates = append(candidates, service.preferBidiAccounts(groups.WarmBusy, modelID, modelAccessScope)...)
 	candidates = append(candidates, service.preferBidiAccounts(groups.StandbyBusy, modelID, modelAccessScope)...)
 	if len(candidates) == 0 {
-		return nil, aistudio.ErrNoEligibleAccount
+		// 区分原因：全部冷却按 429，账户都不可调度按 503，没有账户支持该模型才按请求本身的原因
+		return nil, service.pool.NoCandidateError(selection, groups)
 	}
 	return candidates, nil
 }

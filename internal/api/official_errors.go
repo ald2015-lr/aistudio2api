@@ -3,9 +3,12 @@ package api
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -113,6 +116,7 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.As(err, &cooling) {
 		return rateLimitPublicError()
 	}
+	// 号池一侧的暂时性原因（账户需要重新登录、已停用、被占用，号池为空或目录尚未加载）：按服务暂时不可用返回
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {
 		return unavailablePublicError()
@@ -120,11 +124,12 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.Is(err, aistudio.ErrModelNotFound) {
 		return modelNotFoundPublicError(model)
 	}
+	// 号池中没有任何账户能处理请求的模型、能力或通道组合：属于请求本身的原因，指明模型时按模型不存在返回 404
 	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
 		if strings.TrimSpace(model) != "" {
 			return modelNotFoundPublicError(model)
 		}
-		return unavailablePublicError()
+		return invalidPublicError(err)
 	}
 	if errors.Is(err, aistudio.ErrInvalidArgument) || isUnverifiedProtocolError(err) {
 		return invalidPublicError(err)
@@ -413,10 +418,34 @@ func anthropicTypeForStatus(status int, kind string) string {
 	}
 }
 
+// retryAtProvider 由能给出最早恢复时间的错误实现（如全部候选账户冷却）
+type retryAtProvider interface {
+	RetryAt() time.Time
+}
+
+// setRetryAfter 在 429、503 且已知最早恢复时间时写入 Retry-After（整秒，向上取整，至少 1 秒），
+// 客户端与中转据此退避，不必盲目重试
+func setRetryAfter(w http.ResponseWriter, err error, status int) {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
+		return
+	}
+	var provider retryAtProvider
+	if !errors.As(err, &provider) {
+		return
+	}
+	until := provider.RetryAt()
+	if until.IsZero() {
+		return
+	}
+	seconds := max(int64(math.Ceil(time.Until(until).Seconds())), 1)
+	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+}
+
 // writeOpenAIRequestError 以 OpenAI 官方格式返回请求错误
 func writeOpenAIRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
+	setRetryAfter(w, err, public.Status)
 	writeJSON(w, public.Status, openAIErrorBody(public))
 }
 
@@ -431,6 +460,7 @@ func writeOpenAIInvalid(w http.ResponseWriter, err error) {
 func writeGeminiRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
+	setRetryAfter(w, err, public.Status)
 	writeJSON(w, public.Status, geminiErrorBody(public))
 }
 
@@ -445,6 +475,7 @@ func writeGeminiInvalid(w http.ResponseWriter, err error) {
 func writeAnthropicRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
+	setRetryAfter(w, err, public.Status)
 	writeJSON(w, public.Status, anthropicErrorBody(public, accessLogRequestID(w)))
 }
 
