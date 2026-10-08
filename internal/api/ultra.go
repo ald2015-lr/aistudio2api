@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -16,16 +17,31 @@ const ultraPrefix = "/ultra"
 // ultraEntry 处理 /ultra 前缀：去掉前缀后标记为 Ultra 号池的请求，交给与主路由相同的处理链；其余 /ultra/* 路径返回 404
 func ultraEntry(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, ultraPrefix)
-		if !strings.HasPrefix(path, "/v1/") && !strings.HasPrefix(path, "/v1beta/") {
+		path, rawPath, ok := stripRoutePrefix(r.URL, ultraPrefix)
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
 		inner := r.Clone(aistudio.ContextWithPoolScope(r.Context(), aistudio.PoolScopeUltra))
 		inner.URL.Path = path
-		inner.URL.RawPath = ""
+		inner.URL.RawPath = rawPath
 		next.ServeHTTP(w, inner)
 	})
+}
+
+// stripRoutePrefix 去掉 /ultra、/trace 等路由前缀，返回交给主路由的路径与其转义形式；不是 /v1/、/v1beta/ 路径时 ok 为 false。
+// 前缀与 /v1/ 按转义后的路径判断，并保留客户端的转义（如 ID 中的 %2F）：主路由按转义后的路径段匹配，
+// 去掉转义会让同一个请求与直接请求 /v1 时匹配到不同的路由
+func stripRoutePrefix(u *url.URL, prefix string) (path string, rawPath string, ok bool) {
+	escaped := strings.TrimPrefix(u.EscapedPath(), prefix)
+	if !strings.HasPrefix(escaped, "/v1/") && !strings.HasPrefix(escaped, "/v1beta/") {
+		return "", "", false
+	}
+	path = strings.TrimPrefix(u.Path, prefix)
+	if u.RawPath != "" {
+		rawPath = escaped
+	}
+	return path, rawPath, true
 }
 
 // poolScopeMiddleware 为没有经过 /ultra 入口的请求写入号池：独占模式下只用普通号池，否则不限号池。

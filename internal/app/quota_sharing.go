@@ -18,7 +18,8 @@ import (
 // 成功说明两个通道额度独立，同样达到每日限额说明共用。
 // 证据足够判定为共用后，一个通道达到每日限额就同时冷却另一个通道，
 // 不再让请求去另一个通道白白失败一次、再换号重试。
-// 学到的结论保存在账户目录的 .quota-sharing.json，重启后继续有效
+// 学到的结论保存在账户目录的 .quota-sharing.json，重启后继续有效。
+// 结论按号池分开学习：Ultra 账户的额度与其他权益不同，键为 模型|ultra；普通号池的键仍为模型 ID，已保存的记录继续有效
 const (
 	quotaSharingFileName = ".quota-sharing.json"
 	// quotaSharedMinEvidence 至少这么多次"另一通道随后也达到每日限额"才判定为共用
@@ -45,17 +46,31 @@ type quotaSharing struct {
 	path     string
 	requests *requestRegistry
 	models   map[string]*quotaSharingStats
-	// pending 为等待验证的观察：键为 账户|模型|通道，值为另一个通道达到每日限额的时间
-	pending map[string]time.Time
-	// sinceRevisit 为判定共用后各模型距上次复核的每日限额次数（只在内存中）
+	// pending 为等待验证的观察：键为 账户|模型|通道，值为另一个通道达到每日限额的时间与账户当时的号池
+	pending map[string]quotaPending
+	// sinceRevisit 为判定共用后各模型（按号池分开）距上次复核的每日限额次数（只在内存中）
 	sinceRevisit map[string]int
+}
+
+// quotaPending 为一次等待验证的观察：证据记入账户当时所在号池的判定
+type quotaPending struct {
+	since time.Time
+	pool  aistudio.PoolScope
+}
+
+// quotaStatsKey 返回模型在号池内的判定键：Ultra 号池为 模型|ultra，普通号池沿用模型 ID
+func quotaStatsKey(modelID string, pool aistudio.PoolScope) string {
+	if pool == aistudio.PoolScopeUltra {
+		return modelID + "|" + pool.String()
+	}
+	return modelID
 }
 
 func newQuotaSharing(directory string, requests *requestRegistry) *quotaSharing {
 	sharing := &quotaSharing{
 		requests:     requests,
 		models:       make(map[string]*quotaSharingStats),
-		pending:      make(map[string]time.Time),
+		pending:      make(map[string]quotaPending),
 		sinceRevisit: make(map[string]int),
 	}
 	if strings.TrimSpace(directory) != "" {
@@ -117,17 +132,17 @@ func otherChannel(channel aistudio.Channel) aistudio.Channel {
 	return aistudio.ChannelBuild
 }
 
-// sharedLocked 判断模型的两个通道是否已判定为共用每日额度；调用方持有 mu
-func (sharing *quotaSharing) sharedLocked(modelID string) bool {
-	stats := sharing.models[modelID]
+// sharedLocked 判断判定键（quotaStatsKey）对应模型的两个通道是否已判定为共用每日额度；调用方持有 mu
+func (sharing *quotaSharing) sharedLocked(statsKey string) bool {
+	stats := sharing.models[statsKey]
 	return stats != nil && stats.Shared >= quotaSharedMinEvidence && stats.Independent*quotaSharedRatio <= stats.Shared
 }
 
 // verdictLocked 返回用于日志的判定文字；调用方持有 mu
-func (sharing *quotaSharing) verdictLocked(modelID string) string {
-	stats := sharing.models[modelID]
+func (sharing *quotaSharing) verdictLocked(statsKey string) string {
+	stats := sharing.models[statsKey]
 	switch {
-	case sharing.sharedLocked(modelID):
+	case sharing.sharedLocked(statsKey):
 		return "共用（达到每日限额时同时冷却两个通道）"
 	case stats != nil && stats.Independent > 0 && stats.Independent*quotaSharedRatio > stats.Shared:
 		return "独立（两个通道分别计算额度）"
@@ -136,14 +151,15 @@ func (sharing *quotaSharing) verdictLocked(modelID string) string {
 	}
 }
 
-// recordLocked 记录一次证据并保存、写日志；调用方持有 mu
-func (sharing *quotaSharing) recordLocked(modelID string, shared bool) {
-	stats := sharing.models[modelID]
+// recordLocked 记录模型在号池内的一次证据并保存、写日志；调用方持有 mu
+func (sharing *quotaSharing) recordLocked(modelID string, pool aistudio.PoolScope, shared bool) {
+	statsKey := quotaStatsKey(modelID, pool)
+	stats := sharing.models[statsKey]
 	if stats == nil {
 		stats = &quotaSharingStats{}
-		sharing.models[modelID] = stats
+		sharing.models[statsKey] = stats
 	}
-	before := sharing.verdictLocked(modelID)
+	before := sharing.verdictLocked(statsKey)
 	if shared {
 		stats.Shared++
 	} else {
@@ -152,31 +168,36 @@ func (sharing *quotaSharing) recordLocked(modelID string, shared bool) {
 	sharing.saveLocked()
 	if sharing.requests != nil {
 		level := "INFO"
-		if after := sharing.verdictLocked(modelID); after != before {
+		if after := sharing.verdictLocked(statsKey); after != before {
 			level = "WARN"
 		}
+		poolField := ""
+		if pool == aistudio.PoolScopeUltra {
+			poolField = " | 号池=Ultra"
+		}
 		sharing.requests.log("service", level, fmt.Sprintf(
-			"每日额度通道判定 | 模型=%s | 另一通道也达到限额=%d | 另一通道仍可用=%d | 结论=%s",
-			modelID, stats.Shared, stats.Independent, sharing.verdictLocked(modelID),
+			"每日额度通道判定 | 模型=%s%s | 另一通道也达到限额=%d | 另一通道仍可用=%d | 结论=%s",
+			modelID, poolField, stats.Shared, stats.Independent, sharing.verdictLocked(statsKey),
 		))
 	}
 }
 
 // pruneLocked 丢弃过期的观察；调用方持有 mu
 func (sharing *quotaSharing) pruneLocked(now time.Time) {
-	for key, since := range sharing.pending {
-		if now.Sub(since) > quotaPendingTTL {
+	for key, pending := range sharing.pending {
+		if now.Sub(pending.since) > quotaPendingTTL {
 			delete(sharing.pending, key)
 		}
 	}
 }
 
-// dailyLimitHit 在账户的某个通道达到模型每日限额时调用。
+// dailyLimitHit 在账户的某个通道达到模型每日限额时调用，pool 为账户当前所在的号池。
 // 若这是另一个通道达到限额后该通道的首次尝试，记为"共用"证据；
-// 返回是否应同时冷却另一个通道（模型已判定为共用额度时）
+// 返回是否应同时冷却另一个通道（模型在该号池内已判定为共用额度时）
 func (sharing *quotaSharing) dailyLimitHit(
 	accountID string,
 	modelID string,
+	pool aistudio.PoolScope,
 	channel aistudio.Channel,
 	leaseCheckedAt time.Time,
 	now time.Time,
@@ -188,24 +209,25 @@ func (sharing *quotaSharing) dailyLimitHit(
 	defer sharing.mu.Unlock()
 	sharing.pruneLocked(now)
 	key := quotaSharingKey(accountID, modelID, channel)
-	if since, exists := sharing.pending[key]; exists {
+	if pending, exists := sharing.pending[key]; exists {
 		delete(sharing.pending, key)
 		// 只有在另一个通道达到限额之后才发起的尝试才算证据
-		if leaseCheckedAt.After(since) {
-			sharing.recordLocked(modelID, true)
+		if leaseCheckedAt.After(pending.since) {
+			sharing.recordLocked(modelID, pending.pool, true)
 		}
 	}
 	other := otherChannel(channel)
-	if sharing.sharedLocked(modelID) {
+	statsKey := quotaStatsKey(modelID, pool)
+	if sharing.sharedLocked(statsKey) {
 		// 判定为共用后另一个通道总是同时冷却，不再有新的证据，判定原先永远不会改变。
 		// 定期放行一次另一个通道作为复核：额度后来变为独立时，判定随之修正
-		sharing.sinceRevisit[modelID]++
-		if sharing.sinceRevisit[modelID] < quotaRevisitEvery {
+		sharing.sinceRevisit[statsKey]++
+		if sharing.sinceRevisit[statsKey] < quotaRevisitEvery {
 			return other, true
 		}
-		sharing.sinceRevisit[modelID] = 0
+		sharing.sinceRevisit[statsKey] = 0
 	}
-	sharing.pending[quotaSharingKey(accountID, modelID, other)] = now
+	sharing.pending[quotaSharingKey(accountID, modelID, other)] = quotaPending{since: now, pool: pool}
 	return other, false
 }
 
@@ -223,10 +245,10 @@ func (sharing *quotaSharing) attemptSucceeded(
 	sharing.mu.Lock()
 	defer sharing.mu.Unlock()
 	key := quotaSharingKey(accountID, modelID, channel)
-	since, exists := sharing.pending[key]
-	if !exists || !leaseCheckedAt.After(since) {
+	pending, exists := sharing.pending[key]
+	if !exists || !leaseCheckedAt.After(pending.since) {
 		return
 	}
 	delete(sharing.pending, key)
-	sharing.recordLocked(modelID, false)
+	sharing.recordLocked(modelID, pending.pool, false)
 }

@@ -417,6 +417,7 @@ func cleanOperationID(value string) string {
 	return strings.TrimPrefix(strings.TrimSpace(value), "operations/")
 }
 
+// videoContentURL 返回视频下载地址；经 /ultra 进入的请求保留前缀，按该地址下载时仍使用 Ultra 号池
 func videoContentURL(r *http.Request, operationID string) string {
 	scheme := "http"
 	if r.TLS != nil {
@@ -425,7 +426,11 @@ func videoContentURL(r *http.Request, operationID string) string {
 	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
 		scheme = forwarded
 	}
-	return scheme + "://" + r.Host + "/v1/videos/" + operationID + "/content"
+	prefix := ""
+	if ultraRequest(r) {
+		prefix = ultraPrefix
+	}
+	return scheme + "://" + r.Host + prefix + "/v1/videos/" + operationID + "/content"
 }
 
 func normalizeVideoDefaults(request aistudio.VideoRequest) aistudio.VideoRequest {

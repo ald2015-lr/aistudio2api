@@ -74,6 +74,44 @@ func TestGuardDoesNotRememberSingleMessage(t *testing.T) {
 	}
 }
 
+// TestGuardMemoryPerPool 降级记录按号池分开：普通号池记下的对话不会让 /ultra 的同一段对话在选号前被拒绝，反之亦然；
+// 普通号池与不限号池（ULTRA_EXCLUSIVE=false 的普通路径）共用原有记录
+func TestGuardMemoryPerPool(t *testing.T) {
+	request := aistudio.GenerateRequest{ID: "guard-pool", Model: "gemini-guard-test", System: "guard-pool-system", Contents: guardContents("hi", "hello", "continue")}
+	normalCtx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeNormal)
+	allCtx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeAll)
+	ultraCtx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeUltra)
+	for _, test := range []struct {
+		name       string
+		remembered context.Context
+		other      context.Context
+		shared     context.Context
+	}{
+		{name: "普通号池的记录", remembered: normalCtx, other: ultraCtx, shared: allCtx},
+		{name: "Ultra 号池的记录", remembered: ultraCtx, other: normalCtx},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := guardTestService(t)
+			gate, rejected := service.prepareDowngradeGate(test.remembered, request, request.Contents)
+			if rejected != nil || gate == nil {
+				t.Fatalf("gate=%v rejected=%v", gate, rejected)
+			}
+			gate.remember()
+			if _, rejected := service.prepareDowngradeGate(test.remembered, request, request.Contents); rejected == nil {
+				t.Fatal("同一号池的同一段对话应在发送前拒绝")
+			}
+			if _, rejected := service.prepareDowngradeGate(test.other, request, request.Contents); rejected != nil {
+				t.Fatalf("另一个号池的同一段对话在选号前被拒绝: %v", rejected)
+			}
+			if test.shared != nil {
+				if _, rejected := service.prepareDowngradeGate(test.shared, request, request.Contents); rejected == nil {
+					t.Fatal("不限号池应沿用普通号池的记录")
+				}
+			}
+		})
+	}
+}
+
 // TestGuardFinalWindowIgnoresNonTextUsage 回复包含函数调用时结束复核不用包含函数调用的总输出 token
 func TestGuardFinalWindowIgnoresNonTextUsage(t *testing.T) {
 	var meter downgradeMeter

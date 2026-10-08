@@ -167,7 +167,7 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 		return result, requestErr
 	}
 	// 候选在尝试前就已耗尽（调用方给出的候选都已尝试或不可用）：属于号池一侧的暂时性原因
-	return result, PoolNotReady("转录候选账户均不可用", nil)
+	return result, PoolNotReadyIn(PoolScopeFromContext(ctx), "转录候选账户均不可用", nil)
 }
 
 func transcriptionVerifiesModelAccess(result TranscriptionResult) bool {

@@ -142,6 +142,13 @@ func PoolNotReady(reason string, cause error) *AccountsNotReadyError {
 	return &AccountsNotReadyError{Reasons: []string{reason}, Cause: cause}
 }
 
+// PoolNotReadyIn 返回限定号池的请求暂时无法调度的无账户错误：请求路径上号池已知时使用，/ultra 请求的错误写明 Ultra 号池
+func PoolNotReadyIn(scope PoolScope, reason string, cause error) *AccountsNotReadyError {
+	notReady := PoolNotReady(reason, cause)
+	notReady.Pool = scope
+	return notReady
+}
+
 const (
 	// poolMissingReason 为账户池未初始化时的原因
 	poolMissingReason = "账户池未初始化"
@@ -1265,7 +1272,7 @@ func (p *AccountPool) refreshAndValidateLease(
 	selection AccountSelection,
 ) (bool, error) {
 	if lease == nil || lease.account == nil {
-		return false, PoolNotReady(leaseReplacedReason, nil)
+		return false, PoolNotReadyIn(selection.Pool, leaseReplacedReason, nil)
 	}
 	if lease.refreshRuntime {
 		if err := p.refreshAccountRuntime(ctx, lease.account); err != nil {
@@ -1277,7 +1284,7 @@ func (p *AccountPool) refreshAndValidateLease(
 	defer p.mu.Unlock()
 	account := lease.account
 	if p.byID[account.ID] != account {
-		return false, PoolNotReady(leaseReplacedReason, nil)
+		return false, PoolNotReadyIn(selection.Pool, leaseReplacedReason, nil)
 	}
 	lease.modelAccessGeneration = account.modelAccessGeneration
 	if resourceID := strings.TrimSpace(selection.ResourceID); resourceID != "" {

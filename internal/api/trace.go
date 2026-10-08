@@ -140,14 +140,14 @@ func (store *traceStore) list() ([]traceFile, error) {
 // traceEntry 处理 /trace/ 前缀：去掉前缀后交给与主路由相同的处理链，POST 请求结束后写出排查记录
 func (s *server) traceEntry(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, tracePrefix)
-		if !strings.HasPrefix(path, "/v1/") && !strings.HasPrefix(path, "/v1beta/") {
+		path, rawPath, ok := stripRoutePrefix(r.URL, tracePrefix)
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}
 		inner := r.Clone(r.Context())
 		inner.URL.Path = path
-		inner.URL.RawPath = ""
+		inner.URL.RawPath = rawPath
 		if r.Method != http.MethodPost {
 			next.ServeHTTP(w, inner)
 			return

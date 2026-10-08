@@ -222,7 +222,9 @@ if models:
         shared, independent = stats.get("shared", 0), stats.get("independent", 0)
         verdict = ("共用：达到每日限额时同时冷却两个通道" if shared >= 8 and independent * 20 <= shared else
                    "独立：两个通道分别计算额度" if independent and independent * 20 > shared else "观察中")
-        print(f"    {model}：另一通道也达到限额 {shared} 次，另一通道仍可用 {independent} 次 → {verdict}")
+        # Ultra 号池单独学习，键为 模型|ultra
+        name = model[:-len("|ultra")] + "（Ultra 号池）" if model.endswith("|ultra") else model
+        print(f"    {name}：另一通道也达到限额 {shared} 次，另一通道仍可用 {independent} 次 → {verdict}")
 PY
 
 

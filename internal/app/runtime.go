@@ -3268,7 +3268,7 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 		}
 		if runtimeBusyErr != nil {
 			// 候选账户的 runtime 都被其他进程占用：号池一侧的暂时性原因，按 503 返回
-			return nil, aistudio.PoolNotReady("候选账户被其他进程占用", runtimeBusyErr)
+			return nil, aistudio.PoolNotReadyIn(selection.Pool, "候选账户被其他进程占用", runtimeBusyErr)
 		}
 		return nil, service.pool.NoEligibleError(selection)
 	}
@@ -3927,7 +3927,7 @@ func (service *trackedService) generateWithRetry(
 	}
 	if err == nil && (lease == nil || source == nil) {
 		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents
-		err = aistudio.PoolNotReady(fmt.Sprintf("模型 %s 换号结束时没有可用账号", modelID), nil)
+		err = aistudio.PoolNotReadyIn(scope, fmt.Sprintf("模型 %s 换号结束时没有可用账号", modelID), nil)
 	}
 	if err != nil {
 		if activity != nil {
@@ -3994,7 +3994,8 @@ func (service *trackedService) applyQuotaCooldown(
 	if cooldown.Global || cooldown.Kind != dailyQuotaKind {
 		return cooldown, true, nil
 	}
-	other, coolOther := service.quota.dailyLimitHit(accountID, modelID, lease.Channel(), lease.CheckedAt(), time.Now())
+	// 通道共用额度的判定按账户所在号池分开学习
+	other, coolOther := service.quota.dailyLimitHit(accountID, modelID, service.pool.PoolOf(accountID), lease.Channel(), lease.CheckedAt(), time.Now())
 	if !coolOther {
 		return cooldown, true, nil
 	}

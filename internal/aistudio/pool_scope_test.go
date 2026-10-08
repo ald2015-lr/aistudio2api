@@ -392,3 +392,25 @@ func TestNormalPoolErrors(t *testing.T) {
 		t.Fatalf("账户都是 Ultra 账户时普通路径：err = %v，期望说明独占模式的 503", err)
 	}
 }
+
+// TestTranscribeExhaustedCandidatesNamesPool 转录候选在尝试前就已耗尽时的 503 写明请求的号池：/ultra 请求写明 Ultra 号池，
+// 普通路径与不分号池时相同
+func TestTranscribeExhaustedCandidatesNamesPool(t *testing.T) {
+	pool := scopeTestPool(t, map[string]BenefitTier{scopeUltraA: BenefitTierUltra, scopeNormalA: BenefitTierFree})
+	service := &PooledService{pool: pool}
+	request := TranscriptionRequest{Name: "a.wav", MIME: "audio/wav", Size: 1, Reader: strings.NewReader("x"), CandidateAccountIDs: []string{}}
+	for _, test := range []struct {
+		scope PoolScope
+		ultra bool
+	}{
+		{scope: PoolScopeUltra, ultra: true},
+		{scope: PoolScopeNormal},
+		{scope: PoolScopeAll},
+	} {
+		_, err := service.Transcribe(scopeContext(test.scope), request)
+		var notReady *AccountsNotReadyError
+		if !errors.As(err, &notReady) || notReady.Pool != test.scope || strings.Contains(err.Error(), "Ultra 号池") != test.ultra {
+			t.Fatalf("号池 %q 转录候选耗尽：err = %v，期望号池为该号池的 503", test.scope.String(), err)
+		}
+	}
+}

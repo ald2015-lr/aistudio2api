@@ -249,3 +249,24 @@ func TestUltraRequestLabels(t *testing.T) {
 		t.Fatalf("请求日志的号池 = %q，期望 ultra", data.Pool)
 	}
 }
+
+// TestUltraRuntimeBusyNamesPool Ultra 候选账户的 runtime 都被其他进程占用时，/ultra 请求的 503 写明 Ultra 号池
+func TestUltraRuntimeBusyNamesPool(t *testing.T) {
+	manager, pool, requests := partitionTestManager(t, []string{partitionNormalA}, []string{partitionUltraA}, 1, 1, 1, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	service := &trackedService{lifecycle: ctx, pool: pool, requests: requests, workers: manager}
+	manager.mu.RLock()
+	account := manager.accounts[partitionUltraA]
+	manager.mu.RUnlock()
+	_ = manager.markRuntimeBusy(account, errors.New("runtime 被占用"))
+	ultraCtx := aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra)
+	lease, err := service.acquireWarmLease(ultraCtx, aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"})
+	if lease != nil {
+		_ = lease.Release()
+	}
+	var notReady *aistudio.AccountsNotReadyError
+	if !errors.As(err, &notReady) || notReady.Pool != aistudio.PoolScopeUltra || !strings.Contains(err.Error(), "Ultra 号池") {
+		t.Fatalf("Ultra 账户被其他进程占用：err = %v，期望写明 Ultra 号池的 503", err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -319,5 +320,105 @@ func TestUsagePoolDimension(t *testing.T) {
 	}
 	if got := strings.Join(ledger.records[0].Filters["pool"], ","); got != "normal,ultra" {
 		t.Fatalf("记录的号池筛选 = %q", got)
+	}
+}
+
+// poolVideoService 在 poolRecordingService 之上提供视频接口：任务属于 Ultra 账户，非 Ultra 号池的请求按资源号池不符拒绝
+type poolVideoService struct {
+	poolRecordingService
+}
+
+func (service *poolVideoService) GenerateVideo(ctx context.Context, _ aistudio.VideoRequest) (aistudio.VideoOperation, error) {
+	service.record(ctx)
+	return aistudio.VideoOperation{ID: "op1"}, nil
+}
+
+func (service *poolVideoService) GetGenerateVideoOperation(ctx context.Context, operationID string) (aistudio.VideoOperation, error) {
+	service.record(ctx)
+	if aistudio.PoolScopeFromContext(ctx) != aistudio.PoolScopeUltra {
+		return aistudio.VideoOperation{}, &aistudio.ResourcePoolMismatchError{ResourceID: operationID, Owner: aistudio.PoolScopeUltra}
+	}
+	return aistudio.VideoOperation{ID: operationID, Done: true, File: &aistudio.FileRef{Name: "files/video"}}, nil
+}
+
+func (service *poolVideoService) DownloadFile(ctx context.Context, _ string) (aistudio.MediaStream, error) {
+	service.record(ctx)
+	if aistudio.PoolScopeFromContext(ctx) != aistudio.PoolScopeUltra {
+		return aistudio.MediaStream{}, &aistudio.ResourcePoolMismatchError{ResourceID: "op1", Owner: aistudio.PoolScopeUltra}
+	}
+	return aistudio.MediaStream{Body: io.NopCloser(strings.NewReader("video")), MIME: "video/mp4", Size: 5}, nil
+}
+
+// TestUltraGeminiVideoURIKeepsPrefix /ultra 下查询 Gemini 视频任务返回的下载地址带 /ultra 前缀，按该地址下载仍走 Ultra 号池；
+// 普通路径返回的地址不带前缀
+func TestUltraGeminiVideoURIKeepsPrefix(t *testing.T) {
+	service := &poolVideoService{}
+	exclusive := &atomic.Bool{}
+	exclusive.Store(true)
+	handler := ultraTestHandler(service, nil, exclusive)
+	recorder := serve(handler, authorizedRequest(http.MethodGet, "/ultra/v1beta/operations/op1", ""))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("查询视频任务：%d %s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Response struct {
+			GenerateVideoResponse struct {
+				GeneratedSamples []struct {
+					Video struct {
+						URI string `json:"uri"`
+					} `json:"video"`
+				} `json:"generatedSamples"`
+			} `json:"generateVideoResponse"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	samples := body.Response.GenerateVideoResponse.GeneratedSamples
+	if len(samples) != 1 {
+		t.Fatalf("视频任务应返回 1 个结果: %s", recorder.Body.String())
+	}
+	parsed, err := url.Parse(samples[0].Video.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Path != "/ultra/v1/videos/op1/content" {
+		t.Fatalf("/ultra 下返回的视频地址 = %q，期望带 /ultra 前缀", samples[0].Video.URI)
+	}
+	follow := serve(handler, authorizedRequest(http.MethodGet, parsed.Path, ""))
+	if follow.Code != http.StatusOK || follow.Body.String() != "video" {
+		t.Fatalf("按返回地址下载：%d %s", follow.Code, follow.Body.String())
+	}
+	if got := service.lastScope(t); got != aistudio.PoolScopeUltra {
+		t.Fatalf("按返回地址下载的号池 = %q，期望 Ultra", got.String())
+	}
+	if got := videoContentURL(httptest.NewRequest(http.MethodGet, "/v1beta/operations/op1", nil), "op1"); got != "http://example.com/v1/videos/op1/content" {
+		t.Fatalf("普通路径返回的视频地址 = %q", got)
+	}
+}
+
+// TestPrefixRoutesKeepEscapedPath /ultra 与 /trace 去掉前缀后保留客户端的转义：ID 中的 %2F、%2e%2e 等路径段
+// 与直接请求 /v1 时由同一个路由匹配，状态码与重定向都相同
+func TestPrefixRoutesKeepEscapedPath(t *testing.T) {
+	service := &poolRecordingService{}
+	exclusive := &atomic.Bool{}
+	exclusive.Store(true)
+	handler := NewHandler(service, Config{APIKey: "sk-test", UltraExclusive: exclusive.Load, TraceDir: t.TempDir()})
+	for _, path := range []string{"/v1/files/a%2Fb", "/v1/%2e%2e/api/status", "/v1/models%2Fx", "/v1%2Fmodels"} {
+		direct := serve(handler, authorizedRequest(http.MethodGet, path, ""))
+		for _, prefix := range []string{ultraPrefix, tracePrefix} {
+			prefixed := serve(handler, authorizedRequest(http.MethodGet, prefix+path, ""))
+			if prefixed.Code != direct.Code || prefixed.Header().Get("Location") != direct.Header().Get("Location") {
+				t.Fatalf("%s%s：%d Location=%q，直接请求 %s：%d Location=%q", prefix, path,
+					prefixed.Code, prefixed.Header().Get("Location"), path, direct.Code, direct.Header().Get("Location"))
+			}
+		}
+	}
+	recorder := serve(handler, authorizedRequest(http.MethodGet, "/ultra/v1/files/a%2Fb", ""))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("/ultra/v1/files/a%%2Fb：%d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := service.lastScope(t); got != aistudio.PoolScopeUltra {
+		t.Fatalf("/ultra/v1/files/a%%2Fb 的号池 = %q，期望 Ultra", got.String())
 	}
 }

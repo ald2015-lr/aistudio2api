@@ -201,7 +201,7 @@ func (service *trackedService) prepareDowngradeGate(ctx context.Context, request
 	if settings.memory <= 0 || len(contents) == 0 {
 		return gate, nil
 	}
-	gate.memoryKey = conversationHash(request.Model, request.System, contents[:1])
+	gate.memoryKey = downgradeMemoryKey(aistudio.PoolScopeFromContext(ctx), conversationHash(request.Model, request.System, contents[:1]))
 	// 走 /trace/ 排查路由的请求（测试工具反复发送同一段对话）不查历史记录，照常判定与记录
 	if aistudio.TraceFromContext(ctx).Active() {
 		return gate, nil
@@ -1277,6 +1277,15 @@ func (memory *downgradeMemory) size() int {
 	memory.mu.Lock()
 	defer memory.mu.Unlock()
 	return memory.total
+}
+
+// downgradeMemoryKey 返回降级记录的键：记录按号池分开，经 /ultra 的请求只看 Ultra 号池的记录；
+// 普通号池与不限号池沿用原有的键
+func downgradeMemoryKey(scope aistudio.PoolScope, hash string) string {
+	if scope == aistudio.PoolScopeUltra {
+		return hash + "|" + scope.String()
+	}
+	return hash
 }
 
 // conversationHash 计算模型、系统提示与给定消息的哈希：只看角色、文字、思考标记、附件与工具调用内容，不看思考签名
