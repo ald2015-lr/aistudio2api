@@ -30,7 +30,7 @@ type authRuntimeRefresher struct {
 }
 
 // authRefreshWaitLimit 为续签等待同账户其他正常请求结束的上限。同账户的请求可能正在等待本次续签所在的
-// Worker 启动结束（ensureWorker 的 waitForOpening），不设上限会互相等待；超时后放弃本次续签
+// Worker 启动结束（ensureWorker 的 waitForOpening），不设上限会互相等待；超时后不再等待，继续续签
 const authRefreshWaitLimit = 12 * time.Second
 
 // authRetryTransport 为普通 RPC 执行一次认证续签重试
@@ -372,7 +372,8 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 }
 
 // waitForOtherRequests 在有上限的时间内等待同账户其他正常请求结束（续签会重置它们正在使用的 WAA runtime）。
-// 超时返回 ErrAccountLeased，不重置
+// 超过上限不再等待，返回 nil 继续续签：放弃续签会让有续签材料的账户被标为需要登录、退出调度，之后不会再自动恢复。
+// 只有请求本身取消时返回错误
 func (refresher *authRuntimeRefresher) waitForOtherRequests(ctx context.Context, lease *aistudio.AccountLease) error {
 	limit := refresher.waitLimit
 	if limit <= 0 {
@@ -384,7 +385,9 @@ func (refresher *authRuntimeRefresher) waitForOtherRequests(ctx context.Context,
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		return fmt.Errorf("%w: 等待同账户其他请求结束超过 %s", aistudio.ErrAccountLeased, limit)
+		refresher.requests.log(lease.Account().Config.Label, "WARN", fmt.Sprintf(
+			"账户认证续签 | 同账户其他请求 %s 内没有结束，不再等待", limit,
+		))
 	}
 	return nil
 }

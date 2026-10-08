@@ -252,23 +252,59 @@ func TestCountTokensForLeaseSkipsAuthRecovery(t *testing.T) {
 	}
 }
 
-// TestRefreshGivesUpWhileOtherRequestRuns 同账户其他请求在等待上限内没有结束时放弃续签，不重置它正在使用的运行时
-func TestRefreshGivesUpWhileOtherRequestRuns(t *testing.T) {
+// TestRefreshGivesUpWhenRequestCanceledWhileWaiting 等待同账户其他请求期间本次请求被取消时放弃续签，
+// 不刷新 Cookie，也不重置其他请求正在使用的运行时
+func TestRefreshGivesUpWhenRequestCanceledWhileWaiting(t *testing.T) {
+	pool, account := authTestPool(t, true)
+	counts := &authTestCounts{}
+	refresher := newAuthTestRefresher(t, counts)
+	_, leaseCtx := authTestLease(t, pool)
+	authTestLease(t, pool)
+	ctx, cancel := context.WithTimeout(leaseCtx, 50*time.Millisecond)
+	defer cancel()
+	startedAt := time.Now()
+	if err := refresher.Refresh(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("请求取消时应返回取消原因，实际 %v", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > 5*time.Second {
+		t.Fatalf("请求取消后仍在等待，耗时 %s", elapsed)
+	}
+	if counts.refreshes.Load() != 0 || counts.resets.Load() != 0 || authTestSAPISID(t, account) != "OLD" {
+		t.Fatal("放弃续签时不应刷新 Cookie 或重置运行时")
+	}
+}
+
+// TestAuthRetryRefreshesAfterWaitLimit 同账户另一个请求（长时间流式输出）超过等待上限仍未结束时，续签不再等待而是继续：
+// 有续签材料的账户不能因为等不到其他请求就被标为需要登录（退出调度后不会再自动恢复），本次请求续签后重放成功
+func TestAuthRetryRefreshesAfterWaitLimit(t *testing.T) {
 	pool, account := authTestPool(t, true)
 	counts := &authTestCounts{}
 	refresher := newAuthTestRefresher(t, counts)
 	refresher.waitLimit = 50 * time.Millisecond
-	_, ctx := authTestLease(t, pool)
-	authTestLease(t, pool)
+	lease, ctx := authTestLease(t, pool)
+	streaming, _ := authTestLease(t, pool)
+	var sends atomic.Int32
 	startedAt := time.Now()
-	if err := refresher.Refresh(ctx); !errors.Is(err, aistudio.ErrAccountLeased) {
-		t.Fatalf("等待超时应返回账户占用，实际 %v", err)
+	response, err := refresher.do(ctx, "ListModels", func() (*aistudio.RPCResponse, error) {
+		if sends.Add(1) == 1 {
+			return unauthorizedResponse(loginExpiredBody), nil
+		}
+		return &aistudio.RPCResponse{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("[]"))}, nil
+	})
+	if err != nil || response == nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("等待上限后应续签并重放成功，实际 response=%v err=%v", response, err)
 	}
-	if elapsed := time.Since(startedAt); elapsed > 5*time.Second {
-		t.Fatalf("续签等待没有上限，耗时 %s", elapsed)
+	if elapsed := time.Since(startedAt); elapsed < refresher.waitLimit {
+		t.Fatalf("续签前应先等待同账户其他请求，实际只等了 %s", elapsed)
 	}
-	if counts.refreshes.Load() != 0 || counts.resets.Load() != 0 || authTestSAPISID(t, account) != "OLD" {
-		t.Fatal("放弃续签时不应刷新 Cookie 或重置运行时")
+	if sends.Load() != 2 || counts.refreshes.Load() != 1 || counts.resets.Load() != 1 || authTestSAPISID(t, account) != "NEW" {
+		t.Fatalf("应续签一次并重放一次: 发送=%d 续签=%d 重置=%d", sends.Load(), counts.refreshes.Load(), counts.resets.Load())
+	}
+	if err := errors.Join(lease.Release(), streaming.Release()); err != nil {
+		t.Fatal(err)
+	}
+	if status := authTestStatus(t, pool); status.State != aistudio.AccountReady {
+		t.Fatalf("有续签材料的账户不应因等待超时被标为需要登录，实际 %s（%s）", status.State, status.Message)
 	}
 }
 
@@ -333,6 +369,73 @@ func TestOnDemandStartRecoversLoginWithLease(t *testing.T) {
 	}
 	if status := authTestStatus(t, pool); status.State != aistudio.AccountReady {
 		t.Fatalf("恢复后账户应保持就绪，实际 %s", status.State)
+	}
+}
+
+// TestStartupRecoveryWithRequestWaitingForOpening 同账户另一个请求正等待本次 Worker 启动结束（waitForOpening）时，
+// 启动阶段的续签等待有上限、到期后继续续签并重新启动：两个请求都拿到 Worker，账户保持就绪，不互相等待
+func TestStartupRecoveryWithRequestWaitingForOpening(t *testing.T) {
+	pool, account := authTestPool(t, true)
+	firstLaunch := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	manager, launches := authTestManager(t, pool, account, func(call int32) (*aistudio.NativeWorker, error) {
+		if call == 1 {
+			close(firstLaunch)
+			<-releaseFirst
+			return nil, loginRedirectError()
+		}
+		worker, _ := aistudio.NewStubWorker(authTestAccount, 0)
+		return worker, nil
+	})
+	counts := &authTestCounts{}
+	refresher := newAuthTestRefresher(t, counts)
+	refresher.waitLimit = 50 * time.Millisecond
+	refresher.reset = func(accountID string) error {
+		counts.resets.Add(1)
+		return manager.Reset(accountID)
+	}
+	manager.refresher = refresher
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, starterCtx := authTestLease(t, pool)
+	_, waiterCtx := authTestLease(t, pool)
+	starterCtx, starterCancel := context.WithTimeout(starterCtx, 10*time.Second)
+	defer starterCancel()
+	waiterCtx, waiterCancel := context.WithTimeout(waiterCtx, 10*time.Second)
+	defer waiterCancel()
+	starter := make(chan error, 1)
+	go func() {
+		_, err := manager.Worker(starterCtx, authTestAccount, "gemini-test")
+		starter <- err
+	}()
+	select {
+	case <-firstLaunch:
+	case <-ctx.Done():
+		t.Fatal("Worker 没有开始启动")
+	}
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := manager.Worker(waiterCtx, authTestAccount, "gemini-test")
+		waiter <- err
+	}()
+	// 让第二个请求进入 waitForOpening 再结束第一次启动
+	time.Sleep(20 * time.Millisecond)
+	close(releaseFirst)
+	for name, result := range map[string]chan error{"启动请求": starter, "等待请求": waiter} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s应拿到 Worker，实际 %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s互相等待没有结束", name)
+		}
+	}
+	if launches.Load() != 2 || counts.refreshes.Load() != 1 || authTestSAPISID(t, account) != "NEW" {
+		t.Fatalf("应续签一次后重新启动: 启动=%d 续签=%d", launches.Load(), counts.refreshes.Load())
+	}
+	if status := authTestStatus(t, pool); status.State == aistudio.AccountAuthRequired {
+		t.Fatalf("有续签材料的账户不应因等待超时被标为需要登录（%s）", status.Message)
 	}
 }
 
