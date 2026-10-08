@@ -668,6 +668,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				finish = &value
 				return nil
 			default:
+				event = assignLocalCallID(event)
 				output.observe(event)
 				if request.Config.HideThinking && event.Kind == EventReasoning {
 					if event.ThoughtSignature == "" {

@@ -43,6 +43,8 @@ type publicError struct {
 	RPC     string
 	Message string
 	Kind    string
+	// Code 为 OpenAI 错误体的 code（类别没有对应 code 时使用）
+	Code string
 }
 
 var rpcStatusNames = map[int64]string{
@@ -349,6 +351,10 @@ func openAIErrorBody(public publicError) map[string]any {
 		code = "content_policy_violation"
 	case publicKindAuth:
 		code = "invalid_api_key"
+	default:
+		if public.Code != "" {
+			code = public.Code
+		}
 	}
 	return map[string]any{"error": map[string]any{
 		"message": public.Message,

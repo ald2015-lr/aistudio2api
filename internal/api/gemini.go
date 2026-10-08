@@ -157,8 +157,9 @@ type geminiGenerationConfig struct {
 	TranscriptionConfig *geminiTranscriptionConfig `json:"transcriptionConfig"`
 	Seed                *int64                     `json:"seed"`
 	ThinkingConfig      *struct {
-		ThinkingBudget *int64 `json:"thinkingBudget"`
-		ThinkingLevel  string `json:"thinkingLevel"`
+		ThinkingBudget  *int64 `json:"thinkingBudget"`
+		ThinkingLevel   string `json:"thinkingLevel"`
+		IncludeThoughts *bool  `json:"includeThoughts"`
 	} `json:"thinkingConfig"`
 }
 
@@ -414,8 +415,17 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		config.ResponseSchema = request.GenerationConfig.ResponseJSONSchema
 	}
 	if request.GenerationConfig.ThinkingConfig != nil {
-		config.ThinkingBudget = request.GenerationConfig.ThinkingConfig.ThinkingBudget
-		config.ReasoningEffort = request.GenerationConfig.ThinkingConfig.ThinkingLevel
+		thinking := request.GenerationConfig.ThinkingConfig
+		// thinkingBudget=-1 是 Gemini API 的“动态思考”，按未设置处理，使用模型默认强度。
+		// 原先原样传下去，-1 被当作明确的低预算，Gemini 3 上落到最低思考
+		if budget := thinking.ThinkingBudget; budget == nil || *budget != -1 {
+			config.ThinkingBudget = budget
+		}
+		config.ReasoningEffort = thinking.ThinkingLevel
+		// includeThoughts=false：照常思考，但不返回思考正文（保留多轮调用需要的签名）；未设置时保持原行为返回思考
+		if thinking.IncludeThoughts != nil && !*thinking.IncludeThoughts {
+			config.HideThinking = true
+		}
 	}
 	return aistudio.GenerateRequest{
 		ID: id, Model: model, System: system, Contents: contents, Config: config, Tools: tools,

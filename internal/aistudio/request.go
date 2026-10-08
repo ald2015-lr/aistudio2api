@@ -244,8 +244,8 @@ func encodePart(part Part) ([]any, error) {
 			return nil, fmt.Errorf("function call arguments: %w", err)
 		}
 		call := []any{part.FunctionCall.Name, arguments}
-		if part.FunctionCall.ID != "" {
-			call = append(call, part.FunctionCall.ID)
+		if id := upstreamCallID(part.FunctionCall.ID); id != "" {
+			call = append(call, id)
 		}
 		wire := make([]any, 11)
 		wire[10] = call
@@ -268,8 +268,8 @@ func encodePart(part Part) ([]any, error) {
 			return nil, fmt.Errorf("function result content: %w", err)
 		}
 		result := []any{name, response}
-		if part.FunctionResult.ID != "" {
-			result = append(result, part.FunctionResult.ID)
+		if id := upstreamCallID(part.FunctionResult.ID); id != "" {
+			result = append(result, id)
 		}
 		wire := make([]any, 12)
 		wire[11] = result

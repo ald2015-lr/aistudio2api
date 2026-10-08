@@ -231,12 +231,28 @@ func inputTokens(usage *aistudio.Usage) int64 {
 	return usage.InputTokens + usage.ToolTokens
 }
 
+// providerFinishReason 返回需要原样告诉客户端的上游结束原因：标准原因（正常结束、长度、停止序列）之外的都返回，
+// 例如 malformed_function_call、safety、provider_N，便于排查；标准原因返回空串
 func providerFinishReason(reason string) string {
-	normalized := strings.ToLower(strings.TrimSpace(reason))
-	if strings.HasPrefix(normalized, "provider_") {
+	switch normalized := strings.ToLower(strings.TrimSpace(reason)); normalized {
+	case "", "stop", "max_tokens", "max_output_tokens", "length", "stop_sequence", "pause_turn":
+		return ""
+	default:
 		return normalized
 	}
-	return ""
+}
+
+// finishFiltered 判断结束原因是否为内容拦截（安全、版权背诵、屏蔽词、违禁内容、个人敏感信息、图片安全）。
+// 其他非标准原因（malformed_function_call、unexpected_tool_call、other、unspecified、provider_N 等）不是拒答：
+// 原先一律映射为 content_filter / refusal，Claude Code 会显示违反使用政策，Codex 会把回复当作不完整重试
+func finishFiltered(reason string) bool {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "safety", "recitation", "blocklist", "prohibited_content", "spii",
+		"image_safety", "image_prohibited_content", "image_recitation":
+		return true
+	default:
+		return false
+	}
 }
 
 // splitFunctionResultMedia 取出工具结果中以 base64 内嵌的图片，作为真正的图片发给上游。
@@ -285,8 +301,9 @@ func splitFunctionResultMedia(raw json.RawMessage) (json.RawMessage, []aistudio.
 		}
 		part.FromToolResult = true
 		media = append(media, part)
+		kind := mediaKind(part)
 		placeholder, err := json.Marshal(map[string]string{
-			"type": "text", "text": fmt.Sprintf("[图片 %d：已作为图片附在随后的消息中]", len(media)),
+			"type": "text", "text": fmt.Sprintf("[%s %d：已作为%s附在随后的消息中]", kind, len(media), kind),
 		})
 		if err != nil {
 			return nil, nil, err
@@ -303,7 +320,17 @@ func splitFunctionResultMedia(raw json.RawMessage) (json.RawMessage, []aistudio.
 	return encoded, media, nil
 }
 
-// functionResultMediaPart 把工具结果中的一个内容块转成内嵌图片；不是 base64 图片时返回 false
+// mediaKind 返回附件在说明文字里的称呼：图片或文件
+func mediaKind(part aistudio.Part) string {
+	if part.InlineData != nil && !strings.HasPrefix(part.InlineData.MIME, "image/") {
+		return "文件"
+	}
+	return "图片"
+}
+
+// functionResultMediaPart 把工具结果中的一个内容块转成内嵌媒体；不是 base64 图片或文件时返回 false。
+// 除图片外还支持 Anthropic document（如 Claude Code 读取 PDF）、MCP resource 的 blob 与 audio、
+// OpenAI file / input_file 的 file_data：原先这些按 JSON 文本发送，base64 会让输入 token 暴涨
 func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 	var block struct {
 		Type     string          `json:"type"`
@@ -315,6 +342,17 @@ func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 			MediaType string `json:"media_type"`
 			Data      string `json:"data"`
 		} `json:"source"`
+		Resource *struct {
+			MimeType string `json:"mimeType"`
+			Blob     string `json:"blob"`
+			URI      string `json:"uri"`
+		} `json:"resource"`
+		Filename string `json:"filename"`
+		FileData string `json:"file_data"`
+		File     *struct {
+			Filename string `json:"filename"`
+			FileData string `json:"file_data"`
+		} `json:"file"`
 	}
 	if err := json.Unmarshal(raw, &block); err != nil {
 		return aistudio.Part{}, false, nil
@@ -347,8 +385,49 @@ func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 		}
 		mimeType, data = normalizeImagePayload(mimeType, data)
 		return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, true, nil
+	case "document":
+		// Anthropic document：只取 base64 来源；text、content 等来源本来就是文字，保持原样
+		if block.Source == nil || block.Source.Type != "base64" || block.Source.Data == "" {
+			return aistudio.Part{}, false, nil
+		}
+		return inlineToolMedia(block.Source.Data, firstNonEmpty(block.Source.MediaType, "application/pdf"))
+	case "audio":
+		if block.Data == "" || block.MimeType == "" {
+			return aistudio.Part{}, false, nil
+		}
+		return inlineToolMedia(block.Data, block.MimeType)
+	case "resource":
+		if block.Resource == nil || block.Resource.Blob == "" {
+			return aistudio.Part{}, false, nil
+		}
+		return inlineToolMedia(block.Resource.Blob, firstNonEmpty(block.Resource.MimeType, mimeForFilename(block.Resource.URI, "application/octet-stream")))
+	case "file", "input_file":
+		filename, fileData := block.Filename, block.FileData
+		if block.File != nil {
+			filename, fileData = firstNonEmpty(block.File.Filename, filename), firstNonEmpty(block.File.FileData, fileData)
+		}
+		if fileData == "" {
+			return aistudio.Part{}, false, nil
+		}
+		part, err := fileDataPart(fileData, filename)
+		if err != nil {
+			return aistudio.Part{}, false, fmt.Errorf("工具结果中的文件: %w", err)
+		}
+		return part, part.InlineData != nil, nil
 	}
 	return aistudio.Part{}, false, nil
+}
+
+// inlineToolMedia 解码工具结果中的 base64 内容
+func inlineToolMedia(encoded string, mimeType string) (aistudio.Part, bool, error) {
+	data, err := decodeBase64Flexible(encoded)
+	if err != nil {
+		return aistudio.Part{}, false, fmt.Errorf("工具结果中的文件: %w", err)
+	}
+	if strings.HasPrefix(mimeType, "image/") {
+		mimeType, data = normalizeImagePayload(mimeType, data)
+	}
+	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, true, nil
 }
 
 func normalizeFunctionResultContent(raw json.RawMessage) (json.RawMessage, error) {

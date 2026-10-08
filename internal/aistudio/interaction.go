@@ -169,6 +169,7 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		defer stopClose()
 		committed := false
 		send := func(event Event) error {
+			event = assignLocalCallID(event)
 			if request.Config.HideThinking && event.Kind == EventReasoning {
 				if event.ThoughtSignature == "" {
 					return nil

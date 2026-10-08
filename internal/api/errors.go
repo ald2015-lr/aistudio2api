@@ -43,10 +43,22 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 }
 
 // streamHeaders 写入并刷新流式响应头
+// openAIPassthroughCode 返回需要原样放进 OpenAI 错误体的 code；invalid_request 等通用分类按官方保持为 null
+func openAIPassthroughCode(code string) string {
+	switch code {
+	case "file_not_found", "file_too_large", "unsupported_feature", "video_not_ready":
+		return code
+	default:
+		return ""
+	}
+}
+
 func streamHeaders(w http.ResponseWriter) error {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// 关闭 nginx 等反向代理对流式响应的缓冲，否则事件会攒到一定大小才发给客户端
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	return http.NewResponseController(w).Flush()
 }
@@ -180,7 +192,9 @@ func protocolForRequest(r *http.Request) string {
 // writeOpenAIError 以 OpenAI 官方结构返回错误；消息含中文等内部说明时换成官方措辞，原文只写管理日志
 func writeOpenAIError(w http.ResponseWriter, status int, code string, message string) {
 	recordResponseError(w, nil, message)
-	writeJSON(w, status, openAIErrorBody(publicError{Status: status, Message: publicText(status, message), Kind: kindForOpenAICode(code)}))
+	writeJSON(w, status, openAIErrorBody(publicError{
+		Status: status, Message: publicText(status, message), Kind: kindForOpenAICode(code), Code: openAIPassthroughCode(code),
+	}))
 }
 
 // openAIErrorType 为 OpenAI 官方错误类型：429 为 requests，5xx 为 server_error，其余为 invalid_request_error

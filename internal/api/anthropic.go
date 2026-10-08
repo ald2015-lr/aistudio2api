@@ -673,13 +673,14 @@ func anthropicStop(reason string, hasTools bool, stopSequence string) (string, *
 		return "stop_sequence", nil
 	case "pause_turn":
 		return "pause_turn", nil
-	case "", "stop":
+	default:
+		if finishFiltered(reason) {
+			return "refusal", nil
+		}
 		if hasTools {
 			return "tool_use", nil
 		}
 		return "end_turn", nil
-	default:
-		return "refusal", nil
 	}
 }
 

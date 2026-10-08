@@ -230,3 +230,39 @@ func TestNextConversationTurn(t *testing.T) {
 		t.Fatalf("只剩最后一轮时应返回 -1，得到 %d", got)
 	}
 }
+
+// TestLocalCallIDs 上游不带 ID 的函数调用补本地 ID；发回上游时去掉，本地仍能按 ID 关联结果
+func TestLocalCallIDs(t *testing.T) {
+	first := assignLocalCallID(Event{Kind: EventToolCall, ToolCall: &FunctionCall{Name: "read", Arguments: json.RawMessage(`{"path":"a"}`)}})
+	second := assignLocalCallID(Event{Kind: EventToolCall, ToolCall: &FunctionCall{Name: "read", Arguments: json.RawMessage(`{"path":"b"}`)}})
+	if !strings.HasPrefix(first.ToolCall.ID, localCallIDPrefix) || first.ToolCall.ID == second.ToolCall.ID {
+		t.Fatalf("本地 ID: %q %q", first.ToolCall.ID, second.ToolCall.ID)
+	}
+	if kept := assignLocalCallID(Event{Kind: EventToolCall, ToolCall: &FunctionCall{ID: "abc", Name: "read"}}); kept.ToolCall.ID != "abc" {
+		t.Fatal("上游给出的 ID 不应改写")
+	}
+	contents := []Content{
+		{Role: RoleUser, Parts: []Part{{Text: "read both"}}},
+		{Role: RoleAssistant, Parts: []Part{{FunctionCall: first.ToolCall}, {FunctionCall: second.ToolCall}}},
+		{Role: RoleUser, Parts: []Part{
+			{FunctionResult: &FunctionResult{ID: second.ToolCall.ID, Content: json.RawMessage(`{"b":1}`)}},
+			{FunctionResult: &FunctionResult{ID: first.ToolCall.ID, Content: json.RawMessage(`{"a":1}`)}},
+		}},
+	}
+	wire, err := encodeContents(contents)
+	if err != nil {
+		t.Fatalf("按本地 ID 关联并行调用结果失败: %v", err)
+	}
+	encoded, _ := json.Marshal(wire)
+	if strings.Contains(string(encoded), localCallIDPrefix) {
+		t.Fatalf("本地 ID 被发给上游: %s", encoded)
+	}
+	build, err := encodeBuildContents(contents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ = json.Marshal(build)
+	if strings.Contains(string(encoded), localCallIDPrefix) {
+		t.Fatalf("本地 ID 被发给 Build 上游: %s", encoded)
+	}
+}

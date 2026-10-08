@@ -208,8 +208,8 @@ func encodeBuildPart(part Part) (map[string]any, error) {
 			return nil, fmt.Errorf("function call arguments: %w", err)
 		}
 		call := map[string]any{"name": part.FunctionCall.Name, "args": arguments}
-		if part.FunctionCall.ID != "" {
-			call["id"] = part.FunctionCall.ID
+		if id := upstreamCallID(part.FunctionCall.ID); id != "" {
+			call["id"] = id
 		}
 		wire["functionCall"] = call
 		if signature == "" {
@@ -227,8 +227,8 @@ func encodeBuildPart(part Part) (map[string]any, error) {
 			return nil, fmt.Errorf("function result content: %w", err)
 		}
 		result := map[string]any{"name": part.FunctionResult.Name, "response": response}
-		if part.FunctionResult.ID != "" {
-			result["id"] = part.FunctionResult.ID
+		if id := upstreamCallID(part.FunctionResult.ID); id != "" {
+			result["id"] = id
 		}
 		wire["functionResponse"] = result
 	case part.ExecutableCode != nil:

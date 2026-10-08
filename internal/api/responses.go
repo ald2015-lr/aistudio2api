@@ -375,6 +375,9 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			contents = append(contents, aistudio.Content{Role: aistudio.RoleTool, Parts: append(parts, media...)})
 		case "reasoning":
 			pendingSignature = item.EncryptedContent
+		case "web_search_call", "code_interpreter_call", "image_generation_call", "item_reference":
+			// 本服务自己输出的内置工具调用项（以及引用之前输出项的 item_reference）：无状态客户端会把上一轮的
+			// output 原样放回 input，原先返回 400。这些调用在上游执行，结果已体现在随后的助手消息里，跳过即可
 		default:
 			return nil, nil, fmt.Errorf("unsupported input item type %q", item.Type)
 		}
@@ -729,8 +732,18 @@ type responsesStreamWriter struct {
 	searchQueries map[string]struct{}
 	searchProbe   bool
 	pendingText   []string
+	pendingBytes  int
+	pendingSince  time.Time
 	pendingCode   *responsesPendingCode
 }
+
+// 声明了 web_search 时先暂存正文，让搜索调用项排在消息之前（与官方输出顺序一致）；
+// 但 Gemini 的搜索来源通常在最后才到，模型不搜索时更是一直没有，原先整段回复要等到结束才一次发出。
+// 暂存最多 responsesSearchHoldTime 或 responsesSearchHoldBytes，之后照常流式输出，迟到的搜索项排在消息之后
+const (
+	responsesSearchHoldTime  = time.Second
+	responsesSearchHoldBytes = 300
+)
 
 type responsesPendingCode struct {
 	id    string
@@ -792,8 +805,15 @@ func (writer *responsesStreamWriter) live(event aistudio.Event) error {
 		})
 	case aistudio.EventText:
 		if writer.searchProbe {
+			if len(writer.pendingText) == 0 {
+				writer.pendingSince = time.Now()
+			}
 			writer.pendingText = append(writer.pendingText, event.Text)
-			return nil
+			writer.pendingBytes += len(event.Text)
+			if writer.pendingBytes < responsesSearchHoldBytes && time.Since(writer.pendingSince) < responsesSearchHoldTime {
+				return nil
+			}
+			return writer.flushPendingText()
 		}
 		return writer.emitText(event.Text)
 	case aistudio.EventToolCall:
@@ -846,6 +866,7 @@ func (writer *responsesStreamWriter) flushPendingText() error {
 		}
 	}
 	writer.pendingText = nil
+	writer.pendingBytes = 0
 	return nil
 }
 

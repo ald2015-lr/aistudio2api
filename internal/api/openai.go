@@ -3,7 +3,10 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"mime"
 	"net/http"
+	"net/url"
+	"path"
 	"regexp"
 	"strings"
 	"time"
@@ -396,13 +399,21 @@ func openAIContentParts(raw json.RawMessage) ([]aistudio.Part, error) {
 
 func openAIContentPart(raw json.RawMessage) (aistudio.Part, error) {
 	var block struct {
-		Type       string          `json:"type"`
-		Text       string          `json:"text"`
-		ImageURL   json.RawMessage `json:"image_url"`
-		VideoURL   json.RawMessage `json:"video_url"`
-		FileID     string          `json:"file_id"`
-		Filename   string          `json:"filename"`
-		FileData   string          `json:"file_data"`
+		Type     string          `json:"type"`
+		Text     string          `json:"text"`
+		ImageURL json.RawMessage `json:"image_url"`
+		VideoURL json.RawMessage `json:"video_url"`
+		FileID   string          `json:"file_id"`
+		Filename string          `json:"filename"`
+		FileData string          `json:"file_data"`
+		FileURL  string          `json:"file_url"`
+		// File 为 Chat Completions 的写法：{"type":"file","file":{"file_id"|"file_data","filename"}}；
+		// Responses 的 input_file 把这些字段放在顶层
+		File *struct {
+			FileID   string `json:"file_id"`
+			Filename string `json:"filename"`
+			FileData string `json:"file_data"`
+		} `json:"file"`
 		InputAudio *struct {
 			Data   string `json:"data"`
 			Format string `json:"format"`
@@ -419,6 +430,9 @@ func openAIContentPart(raw json.RawMessage) (aistudio.Part, error) {
 		if err != nil {
 			return aistudio.Part{}, err
 		}
+		if remote, ok := remoteMediaPart(url, "image/*"); ok {
+			return remote, nil
+		}
 		return fileOrInlinePart(url, "")
 	case "video_url", "input_video":
 		url, err := imageURLString(block.VideoURL)
@@ -431,8 +445,22 @@ func openAIContentPart(raw json.RawMessage) (aistudio.Part, error) {
 		}
 		return aistudio.Part{ExternalMedia: media}, nil
 	case "file", "input_file":
+		if block.File != nil {
+			block.FileID = firstNonEmpty(block.File.FileID, block.FileID)
+			block.Filename = firstNonEmpty(block.File.Filename, block.Filename)
+			block.FileData = firstNonEmpty(block.File.FileData, block.FileData)
+		}
 		if block.FileData != "" {
-			return fileOrInlinePart(block.FileData, "")
+			return fileDataPart(block.FileData, block.Filename)
+		}
+		if block.FileURL != "" {
+			if remote, ok := remoteMediaPart(block.FileURL, mimeForFilename(block.Filename, "application/pdf")); ok {
+				return remote, nil
+			}
+			return aistudio.Part{}, fmt.Errorf("file_url must be an http or https URL")
+		}
+		if strings.TrimSpace(block.FileID) == "" {
+			return aistudio.Part{}, fmt.Errorf("file part requires file_id, file_data or file_url")
 		}
 		return aistudio.Part{File: &aistudio.FileRef{ID: block.FileID, Name: block.Filename}}, nil
 	case "input_audio":
@@ -461,6 +489,52 @@ func imageURLString(raw json.RawMessage) (string, error) {
 		return "", fmt.Errorf("image_url must contain url")
 	}
 	return object.URL, nil
+}
+
+// remoteMediaPart 把 YouTube 以外的 http/https 地址作为外部媒体交给上游读取（与 Anthropic 的 URL source 一致）。
+// 原先这类地址被当作已上传文件的 ID，标准的 OpenAI 看图请求（image_url 为 https 图片地址）返回 404，
+// 每次还要刷新全部账户的运行态查找这个“文件”
+func remoteMediaPart(value string, fallbackMIME string) (aistudio.Part, bool) {
+	value = strings.TrimSpace(value)
+	if media, ok := aistudio.ExternalMediaForURL(value); ok {
+		return aistudio.Part{ExternalMedia: media}, true
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return aistudio.Part{}, false
+	}
+	return aistudio.Part{ExternalMedia: &aistudio.ExternalMedia{MIME: mimeForFilename(parsed.Path, fallbackMIME), URL: value}}, true
+}
+
+// mimeForFilename 按扩展名推断媒体类型；未知时返回 fallback
+func mimeForFilename(name string, fallback string) string {
+	if detected := mime.TypeByExtension(strings.ToLower(path.Ext(name))); detected != "" {
+		if mediaType, _, err := mime.ParseMediaType(detected); err == nil {
+			return mediaType
+		}
+	}
+	return fallback
+}
+
+// fileDataPart 解析文件内容：data URL，或不带前缀的 base64（按文件名推断类型，默认 PDF）
+func fileDataPart(value string, filename string) (aistudio.Part, error) {
+	if strings.HasPrefix(value, "data:") {
+		return fileOrInlinePart(value, filename)
+	}
+	data, err := decodeBase64Flexible(value)
+	if err != nil {
+		return aistudio.Part{}, fmt.Errorf("file_data must be a data URL or base64: %w", err)
+	}
+	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeForFilename(filename, "application/pdf"), Data: data}}, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func fileOrInlinePart(value string, name string) (aistudio.Part, error) {
@@ -848,13 +922,14 @@ func openAIFinishReason(reason string, hasTools bool) string {
 		return "length"
 	case "stop_sequence":
 		return "stop"
-	case "", "stop":
+	default:
+		if finishFiltered(reason) {
+			return "content_filter"
+		}
 		if hasTools {
 			return "tool_calls"
 		}
 		return "stop"
-	default:
-		return "content_filter"
 	}
 }
 

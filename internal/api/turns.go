@@ -90,8 +90,8 @@ func normalizeTurns(contents []aistudio.Content) ([]aistudio.Content, int) {
 	return result, fixes
 }
 
-// toolMediaIntro 放在工具结果图片之前的说明
-const toolMediaIntro = "以下是上面工具调用返回的图片："
+// toolMediaIntro 放在工具结果图片与文件之前的说明
+const toolMediaIntro = "以下是上面工具调用返回的图片或文件："
 
 // takeToolResultMedia 从一轮消息中取出工具结果里的图片，并在每张图片前标注来自哪次工具调用
 func takeToolResultMedia(content aistudio.Content) (aistudio.Content, []aistudio.Part) {
@@ -113,7 +113,7 @@ func takeToolResultMedia(content aistudio.Content) (aistudio.Content, []aistudio
 		}
 		index++
 		part.FromToolResult = false
-		media = append(media, aistudio.Part{Text: fmt.Sprintf("[工具 %s 返回的图片 %d]", label, index)}, part)
+		media = append(media, aistudio.Part{Text: fmt.Sprintf("[工具 %s 返回的%s %d]", label, mediaKind(part), index)}, part)
 	}
 	content.Parts = kept
 	return content, media

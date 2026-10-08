@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/dlclark/regexp2/v2"
@@ -297,4 +298,30 @@ func validateToolArguments(schema *jsonschema.Schema, arguments []byte) error {
 		return err
 	}
 	return schema.Validate(value)
+}
+
+// localCallIDPrefix 为本地补发的函数调用 ID 前缀。上游的调用 ID 是可选的，不带 ID 时客户端拿到空 id，
+// 并行调用的结果无法对应回去（Responses 流还会复用同一个输出序号）；本地补一个 ID 给客户端，
+// 发回上游时去掉，上游看到的与它原先返回的一致
+const localCallIDPrefix = "call_local_"
+
+var localCallIDSequence atomic.Uint64
+
+// assignLocalCallID 为没有 ID 的函数调用事件补一个本地 ID
+func assignLocalCallID(event Event) Event {
+	if event.Kind != EventToolCall || event.ToolCall == nil || event.ToolCall.ID != "" {
+		return event
+	}
+	call := *event.ToolCall
+	call.ID = fmt.Sprintf("%s%d_%d", localCallIDPrefix, time.Now().UnixNano(), localCallIDSequence.Add(1))
+	event.ToolCall = &call
+	return event
+}
+
+// upstreamCallID 返回发回上游时使用的调用 ID：本地补发的 ID 不发给上游
+func upstreamCallID(id string) string {
+	if strings.HasPrefix(id, localCallIDPrefix) {
+		return ""
+	}
+	return id
 }

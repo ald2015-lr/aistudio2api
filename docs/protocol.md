@@ -684,9 +684,10 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 | `stop` 且包含函数调用 | `tool_calls` | `completed`，保留 function call item | `tool_use` | `STOP`，保留 functionCall Part |
 | `stop_sequence` | `stop` | `completed` | `stop_sequence` 与实际序列 | `STOP` |
 | `max_tokens` | `length` | `incomplete/max_output_tokens` | `max_tokens` | `MAX_TOKENS` |
-| policy、refusal、签名缺失及其他异常终态 | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举或 `OTHER` |
+| 内容拦截：`safety`、`recitation`、`blocklist`、`prohibited_content`、`spii`、`image_safety`、`image_prohibited_content`、`image_recitation` | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举 |
+| 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举或 `OTHER` |
 
-异常终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。`provider_*` 在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值；Gemini 使用 `finishMessage` 保留编号。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
+内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值；Gemini 使用 `finishMessage` 保留编号。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
 
 ## 6. 函数、Google 工具、Drive 与媒体
 
@@ -843,7 +844,7 @@ AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7
 
 Gemini `VALIDATED` 对所有函数按 Schema 核对参数。核对规则：指定函数时只发送被选中的函数；上游调用了未选择的函数、`strict` 函数的参数不符合 Schema（JSON Schema 2020-12 校验，`pattern` 按 ECMAScript 正则、单次匹配最多 1 秒）、要求调用却没有任何工具调用（声明了 Google 搜索等内置工具且上游使用了它们时视为满足）时，事件流以错误结束，HTTP 状态 502；首个事件之前发生时按非流式返回。要求单次调用而上游返回多个调用时只保留第一个。客户端 Schema 本身无法编译（如引用了未提供的外部定义）时不阻止请求，只是不核对该函数的参数。
 
-函数调用响应 Part 为 `[name, Struct, callId?]`；下一轮 function result 使用同一形状并原样带回 thought signature。tool result 显式提供函数名时保留该值；缺少名称时，先按 call ID 关联当前轮尚未返回结果的调用，未匹配且仅剩一个调用时使用其名称。每个结果对应一个调用，调用与结果之间的助手文本不影响关联，新一轮普通对话开始后重新建立关联；存在歧义或缺少调用记录时返回参数错误。函数参数和结果使用 JSON object，标量或数组结果封装为 `{"result":<VALUE>}`。
+函数调用响应 Part 为 `[name, Struct, callId?]`；上游没有给出 callId 时，代理补一个 `call_local_` 开头的本地 ID 返回给客户端，客户端带回结果时按它关联，发回上游时去掉；下一轮 function result 使用同一形状并原样带回 thought signature。tool result 显式提供函数名时保留该值；缺少名称时，先按 call ID 关联当前轮尚未返回结果的调用，未匹配且仅剩一个调用时使用其名称。每个结果对应一个调用，调用与结果之间的助手文本不影响关联，新一轮普通对话开始后重新建立关联；存在歧义或缺少调用记录时返回参数错误。函数参数和结果使用 JSON object，标量或数组结果封装为 `{"result":<VALUE>}`。
 
 ### Drive 上传与文件 Part
 
@@ -1450,7 +1451,7 @@ message 字段为 `role`、`content`、可选 `name`、`tool_call_id`、`tool_ca
 | `input_file`、`file` | `file_id`，或 `filename` + `file_data` |
 | `input_audio` | `input_audio.data`、`input_audio.format` |
 
-OpenAI `image_url` / `input_image` 值为 Base64 data URL 时形成 inline data，值为 YouTube URL 时形成 external media，其他非 data 字符串按已上传 file ID 解析；适配器不下载普通 HTTP 图片 URL。`video_url` / `input_video` 只接受 YouTube URL。`file_data` 接受 Base64 data URL 或已上传 file ID。
+OpenAI `image_url` / `input_image` 值为 Base64 data URL 时形成 inline data，值为 YouTube URL 时形成 external media，其他 http/https 地址同样作为 external media 交给上游读取（媒体类型按扩展名推断，未知时为 `image/*`，与 Anthropic URL source 一致；适配器自己不下载），其余字符串按已上传 file ID 解析。`video_url` / `input_video` 只接受 YouTube URL。Chat 的 file part 为 `{"type":"file","file":{"file_id"|"file_data","filename"}}`，Responses 的 `input_file` 把这些字段放在顶层并可用 `file_url`；`file_data` 接受 Base64 data URL 或不带前缀的 Base64（类型按文件名推断，默认 PDF）。
 
 function tool 使用 `{"type":"function","function":{"name","description","parameters","strict"}}`。`strict:true` 时核对上游返回的参数。Google tool type 为 `web_search`、`web_search_preview`、`image_search`、`url_context`、`code_interpreter`、`google_maps`。
 
@@ -1517,7 +1518,7 @@ Chat SSE 顺序：
 | `metadata` | string-to-string object |
 | `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
 
-input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item。message content Part：
+input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
 
 | type | 字段 |
 | --- | --- |
@@ -1649,7 +1650,7 @@ message content 可以是 string 或 block 数组：
 | `server_tool_use` | `id`、`name:"web_search"`、`input:{query}` |
 | `web_search_tool_result` | `tool_use_id`、`content:[{type:"web_search_result",url,title,encrypted_content,page_age}]` |
 
-`image` / `document` 的 Base64 source 使用 `type:"base64"`、`media_type`、`data`；URL source 使用 `type:"url"` 与非空 `url`，省略 media type 时 image 默认 `image/*`、document 默认 `application/pdf`。`tool_result.is_error=true` 把合法 JSON content 包装为 `{"error":<CONTENT>}`；普通标量或数组结果包装为 `{"result":<CONTENT>}`。
+`image` / `document` 的 Base64 source 使用 `type:"base64"`、`media_type`、`data`；URL source 使用 `type:"url"` 与非空 `url`，省略 media type 时 image 默认 `image/*`、document 默认 `application/pdf`。`tool_result` 中的 Base64 图片、`document`（如 PDF）、MCP `resource` blob 与 `audio` 作为附件放在随后的用户消息中，原位置换成说明文字；`tool_result.is_error=true` 把合法 JSON content 包装为 `{"error":<CONTENT>}`；普通标量或数组结果包装为 `{"result":<CONTENT>}`。
 
 custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`；`strict:true` 时核对上游返回的参数，`cache_control`、`defer_loading` 等其他字段只影响 Anthropic 自身的缓存与加载，忽略。server tool 字段：
 
@@ -1743,7 +1744,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | structured output | `responseMimeType`、`responseSchema`、`responseJsonSchema` |
 | modalities | `responseModalities` |
 | image | `imageConfig:{aspectRatio,imageSize}` |
-| thinking | `thinkingConfig:{thinkingBudget,thinkingLevel}` |
+| thinking | `thinkingConfig:{thinkingBudget,thinkingLevel,includeThoughts}`；`thinkingBudget:-1`（动态思考）按未设置处理，使用模型默认强度；`includeThoughts:false` 照常思考但不返回思考正文（保留签名），未设置时返回思考 |
 | transcription | `transcriptionConfig:{languageCodes,customVocabulary,wordTimestamps,speakerLabels,smartTranscription}` |
 | speech | `speechConfig` |
 
