@@ -180,7 +180,8 @@ func writeAuthError(w http.ResponseWriter, r *http.Request) {
 
 func protocolForRequest(r *http.Request) string {
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/v1beta/"):
+	// /v1/interactions 是 Gemini Interactions 的稳定版入口，与 /v1beta/interactions 一样返回 Gemini 格式错误
+	case strings.HasPrefix(r.URL.Path, "/v1beta/"), r.URL.Path == "/v1/interactions":
 		return "gemini"
 	case strings.HasPrefix(r.URL.Path, "/v1/messages"), r.Header.Get("Anthropic-Version") != "":
 		return "anthropic"

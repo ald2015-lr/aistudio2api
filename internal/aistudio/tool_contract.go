@@ -321,6 +321,11 @@ func assignLocalCallID(event Event) Event {
 	return event
 }
 
+// AssignLocalCallID 供公开协议层兜底：生成服务之外来源的事件同样按本地规则补 ID，发回上游时照常去掉
+func AssignLocalCallID(event Event) Event {
+	return assignLocalCallID(event)
+}
+
 // upstreamCallID 返回发回上游时使用的调用 ID：本地补发的 ID 不发给上游
 func upstreamCallID(id string) string {
 	if strings.HasPrefix(id, localCallIDPrefix) {

@@ -333,14 +333,17 @@ func mediaKind(part aistudio.Part) string {
 
 // functionResultMediaPart 把工具结果中的一个内容块转成内嵌媒体；不是 base64 图片或文件时返回 false。
 // 除图片外还支持 Anthropic document（如 Claude Code 读取 PDF）、MCP resource 的 blob 与 audio、
-// OpenAI file / input_file 的 file_data：原先这些按 JSON 文本发送，base64 会让输入 token 暴涨
+// OpenAI file / input_file 的 file_data，以及 Interactions 带 data 与 mime_type 的 image、audio、document 内容块：
+// 原先这些按 JSON 文本发送，base64 会让输入 token 暴涨
 func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 	var block struct {
 		Type     string          `json:"type"`
 		ImageURL json.RawMessage `json:"image_url"`
 		Data     string          `json:"data"`
 		MimeType string          `json:"mimeType"`
-		Source   *struct {
+		// MimeTypeSnake 为 Interactions 内容块的写法 {"type":"image","data":...,"mime_type":...}
+		MimeTypeSnake string `json:"mime_type"`
+		Source        *struct {
 			Type      string `json:"type"`
 			MediaType string `json:"media_type"`
 			Data      string `json:"data"`
@@ -360,6 +363,7 @@ func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 	if err := json.Unmarshal(raw, &block); err != nil {
 		return aistudio.Part{}, false, nil
 	}
+	block.MimeType = firstNonEmpty(block.MimeType, block.MimeTypeSnake)
 	switch block.Type {
 	case "image_url", "input_image":
 		url, err := imageURLString(block.ImageURL)
@@ -389,6 +393,10 @@ func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 		mimeType, data = normalizeImagePayload(mimeType, data)
 		return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, true, nil
 	case "document":
+		// Interactions document 内容块直接带 data 与 mime_type
+		if block.Source == nil && block.Data != "" && block.MimeType != "" {
+			return inlineToolMedia(block.Data, block.MimeType)
+		}
 		// Anthropic document：只取 base64 来源；text、content 等来源本来就是文字，保持原样
 		if block.Source == nil || block.Source.Type != "base64" || block.Source.Data == "" {
 			return aistudio.Part{}, false, nil

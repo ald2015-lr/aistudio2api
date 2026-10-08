@@ -30,7 +30,7 @@
 - **双额度通道**: 每个账户同时拥有 Playground 与 Build 应用代理两份独立额度，`UPSTREAM_CHANNELS` 可单独或同时启用；一个通道触发限额后，同一账户由另一个通道继续
 - **多账户高并发**: 识别 Free、Pro、Ultra 与 Plus 权益，按实时模型目录在账户间轮询或优先复用
 - **两种 WAA 后端**: 默认由 Camoufox 持有官方 WAA 生命周期；设置 `WAA_BACKEND=go` 后由纯 Go 生成官方 proof，运行时不下载、不启动浏览器
-- **四套 API 协议**: OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 与 Gemini GenerateContent
+- **四套 API 协议**: OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 与 Gemini GenerateContent，另支持 Gemini Interactions
 - **主流 agent 客户端**: 支持 Claude Code、Codex、OpenCode、pi、omp、OpenClaw、Hermes 的文件读写工具调用，Claude Code、Codex、omp 的原生联网搜索可直接使用
 - **四协议工具选择**: 必须调用、指定函数、单次调用、`strict` 参数校验、Gemini `VALIDATED` 与 Anthropic `thinking.disabled`；Playground 无法编码的工具 Schema（`$ref`、`uniqueItems` 等）降级编码并把完整 Schema 交给模型
 
@@ -323,6 +323,7 @@ providers:
 | 模型 | `GET /v1/models`、`GET /v1/models/{model}`、`GET /v1beta/models`、`GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
+| Gemini Interactions | `POST /v1beta/interactions`、`POST /v1/interactions` |
 | Files | `POST /v1/files`、`GET /v1/files/{id}`、`GET /v1/files/{id}/content`、`DELETE /v1/files/{id}` |
 | Anthropic | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 | Gemini | `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens` |
@@ -339,6 +340,37 @@ providers:
 生成请求中的内联附件会优先上传为临时 Drive 文件，随请求结束清理；账户未授予 Drive 权限时保持内联数据发送。图片、音频、视频、PDF 等输入仍需所选模型支持。重复使用的附件可通过 Files 接口上传一次并复用文件 ID。
 
 Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。
+
+### Gemini Interactions
+
+新版 Google Gen AI SDK 的 `client.interactions` 与 TalkifyTTS 等客户端连接 `http://127.0.0.1:2048/v1beta/interactions`，稳定版入口为 `/v1/interactions`。与其他接口一样必须携带 `PROXY_API_KEY`，错误按 Gemini 格式返回：
+
+```bash
+curl http://127.0.0.1:2048/v1beta/interactions \
+  -H "x-goog-api-key: sk-onechat-fun-fun" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<模型名>", "input": "Hello, world!", "stream": true}'
+```
+
+语音生成（单人或多说话人）：
+
+```python
+from google import genai
+
+client = genai.Client(api_key="sk-onechat-fun-fun", http_options={"base_url": "http://127.0.0.1:2048"})
+stream = client.interactions.create(
+    model="<TTS 模型>",
+    input="Hello, this is a test.",
+    response_format={"type": "audio"},
+    generation_config={"speech_config": [{"voice": "Kore"}]},
+    stream=True,
+)
+for event in stream:
+    if event.event_type == "step.delta" and event.delta.type == "audio":
+        print(event.delta.data)
+```
+
+流式音频默认为 Base64 编码的 24 kHz、16-bit 小端、单声道 PCM；非流式默认为完整 WAV，`response_format.mime_type` 可显式选择 `audio/l16` 或 `audio/wav`。模型名后缀、函数调用（`id` 一定非空，原样回传即可对应结果）与 `previous_interaction_id` 续接均可用；续接与 Responses 共用当前进程内的响应节点，不接受 `resp_` 开头的 Responses ID，语音输出不保存。字段与事件见 [Interactions 协议](docs/protocol.md#gemini-interactions)。
 
 ### TTS 语音生成
 
@@ -551,7 +583,7 @@ Go 负责编码、调度、流式解码与公开协议；受 WAA 保护的 `Gene
 
 - **客户端管理历史**: Chat、Anthropic 和 Gemini 请求由客户端提交完整对话上下文
 - **AI Studio 历史**: API 请求不保存到官网历史；`TEMPORARY_CHAT=true` 还会关闭 WAA 预热页的自动保存
-- **Responses 会话**: `previous_response_id` 仅在当前进程内保存，重启后不会保留
+- **Responses 与 Interactions 会话**: `previous_response_id` 与 `previous_interaction_id` 仅在当前进程内保存，重启后不会保留
 - **认证有效期**: Chrome 导入账户保留 DBSC 续签材料；隔离登录账户失效后在账户页重新登录
 
 ## 故障排除

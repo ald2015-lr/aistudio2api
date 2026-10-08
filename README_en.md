@@ -30,7 +30,7 @@
 - **Dual Quota Channels**: Every account has separate Playground and Build app proxy quotas, and `UPSTREAM_CHANNELS` enables either or both; when one channel hits its limit, the same account continues on the other
 - **High-Concurrency Multi-Account**: Detects Free, Pro, Ultra, and Plus benefits and routes across accounts by the live model catalog with round-robin or fill-first
 - **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
-- **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent
+- **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent, plus Gemini Interactions
 - **Mainstream Agent Clients**: Works with Claude Code, Codex, OpenCode, pi, omp, OpenClaw, and Hermes, including file read and write tool calls; native web search works in Claude Code, Codex, and omp
 - **Tool Choice Across Four Protocols**: Required, named, and single function calls, `strict` argument validation, Gemini `VALIDATED`, and Anthropic `thinking.disabled`; tool schemas Playground cannot encode (`$ref`, `uniqueItems`, and similar) are sent as a simplified shape with the full schema handed to the model
 
@@ -252,6 +252,7 @@ Main endpoints:
 | Models | `GET /v1/models`, `GET /v1/models/{model}`, `GET /v1beta/models`, `GET /v1beta/models/{model}` |
 | OpenAI Chat | `POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
+| Gemini Interactions | `POST /v1beta/interactions`, `POST /v1/interactions` |
 | Files | `POST /v1/files`, `GET /v1/files/{id}`, `GET /v1/files/{id}/content`, `DELETE /v1/files/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | Gemini | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
@@ -268,6 +269,37 @@ All four generation APIs can enable Search, Image Search, URL Context, Code Exec
 Inline attachments in generation requests are preferentially uploaded as temporary Drive files and cleaned up when the request ends. If the account has not granted Drive access, the original inline data is sent instead. Images, audio, video, PDFs, and other inputs must be supported by the selected model. Upload reusable attachments once through the Files API and reuse their file IDs.
 
 Gemini attachments and video image inputs accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. Base64 media data supports standard and URL-safe alphabets, padded and unpadded forms, and the `data:<MIME>;base64,` prefix. Markdown images in OpenAI assistant history also support URL-safe Base64 and CR/LF line breaks. Inline GIFs and GIFs uploaded through video multipart requests are converted to PNG using the first frame, preserving the logical canvas, frame position, and transparency.
+
+### Gemini Interactions
+
+The Google Gen AI SDK's `client.interactions`, TalkifyTTS, and similar clients connect to `http://127.0.0.1:2048/v1beta/interactions`; the stable endpoint is `/v1/interactions`. Like every other API call it requires `PROXY_API_KEY`, and errors use the Gemini format:
+
+```bash
+curl http://127.0.0.1:2048/v1beta/interactions \
+  -H "x-goog-api-key: sk-onechat-fun-fun" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<model>", "input": "Hello, world!", "stream": true}'
+```
+
+Speech generation (single or multi-speaker):
+
+```python
+from google import genai
+
+client = genai.Client(api_key="sk-onechat-fun-fun", http_options={"base_url": "http://127.0.0.1:2048"})
+stream = client.interactions.create(
+    model="<TTS model>",
+    input="Hello, this is a test.",
+    response_format={"type": "audio"},
+    generation_config={"speech_config": [{"voice": "Kore"}]},
+    stream=True,
+)
+for event in stream:
+    if event.event_type == "step.delta" and event.delta.type == "audio":
+        print(event.delta.data)
+```
+
+Streaming audio defaults to Base64-encoded 24 kHz, 16-bit little-endian mono PCM; non-streaming defaults to a complete WAV file. Set `response_format.mime_type` to `audio/l16` or `audio/wav` to choose explicitly. Model name suffixes, function calls (the `id` is always non-empty; send it back unchanged to match results), and `previous_interaction_id` all work. Continuation shares the in-process response nodes with Responses, rejects `resp_` Responses IDs, and does not store speech output. See the [Interactions protocol](docs/protocol.md#gemini-interactions) for fields and events.
 
 ### TTS Speech Generation
 
@@ -480,7 +512,7 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 
 - **Client-Managed History**: Clients submit complete conversation context for Chat, Anthropic, and Gemini requests
 - **AI Studio History**: API requests are not saved to website history; `TEMPORARY_CHAT=true` also disables autosave for the WAA prewarm page
-- **Responses Sessions**: `previous_response_id` is stored only in the current process and is cleared on restart
+- **Responses and Interactions Sessions**: `previous_response_id` and `previous_interaction_id` are stored only in the current process and are cleared on restart
 - **Authentication Expiry**: Chrome imports retain DBSC renewal material; isolated-login accounts must log in again after authentication expires
 
 ## Troubleshooting

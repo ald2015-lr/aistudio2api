@@ -496,6 +496,13 @@ func geminiStreamError(w http.ResponseWriter, err error) map[string]any {
 	return geminiErrorBody(publicErrorFor(err, accessLogModel(w)))
 }
 
+// interactionStreamError 为 Interactions 流式响应中途出错时 error 事件的内容：与 geminiStreamError 同样按官方措辞脱敏，
+// code 为 Google RPC 状态名
+func interactionStreamError(w http.ResponseWriter, err error) map[string]any {
+	public := publicErrorFor(err, accessLogModel(w))
+	return map[string]any{"error": map[string]any{"code": public.RPC, "message": public.Message}}
+}
+
 // anthropicStreamError 为流式响应中途出错时写出的 Anthropic error 事件
 func anthropicStreamError(w http.ResponseWriter, err error) map[string]any {
 	return anthropicErrorBody(publicErrorFor(err, accessLogModel(w)), "")

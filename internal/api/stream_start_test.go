@@ -55,6 +55,7 @@ func TestStreamErrorBeforeFirstEventReturnsHTTPStatus(t *testing.T) {
 		{name: "Responses", path: "/v1/responses", body: `{"model":"gemini-2.5-flash","stream":true,"input":"hi"}`},
 		{name: "Anthropic", path: "/v1/messages", body: `{"model":"gemini-2.5-flash","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, header: map[string]string{"Anthropic-Version": "2023-06-01"}},
 		{name: "Gemini", path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", body: `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`},
+		{name: "Interactions", path: "/v1beta/interactions", body: `{"model":"test-model","stream":true,"input":"hi"}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			handler := NewHandler(&scriptedService{events: []aistudio.Event{failure}}, Config{APIKey: "sk-test"})

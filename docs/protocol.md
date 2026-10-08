@@ -1075,6 +1075,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | --- | --- |
 | OpenAI Chat | `GET /v1/models`、`GET /v1/models/{model}`、`POST /v1/chat/completions` |
 | OpenAI Responses | `POST /v1/responses` |
+| Gemini Interactions | `POST /v1beta/interactions`、`POST /v1/interactions` |
 | OpenAI 媒体 | `POST /v1/images/generations`、`POST /v1/audio/speech`、`POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content` |
 | Anthropic | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 | Gemini | `GET /v1beta/models`、`GET /v1beta/models/{model}`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`、`:predictLongRunning`、`GET /v1beta/operations/{id}` |
@@ -1714,6 +1715,44 @@ Anthropic SSE：
 
 delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signature_delta{signature}`、`input_json_delta{partial_json}`。thinking signature 在对应 thinking block 关闭前发送；redacted thinking 使用一个 start/stop block；tool_use 先发送空 input，再通过 `input_json_delta` 发送完整参数 JSON。搜索块在来源汇总后以完整的 start/stop block 输出，查询计数随最终 `message_delta.usage` 返回。
 
+### Gemini Interactions
+
+`POST /v1beta/interactions` 与 `POST /v1/interactions` 接受同一创建请求，与其他公开端点一样必须携带 API key（`x-goog-api-key`、Bearer、`X-API-Key` 或 `key` 查询参数）；缺少或错误时两个入口都返回 Gemini 格式的 401 `UNAUTHENTICATED`。
+
+```json
+{
+  "model": "<TTS 模型>",
+  "input": [{"type":"user_input","content":[{
+    "type":"text","text":"Have a wonderful day!",
+    "annotations":[{"type":"speech_metadata","style":"cheerful and friendly"}]
+  }]}],
+  "response_format": {"type":"audio","mime_type":"audio/l16","sample_rate":24000},
+  "generation_config": {"speech_config":[{"voice":"Kore"}]},
+  "stream": true
+}
+```
+
+| 字段 | 映射 |
+| --- | --- |
+| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-128`、`-nothinking`、`-online` 后缀与其他入口一样解析，交互资源的 `model` 报告请求的原名 |
+| `input` | 字符串、单个内容块、内容块数组或步骤数组；内容类型为 `text`、`image`、`audio`、`video`、`document`。没有输入、续接历史和系统指令时选号前返回 400，只有系统指令时按用户消息生成 |
+| 媒体内容 | `mime_type` 与 `data`（Base64）或 `uri` 二选一，复用 Gemini 文件与内联媒体解析 |
+| 输入步骤 | `user_input`、`model_output`、`thought`、`function_call`、`function_result`；`function_call` 必须带 `id`，函数结果通过 `call_id` 匹配历史调用并补齐名称，对不上任何调用时返回 400；`thought.signature` 挂到随后的模型内容或函数调用上，连续多个签名各自保留 |
+| 函数结果媒体 | `function_result.result` 中以 Base64 内嵌的 `image`、`audio`、`document`（`data` 与 `mime_type`）以及其他协议的图片、文件写法先取出作为真正的媒体发送，原位置换成文字说明 |
+| `system_instruction` | 当前请求的系统指令 |
+| `generation_config` | `temperature`、`top_p`、`top_k`、`max_output_tokens`、`seed`、`stop_sequences`、`thinking_level`、`thinking_summaries`（`auto` 或 `none`）、`speech_config`、`tool_choice` |
+| `response_format` | 单对象或数组；文本使用 `{type:"text",mime_type:"application/json",schema:{...}}` 请求结构化输出；图片使用 `{type:"image",aspect_ratio?,image_size?}`；音频使用 `{type:"audio",mime_type?:"audio/wav|audio/l16"}` |
+| 语音配置 | `speech_config:[{voice}]`；多说话人使用 `{speakers:[{speaker,voice}],mode?}`，`mode` 为 `verbatim` 或 `conversational` |
+| 语音文本 | 文本块 `annotations` 中的 `{type:"speech_metadata",speaker?,style?}` 保留说话人与风格 |
+| 函数与工具 | `tools:[{type:"function",name,description?,parameters?}]`；另接受 `google_search`、`url_context`、`code_execution`、`google_maps`；`tool_choice` 为 `auto` 或 `none` |
+| 续接 | 默认保存；`previous_interaction_id` 重建前序内容，`store:false` 仅返回本次响应。与 Responses 共用当前服务实例内最多 256 个响应节点，只接受 `int_` 开头的交互 ID，`resp_` 开头的 Responses ID 返回 400；音频输出不保存进节点（只保留音频分片带的签名） |
+
+音频输出为 24 kHz、16-bit 小端、单声道。非流式默认 `audio/wav`，流式默认 `audio/l16`；显式 WAV 流在音频汇总完成后发送一个有效 WAV 块。`sample_rate` 可省略或设为 `24000`，`delivery` 可省略或设为 `inline`。创建请求在当前连接内执行，`background` 可省略或设为 `false`。
+
+非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps` 与 `usage`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
+
+SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
+
 ### Gemini GenerateContent
 
 `POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent` 与 `:countTokens` 接受：
@@ -2097,7 +2136,7 @@ OpenAI Chat 使用 Markdown data URL 承载生成图片；客户端把 assistant
 
 用户文本中的 `youtu.be/<ID>`、`youtube.com/watch?v=<ID>`、`/shorts/<ID>`、`/live/<ID>` 和 `/embed/<ID>` 会转换为 `video/*` 外部媒体 part，并从用户 text part 中移除；重复 URL 合并为一个附件。OpenAI `video_url`/`input_video`、Anthropic URL source 与 Gemini `fileData.fileUri` 使用相同的外部媒体编码。
 
-OpenAI Responses 的 `previous_response_id` 在进程内保存最多 256 个响应节点并重建完整 contents；重启后客户端重新提交完整上下文。Drive 与 Veo 资源绑定持久化到磁盘。
+OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 在进程内共用最多 256 个响应节点并重建完整 contents；重启后客户端重新提交完整上下文。Drive 与 Veo 资源绑定持久化到磁盘。
 
 `store` 省略或为 `true` 时建立响应节点；`store=false` 返回当前响应并保持既有续接链。
 
@@ -2180,6 +2219,10 @@ data: {"type":"error","error":{"type":"api_error","message":"..."}}
 
 # Gemini
 data: {"error":{"code":502,"message":"...","status":"INTERNAL"}}
+
+# Gemini Interactions
+event: error
+data: {"event_type":"error","error":{"code":"INTERNAL","message":"..."}}
 ```
 
 MakerSuite 错误解析：
