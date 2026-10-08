@@ -26,11 +26,6 @@ const buildProofField = 3
 // buildThinkingLevels 把 thinking level 枚举换算为 Gemini API 名称
 var buildThinkingLevels = map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL"}
 
-// buildSafetyCategories 为官网 Playground 关闭过滤的四个安全类别
-var buildSafetyCategories = []string{
-	"HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
-}
-
 // buildModelDefaults 返回 Build 独有模型按目录推导的生成默认值
 func buildModelDefaults(model Model) GenerationDefaults {
 	thinking := model.Capabilities["thinking"]
@@ -79,11 +74,8 @@ func EncodeBuildGenerateRequest(request GenerateRequest, defaults GenerationDefa
 	if len(config) > 0 {
 		body["generationConfig"] = config
 	}
-	if !imageRoute {
-		settings := make([]any, 0, len(buildSafetyCategories))
-		for _, category := range buildSafetyCategories {
-			settings = append(settings, map[string]any{"category": category, "threshold": "OFF"})
-		}
+	// 与 Playground 相同的安全设置：非图片模型默认四类 OFF，客户端阈值只覆盖对应类别；图片路由只发送客户端列出的类别
+	if settings := encodeBuildSafetySettings(resolveSafetySettings(request.SafetySettings, imageRoute)); settings != nil {
 		body["safetySettings"] = settings
 	}
 	encoded, err := json.Marshal(body)
@@ -365,6 +357,10 @@ func encodeBuildGenerationConfig(config GenerationConfig, defaults GenerationDef
 	}
 	if config.ResponseMIMEType != "" {
 		encoded["responseMimeType"] = config.ResponseMIMEType
+	}
+	if len(wire) > 17 && wire[17] != nil {
+		// 与 Playground 同一校验，Build 发送 Gemini API 枚举名
+		encoded["mediaResolution"] = strings.ToUpper(strings.TrimSpace(config.MediaResolution))
 	}
 	if len(bytes.TrimSpace(config.ResponseSchema)) > 0 {
 		encoded["responseJsonSchema"] = json.RawMessage(config.ResponseSchema)

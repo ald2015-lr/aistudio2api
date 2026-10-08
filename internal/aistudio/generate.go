@@ -46,8 +46,9 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	wire := make([]any, length)
 	wire[0] = wireModelName(request.Model)
 	wire[1] = contents
-	if !defaults.ImageRoute {
-		wire[2] = observedSafetySettings()
+	// 安全设置：非图片模型默认官网四类 OFF，客户端阈值只覆盖对应类别；图片模型只发送客户端列出的类别
+	if safety := encodeSafetySettings(resolveSafetySettings(request.SafetySettings, defaults.ImageRoute)); safety != nil {
+		wire[2] = safety
 	}
 	wire[3] = config
 	if request.System != "" {
@@ -170,6 +171,10 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if err != nil {
 		return nil, err
 	}
+	mediaResolution, err := encodeMediaResolution(config.MediaResolution)
+	if err != nil {
+		return nil, err
+	}
 	includeThinking := defaults.Thinking || defaults.ThinkingBudget || defaults.ThinkingLevel || thinkingBudget != nil || hasReasoningEffort
 	length := 14
 	if responseModalities != nil {
@@ -182,6 +187,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		if length < 17 {
 			length = 17
 		}
+	}
+	if mediaResolution != 0 && length < 18 {
+		length = 18
 	}
 	if config.Seed != nil {
 		if length < 19 {
@@ -235,6 +243,9 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 			thinking[1] = *thinkingBudget
 		}
 		wire[16] = thinking
+	}
+	if mediaResolution != 0 {
+		wire[17] = mediaResolution
 	}
 	if config.Seed != nil {
 		wire[18] = *config.Seed
@@ -413,6 +424,28 @@ func encodeSpeechConfig(config *SpeechConfig) ([]any, error) {
 	return wire, nil
 }
 
+// mediaResolutions 为 Gemini API 输入媒体分辨率名与 generation config 字段 18 的编号
+var mediaResolutions = map[string]int64{"MEDIA_RESOLUTION_LOW": 1, "MEDIA_RESOLUTION_MEDIUM": 2, "MEDIA_RESOLUTION_HIGH": 3}
+
+// encodeMediaResolution 校验输入媒体分辨率（不区分大小写）并返回 wire 编号；未设置或 MEDIA_RESOLUTION_UNSPECIFIED 时为 0，不发送
+func encodeMediaResolution(value string) (int64, error) {
+	name := strings.ToUpper(strings.TrimSpace(value))
+	if name == "" || name == "MEDIA_RESOLUTION_UNSPECIFIED" {
+		return 0, nil
+	}
+	code, ok := mediaResolutions[name]
+	if !ok {
+		return 0, fmt.Errorf("mediaResolution %q 不受支持，可用值为 MEDIA_RESOLUTION_LOW、MEDIA_RESOLUTION_MEDIUM、MEDIA_RESOLUTION_HIGH", value)
+	}
+	return code, nil
+}
+
+// ValidateMediaResolution 检查输入媒体分辨率是否为可用的 Gemini API 枚举名，供选号前校验
+func ValidateMediaResolution(value string) error {
+	_, err := encodeMediaResolution(value)
+	return err
+}
+
 func applyModelMediaDefaults(config GenerationConfig, model Model) GenerationConfig {
 	if model.Capabilities["image_route"] && imageModalityNeedsText(config.ResponseModalities) {
 		// 图像输出同时请求文本模态
@@ -561,14 +594,6 @@ func speakerSegments(part Part, pattern *regexp.Regexp) []Part {
 	return result
 }
 
-func observedSafetySettings() []any {
-	settings := make([]any, 0, 4)
-	for category := int64(7); category <= 10; category++ {
-		settings = append(settings, []any{nil, nil, category, int64(5)})
-	}
-	return settings
-}
-
 func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
 	lease, leased := AccountLeaseFromContext(ctx)
 	build := leased && lease.Channel() == ChannelBuild
@@ -589,6 +614,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	if err := ValidateStopSequences(request.Config.StopSequences); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	if err := ValidateMediaResolution(request.Config.MediaResolution); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
 	if request.Truncate && entry.model.InputTokenLimit > 0 {

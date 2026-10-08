@@ -170,7 +170,7 @@ Build 请求与 Playground 共用同一预处理：工具可用性校验、模�
 | `tools` | 工具声明 |
 | `toolConfig` | 同时声明函数与 Google 工具时为 `{"includeServerSideToolInvocations":true}` |
 | `generationConfig` | 生成参数 |
-| `safetySettings` | 骚扰、仇恨、色情、危险四类 `OFF`；图片路由不发送 |
+| `safetySettings` | 骚扰、仇恨、色情、危险四类 `OFF`，请求中的类别按名称覆盖或追加；图片路由只发送请求中的类别，没有时不发送 |
 
 ```json
 {
@@ -230,6 +230,7 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 | `maxOutputTokens` | 请求值或目录默认值，按模型上限校验；带语音配置且未显式设置时不发送 |
 | `temperature`、`topP`、`topK`、`seed` | 请求值或目录默认值 |
 | `responseMimeType` | 请求值 |
+| `mediaResolution` | 请求值，大写的 Gemini API 枚举名；未设置或 `MEDIA_RESOLUTION_UNSPECIFIED` 时不发送 |
 | `responseJsonSchema` | 请求的 JSON Schema 原样发送 |
 | `responseModalities` | 大写模态名；图片模型补 `IMAGE`、`TEXT`，TTS 与音乐模型补 `AUDIO` |
 | `imageConfig` | `{aspectRatio?, imageSize?}`；可设置分辨率的图片模型默认 `1K` |

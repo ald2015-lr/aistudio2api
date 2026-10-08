@@ -21,12 +21,15 @@ type geminiRequest struct {
 	GenerationConfig  geminiGenerationConfig `json:"generationConfig"`
 	Tools             []geminiToolGroup      `json:"tools"`
 	ToolConfig        geminiToolConfig       `json:"toolConfig"`
+	// SafetySettings 的名称原样交给协议核心，无法识别的类别或阈值在选号前跳过并记 WARN
+	SafetySettings []aistudio.SafetySetting `json:"safetySettings"`
 	// 兼容写法：snake_case 字段名（Gemini 官方文档的 curl 示例就用 system_instruction，官方接口两种写法都接受），
 	// 以及 countTokens 的 generateContentRequest 包装
-	SystemInstructionSnake *geminiContent  `json:"system_instruction"`
-	GenerationConfigSnake  json.RawMessage `json:"generation_config"`
-	ToolConfigSnake        json.RawMessage `json:"tool_config"`
-	GenerateContentRequest *geminiRequest  `json:"generateContentRequest"`
+	SystemInstructionSnake *geminiContent           `json:"system_instruction"`
+	GenerationConfigSnake  json.RawMessage          `json:"generation_config"`
+	ToolConfigSnake        json.RawMessage          `json:"tool_config"`
+	SafetySettingsSnake    []aistudio.SafetySetting `json:"safety_settings"`
+	GenerateContentRequest *geminiRequest           `json:"generateContentRequest"`
 	// requests 为批量写法（{"requests": [{...}]}），content 为单数写法；只支持一条请求
 	Requests []geminiRequest `json:"requests"`
 	Content  *geminiContent  `json:"content"`
@@ -156,11 +159,14 @@ type geminiGenerationConfig struct {
 	SpeechConfig        *geminiSpeechConfig        `json:"speechConfig"`
 	TranscriptionConfig *geminiTranscriptionConfig `json:"transcriptionConfig"`
 	Seed                *int64                     `json:"seed"`
+	MediaResolution     string                     `json:"mediaResolution"`
 	ThinkingConfig      *struct {
 		ThinkingBudget  *int64 `json:"thinkingBudget"`
 		ThinkingLevel   string `json:"thinkingLevel"`
 		IncludeThoughts *bool  `json:"includeThoughts"`
 	} `json:"thinkingConfig"`
+	// MediaResolutionSnake 为 generationConfig 内的 snake_case 写法；整个 generation_config 用 snake_case 时已统一转换为 camelCase
+	MediaResolutionSnake string `json:"media_resolution"`
 }
 
 type geminiTranscriptionConfig struct {
@@ -391,6 +397,11 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		StopSequences:    normalizeStopSequences(request.GenerationConfig.StopSequences),
 		ResponseMIMEType: request.GenerationConfig.ResponseMIMEType,
 		Seed:             request.GenerationConfig.Seed,
+		MediaResolution:  request.GenerationConfig.mediaResolution(),
+	}
+	// 媒体分辨率只接受 Gemini API 枚举名，写错时在选号前返回 400
+	if err := aistudio.ValidateMediaResolution(config.MediaResolution); err != nil {
+		return aistudio.GenerateRequest{}, fmt.Errorf("unsupported generationConfig.mediaResolution %q; expected MEDIA_RESOLUTION_LOW, MEDIA_RESOLUTION_MEDIUM or MEDIA_RESOLUTION_HIGH", config.MediaResolution)
 	}
 	config.ResponseModalities, err = mapGeminiResponseModalities(request.GenerationConfig.ResponseModalities)
 	if err != nil {
@@ -429,7 +440,16 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	}
 	return aistudio.GenerateRequest{
 		ID: id, Model: model, System: system, Contents: contents, Config: config, Tools: tools,
+		SafetySettings: append([]aistudio.SafetySetting(nil), request.SafetySettings...),
 	}, nil
+}
+
+// mediaResolution 返回输入媒体分辨率，两种写法同时出现时以 camelCase 为准
+func (config geminiGenerationConfig) mediaResolution() string {
+	if config.MediaResolution != "" {
+		return config.MediaResolution
+	}
+	return config.MediaResolutionSnake
 }
 
 func (config geminiGenerationConfig) validate() error {
@@ -1389,6 +1409,10 @@ func (request *geminiRequest) normalizeVariants() error {
 	if request.SystemInstruction == nil && request.SystemInstructionSnake != nil {
 		request.SystemInstruction = request.SystemInstructionSnake
 	}
+	if request.SafetySettings == nil && request.SafetySettingsSnake != nil {
+		request.SafetySettings = request.SafetySettingsSnake
+	}
+	request.SafetySettingsSnake = nil
 	if geminiRawObjectPresent(request.GenerationConfigSnake) && reflect.ValueOf(request.GenerationConfig).IsZero() {
 		if err := decodeSnakeJSON(request.GenerationConfigSnake, &request.GenerationConfig); err != nil {
 			return fmt.Errorf("generation_config: %w", err)

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,4 +148,56 @@ func TestStartGenerateRejectsInvalidToolChoice(t *testing.T) {
 	if _, _, err := service.startGenerate(ctx, request); !errors.Is(err, aistudio.ErrInvalidArgument) {
 		t.Fatalf("err = %v，期望参数错误", err)
 	}
+}
+
+// TestStartGenerateRejectsInvalidMediaResolution 媒体分辨率不是可用的枚举名时在选号前返回参数错误
+func TestStartGenerateRejectsInvalidMediaResolution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	service := &trackedService{
+		lifecycle: ctx, pool: aistudio.NewAccountPool(nil, 1), requests: requests,
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+	}
+	request := aistudio.GenerateRequest{
+		ID: "req-media", Model: "test-model",
+		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
+		Config:   aistudio.GenerationConfig{MediaResolution: "MEDIA_RESOLUTION_ULTRA"},
+	}
+	if _, _, err := service.startGenerate(ctx, request); !errors.Is(err, aistudio.ErrInvalidArgument) {
+		t.Fatalf("err = %v，期望参数错误", err)
+	}
+}
+
+// TestStartGenerateSkipsUnknownSafetySettings 无法识别的安全设置跳过并记 WARN，不作为参数错误
+func TestStartGenerateSkipsUnknownSafetySettings(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	service := &trackedService{
+		lifecycle: ctx, pool: aistudio.NewAccountPool(nil, 1), requests: requests,
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+	}
+	request := aistudio.GenerateRequest{
+		ID: "req-safety", Model: "test-model",
+		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
+		SafetySettings: []aistudio.SafetySetting{
+			{Category: "HARM_CATEGORY_TOXICITY", Threshold: "BLOCK_NONE"},
+			{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_ONLY_HIGH"},
+		},
+	}
+	// 服务未运行：通过选号前校验后，在申请数据上下文时返回服务已停止
+	_, _, err := service.startGenerate(ctx, request)
+	var stopped *serviceStoppedError
+	if !errors.As(err, &stopped) {
+		t.Fatalf("err = %v，期望通过参数校验后返回服务已停止", err)
+	}
+	requests.mu.Lock()
+	defer requests.mu.Unlock()
+	for _, entry := range requests.logs {
+		if entry.Level == "WARN" && strings.Contains(entry.Message, "HARM_CATEGORY_TOXICITY") && !strings.Contains(entry.Message, "HARM_CATEGORY_HARASSMENT") {
+			return
+		}
+	}
+	t.Fatalf("没有记录跳过安全设置的 WARN: %+v", requests.logs)
 }

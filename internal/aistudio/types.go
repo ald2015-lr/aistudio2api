@@ -197,6 +197,12 @@ type ImageConfig struct {
 	ImageSize   string `json:"image_size,omitempty"`
 }
 
+// SafetySetting 表示一个安全类别的拦截阈值，取 Gemini API 枚举名
+type SafetySetting struct {
+	Category  string `json:"category"`
+	Threshold string `json:"threshold"`
+}
+
 // SpeakerVoiceConfig 表示多说话人的声音选择
 type SpeakerVoiceConfig struct {
 	Speaker   string `json:"speaker"`
@@ -236,6 +242,8 @@ type GenerationConfig struct {
 	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
 	ThinkingBudget      *int64               `json:"thinking_budget,omitempty"`
 	Seed                *int64               `json:"seed,omitempty"`
+	// MediaResolution 为输入媒体分辨率，取 Gemini API 枚举名（MEDIA_RESOLUTION_LOW 等）
+	MediaResolution string `json:"media_resolution,omitempty"`
 	// HideThinking 不返回思考正文，只保留思考签名（Anthropic thinking.type=disabled）
 	HideThinking bool `json:"hide_thinking,omitempty"`
 }
@@ -251,6 +259,8 @@ type GenerateRequest struct {
 	Config          GenerationConfig `json:"config,omitempty"`
 	Tools           Tools            `json:"tools,omitempty"`
 	AccountID       string           `json:"account_id,omitempty"`
+	// SafetySettings 覆盖对应类别的拦截阈值；非图片模型未列出的官网四类保持 OFF
+	SafetySettings []SafetySetting `json:"safety_settings,omitempty"`
 	// ImageRoute 内部标记：图像生成模型（由模型目录能力推导）
 	ImageRoute bool `json:"-"`
 	// Stream 为客户端是否要求流式响应：降级判定按此选择缓存方式（流式严格模式在判定前不发出任何内容）

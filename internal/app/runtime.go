@@ -3320,18 +3320,28 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 		activeTraces.Store(requestID, trace)
 		trace.OnFinish(func() { activeTraces.Delete(requestID) })
 	}
+	// 安全设置中无法识别的类别或阈值跳过并记 WARN（同时写进排查时间线），不返回 400，其余设置照常发送
+	if len(request.SafetySettings) > 0 {
+		var skipped []string
+		request.SafetySettings, skipped = aistudio.NormalizeSafetySettings(request.SafetySettings)
+		if len(skipped) > 0 {
+			service.requests.logRequestProgress(request.ID, "service", "WARN", "安全设置已跳过无法识别的条目 | "+strings.Join(skipped, "；"))
+		}
+	}
 	trace.AddParameters("发往上游（seed 与随机后缀处理后）", request)
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelID(request.Model)
 	// 选号前就能判断的参数错误直接返回 400，不占用账号：既没有系统提示也没有对话内容（例如消息全被过滤掉），
-	// 或者工具选择本身不成立（指定了未声明的函数、要求调用却没有工具）
+	// 工具选择本身不成立（指定了未声明的函数、要求调用却没有工具），停止序列超限，或媒体分辨率不是可用的枚举名
 	var invalid error
 	if len(request.Contents) == 0 {
 		invalid = fmt.Errorf("%w: 请求没有系统提示或对话内容", aistudio.ErrInvalidArgument)
 	} else if err := aistudio.ValidateToolChoice(request.Tools); err != nil {
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	} else if err := aistudio.ValidateStopSequences(request.Config.StopSequences); err != nil {
+		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
+	} else if err := aistudio.ValidateMediaResolution(request.Config.MediaResolution); err != nil {
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	}
 	if invalid != nil {

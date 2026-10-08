@@ -431,6 +431,8 @@ safety settings：
 ]
 ```
 
+每项为 `[null, null, 类别, 阈值]`，编号与 Gemini API 枚举相同：类别 `HARM_CATEGORY_HARASSMENT`=7、`HATE_SPEECH`=8、`SEXUALLY_EXPLICIT`=9、`DANGEROUS_CONTENT`=10、`CIVIC_INTEGRITY`=11；阈值 `BLOCK_LOW_AND_ABOVE`=1、`BLOCK_MEDIUM_AND_ABOVE`=2、`BLOCK_ONLY_HIGH`=3、`BLOCK_NONE`=4、`OFF`=5。非图片模型默认发送上面 7–10 四类 `OFF`，Gemini 协议请求中的类别按名称（不区分大小写）覆盖或追加，未列出的类别保持 `OFF`；图片模型只发送请求中的类别，没有时为 `null`。上游对 `HARM_CATEGORY_UNSPECIFIED`（0）与 `DEROGATORY` 至 `DANGEROUS`（1–6）返回 400，这些类别与其他未知类别或阈值在选号前跳过并记一条 WARN（排查记录同时写入时间线），其余设置照常发送；阈值 `HARM_BLOCK_THRESHOLD_UNSPECIFIED` 沿用默认值。
+
 generation config 字段：
 
 | JSON 索引 | protobuf field | 内容 |
@@ -446,6 +448,7 @@ generation config 字段：
 | 14 | 15 | response modalities：TEXT=`1`、IMAGE=`2`、AUDIO=`3` |
 | 15 | 16 | speech config |
 | 16 | 17 | thinking config `[1, budget?, null, level]` |
+| 17 | 18 | media resolution：LOW=`1`、MEDIUM=`2`、HIGH=`3` |
 | 18 | 19 | seed |
 | 26 | 27 | image config `[aspectRatio?, imageSize?]` |
 | 31 | 32 | transcription config |
@@ -1388,6 +1391,8 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | stop sequence | 映射 generation config field 2 |
 | stop sequence 命中 | 协议核心在正文事件流中匹配并返回实际命中的序列；最多 32 个、单个最长 1024 字节，超过时返回 400 |
 | structured output | MIME type 映射 field 8，Schema 映射 field 9 |
+| Gemini `mediaResolution` | 映射 generation config field 18；Build 发送枚举名 |
+| Gemini `safetySettings` | 映射 GenerateContent field 3；Build 发送 `safetySettings`；OpenAI Chat、Responses 与 Anthropic 没有对应字段，固定按默认四类 `OFF` 发送 |
 | OpenAI Chat `n` | 仅接受省略或 `1` |
 | OpenAI Chat `parallel_tool_calls` | `false` 时一次回复最多一个函数调用（见上文工具选择） |
 | OpenAI Chat `logprobs` / `logit_bias` | 分别接受省略或 `false`、省略或空对象 |
@@ -1719,9 +1724,12 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
   "systemInstruction": {"role":"user","parts":[{"text":"Be concise"}]},
   "generationConfig": {},
   "tools": [],
-  "toolConfig": {}
+  "toolConfig": {},
+  "safetySettings": [{"category":"HARM_CATEGORY_HARASSMENT","threshold":"BLOCK_ONLY_HIGH"}]
 }
 ```
+
+`safetySettings` 也可写成 `safety_settings`，不是数组或条目字段类型不对时返回 400；类别与阈值的取值见上文 GenerateContent 的 safety settings。
 
 Content 字段为 `role` 与 `parts`。Part oneof：
 
@@ -1740,6 +1748,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | 类别 | 字段 |
 | --- | --- |
 | sampling | `temperature`、`topP`、`topK`、`frequencyPenalty`、`presencePenalty`、`seed` |
+| media | `mediaResolution`（或 `media_resolution`）：`MEDIA_RESOLUTION_LOW`、`MEDIA_RESOLUTION_MEDIUM`、`MEDIA_RESOLUTION_HIGH`，不区分大小写；其他值在选号前返回 400 |
 | output limits | `candidateCount`、`maxOutputTokens`、`stopSequences` |
 | log probabilities | `responseLogprobs`、`logprobs` |
 | structured output | `responseMimeType`、`responseSchema`、`responseJsonSchema` |
