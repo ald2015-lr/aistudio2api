@@ -45,8 +45,8 @@ jobs:
             exit 1
           fi
           # 标签已存在时只接受指向当前提交（重新运行），指向其他提交时拒绝，不移动已发布的标签
-          existing="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha' 2>/dev/null || true)"
-          if [[ -n "$existing" ]]; then
+          # 查询失败（标签不存在时为 404，gh 会把错误内容写到标准输出）按不存在处理；若实际已存在，下面的创建会失败
+          if existing="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha' 2>/dev/null)"; then
             sha="${existing#* }"
             if [[ "${existing%% *}" == tag ]]; then sha="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq .object.sha)"; fi
             if [[ "$sha" != "$GITHUB_SHA" ]]; then
