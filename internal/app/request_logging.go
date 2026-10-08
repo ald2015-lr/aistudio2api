@@ -124,7 +124,8 @@ func requestProtocol(path string) string {
 		return "openai-responses"
 	case strings.HasPrefix(path, "/v1/messages"):
 		return "anthropic"
-	case strings.HasSuffix(path, "/interactions"):
+	case path == "/v1/interactions" || path == "/v1beta/interactions":
+		// Interactions API 在 /v1 与 /v1beta 下各有一个入口，单独归类，不并入 gemini
 		return "interactions"
 	case strings.HasPrefix(path, "/v1beta/"):
 		return "gemini"

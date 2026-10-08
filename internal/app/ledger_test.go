@@ -16,7 +16,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
-// TestRequestProtocol 按路径归类协议：排查路由去掉 /trace 前缀，token 计数单独归类
+// TestRequestProtocol 按路径归类协议：排查路由去掉 /trace 前缀，token 计数与 Interactions API 单独归类
 func TestRequestProtocol(t *testing.T) {
 	for path, want := range map[string]string{
 		"/v1/chat/completions":                                "openai-chat",
@@ -29,6 +29,10 @@ func TestRequestProtocol(t *testing.T) {
 		"/v1beta/models/gemini-x:generateContent":             "gemini",
 		"/trace/v1beta/models/gemini-x:streamGenerateContent": "gemini",
 		"/v1beta/models/gemini-x:countTokens":                 "count_tokens",
+		"/v1/interactions":                                    "interactions",
+		"/v1beta/interactions":                                "interactions",
+		"/trace/v1beta/interactions":                          "interactions",
+		"/trace/v1/interactions":                              "interactions",
 		"/v1/images/generations":                              "images",
 		"/v1/audio/speech":                                    "audio",
 		"/v1/videos":                                          "videos",

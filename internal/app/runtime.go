@@ -250,7 +250,11 @@ func (preparer *accountWorkerPreparer) Prepare(ctx context.Context, request aist
 	if !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
+	// 只对 Worker 的准备计时并计入请求日志的 proof_ms（含排在同账户进行中的 proof 之后的等待），
+	// 同样在账户锁外完成，不含前后两次核对；失败或 Worker 被替换的尝试也计入，累计值反映请求在 proof 上花的全部时间
+	startedAt := time.Now()
 	prepared, err := preparer.worker.Prepare(ctx, request)
+	api.AddAccessLogProof(ctx, time.Since(startedAt))
 	if !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
