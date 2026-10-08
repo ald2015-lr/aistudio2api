@@ -393,8 +393,8 @@ onUnmounted(() => {
     >
       <div class="flex h-14 items-center justify-between gap-2 border-b border-[#30363d] px-4">
         <div class="flex min-w-0 items-center gap-2">
-          <div class="h-3 w-3 rounded-full" :class="statusColor"></div>
-          <h1 class="whitespace-nowrap text-lg font-bold text-white">AI Studio Proxy</h1>
+          <div class="h-3 w-3 shrink-0 rounded-full" :class="statusColor"></div>
+          <h1 class="truncate text-lg font-bold text-white" title="AI Studio Proxy">AI Studio Proxy</h1>
         </div>
         <div class="group relative">
           <button
