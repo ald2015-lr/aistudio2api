@@ -2566,6 +2566,24 @@ func (service *trackedService) catalogModels() []aistudio.Model {
 	return service.pool.CatalogModels(service.modelSnapshot())
 }
 
+// streamPrefersPlayground 判断流式请求是否应优先走 Playground：模型在 Build 通道只能一次性返回整段回复
+func (service *trackedService) streamPrefersPlayground(request aistudio.GenerateRequest, modelID string) bool {
+	return request.Stream && service.modelBuildUnary(modelID)
+}
+
+// modelBuildUnary 判断模型在 Build 通道是否只能一次性返回（需要订阅权益的模型）；目录里没有该模型时返回 false
+func (service *trackedService) modelBuildUnary(modelID string) bool {
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	service.modelsMu.RLock()
+	defer service.modelsMu.RUnlock()
+	for _, model := range service.models {
+		if strings.TrimPrefix(model.ID, "models/") == modelID {
+			return aistudio.BuildUsesUnary(model)
+		}
+	}
+	return false
+}
+
 func (service *trackedService) modelSnapshot() []aistudio.Model {
 	service.modelsMu.RLock()
 	models := append([]aistudio.Model{}, service.models...)
@@ -3610,6 +3628,11 @@ func (service *trackedService) generateWithRetry(
 		if diag.guard() != nil && !selection.BuildOnly && !selection.PlaygroundOnly {
 			selection.PlaygroundFirst = true
 		}
+		// 需要订阅权益的模型在 Build 通道只能经单次代理调用，整段回复生成完才一次返回：
+		// 流式请求优先走 Playground 逐块输出，没有可用的 Playground 账号时再退回 Build
+		if !selection.BuildOnly && !selection.PlaygroundOnly && service.streamPrefersPlayground(request, modelID) {
+			selection.PlaygroundFirst = true
+		}
 		if (unbound || fileBound) && len(attempted) > 0 {
 			enabled, _ := service.pool.EnabledAccountsIn(scope)
 			for _, accountID := range enabled {
@@ -3620,8 +3643,9 @@ func (service *trackedService) generateWithRetry(
 		}
 		nextLease, acquireErr := service.acquireWarmLease(requestCtx, selection)
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && playgroundUnavailable(acquireErr) {
-			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定
-			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
+			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道。降级判定在 Build 通道按估算 + CountTokens 判定；
+			// 需要订阅权益的模型在 Build 通道一次性返回整段回复
+			trace.Note("优先 Playground：该通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
 			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
 		}

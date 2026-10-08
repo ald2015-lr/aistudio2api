@@ -101,6 +101,11 @@ func buildUsesUnary(model Model) bool {
 	return len(model.AccessModes) > 0 && !modelAllowedByTier(model, BenefitTierFree)
 }
 
+// BuildUsesUnary 判断模型在 Build 通道是否只能经单次代理调用（整段回复生成完才一次返回，不能流式输出）
+func BuildUsesUnary(model Model) bool {
+	return buildUsesUnary(model)
+}
+
 // buildBindingPrompt 从 Build 代理请求体取出 WAA binding：路径与请求体以空格连接
 func buildBindingPrompt(body []byte) (string, error) {
 	var wire []any

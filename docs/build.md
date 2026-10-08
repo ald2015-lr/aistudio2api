@@ -62,7 +62,7 @@ https://alkalimakersuite-pa.clients6.google.com/$rpc/google.internal.alkali.appl
 ["/v1beta/models/<MODEL_ID>:generateContent", "<GEMINI_API_JSON>", "<WAA_PROOF>", "POST"]
 ```
 
-模型的 AccessModes 非空且 Free 权益不能使用时（需要 Pro、Ultra 等订阅），生成经 `ProxyUnaryCall` 与 `:generateContent`；其余模型经 `ProxyStreamedCall` 与 `:streamGenerateContent`。
+模型的 AccessModes 非空且 Free 权益不能使用时（需要 Pro、Ultra 等订阅），生成经 `ProxyUnaryCall` 与 `:generateContent`；其余模型经 `ProxyStreamedCall` 与 `:streamGenerateContent`。`ProxyUnaryCall` 在整段回复生成完后一次返回，不能逐块输出，因此这类模型的流式请求优先选 Playground 通道（`GenerateContent` 携带权益头、逐块返回）；没有可用的 Playground 账号（不支持该模型或全部冷却）时才退回 Build，此时流式请求会在结束时一次收到全部内容。
 
 ### 请求头
 
