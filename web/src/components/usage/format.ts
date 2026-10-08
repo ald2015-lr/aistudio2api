@@ -109,6 +109,10 @@ export function useUsageFormat() {
       const stateKey = stateKeys[key]
       return stateKey === undefined ? key : t(stateKey)
     }
+    if (dimension === 'pool') {
+      if (key === 'ultra') return t('pool.ultra')
+      if (key === 'normal') return t('pool.normal')
+    }
     return key
   }
 

@@ -8,7 +8,17 @@ export const calendarPresets = ['today', 'yesterday', 'week', 'month', 'lastMont
 export type RangePreset =
   (typeof relativePresets)[number] | (typeof calendarPresets)[number] | 'custom'
 
-export const dimensions: UsageDimension[] = ['model', 'account', 'channel', 'protocol', 'state']
+export const dimensions: UsageDimension[] = [
+  'model',
+  'account',
+  'channel',
+  'protocol',
+  'state',
+  'pool',
+]
+
+// poolValues 为号池维度的全部取值：经 /ultra 进入的请求为 ultra，其余为 normal
+export const poolValues = ['normal', 'ultra'] as const
 
 // maxSpan 与服务端校验一致；retention 为账本保留时长
 export const maxSpan = 93 * 86_400_000

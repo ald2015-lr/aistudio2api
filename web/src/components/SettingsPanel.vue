@@ -29,6 +29,9 @@ type EditableKey =
   | 'first_event_timeout'
   | 'warm_worker_limit'
   | 'max_active_workers'
+  | 'ultra_exclusive'
+  | 'ultra_warm_worker_limit'
+  | 'ultra_max_active_workers'
   | 'warm_startup_concurrency'
   | 'per_account_concurrency'
   | 'routing_strategy'
@@ -50,6 +53,9 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'first_event_timeout',
   'warm_worker_limit',
   'max_active_workers',
+  'ultra_exclusive',
+  'ultra_warm_worker_limit',
+  'ultra_max_active_workers',
   'warm_startup_concurrency',
   'per_account_concurrency',
   'routing_strategy',
@@ -128,6 +134,9 @@ const form = reactive<ServiceConfig>({
   first_event_timeout: '0s',
   warm_worker_limit: 5,
   max_active_workers: 10,
+  ultra_exclusive: true,
+  ultra_warm_worker_limit: 2,
+  ultra_max_active_workers: 5,
   warm_startup_concurrency: 2,
   per_account_concurrency: 2,
   routing_strategy: 'round-robin',
@@ -292,8 +301,21 @@ function validate(value: ServiceConfig): string {
   if (value.warm_startup_concurrency > value.warm_worker_limit) {
     return t('settings.invalidWarmConcurrency')
   }
+  // Ultra 常驻数可以为 0（只按需启动），峰值至少为 1 且不小于常驻数
+  const ultraWarm = value.ultra_warm_worker_limit
+  if (typeof ultraWarm !== 'number' || !Number.isInteger(ultraWarm) || ultraWarm < 0) {
+    return t('settings.invalidUltraWarmWorkers')
+  }
+  if (!isPositiveInteger(value.ultra_max_active_workers) || value.ultra_max_active_workers < ultraWarm) {
+    return t('settings.invalidUltraMaxWorkers')
+  }
   return ''
 }
+
+// ultraMaxFloor 为 Ultra 峰值输入框的下限：至少为 1，且不小于 Ultra 常驻数
+const ultraMaxFloor = computed(() =>
+  typeof form.ultra_warm_worker_limit === 'number' ? Math.max(1, form.ultra_warm_worker_limit) : 1,
+)
 
 // payload 构造保存内容；自动保存时所有失焦字段沿用已保存的值，避免把输入到一半的内容写进去
 function payload(includeBlurFields: boolean): ServiceConfig {
@@ -676,6 +698,50 @@ onBeforeUnmount(() => {
           />
         </label>
       </div>
+      <p class="-mt-4 text-xs leading-5 text-gray-500">{{ t('settings.workerPartitionHelp') }}</p>
+
+      <fieldset class="block rounded-lg border border-fuchsia-500/30 bg-[#161b22] p-4">
+        <legend class="sr-only">{{ t('settings.ultraTitle') }}</legend>
+        <div class="mb-1 flex items-center gap-2">
+          <span class="tag tag-ultra">{{ t('pool.ultra') }}</span>
+          <span class="text-sm font-medium text-gray-300">{{ t('settings.ultraTitle') }}</span>
+        </div>
+        <p class="mb-4 text-xs leading-5 text-gray-500">{{ t('settings.ultraHelp') }}</p>
+        <label class="flex items-start gap-3">
+          <input v-model="form.ultra_exclusive" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{ t('settings.ultraExclusive') }}</span>
+            <span class="mt-1 block text-xs text-gray-500">{{ t('settings.ultraExclusiveHelp') }}</span>
+          </span>
+        </label>
+        <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.ultraWarmWorkerLimit')
+            }}</span>
+            <input
+              v-model.number="form.ultra_warm_worker_limit"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="number"
+              min="0"
+              required
+            />
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.ultraMaxActiveWorkers')
+            }}</span>
+            <input
+              v-model.number="form.ultra_max_active_workers"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="number"
+              :min="ultraMaxFloor"
+              required
+            />
+          </label>
+        </div>
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.ultraWorkersHelp') }}</span>
+      </fieldset>
 
       <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <span class="mb-2 block text-sm font-medium text-gray-300">{{

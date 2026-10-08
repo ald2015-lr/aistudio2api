@@ -115,6 +115,14 @@ const workerSets = computed(() => ({
   starting: new Set(status.value?.workers?.starting_ids ?? []),
 }))
 
+// ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；没有 Ultra 账户也没有 Ultra Worker 时不显示
+const ultraWorkers = computed(() => {
+  const workers = status.value?.ultra_workers
+  if (workers === undefined) return null
+  const accounts = status.value?.ultra_accounts?.total ?? 0
+  return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0 ? workers : null
+})
+
 // navBadge 在导航项旁显示账户就绪数与活动请求数
 function navBadge(id: TabID): string {
   if (status.value === null) return ''
@@ -487,6 +495,20 @@ onUnmounted(() => {
               })
             }}
           </div>
+          <div
+            v-if="ultraWorkers"
+            v-tooltip="
+              tf('app.ultraWorkersDetail', {
+                warm: ultraWorkers.warm,
+                starting: ultraWorkers.starting,
+                target: ultraWorkers.target,
+                max: ultraWorkers.max,
+              })
+            "
+            :class="ultraWorkers.occupied >= ultraWorkers.max ? 'text-yellow-400' : 'text-fuchsia-300'"
+          >
+            {{ tf('app.ultraWorkers', { occupied: ultraWorkers.occupied, max: ultraWorkers.max }) }}
+          </div>
           <template v-if="status.workers?.prewarm">
             <div v-if="status.workers.prewarm.active" class="text-cyan-300">
               {{
@@ -565,6 +587,7 @@ onUnmounted(() => {
         :error="errors.accounts"
         :worker-sets="workerSets"
         :worker-counts="status?.workers ?? null"
+        :ultra-worker-counts="status?.ultra_workers ?? null"
         :cooldowns="cooldowns"
         @refresh="loadAccountData"
         @notice="showNotice"
@@ -596,7 +619,12 @@ onUnmounted(() => {
         @saved="config = $event"
         @notice="showNotice"
       />
-      <PlaygroundPanel v-else :models="models" :api-key="config?.proxy_api_key ?? ''" />
+      <PlaygroundPanel
+        v-else
+        :models="models"
+        :accounts="accounts"
+        :api-key="config?.proxy_api_key ?? ''"
+      />
     </main>
 
     <Transition name="notice">

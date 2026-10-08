@@ -15,6 +15,7 @@ import { useUsageFormat } from './usage/format'
 import {
   dimensions,
   liveRange,
+  poolValues,
   ratio,
   rateTone,
   readPreference,
@@ -49,6 +50,15 @@ const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 let controller: AbortController | undefined
 let clockTimer: number | undefined
 
+// filterDimensions 为下拉多选的筛选维度；号池只有两个取值，单独用分段按钮筛选
+const filterDimensions = dimensions.filter((item) => item !== 'pool')
+const poolChoices = ['all', ...poolValues] as const
+type PoolChoice = (typeof poolChoices)[number]
+const poolFilter = computed<PoolChoice>(() => {
+  const values = state.filters.pool ?? []
+  const value = values.length === 1 ? values[0] : undefined
+  return value === 'normal' || value === 'ultra' ? value : 'all'
+})
 const resolved = computed(() => resolveRange(state, new Date(now.value)))
 const live = computed(() => liveRange(state.range))
 const hasFilters = computed(() => dimensions.some((item) => (state.filters[item] ?? []).length > 0))
@@ -157,8 +167,17 @@ function setFilter(dimension: UsageDimension, values: string[]): void {
   state.filters = filters
 }
 
-// addFilter 把取值加入维度筛选
+// setPool 选择号池筛选：全部号池即不筛选
+function setPool(choice: PoolChoice): void {
+  setFilter('pool', choice === 'all' ? [] : [choice])
+}
+
+// addFilter 把取值加入维度筛选；号池同时选两个等于不筛选，改为只看这一个
 function addFilter(dimension: UsageDimension, value: string): void {
+  if (dimension === 'pool') {
+    setFilter('pool', [value])
+    return
+  }
   const values = state.filters[dimension] ?? []
   if (!values.includes(value)) setFilter(dimension, [...values, value])
 }
@@ -439,8 +458,21 @@ const statusOptions = computed(() =>
       >
         <RangePicker :range="state.range" :resolved="resolved" @apply="applyRange" />
         <span class="mx-1 hidden h-5 w-px bg-line sm:block" aria-hidden="true"></span>
+        <div class="seg" role="group" :aria-label="t('usage.dimension.pool')">
+          <button
+            v-for="choice in poolChoices"
+            :key="choice"
+            type="button"
+            class="seg-item"
+            :class="{ active: poolFilter === choice }"
+            :aria-pressed="poolFilter === choice"
+            @click="setPool(choice)"
+          >
+            {{ choice === 'all' ? t('usage.poolAll') : dimensionLabel('pool', choice) }}
+          </button>
+        </div>
         <FilterMenu
-          v-for="dimension in dimensions"
+          v-for="dimension in filterDimensions"
           :key="dimension"
           :label="t(`usage.dimension.${dimension}`)"
           :options="report?.options[dimension] ?? []"

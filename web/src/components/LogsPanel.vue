@@ -418,6 +418,12 @@ onBeforeUnmount(() => {
                     <span class="badge" :class="requestBadge(item.row)">{{
                       requestStatus(item.row)
                     }}</span>
+                    <span
+                      v-if="item.row.entry.request.pool === 'ultra'"
+                      v-tooltip="t('pool.ultraHelp')"
+                      class="tag tag-ultra shrink-0"
+                      >{{ t('pool.ultra') }}</span
+                    >
                     <strong class="log-title">{{ requestTitle(item.row) }}</strong>
                     <span
                       v-for="(chip, index) in requestChips(item.row)"

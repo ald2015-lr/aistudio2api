@@ -70,6 +70,7 @@ const summary = computed(() => {
     { label: t('usage.dimension.account'), value: record.account || '—' },
     { label: t('usage.dimension.channel'), value: dimensionLabel('channel', record.channel) },
     { label: t('usage.dimension.protocol'), value: dimensionLabel('protocol', record.protocol) },
+    { label: t('usage.dimension.pool'), value: dimensionLabel('pool', record.pool) },
     { label: t('usage.path'), value: record.path },
     { label: t('usage.dimension.status'), value: String(record.status) },
     { label: t('usage.duration'), value: duration(record.duration_ms) },

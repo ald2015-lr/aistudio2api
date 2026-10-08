@@ -290,6 +290,12 @@ function latencyWidth(milliseconds: number): number {
                 }}</span>
                 <span class="ml-1.5 text-gray-500 tabular-nums">{{ record.status }}</span>
                 <span
+                  v-if="record.pool === 'ultra'"
+                  v-tooltip="t('pool.ultraHelp')"
+                  class="tag tag-ultra ml-1.5"
+                  >{{ t('pool.ultra') }}</span
+                >
+                <span
                   v-if="record.downgrade === 'rejected'"
                   v-tooltip="t('usage.downgrade.rejected')"
                   class="tag ml-1.5 text-red-300"
@@ -371,6 +377,9 @@ function latencyWidth(milliseconds: number): number {
                 dimensionLabel('state', record.state)
               }}</span>
               <span class="text-gray-500 tabular-nums">{{ record.status }}</span>
+              <span v-if="record.pool === 'ultra'" class="tag tag-ultra">{{
+                t('pool.ultra')
+              }}</span>
               <span class="ml-auto text-gray-400 tabular-nums">{{
                 dateTime(record.time, true)
               }}</span>

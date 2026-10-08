@@ -547,6 +547,14 @@ button[aria-busy='true']::before {
     white-space: nowrap;
   }
 
+  /* Ultra 号池的标记：账户权益、请求日志、请求摘要与用量记录共用 */
+  .tag-ultra {
+    border-color: rgb(217 70 239 / 55%);
+    background: rgb(217 70 239 / 14%);
+    color: #f5d0fe;
+    font-weight: 600;
+  }
+
   .dot {
     display: inline-block;
     width: 0.5rem;

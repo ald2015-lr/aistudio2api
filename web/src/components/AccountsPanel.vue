@@ -12,6 +12,7 @@ import type {
   AccountState,
   ChromeImportProfile,
   Cooldown,
+  UltraWorkerCounters,
   WorkerCounters,
   WorkerState,
 } from '@/types'
@@ -25,6 +26,7 @@ const props = defineProps<{
   error: string
   workerSets: { warm: Set<string>; starting: Set<string> }
   workerCounts: WorkerCounters | null
+  ultraWorkerCounts: UltraWorkerCounters | null
   cooldowns: Cooldown[]
 }>()
 
@@ -364,6 +366,9 @@ async function removeAccount(account: Account): Promise<void> {
 
 type StateFilter = 'all' | AccountState
 type WorkerFilter = 'all' | WorkerState
+// AccountTier 为筛选与显示用的权益：unknown 表示权益尚未从官网读取
+type AccountTier = 'Ultra' | 'Pro' | 'Plus' | 'Free' | 'unknown'
+type TierFilter = 'all' | AccountTier
 type SortKey = 'default' | 'state' | 'label' | 'models' | 'worker'
 
 const filterStates: AccountState[] = [
@@ -395,6 +400,14 @@ const workerFilterOptions: { value: WorkerFilter; label: TranslationKey }[] = [
   { value: 'starting', label: 'accounts.workerFilterStarting' },
   { value: 'none', label: 'accounts.workerFilterNone' },
 ]
+const tierFilterOptions: { value: TierFilter; label: TranslationKey }[] = [
+  { value: 'all', label: 'accounts.tierFilterAll' },
+  { value: 'Ultra', label: 'accounts.tierFilterUltra' },
+  { value: 'Pro', label: 'accounts.tierFilterPro' },
+  { value: 'Plus', label: 'accounts.tierFilterPlus' },
+  { value: 'Free', label: 'accounts.tierFilterFree' },
+  { value: 'unknown', label: 'accounts.tierFilterUnknown' },
+]
 const workerOrder: Record<WorkerState, number> = { warm: 0, starting: 1, none: 2 }
 const workerLabelKeys: Record<WorkerState, TranslationKey> = {
   warm: 'accounts.workerWarm',
@@ -412,6 +425,14 @@ const workerDotClass: Record<WorkerState, string> = {
   none: 'bg-gray-700',
 }
 
+// accountTier 返回账户的权益：Ultra 号池的账户为 Ultra；权益尚未读取时为 unknown（服务端暂按 Free 显示，计入普通号池）
+function accountTier(account: Account): AccountTier {
+  if (account.pool === 'ultra') return 'Ultra'
+  if (account.benefit_tier_known === false) return 'unknown'
+  const tier = account.benefit_tier
+  return tier === 'Ultra' || tier === 'Pro' || tier === 'Plus' ? tier : 'Free'
+}
+
 // workerState 账户 Worker 的实时状态：运行中、启动中或未启动
 function workerState(account: Account): WorkerState {
   if (props.workerSets.warm.has(account.id)) return 'warm'
@@ -422,6 +443,7 @@ function workerState(account: Account): WorkerState {
 const query = ref('')
 const stateFilter = ref<StateFilter>('all')
 const workerFilter = ref<WorkerFilter>('all')
+const tierFilter = ref<TierFilter>('all')
 const sortKey = ref<SortKey>('default')
 const selected = ref<Set<string>>(new Set())
 
@@ -438,11 +460,31 @@ const stateCounts = computed(() => {
   return counts
 })
 
+// tierCounts 按权益统计账户数，ultraReady 为 Ultra 号池中就绪的账户数
+const tierCounts = computed(() => {
+  const counts: Record<TierFilter, number> = {
+    all: props.accounts.length,
+    Ultra: 0,
+    Pro: 0,
+    Plus: 0,
+    Free: 0,
+    unknown: 0,
+  }
+  for (const account of props.accounts) counts[accountTier(account)] += 1
+  return counts
+})
+const ultraReady = computed(
+  () =>
+    props.accounts.filter((account) => accountTier(account) === 'Ultra' && account.state === 'ready')
+      .length,
+)
+
 const filtered = computed(() => {
   const term = query.value.trim().toLowerCase()
   const list = props.accounts.filter((account) => {
     if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
+    if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
     if (term === '') return true
     return [account.label, account.proxy, account.message, account.benefit_tier].some((value) =>
       value.toLowerCase().includes(term),
@@ -476,7 +518,7 @@ const { page, pageSize, pageItems } = usePaging(
   50,
 )
 
-watch([query, stateFilter, workerFilter, sortKey], () => {
+watch([query, stateFilter, workerFilter, tierFilter, sortKey], () => {
   page.value = 1
 })
 
@@ -672,7 +714,7 @@ function closeBulkPanel(): void {
     <div class="page space-y-4">
       <!-- 标题与主要操作 -->
       <div class="flex flex-wrap items-center justify-between gap-3 border-b border-[#30363d] pb-3">
-        <div class="flex items-baseline gap-3">
+        <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
           <h2 class="page-title">{{ t('section.accounts.title') }}</h2>
           <span class="font-mono text-xs text-gray-500">
             {{ tf('app.readyOf', { ready: stateCounts.ready, total: accounts.length }) }}
@@ -682,6 +724,24 @@ function closeBulkPanel(): void {
           </span>
           <span v-if="workerCounts && workerCounts.starting > 0" class="font-mono text-xs text-cyan-300">
             {{ tf('app.workersStarting', { count: workerCounts.starting }) }}
+          </span>
+          <span
+            v-tooltip="t('accounts.ultraCountHelp')"
+            class="tag tag-ultra"
+            tabindex="0"
+          >
+            {{ tf('accounts.ultraCount', { ready: ultraReady, total: tierCounts.Ultra }) }}
+          </span>
+          <span
+            v-if="ultraWorkerCounts && tierCounts.Ultra > 0"
+            class="font-mono text-xs text-fuchsia-300"
+          >
+            {{
+              tf('accounts.ultraWorkers', {
+                warm: ultraWorkerCounts.warm,
+                target: ultraWorkerCounts.target,
+              })
+            }}
           </span>
         </div>
         <div class="flex flex-wrap items-center gap-2">
@@ -887,7 +947,7 @@ function closeBulkPanel(): void {
         </div>
         <input
           v-model="query"
-          class="input min-w-0 flex-1 sm:max-w-80"
+          class="input min-w-40 flex-1 sm:max-w-80"
           type="search"
           :placeholder="t('accounts.search')"
           :aria-label="t('accounts.search')"
@@ -895,6 +955,11 @@ function closeBulkPanel(): void {
         <select v-model="workerFilter" class="input" :aria-label="t('accounts.worker')">
           <option v-for="option in workerFilterOptions" :key="option.value" :value="option.value">
             {{ t(option.label) }}
+          </option>
+        </select>
+        <select v-model="tierFilter" class="input" :aria-label="t('accounts.benefitTier')">
+          <option v-for="option in tierFilterOptions" :key="option.value" :value="option.value">
+            {{ t(option.label) }} ({{ tierCounts[option.value] }})
           </option>
         </select>
         <select v-model="sortKey" class="input" :aria-label="t('accounts.sortDefault')">
@@ -1037,7 +1102,21 @@ function closeBulkPanel(): void {
                     {{ account.message }}
                   </div>
                 </td>
-                <td class="cell-truncate text-xs text-gray-300">{{ account.benefit_tier || '—' }}</td>
+                <td class="cell-truncate text-xs text-gray-300">
+                  <span
+                    v-if="accountTier(account) === 'Ultra'"
+                    v-tooltip="t('accounts.ultraCountHelp')"
+                    class="tag tag-ultra"
+                    >{{ t('pool.ultra') }}</span
+                  >
+                  <span
+                    v-else-if="accountTier(account) === 'unknown'"
+                    v-tooltip="t('accounts.tierUnknownHelp')"
+                    class="text-gray-500"
+                    >{{ t('accounts.tierUnknown') }}</span
+                  >
+                  <template v-else>{{ accountTier(account) }}</template>
+                </td>
                 <td class="font-mono text-xs text-gray-300">
                   {{ account.models.length === 0 ? '—' : account.models.length }}
                 </td>

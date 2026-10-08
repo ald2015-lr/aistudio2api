@@ -23,7 +23,14 @@ export interface Account {
   models: string[]
   benefit_tier: string
   message: string
+  // benefit_tier_known 为 false 表示权益尚未从官网读取：benefit_tier 按 Free 显示，账户属于普通号池
+  benefit_tier_known: boolean
+  // pool 为账户当前所属的号池：权益为 Ultra 的账户属于 ultra，其余属于 normal
+  pool: AccountPool
 }
+
+// AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
+export type AccountPool = 'ultra' | 'normal'
 
 export interface AccountDraft {
   label: string
@@ -115,6 +122,17 @@ export interface WorkerCounters {
   starting_ids?: string[]
 }
 
+// UltraWorkerCounters 为 Ultra 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
+// warm_limit 与 max 为 Ultra 常驻数与峰值数设置
+export interface UltraWorkerCounters {
+  warm: number
+  starting: number
+  occupied: number
+  target: number
+  warm_limit: number
+  max: number
+}
+
 export interface ServiceStatus {
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
@@ -122,7 +140,11 @@ export interface ServiceStatus {
   version: string
   active_requests: number
   accounts: AccountCounters
+  // workers 的数量与上限只含普通分区，warm_ids、starting_ids 包含两个分区
   workers?: WorkerCounters
+  // ultra_accounts 为 Ultra 号池的账户计数，ultra_workers 为 Ultra 分区的 Worker 计数
+  ultra_accounts?: AccountCounters
+  ultra_workers?: UltraWorkerCounters
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'
@@ -142,7 +164,9 @@ export interface RequestLog {
   state: 'running' | 'completed' | 'tool_calls' | 'limited' | 'blocked' | 'failed' | 'cancelled'
   model?: string
   method?: string
+  // path 保留 /ultra 前缀；pool 为 ultra 表示请求经 /ultra 进入，只用 Ultra 号池的账户
   path?: string
+  pool?: 'ultra'
   status?: number
   duration_ms?: number
   tool_calls?: number
@@ -203,6 +227,8 @@ export interface RequestSummary {
   channel?: UpstreamChannel
   state: RequestState
   started_at: string
+  // pool 为 ultra 表示请求经 /ultra 进入
+  pool?: 'ultra'
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（服务配置页，修改后立即生效）
@@ -257,8 +283,14 @@ export interface ServiceConfig {
   request_timeout: string
   // first_event_timeout 为每次尝试等待首个上游事件的上限，0s 表示关闭
   first_event_timeout: string
+  // warm_worker_limit 与 max_active_workers 只约束普通分区的 Worker
   warm_worker_limit: number
   max_active_workers: number
+  // ultra_exclusive 为真时 Ultra 账户只服务 /ultra 请求；ultra_warm_worker_limit 可以为 0（只按需启动），
+  // ultra_max_active_workers 至少为 1 且不小于 Ultra 常驻数
+  ultra_exclusive: boolean
+  ultra_warm_worker_limit: number
+  ultra_max_active_workers: number
   warm_startup_concurrency: number
   per_account_concurrency: number
   routing_strategy: 'round-robin' | 'fill-first'
@@ -301,6 +333,8 @@ export interface PlaygroundInput {
   imageQuality: 'auto' | 'low' | 'medium' | 'high'
   voice: string
   apiKey: string
+  // ultra 为真时请求经 /ultra 前缀发送，只由 Ultra 号池的账户处理
+  ultra: boolean
 }
 
 export interface PlaygroundMedia {
@@ -318,8 +352,8 @@ export interface PlaygroundResult {
   status: number
 }
 
-// UsageDimension 为用量可筛选与分组的维度
-export type UsageDimension = 'model' | 'account' | 'channel' | 'protocol' | 'state'
+// UsageDimension 为用量可筛选与分组的维度；pool 为号池，取值为 normal 或 ultra
+export type UsageDimension = 'model' | 'account' | 'channel' | 'protocol' | 'state' | 'pool'
 
 export type UsageFilters = Partial<Record<UsageDimension, string[]>>
 
@@ -422,6 +456,8 @@ export interface UsageRecord {
   reply_hash?: string
   duplicate?: boolean
   has_body: boolean
+  // pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为 normal
+  pool: 'normal' | 'ultra'
 }
 
 export interface UsageRecordPage {

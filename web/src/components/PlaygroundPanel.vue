@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
-import { ApiError, runPlayground, type PlaygroundChunk } from '@/api'
+import { ApiError, playgroundPrefix, runPlayground, type PlaygroundChunk } from '@/api'
 import { copyText } from '@/clipboard'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
+  Account,
   Model,
   PlaygroundInput,
   PlaygroundMode,
@@ -16,6 +17,7 @@ import UiSelect from './UiSelect.vue'
 
 const props = defineProps<{
   models: Model[]
+  accounts: Account[]
   apiKey: string
 }>()
 
@@ -54,6 +56,7 @@ const form = reactive<PlaygroundInput>({
   imageQuality: 'auto',
   voice: '',
   apiKey: props.apiKey,
+  ultra: false,
 })
 const result = reactive<PlaygroundResult>({
   text: '',
@@ -72,8 +75,20 @@ const submittedPrompt = ref('')
 const submittedModel = ref('')
 let controller: AbortController | undefined
 
+// ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 账户时模型列表只显示这些模型，还没有读到时显示全部模型
+const ultraModelIDs = computed(
+  () =>
+    new Set(
+      props.accounts
+        .filter((account) => account.pool === 'ultra')
+        .flatMap((account) => account.models),
+    ),
+)
 const availableModels = computed(() =>
   props.models.filter((model) => {
+    if (form.ultra && ultraModelIDs.value.size > 0 && !ultraModelIDs.value.has(model.id)) {
+      return false
+    }
     const capabilities = model.capabilities ?? {}
     if (form.mode === 'image') return capabilities.image_route === true
     if (form.mode === 'speech') return capabilities.speech_route === true
@@ -109,7 +124,7 @@ function modeLabel(mode: (typeof modes)[number]): string {
 }
 
 watch(
-  [() => props.models, () => form.mode],
+  [() => props.models, () => form.mode, () => form.ultra, ultraModelIDs],
   () => {
     if (!availableModels.value.some((model) => model.id === form.model)) {
       form.model = availableModels.value[0]?.id ?? ''
@@ -131,7 +146,8 @@ watch(
   },
 )
 
-const endpoint = computed(() => {
+// endpointPath 为当前输出类型与协议的公开 API 路径，endpoint 加上号池前缀
+const endpointPath = computed(() => {
   if (form.mode === 'image') return '/v1/images/generations'
   if (form.mode === 'speech') return '/v1/audio/speech'
   if (form.mode === 'music') return `/v1beta/models/${form.model || '{model}'}:generateContent`
@@ -142,6 +158,7 @@ const endpoint = computed(() => {
   const method = form.stream ? 'streamGenerateContent' : 'generateContent'
   return `/v1beta/models/${form.model || '{model}'}:${method}`
 })
+const endpoint = computed(() => `${playgroundPrefix(form)}${endpointPath.value}`)
 
 const visibleOutput = computed(() => {
   if (outputMode.value === 'raw') return result.raw
@@ -535,6 +552,20 @@ onUnmounted(() => {
           class="h-24 w-full resize-none rounded border border-[#30363d] bg-[#0d1117] px-2 py-1 text-xs text-white focus:border-blue-500 focus:outline-none"
           :placeholder="t('playground.systemPlaceholder')"
         ></textarea>
+      </div>
+
+      <div>
+        <label class="flex items-center justify-between gap-2">
+          <span class="text-xs font-bold text-gray-500 uppercase">{{ t('playground.ultra') }}</span>
+          <input v-model="form.ultra" class="h-4 w-4 accent-blue-600" type="checkbox" />
+        </label>
+        <p class="mt-1 text-[11px] leading-4 text-gray-500">
+          {{
+            form.ultra && ultraModelIDs.size === 0
+              ? t('playground.ultraNoModels')
+              : t('playground.ultraHelp')
+          }}
+        </p>
       </div>
 
       <div>

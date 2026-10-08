@@ -259,7 +259,12 @@ function toolPayload(input: PlaygroundInput): unknown[] | undefined {
   return [{ type: input.tool }]
 }
 
-// buildPlaygroundRequest 将输出类型和协议映射为公开 API 请求
+// playgroundPrefix 返回试用请求的路径前缀：使用 Ultra 账户时经 /ultra 发送，只由 Ultra 号池的账户处理
+export function playgroundPrefix(input: Pick<PlaygroundInput, 'ultra'>): string {
+  return input.ultra ? '/ultra' : ''
+}
+
+// buildPlaygroundRequest 将输出类型和协议映射为公开 API 请求（路径不含号池前缀）
 function buildPlaygroundRequest(input: PlaygroundInput): PlaygroundRequest {
   const headers = new Headers({ 'Content-Type': 'application/json' })
   if (input.apiKey !== '') {
@@ -447,16 +452,21 @@ function waitForVideoPoll(signal: AbortSignal): Promise<void> {
   })
 }
 
+// completeVideo 轮询视频任务并下载结果；prefix 为创建任务时的号池前缀，任务只能在同一号池查询
 async function completeVideo(
   response: Response,
   headers: Headers,
   signal: AbortSignal,
+  prefix: string,
 ): Promise<{ status: number; chunk: PlaygroundChunk; raw: string }> {
   let value: unknown = await response.json()
   let state = videoState(value)
   while (state.status === 'queued') {
     await waitForVideoPoll(signal)
-    const poll = await fetch(`/v1/videos/${encodeURIComponent(state.id)}`, { headers, signal })
+    const poll = await fetch(`${prefix}/v1/videos/${encodeURIComponent(state.id)}`, {
+      headers,
+      signal,
+    })
     if (!poll.ok) {
       throw new ApiError(await responseErrorMessage(poll), poll.status)
     }
@@ -466,7 +476,7 @@ async function completeVideo(
   if (state.status === 'failed') {
     throw new ApiError('Veo generation failed', response.status)
   }
-  const content = await fetch(`/v1/videos/${encodeURIComponent(state.id)}/content`, {
+  const content = await fetch(`${prefix}/v1/videos/${encodeURIComponent(state.id)}/content`, {
     headers,
     signal,
   })
@@ -685,7 +695,8 @@ export async function runPlayground(
   onDelta: (chunk: PlaygroundChunk, raw: string) => void,
 ): Promise<{ status: number; chunk?: PlaygroundChunk; raw?: string }> {
   const request = buildPlaygroundRequest(input)
-  const response = await fetch(request.path, {
+  const prefix = playgroundPrefix(input)
+  const response = await fetch(`${prefix}${request.path}`, {
     method: 'POST',
     headers: request.headers,
     body: request.body,
@@ -697,7 +708,7 @@ export async function runPlayground(
   }
 
   if (input.mode === 'video') {
-    return completeVideo(response, request.headers, signal)
+    return completeVideo(response, request.headers, signal, prefix)
   }
 
   if (request.responseType === 'audio') {

@@ -20,6 +20,9 @@ function number(value: number, digits = 0): string {
       <span class="request-state" :class="`state-${request.state}`">{{
         request.status ?? t('logs.running')
       }}</span>
+      <span v-if="request.pool === 'ultra'" v-tooltip="t('pool.ultraHelp')" class="tag tag-ultra">{{
+        t('pool.ultra')
+      }}</span>
       <strong>{{ request.model || `${request.method} ${request.path}` }}</strong>
       <span v-if="request.duration_ms !== undefined" class="request-duration"
         >{{ number(request.duration_ms / 1000, 2) }} s</span
@@ -63,6 +66,10 @@ function number(value: number, digits = 0): string {
         <dd>{{ request.id }}</dd>
         <dt>{{ t('logs.endpoint') }}</dt>
         <dd>{{ request.method }} {{ request.path }}</dd>
+        <template v-if="request.pool === 'ultra'">
+          <dt>{{ t('logs.pool') }}</dt>
+          <dd>{{ t('pool.ultra') }}</dd>
+        </template>
         <template v-if="request.channel">
           <dt>{{ t('logs.channel') }}</dt>
           <dd>{{ t(channelLabelKey(request.channel)) }}</dd>

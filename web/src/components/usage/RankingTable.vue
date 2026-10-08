@@ -18,7 +18,7 @@ const emit = defineEmits<{
 const { t } = useI18n()
 const { compact, integer, duration, percent, ago, dimensionLabel } = useUsageFormat()
 const id = useId()
-const tabs: Tab[] = ['account', 'model', 'channel', 'protocol', 'state', 'status']
+const tabs: Tab[] = ['account', 'model', 'channel', 'protocol', 'state', 'pool', 'status']
 const tab = ref<Tab>(
   readPreference('aistudio2api_usage_ranking', 'account', (value) => tabs.includes(value as Tab)),
 )

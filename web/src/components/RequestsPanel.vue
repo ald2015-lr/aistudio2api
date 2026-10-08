@@ -287,7 +287,15 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                 <tbody>
                   <tr v-for="request in requestItems" :key="request.id">
                     <td>
-                      <div class="cell-truncate text-gray-200">{{ request.model || '—' }}</div>
+                      <div class="flex min-w-0 items-center gap-1.5">
+                        <span
+                          v-if="request.pool === 'ultra'"
+                          v-tooltip="t('pool.ultraHelp')"
+                          class="tag tag-ultra shrink-0"
+                          >{{ t('pool.ultra') }}</span
+                        >
+                        <span class="cell-truncate text-gray-200">{{ request.model || '—' }}</span>
+                      </div>
                       <div class="cell-truncate text-xs text-gray-500">
                         {{ accountLabel(request.account_id, request.account_label)
                         }}<template v-if="request.channel">
