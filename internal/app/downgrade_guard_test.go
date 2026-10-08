@@ -13,6 +13,10 @@ func guardTestService(t *testing.T) *trackedService {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	// 降级记录是进程级的：每个测试用独立的记录，否则 -count>1 时上一轮记下的对话会让这一轮直接被拒绝
+	saved := conversationMemory
+	conversationMemory = &downgradeMemory{entries: make(map[string][]downgradeMemoryEntry)}
+	t.Cleanup(func() { conversationMemory = saved })
 	service := &trackedService{lifecycle: ctx, requests: newRequestRegistry(ctx)}
 	guard := config.DefaultDowngradeGuard()
 	guard.Models = []string{"gemini-guard-test"}
