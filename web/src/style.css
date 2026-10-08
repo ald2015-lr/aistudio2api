@@ -1,6 +1,15 @@
 @import 'tailwindcss';
 
 @theme {
+  /* 界面颜色令牌（用量页等新组件使用，生成 bg-canvas、border-line 等工具类）。
+     控制台只有深色主题（:root 为 color-scheme: dark），令牌取值即深色变体，与各处现有的十六进制颜色一致 */
+  --color-canvas: #0d1117;
+  --color-panel: #161b22;
+  --color-raised: #21262d;
+  --color-overlay: #1c2128;
+  --color-line: #30363d;
+  --color-line-strong: #484f58;
+  --color-fg: #c9d1d9;
   --color-gray-200: #e5e7eb;
   --color-gray-300: #d1d5db;
   --color-gray-400: #9ca3af;
@@ -299,6 +308,10 @@ button[aria-busy='true']::before {
 
 .ui-tooltip.visible {
   opacity: 1;
+}
+
+.ui-popover {
+  animation: overlay-in 120ms ease-out;
 }
 
 @media (prefers-reduced-motion: reduce) {

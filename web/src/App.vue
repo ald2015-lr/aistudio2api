@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import {
+  computed,
+  defineAsyncComponent,
+  h,
+  onMounted,
+  onUnmounted,
+  reactive,
+  ref,
+  watch,
+} from 'vue'
 import { api, openAdminEvents, type EventConnection, type EventsState } from '@/api'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
@@ -24,12 +33,33 @@ import UiIcon, { type IconName } from '@/components/UiIcon.vue'
 import { readStorage, writeStorage } from '@/storage'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
+// 用量页按需加载：图表库只在打开用量页时下载，不进入主包
+const UsagePanel = defineAsyncComponent({
+  loader: () => import('@/components/UsagePanel.vue'),
+  loadingComponent: {
+    render: () =>
+      h('p', { class: 'p-8 text-sm text-gray-500', role: 'status' }, t('usage.panelLoading')),
+  },
+  errorComponent: {
+    render: () =>
+      h('p', { class: 'p-8 text-sm text-red-300', role: 'alert' }, t('usage.panelFailed')),
+  },
+  delay: 150,
+})
 // 前端最多保留的日志条数；日志面板按可视区域渲染，这里只限制内存占用
 const LOG_LIMIT = 1500
 // 前端最多保留的请求条数；超出时先丢弃最早的已结束请求，进行中的请求始终保留
 const REQUEST_LIMIT = 500
 const TAB_STORAGE_KEY = 'aistudio2api_active_tab'
-const validTabs: TabID[] = ['logs', 'accounts', 'models', 'requests', 'settings', 'playground']
+const validTabs: TabID[] = [
+  'logs',
+  'accounts',
+  'models',
+  'requests',
+  'usage',
+  'settings',
+  'playground',
+]
 const savedTab = readStorage(TAB_STORAGE_KEY) as TabID | null
 const currentTab = ref<TabID>(savedTab && validTabs.includes(savedTab) ? savedTab : 'logs')
 watch(currentTab, (tab) => {
@@ -62,6 +92,7 @@ const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'accounts', label: 'nav.accounts', icon: 'key' },
   { id: 'models', label: 'nav.models', icon: 'dashboard' },
   { id: 'requests', label: 'nav.requests', icon: 'info' },
+  { id: 'usage', label: 'nav.usage', icon: 'usage' },
   { id: 'settings', label: 'nav.settings', icon: 'settings' },
   { id: 'playground', label: 'nav.playground', icon: 'chat' },
 ]
@@ -555,6 +586,7 @@ onUnmounted(() => {
         @refresh="loadRequestData"
         @notice="showNotice"
       />
+      <UsagePanel v-else-if="currentTab === 'usage'" />
       <SettingsPanel
         v-else-if="currentTab === 'settings'"
         :config="config"

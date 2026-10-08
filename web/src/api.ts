@@ -12,9 +12,12 @@ import type {
   PlaygroundInput,
   PlaygroundMedia,
   Cooldown,
+  RequestBody,
   RequestSummary,
   ServiceConfig,
   ServiceStatus,
+  UsageRecordPage,
+  UsageReport,
 } from '@/types'
 
 interface AccountsResponse {
@@ -167,6 +170,16 @@ export const api = {
     requestCommand(`/api/requests/${encodeURIComponent(id)}/cancel`, {
       method: 'POST',
     }),
+  usage: (query: URLSearchParams, signal?: AbortSignal) =>
+    requestJSON<UsageReport>(`/api/usage?${query.toString()}`, { signal: signal ?? null }),
+  usageRecords: (query: URLSearchParams, signal?: AbortSignal) =>
+    requestJSON<UsageRecordPage>(`/api/usage/records?${query.toString()}`, {
+      signal: signal ?? null,
+    }),
+  // usageExportURL 返回 CSV 下载地址：同源链接自动携带管理令牌 Cookie
+  usageExportURL: (query: URLSearchParams) => `/api/usage/records.csv?${query.toString()}`,
+  requestBody: (id: string) =>
+    requestJSON<RequestBody>(`/api/requests/${encodeURIComponent(id)}/body`),
 }
 
 // openAdminEvents 建立唯一的管理状态 SSE 连接

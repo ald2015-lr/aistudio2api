@@ -1,6 +1,13 @@
 export type Locale = 'zh-CN' | 'zh-TW' | 'en' | 'ja' | 'ko' | 'fr' | 'de'
 
-export type TabID = 'logs' | 'accounts' | 'models' | 'requests' | 'settings' | 'playground'
+export type TabID =
+  | 'logs'
+  | 'accounts'
+  | 'models'
+  | 'requests'
+  | 'usage'
+  | 'settings'
+  | 'playground'
 
 export type AccountState =
   'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled'
@@ -309,4 +316,124 @@ export interface PlaygroundResult {
   raw: string
   durationMs: number
   status: number
+}
+
+// UsageDimension 为用量可筛选与分组的维度
+export type UsageDimension = 'model' | 'account' | 'channel' | 'protocol' | 'state'
+
+export type UsageFilters = Partial<Record<UsageDimension, string[]>>
+
+export interface UsageLatency {
+  avg_ms: number
+  p50_ms: number
+  p95_ms: number
+  p99_ms: number
+}
+
+// UsageStats 为一组请求的结果、token 与耗时；成功包含工具调用、达到输出上限与上游终止
+export interface UsageStats {
+  requests: number
+  succeeded: number
+  failed: number
+  canceled: number
+  rate_limited: number
+  input_tokens: number
+  reasoning_tokens: number
+  reply_tokens: number
+  total_tokens: number
+  duration: UsageLatency
+  first_event: UsageLatency
+  queue_avg_ms: number
+  // downgrade_checked 为经过降级判定的请求数，downgrade_rejected 为其中因降级被拒绝的请求数
+  downgrade_checked: number
+  downgrade_rejected: number
+  // replies 为参与重复回复统计的请求数，duplicate_replies 为其中与近期某次回复完全相同的请求数
+  replies: number
+  duplicate_replies: number
+  last_at?: string
+}
+
+export interface UsageBucket extends UsageStats {
+  at: string
+}
+
+export interface UsageGroup extends UsageStats {
+  key: string
+}
+
+export interface UsagePair extends UsageStats {
+  account: string
+  model: string
+}
+
+export interface UsageSeries {
+  key: string
+  other?: boolean
+  requests: number[]
+  tokens: number[]
+}
+
+export interface UsageReport {
+  from: string
+  to: string
+  bucket_seconds: number
+  generated_at: string
+  latest_at?: string
+  totals: UsageStats
+  previous: UsageStats
+  recent: { minutes: number; requests: number; tokens: number }
+  buckets: UsageBucket[]
+  stack_by: UsageDimension
+  series: UsageSeries[]
+  groups: Record<UsageDimension | 'status', UsageGroup[]>
+  pairs: UsagePair[]
+  options: Record<UsageDimension, string[]>
+}
+
+export interface RequestAttempt {
+  account: string
+  channel: string
+  error: string
+  duration_ms: number
+}
+
+export interface UsageRecord {
+  id: string
+  time: string
+  protocol: string
+  path: string
+  model: string
+  account: string
+  channel: string
+  status: number
+  state: string
+  duration_ms: number
+  first_event_ms: number
+  queue_ms: number
+  input_tokens: number
+  reasoning_tokens: number
+  reply_tokens: number
+  total_tokens: number
+  tool_calls: number
+  error: string
+  attempts: RequestAttempt[]
+  served_model?: string
+  downgrade?: string
+  reply_hash?: string
+  duplicate?: boolean
+  has_body: boolean
+}
+
+export interface UsageRecordPage {
+  items: UsageRecord[]
+  next_cursor?: string
+}
+
+export interface RequestBody {
+  id: string
+  time: string
+  request: string
+  request_size: number
+  response: string
+  response_size: number
 }

@@ -47,6 +47,7 @@
 - **Live and Robotics**: WebSocket text, audio, JPEG images, media end, tool calls, resumption, and interruption
 - **Anti-Fingerprinting**: Camoufox holds the official WAA lifecycle with a stable browser fingerprint and network exit per account
 - **GUI Launcher**: Manage accounts, service controls, live logs, models, requests, and configuration in the web UI
+- **Usage Dashboard**: A local SQLite ledger tracks request counts, success rate, tokens, latency percentiles, downgrade rejection rate and duplicate reply rate, with filters, breakdowns, request records and CSV export
 - **Modular Architecture**: Go handles protocols, scheduling, APIs, and management; Camoufox hosts WAA and isolated login
 
 ## System Requirements
@@ -453,7 +454,10 @@ cp .env.example .env
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
 | `AUTO_START` | `true` | Start the generation service automatically when the management process starts, retrying transient failures from 5 seconds up to 1 minute apart; `false` keeps it `STOPPED` until started from the management page |
+| `REQUEST_BODY_LOG` | `false` | Also store public API POST request and response bodies in the usage ledger (each truncated to 64 KiB, newest 1000 kept), viewable in the request details of the Usage page; bodies are stored in plain text on this machine. Takes effect after restarting the program |
 | `ADMIN_PASSWORD` | empty | When set, the management page can also be opened with HTTP Basic authentication (any username, this value as password); 10 failures within 10 minutes block the IP for 15 minutes. Without it, only the admin token works. The management page and `/api/` always require the admin token stored in `.admin-token`: open the `http://127.0.0.1:2048/?admin_token=<token>` address printed in the startup log once and the browser remembers the login; scripts send it in the `X-Admin-Token` header. Use HTTPS, since plain HTTP sends the token and password in clear text |
+
+The Usage page of the management UI reads the local ledger `runtime/requests.db`: every POST request that passes the API key check adds one row when it finishes (token counting requests are not recorded), giving request counts, success rate, tokens, latency percentiles, downgrade rejection rate, duplicate reply rate, breakdowns, request records and CSV export; records and rollups are kept for 90 days. If the ledger cannot be opened the service logs a WARN and keeps running.
 
 The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` limits concurrent Camoufox cold starts (prewarming can fill it, cold starts for waiting requests keep one extra slot), and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 

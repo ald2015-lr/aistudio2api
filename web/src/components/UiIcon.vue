@@ -16,6 +16,13 @@ export type IconName =
   | 'copy'
   | 'eye'
   | 'eye-off'
+  | 'usage'
+  | 'success'
+  | 'quality'
+  | 'tokens'
+  | 'throughput'
+  | 'latency'
+  | 'firstEvent'
 
 const props = withDefaults(
   defineProps<{
@@ -38,6 +45,14 @@ const aliases: Partial<Record<IconName, keyof typeof legacyIcons>> = {
   copy: 'dashboard',
   eye: 'info',
   'eye-off': 'close',
+  // 用量页沿用已有图标，不引入新的图标库
+  usage: 'dashboard',
+  success: 'check',
+  quality: 'info',
+  tokens: 'dashboard',
+  throughput: 'play',
+  latency: 'refresh',
+  firstEvent: 'play',
 }
 
 const source = computed(() => {

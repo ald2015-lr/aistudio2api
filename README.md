@@ -47,6 +47,7 @@
 - **Live 与 Robotics**: 通过 WebSocket 支持文本、音频、JPEG、媒体结束、工具调用、恢复和中断
 - **反指纹检测**: 使用 Camoufox 持有官方 WAA 生命周期，并为每个账户固定浏览器指纹与出口
 - **图形界面启动器**: 通过网页管理账户、服务启停、实时日志、模型、请求和配置
+- **用量看板**: 本地 SQLite 账本统计请求数、成功率、Token、耗时分位、降级拦截率与重复回复率，支持筛选、排行、请求记录与 CSV 导出
 - **模块化架构**: Go 负责协议、调度、API 与管理端，Camoufox 负责 WAA 运行时和隔离登录
 
 ## 系统要求
@@ -524,7 +525,10 @@ cp .env.example .env
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
+| `REQUEST_BODY_LOG` | `false` | 用量账本同时保存公开 API POST 请求与响应的正文（各截断到 64 KiB，只保留最近 1000 条），在用量页的请求详情中查看；正文以明文保存在本机，修改后重启程序生效 |
 | `ADMIN_PASSWORD` | 空 | 设置后除管理令牌外也可以用密码打开管理页面，浏览器弹出登录框（用户名随意，密码为此值）；同一 IP 10 分钟内错 10 次封禁 15 分钟；留空时只能用管理令牌（`.admin-token`）登录。纯 HTTP 下令牌与密码均为明文传输，建议配合 HTTPS |
+
+管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。
 
 服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
 
