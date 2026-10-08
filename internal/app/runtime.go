@@ -3603,6 +3603,9 @@ func (service *trackedService) generateWithRetry(
 					"上游首事件等待 | 已等待=%s | 模型=%s | %s",
 					streamStallThreshold, modelID, activity.logFields(time.Now()),
 				))
+			}, func() {
+				// 收到首个上游事件（含错误事件）即停止计时：错误流关闭得慢时不能把上游返回的错误改成首事件超时
+				_ = firstEvent.stop()
 			})
 			if firstEventDelayed && err == nil {
 				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", fmt.Sprintf(
@@ -3947,8 +3950,9 @@ func drainAttemptEvents(source <-chan aistudio.Event, limit time.Duration) bool 
 var errStreamClosedBeforeFirstEvent = errors.New("AI Studio stream closed before first event")
 var errStreamClosedBeforeFinish = errors.New("AI Studio stream closed before finish")
 
-// firstGenerateEvent 等待首事件并在请求期限内完成错误流清理
-func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWait func()) (aistudio.Event, error) {
+// firstGenerateEvent 等待首事件并在请求期限内完成错误流清理；onEvent 在收到第一个上游事件（含错误事件）时调用，
+// 用于停止首事件超时，之后等待错误流结束的时间不再计入
+func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWait func(), onEvent func()) (aistudio.Event, error) {
 	timer := time.NewTimer(streamStallThreshold)
 	defer timer.Stop()
 	wait := timer.C
@@ -3957,6 +3961,9 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 		case event, ok := <-source:
 			if !ok {
 				return aistudio.Event{}, errStreamClosedBeforeFirstEvent
+			}
+			if onEvent != nil {
+				onEvent()
 			}
 			if event.Kind != aistudio.EventError {
 				return event, nil

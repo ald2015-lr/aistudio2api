@@ -205,6 +205,47 @@ func TestFirstEventTimeoutDisabledWaits(t *testing.T) {
 	}
 }
 
+// slowCloseErrorService 是测试用的上游：立即返回一个错误事件，之后过 closeDelay 才关闭事件流（模拟关闭响应体较慢）
+type slowCloseErrorService struct {
+	*stallingService
+	err        error
+	closeDelay time.Duration
+}
+
+func (service *slowCloseErrorService) Generate(_ context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	service.mu.Lock()
+	service.calls = append(service.calls, request.AccountID)
+	service.mu.Unlock()
+	events := make(chan aistudio.Event, 1)
+	events <- aistudio.Event{Kind: aistudio.EventError, Err: service.err}
+	go func() {
+		time.Sleep(service.closeDelay)
+		close(events)
+	}()
+	return events, nil
+}
+
+// TestFirstEventTimeoutKeepsUpstreamErrorEvent 首个上游事件就是错误时停止计时：事件流关闭得慢、期间到了首事件超时，
+// 仍按上游错误结束（不可重试的 400 不换号），不能改成首事件超时
+func TestFirstEventTimeoutKeepsUpstreamErrorEvent(t *testing.T) {
+	upstreamErr := &aistudio.RPCError{Method: "GenerateContent", StatusCode: 400, Code: 3, Message: "invalid argument"}
+	upstream := &slowCloseErrorService{stallingService: newStallingService(), err: upstreamErr, closeDelay: 600 * time.Millisecond}
+	service, pool := firstEventTestService(t, upstream, 200*time.Millisecond, "alice@example.com", "bob@example.com")
+	_, err := runFirstEventRequest(t, service)
+	var rpcError *aistudio.RPCError
+	var timeout *firstEventTimeoutError
+	if !errors.As(err, &rpcError) || errors.As(err, &timeout) {
+		t.Fatalf("err = %v，期望保留上游返回的错误，不是首事件超时", err)
+	}
+	upstream.mu.Lock()
+	calls := len(upstream.calls)
+	upstream.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("尝试次数 = %d，不可重试的上游错误不应换号", calls)
+	}
+	assertLeasesReleased(t, pool)
+}
+
 // TestFirstEventDeadlineStopFire 停止与触发互斥：停止后不会再取消尝试，触发后停止返回超时错误；0 表示关闭
 func TestFirstEventDeadlineStopFire(t *testing.T) {
 	var cancelled []error
