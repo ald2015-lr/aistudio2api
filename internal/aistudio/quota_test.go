@@ -56,9 +56,16 @@ func TestQuotaCooldownClassification(t *testing.T) {
 			kind: "分钟限额", until: now.Add(time.Minute),
 		},
 		{
-			name: "只有通用文案时短期冷却",
+			name: "只有通用文案时按每日限额冷却到太平洋时间次日零点",
 			err:  quotaError("You exceeded your current quota, please check your plan and billing details.", nil, 0),
-			kind: "限流", until: now.Add(unknownRateLimitCooldown),
+			kind: DailyQuotaKind, until: nextQuotaDay(now),
+		},
+		{
+			name: "通用文案但元数据是分钟限额时按分钟",
+			err: quotaError("You exceeded your current quota, please check your plan and billing details.", map[string]string{
+				"quota_limit": "GenerateRequestsPerMinutePerProjectPerModel",
+			}, 0),
+			kind: "分钟限额", until: now.Add(time.Minute),
 		},
 		{
 			name: "RetryInfo 决定分钟限额恢复时间",

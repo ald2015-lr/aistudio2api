@@ -34,7 +34,8 @@ type QuotaCooldown struct {
 //
 // 周期按 quota_unit、quota_limit、quota_metric、错误文案的顺序取第一个有周期证据的字段：
 // 同一个 quota_metric（如 generate_content_free_tier_requests）同时有分钟和每日两种限额，
-// 不能按指标名猜周期；“You exceeded your current quota”是所有额度 429 的通用文案，也不代表每日限额。
+// 不能按指标名猜周期。没有任何周期证据、只有通用文案 “You exceeded your current quota” 时按每日限额处理：
+// AI Studio 对额度耗尽常只返回这句文案，按短期限流冷却会让额度已经用完的账号每隔几十秒被重新选中、整池反复 429。
 // 只有元数据明确为全局（_global、PerProjectPerUser）且没有按模型标记时才冻结整个账号，
 // 否则只冷却失败的模型或通道。
 //
@@ -70,6 +71,9 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 			until, kind = minuteQuotaReset(rpcError.Metadata["window_start_time"], now), "分钟限额"
 			break
 		}
+	}
+	if kind == "限流" && strings.Contains(strings.ToLower(rpcError.Message), "you exceeded your current quota") {
+		until, kind = nextQuotaDay(now), DailyQuotaKind
 	}
 	if delay := rpcError.RetryDelay; delay > 0 {
 		retryAt := now.Add(delay)
