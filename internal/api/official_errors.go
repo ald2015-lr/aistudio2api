@@ -28,6 +28,8 @@ const (
 	officialTooLargeMessage    = "Request payload size exceeds the limit."
 	// officialToolContractMessage 用于上游回复不满足客户端要求的工具约束（没有官方原文，措辞与官方风格一致）
 	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
+	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
+	officialUltraUnavailableMessage = "The service is currently unavailable: no account in the Ultra pool is ready."
 )
 
 // 错误类别：决定 OpenAI 的 code/param 与 Anthropic 的错误类型、措辞
@@ -119,6 +121,10 @@ func publicErrorFor(err error, model string) publicError {
 	// 号池一侧的暂时性原因（账户需要重新登录、已停用、被占用，号池为空或目录尚未加载）：按服务暂时不可用返回
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {
+		if notReady.Pool == aistudio.PoolScopeUltra {
+			// /ultra 请求：说明是 Ultra 号池暂时没有可用账户，调用方可以改走普通路径或稍后重试
+			return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialUltraUnavailableMessage}
+		}
 		return unavailablePublicError()
 	}
 	if errors.Is(err, aistudio.ErrModelNotFound) {

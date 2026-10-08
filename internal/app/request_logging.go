@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -25,7 +26,7 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		InputMedia: entry.InputMedia, InputMediaBytes: entry.InputMediaBytes, InputFiles: entry.InputFiles,
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
-		Channel: entry.Channel,
+		Channel: entry.Channel, Pool: entry.Pool,
 	}
 	if entry.Generation {
 		data.Parameters = map[string]string{
@@ -45,6 +46,14 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		}
 	}
 	return data
+}
+
+// requestPoolLabel 返回活动请求与请求日志使用的号池标记：经 /ultra 进入的请求为 ultra，其余为空
+func requestPoolLabel(ctx context.Context) string {
+	if aistudio.PoolScopeFromContext(ctx) == aistudio.PoolScopeUltra {
+		return aistudio.PoolScopeUltra.String()
+	}
+	return ""
 }
 
 // RecordAccessStart 保存可与后续事件关联的请求开始记录

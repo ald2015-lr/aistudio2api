@@ -172,7 +172,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	apiHandler := api.NewHandler(manager, api.Config{
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
 		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
-		Ledger: manager.requestLedger(),
+		Ledger: manager.requestLedger(), UltraExclusive: manager.activeUltraExclusive,
 	})
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")

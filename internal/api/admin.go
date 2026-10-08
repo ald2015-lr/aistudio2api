@@ -44,6 +44,8 @@ type AdminStatus struct {
 	ActiveRequests int                `json:"active_requests"`
 	Accounts       AdminAccountCounts `json:"accounts"`
 	Workers        AdminWorkerCounts  `json:"workers"`
+	// UltraAccounts 为 Ultra 号池（权益为 Ultra 的账户）的状态计数，Accounts 包含全部账户
+	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
 }
 
 // AdminPrewarmState 表示预热循环的实时状态
@@ -85,6 +87,7 @@ type RequestLog struct {
 	Model        string           `json:"model,omitempty"`
 	Method       string           `json:"method,omitempty"`
 	Path         string           `json:"path,omitempty"`
+	Pool         string           `json:"pool,omitempty"`
 	Status       int              `json:"status,omitempty"`
 	DurationMS   float64          `json:"duration_ms,omitempty"`
 	Usage        *RequestLogUsage `json:"usage,omitempty"`
@@ -158,6 +161,8 @@ type AccessLog struct {
 	Attempts []RequestAttempt
 	// Authorized 表示请求通过了公开 API key 校验
 	Authorized bool
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	Pool string
 }
 
 // AdminAccountCounts 表示账户状态计数
@@ -181,6 +186,10 @@ type AdminAccount struct {
 	Models      []string `json:"models"`
 	BenefitTier string   `json:"benefit_tier"`
 	Message     string   `json:"message"`
+	// BenefitTierKnown 表示权益已经从官网读取过；为 false 时 benefit_tier 按 Free 显示，账户属于普通号池
+	BenefitTierKnown bool `json:"benefit_tier_known"`
+	// Pool 为账户当前所属的号池：ultra（权益为 Ultra）或 normal
+	Pool string `json:"pool"`
 }
 
 // AccountInput 表示已有账户配置
@@ -284,6 +293,8 @@ type AdminRequest struct {
 	Channel      string    `json:"channel,omitempty"`
 	State        string    `json:"state"`
 	StartedAt    time.Time `json:"started_at"`
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	Pool string `json:"pool,omitempty"`
 }
 
 // AdminEvent 表示管理端增量事件

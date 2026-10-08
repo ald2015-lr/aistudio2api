@@ -119,12 +119,9 @@ func newRequestRegistry(ctx context.Context) *requestRegistry {
 }
 
 func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
-	// 只统计数量，不构建上千个账户的完整状态，避免长时间占用账户池锁
-	stateCounts := admin.pool.StateCounts()
-	counts := api.AdminAccountCounts{
-		Total: stateCounts.Total, Ready: stateCounts.Ready, Busy: stateCounts.Busy,
-		Cooldown: stateCounts.Cooldown, AuthRequired: stateCounts.AuthRequired,
-	}
+	// 只统计数量，不构建上千个账户的完整状态，避免长时间占用账户池锁；同一次加锁同时统计 Ultra 号池
+	stateCounts, ultraCounts := admin.pool.PoolStateCounts()
+	counts := adminAccountCounts(stateCounts)
 	state := admin.service.State()
 	running := state == "RUNNING"
 	warm := admin.workers.WarmAccountIDs()
@@ -137,6 +134,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Version:        buildVersion(),
 		ActiveRequests: admin.requests.count(),
 		Accounts:       counts,
+		UltraAccounts:  adminAccountCounts(ultraCounts),
 		Workers: api.AdminWorkerCounts{
 			Warm: len(warm), Starting: len(starting),
 			Target: admin.workers.PrewarmTarget(), Max: admin.workers.maxActiveValue(),
@@ -145,6 +143,14 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			WarmIDs:  warm, StartingIDs: starting,
 		},
 	}, nil
+}
+
+// adminAccountCounts 投影账户状态计数
+func adminAccountCounts(counts aistudio.AccountStateCounts) api.AdminAccountCounts {
+	return api.AdminAccountCounts{
+		Total: counts.Total, Ready: counts.Ready, Busy: counts.Busy,
+		Cooldown: counts.Cooldown, AuthRequired: counts.AuthRequired,
+	}
 }
 
 func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error) {
@@ -696,6 +702,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
 		Proxy: status.Proxy, Locale: status.Locale, Timezone: status.Timezone,
 		Models: models, BenefitTier: status.BenefitTier, Message: message,
+		BenefitTierKnown: status.BenefitTierKnown, Pool: status.Pool,
 	}
 }
 
@@ -1026,11 +1033,12 @@ func adminRequestStateUpdates(
 	return updates, nil
 }
 
-func (registry *requestRegistry) start(request aistudio.GenerateRequest, cancel context.CancelFunc) {
+// start 登记活动请求；经 /ultra 进入的请求标记为 Ultra 号池
+func (registry *requestRegistry) start(ctx context.Context, request aistudio.GenerateRequest, cancel context.CancelFunc) {
 	tracked := trackedRequest{
 		request: api.AdminRequest{
 			ID: request.ID, Model: request.Model, AccountID: request.AccountID,
-			State: "queued", StartedAt: time.Now().UTC(),
+			State: "queued", StartedAt: time.Now().UTC(), Pool: requestPoolLabel(ctx),
 		},
 		cancel: cancel,
 	}

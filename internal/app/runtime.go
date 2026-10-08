@@ -3461,7 +3461,7 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	}
 	if invalid != nil {
 		api.SetAccessLogError(ctx, invalid)
-		service.requests.start(request, func() {})
+		service.requests.start(ctx, request, func() {})
 		service.requests.finish(request.ID, "failed", invalid)
 		return nil, nil, invalid
 	}
@@ -3469,7 +3469,7 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	gate, remembered := service.prepareDowngradeGate(ctx, request, guardContents)
 	if remembered != nil {
 		api.SetAccessLogError(ctx, remembered)
-		service.requests.start(request, func() {})
+		service.requests.start(ctx, request, func() {})
 		service.recordDowngradeDecision(ctx, request.ID, "", request.Model, remembered.Decision, true)
 		service.requests.finish(request.ID, "failed", remembered)
 		return nil, nil, remembered
@@ -3477,11 +3477,11 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
-		service.requests.start(request, func() {})
+		service.requests.start(ctx, request, func() {})
 		service.requests.finish(request.ID, "failed", err)
 		return nil, nil, err
 	}
-	service.requests.start(request, cancel)
+	service.requests.start(ctx, request, cancel)
 	resourceID, err := service.pool.ResourceIDForContents(requestCtx, request.Contents)
 	if err != nil {
 		api.SetAccessLogError(requestCtx, err)

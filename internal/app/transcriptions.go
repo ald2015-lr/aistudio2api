@@ -22,11 +22,11 @@ func (service *trackedService) Transcribe(
 	requestCtx, cancel, err := service.dataRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
-		service.requests.start(aistudio.GenerateRequest{ID: request.ID, Model: request.Model}, func() {})
+		service.requests.start(ctx, aistudio.GenerateRequest{ID: request.ID, Model: request.Model}, func() {})
 		service.requests.finish(request.ID, "failed", err)
 		return aistudio.TranscriptionResult{}, err
 	}
-	service.requests.start(aistudio.GenerateRequest{
+	service.requests.start(ctx, aistudio.GenerateRequest{
 		ID: request.ID, Model: request.Model, Config: request.Config,
 	}, cancel)
 	request.CandidateAccountIDs, err = service.transcriptionCandidates(requestCtx, request.Model)

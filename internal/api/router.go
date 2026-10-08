@@ -3,7 +3,6 @@ package api
 import (
 	"fmt"
 	"net/http"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +24,8 @@ type Config struct {
 	TraceDir string
 	// Ledger 为用量账本；为 nil 时不注册用量接口、不记录正文。必须是 nil 接口值，不能是包着 nil 指针的接口
 	Ledger RequestLedger
+	// UltraExclusive 每次请求读取当前的 ULTRA_EXCLUSIVE：为真时普通路径只用普通号池，为假时不限号池；为 nil 时按独占
+	UltraExclusive func() bool
 }
 
 type server struct {
@@ -32,11 +33,9 @@ type server struct {
 	config            Config
 	responseStates    *responseStateStore
 	thoughtSignatures *thoughtSignatureStore
-	// aliasModels 缓存模型后缀解析用的模型目录，避免每个请求都在账户池锁内重算
-	aliasModels atomic.Pointer[aliasModelSnapshot]
-	// aliasRefreshMu 保证没有快照时只有一个请求计算目录；aliasRefreshing 保证后台同时只有一个刷新
-	aliasRefreshMu  sync.Mutex
-	aliasRefreshing atomic.Bool
+	// aliasCaches 按号池缓存模型后缀解析用的模型目录（下标为 aistudio.PoolScope），避免每个请求都在账户池锁内重算；
+	// /ultra 只看 Ultra 号池账户的目录，普通路径按是否独占看普通号池或全部账户
+	aliasCaches [3]aliasCatalogCache
 	// traces 保存 /trace/ 排查路由的请求记录
 	traces *traceStore
 }
@@ -92,11 +91,14 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文
 	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey,
 		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, public)))))
-	publicChain := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
+	// 号池标记在最外层：/ultra 入口已标记为 Ultra 号池时保留，其余请求按 ULTRA_EXCLUSIVE 标记为普通号池或不限号池
+	publicChain := poolScopeMiddleware(config.ultraExclusive, requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
 	root.Handle("/v1/", publicChain)
 	root.Handle("/v1beta/", publicChain)
 	// 排查路由：与主路由完全相同的处理链，额外为每个 POST 请求写完整排查记录（见 trace.go）
 	root.Handle("/trace/", s.traceEntry(publicChain))
+	// Ultra 路由：与主路由完全相同的处理链，请求只使用 Ultra 号池的账户（见 ultra.go）
+	root.Handle(ultraPrefix+"/", ultraEntry(publicChain))
 	// 先拒绝跨站请求，再校验令牌或密码：浏览器对跨站请求也会自动附带缓存的 Basic 凭据，不能让它们计入密码失败次数
 	root.Handle("/api/", sameOriginMiddleware(adminAccessMiddleware(config.AdminPassword, config.AdminToken, controlPlaneMiddleware(control))))
 	return root

@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -144,45 +146,63 @@ type aliasModelSnapshot struct {
 	expires time.Time
 }
 
+// aliasCatalogCache 为一个号池的别名目录快照：refreshMu 保证没有快照时只有一个请求计算目录，refreshing 保证后台同时只有一个刷新
+type aliasCatalogCache struct {
+	models     atomic.Pointer[aliasModelSnapshot]
+	refreshMu  sync.Mutex
+	refreshing atomic.Bool
+}
+
+// aliasCache 返回请求号池的别名目录缓存：各号池的模型目录不同，不能共用快照
+func (s *server) aliasCache(ctx context.Context) (*aliasCatalogCache, aistudio.PoolScope) {
+	scope := aistudio.PoolScopeFromContext(ctx)
+	if int(scope) >= len(s.aliasCaches) {
+		scope = aistudio.PoolScopeAll
+	}
+	return &s.aliasCaches[scope], scope
+}
+
 // aliasCatalog 返回后缀解析用的模型目录。Models 需要在账户池锁内按账户计算各模型可用通道，
 // 账户多、请求多时逐请求计算会加剧锁竞争；后缀解析只需要模型 ID 与能力，短时缓存即可
 // aliasCatalog 返回别名解析用的模型目录。每个生成请求都会调用：原先快照 3 秒就过期，且过期那一刻到达的每个请求
 // 都各自在账户池锁内重算一遍全部账户的模型，高并发时把账户池锁占满（诊断中锁占用率超过 100%，状态接口卡死）。
-// 现在已有快照时一律立即返回（过期的在后台只刷新一次），只有还没有快照时才同步计算，且同一时间只算一次
+// 现在已有快照时一律立即返回（过期的在后台只刷新一次），只有还没有快照时才同步计算，且同一时间只算一次。
+// 快照按请求号池分别缓存（见 aliasCache）
 func (s *server) aliasCatalog(ctx context.Context) ([]aistudio.Model, error) {
-	if cached := s.aliasModels.Load(); cached != nil {
+	cache, scope := s.aliasCache(ctx)
+	if cached := cache.models.Load(); cached != nil {
 		if time.Now().After(cached.expires) {
-			s.refreshAliasCatalogAsync()
+			s.refreshAliasCatalogAsync(cache, scope)
 		}
 		return cached.models, nil
 	}
-	s.aliasRefreshMu.Lock()
-	defer s.aliasRefreshMu.Unlock()
-	if cached := s.aliasModels.Load(); cached != nil {
+	cache.refreshMu.Lock()
+	defer cache.refreshMu.Unlock()
+	if cached := cache.models.Load(); cached != nil {
 		return cached.models, nil
 	}
 	models, err := s.service.Models(ctx)
 	if err != nil {
 		return nil, err
 	}
-	s.aliasModels.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
+	cache.models.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
 	return models, nil
 }
 
-// refreshAliasCatalogAsync 在后台刷新别名目录，同一时间最多一个刷新；失败时保留旧快照，下次过期再试
-func (s *server) refreshAliasCatalogAsync() {
-	if !s.aliasRefreshing.CompareAndSwap(false, true) {
+// refreshAliasCatalogAsync 在后台刷新号池的别名目录，同一号池同一时间最多一个刷新；失败时保留旧快照，下次过期再试
+func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistudio.PoolScope) {
+	if !cache.refreshing.CompareAndSwap(false, true) {
 		return
 	}
 	go func() {
-		defer s.aliasRefreshing.Store(false)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cache.refreshing.Store(false)
+		ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(context.Background(), scope), 2*time.Minute)
 		defer cancel()
 		models, err := s.service.Models(ctx)
 		if err != nil {
 			return
 		}
-		s.aliasModels.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
+		cache.models.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
 	}()
 }
 

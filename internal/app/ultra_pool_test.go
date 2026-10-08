@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
 const (
@@ -225,5 +226,26 @@ func TestCandidatesAndModelsPerPool(t *testing.T) {
 	}
 	if models, _ := service.Models(normal); len(models) != 1 {
 		t.Fatalf("普通号池模型目录 = %v，期望 1 个模型", models)
+	}
+}
+
+// TestUltraRequestLabels /ultra 请求在活动请求与请求日志中标记 pool=ultra，其余请求不标记
+func TestUltraRequestLabels(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registry := newRequestRegistry(ctx)
+	registry.start(aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra), aistudio.GenerateRequest{ID: "req-ultra"}, func() {})
+	registry.start(aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeNormal), aistudio.GenerateRequest{ID: "req-normal"}, func() {})
+	for _, request := range registry.list() {
+		want := ""
+		if request.ID == "req-ultra" {
+			want = "ultra"
+		}
+		if request.Pool != want {
+			t.Fatalf("活动请求 %s 的号池 = %q，期望 %q", request.ID, request.Pool, want)
+		}
+	}
+	if data := requestLogData(api.AccessLog{RequestID: "req-ultra", Path: "/ultra/v1/chat/completions", Pool: "ultra"}); data.Pool != "ultra" {
+		t.Fatalf("请求日志的号池 = %q，期望 ultra", data.Pool)
 	}
 }

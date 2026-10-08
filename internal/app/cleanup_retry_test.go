@@ -119,7 +119,7 @@ func TestRestartServiceRespectsStopDuringDrain(t *testing.T) {
 		},
 	}
 	manager.intent.running.Store(true)
-	manager.requests.start(aistudio.GenerateRequest{ID: "r1"}, func() {})
+	manager.requests.start(context.Background(), aistudio.GenerateRequest{ID: "r1"}, func() {})
 
 	done := make(chan error, 1)
 	go func() {

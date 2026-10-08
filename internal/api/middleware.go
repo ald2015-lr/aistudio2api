@@ -25,6 +25,7 @@ type accessLogMetadata struct {
 	admin           AdminService
 	method          string
 	path            string
+	pool            string
 	started         bool
 	generation      bool
 	model           string
@@ -156,7 +157,7 @@ func (metadata *accessLogMetadata) start(force bool) {
 	metadata.started = true
 	admin := metadata.admin
 	entry := AccessLog{
-		Method: metadata.method, Path: metadata.path, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
+		Method: metadata.method, Path: metadata.path, Pool: metadata.pool, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
 		Temperature: metadata.temperature, TopP: metadata.topP, TopK: metadata.topK, Thinking: metadata.thinking,
 		MaxOutputTokens: metadata.maxOutputTokens, Seed: metadata.seed, Generation: metadata.generation, RequestID: metadata.requestID,
 		InputMessages: metadata.inputMessages, InputTextChars: metadata.inputTextChars,
@@ -537,11 +538,17 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		path := r.URL.Path
+		pool := ""
 		if aistudio.TraceFromContext(r.Context()) != nil {
 			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径
 			path = tracePrefix + path
 		}
-		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, requestID: newID("req"), startedAt: started}
+		if ultraRequest(r) {
+			// Ultra 路由的请求在管理日志里显示带 /ultra 前缀的路径，并标记号池
+			path = ultraPrefix + path
+			pool = aistudio.PoolScopeUltra.String()
+		}
+		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, pool: pool, requestID: newID("req"), startedAt: started}
 		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}
 		request := r.WithContext(context.WithValue(r.Context(), accessLogContextKey{}, metadata))
 		next.ServeHTTP(writer, request)
@@ -573,8 +580,8 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				InputMedia: snapshot.inputMedia, InputMediaBytes: snapshot.inputMediaBytes, InputFiles: snapshot.inputFiles,
 				Temperature: snapshot.temperature, TopP: snapshot.topP, TopK: snapshot.topK,
 				Thinking: snapshot.thinking, MaxOutputTokens: snapshot.maxOutputTokens, Seed: snapshot.seed,
-				RequestID: snapshot.requestID,
-				Method:    r.Method, Path: path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
+				RequestID: snapshot.requestID, Pool: pool,
+				Method: r.Method, Path: path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
