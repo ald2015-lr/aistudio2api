@@ -141,7 +141,7 @@ func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
 	}
 	description := declaration.Description
 	if degraded || declaration.Strict {
-		description = appendSchemaHint(description, raw)
+		description = appendSchemaHint(description, "Arguments must follow this JSON Schema: ", raw)
 	}
 	var wireDescription any
 	if description != "" {
@@ -153,13 +153,39 @@ func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
 // maxSchemaHintBytes 为附在函数说明里的完整 Schema 的大小上限，超过时不附
 const maxSchemaHintBytes = 16 << 10
 
-// appendSchemaHint 在函数说明末尾附上完整参数 Schema
-func appendSchemaHint(description string, raw json.RawMessage) string {
+// appendSchemaHint 在说明末尾附上完整 Schema
+func appendSchemaHint(description string, prefix string, raw json.RawMessage) string {
 	var compact bytes.Buffer
 	if json.Compact(&compact, raw) != nil || compact.Len() > maxSchemaHintBytes {
 		return description
 	}
-	return strings.TrimSpace(description + "\nArguments must follow this JSON Schema: " + compact.String())
+	return strings.TrimSpace(description + "\n" + prefix + compact.String())
+}
+
+// encodeResponseSchema 编码 Playground 结构化输出 Schema。含 Playground 无法编码的写法时与函数参数一样降级：
+// 只编码层级与类型，把完整 Schema 附在根节点说明里交给模型遵守（原先整个请求返回 400）。
+// 超过大小或嵌套上限的 Schema 仍直接报错；Build 通道原样发送 responseJsonSchema，不经过这里
+func encodeResponseSchema(raw json.RawMessage) ([]any, error) {
+	wire, err := encodeJSONSchema(raw)
+	if err == nil || isSchemaLimitError(err) {
+		return wire, err
+	}
+	var schema any
+	if json.Unmarshal(raw, &schema) != nil {
+		return nil, err
+	}
+	shape := toolSchemaShape(schema, 0)
+	description, _ := shape["description"].(string)
+	shape["description"] = appendSchemaHint(description, "The response must follow this JSON Schema: ", raw)
+	encoded, marshalErr := json.Marshal(shape)
+	if marshalErr != nil {
+		return nil, marshalErr
+	}
+	wire, shapeErr := encodeJSONSchema(encoded)
+	if shapeErr != nil {
+		return nil, err
+	}
+	return wire, nil
 }
 
 // toolSchemaShape 提取工具参数的层级与类型，供 Playground 编码；depth 防止病态嵌套

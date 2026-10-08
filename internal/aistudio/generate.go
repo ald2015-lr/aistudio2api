@@ -72,7 +72,7 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	var responseSchema []any
 	var err error
 	if len(config.ResponseSchema) > 0 {
-		responseSchema, err = encodeJSONSchema(config.ResponseSchema)
+		responseSchema, err = encodeResponseSchema(config.ResponseSchema)
 		if err != nil {
 			return nil, fmt.Errorf("response schema: %w", err)
 		}

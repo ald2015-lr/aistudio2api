@@ -830,9 +830,9 @@ Schema 归一化规则：
 | 组合 Schema 缺少根 `type` | 首个带类型的分支作为根类型，该分支的 `items` 同时写入根节点 |
 | 其他节点缺少 `type` | 含 `properties` 为 object，含 `items` 或 `prefixItems` 为 array，其余为 string |
 | array 缺少 `items` | `prefixItems` 中带类型的项组成 `anyOf`；没有时为 string |
-| 其他 Schema 字段 | 结构化输出返回 `400 invalid_request` / `INVALID_ARGUMENT`；函数参数见下文的降级编码 |
+| 其他 Schema 字段 | 降级编码：只编码层级与类型，完整 Schema 附在说明里（函数参数附在函数说明，结构化输出附在根节点说明；见下文） |
 
-函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道原样发送 `parametersJsonSchema`，不经过降级。
+函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道原样发送 `parametersJsonSchema`，不经过降级。结构化输出（`response_format` / `text.format` / `responseSchema`）在 Playground 上按同样规则降级，完整 Schema 以 `The response must follow this JSON Schema: ...` 附在根节点说明；Build 通道原样发送 `responseJsonSchema`。
 
 AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7 的函数声明，由模型决定是否调用；none 省略 tools。Playground 没有工具选择字段，必须调用、指定函数与单次调用以系统指令写明要求，再由生成链路核对上游实际返回的调用；Build 通道写入原生 `toolConfig.functionCallingConfig`（必须调用为 `ANY`，指定函数写入 `allowedFunctionNames`，`validated` 或任一函数 `strict` 时为 `VALIDATED`）。客户端工具选择映射如下：
 

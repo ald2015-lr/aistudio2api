@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"fmt"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -264,5 +265,25 @@ func TestLocalCallIDs(t *testing.T) {
 	encoded, _ = json.Marshal(build)
 	if strings.Contains(string(encoded), localCallIDPrefix) {
 		t.Fatalf("本地 ID 被发给 Build 上游: %s", encoded)
+	}
+}
+
+// TestResponseSchemaFallback 结构化输出 Schema 含无法编码的写法时降级编码，完整 Schema 附在根说明里
+func TestResponseSchemaFallback(t *testing.T) {
+	raw := json.RawMessage(`{"type":"object","$defs":{"tag":{"type":"string"}},"properties":{"tags":{"type":"array","uniqueItems":true,"items":{"$ref":"#/$defs/tag"}},"score":{"type":"number","exclusiveMaximum":10}}}`)
+	wire, err := encodeResponseSchema(raw)
+	if err != nil {
+		t.Fatalf("降级编码失败: %v", err)
+	}
+	encoded, _ := json.Marshal(wire)
+	if !strings.Contains(string(encoded), "The response must follow this JSON Schema") || !strings.Contains(string(encoded), `"tags"`) {
+		t.Fatalf("wire=%s", encoded)
+	}
+	if plain, err := encodeResponseSchema(json.RawMessage(`{"type":"object","properties":{"a":{"type":"string"}}}`)); err != nil || strings.Contains(fmt.Sprint(plain), "must follow") {
+		t.Fatalf("可直接编码的 Schema 不应附说明: %v %v", plain, err)
+	}
+	deep := strings.Repeat(`{"type":"array","items":`, maxSchemaDepth+2) + `{"type":"string"}` + strings.Repeat(`}`, maxSchemaDepth+2)
+	if _, err := encodeResponseSchema(json.RawMessage(deep)); err == nil {
+		t.Fatal("超过嵌套上限应返回错误")
 	}
 }
