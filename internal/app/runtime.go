@@ -3325,6 +3325,8 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 		invalid = fmt.Errorf("%w: 请求没有系统提示或对话内容", aistudio.ErrInvalidArgument)
 	} else if err := aistudio.ValidateToolChoice(request.Tools); err != nil {
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
+	} else if err := aistudio.ValidateStopSequences(request.Config.StopSequences); err != nil {
+		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	}
 	if invalid != nil {
 		api.SetAccessLogError(ctx, invalid)

@@ -1,9 +1,30 @@
 package aistudio
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
+
+const (
+	// maxStopSequences、maxStopSequenceBytes 为停止序列的数量与单个长度上限（OpenAI 最多 4 个，Gemini 最多 5 个）。
+	// 停止序列在本地逐块匹配，每个序列的所有前缀都参与比较，不设上限时耗时随客户端输入按平方增长
+	maxStopSequences     = 32
+	maxStopSequenceBytes = 1024
+)
+
+// ValidateStopSequences 检查停止序列的数量与长度
+func ValidateStopSequences(sequences []string) error {
+	if len(sequences) > maxStopSequences {
+		return fmt.Errorf("stop sequences 最多 %d 个，收到 %d 个", maxStopSequences, len(sequences))
+	}
+	for _, sequence := range sequences {
+		if len(sequence) > maxStopSequenceBytes {
+			return fmt.Errorf("单个 stop sequence 最长 %d 字节", maxStopSequenceBytes)
+		}
+	}
+	return nil
+}
 
 type stopSequenceMatcher struct {
 	sequences []string

@@ -202,3 +202,20 @@ func TestQuotaFailureAndBareStatus(t *testing.T) {
 		t.Fatalf("封装只有状态码=%+v", wrapped)
 	}
 }
+
+// TestValidateStopSequences 停止序列的数量与长度有上限
+func TestValidateStopSequences(t *testing.T) {
+	if err := ValidateStopSequences([]string{"END", "###"}); err != nil {
+		t.Fatal(err)
+	}
+	many := make([]string, maxStopSequences+1)
+	for index := range many {
+		many[index] = fmt.Sprint(index)
+	}
+	if ValidateStopSequences(many) == nil {
+		t.Fatal("超过数量上限应返回错误")
+	}
+	if ValidateStopSequences([]string{string(make([]byte, maxStopSequenceBytes+1))}) == nil {
+		t.Fatal("超过长度上限应返回错误")
+	}
+}

@@ -1385,7 +1385,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Gemini max tokens | `maxOutputTokens` 映射 generation config field 4 |
 | temperature / topP / topK / seed | 映射 generation config fields 5 / 6 / 7 / 19 |
 | stop sequence | 映射 generation config field 2 |
-| stop sequence 命中 | 协议核心在正文事件流中匹配并返回实际命中的序列 |
+| stop sequence 命中 | 协议核心在正文事件流中匹配并返回实际命中的序列；最多 32 个、单个最长 1024 字节，超过时返回 400 |
 | structured output | MIME type 映射 field 8，Schema 映射 field 9 |
 | OpenAI Chat `n` | 仅接受省略或 `1` |
 | OpenAI Chat `parallel_tool_calls` | `false` 时一次回复最多一个函数调用（见上文工具选择） |

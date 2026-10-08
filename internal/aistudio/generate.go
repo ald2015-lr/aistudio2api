@@ -588,6 +588,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
+	if err := ValidateStopSequences(request.Config.StopSequences); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
 	if request.Truncate && entry.model.InputTokenLimit > 0 {
 		if request, err = c.truncateRequest(ctx, request, entry.model.InputTokenLimit); err != nil {
 			return nil, err
