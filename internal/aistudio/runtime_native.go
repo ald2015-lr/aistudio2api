@@ -47,10 +47,18 @@ func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnati
 	}, nil
 }
 
+// errWorkerClosed 表示 runtime 已开始关闭，不再生成 proof
+var errWorkerClosed = errors.New("WAA worker 已关闭")
+
 // Prepare 生成 fresh proof 并写入请求指定的 WAA field
 func (worker *NativeWorker) Prepare(ctx context.Context, request ProtectedRequest) (PreparedProtectedRequest, error) {
 	worker.operationMu.Lock()
 	defer worker.operationMu.Unlock()
+	// 调用方在账户锁外执行 Prepare，可能排在一次关闭之后才拿到 operationMu：关闭失败时状态停在 WorkerClosing，
+	// 不能再改回 Busy/Ready，否则清理重试认不出这个关不掉的 runtime
+	if phase := worker.phase(); phase == WorkerClosing || phase == WorkerClosed {
+		return PreparedProtectedRequest{}, errWorkerClosed
+	}
 	worker.updateState(func(state *WorkerState) {
 		state.Phase = WorkerBusy
 		state.RequestCount++
@@ -188,6 +196,13 @@ func (worker *NativeWorker) Close() error {
 		state.Phase = WorkerClosed
 	})
 	return err
+}
+
+// phase 返回记录的阶段，不检查浏览器控制连接
+func (worker *NativeWorker) phase() WorkerPhase {
+	worker.stateMu.RLock()
+	defer worker.stateMu.RUnlock()
+	return worker.state.Phase
 }
 
 func (worker *NativeWorker) updateState(update func(*WorkerState)) {

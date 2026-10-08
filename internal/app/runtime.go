@@ -240,38 +240,52 @@ const (
 	workerEvictionTimeout = 100 * time.Millisecond
 )
 
-// Prepare 在账户 Worker 有效期间生成 proof
+// Prepare 在账户 Worker 有效期间生成 proof。proof 每次要 1～5 秒，在账户锁外执行：原先整段持有 account.mu，
+// 同账户的状态读取（WorkerFailed、runtimeAvailable、预热巡检等）和取 Worker 都要排在 proof 之后。
+// 执行前后各在锁内核对一次，执行期间 Worker 被关闭或替换时丢弃结果、按 Worker 已更新返回，由上层重建后重放；
+// 同账户的 proof 仍由 Worker 自身的 operationMu 串行生成，关闭也要等进行中的 proof 结束
 func (preparer *accountWorkerPreparer) Prepare(ctx context.Context, request aistudio.ProtectedRequest) (aistudio.PreparedProtectedRequest, error) {
-	preparer.account.mu.Lock()
-	defer preparer.account.mu.Unlock()
-	if preparer.account.worker != preparer.worker {
+	if !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
-	if preparer.account.bootstrapModel != preparer.bootstrapModel {
+	prepared, err := preparer.worker.Prepare(ctx, request)
+	if !preparer.current() {
 		return aistudio.PreparedProtectedRequest{}, errAccountWorkerReplaced
 	}
-	return preparer.worker.Prepare(ctx, request)
+	return prepared, err
 }
 
 // SendProtected 校验当前账户 Worker 后发送浏览器请求
 func (preparer *accountWorkerPreparer) SendProtected(ctx context.Context, request aistudio.ProtectedRequest) (*aistudio.RPCResponse, error) {
-	preparer.account.mu.Lock()
-	current := preparer.account.worker == preparer.worker && preparer.account.bootstrapModel == preparer.bootstrapModel
-	preparer.account.mu.Unlock()
-	if !current {
+	if !preparer.current() {
 		return nil, errAccountWorkerReplaced
 	}
 	return preparer.worker.SendProtected(ctx, request)
 }
 
-// BrowserStorageState 返回同一有效账户 Worker 的浏览器 Cookie 状态
+// BrowserStorageState 返回同一有效账户 Worker 的浏览器 Cookie 状态。导出同样在账户锁外执行，
+// 执行后再核对一次：Worker 在导出期间被替换（如续签后重建）时，旧浏览器的 Cookie 不能再写回账户状态
 func (preparer *accountWorkerPreparer) BrowserStorageState(ctx context.Context) (aistudio.StorageState, error) {
+	if !preparer.current() {
+		return aistudio.StorageState{}, errAccountWorkerReplaced
+	}
+	state, err := preparer.worker.BrowserStorageState(ctx)
+	if !preparer.current() {
+		return aistudio.StorageState{}, errAccountWorkerReplaced
+	}
+	return state, err
+}
+
+// current 在账户锁内核对 preparer 的 Worker 仍是账户当前发布的 Worker：没有被替换或关闭（指针不变），
+// 页面模型不变，也没有开始关闭（关闭失败时 Worker 仍挂在账户上，状态停在 WorkerClosing）
+func (preparer *accountWorkerPreparer) current() bool {
 	preparer.account.mu.Lock()
 	defer preparer.account.mu.Unlock()
 	if preparer.account.worker != preparer.worker || preparer.account.bootstrapModel != preparer.bootstrapModel {
-		return aistudio.StorageState{}, errAccountWorkerReplaced
+		return false
 	}
-	return preparer.worker.BrowserStorageState(ctx)
+	phase := preparer.worker.State().Phase
+	return phase != aistudio.WorkerClosing && phase != aistudio.WorkerClosed
 }
 
 // accountWorkerInitError 表示单个账户的 WAA worker 初始化失败
@@ -775,7 +789,7 @@ func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
 	manager.mu.RUnlock()
 	occupied := workerOccupancy{accountIDs: make([]string, 0, len(accounts))}
 	for _, account := range accounts {
-		// 正在生成 proof 的账户必然有 Worker，按占用 1 个槽位计，不排队等锁
+		// 账户锁被占用时账户正在关闭、发布或核对 Worker（WAA proof 在锁外生成），按占用 1 个槽位计，不排队等锁
 		if !account.mu.TryLock() {
 			occupied.accountIDs = append(occupied.accountIDs, account.id)
 			occupied.slots++
@@ -814,8 +828,8 @@ func (manager *accountWorkerManager) ReadyWarmAccountIDs() []string {
 		if !account.warm.Load() {
 			continue
 		}
-		// 账户锁被占用说明该 Worker 正在为请求生成 proof（每次 1～5 秒），Worker 必然可用。
-		// 这里不排队等锁：每个请求分配账号时都会调用本函数，逐个等待会让调度随并发线性变慢
+		// 账户锁只在核对、发布或关闭 Worker 时持有（WAA proof 在锁外生成），拿不到锁时按 warm 标志计入。
+		// 这里不排队等锁：每个请求分配账号时都会调用本函数，关闭浏览器可能要几秒，逐个等待会让调度随并发线性变慢
 		if !account.mu.TryLock() {
 			warm = append(warm, account.id)
 			continue
@@ -926,7 +940,7 @@ func (manager *accountWorkerManager) readyWorker(accountID string, bootstrapMode
 }
 
 // checkReadyWorker 检查账户是否已有可用 Worker。wait 为 false 时不等待账户锁：
-// 锁正被占用（如同账户的请求正在生成 WAA proof）时立即返回 busy
+// 锁正被占用（如该账户的 Worker 正在关闭或替换）时立即返回 busy
 func (manager *accountWorkerManager) checkReadyWorker(
 	accountID string,
 	bootstrapModel string,
@@ -1285,7 +1299,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			return nil, err
 		}
 		// 快路径：不持有全局 rebalanceMu，直接检查账户现成的 Worker。检查要等该账户的锁，
-		// 同账户的其他请求正在生成 WAA proof 时可能等几秒；原先持有 rebalanceMu 等待，
+		// 该账户的 Worker 正在关闭或替换时可能等几秒（WAA proof 已在锁外生成）；原先持有 rebalanceMu 等待，
 		// 全系统所有请求获取 Worker 都会跟着排队
 		preparer, ready, err := manager.readyWorker(accountID, bootstrapModel)
 		if err != nil {

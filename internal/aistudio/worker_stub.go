@@ -14,9 +14,20 @@ type stubRuntime struct {
 	mu            sync.Mutex
 	closeFailures int
 	closed        int
+	hooks         StubWorkerHooks
 }
 
-func (runtime *stubRuntime) Proof(context.Context, string, string) (string, error) {
+// StubWorkerHooks 替换 stub Worker 的 proof 生成与 Cookie 导出，供其他包测试控制 WAA 准备的耗时与结果；
+// 为空的项保持默认行为（不生成 proof、不返回 Cookie）
+type StubWorkerHooks struct {
+	Proof          func(context.Context) (string, error)
+	StorageCookies func(context.Context) ([]byte, error)
+}
+
+func (runtime *stubRuntime) Proof(ctx context.Context, _ string, _ string) (string, error) {
+	if runtime.hooks.Proof != nil {
+		return runtime.hooks.Proof(ctx)
+	}
 	return "", errors.New("stub worker 不生成 proof")
 }
 
@@ -28,7 +39,12 @@ func (runtime *stubRuntime) SendProtected(context.Context, string, http.Header, 
 	return nil, errors.New("stub worker 不发送请求")
 }
 
-func (runtime *stubRuntime) StorageCookies(context.Context) ([]byte, error) { return nil, nil }
+func (runtime *stubRuntime) StorageCookies(ctx context.Context) ([]byte, error) {
+	if runtime.hooks.StorageCookies != nil {
+		return runtime.hooks.StorageCookies(ctx)
+	}
+	return nil, nil
+}
 
 func (runtime *stubRuntime) State() camoufoxnative.State { return camoufoxnative.State{} }
 
@@ -46,7 +62,15 @@ func (runtime *stubRuntime) Close() error {
 // NewStubWorker 返回不启动浏览器的就绪 Worker，供测试使用：前 closeFailures 次 Close 返回错误，
 // 返回的函数报告成功关闭的次数
 func NewStubWorker(accountID string, closeFailures int) (*NativeWorker, func() int) {
-	runtime := &stubRuntime{closeFailures: closeFailures}
+	return newStubWorker(accountID, &stubRuntime{closeFailures: closeFailures})
+}
+
+// NewStubWorkerWithHooks 返回使用 hooks 生成 proof、导出 Cookie 的就绪 stub Worker，返回的函数报告成功关闭的次数
+func NewStubWorkerWithHooks(accountID string, hooks StubWorkerHooks) (*NativeWorker, func() int) {
+	return newStubWorker(accountID, &stubRuntime{hooks: hooks})
+}
+
+func newStubWorker(accountID string, runtime *stubRuntime) (*NativeWorker, func() int) {
 	worker := &NativeWorker{
 		accountID: accountID,
 		runtime:   runtime,
