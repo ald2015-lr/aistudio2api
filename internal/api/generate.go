@@ -80,9 +80,12 @@ func (result *generationResult) apply(event aistudio.Event) error {
 			}
 			media := *event.Media
 			media.Data = append([]byte(nil), media.Data...)
-			if strings.HasPrefix(media.MIME, "audio/") && len(media.Data) > 0 && media.URL == "" && len(result.events) > 0 {
+			// 只拼接前后都不带签名的 PCM（audio/l16）分片：裸采样数据可以直接相接，其他格式的分片各自带文件头或帧结构；
+			// 带签名的分片保持独立，否则合并后只剩前一片的签名
+			if isPCMAudio(media.MIME) && len(media.Data) > 0 && media.URL == "" && event.ThoughtSignature == "" && len(result.events) > 0 {
 				previous := &result.events[len(result.events)-1]
-				if previous.Kind == aistudio.EventMedia && previous.Media != nil && previous.Media.MIME == media.MIME && previous.Media.URL == "" {
+				if previous.Kind == aistudio.EventMedia && previous.Media != nil && previous.Media.MIME == media.MIME && previous.Media.URL == "" &&
+					previous.ThoughtSignature == "" {
 					previous.Media.Data = append(previous.Media.Data, media.Data...)
 					result.media[len(result.media)-1].Data = append(result.media[len(result.media)-1].Data, media.Data...)
 					return nil

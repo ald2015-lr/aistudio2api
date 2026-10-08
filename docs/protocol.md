@@ -890,7 +890,7 @@ OpenAI 文件入口接收 `multipart/form-data` 的 `file` 与 `purpose`，单�
 | TTS | modalities `[3]`，speech config | Part field 3 音频 chunk |
 | Lyria | modalities `[3]` | Part field 3 音频 chunk |
 
-单声音 speech config 为 `[[[voiceName]]]`。多说话人 speech config 为 `[null,null,[null,[[speaker,[[voiceName]]],...],mode?]]`，mode `1` 为 `VERBATIM`、`2` 为 `CONVERSATIONAL`。文本 Part field 41 为 SpeechMetadata `[speaker?, style?]`；能力码 85 的 TTS 模型要求多说话人请求的每个文本 Part 带 speaker，且台词不写 `## Transcript:`。相邻且 MIME 相同的音频 Part 按到达顺序拼接。图片宽高比、图片分辨率与 TTS voice 必须来自当前模型能力选项。
+单声音 speech config 为 `[[[voiceName]]]`。多说话人 speech config 为 `[null,null,[null,[[speaker,[[voiceName]]],...],mode?]]`，mode `1` 为 `VERBATIM`、`2` 为 `CONVERSATIONAL`。文本 Part field 41 为 SpeechMetadata `[speaker?, style?]`；能力码 85 的 TTS 模型要求多说话人请求的每个文本 Part 带 speaker，且台词不写 `## Transcript:`。非流式结果只把相邻、MIME 相同且前后都不带签名的 `audio/l16` 音频 Part 按到达顺序拼接，其他音频格式与带签名的分片保持独立；`/v1/audio/speech` 按到达顺序拼接同一 MIME 的全部音频片段。图片宽高比、图片分辨率与 TTS voice 必须来自当前模型能力选项。
 
 ### Veo
 
@@ -1831,6 +1831,8 @@ tool group 字段：
 ```
 
 `groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`retrievedContext:{uri,title,text}` 或 `maps:{uri,title,text,placeId}`；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
+
+非流式响应把相邻的同类正文或思考片段合并为一个 Part，已带签名的 Part 不再并入带签名的片段；工具调用、媒体与带转录元数据的 Part 保持独立。单独到达的签名挂到前一个未签名的文本 Part 上；输出开头的单个签名挂到随后新建的 Part 上，该 Part 自带签名时前置签名单独成 Part。签名不覆盖、不挪位，其余独立签名（含流式响应中的独立签名）以 `{"text":"","thought":true,"thoughtSignature":"..."}` 承载，作为输入回传时还原为纯签名 Part。
 
 `:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`，元素之间的空行用作心跳）。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 

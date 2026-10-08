@@ -223,6 +223,12 @@ func joinedAudio(values []aistudio.Media) (aistudio.Media, error) {
 	return joined, nil
 }
 
+// isPCMAudio 判断 MIME 是否为 16 位 PCM（audio/l16）：类型名不区分大小写，可以带 rate、channels 等参数
+func isPCMAudio(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	return err == nil && mediaType == "audio/l16"
+}
+
 func encodeSpeechResponse(media aistudio.Media, format string) ([]byte, string, error) {
 	format = strings.ToLower(strings.TrimSpace(format))
 	if format == "" {
