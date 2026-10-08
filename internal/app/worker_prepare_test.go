@@ -226,7 +226,7 @@ func TestPrepareDetectsResetDuringProof(t *testing.T) {
 		return err
 	})
 	finishWithin(t, time.Second, "重置等待期间的状态统计", func() error {
-		manager.occupiedSlotsApprox()
+		manager.occupiedSlotsApprox(nil)
 		manager.ReadyWarmAccountIDs()
 		return nil
 	})

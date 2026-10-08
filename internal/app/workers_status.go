@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
@@ -21,37 +22,42 @@ func (manager *accountWorkerManager) OpeningAccountIDs() []string {
 	return ids
 }
 
-// occupiedSlotsApprox 统计占用的 Worker 槽位，供状态接口使用，不会阻塞：
+// occupiedSlotsApprox 按分区统计占用的 Worker 槽位，供状态接口使用，不会阻塞：
 // 关闭或替换 Worker 期间会持有账户锁（关闭浏览器可能几秒，WAA proof 在锁外生成），拿不到锁的账户按占用 1 个槽位计。
-// 调度路径仍使用精确的 occupiedWorkers
-func (manager *accountWorkerManager) occupiedSlotsApprox() int {
+// 调度路径仍使用精确的 occupiedWorkersIn
+func (manager *accountWorkerManager) occupiedSlotsApprox(ultra map[string]struct{}) (normal int, ultraSlots int) {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
 	for _, account := range manager.accounts {
 		accounts = append(accounts, account)
 	}
 	manager.mu.RUnlock()
-	slots := 0
 	for _, account := range accounts {
+		slots := 0
 		if !account.mu.TryLock() {
-			slots++
-			continue
+			slots = 1
+		} else {
+			if account.worker != nil {
+				slots++
+			}
+			if account.cleanupWorker != nil {
+				slots++
+			}
+			if account.worker == nil && account.cleanupWorker == nil && account.runtimeLease != nil {
+				slots++
+			}
+			if account.cleanupWorker == nil && account.cleanupLease != nil {
+				slots++
+			}
+			account.mu.Unlock()
 		}
-		if account.worker != nil {
-			slots++
+		if partitionOf(account.id, ultra) == aistudio.PoolScopeUltra {
+			ultraSlots += slots
+		} else {
+			normal += slots
 		}
-		if account.cleanupWorker != nil {
-			slots++
-		}
-		if account.worker == nil && account.cleanupWorker == nil && account.runtimeLease != nil {
-			slots++
-		}
-		if account.cleanupWorker == nil && account.cleanupLease != nil {
-			slots++
-		}
-		account.mu.Unlock()
 	}
-	return slots
+	return normal, ultraSlots
 }
 
 // Onboarding 返回当前生成服务的新账户自动处理状态

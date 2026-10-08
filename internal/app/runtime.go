@@ -462,14 +462,24 @@ func (manager *accountWorkerManager) reapIdleWorkers() {
 	}
 }
 
-// reapIdleWorker 关闭一个最近使用早于 before 的多余空闲 Worker，并返回是否关闭
+// reapIdleWorker 关闭一个最近使用早于 before 的多余空闲 Worker，并返回是否关闭；各分区按自己的常驻数回收
 func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
+	for _, partition := range workerPartitions {
+		if manager.reapIdleWorkerIn(partition, before) {
+			return true
+		}
+	}
+	return false
+}
+
+// reapIdleWorkerIn 在分区的 Worker 超出该分区常驻数时关闭其中一个空闲超时的 Worker
+func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolScope, before time.Time) bool {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
-	if len(manager.openings) > 0 || len(manager.WarmAccountIDs()) <= manager.warmTargetValue() {
+	if len(manager.openings) > 0 || len(manager.warmAccountIDsIn(partition)) <= manager.warmTargetFor(partition) {
 		return false
 	}
-	victim := manager.idleWarmVictim("")
+	victim := manager.idleWarmVictimFor("", "", false, partition)
 	if victim == "" {
 		return false
 	}
@@ -487,7 +497,7 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	}
 	if evicted {
 		manager.requests.log("service", "INFO", fmt.Sprintf(
-			"WAA Worker 空闲回收 | Worker=%d/%d", len(manager.WarmAccountIDs()), manager.maxActiveValue(),
+			"%s 空闲回收 | Worker=%d/%d", workerLogName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
 		))
 	}
 	return evicted
@@ -792,10 +802,17 @@ type workerOccupancy struct {
 
 // occupiedWorkers 返回仍持有进程或运行锁的账户与容量槽位
 func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
+	return manager.occupiedWorkersIn(aistudio.PoolScopeAll, nil)
+}
+
+// occupiedWorkersIn 返回分区内仍持有进程或运行锁的账户与容量槽位；partition 为不限号池时统计全部分区
+func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolScope, ultra map[string]struct{}) workerOccupancy {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
 	for _, account := range manager.accounts {
-		accounts = append(accounts, account)
+		if partition == aistudio.PoolScopeAll || partitionOf(account.id, ultra) == partition {
+			accounts = append(accounts, account)
+		}
 	}
 	manager.mu.RUnlock()
 	occupied := workerOccupancy{accountIDs: make([]string, 0, len(accounts))}
@@ -872,14 +889,21 @@ func (manager *accountWorkerManager) coldAccounts(accountIDs []string) []string 
 	return cold
 }
 
-// PrewarmTarget 返回当前配置需要预热的账户数
+// PrewarmTarget 返回当前配置需要预热的账户数：各分区的常驻数与分区内可预热的账户数取小后相加
 func (manager *accountWorkerManager) PrewarmTarget() int {
-	return min(manager.warmTargetValue(), manager.bootstrapSummary().Available)
+	summary := manager.bootstrapSummary()
+	target := 0
+	for _, partition := range workerPartitions {
+		target += manager.prewarmTargetFrom(partition, summary)
+	}
+	return target
 }
 
+// classifyBootstrapCandidates 分类分区内可预热的候选账户
 func (manager *accountWorkerManager) classifyBootstrapCandidates(
 	ctx context.Context,
 	warm []string,
+	partition aistudio.PoolScope,
 ) (aistudio.AccountCandidateGroups, error) {
 	combined := aistudio.AccountCandidateGroups{}
 	seenWarmReady := make(map[string]struct{})
@@ -900,7 +924,7 @@ func (manager *accountWorkerManager) classifyBootstrapCandidates(
 	var matched bool
 	for _, modelID := range modelIDs {
 		groups, err := manager.pool.ClassifyCandidatesCached(aistudio.AccountSelection{
-			ModelID: modelID, Method: "generateContent",
+			ModelID: modelID, Method: "generateContent", Pool: partition,
 		}, warm)
 		if errors.Is(err, aistudio.ErrModelNotFound) {
 			continue
@@ -1199,10 +1223,6 @@ func workerStartupProgress(stage camoufoxnative.StartupStage) (int, string) {
 	panic(fmt.Sprintf("未知 WAA Worker 启动阶段: %s", stage))
 }
 
-func (manager *accountWorkerManager) idleWarmVictim(excludeID string) string {
-	return manager.idleWarmVictimFor(excludeID, "", false)
-}
-
 // tryReserveVictim 在旧 Worker 尚未被其他替换选中时标记它，返回是否标记成功。
 // ensureWorker 的替换与不经过 rebalanceMu 的冷却轮换都用它原子检查并标记，避免同一个 Worker 被两边同时淘汰
 func (manager *accountWorkerManager) tryReserveVictim(accountID string) bool {
@@ -1229,9 +1249,10 @@ func (manager *accountWorkerManager) victimReserved(accountID string) bool {
 	return reserved
 }
 
-// idleWarmVictimFor 选择空闲热 Worker，优先冷却中的账户，其次最久未用；coolingOnly 时只返回冷却中的账户
-func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID string, coolingOnly bool) string {
-	warm := manager.WarmAccountIDs()
+// idleWarmVictimFor 在分区内选择空闲热 Worker，优先冷却中的账户，其次最久未用；coolingOnly 时只返回冷却中的账户。
+// 只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然
+func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID string, coolingOnly bool, partition aistudio.PoolScope) string {
+	warm := manager.warmAccountIDsIn(partition)
 	var selected string
 	var selectedUsed time.Time
 	selectedCooling := false
@@ -1357,17 +1378,23 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return preparer, nil
 		}
-		occupancy := manager.occupiedWorkers()
+		// 容量只计账户所在分区：Worker 按账户当前权益计入普通或 Ultra 分区
+		ultra := manager.pool.UltraAccountIDs()
+		partition := partitionOf(accountID, ultra)
+		occupancy := manager.occupiedWorkersIn(partition, ultra)
 		occupied := make(map[string]struct{}, len(occupancy.accountIDs)+len(manager.openings))
 		for _, occupiedAccountID := range occupancy.accountIDs {
 			occupied[occupiedAccountID] = struct{}{}
 		}
 		for openingAccountID := range manager.openings {
+			if partitionOf(openingAccountID, ultra) != partition {
+				continue
+			}
 			occupied[openingAccountID] = struct{}{}
 			occupancy.slots++
 		}
 		_, replacing := occupied[accountID]
-		if replacing || occupancy.slots < manager.maxActiveValue() {
+		if replacing || occupancy.slots < manager.maxActiveFor(partition) {
 			opening := make(chan struct{})
 			manager.openings[accountID] = opening
 			manager.openingSet.Store(accountID, struct{}{})
@@ -1382,20 +1409,20 @@ func (manager *accountWorkerManager) ensureWorker(
 				}
 			}
 			manager.finishOpening(accountID, opening)
-			warmCount := len(manager.WarmAccountIDs())
+			warmCount := len(manager.warmAccountIDsIn(partition))
 			manager.rebalanceMu.Unlock()
-			if err == nil && warmCount > manager.warmTargetValue() {
+			if err == nil && warmCount > manager.warmTargetFor(partition) {
 				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"WAA Worker 按需扩容 | Worker=%d/%d", warmCount, manager.maxActiveValue(),
+					"%s 按需扩容 | Worker=%d/%d", workerLogName(partition), warmCount, manager.maxActiveFor(partition),
 				))
 			}
 			return preparer, err
 		}
 		victim := ""
 		if len(manager.openings) == 0 {
-			victim = manager.idleWarmVictimFor(accountID, modelID, false)
+			victim = manager.idleWarmVictimFor(accountID, modelID, false, partition)
 		} else {
-			victim = manager.idleWarmVictimFor(accountID, modelID, true)
+			victim = manager.idleWarmVictimFor(accountID, modelID, true, partition)
 		}
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
 		if victim != "" && !manager.tryReserveVictim(victim) {
@@ -1432,7 +1459,7 @@ func (manager *accountWorkerManager) ensureWorker(
 				return nil, errors.Join(ctxErr, discardErr)
 			}
 			if victim == "" {
-				victim = manager.idleWarmVictimFor(accountID, modelID, false)
+				victim = manager.idleWarmVictimFor(accountID, modelID, false, partition)
 				if victim != "" && !manager.tryReserveVictim(victim) {
 					victim = ""
 				}
@@ -1452,14 +1479,14 @@ func (manager *accountWorkerManager) ensureWorker(
 			if evictionErr == nil && evicted {
 				activationErr := activateAccountWorker(pending)
 				manager.finishOpening(accountID, opening)
-				warmCount := len(manager.WarmAccountIDs())
+				warmCount := len(manager.warmAccountIDsIn(partition))
 				manager.rebalanceMu.Unlock()
 				if activationErr != nil {
 					return nil, activationErr
 				}
-				if warmCount > manager.warmTargetValue() {
+				if warmCount > manager.warmTargetFor(partition) {
 					manager.requests.log("service", "INFO", fmt.Sprintf(
-						"WAA Worker 按需替换 | Worker=%d/%d", warmCount, manager.maxActiveValue(),
+						"%s 按需替换 | Worker=%d/%d", workerLogName(partition), warmCount, manager.maxActiveFor(partition),
 					))
 				}
 				return pending, nil
@@ -1599,10 +1626,12 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 	var failures []error
 	var classifyErr error
 	failedAccounts := make(map[string]struct{})
-	inflight := make(map[string]struct{})
+	// inflight 为本轮正在启动的账户与其所在的 Worker 分区
+	inflight := make(map[string]aistudio.PoolScope)
 	results := make(chan warmResult, warmResultBuffer)
 	launched := 0
-	capacityFull := false
+	// capacityFull 为 Worker 槽位已满的分区：该分区本轮不再启动新的
+	capacityFull := make(map[aistudio.PoolScope]bool, len(workerPartitions))
 	// openingElsewhere 记录已由其他路径（如请求按需扩容）在启动的账户，本轮不再重复尝试，避免空转
 	openingElsewhere := make(map[string]struct{})
 	var busySince time.Time
@@ -1614,6 +1643,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		manager.fillInflight.Store(0)
 	}()
 	handle := func(result warmResult) {
+		partition := inflight[result.accountID]
 		delete(inflight, result.accountID)
 		manager.fillInflight.Store(int32(len(inflight)))
 		if result.err == nil {
@@ -1624,9 +1654,9 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		if ctx.Err() != nil {
 			return
 		}
-		// 槽位已满或该账户已在启动：不算失败，本轮不再启动新的，交给 keepWarm 稍后重试
+		// 槽位已满或该账户已在启动：不算失败，该分区本轮不再启动新的，交给 keepWarm 稍后重试
 		if errors.Is(result.err, errAccountWorkerCapacity) {
-			capacityFull = true
+			capacityFull[partition] = true
 			return
 		}
 		if errors.Is(result.err, errAccountWorkerOpening) {
@@ -1650,8 +1680,22 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		manager.fillLoopAt.Store(time.Now().UnixNano())
 		manager.fillInflight.Store(int32(len(inflight)))
 		warm := manager.WarmAccountIDs()
-		target := manager.warmTargetValue()
-		if len(warm) >= target && len(inflight) == 0 {
+		// 每个分区从自己的账户补齐到自己的常驻数（见 worker_partition.go）
+		ultra := manager.pool.UltraAccountIDs()
+		summary := manager.bootstrapSummary()
+		targets := make(map[aistudio.PoolScope]int, len(workerPartitions))
+		warmCounts := make(map[aistudio.PoolScope]int, len(workerPartitions))
+		inflightCounts := make(map[aistudio.PoolScope]int, len(workerPartitions))
+		for _, partition := range inflight {
+			inflightCounts[partition]++
+		}
+		filled := true
+		for _, partition := range workerPartitions {
+			targets[partition] = manager.fillTargetFor(partition, summary)
+			warmCounts[partition] = len(inPartition(warm, ultra, partition))
+			filled = filled && warmCounts[partition] >= targets[partition]
+		}
+		if filled && len(inflight) == 0 {
 			if launched > 0 {
 				manager.requests.log("service", "INFO", fmt.Sprintf(
 					"WAA Worker 预热完成 | Worker=%d/%d | 耗时=%s",
@@ -1661,68 +1705,77 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			notify(nil)
 			return
 		}
-		slots := min(manager.warmConcurrencyValue()-len(inflight), target-len(warm)-len(inflight))
-		if capacityFull {
-			slots = 0
-		}
+		remaining := manager.warmConcurrencyValue() - len(inflight)
 		pendingBusy := false
 		readyCount := 0
+		classified := false
+		var roundClassifyErr error
 		var runtimeBusyErr error
-		if slots > 0 {
-			groups, err := manager.classifyBootstrapCandidates(ctx, warm)
+		for _, partition := range workerPartitions {
+			slots := min(remaining, targets[partition]-warmCounts[partition]-inflightCounts[partition])
+			if capacityFull[partition] || slots <= 0 {
+				continue
+			}
+			classified = true
+			groups, err := manager.classifyBootstrapCandidates(ctx, warm, partition)
 			if err != nil {
-				classifyErr = err
-			} else {
-				classifyErr = nil
-				skipped := make(map[string]struct{}, len(failedAccounts)+len(inflight))
-				for accountID := range failedAccounts {
-					skipped[accountID] = struct{}{}
+				if roundClassifyErr == nil {
+					roundClassifyErr = err
 				}
-				for accountID := range inflight {
-					skipped[accountID] = struct{}{}
-				}
-				for accountID := range manager.recentWarmFailures(time.Now()) {
-					skipped[accountID] = struct{}{}
-				}
-				for accountID := range openingElsewhere {
-					skipped[accountID] = struct{}{}
-				}
-				for _, accountID := range manager.OpeningAccountIDs() {
-					skipped[accountID] = struct{}{}
-				}
-				ready := excludeAccountIDs(groups.StandbyReady, skipped)
-				busy := excludeAccountIDs(groups.StandbyBusy, skipped)
-				var readyBusyErr, standbyBusyErr error
-				ready, readyBusyErr = manager.runtimeAvailable(ready)
-				busy, standbyBusyErr = manager.runtimeAvailable(busy)
-				runtimeBusyErr = errors.Join(readyBusyErr, standbyBusyErr)
-				pendingBusy = len(busy) > 0
-				ready = manager.preferUncooled(ready)
-				readyCount = len(ready)
-				started := ready[:min(slots, len(ready))]
-				for _, accountID := range started {
-					inflight[accountID] = struct{}{}
-					launched++
-					go func(accountID string) {
-						// 不等待 Worker 槽位：槽位满时立即返回；冷启动名额按后台启动排队，让给按需启动（见 startupSlots）。
-						// 单个任务限时，避免个别账户拖住整轮预热
-						taskCtx, taskCancel := context.WithTimeout(
-							withBackgroundStartup(ctx), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
-						)
-						_, err := manager.ensureWorker(taskCtx, accountID, "", false)
-						taskCancel()
-						results <- warmResult{accountID: accountID, err: err}
-					}(accountID)
-				}
-				manager.fillLaunched.Store(int32(launched))
-				manager.fillInflight.Store(int32(len(inflight)))
-				if len(started) > 0 {
-					busySince = time.Time{}
-				}
+				continue
+			}
+			skipped := make(map[string]struct{}, len(failedAccounts)+len(inflight))
+			for accountID := range failedAccounts {
+				skipped[accountID] = struct{}{}
+			}
+			for accountID := range inflight {
+				skipped[accountID] = struct{}{}
+			}
+			for accountID := range manager.recentWarmFailures(time.Now()) {
+				skipped[accountID] = struct{}{}
+			}
+			for accountID := range openingElsewhere {
+				skipped[accountID] = struct{}{}
+			}
+			for _, accountID := range manager.OpeningAccountIDs() {
+				skipped[accountID] = struct{}{}
+			}
+			ready := excludeAccountIDs(groups.StandbyReady, skipped)
+			busy := excludeAccountIDs(groups.StandbyBusy, skipped)
+			var readyBusyErr, standbyBusyErr error
+			ready, readyBusyErr = manager.runtimeAvailable(ready)
+			busy, standbyBusyErr = manager.runtimeAvailable(busy)
+			runtimeBusyErr = errors.Join(runtimeBusyErr, readyBusyErr, standbyBusyErr)
+			pendingBusy = pendingBusy || len(busy) > 0
+			ready = manager.preferUncooled(ready)
+			readyCount += len(ready)
+			started := ready[:min(slots, len(ready))]
+			for _, accountID := range started {
+				inflight[accountID] = partition
+				launched++
+				go func(accountID string) {
+					// 不等待 Worker 槽位：槽位满时立即返回；冷启动名额按后台启动排队，让给按需启动（见 startupSlots）。
+					// 单个任务限时，避免个别账户拖住整轮预热
+					taskCtx, taskCancel := context.WithTimeout(
+						withBackgroundStartup(ctx), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
+					)
+					_, err := manager.ensureWorker(taskCtx, accountID, "", false)
+					taskCancel()
+					results <- warmResult{accountID: accountID, err: err}
+				}(accountID)
+			}
+			remaining -= len(started)
+			manager.fillLaunched.Store(int32(launched))
+			manager.fillInflight.Store(int32(len(inflight)))
+			if len(started) > 0 {
+				busySince = time.Time{}
 			}
 		}
+		if classified {
+			classifyErr = roundClassifyErr
+		}
 		if len(inflight) == 0 {
-			if pendingBusy && !capacityFull {
+			if pendingBusy {
 				if busySince.IsZero() {
 					busySince = time.Now()
 				}
@@ -1738,10 +1791,11 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				// 本轮暂时无法继续：记录原因后结束，由 keepWarm 定期再补
 				reason := fmt.Sprintf("暂无可启动的账户（预热失败冷却中 %d 个）", len(manager.recentWarmFailures(time.Now())))
 				level := "INFO"
+				full, anyFull := fullPartition(capacityFull)
 				switch {
-				case capacityFull:
-					occupancy := manager.occupiedWorkers()
-					reason = fmt.Sprintf("Worker 槽位已满（占用 %d / 峰值上限 %d）", occupancy.slots, manager.maxActiveValue())
+				case anyFull:
+					occupancy := manager.occupiedWorkersIn(full, manager.pool.UltraAccountIDs())
+					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.slots, manager.maxActiveFor(full))
 					level = "WARN"
 				case classifyErr != nil:
 					reason = "候选账户分类失败: " + strings.TrimSpace(classifyErr.Error())
@@ -3130,28 +3184,18 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			continue
 		}
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
-		coolingVictim := len(active) >= service.workers.maxActiveValue() &&
-			service.workers.idleWarmVictimFor("", selection.ModelID, true) != ""
-		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.maxActiveValue() || coolingVictim) && warmCandidates > 0 && !fixedAccount {
-			standby := groups.StandbyReady
-			if cold := service.workers.coldAccounts(standby); len(cold) > 0 {
-				standby = cold
-			}
-			service.workers.expandInBackground(standby[0], selection.ModelID)
-			if err := wait(schedulingRecheck); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if len(groups.StandbyReady) > 0 && (len(active) < service.workers.maxActiveValue() ||
-			warmCandidates == 0 && service.workers.idleWarmVictim("") != "") {
-			standby := groups.StandbyReady
-			if len(active) < service.workers.maxActiveValue() {
-				if cold := service.workers.coldAccounts(standby); len(cold) > 0 {
-					standby = cold
+		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
+		capacity := service.workers.standbyCapacity(active, selection.ModelID)
+		if len(groups.StandbyReady) > 0 && warmCandidates > 0 && !fixedAccount {
+			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
+				service.workers.expandInBackground(accountID, selection.ModelID)
+				if err := wait(schedulingRecheck); err != nil {
+					return nil, err
 				}
+				continue
 			}
-			accountID := standby[0]
+		}
+		if accountID := capacity.promotable(groups.StandbyReady, warmCandidates == 0); accountID != "" {
 			candidate := selection
 			candidate.AccountID = accountID
 			lease, _, acquireErr := service.pool.TryAcquireFor(ctx, candidate)

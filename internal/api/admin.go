@@ -46,6 +46,20 @@ type AdminStatus struct {
 	Workers        AdminWorkerCounts  `json:"workers"`
 	// UltraAccounts 为 Ultra 号池（权益为 Ultra 的账户）的状态计数，Accounts 包含全部账户
 	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
+	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含两个分区）
+	UltraWorkers AdminWorkerPartition `json:"ultra_workers"`
+}
+
+// AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限
+type AdminWorkerPartition struct {
+	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的）
+	Warm     int `json:"warm"`
+	Starting int `json:"starting"`
+	Occupied int `json:"occupied"`
+	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
+	Target    int `json:"target"`
+	WarmLimit int `json:"warm_limit"`
+	Max       int `json:"max"`
 }
 
 // AdminPrewarmState 表示预热循环的实时状态
@@ -58,7 +72,8 @@ type AdminPrewarmState struct {
 	Reason         string `json:"reason,omitempty"`
 }
 
-// AdminWorkerCounts 表示 WAA Worker 的实时数量与对应账户
+// AdminWorkerCounts 表示 WAA Worker 的实时数量与对应账户：数量与上限只含普通分区（Ultra 分区见 AdminWorkerPartition），
+// WarmIDs、StartingIDs 包含两个分区；预热循环两个分区共用
 type AdminWorkerCounts struct {
 	Warm        int               `json:"warm"`
 	Starting    int               `json:"starting"`

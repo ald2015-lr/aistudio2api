@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -50,7 +51,8 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 		workers := service.workers
 		workers.sweepFailedWorkers(dataContext)
 		workers.retryPendingCleanup()
-		if len(workers.WarmAccountIDs())+len(workers.OpeningAccountIDs()) >= workers.PrewarmTarget() {
+		// 普通与 Ultra 分区各自按自己的预热目标判断
+		if !workers.prewarmNeeded() {
 			continue
 		}
 		workers.StartPrewarm(dataContext)
@@ -180,14 +182,54 @@ func (manager *accountWorkerManager) preferUncooled(accountIDs []string) []strin
 
 // rotateCooledWorkers 把预热池中被长时间冷却占住的空闲 Worker（如当天某模型额度已用完）
 // 换成没有冷却的账户。原先只有请求到来、找不到可用的预热 Worker 时才现场启动或替换浏览器，
-// 这几秒到十几秒都算在请求的等待时间里；这里在后台提前完成
+// 这几秒到十几秒都算在请求的等待时间里；这里在后台提前完成。
+// 普通与 Ultra 分区分别统计与轮换：只淘汰本分区的 Worker，接替的账户也按本分区统计，随后由预热按本分区补齐；
+// 一轮最多替换的数量两个分区共用启动预热并发
 func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	workers := service.workers
-	warm := workers.WarmAccountIDs()
-	if len(warm) == 0 {
-		workers.setHotModels(nil)
+	ultra := service.pool.UltraAccountIDs()
+	allWarm := workers.WarmAccountIDs()
+	opening := workers.OpeningAccountIDs()
+	var allHot []string
+	var details []string
+	rotated := 0
+	budget := workers.warmConcurrencyValue()
+	for _, partition := range workerPartitions {
+		warm := inPartition(allWarm, ultra, partition)
+		if len(warm) == 0 {
+			continue
+		}
+		hot, counts := service.hotModelsIn(warm)
+		allHot = append(allHot, hot...)
+		if len(hot) == 0 || budget-rotated <= 0 || ctx.Err() != nil {
+			continue
+		}
+		count := service.rotatePartition(ctx, partition, warm, opening, hot, budget-rotated)
+		if count == 0 {
+			continue
+		}
+		rotated += count
+		prefix := ""
+		if partition == aistudio.PoolScopeUltra {
+			prefix = "Ultra "
+		}
+		for _, modelID := range hot {
+			details = append(details, fmt.Sprintf("%s%s %d/%d", prefix, modelID, counts[modelID], len(warm)))
+		}
+	}
+	sort.Strings(allHot)
+	workers.setHotModels(slices.Compact(allHot))
+	if rotated == 0 {
 		return
 	}
+	service.requests.log("service", "INFO", fmt.Sprintf(
+		"WAA Worker 冷却轮换 | 替换=%d | 预热池中长时间冷却=%s", rotated, strings.Join(details, "，"),
+	))
+	workers.StartPrewarm(ctx)
+}
+
+// hotModelsIn 返回分区预热池中被大量 Worker 长时间冷却的模型与各模型的冷却数
+func (service *trackedService) hotModelsIn(warm []string) ([]string, map[string]int) {
 	threshold := max(rotationMinAccounts, int(float64(len(warm))*rotationMinShare))
 	counts := service.pool.LongCooldownModels(warm, rotationMinRemaining)
 	hot := make([]string, 0)
@@ -197,20 +239,24 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		}
 	}
 	sort.Strings(hot)
-	workers.setHotModels(hot)
-	if len(hot) == 0 {
-		return
-	}
-	occupied := make(map[string]struct{}, len(warm))
+	return hot, counts
+}
+
+// rotatePartition 在分区内淘汰最多 limit 个在热门模型上长时间冷却的空闲 Worker，返回淘汰数
+func (service *trackedService) rotatePartition(
+	ctx context.Context, partition aistudio.PoolScope, warm []string, openingIDs []string, hot []string, limit int,
+) int {
+	workers := service.workers
+	occupied := make(map[string]struct{}, len(warm)+len(openingIDs))
 	for _, accountID := range warm {
 		occupied[accountID] = struct{}{}
 	}
-	for _, accountID := range workers.OpeningAccountIDs() {
+	for _, accountID := range openingIDs {
 		occupied[accountID] = struct{}{}
 	}
-	limit := min(workers.warmConcurrencyValue(), service.pool.SpareAccounts(aistudio.PoolScopeAll, occupied, hot, rotationMinRemaining))
+	limit = min(limit, service.pool.SpareAccounts(partition, occupied, hot, rotationMinRemaining))
 	if limit <= 0 {
-		return
+		return 0
 	}
 	victims := service.pool.LongCoolingSet(warm, hot, rotationMinRemaining, true)
 	rotated := 0
@@ -245,17 +291,7 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 			rotated++
 		}
 	}
-	if rotated == 0 {
-		return
-	}
-	details := make([]string, 0, len(hot))
-	for _, modelID := range hot {
-		details = append(details, fmt.Sprintf("%s %d/%d", modelID, counts[modelID], len(warm)))
-	}
-	service.requests.log("service", "INFO", fmt.Sprintf(
-		"WAA Worker 冷却轮换 | 替换=%d | 预热池中长时间冷却=%s", rotated, strings.Join(details, "，"),
-	))
-	workers.StartPrewarm(ctx)
+	return rotated
 }
 
 // retryPendingCleanup 重试清理失败的账户：关闭失败的浏览器或释放失败的运行时租约会让账户停在“待清理”状态，

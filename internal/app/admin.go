@@ -127,6 +127,10 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	warm := admin.workers.WarmAccountIDs()
 	sort.Strings(warm)
 	starting := admin.workers.OpeningAccountIDs()
+	// Worker 计数按分区：workers 的数量与上限只含普通分区，ultra_workers 为 Ultra 分区；Worker 列表包含两个分区
+	ultra := admin.pool.UltraAccountIDs()
+	normalOccupied, ultraOccupied := admin.workers.occupiedSlotsApprox(ultra)
+	normal := aistudio.PoolScopeNormal
 	return api.AdminStatus{
 		State:          state,
 		Running:        running,
@@ -136,12 +140,13 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Accounts:       counts,
 		UltraAccounts:  adminAccountCounts(ultraCounts),
 		Workers: api.AdminWorkerCounts{
-			Warm: len(warm), Starting: len(starting),
-			Target: admin.workers.PrewarmTarget(), Max: admin.workers.maxActiveValue(),
-			Occupied: admin.workers.occupiedSlotsApprox(),
+			Warm: len(inPartition(warm, ultra, normal)), Starting: len(inPartition(starting, ultra, normal)),
+			Target: admin.workers.prewarmTargetFor(normal), Max: admin.workers.maxActiveFor(normal),
+			Occupied: normalOccupied,
 			Prewarm:  admin.workers.prewarmState(),
 			WarmIDs:  warm, StartingIDs: starting,
 		},
+		UltraWorkers: admin.workers.ultraWorkerCounts(ultra, warm, starting, ultraOccupied),
 	}, nil
 }
 
