@@ -63,7 +63,7 @@
 
 ### Method 1: Windows One-Click Start (Recommended)
 
-Download the `windows-amd64.zip` package from [Releases](https://github.com/Mag1cFall/AIStudio2API/releases), extract it, and run `start.bat`. The package includes the management interface and is ready to run.
+Download the `windows-amd64.zip` package from [Releases](https://github.com/ald2015-lr/aistudio2api/releases), extract it, and run `start.bat`. The package includes the management interface and is ready to run.
 
 To start from source:
 

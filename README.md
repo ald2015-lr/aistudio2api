@@ -63,7 +63,7 @@
 
 ### 方式一：Windows 一键启动（推荐）
 
-从 [Releases](https://github.com/Mag1cFall/AIStudio2API/releases) 下载 `windows-amd64.zip` 发布包，解压后运行 `start.bat`。发布包已包含管理界面，可直接运行。
+从 [Releases](https://github.com/ald2015-lr/aistudio2api/releases) 下载 `windows-amd64.zip` 发布包，解压后运行 `start.bat`。发布包已包含管理界面，可直接运行。
 
 从源码启动时：
 

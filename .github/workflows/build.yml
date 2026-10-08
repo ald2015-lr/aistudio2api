@@ -6,22 +6,72 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '发布版本号（如 v1.0.0），留空只运行检查与构建'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: build-${{ github.ref }}-${{ inputs.release_tag || 'ci' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') && !inputs.release_tag }}
 
 jobs:
+  tag:
+    # 手动运行并填写版本号时，先在 main 当前提交上创建标签，之后与推送标签走同一条构建与发布流程；
+    # 用 GITHUB_TOKEN 创建的标签不会再触发一次推送标签的运行
+    if: github.event_name == 'workflow_dispatch' && inputs.release_tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Create Release Tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/heads/main ]]; then
+            echo "只能从 main 发布，当前为 $GITHUB_REF" >&2
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "版本号格式应为 vX.Y.Z 或 vX.Y.Z-后缀，收到 $RELEASE_TAG" >&2
+            exit 1
+          fi
+          # 标签已存在时只接受指向当前提交（重新运行），指向其他提交时拒绝，不移动已发布的标签
+          existing="$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.type + " " + .object.sha' 2>/dev/null || true)"
+          if [[ -n "$existing" ]]; then
+            sha="${existing#* }"
+            if [[ "${existing%% *}" == tag ]]; then sha="$(gh api "repos/$GH_REPO/git/tags/$sha" --jq .object.sha)"; fi
+            if [[ "$sha" != "$GITHUB_SHA" ]]; then
+              echo "标签 $RELEASE_TAG 已指向其他提交 $sha" >&2
+              exit 1
+            fi
+            echo "标签 $RELEASE_TAG 已指向当前提交，继续构建与发布"
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$RELEASE_TAG" -f sha="$GITHUB_SHA" >/dev/null
+          echo "已在 $GITHUB_SHA 上创建标签 $RELEASE_TAG"
+
   build:
+    needs: tag
+    # 普通推送与 Pull Request 时 tag 任务被跳过，构建照常运行
+    if: ${{ !cancelled() && (needs.tag.result == 'success' || needs.tag.result == 'skipped') }}
     runs-on: ubuntu-24.04
     env:
       CGO_ENABLED: '0'
       GOTOOLCHAIN: local
     steps:
       - uses: actions/checkout@v7
+        with:
+          # 手动发布时检出刚创建的标签，二进制中的版本号取自该标签
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || '' }}
       - uses: actions/setup-node@v7
         with:
           node-version: '22.13.0'
@@ -61,9 +111,12 @@ jobs:
           cache: false
       - name: Build Packages
         shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           version="${GITHUB_SHA:0:7}"
           if [[ "$GITHUB_REF_TYPE" == tag ]]; then version="$GITHUB_REF_NAME"; fi
+          if [[ -n "$RELEASE_TAG" ]]; then version="$RELEASE_TAG"; fi
           mkdir -p dist
           for target in windows/amd64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
             export GOOS="${target%/*}" GOARCH="${target#*/}"
@@ -90,7 +143,10 @@ jobs:
           retention-days: 7
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    if: >-
+      ${{ !cancelled() && needs.build.result == 'success' &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')) }}
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -104,7 +160,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         shell: bash
         run: |
           flags=()
