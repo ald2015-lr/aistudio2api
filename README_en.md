@@ -29,6 +29,7 @@
 
 - **Dual Quota Channels**: Every account has separate Playground and Build app proxy quotas, and `UPSTREAM_CHANNELS` enables either or both; when one channel hits its limit, the same account continues on the other
 - **High-Concurrency Multi-Account**: Detects Free, Pro, Ultra, and Plus benefits and routes across accounts by the live model catalog with round-robin or fill-first
+- **Separate Ultra Pool**: Call Ultra accounts on their own through the `/ultra` prefix (for example `http://127.0.0.1:2048/ultra/v1`), exclusive by default, with their own resident and peak worker counts
 - **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
 - **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent, plus Gemini Interactions
 - **Mainstream Agent Clients**: Works with Claude Code, Codex, OpenCode, pi, omp, OpenClaw, and Hermes, including file read and write tool calls; native web search works in Claude Code, Codex, and omp
@@ -271,6 +272,29 @@ Inline attachments in generation requests are preferentially uploaded as tempora
 
 Gemini attachments and video image inputs accept `inlineData` / `inline_data`, `fileData` / `file_data`, `mimeType` / `mime_type`, and `fileUri` / `file_uri`. Base64 media data supports standard and URL-safe alphabets, padded and unpadded forms, and the `data:<MIME>;base64,` prefix. Markdown images in OpenAI assistant history also support URL-safe Base64 and CR/LF line breaks. Inline GIFs and GIFs uploaded through video multipart requests are converted to PNG using the first frame, preserving the logical canvas, frame position, and transparency.
 
+### Ultra Pool (/ultra prefix)
+
+Accounts with the Ultra tier form a separate Ultra pool; every other account (including accounts whose tier has not been read yet) belongs to the normal pool. Point a client's base URL at the `/ultra` prefix and its requests are served only by Ultra accounts; endpoints, authentication (the same `PROXY_API_KEY`), request bodies and response formats are the same as on the normal API:
+
+| Protocol | Normal pool base URL | Ultra pool base URL |
+| --- | --- | --- |
+| OpenAI Chat / Responses | `http://127.0.0.1:2048/v1` | `http://127.0.0.1:2048/ultra/v1` |
+| Anthropic Messages | `http://127.0.0.1:2048` | `http://127.0.0.1:2048/ultra` |
+| Gemini | `http://127.0.0.1:2048` | `http://127.0.0.1:2048/ultra` (requests go to `/ultra/v1beta/...`) |
+
+```bash
+curl http://127.0.0.1:2048/ultra/v1/chat/completions \
+  -H "Authorization: Bearer <PROXY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<MODEL>", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+- **Exclusive switch**: with `ULTRA_EXCLUSIVE=true` (default), Ultra accounts only serve `/ultra` requests and normal paths use the other accounts only; with `false`, normal paths may also use Ultra accounts, while `/ultra` still uses Ultra accounts only.
+- **Models and errors**: `/ultra/v1/models` and `/ultra/v1beta/models` list only the models available on Ultra accounts. With no usable Ultra account the API returns 503; when all Ultra accounts are cooling down it returns 429 with `Retry-After`. Files, videos and other resources can only be used within the pool that created them; a cross-pool reference returns 400.
+- **Separate worker counts**: workers of Ultra accounts are counted separately from the normal pool. `ULTRA_WARM_WORKER_LIMIT` (resident, default 2; 0 means start on demand only) and `ULTRA_MAX_ACTIVE_WORKERS` (peak, default 5) can be raised to 10, 20 or whatever you need; `WARM_WORKER_LIMIT` and `MAX_ACTIVE_WORKERS` apply to the normal pool only, so the total number of browsers can reach the sum of both limits. Ultra requests never take workers from the normal pool and vice versa.
+- **Management UI**: the "Ultra pool" section of Settings edits these three settings, which apply immediately on save; the Accounts page shows how many Ultra accounts you have (ready / total) and filters by tier; the sidebar shows Ultra worker usage; requests under `/ultra` carry an Ultra tag in the request log, the request list and usage records, and the Usage page filters and groups by pool; in the API playground, tick "Use Ultra accounts" to send through `/ultra`.
+- Other unknown paths under `/ultra` return 404; the `/trace/` debugging route is not split by pool.
+
 ### Gemini Interactions
 
 The Google Gen AI SDK's `client.interactions`, TalkifyTTS, and similar clients connect to `http://127.0.0.1:2048/v1beta/interactions`; the stable endpoint is `/v1/interactions`. Like every other API call it requires `PROXY_API_KEY`, and errors use the Gemini format:
@@ -445,8 +469,11 @@ cp .env.example .env
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Maximum request execution time |
 | `FIRST_EVENT_TIMEOUT` | `0` (disabled) | How long each attempt waits for its first upstream event after sending upstream; on timeout only that attempt is abandoned and the request retries on another account, returning 504 when no retry is possible. Must be shorter than `REQUEST_TIMEOUT`; models that think for a long time may take a while to emit their first event, so leave plenty of headroom |
-| `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
-| `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
+| `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts in the normal pool (Ultra accounts excluded) |
+| `MAX_ACTIVE_WORKERS` | `10` | Maximum normal-pool workers active during peak load; the total number of browsers can reach this plus `ULTRA_MAX_ACTIVE_WORKERS` |
+| `ULTRA_EXCLUSIVE` | `true` | `true` keeps Ultra accounts for requests under the `/ultra` prefix and normal paths use the other accounts only; `false` lets normal paths use Ultra accounts too, while `/ultra` still uses Ultra accounts only |
+| `ULTRA_WARM_WORKER_LIMIT` | `2` | Resident prewarmed workers of the Ultra pool; `0` means start on demand only |
+| `ULTRA_MAX_ACTIVE_WORKERS` | `5` | Maximum Ultra-pool workers active during peak load; at least 1 and not lower than `ULTRA_WARM_WORKER_LIMIT` |
 | `WARM_STARTUP_CONCURRENCY` | `2` | Concurrent Camoufox worker cold starts: prewarming uses at most this many, and cold starts for waiting requests get one extra reserved slot and go first; `WAA_BACKEND=go` is not limited |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
@@ -459,7 +486,7 @@ cp .env.example .env
 
 The Usage page of the management UI reads the local ledger `runtime/requests.db`: every POST request that passes the API key check adds one row when it finishes (token counting requests are not recorded), giving request counts, success rate, tokens, latency percentiles, downgrade rejection rate, duplicate reply rate, breakdowns, request records and CSV export; records and rollups are kept for 90 days. If the ledger cannot be opened the service logs a WARN and keeps running.
 
-The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` limits concurrent Camoufox cold starts (prewarming can fill it, cold starts for waiting requests keep one extra slot), and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
+The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool of the normal pool, `MAX_ACTIVE_WORKERS` caps its peak worker count, the Ultra pool has its own `ULTRA_WARM_WORKER_LIMIT` and `ULTRA_MAX_ACTIVE_WORKERS` (see [Ultra Pool](#ultra-pool-ultra-prefix)), and these worker settings and `ULTRA_EXCLUSIVE` apply immediately when saved from the management UI; `WARM_STARTUP_CONCURRENCY` limits concurrent Camoufox cold starts (prewarming can fill it, cold starts for waiting requests keep one extra slot), and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 
 ### Port Configuration
 

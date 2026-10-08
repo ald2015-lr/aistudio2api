@@ -29,6 +29,7 @@
 
 - **双额度通道**: 每个账户同时拥有 Playground 与 Build 应用代理两份独立额度，`UPSTREAM_CHANNELS` 可单独或同时启用；一个通道触发限额后，同一账户由另一个通道继续
 - **多账户高并发**: 识别 Free、Pro、Ultra 与 Plus 权益，按实时模型目录在账户间轮询或优先复用
+- **Ultra 独立号池**: Ultra 账户经 `/ultra` 前缀单独调用（如 `http://127.0.0.1:2048/ultra/v1`），默认独占，Worker 常驻与峰值数单独设置
 - **两种 WAA 后端**: 默认由 Camoufox 持有官方 WAA 生命周期；设置 `WAA_BACKEND=go` 后由纯 Go 生成官方 proof，运行时不下载、不启动浏览器
 - **四套 API 协议**: OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 与 Gemini GenerateContent，另支持 Gemini Interactions
 - **主流 agent 客户端**: 支持 Claude Code、Codex、OpenCode、pi、omp、OpenClaw、Hermes 的文件读写工具调用，Claude Code、Codex、omp 的原生联网搜索可直接使用
@@ -342,6 +343,29 @@ providers:
 
 Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。
 
+### Ultra 号池（/ultra 前缀）
+
+权益为 Ultra 的账户组成单独的 Ultra 号池，其余账户（含权益尚未读取的账户）组成普通号池。把客户端的 Base URL 换成 `/ultra` 前缀，请求就只由 Ultra 账户处理；端点、鉴权（同一个 `PROXY_API_KEY`）、请求体与响应格式都和普通接口相同：
+
+| 协议 | 普通号池 Base URL | Ultra 号池 Base URL |
+| --- | --- | --- |
+| OpenAI Chat / Responses | `http://127.0.0.1:2048/v1` | `http://127.0.0.1:2048/ultra/v1` |
+| Anthropic Messages | `http://127.0.0.1:2048` | `http://127.0.0.1:2048/ultra` |
+| Gemini | `http://127.0.0.1:2048` | `http://127.0.0.1:2048/ultra`（请求 `/ultra/v1beta/...`） |
+
+```bash
+curl http://127.0.0.1:2048/ultra/v1/chat/completions \
+  -H "Authorization: Bearer <PROXY_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "<MODEL>", "messages": [{"role": "user", "content": "Hello"}]}'
+```
+
+- **独占开关**：`ULTRA_EXCLUSIVE=true`（默认）时 Ultra 账户只服务 `/ultra` 请求，普通路径只用其余账户；设为 `false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户。
+- **模型与错误**：`/ultra/v1/models`、`/ultra/v1beta/models` 只列 Ultra 账户可用的模型。没有可用的 Ultra 账户时返回 503，Ultra 账户全部冷却时返回 429 与 `Retry-After`；文件、视频等资源只能在创建它的号池内使用，跨号池引用返回 400。
+- **单独的 Worker 数**：Ultra 账户的 Worker 与普通号池分开计数，`ULTRA_WARM_WORKER_LIMIT`（常驻，默认 2，可以为 0 表示只按需启动）与 `ULTRA_MAX_ACTIVE_WORKERS`（峰值，默认 5）可按需设为 10、20 等；`WARM_WORKER_LIMIT`、`MAX_ACTIVE_WORKERS` 只约束普通号池，浏览器总数最多为两个峰值之和。Ultra 请求不会挤占普通号池的 Worker，反之亦然。
+- **管理页面**：“服务配置”的“Ultra 号池”可修改以上三项，保存后立即生效；“账户”页显示 Ultra 账户的就绪数与总数，可按权益筛选；侧栏显示 Ultra Worker 占用；请求日志、请求摘要与用量记录中经 `/ultra` 的请求带 Ultra 标记，用量页可按号池筛选与分组；API 试用勾选“使用 Ultra 账户”即经 `/ultra` 发送。
+- `/ultra` 下其余未知路径返回 404；排查路由 `/trace/` 不分号池。
+
 ### Gemini Interactions
 
 新版 Google Gen AI SDK 的 `client.interactions` 与 TalkifyTTS 等客户端连接 `http://127.0.0.1:2048/v1beta/interactions`，稳定版入口为 `/v1/interactions`。与其他接口一样必须携带 `PROXY_API_KEY`，错误按 Gemini 格式返回：
@@ -516,8 +540,11 @@ cp .env.example .env
 | `INIT_TIMEOUT` | `2m` | 单账户 WAA 初始化超时 |
 | `REQUEST_TIMEOUT` | `5m` | 单次请求最大执行时间 |
 | `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
-| `WARM_WORKER_LIMIT` | `5` | 常驻预热账户数 |
-| `MAX_ACTIVE_WORKERS` | `10` | 高峰期最多同时运行的 Worker 数 |
+| `WARM_WORKER_LIMIT` | `5` | 普通号池的常驻预热账户数（不含 Ultra 账户） |
+| `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS` 之和 |
+| `ULTRA_EXCLUSIVE` | `true` | `true` 时 Ultra 账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户 |
+| `ULTRA_WARM_WORKER_LIMIT` | `2` | Ultra 号池的常驻预热 Worker 数，可以为 `0`（只按需启动） |
+| `ULTRA_MAX_ACTIVE_WORKERS` | `5` | Ultra 号池高峰期最多同时运行的 Worker 数，至少为 1 且不小于 `ULTRA_WARM_WORKER_LIMIT` |
 | `WARM_STARTUP_CONCURRENCY` | `2` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，请求现场的冷启动另保留 1 个名额并优先；`WAA_BACKEND=go` 不受此限 |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数 |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
@@ -530,7 +557,7 @@ cp .env.example .env
 
 管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。
 
-服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
+服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制普通号池的常驻预热规模，`MAX_ACTIVE_WORKERS` 控制普通号池的峰值 Worker 上限，Ultra 号池由 `ULTRA_WARM_WORKER_LIMIT` 与 `ULTRA_MAX_ACTIVE_WORKERS` 单独控制（见 [Ultra 号池](#ultra-号池ultra-前缀)），这些 Worker 设置与 `ULTRA_EXCLUSIVE` 在管理页保存后立即生效；`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
 
 ### 端口配置
 
