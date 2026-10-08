@@ -156,3 +156,30 @@ func TestLoginSummaryReportsMissingFiles(t *testing.T) {
 		t.Fatal("其他原因的不可用不应标记为文件缺失")
 	}
 }
+
+// TestStaleLeaseDoesNotOverwriteSavedLogin 保存新登录状态之后，之前开始的租约写回旧 Cookie 被丢弃
+func TestStaleLeaseDoesNotOverwriteSavedLogin(t *testing.T) {
+	pool := testPoolWithAccount(t, "alice@example.com")
+	ctx := context.Background()
+	stale, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "alice@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stale.Release()
+	saver, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "alice@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saver.SaveStorageState(testStorageState("RELOGIN")); err != nil {
+		t.Fatal(err)
+	}
+	if err := saver.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stale.ReplaceCookies(testStorageState("OLD").Cookies); err != nil {
+		t.Fatal(err)
+	}
+	if got := diskSAPISID(t, stale.Account().StoragePath); got != "RELOGIN" {
+		t.Fatalf("重新登录后的 SAPISID 被旧租约覆盖为 %q", got)
+	}
+}

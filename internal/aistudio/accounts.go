@@ -1479,6 +1479,11 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	}
 	l.pool.mu.Lock()
 	l.account.StorageState = state
+	// 保存新的登录状态（管理端重新登录、目录监视载入新文件）与续签一样推进认证代际：
+	// 在此之前开始的租约导出的旧 Cookie 不能再写回覆盖新登录（见 authRefreshedSinceLease）
+	l.account.authGeneration++
+	l.authGeneration = l.account.authGeneration
+	l.account.authCheckedAt = time.Time{}
 	l.pool.mu.Unlock()
 	return nil
 }

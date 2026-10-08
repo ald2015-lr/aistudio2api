@@ -546,8 +546,11 @@ function responsesChunk(value: unknown): PlaygroundChunk {
   if (type !== '') return chunk
   const response = isRecord(value) && isRecord(value.response) ? value.response : value
   if (!isRecord(response)) return chunk
-  if (typeof response.output_text === 'string') chunk.text += response.output_text
-  if (!Array.isArray(response.output)) return chunk
+  // output_text 是 output 中全部消息正文的合并，两者都累加会把正文显示两遍；只在没有 output 时使用
+  if (!Array.isArray(response.output)) {
+    if (typeof response.output_text === 'string') chunk.text = response.output_text
+    return chunk
+  }
   for (const item of response.output) {
     if (!isRecord(item)) continue
     if (item.type === 'reasoning' && Array.isArray(item.summary)) {

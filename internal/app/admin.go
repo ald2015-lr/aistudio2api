@@ -728,24 +728,32 @@ func (admin *runtimeAdmin) RuntimeConfig(context.Context) (api.RuntimeConfig, er
 	return runtimeConfigDTO(cfg), nil
 }
 
+// invalidConfigError 表示管理页面提交的配置无效，返回 400 invalid_config（原先按上游错误返回 502）
+func invalidConfigError(err error) error {
+	return &adminOperationError{status: http.StatusBadRequest, code: "invalid_config", message: err.Error()}
+}
+
 func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.RuntimeConfig) (api.RuntimeConfig, error) {
 	initTimeout, err := time.ParseDuration(value.InitTimeout)
 	if err != nil {
-		return api.RuntimeConfig{}, fmt.Errorf("INIT_TIMEOUT 无效: %w", err)
+		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("INIT_TIMEOUT 无效: %w", err))
 	}
 	requestTimeout, err := time.ParseDuration(value.RequestTimeout)
 	if err != nil {
-		return api.RuntimeConfig{}, fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err)
+		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err))
 	}
-	// 管理页面不编辑 AUTO_START 与 ADMIN_PASSWORD，保存时沿用 .env 中的现值，避免被整体重写抹掉
-	autoStart := config.Default().AutoStart
-	adminPassword := ""
-	downgradeGuard := config.DefaultDowngradeGuard()
-	if saved, loadErr := config.Load(admin.configPath); loadErr == nil {
-		autoStart = saved.AutoStart
-		adminPassword = saved.AdminPassword
-		downgradeGuard = saved.DowngradeGuard
+	// 管理页面不编辑 AUTO_START 与 ADMIN_PASSWORD，保存时沿用 .env 中的现值，避免被整体重写抹掉。
+	// 现有 .env 读不出来时不保存：原先按默认值继续，会用空的 ADMIN_PASSWORD 与默认降级判定设置覆盖写盘
+	saved, loadErr := config.Load(admin.configPath)
+	if loadErr != nil {
+		return api.RuntimeConfig{}, &adminOperationError{
+			status: http.StatusConflict, code: "config_unreadable",
+			message: "现有配置文件读取失败，未保存（请先修正 .env）: " + loadErr.Error(),
+		}
 	}
+	autoStart := saved.AutoStart
+	adminPassword := saved.AdminPassword
+	downgradeGuard := saved.DowngradeGuard
 	// 降级判定设置：旧版页面保存时不带该字段，沿用现值
 	if value.DowngradeGuard != nil {
 		downgradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -766,6 +774,9 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		AutoStart:              autoStart,
 		AdminPassword:          adminPassword,
 		DowngradeGuard:         downgradeGuard,
+	}
+	if err := cfg.Validate(); err != nil {
+		return api.RuntimeConfig{}, invalidConfigError(err)
 	}
 	if err := cfg.Save(admin.configPath); err != nil {
 		return api.RuntimeConfig{}, err

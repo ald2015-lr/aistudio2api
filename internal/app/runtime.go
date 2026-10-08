@@ -3621,7 +3621,7 @@ func (service *trackedService) generateWithRetry(
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
-			} else if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, selection) {
+			} else if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
 				delete(attempted, request.AccountID)
 				maxAttempts++
 			}
@@ -3732,6 +3732,14 @@ func (service *trackedService) generateWithRetry(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
 	)
+}
+
+// channelFallback 返回判断“同一账号能否换通道重试”用的选号条件：去掉 PlaygroundFirst（降级判定的通道偏好，
+// Playground 没有可用账号时本来就会退回其他通道），保留 BuildOnly、PlaygroundOnly 等硬性限制。
+// 原先带着 PlaygroundFirst 判断，Playground 冷却后同一账号的 Build 通道永远不会被尝试
+func channelFallback(selection aistudio.AccountSelection) aistudio.AccountSelection {
+	selection.PlaygroundFirst = false
+	return selection
 }
 
 // applyQuotaCooldown 在上游返回额度 429 时冷却该账号的模型（或整个账号），并记录日志；
