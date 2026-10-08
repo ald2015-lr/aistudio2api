@@ -63,6 +63,17 @@ func inPartition(accountIDs []string, ultra map[string]struct{}, partition aistu
 	return result
 }
 
+// openingIn 判断分区内是否有正在启动的 Worker；调用方持有 rebalanceMu。
+// 另一个分区的启动不影响本分区的淘汰选号与空闲回收
+func (manager *accountWorkerManager) openingIn(partition aistudio.PoolScope, ultra map[string]struct{}) bool {
+	for accountID := range manager.openings {
+		if partitionOf(accountID, ultra) == partition {
+			return true
+		}
+	}
+	return false
+}
+
 // warmAccountIDsIn 返回分区内驻留的 Worker
 func (manager *accountWorkerManager) warmAccountIDsIn(partition aistudio.PoolScope) []string {
 	return inPartition(manager.WarmAccountIDs(), manager.pool.UltraAccountIDs(), partition)
@@ -83,15 +94,22 @@ func (manager *accountWorkerManager) prewarmTargetFrom(partition aistudio.PoolSc
 
 // prewarmNeeded 判断是否有分区的驻留与启动中 Worker 少于该分区的预热目标
 func (manager *accountWorkerManager) prewarmNeeded() bool {
+	_, short := manager.shortPartition()
+	return short
+}
+
+// shortPartition 返回第一个驻留与启动中 Worker 少于预热目标的分区。按分区判断：
+// 一个分区按需扩容超出常驻数时，不能掩盖另一个分区预热不足
+func (manager *accountWorkerManager) shortPartition() (aistudio.PoolScope, bool) {
 	ultra := manager.pool.UltraAccountIDs()
 	warm, opening := manager.WarmAccountIDs(), manager.OpeningAccountIDs()
 	summary := manager.bootstrapSummary()
 	for _, partition := range workerPartitions {
 		if len(inPartition(warm, ultra, partition))+len(inPartition(opening, ultra, partition)) < manager.prewarmTargetFrom(partition, summary) {
-			return true
+			return partition, true
 		}
 	}
-	return false
+	return aistudio.PoolScopeAll, false
 }
 
 // workerLogName 返回分区在运行日志里的 Worker 名称：普通分区沿用原有写法，Ultra 分区加前缀
@@ -111,9 +129,14 @@ func workerSlotName(partition aistudio.PoolScope) string {
 }
 
 // fillTargetFor 返回预热循环中分区要补齐到的常驻数：普通分区按 WARM_WORKER_LIMIT；Ultra 分区按 ULTRA_WARM_WORKER_LIMIT，
-// 没有可预热的 Ultra 账户时为 0，没有 Ultra 账户的部署不会为空分区反复分类候选
+// 没有可预热的 Ultra 账户时为 0，没有 Ultra 账户的部署不会为空分区反复分类候选。
+// 可预热的账户都是 Ultra 时普通分区同样为 0：只有 Ultra 账户（或普通账户都不可用）的部署按 Ultra 分区完成预热，
+// Ultra 常驻数为 0 时直接完成首轮预热、Ultra Worker 按需启动；没有可预热账户时仍按原来的方式报错
 func (manager *accountWorkerManager) fillTargetFor(partition aistudio.PoolScope, summary aistudio.BootstrapSummary) int {
 	if partition == aistudio.PoolScopeUltra && summary.UltraAvailable == 0 {
+		return 0
+	}
+	if partition == aistudio.PoolScopeNormal && summary.UltraAvailable > 0 && summary.Available == summary.UltraAvailable {
 		return 0
 	}
 	return manager.warmTargetFor(partition)

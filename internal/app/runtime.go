@@ -476,7 +476,8 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolScope, before time.Time) bool {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
-	if len(manager.openings) > 0 || len(manager.warmAccountIDsIn(partition)) <= manager.warmTargetFor(partition) {
+	ultra := manager.pool.UltraAccountIDs()
+	if manager.openingIn(partition, ultra) || len(inPartition(manager.WarmAccountIDs(), ultra, partition)) <= manager.warmTargetFor(partition) {
 		return false
 	}
 	victim := manager.idleWarmVictimFor("", "", false, partition)
@@ -1418,12 +1419,8 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			return preparer, err
 		}
-		victim := ""
-		if len(manager.openings) == 0 {
-			victim = manager.idleWarmVictimFor(accountID, modelID, false, partition)
-		} else {
-			victim = manager.idleWarmVictimFor(accountID, modelID, true, partition)
-		}
+		// 同分区有 Worker 正在启动时只淘汰冷却中的空闲 Worker
+		victim := manager.idleWarmVictimFor(accountID, modelID, manager.openingIn(partition, ultra), partition)
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
 		if victim != "" && !manager.tryReserveVictim(victim) {
 			victim = ""
@@ -1805,9 +1802,11 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				case readyCount > 0:
 					reason = "等待本轮启动结果"
 				}
-				if len(warm) < manager.PrewarmTarget() {
+				// 按分区判断是否预热不足，日志写出该分区的计数（没有 Ultra 账户时与总数相同）
+				if short, needed := manager.shortPartition(); needed {
 					manager.noteWarmIdle(level, reason, fmt.Sprintf(
-						"WAA Worker 预热等待 | Worker=%d/%d | 原因=%s", len(warm), manager.PrewarmTarget(), reason,
+						"%s 预热等待 | Worker=%d/%d | 原因=%s",
+						workerLogName(short), len(manager.warmAccountIDsIn(short)), manager.prewarmTargetFor(short), reason,
 					))
 				}
 				if launched > 0 {

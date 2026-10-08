@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -412,4 +413,203 @@ func TestRotationStaysInPartition(t *testing.T) {
 	if hot := manager.hotModelList(); !slices.Equal(hot, []string{testRuntimeModel}) {
 		t.Fatalf("热门冷却模型 = %v", hot)
 	}
+}
+
+// serviceLogMessages 返回已记录的运行日志
+func serviceLogMessages(requests *requestRegistry) []string {
+	requests.mu.Lock()
+	defer requests.mu.Unlock()
+	messages := make([]string, 0, len(requests.logs))
+	for _, entry := range requests.logs {
+		messages = append(messages, entry.Message)
+	}
+	return messages
+}
+
+// TestPrewarmUltraOnlyDeployment 只有 Ultra 账户的部署：普通分区没有可预热的账户，不为空分区分类候选；
+// Ultra 常驻数为 0 时首轮预热直接完成（Ultra Worker 按需启动），常驻数大于 0 时补齐 Ultra 分区后记录预热完成
+func TestPrewarmUltraOnlyDeployment(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		ultraWarm int
+	}{
+		{name: "Ultra 常驻数为 0", ultraWarm: 0},
+		{name: "Ultra 常驻数为 2", ultraWarm: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager, _, requests := partitionTestManager(t, nil, []string{partitionUltraA, partitionUltraB}, 1, 3, test.ultraWarm, 3)
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := <-manager.StartPrewarm(ctx); err != nil {
+				t.Fatalf("只有 Ultra 账户时首轮预热失败: %v", err)
+			}
+			manager.waitPrewarm()
+			if got := len(manager.warmAccountIDsIn(aistudio.PoolScopeUltra)); got != test.ultraWarm {
+				t.Fatalf("Ultra 分区驻留 %d 个，期望 %d", got, test.ultraWarm)
+			}
+			if manager.prewarmNeeded() {
+				t.Fatal("两个分区都已达标，不应再预热")
+			}
+			if reason := manager.prewarmState().Reason; reason != "" {
+				t.Fatalf("预热不应记录等待原因: %q", reason)
+			}
+			for _, message := range serviceLogMessages(requests) {
+				if strings.Contains(message, "预热暂停") {
+					t.Fatalf("补齐全部分区后不应记录预热暂停: %q", message)
+				}
+			}
+		})
+	}
+}
+
+// gateLaunch 让账户的 Worker 停在启动中直到放行（其他账户照常立即启动），返回放行函数；需在管理器启动任何 Worker 之前调用
+func gateLaunch(manager *accountWorkerManager, accountID string) func() {
+	gate := make(chan struct{})
+	launch := manager.launch
+	manager.launch = func(ctx context.Context, id string, options camoufoxnative.Options) (*aistudio.NativeWorker, error) {
+		if id == accountID {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return launch(ctx, id, options)
+	}
+	return func() { close(gate) }
+}
+
+// startOpening 在后台启动账户的 Worker 并等到它进入启动中，返回启动结束时关闭的通道
+func startOpening(t *testing.T, ctx context.Context, manager *accountWorkerManager, accountID string) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = manager.promote(ctx, accountID, testRuntimeModel)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for !slices.Contains(manager.OpeningAccountIDs(), accountID) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s 的 Worker 没有进入启动中", accountID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return done
+}
+
+// TestOpeningOnlyGatesOwnPartition 只有同分区正在启动的 Worker 才影响淘汰选号与空闲回收：
+// Ultra Worker 启动期间，普通分区照常替换空闲的普通 Worker、回收超出常驻数的空闲普通 Worker；
+// 普通 Worker 启动期间，Ultra 请求照常在 Ultra 分区内替换空闲的 Ultra Worker，不必等普通 Worker 启动结束
+func TestOpeningOnlyGatesOwnPartition(t *testing.T) {
+	t.Run("替换空闲 Worker", func(t *testing.T) {
+		manager, _, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB}, []string{partitionUltraA}, 1, 1, 1, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		release := gateLaunch(manager, partitionUltraA)
+		if _, err := manager.promote(ctx, partitionNormalA, testRuntimeModel); err != nil {
+			t.Fatal(err)
+		}
+		opening := startOpening(t, ctx, manager, partitionUltraA)
+		defer func() { release(); <-opening }()
+		if _, err := manager.promote(ctx, partitionNormalB, testRuntimeModel); err != nil {
+			t.Fatalf("Ultra Worker 启动期间，普通分区内替换空闲普通 Worker 失败: %v", err)
+		}
+		if got := manager.warmAccountIDsIn(aistudio.PoolScopeNormal); !slices.Equal(got, []string{partitionNormalB}) {
+			t.Fatalf("普通分区驻留 Worker = %v，期望只有 %s", got, partitionNormalB)
+		}
+	})
+	t.Run("空闲回收", func(t *testing.T) {
+		manager, _, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB}, []string{partitionUltraA}, 1, 3, 1, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		release := gateLaunch(manager, partitionUltraA)
+		for _, accountID := range []string{partitionNormalA, partitionNormalB} {
+			if _, err := manager.promote(ctx, accountID, testRuntimeModel); err != nil {
+				t.Fatal(err)
+			}
+		}
+		opening := startOpening(t, ctx, manager, partitionUltraA)
+		defer func() { release(); <-opening }()
+		later := time.Now().Add(time.Hour)
+		for manager.reapIdleWorker(later) {
+		}
+		if got := len(manager.warmAccountIDsIn(aistudio.PoolScopeNormal)); got != 1 {
+			t.Fatalf("Ultra Worker 启动期间普通分区超出常驻数的空闲 Worker 没有回收，普通分区驻留 %d 个", got)
+		}
+		if !slices.Contains(manager.OpeningAccountIDs(), partitionUltraA) {
+			t.Fatal("Ultra Worker 应仍在启动中")
+		}
+	})
+	t.Run("Ultra 请求在普通 Worker 启动期间替换", func(t *testing.T) {
+		manager, pool, requests := partitionTestManager(t,
+			[]string{partitionNormalA, partitionNormalB}, []string{partitionUltraA, partitionUltraB}, 1, 3, 1, 1)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		release := gateLaunch(manager, partitionNormalB)
+		for _, accountID := range []string{partitionNormalA, partitionUltraA} {
+			if _, err := manager.promote(ctx, accountID, testRuntimeModel); err != nil {
+				t.Fatal(err)
+			}
+		}
+		opening := startOpening(t, ctx, manager, partitionNormalB)
+		defer func() { release(); <-opening }()
+		service := &trackedService{lifecycle: ctx, pool: pool, requests: requests, workers: manager}
+		type acquired struct {
+			lease *aistudio.AccountLease
+			err   error
+		}
+		result := make(chan acquired, 1)
+		go func() {
+			lease, err := service.acquireWarmLease(aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra),
+				aistudio.AccountSelection{ModelID: partitionUltraModel, Method: "generateContent"})
+			result <- acquired{lease: lease, err: err}
+		}()
+		select {
+		case got := <-result:
+			if got.err != nil {
+				t.Fatalf("Ultra 请求调度失败: %v", got.err)
+			}
+			defer got.lease.Release()
+			if got.lease.Account().ID != partitionUltraB {
+				t.Fatalf("Ultra 请求用到了 %s", got.lease.Account().ID)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("普通 Worker 启动期间，Ultra 请求没有在 Ultra 分区内替换空闲的 Ultra Worker")
+		}
+		if !slices.Contains(manager.OpeningAccountIDs(), partitionNormalB) {
+			t.Fatal("普通 Worker 应仍在启动中")
+		}
+	})
+}
+
+// TestPrewarmReasonForShortPartition 一个分区预热不上而另一个分区按需扩容超出常驻数时，总数达标也要记录等待原因，
+// 日志写明是哪个分区
+func TestPrewarmReasonForShortPartition(t *testing.T) {
+	manager, _, requests := partitionTestManager(t,
+		[]string{partitionNormalA, partitionNormalB, partitionNormalC}, []string{partitionUltraA, partitionUltraB}, 1, 3, 2, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, accountID := range []string{partitionNormalA, partitionNormalB, partitionNormalC} {
+		if _, err := manager.promote(ctx, accountID, testRuntimeModel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manager.noteWarmFailure(partitionUltraA)
+	manager.noteWarmFailure(partitionUltraB)
+	if err := <-manager.StartPrewarm(ctx); err != nil {
+		t.Fatalf("预热失败: %v", err)
+	}
+	manager.waitPrewarm()
+	if got := len(manager.warmAccountIDsIn(aistudio.PoolScopeUltra)); got != 0 {
+		t.Fatalf("Ultra 账户都在预热失败冷却中，Ultra 分区驻留 %d 个，期望 0", got)
+	}
+	if reason := manager.prewarmState().Reason; reason == "" {
+		t.Fatal("Ultra 分区预热不上，预热状态却没有记录原因")
+	}
+	for _, message := range serviceLogMessages(requests) {
+		if strings.HasPrefix(message, "Ultra WAA Worker 预热等待 | Worker=0/2") {
+			return
+		}
+	}
+	t.Fatalf("没有记录 Ultra 分区的预热等待日志: %q", serviceLogMessages(requests))
 }
