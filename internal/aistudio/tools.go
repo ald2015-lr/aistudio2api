@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 func encodeRequestedTools(tools Tools) ([]any, bool, error) {
@@ -115,27 +116,33 @@ func encodeGoogleTimestamp(value time.Time) []any {
 // 不让整个请求失败：改为只编码层级与类型（toolSchemaShape），并把完整 Schema 附在函数说明里交给模型遵守。
 // strict 函数同样附上完整 Schema。超过大小或嵌套上限的 Schema 仍直接报错
 func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
+	wire, _, err := encodeFunctionDeclarationHint(declaration)
+	return wire, err
+}
+
+// encodeFunctionDeclarationHint 同 encodeFunctionDeclaration，另返回附在说明里的完整 Schema 提示字数（没有附时为 0）
+func encodeFunctionDeclarationHint(declaration FunctionDeclaration) ([]any, int64, error) {
 	if declaration.Name == "" {
-		return nil, fmt.Errorf("function declaration 缺少名称")
+		return nil, 0, fmt.Errorf("function declaration 缺少名称")
 	}
 	raw := normalizeFunctionParameters(declaration.Parameters)
 	parameters, err := encodeJSONSchema(raw)
 	degraded := false
 	if err != nil {
 		if isSchemaLimitError(err) {
-			return nil, fmt.Errorf("parameters: %w", err)
+			return nil, 0, fmt.Errorf("parameters: %w", err)
 		}
 		var schema any
 		if json.Unmarshal(raw, &schema) != nil {
-			return nil, fmt.Errorf("parameters: %w", err)
+			return nil, 0, fmt.Errorf("parameters: %w", err)
 		}
 		shape, marshalErr := json.Marshal(toolSchemaShape(schema, 0))
 		if marshalErr != nil {
-			return nil, marshalErr
+			return nil, 0, marshalErr
 		}
 		parameters, err = encodeJSONSchema(shape)
 		if err != nil {
-			return nil, fmt.Errorf("parameters: %w", err)
+			return nil, 0, fmt.Errorf("parameters: %w", err)
 		}
 		degraded = true
 	}
@@ -147,7 +154,12 @@ func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
 	if description != "" {
 		wireDescription = description
 	}
-	return []any{declaration.Name, wireDescription, parameters}, nil
+	return []any{declaration.Name, wireDescription, parameters}, schemaHintChars(declaration.Description, description), nil
+}
+
+// schemaHintChars 返回说明因附上完整 Schema 增加的字数
+func schemaHintChars(before string, after string) int64 {
+	return max(int64(utf8.RuneCountInString(after)-utf8.RuneCountInString(before)), 0)
 }
 
 // maxSchemaHintBytes 为附在函数说明里的完整 Schema 的大小上限，超过时不附
@@ -166,26 +178,33 @@ func appendSchemaHint(description string, prefix string, raw json.RawMessage) st
 // 只编码层级与类型，把完整 Schema 附在根节点说明里交给模型遵守（原先整个请求返回 400）。
 // 超过大小或嵌套上限的 Schema 仍直接报错；Build 通道原样发送 responseJsonSchema，不经过这里
 func encodeResponseSchema(raw json.RawMessage) ([]any, error) {
+	wire, _, err := encodeResponseSchemaHint(raw)
+	return wire, err
+}
+
+// encodeResponseSchemaHint 同 encodeResponseSchema，另返回降级时附在根说明里的完整 Schema 提示字数（没有附时为 0）
+func encodeResponseSchemaHint(raw json.RawMessage) ([]any, int64, error) {
 	wire, err := encodeJSONSchema(raw)
 	if err == nil || isSchemaLimitError(err) {
-		return wire, err
+		return wire, 0, err
 	}
 	var schema any
 	if json.Unmarshal(raw, &schema) != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	shape := toolSchemaShape(schema, 0)
 	description, _ := shape["description"].(string)
-	shape["description"] = appendSchemaHint(description, "The response must follow this JSON Schema: ", raw)
+	hinted := appendSchemaHint(description, "The response must follow this JSON Schema: ", raw)
+	shape["description"] = hinted
 	encoded, marshalErr := json.Marshal(shape)
 	if marshalErr != nil {
-		return nil, marshalErr
+		return nil, 0, marshalErr
 	}
 	wire, shapeErr := encodeJSONSchema(encoded)
 	if shapeErr != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return wire, nil
+	return wire, schemaHintChars(description, hinted), nil
 }
 
 // toolSchemaShape 提取工具参数的层级与类型，供 Playground 编码；depth 防止病态嵌套

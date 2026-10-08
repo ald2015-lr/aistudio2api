@@ -3546,6 +3546,10 @@ func (service *trackedService) generateWithRetry(
 				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "上游已返回响应头")
 			}
 		})
+		// 降级判定的输入字数按本次尝试实际发送的内容（工具约束提示、附带的 Schema、截断之后）校准
+		if gate := diag.guard(); gate != nil {
+			attemptCtx = aistudio.ContextWithSentInputObserver(attemptCtx, gate.observeSentInput)
+		}
 		if err == nil {
 			source, err = service.service.Generate(attemptCtx, request)
 		}

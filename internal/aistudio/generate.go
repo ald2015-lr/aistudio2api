@@ -596,6 +596,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return nil, err
 		}
 	}
+	// 降级判定按实际发送的输入校准"字数 → token"比例：此时工具约束已写进系统指令、函数已按指定筛选、对话已截断
+	channel := ChannelPlayground
+	if build {
+		channel = ChannelBuild
+	}
+	reportSentInput(ctx, channel, request)
 	if entry.defaults.InteractionStream && !build {
 		return c.generateInteraction(ctx, request, entry)
 	}

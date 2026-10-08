@@ -153,19 +153,17 @@ func downgradeGuardSummary(guard config.DowngradeGuard) string {
 
 // downgradeGate 为一次被拦截模型请求的降级判定
 type downgradeGate struct {
-	service    *trackedService
-	settings   *downgradeSettings
-	requestID  string
-	model      string
-	family     string
-	mode       string
-	clientCtx  context.Context
-	cancel     context.CancelFunc
-	system     string
-	contents   []aistudio.Content
-	memoryKey  string
-	inputChars int64
-	hasMedia   bool
+	service   *trackedService
+	settings  *downgradeSettings
+	requestID string
+	model     string
+	family    string
+	mode      string
+	clientCtx context.Context
+	cancel    context.CancelFunc
+	system    string
+	contents  []aistudio.Content
+	memoryKey string
 
 	// 以下由 forwardEvents 在拿到账号后写入（attach），判定 goroutine 读取
 	mu           sync.Mutex
@@ -174,6 +172,9 @@ type downgradeGate struct {
 	channel      string
 	accountLabel string
 	rejected     *aistudio.ModelDowngradedError
+	// inputChars、hasMedia 为输入字数与是否含附件：准备判定时按客户端请求计算，每次尝试编码前按实际发送的输入更新
+	inputChars int64
+	hasMedia   bool
 }
 
 // prepareDowngradeGate 为被拦截的模型准备判定；不拦截时返回 nil。同一段对话近期被判定为降级、且当时的消息原样都在时
@@ -194,7 +195,8 @@ func (service *trackedService) prepareDowngradeGate(ctx context.Context, request
 			gate.mode = gateModeFast
 		}
 	}
-	// 字数按实际发往上游的内容（含随机后缀）计算：上游输入 token 数包含后缀，分母不含后缀会让短提示词的比例被放大数倍
+	// 字数按实际发往上游的内容（含随机后缀）计算：上游输入 token 数包含后缀，分母不含后缀会让短提示词的比例被放大数倍。
+	// 每次尝试编码前再按改写后的实际输入更新（observeSentInput）
 	gate.inputChars, gate.hasMedia = guardInputSize(request.System, request.Contents, request.Tools)
 	if settings.memory <= 0 || len(contents) == 0 {
 		return gate, nil
@@ -287,11 +289,33 @@ func (gate *downgradeGate) channelTitle() string {
 	}
 }
 
+// observeSentInput 按本次尝试实际发往上游的输入更新字数：工具约束写进系统指令、strict 或降级的 Schema 附在函数说明里、
+// truncation=auto 删除的较早轮次都会改变上游的输入 token 数，分母仍按客户端原始请求计算会让比例失真。
+// 没有这些改写的普通请求算出的字数与准备判定时相同
+func (gate *downgradeGate) observeSentInput(input aistudio.SentInput) {
+	if gate == nil {
+		return
+	}
+	chars, media := guardInputSize(input.System, input.Contents, input.Tools)
+	chars += input.SchemaHintChars
+	gate.mu.Lock()
+	gate.inputChars, gate.hasMedia = chars, media
+	gate.mu.Unlock()
+}
+
+// inputSize 返回当前的输入字数与是否含附件
+func (gate *downgradeGate) inputSize() (int64, bool) {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	return gate.inputChars, gate.hasMedia
+}
+
 // tokenRatio 返回"字数 → token"的估算比例。upper 为真时比例只是上限（输入含附件，或没有上游输入数时按 1 token/字），
 // 按它估算出的速度偏高，只能作为放行依据，不能单独作为拒绝依据
 func (gate *downgradeGate) tokenRatio(promptTokens int64) (float64, bool) {
-	if promptTokens > 0 && gate.inputChars > 0 {
-		return float64(promptTokens) / float64(gate.inputChars), gate.hasMedia
+	inputChars, hasMedia := gate.inputSize()
+	if promptTokens > 0 && inputChars > 0 {
+		return float64(promptTokens) / float64(inputChars), hasMedia
 	}
 	return 1, true
 }
@@ -962,11 +986,12 @@ func (run *downgradeRun) finalDecision() (aistudio.DowngradeDecision, bool, bool
 // sampleBuildEstimate 统计 Build 通道按比例估算的正文 token 与最终真实数的偏差（判断估算是否可靠）
 func (run *downgradeRun) sampleBuildEstimate() {
 	gate, meter := run.gate, &run.meter
-	if gate.channelName() != string(aistudio.ChannelBuild) || gate.hasMedia || meter.promptTokens <= 0 || gate.inputChars <= 0 ||
+	inputChars, hasMedia := gate.inputSize()
+	if gate.channelName() != string(aistudio.ChannelBuild) || hasMedia || meter.promptTokens <= 0 || inputChars <= 0 ||
 		meter.finalOutput <= 0 || meter.totalChars <= 0 {
 		return
 	}
-	ratio := float64(meter.promptTokens) / float64(gate.inputChars)
+	ratio := float64(meter.promptTokens) / float64(inputChars)
 	downgradeStats.buildSample(float64(meter.totalChars)*ratio, meter.finalOutput)
 }
 
