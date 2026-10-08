@@ -183,3 +183,34 @@ func TestUpdateRuntimeConfigKeepsRequestBodyLog(t *testing.T) {
 		t.Fatalf("保存后 REQUEST_BODY_LOG=%v err=%v，期望沿用 true", saved.RequestBodyLog, err)
 	}
 }
+
+// TestUltraLedgerRows Ultra 路由的请求去掉 /ultra 前缀后归类协议，账本记录带 pool=ultra 并保留带前缀的路径
+func TestUltraLedgerRows(t *testing.T) {
+	for path, want := range map[string]string{
+		"/ultra/v1/chat/completions":                          "openai-chat",
+		"/ultra/v1/responses":                                 "openai-responses",
+		"/ultra/v1/messages":                                  "anthropic",
+		"/ultra/v1/messages/count_tokens":                     "count_tokens",
+		"/ultra/v1beta/models/gemini-x:streamGenerateContent": "gemini",
+		"/ultra/v1beta/models/gemini-x:countTokens":           "count_tokens",
+		"/ultra/v1beta/interactions":                          "interactions",
+		"/ultra/v1/images/generations":                        "images",
+		"/ultra/v1/files":                                     "files",
+	} {
+		if got := requestProtocol(path); got != want {
+			t.Fatalf("requestProtocol(%q) = %q，期望 %q", path, got, want)
+		}
+	}
+	if ledgerEntry(api.AccessLog{Method: http.MethodPost, Path: "/ultra/v1/messages/count_tokens", Authorized: true}) {
+		t.Fatal("Ultra 路由的计数请求同样不计入账本")
+	}
+	row := requestRow(api.AccessLog{
+		RequestID: "req_ultra", Method: http.MethodPost, Path: "/ultra/v1/chat/completions", Status: http.StatusOK, Pool: "ultra",
+	}, time.Now().UTC())
+	if row.Pool != "ultra" || row.Protocol != "openai-chat" || row.Path != "/ultra/v1/chat/completions" {
+		t.Fatalf("Ultra 账本记录不对: %+v", row)
+	}
+	if row := requestRow(api.AccessLog{RequestID: "req_normal", Method: http.MethodPost, Path: "/v1/chat/completions"}, time.Now().UTC()); row.Pool != "" {
+		t.Fatalf("普通请求的账本号池应为空，实际 %q", row.Pool)
+	}
+}

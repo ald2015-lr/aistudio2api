@@ -302,3 +302,22 @@ func TestUltraBodyCapture(t *testing.T) {
 		t.Fatalf("/ultra 请求正文没有保存: %+v", ledger.bodies)
 	}
 }
+
+// TestUsagePoolDimension 用量接口接受号池筛选，号池可以作为堆叠维度，记录查询同样接受号池筛选
+func TestUsagePoolDimension(t *testing.T) {
+	ledger := &fakeLedger{}
+	handler := ledgerTestHandler(ledger)
+	if recorder := adminGet(handler, "/api/usage?"+usageRange()+"&stack=pool&pool=ultra"); recorder.Code != http.StatusOK {
+		t.Fatalf("按号池堆叠与筛选：%d %s", recorder.Code, recorder.Body.String())
+	}
+	query := ledger.usage[0]
+	if query.Stack != "pool" || strings.Join(query.Filters["pool"], ",") != UsagePoolUltra {
+		t.Fatalf("号池参数不对: stack=%s filters=%+v", query.Stack, query.Filters)
+	}
+	if recorder := adminGet(handler, "/api/usage/records?"+usageRange()+"&pool=normal,ultra"); recorder.Code != http.StatusOK {
+		t.Fatalf("记录按号池筛选：%d %s", recorder.Code, recorder.Body.String())
+	}
+	if got := strings.Join(ledger.records[0].Filters["pool"], ","); got != "normal,ultra" {
+		t.Fatalf("记录的号池筛选 = %q", got)
+	}
+}

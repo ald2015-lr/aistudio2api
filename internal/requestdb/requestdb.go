@@ -59,25 +59,30 @@ const rollupFields = `requests, input_tokens, reasoning_tokens, reply_tokens, to
  duration_hist, first_event_hist, last_time`
 
 // rollupKeyFields 是汇总表的主键列
-const rollupKeyFields = `start, model, account, channel, protocol, state, status`
+const rollupKeyFields = `start, model, account, channel, protocol, state, status, pool`
 
-// rollupColumns 是小时与本地日汇总表的列，start 是分段起点
+// rollupColumnsV1 是加入号池之前的小时与本地日汇总表的列（迁移旧账本时按它复制）
+const rollupColumnsV1 = `start, model, account, channel, protocol, state, status, ` + rollupFields
+
+// rollupColumns 是小时与本地日汇总表的列，start 是分段起点；pool 为请求的号池（ultra，普通号池为空），
+// 放在最后，与旧账本迁移时追加的列位置一致
 const rollupColumns = `
  start INTEGER NOT NULL, model TEXT NOT NULL, account TEXT NOT NULL, channel TEXT NOT NULL, protocol TEXT NOT NULL,
  state TEXT NOT NULL, status INTEGER NOT NULL, requests INTEGER NOT NULL,
  input_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL, reply_tokens INTEGER NOT NULL, total_tokens INTEGER NOT NULL,
  duration_ms INTEGER NOT NULL, first_event_ms INTEGER NOT NULL, first_events INTEGER NOT NULL, queue_ms INTEGER NOT NULL,
  downgrade_checked INTEGER NOT NULL, downgrade_rejected INTEGER NOT NULL, replies INTEGER NOT NULL, duplicates INTEGER NOT NULL,
- duration_hist BLOB NOT NULL, first_event_hist BLOB NOT NULL, last_time INTEGER NOT NULL,
- PRIMARY KEY (start, model, account, channel, protocol, state, status)`
+ duration_hist BLOB NOT NULL, first_event_hist BLOB NOT NULL, last_time INTEGER NOT NULL, pool TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY (start, model, account, channel, protocol, state, status, pool)`
 
 // requestFields 是原始记录表的列，写入按这个顺序
 const requestFields = `id, time, protocol, path, model, account, channel, status, state,
  duration_ms, first_event_ms, queue_ms, input_tokens, reasoning_tokens, reply_tokens, total_tokens, tool_calls,
- error, attempts, served_model, downgrade, reply_hash, duplicate`
+ error, attempts, served_model, downgrade, reply_hash, duplicate, pool`
 
 // 本地相对上游新增 served_model（上游标明的实际模型）、downgrade（降级判定结论）、reply_hash（回复正文指纹）
-// 与 duplicate（窗口内出现过相同回复），用于统计降级拦截率与重复回复率；指纹只用于比对，不保存回复内容
+// 与 duplicate（窗口内出现过相同回复），用于统计降级拦截率与重复回复率；指纹只用于比对，不保存回复内容。
+// pool 为请求的号池（经 /ultra 进入的请求为 ultra，其余为空），旧账本打开时由 migrate 补上（见 migrate）
 const schema = `
 CREATE TABLE IF NOT EXISTS requests (
  id TEXT PRIMARY KEY, time INTEGER NOT NULL, protocol TEXT NOT NULL, path TEXT NOT NULL,
@@ -85,7 +90,8 @@ CREATE TABLE IF NOT EXISTS requests (
  duration_ms INTEGER NOT NULL, first_event_ms INTEGER NOT NULL, queue_ms INTEGER NOT NULL,
  input_tokens INTEGER NOT NULL, reasoning_tokens INTEGER NOT NULL, reply_tokens INTEGER NOT NULL,
  total_tokens INTEGER NOT NULL, tool_calls INTEGER NOT NULL, error TEXT NOT NULL, attempts TEXT NOT NULL,
- served_model TEXT NOT NULL, downgrade TEXT NOT NULL, reply_hash TEXT NOT NULL, duplicate INTEGER NOT NULL);
+ served_model TEXT NOT NULL, downgrade TEXT NOT NULL, reply_hash TEXT NOT NULL, duplicate INTEGER NOT NULL,
+ pool TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS requests_time ON requests(time);
 CREATE INDEX IF NOT EXISTS requests_model_time ON requests(model, time);
 CREATE INDEX IF NOT EXISTS requests_account_time ON requests(account, time);
@@ -124,6 +130,8 @@ type Row struct {
 	Downgrade string
 	// ReplyHash 为回复正文指纹，只用于判断两次回复是否相同
 	ReplyHash string
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	Pool string
 }
 
 // countedReply 判断记录是否参与重复回复统计
@@ -177,6 +185,9 @@ func Open(path string, log Logger) (*Store, error) {
 	db.SetMaxOpenConns(4)
 	if _, err := db.Exec(schema); err != nil {
 		return nil, errors.Join(fmt.Errorf("初始化请求账本: %w", err), db.Close())
+	}
+	if err := migrate(db, log); err != nil {
+		return nil, errors.Join(fmt.Errorf("升级请求账本: %w", err), db.Close())
 	}
 	store := &Store{db: db, writes: make(chan write, queueLimit), done: make(chan struct{}), log: log}
 	if err := store.alignDays(); err != nil {
@@ -318,13 +329,14 @@ type rollupKey struct {
 	protocol string
 	state    string
 	status   int
+	pool     string
 }
 
 // keyOf 返回条目在指定分段起点下的汇总键
 func keyOf(start int64, value *entry) rollupKey {
 	return rollupKey{
 		start: start, model: value.model, account: value.account, channel: value.channel,
-		protocol: value.protocol, state: value.state, status: value.status,
+		protocol: value.protocol, state: value.state, status: value.status, pool: value.pool,
 	}
 }
 
@@ -370,11 +382,11 @@ func (store *Store) write(batch []write) (err error) {
 					return err
 				}
 			}
-			result, err := tx.Exec(`INSERT OR IGNORE INTO requests (`+requestFields+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			result, err := tx.Exec(`INSERT OR IGNORE INTO requests (`+requestFields+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 				row.ID, row.Time.UnixMilli(), row.Protocol, row.Path, row.Model, row.Account, row.Channel, row.Status, row.State,
 				row.Duration.Milliseconds(), row.FirstEvent.Milliseconds(), row.Queue.Milliseconds(),
 				row.InputTokens, row.ReasoningTokens, row.ReplyTokens, row.TotalTokens, row.ToolCalls, row.Error, string(encoded),
-				row.ServedModel, row.Downgrade, row.ReplyHash, duplicate)
+				row.ServedModel, row.Downgrade, row.ReplyHash, duplicate, row.Pool)
 			if err != nil {
 				return err
 			}
@@ -418,8 +430,8 @@ func mergeRollup(tx *sql.Tx, table string, key rollupKey, value *entry) error {
 	existing := &entry{}
 	var durations, firstEvents []byte
 	err := tx.QueryRow(`SELECT `+rollupFields+` FROM `+table+`
- WHERE start=? AND model=? AND account=? AND channel=? AND protocol=? AND state=? AND status=?`,
-		key.start, key.model, key.account, key.channel, key.protocol, key.state, key.status).Scan(
+ WHERE start=? AND model=? AND account=? AND channel=? AND protocol=? AND state=? AND status=? AND pool=?`,
+		key.start, key.model, key.account, key.channel, key.protocol, key.state, key.status, key.pool).Scan(
 		&existing.requests, &existing.inputTokens, &existing.reasoningTokens, &existing.replyTokens, &existing.totalTokens,
 		&existing.durationMS, &existing.firstEventMS, &existing.firstEvents, &existing.queueMS,
 		&existing.downgradeChecked, &existing.downgradeRejected, &existing.replies, &existing.duplicates,
@@ -438,8 +450,8 @@ func mergeRollup(tx *sql.Tx, table string, key rollupKey, value *entry) error {
 		value.combine(existing)
 	}
 	_, err = tx.Exec(`INSERT OR REPLACE INTO `+table+` (`+rollupKeyFields+`, `+rollupFields+`)
- VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		key.start, key.model, key.account, key.channel, key.protocol, key.state, key.status, value.requests,
+ VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		key.start, key.model, key.account, key.channel, key.protocol, key.state, key.status, key.pool, value.requests,
 		value.inputTokens, value.reasoningTokens, value.replyTokens, value.totalTokens,
 		value.durationMS, value.firstEventMS, value.firstEvents, value.queueMS,
 		value.downgradeChecked, value.downgradeRejected, value.replies, value.duplicates,

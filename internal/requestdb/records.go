@@ -17,7 +17,7 @@ import (
 // recordColumns 是请求记录查询读取的列，最后一列表示是否保存了正文
 const recordColumns = `r.id, r.time, r.protocol, r.path, r.model, r.account, r.channel, r.status, r.state,
  r.duration_ms, r.first_event_ms, r.queue_ms, r.input_tokens, r.reasoning_tokens, r.reply_tokens, r.total_tokens,
- r.tool_calls, r.error, r.attempts, r.served_model, r.downgrade, r.reply_hash, r.duplicate,
+ r.tool_calls, r.error, r.attempts, r.served_model, r.downgrade, r.reply_hash, r.duplicate, r.pool,
  EXISTS(SELECT 1 FROM bodies b WHERE b.id = r.id)`
 
 // recordFilter 返回请求记录的范围、维度筛选、状态码与关键字条件；关键字匹配请求 ID 与错误，或等于回复指纹（列出同一回复的全部请求）
@@ -41,15 +41,16 @@ func recordFilter(query api.UsageRecordQuery) (string, []any) {
 func scanRecord(rows *sql.Rows) (api.UsageRecord, error) {
 	var record api.UsageRecord
 	var at int64
-	var attempts string
+	var attempts, pool string
 	err := rows.Scan(&record.ID, &at, &record.Protocol, &record.Path, &record.Model, &record.Account, &record.Channel,
 		&record.Status, &record.State, &record.DurationMS, &record.FirstEventMS, &record.QueueMS, &record.InputTokens,
 		&record.ReasoningTokens, &record.ReplyTokens, &record.TotalTokens, &record.ToolCalls, &record.Error, &attempts,
-		&record.ServedModel, &record.Downgrade, &record.ReplyHash, &record.Duplicate, &record.HasBody)
+		&record.ServedModel, &record.Downgrade, &record.ReplyHash, &record.Duplicate, &pool, &record.HasBody)
 	if err != nil {
 		return record, err
 	}
 	record.Time = time.UnixMilli(at).UTC()
+	record.Pool = poolValue(pool)
 	if err := json.Unmarshal([]byte(attempts), &record.Attempts); err != nil {
 		return record, err
 	}
@@ -90,9 +91,9 @@ func (store *Store) Records(ctx context.Context, query api.UsageRecordQuery) (ap
 	return page, nil
 }
 
-// csvHeader 是导出文件的列名
+// csvHeader 是导出文件的列名；pool 为号池（ultra 或 normal）
 var csvHeader = []string{
-	"time", "id", "protocol", "path", "model", "account", "channel", "status", "state", "duration_ms", "first_event_ms",
+	"time", "id", "protocol", "path", "model", "account", "channel", "pool", "status", "state", "duration_ms", "first_event_ms",
 	"queue_ms", "input_tokens", "reasoning_tokens", "reply_tokens", "total_tokens", "tool_calls", "error", "attempts",
 	"served_model", "downgrade", "reply_hash", "duplicate",
 }
@@ -131,7 +132,7 @@ func (store *Store) ExportRecords(ctx context.Context, query api.UsageRecordQuer
 		integer := func(value int64) string { return strconv.FormatInt(value, 10) }
 		if err := writer.Write([]string{
 			record.Time.Format(time.RFC3339Nano), record.ID, record.Protocol, csvText(record.Path), csvText(record.Model),
-			csvText(record.Account), record.Channel, strconv.Itoa(record.Status), record.State, integer(record.DurationMS),
+			csvText(record.Account), record.Channel, record.Pool, strconv.Itoa(record.Status), record.State, integer(record.DurationMS),
 			integer(record.FirstEventMS), integer(record.QueueMS), integer(record.InputTokens), integer(record.ReasoningTokens),
 			integer(record.ReplyTokens), integer(record.TotalTokens), strconv.Itoa(record.ToolCalls), csvText(record.Error), string(attempts),
 			csvText(record.ServedModel), record.Downgrade, record.ReplyHash, strconv.FormatBool(record.Duplicate),

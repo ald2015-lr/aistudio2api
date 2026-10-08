@@ -109,7 +109,7 @@ func requestRow(entry api.AccessLog, finished time.Time) requestdb.Row {
 		ID: entry.RequestID, Time: finished, Protocol: requestProtocol(entry.Path), Path: entry.Path,
 		Model: entry.Model, Account: entry.Account, Channel: entry.Channel, Status: entry.Status, State: data.State,
 		Duration: entry.Latency, FirstEvent: entry.FirstEvent, Queue: entry.QueueWait, ToolCalls: entry.ToolCalls, Error: data.Error,
-		Attempts: entry.Attempts, ServedModel: entry.ServedModel, ReplyHash: entry.ReplyHash,
+		Attempts: entry.Attempts, ServedModel: entry.ServedModel, ReplyHash: entry.ReplyHash, Pool: entry.Pool,
 	}
 	if entry.Downgrade != nil {
 		row.Downgrade = entry.Downgrade.Verdict
@@ -121,9 +121,9 @@ func requestRow(entry api.AccessLog, finished time.Time) requestdb.Row {
 	return row
 }
 
-// requestProtocol 按公开 API 路径归类请求协议；排查路由 /trace/ 的请求先去掉前缀，与主路由归为同一协议
+// requestProtocol 按公开 API 路径归类请求协议；排查路由 /trace/ 与 Ultra 路由 /ultra/ 的请求先去掉前缀，与主路由归为同一协议
 func requestProtocol(path string) string {
-	path = strings.TrimPrefix(path, "/trace")
+	path = strings.TrimPrefix(strings.TrimPrefix(path, "/trace"), "/ultra")
 	switch {
 	case api.CountTokensPath(path):
 		return "count_tokens"

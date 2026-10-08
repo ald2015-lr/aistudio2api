@@ -36,8 +36,15 @@ type RequestLedger interface {
 	RequestBody(context.Context, string) (RequestBody, error)
 }
 
-// UsageDimensions 是用量可筛选与分组的维度
-var UsageDimensions = []string{"model", "account", "channel", "protocol", "state"}
+// UsageDimensions 是用量可筛选与分组的维度；pool 为号池，取值见 UsagePoolNormal 与 UsagePoolUltra
+var UsageDimensions = []string{"model", "account", "channel", "protocol", "state", "pool"}
+
+// UsagePoolNormal 与 UsagePoolUltra 为用量接口中号池维度的取值：经 /ultra 进入的请求为 ultra，其余为 normal
+// （账本中普通号池的请求保存为空）
+const (
+	UsagePoolNormal = "normal"
+	UsagePoolUltra  = "ultra"
+)
 
 // UsageFilters 按维度限定参与统计的请求，同一维度内多个取值为或关系
 type UsageFilters map[string][]string
@@ -208,6 +215,8 @@ type UsageRecord struct {
 	ReplyHash string `json:"reply_hash,omitempty"`
 	Duplicate bool   `json:"duplicate,omitempty"`
 	HasBody   bool   `json:"has_body"`
+	// Pool 为请求的号池：ultra 或 normal
+	Pool string `json:"pool"`
 }
 
 // UsageRecordPage 是按完成时间倒序的一页请求记录，NextCursor 为空表示没有更早的记录
@@ -333,7 +342,7 @@ func (s *server) handleUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	if value := values.Get("stack"); value != "" {
 		if !slices.Contains(UsageDimensions, value) {
-			writeAdminError(w, http.StatusBadRequest, "invalid_request", "stack 必须是 model、account、channel、protocol 或 state")
+			writeAdminError(w, http.StatusBadRequest, "invalid_request", "stack 必须是 model、account、channel、protocol、state 或 pool")
 			return
 		}
 		query.Stack = value

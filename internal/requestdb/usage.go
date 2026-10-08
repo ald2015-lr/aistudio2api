@@ -30,6 +30,7 @@ type entry struct {
 	protocol        string
 	state           string
 	status          int
+	pool            string
 	requests        int64
 	inputTokens     int64
 	reasoningTokens int64
@@ -54,7 +55,7 @@ type entry struct {
 func rowEntry(row *Row, duplicate bool) *entry {
 	value := &entry{
 		time: row.Time.UnixMilli(), model: row.Model, account: row.Account, channel: row.Channel, protocol: row.Protocol,
-		state: row.State, status: row.Status, requests: 1, inputTokens: row.InputTokens, reasoningTokens: row.ReasoningTokens,
+		state: row.State, status: row.Status, pool: row.Pool, requests: 1, inputTokens: row.InputTokens, reasoningTokens: row.ReasoningTokens,
 		replyTokens: row.ReplyTokens, totalTokens: row.TotalTokens, durationMS: row.Duration.Milliseconds(),
 		queueMS: row.Queue.Milliseconds(), duration: single(row.Duration.Milliseconds()), lastTime: row.Time.UnixMilli(),
 	}
@@ -124,8 +125,26 @@ func (value *entry) dimension(name string) string {
 		return value.state
 	case "status":
 		return strconv.Itoa(value.status)
+	case "pool":
+		return poolValue(value.pool)
 	}
 	return ""
+}
+
+// poolValue 把账本中的号池换成用量接口的取值：普通号池的请求保存为空，对外为 normal
+func poolValue(stored string) string {
+	if stored == "" {
+		return api.UsagePoolNormal
+	}
+	return stored
+}
+
+// storedPool 把用量接口的号池筛选值换成账本中保存的取值
+func storedPool(value string) string {
+	if value == api.UsagePoolNormal {
+		return ""
+	}
+	return value
 }
 
 // aggregate 累计一组条目；耗时与首个事件只统计成功请求，工具调用、输出上限与上游终止都计为成功
@@ -320,7 +339,7 @@ func planHours(from, to int64, starts []int64) []segment {
 	return segments
 }
 
-// filterSQL 返回维度筛选的 SQL 条件与参数，维度名同时是三张表的列名
+// filterSQL 返回维度筛选的 SQL 条件与参数，维度名同时是三张表的列名；号池筛选值 normal 对应保存的空值
 func filterSQL(filters api.UsageFilters) (string, []any) {
 	var clause strings.Builder
 	var args []any
@@ -331,6 +350,9 @@ func filterSQL(filters api.UsageFilters) (string, []any) {
 		}
 		clause.WriteString(" AND " + dimension + " IN (" + strings.TrimSuffix(strings.Repeat("?,", len(values)), ",") + ")")
 		for _, value := range values {
+			if dimension == "pool" {
+				value = storedPool(value)
+			}
 			args = append(args, value)
 		}
 	}
@@ -352,7 +374,7 @@ func (store *Store) scan(ctx context.Context, part segment, filters api.UsageFil
 		var durations, firstEvents []byte
 		for rows.Next() {
 			if err := rows.Scan(&value.time, &value.model, &value.account, &value.channel, &value.protocol, &value.state,
-				&value.status, &value.requests, &value.inputTokens, &value.reasoningTokens, &value.replyTokens, &value.totalTokens,
+				&value.status, &value.pool, &value.requests, &value.inputTokens, &value.reasoningTokens, &value.replyTokens, &value.totalTokens,
 				&value.durationMS, &value.firstEventMS, &value.firstEvents, &value.queueMS,
 				&value.downgradeChecked, &value.downgradeRejected, &value.replies, &value.duplicates,
 				&durations, &firstEvents, &value.lastTime); err != nil {
@@ -368,7 +390,7 @@ func (store *Store) scan(ctx context.Context, part segment, filters api.UsageFil
 		}
 		return errors.Join(rows.Err(), rows.Close())
 	}
-	rows, err := store.db.QueryContext(ctx, `SELECT time, model, account, channel, protocol, state, status,
+	rows, err := store.db.QueryContext(ctx, `SELECT time, model, account, channel, protocol, state, status, pool,
  duration_ms, first_event_ms, queue_ms, input_tokens, reasoning_tokens, reply_tokens, total_tokens,
  downgrade, reply_hash, duplicate
  FROM requests WHERE time >= ? AND time < ?`+clause, args...)
@@ -381,7 +403,7 @@ func (store *Store) scan(ctx context.Context, part segment, filters api.UsageFil
 	value.requests = 1
 	for rows.Next() {
 		if err := rows.Scan(&value.time, &value.model, &value.account, &value.channel, &value.protocol, &value.state, &value.status,
-			&value.durationMS, &value.firstEventMS, &value.queueMS, &value.inputTokens, &value.reasoningTokens, &value.replyTokens,
+			&value.pool, &value.durationMS, &value.firstEventMS, &value.queueMS, &value.inputTokens, &value.reasoningTokens, &value.replyTokens,
 			&value.totalTokens, &downgrade, &replyHash, &duplicate); err != nil {
 			return errors.Join(err, rows.Close())
 		}
@@ -560,7 +582,11 @@ func (store *Store) options(ctx context.Context, segments []segment) (map[string
 				return nil, errors.Join(err, rows.Close())
 			}
 			for index, dimension := range api.UsageDimensions {
-				seen[dimension][values[index]] = struct{}{}
+				value := values[index]
+				if dimension == "pool" {
+					value = poolValue(value)
+				}
+				seen[dimension][value] = struct{}{}
 			}
 		}
 		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
