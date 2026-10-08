@@ -243,7 +243,9 @@ const total = computed(() => props.report.totals.requests)
                 {{ row.last_at ? ago(row.last_at, now) : '—' }}
               </td>
               <td class="px-2 py-2 text-right">
+                <!-- 未分配（空取值）不能作为筛选条件：服务端忽略空筛选值，筛选后仍显示全部请求 -->
                 <button
+                  v-if="row.key !== ''"
                   type="button"
                   class="btn btn-sm btn-ghost"
                   :aria-label="`${t('usage.onlyThis')}: ${dimensionLabel(tab, row.key)}`"

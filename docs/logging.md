@@ -253,7 +253,7 @@ WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash
 
 ## 用量账本
 
-`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta` 与 `/trace/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试，以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）不写入，避免抬高请求数；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由的请求按去掉 `/trace` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要按 2000 字截断。
+`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta` 与 `/trace/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试，以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）不写入，避免抬高请求数；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由的请求按去掉 `/trace` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
 
 同一事务按 UTC 小时与服务器本地日累加汇总与耗时分布：完整落在范围与单个分桶内的本地日读取日汇总，其余整小时读取小时汇总，范围边缘与跨分桶的部分读取原始记录。服务器时区变化后，下次启动时从小时汇总与原始记录重建本地日汇总。写入由后台协程批量提交，不阻塞响应：等待写入的记录超过 4096 条时丢弃新记录，写入恢复后输出丢弃数。记录与汇总按服务器本地日整日保留 90 天，启动时与之后每天清理一次。账本打开失败时写一条 WARN，本次运行不记录用量、不注册用量接口，服务照常运行。
 

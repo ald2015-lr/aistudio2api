@@ -32,8 +32,12 @@ const batchLimit = 256
 // queueLimit 是等待写入的最大记录数，队列已满时丢弃新记录
 const queueLimit = 4096
 
-// textLimit 是错误摘要与每次上游尝试错误保存的最大字符数，避免个别超长错误撑大账本
+// textLimit 是错误摘要、每次上游尝试错误与路径保存的最大字符数，避免个别超长错误撑大账本
 const textLimit = 2000
+
+// modelLimit 是模型名与实际服务模型保存的最大字符数。模型名来自客户端，没有通过模型目录校验的请求也会记录：
+// 原样保存时一个超长模型名会写进汇总主键，并在之后 90 天的每次用量查询的分项、候选、组合与堆叠序列里重复出现
+const modelLimit = 200
 
 // duplicateWindow 是重复回复的比对窗口，与请求日志的重复回复检测一致：窗口内出现过完全相同的回复正文才计为重复
 const duplicateWindow = 2 * time.Hour
@@ -41,6 +45,10 @@ const duplicateWindow = 2 * time.Hour
 // duplicateMinReplyTokens 是参与重复回复统计的最少回复 token，约等于请求日志重复检测的 200 字节下限：
 // 过短的回复（固定答复、单个词）相同属于正常
 const duplicateMinReplyTokens = 50
+
+// duplicateQuery 查找窗口内是否已有相同回复指纹。指纹非空的条件不能省：SQLite 推断不出绑定参数非空，
+// 少了它就用不上部分索引 requests_reply_hash，每条回复都要扫描窗口内的全部记录，请求多时写入跟不上、队列满后丢记录
+const duplicateQuery = `SELECT EXISTS(SELECT 1 FROM requests WHERE reply_hash = ? AND reply_hash != '' AND time >= ? AND time <= ?)`
 
 // hourMS 是一小时的毫秒数
 const hourMS = int64(time.Hour / time.Millisecond)
@@ -212,11 +220,12 @@ func (store *Store) Record(row Row) {
 	if row.ID == "" {
 		return
 	}
-	row.Error = truncateText(row.Error)
+	row.Error, row.Path = truncateText(row.Error, textLimit), truncateText(row.Path, textLimit)
+	row.Model, row.ServedModel = truncateText(row.Model, modelLimit), truncateText(row.ServedModel, modelLimit)
 	if len(row.Attempts) > 0 {
 		attempts := make([]api.RequestAttempt, len(row.Attempts))
 		for index, attempt := range row.Attempts {
-			attempt.Error = truncateText(attempt.Error)
+			attempt.Error = truncateText(attempt.Error, textLimit)
 			attempts[index] = attempt
 		}
 		row.Attempts = attempts
@@ -231,13 +240,13 @@ func (store *Store) SaveBody(body api.RequestBody) {
 	}
 }
 
-// truncateText 按字符截断过长的文本
-func truncateText(text string) string {
-	if utf8.RuneCountInString(text) <= textLimit {
+// truncateText 按字符截断超过 limit 的文本
+func truncateText(text string, limit int) string {
+	if utf8.RuneCountInString(text) <= limit {
 		return text
 	}
 	runes := []rune(text)
-	return string(runes[:textLimit]) + "…"
+	return string(runes[:limit]) + "…"
 }
 
 // enqueue 把记录交给写入协程，队列已满时计入丢弃数而不阻塞请求
@@ -357,8 +366,7 @@ func (store *Store) write(batch []write) (err error) {
 			duplicate := false
 			if row.countedReply() {
 				at := row.Time.UnixMilli()
-				if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM requests WHERE reply_hash = ? AND time >= ? AND time <= ?)`,
-					row.ReplyHash, at-duplicateWindow.Milliseconds(), at).Scan(&duplicate); err != nil {
+				if err := tx.QueryRow(duplicateQuery, row.ReplyHash, at-duplicateWindow.Milliseconds(), at).Scan(&duplicate); err != nil {
 					return err
 				}
 			}

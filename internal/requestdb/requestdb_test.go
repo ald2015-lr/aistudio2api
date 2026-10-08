@@ -155,6 +155,31 @@ func TestLedgerDuplicateReplies(t *testing.T) {
 	}
 }
 
+// TestLedgerDuplicateQueryUsesReplyIndex 重复回复查找走回复指纹的部分索引，而不是扫描窗口内的全部记录
+func TestLedgerDuplicateQueryUsesReplyIndex(t *testing.T) {
+	store := openTestStore(t, filepath.Join(t.TempDir(), "requests.db"))
+	defer store.Close()
+	rows, err := store.db.Query(`EXPLAIN QUERY PLAN `+duplicateQuery, "abc123", 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(errors.Join(err, rows.Close()))
+		}
+		plan = append(plan, detail)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(plan, "\n"), "requests_reply_hash") {
+		t.Fatalf("重复回复查找没有使用回复指纹索引: %q", plan)
+	}
+}
+
 // TestLedgerRecordsFiltersCursorAndExport 记录按维度、状态码与关键字筛选，游标分页不重不漏，CSV 防公式注入并带本地新增列
 func TestLedgerRecordsFiltersCursorAndExport(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "requests.db")
@@ -272,16 +297,18 @@ func TestLedgerRetentionPrunesOldRecords(t *testing.T) {
 	}
 }
 
-// TestLedgerRecordBounds 空 ID 的记录不写入，超长错误按字符截断，关闭后写入被忽略且不阻塞
+// TestLedgerRecordBounds 空 ID 的记录不写入，超长错误、路径与模型名按字符截断，关闭后写入被忽略且不阻塞
 func TestLedgerRecordBounds(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "requests.db")
 	store := openTestStore(t, path)
 	now := time.Now().UTC()
 	store.Record(Row{Time: now, State: "completed"})
 	long := strings.Repeat("错", textLimit+50)
+	// 模型名来自客户端：1 MiB 的模型名不能原样进入汇总主键与之后每次用量查询
+	model := strings.Repeat("m", 1<<20)
 	store.Record(Row{
-		ID: "long", Time: now, State: "failed", Status: 500, Error: long,
-		Attempts: []api.RequestAttempt{{Error: long}},
+		ID: "long", Time: now, State: "failed", Status: 500, Error: long, Path: "/v1beta/models/" + model + ":generateContent",
+		Model: model, ServedModel: model, Attempts: []api.RequestAttempt{{Error: long}},
 	})
 	store = reopen(t, store, path)
 	page, err := store.Records(context.Background(), api.UsageRecordQuery{From: now.Add(-time.Minute), To: now.Add(time.Minute)})
@@ -291,6 +318,20 @@ func TestLedgerRecordBounds(t *testing.T) {
 	record := page.Items[0]
 	if utf8.RuneCountInString(record.Error) != textLimit+1 || utf8.RuneCountInString(record.Attempts[0].Error) != textLimit+1 {
 		t.Fatalf("超长错误没有截断: %d %d", utf8.RuneCountInString(record.Error), utf8.RuneCountInString(record.Attempts[0].Error))
+	}
+	if utf8.RuneCountInString(record.Path) != textLimit+1 || utf8.RuneCountInString(record.Model) != modelLimit+1 ||
+		utf8.RuneCountInString(record.ServedModel) != modelLimit+1 {
+		t.Fatalf("超长路径或模型名没有截断: path=%d model=%d served=%d",
+			utf8.RuneCountInString(record.Path), utf8.RuneCountInString(record.Model), utf8.RuneCountInString(record.ServedModel))
+	}
+	report, err := store.Usage(context.Background(), api.UsageQuery{
+		From: now.Add(-time.Hour), To: now.Add(time.Minute), Bucket: time.Hour, Location: time.UTC, Stack: "model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if models := report.Groups["model"]; len(models) != 1 || models[0].Key != record.Model {
+		t.Fatalf("用量分项的模型名应是截断后的取值: %d 项", len(models))
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

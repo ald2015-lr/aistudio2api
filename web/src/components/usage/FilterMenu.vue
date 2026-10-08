@@ -20,9 +20,10 @@ const query = ref('')
 watch(open, (value) => {
   if (value) query.value = ''
 })
+// 未分配（空取值）不列为候选：服务端忽略空筛选值，勾选后仍显示全部请求
 const visible = computed(() => {
   const needle = query.value.trim().toLowerCase()
-  const values = [...new Set([...props.selected, ...props.options])]
+  const values = [...new Set([...props.selected, ...props.options])].filter((value) => value !== '')
   return needle === ''
     ? values
     : values.filter((value) => props.format(value).toLowerCase().includes(needle))
