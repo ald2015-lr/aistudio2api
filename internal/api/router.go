@@ -88,7 +88,8 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	root.Handle("/v1beta/", publicChain)
 	// 排查路由：与主路由完全相同的处理链，额外为每个 POST 请求写完整排查记录（见 trace.go）
 	root.Handle("/trace/", s.traceEntry(publicChain))
-	root.Handle("/api/", adminAccessMiddleware(config.AdminPassword, config.AdminToken, sameOriginMiddleware(control)))
+	// 先拒绝跨站请求，再校验令牌或密码：浏览器对跨站请求也会自动附带缓存的 Basic 凭据，不能让它们计入密码失败次数
+	root.Handle("/api/", sameOriginMiddleware(adminAccessMiddleware(config.AdminPassword, config.AdminToken, controlPlaneMiddleware(control))))
 	return root
 }
 

@@ -103,20 +103,14 @@ func (limiter *adminLoginLimiter) success(ip string) {
 
 // requestRemoteIP 返回请求来源 IP；直连来源是本机反代时取反代传来的真实客户端地址，
 // 避免所有外网请求共用 127.0.0.1 的错误计数，被他人故意输错密码连带封禁
+// requestRemoteIP 返回限速使用的来源地址：只取连接的对端地址，不信任 X-Real-IP / X-Forwarded-For。
+// 这些头可以由客户端伪造（反向代理通常把客户端发来的 X-Forwarded-For 原样保留在前面），
+// 信任它们时每次换一个伪造地址就能绕过单来源限速。反向代理后面的客户端因此共用一个计数，
+// 与全部来源合计上限的效果相同；管理令牌不受密码限速影响
 func requestRemoteIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
-	}
-	if net.ParseIP(host).IsLoopback() {
-		if clientIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); clientIP != "" {
-			return clientIP
-		}
-		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
-			if first := strings.TrimSpace(strings.Split(forwarded, ",")[0]); first != "" {
-				return first
-			}
-		}
 	}
 	return host
 }

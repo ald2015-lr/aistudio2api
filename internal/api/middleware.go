@@ -585,17 +585,38 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// sameOriginMiddleware 拒绝来自其他网站的浏览器请求：浏览器标明跨站（Sec-Fetch-Site: cross-site）、
+// Origin 与请求主机不同、Origin 不是 http/https 或带用户信息时返回 403。非浏览器客户端（不带这些头）照常放行
 func sameOriginMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+			writeAdminError(w, http.StatusForbidden, "control_plane_origin_forbidden", "Control plane requires a same-origin browser request")
+			return
+		}
 		originValue := strings.TrimSpace(r.Header.Get("Origin"))
 		if originValue == "" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		origin, err := url.Parse(originValue)
-		if err != nil || origin.Host == "" || !strings.EqualFold(origin.Host, r.Host) {
+		if err != nil || origin.Host == "" || origin.User != nil ||
+			(origin.Scheme != "http" && origin.Scheme != "https") || !strings.EqualFold(origin.Host, r.Host) {
 			writeAdminError(w, http.StatusForbidden, "control_plane_origin_forbidden", "Control plane requires a same-origin browser request")
 			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// maxControlBodyBytes 为管理接口请求体上限：导入账户的 storage-state 通常几十 KB，留足余量
+const maxControlBodyBytes = 8 << 20
+
+// controlPlaneMiddleware 为管理接口限制请求体大小，并禁止缓存响应（响应可能含账户与配置信息）
+func controlPlaneMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxControlBodyBytes)
 		}
 		next.ServeHTTP(w, r)
 	})

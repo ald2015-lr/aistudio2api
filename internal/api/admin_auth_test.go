@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -116,5 +117,62 @@ func TestAdminLimiterGlobalCap(t *testing.T) {
 	}
 	if limiter.blocked("203.0.113.77", now.Add(adminAuthBlock+time.Second)) {
 		t.Fatal("封禁到期后应恢复")
+	}
+}
+
+// TestSameOriginRejectsCrossSite 跨站浏览器请求、非 http(s) 或带用户信息的 Origin 被拒绝，非浏览器请求放行
+func TestSameOriginRejectsCrossSite(t *testing.T) {
+	ok := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
+	handler := sameOriginMiddleware(ok)
+	for _, test := range []struct {
+		name   string
+		header map[string]string
+		want   int
+	}{
+		{name: "命令行", want: http.StatusNoContent},
+		{name: "同源页面", header: map[string]string{"Origin": "http://panel.example", "Sec-Fetch-Site": "same-origin"}, want: http.StatusNoContent},
+		{name: "跨站", header: map[string]string{"Sec-Fetch-Site": "cross-site"}, want: http.StatusForbidden},
+		{name: "其他主机", header: map[string]string{"Origin": "https://evil.example"}, want: http.StatusForbidden},
+		{name: "非 http 协议", header: map[string]string{"Origin": "chrome-extension://panel.example"}, want: http.StatusForbidden},
+		{name: "带用户信息", header: map[string]string{"Origin": "http://user@panel.example"}, want: http.StatusForbidden},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, "http://panel.example/api/config", nil)
+			for name, value := range test.header {
+				request.Header.Set(name, value)
+			}
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != test.want {
+				t.Fatalf("status = %d，期望 %d", recorder.Code, test.want)
+			}
+		})
+	}
+}
+
+// TestRequestRemoteIPIgnoresForwardedHeaders 限速来源只取连接对端地址，伪造的转发头不能绕过单来源限速
+func TestRequestRemoteIPIgnoresForwardedHeaders(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/status", nil)
+	request.RemoteAddr = "127.0.0.1:41000"
+	request.Header.Set("X-Real-IP", "203.0.113.9")
+	request.Header.Set("X-Forwarded-For", "198.51.100.7, 127.0.0.1")
+	if got := requestRemoteIP(request); got != "127.0.0.1" {
+		t.Fatalf("来源 = %q，期望连接对端地址", got)
+	}
+}
+
+// TestControlPlaneLimitsBody 管理接口限制请求体大小并禁止缓存
+func TestControlPlaneLimitsBody(t *testing.T) {
+	handler := controlPlaneMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPut, "/api/config", strings.NewReader(strings.Repeat("a", maxControlBodyBytes+1))))
+	if recorder.Code != http.StatusRequestEntityTooLarge || recorder.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d cache-control=%q", recorder.Code, recorder.Header().Get("Cache-Control"))
 	}
 }
