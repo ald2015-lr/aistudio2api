@@ -475,6 +475,9 @@ func responsesErrorObject(w http.ResponseWriter, err error) map[string]any {
 	public := publicErrorFor(err, accessLogModel(w))
 	code := "server_error"
 	switch {
+	case public.Kind == publicKindContextLength:
+		// Codex 等客户端看到 context_length_exceeded 才会自动压缩上下文，invalid_prompt 只会让本轮失败
+		code = "context_length_exceeded"
 	case public.Status == http.StatusTooManyRequests:
 		code = "rate_limit_exceeded"
 	case public.Status < http.StatusInternalServerError:

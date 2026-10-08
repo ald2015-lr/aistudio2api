@@ -1831,7 +1831,7 @@ tool group 字段：
 
 `groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`retrievedContext:{uri,title,text}` 或 `maps:{uri,title,text,placeId}`；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
 
-`:streamGenerateContent` 使用 SSE。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误帧为 `data: {"error":{"code","message","status"}}`。
+`:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`，元素之间的空行用作心跳）。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 
 ### Files、Transcribe 与媒体
 

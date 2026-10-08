@@ -1161,10 +1161,72 @@ func geminiUsage(usage *aistudio.Usage) map[string]any {
 	}
 }
 
+// geminiChunkWriter 输出 streamGenerateContent 的分块：带 alt=sse 时为 SSE；
+// 不带时与官方一致，为逐块写出的 JSON 数组（原先一律返回 SSE，按官方默认格式解析的客户端读不出来）
+type geminiChunkWriter struct {
+	w     http.ResponseWriter
+	sse   bool
+	wrote bool
+}
+
+func newGeminiChunkWriter(w http.ResponseWriter, r *http.Request) (*geminiChunkWriter, error) {
+	writer := &geminiChunkWriter{w: w, sse: strings.EqualFold(r.URL.Query().Get("alt"), "sse")}
+	if writer.sse {
+		return writer, streamHeaders(w)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	if _, err := io.WriteString(w, "["); err != nil {
+		return nil, err
+	}
+	return writer, http.NewResponseController(w).Flush()
+}
+
+func (writer *geminiChunkWriter) chunk(payload any) error {
+	if writer.sse {
+		return writeSSE(writer.w, "", payload)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	separator := "\r\n"
+	if writer.wrote {
+		separator = ",\r\n"
+	}
+	writer.wrote = true
+	if _, err := io.WriteString(writer.w, separator+string(data)); err != nil {
+		return err
+	}
+	return http.NewResponseController(writer.w).Flush()
+}
+
+// heartbeat 保持连接：JSON 数组元素之间的空白不影响解析
+func (writer *geminiChunkWriter) heartbeat() error {
+	if writer.sse {
+		return writeSSEHeartbeat(writer.w)
+	}
+	if _, err := io.WriteString(writer.w, "\n"); err != nil {
+		return err
+	}
+	return http.NewResponseController(writer.w).Flush()
+}
+
+func (writer *geminiChunkWriter) close() {
+	if !writer.sse {
+		_, _ = io.WriteString(writer.w, "\r\n]")
+		_ = http.NewResponseController(writer.w).Flush()
+	}
+}
+
 func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, events <-chan aistudio.Event) {
-	if err := streamHeaders(w); err != nil {
+	chunks, err := newGeminiChunkWriter(w, r)
+	if err != nil {
 		return
 	}
+	defer chunks.close()
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
 		response := map[string]any{"responseId": request.ID, "modelVersion": request.Model}
 		switch event.Kind {
@@ -1232,11 +1294,11 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		default:
 			return nil
 		}
-		return writeSSE(w, "", response)
-	}, func() error { return writeSSEHeartbeat(w) })
+		return chunks.chunk(response)
+	}, chunks.heartbeat)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
-			_ = writeSSE(w, "", geminiStreamError(w, err))
+			_ = chunks.chunk(geminiStreamError(w, err))
 		}
 		return
 	}
@@ -1253,7 +1315,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	if result.usage != nil {
 		final["usageMetadata"] = geminiUsage(result.usage)
 	}
-	_ = writeSSE(w, "", final)
+	_ = chunks.chunk(final)
 }
 
 func geminiStreamCandidate(part map[string]any) map[string]any {

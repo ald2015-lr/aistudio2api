@@ -141,3 +141,55 @@ func TestToolResultDocumentsBecomeAttachments(t *testing.T) {
 		t.Fatalf("cleaned=%s", cleaned)
 	}
 }
+
+// TestAnthropicStreamKeepsSignatureAfterText 流式在正文块打开时收到独立签名也输出 redacted_thinking
+func TestAnthropicStreamKeepsSignatureAfterText(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	writer := &anthropicStreamWriter{w: recorder, id: "msg_1", model: "m"}
+	if err := writer.live(aistudio.Event{Kind: aistudio.EventText, Text: "hello"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.live(aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(recorder.Body.String(), `"redacted_thinking"`) || !strings.Contains(recorder.Body.String(), "sig-1") {
+		t.Fatalf("签名被丢弃: %s", recorder.Body.String())
+	}
+}
+
+// TestResponsesStreamContextLengthCode Responses 流内错误对上下文超限返回 context_length_exceeded
+func TestResponsesStreamContextLengthCode(t *testing.T) {
+	err := &aistudio.RPCError{Method: "GenerateContent", StatusCode: 400, Code: 3, Message: "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576)."}
+	if got := responsesErrorObject(httptest.NewRecorder(), err)["code"]; got != "context_length_exceeded" {
+		t.Fatalf("code=%v", got)
+	}
+}
+
+// TestGeminiStreamFormats streamGenerateContent 带 alt=sse 时为 SSE，不带时为 JSON 数组
+func TestGeminiStreamFormats(t *testing.T) {
+	events := []aistudio.Event{{Kind: aistudio.EventText, Text: "hi"}, {Kind: aistudio.EventFinish, FinishReason: "stop"}}
+	for _, test := range []struct {
+		path string
+		sse  bool
+	}{
+		{path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse", sse: true},
+		{path: "/v1beta/models/gemini-2.5-flash:streamGenerateContent", sse: false},
+	} {
+		handler := NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"})
+		recorder := postJSON(t, handler, test.path, `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, nil)
+		body := recorder.Body.String()
+		if test.sse {
+			if !strings.HasPrefix(body, "data: ") {
+				t.Fatalf("SSE 格式: %q", body)
+			}
+			continue
+		}
+		var chunks []map[string]any
+		if err := json.Unmarshal([]byte(body), &chunks); err != nil || len(chunks) < 2 {
+			t.Fatalf("JSON 数组格式: %q err=%v", body, err)
+		}
+		if recorder.Header().Get("Content-Type") != "application/json" {
+			t.Fatalf("Content-Type=%q", recorder.Header().Get("Content-Type"))
+		}
+	}
+}

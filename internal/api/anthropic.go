@@ -767,9 +767,11 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 			"delta": map[string]any{"type": "thinking_delta", "thinking": event.Text},
 		})
 	case aistudio.EventThoughtSignature:
-		if event.ThoughtSignature == "" || writer.currentBlock == "text" {
+		if event.ThoughtSignature == "" {
 			return nil
 		}
+		// 与非流式一致：正文块打开时也关闭它并输出 redacted_thinking，签名随下一轮带回上游。
+		// 原先流式在正文块打开时直接丢弃独立签名，非流式却保留
 		return writer.redactedThinking(event.ThoughtSignature)
 	case aistudio.EventToolCall:
 		if event.ToolCall == nil {
