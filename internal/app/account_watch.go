@@ -351,12 +351,17 @@ func (watcher *accountWatcher) startLoginRefresh(ctx context.Context, known map[
 // applyLoginUpdate 载入外部更新的登录状态；返回 false 表示账户正在处理请求，需要下一轮再试
 func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudio.AccountLoginSummary) bool {
 	if summary.Enabled && summary.State == aistudio.AccountAuthRequired {
-		// 需要登录的账户：完整重新载入，恢复调度并重新同步模型目录
-		if err := admin.reloadAccountCredentials(ctx, summary.ID, summary.StoragePath); err != nil {
+		// 需要登录的账户：完整重新载入，恢复调度并重新同步模型目录。需要登录的账户仍有未结束的租约时也按此处理
+		// （不再显示为忙碌），等不到账户空闲就下一轮再试
+		reloaded, err := admin.reloadAccountCredentials(ctx, summary.ID, summary.StoragePath)
+		if err != nil {
 			admin.requests.log("auth", "WARN", fmt.Sprintf(
 				"重新载入认证文件失败 | 账户=%s | 错误=%s", summary.ID, strings.TrimSpace(err.Error()),
 			))
 			return true
+		}
+		if !reloaded {
+			return false
 		}
 		admin.requests.log("auth", "INFO", "检测到新的认证文件，已重新载入并恢复调度 | 账户="+summary.ID)
 		return true
@@ -489,27 +494,34 @@ func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	return errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID))
 }
 
-// reloadAccountCredentials 用磁盘上的新认证文件替换账户的认证状态并恢复调度
-func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, accountID string, storagePath string) error {
+// credentialReloadAcquireWait 为重新载入需要登录账户的认证文件时等待账户空闲的最长时间
+var credentialReloadAcquireWait = 10 * time.Second
+
+// reloadAccountCredentials 用磁盘上的新认证文件替换账户的认证状态并恢复调度；
+// 返回 false 表示账户仍有请求未结束、等待超时，需要下一轮再试
+func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, accountID string, storagePath string) (bool, error) {
 	state, err := aistudio.LoadStorageState(storagePath)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if _, err := aistudio.NewSigner().Sign(state); err != nil {
-		return fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
+		return false, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
 	}
-	acquireCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	acquireCtx, cancel := context.WithTimeout(ctx, credentialReloadAcquireWait)
 	defer cancel()
 	lease, err := admin.pool.AcquireAccount(acquireCtx, accountID)
 	if err != nil {
-		return accountOperationError(err)
+		if acquireCtx.Err() != nil && ctx.Err() == nil {
+			return false, nil
+		}
+		return false, accountOperationError(err)
 	}
 	account := lease.Account()
 	if err := admin.workers.Reset(account.ID); err != nil {
-		return errors.Join(err, lease.Release())
+		return false, errors.Join(err, lease.Release())
 	}
 	if err := lease.SaveStorageState(state); err != nil {
-		return errors.Join(err, lease.Release())
+		return false, errors.Join(err, lease.Release())
 	}
 	if err := admin.service.changeModels(func() error {
 		return errors.Join(
@@ -518,11 +530,11 @@ func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, account
 			admin.pool.SetCatalog(account.ID, account.BenefitTier, nil),
 		)
 	}); err != nil {
-		return errors.Join(err, lease.Release())
+		return false, errors.Join(err, lease.Release())
 	}
 	if err := lease.Release(); err != nil {
-		return err
+		return false, err
 	}
 	admin.syncAccountModelCatalog(ctx, account)
-	return nil
+	return true, nil
 }

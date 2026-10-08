@@ -107,7 +107,7 @@ Chrome Local State + Profile Preferences + Web Data/token_service
 
 OAuthMultilogin 使用 `MultiOAuth` 头。第一次 assertion 为 `DBSC_CHALLENGE_IF_REQUIRED`，响应提供 challenge；第二次 assertion 的 JWT header 使用 `ES256` 与 `DEVICE_BOUND_SESSION_CREDENTIALS_ASSERTION`。payload 绑定 Google OAuth client、challenge、设备公钥 issuer 和临时 HPKE 公钥。Cookie 密文使用 X25519、HKDF-SHA256 与 AES-128-GCM 解密。
 
-Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存来源、Gaia ID、refresh token 与 wrapped binding key。普通或受保护 RPC 首次返回 HTTP `401` 时，服务在同一账户出口续签 Cookie、使动态头失效、关闭该账户 WAA runtime，并重放一次。HTTP `403` 与协议 Code 7 保留上游错误，不清除账户或模型成功状态；首个上游语义事件前可以切换到下一个同能力账户。隔离 Camoufox 登录和外部 storage state 不携带 Chrome OAuth 扩展。
+Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存来源、Gaia ID、refresh token 与 wrapped binding key。HTTP `401`、协议 Code 16、纯 Go 后端载入首页跳转到 `accounts.google.com`、签名 Cookie 缺失或过期都按登录失效处理，覆盖普通 RPC、受保护 RPC、Live 建连和按需启动 Worker：服务在同一账户出口续签 Cookie、使动态头失效、关闭该账户 WAA runtime，并重放一次；没有续签材料、续签失败或重放仍失效时账户标为 `auth_required`，后续调度使用其他账户。续签先等待同账户其他正常请求结束（最多 12 秒，超时放弃本次续签），并发失效复用一次提交结果；降级判定借用生成租约的计数不做认证恢复。预热没有请求租约，没有续签材料的账户直接标为 `auth_required`，有续签材料的留给按需启动恢复。生成只在正常结束时确认登录有效，正文之后返回的 401 仍写回 `auth_required`；认证结果按认证代际和请求开始时间写回，管理端重新登录或验证之前开始的请求不会覆盖其结果。HTTP `403`、协议 Code 7 与 Drive `unauthorized_client` 保留上游错误，不清除账户或模型成功状态；首个上游语义事件前可以切换到下一个同能力账户。隔离 Camoufox 登录和外部 storage state 不携带 Chrome OAuth 扩展。
 
 `storage-state.json` 保留 Playwright 根字段和未知扩展字段，已定义形状如下。`wrapped_binding_key` 是 Go `[]byte` 的 Base64 JSON 字符串。
 
@@ -1232,7 +1232,7 @@ POST /api/control/stop
 | 状态 | 调度语义 |
 | --- | --- |
 | `ready` | 认证有效且存在可用槽位 |
-| `busy` | 账户存在独占操作、认证刷新或活动请求；调度仍按 `PER_ACCOUNT_CONCURRENCY` 判断剩余槽位 |
+| `busy` | 就绪账户存在独占操作、认证刷新或活动请求；调度仍按 `PER_ACCOUNT_CONCURRENCY` 判断剩余槽位。需要登录或不可用的账户有活动请求时仍显示原状态 |
 | `cooldown` | 账户的全局 `*` 冷却仍有效；模型 scope 冷却只影响对应请求的候选分类 |
 | `auth_required` | 账户级认证失败 |
 | `unavailable` | 当前运行时不可用 |

@@ -1502,28 +1502,73 @@ func (l *AccountLease) markAuthenticationStateAt(required bool, reason string, c
 	l.operation.Unlock()
 	l.pool.mu.Lock()
 	defer l.pool.mu.Unlock()
-	if l.pool.byID[l.account.ID] != l.account || authGeneration != l.account.authGeneration ||
-		checkedAt.Before(l.account.authCheckedAt) {
-		return nil
+	l.pool.markAuthenticationLocked(l.account, authGeneration, required, reason, checkedAt)
+	return nil
+}
+
+// markAuthenticationLocked 按认证代际与顺序时间写回认证结果，返回是否写入；调用方持有 p.mu。
+// 登录已被替换（代际变化）或已有更晚的结果时忽略。同一时间先确认有效、后确认失效时以失效为准：
+// 同一请求先输出正文、随后才返回认证失败，账户不能继续显示为就绪
+func (p *AccountPool) markAuthenticationLocked(
+	account *Account,
+	authGeneration uint64,
+	required bool,
+	reason string,
+	checkedAt time.Time,
+) bool {
+	if p.byID[account.ID] != account || authGeneration != account.authGeneration ||
+		checkedAt.Before(account.authCheckedAt) {
+		return false
 	}
-	if required && checkedAt.Equal(l.account.authCheckedAt) && l.account.State == AccountReady {
-		return nil
-	}
-	l.account.authCheckedAt = checkedAt
-	if !l.account.Config.Enabled {
-		l.account.State = AccountDisabled
+	account.authCheckedAt = checkedAt
+	if !account.Config.Enabled {
+		account.State = AccountDisabled
 	} else if required {
-		l.account.State = AccountAuthRequired
-	} else if l.account.State == AccountAuthRequired {
-		l.account.State = AccountReady
+		account.State = AccountAuthRequired
+	} else if account.State == AccountAuthRequired {
+		account.State = AccountReady
 	}
 	if required {
-		l.account.stateMessage = strings.TrimSpace(reason)
-	} else if l.account.State == AccountReady {
-		l.account.stateMessage = ""
+		account.stateMessage = strings.TrimSpace(reason)
+	} else if account.State == AccountReady {
+		account.stateMessage = ""
 	}
-	l.pool.notifyLocked()
-	return nil
+	p.notifyLocked()
+	return true
+}
+
+// AuthGeneration 返回账户当前的认证代际；账户不存在时返回 0
+func (p *AccountPool) AuthGeneration(accountID string) uint64 {
+	if p == nil {
+		return 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return 0
+	}
+	return account.authGeneration
+}
+
+// MarkAuthenticationRequiredIfGeneration 在没有请求租约的路径（预热启动 Worker）写回认证失败：
+// 与租约写回使用同一顺序规则，generation 为开始前读取的认证代际，期间保存过新登录时不写入。返回是否写入
+func (p *AccountPool) MarkAuthenticationRequiredIfGeneration(
+	accountID string,
+	generation uint64,
+	checkedAt time.Time,
+	reason string,
+) (bool, error) {
+	if p == nil {
+		return false, ErrAccountNotFound
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return false, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	return p.markAuthenticationLocked(account, generation, true, reason, checkedAt.UTC()), nil
 }
 
 // ModelAccessGeneration 返回账户当前模型资格目录代际
@@ -1564,6 +1609,35 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	l.account.authCheckedAt = time.Time{}
 	l.pool.mu.Unlock()
 	return nil
+}
+
+// WaitForAuthRefresh 在 BeginAuthRefresh 之后等待同账户的其他正常请求结束，或复用其他租约已经提交的新认证：
+// 续签会重置账户的 WAA runtime，正在流式输出的请求不能被打断。调用方必须给 ctx 设上限，
+// 同账户的请求可能正等待本次续签所在的 Worker 启动结束
+func (l *AccountLease) WaitForAuthRefresh(ctx context.Context) error {
+	if l == nil || l.account == nil || l.pool == nil {
+		return fmt.Errorf("账户租约未初始化")
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		l.operation.Lock()
+		generation := l.authGeneration
+		l.operation.Unlock()
+		l.pool.mu.Lock()
+		ready := l.exclusive || generation != l.account.authGeneration || l.account.active <= l.account.authRefreshers
+		changed := l.pool.changed
+		l.pool.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
 }
 
 // RefreshStorageState 保证并发认证失效只提交一次
@@ -2394,13 +2468,15 @@ func (p *AccountPool) Status() []AccountStatus {
 	return statuses
 }
 
-// accountStateLocked 推导账户对外状态：停用、忙碌、冷却或原始状态；调用方持有 p.mu
+// accountStateLocked 推导账户对外状态：停用、忙碌、冷却或原始状态；调用方持有 p.mu。
+// 只有就绪账户会显示为忙碌：需要登录或不可用的账户即使还有未结束的租约也显示原状态，不被“忙碌”盖住
 func accountStateLocked(account *Account, now time.Time) AccountState {
 	state := account.State
 	_, active := accountCooldown(account, "", now)
 	if !account.Config.Enabled {
 		state = AccountDisabled
-	} else if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 {
+	} else if state == AccountReady &&
+		(account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0) {
 		state = AccountBusy
 	} else if state == AccountReady && active {
 		state = AccountCooldown
@@ -2797,6 +2873,10 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 		account.State = state
 	}
 	account.stateMessage = strings.TrimSpace(reason)
+	if state == AccountReady || state == AccountAuthRequired {
+		// 管理操作（重新登录、验证）写入的认证结果同样参与顺序判断：此前开始的请求较晚返回的结果不能覆盖它
+		account.authCheckedAt = time.Now().UTC()
+	}
 	p.notifyLocked()
 	return nil
 }

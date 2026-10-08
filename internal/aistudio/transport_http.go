@@ -53,6 +53,7 @@ type MakerSuiteHTTPTransport struct {
 
 type accountLeaseContextKey struct{}
 type accountSelectionObserverContextKey struct{}
+type authRecoveryDisabledContextKey struct{}
 
 // ContextWithAccountLease 将上层已持有的租约传给协议传输
 func ContextWithAccountLease(ctx context.Context, lease *AccountLease) context.Context {
@@ -63,6 +64,18 @@ func ContextWithAccountLease(ctx context.Context, lease *AccountLease) context.C
 func AccountLeaseFromContext(ctx context.Context) (*AccountLease, bool) {
 	lease, ok := ctx.Value(accountLeaseContextKey{}).(*AccountLease)
 	return lease, ok && lease != nil && lease.Account() != nil
+}
+
+// WithoutAuthRecovery 标记请求不做认证恢复：认证失败时原样返回，不续签、不重置 WAA runtime、不改账户状态。
+// 用于借用其他请求租约的附带调用（降级判定的计数）：它的 401 若触发续签，会重置同账户正在流式输出的运行时
+func WithoutAuthRecovery(ctx context.Context) context.Context {
+	return context.WithValue(ctx, authRecoveryDisabledContextKey{}, true)
+}
+
+// AuthRecoveryDisabled 返回请求是否带有 WithoutAuthRecovery 标记
+func AuthRecoveryDisabled(ctx context.Context) bool {
+	disabled, _ := ctx.Value(authRecoveryDisabledContextKey{}).(bool)
+	return disabled
 }
 
 // ContextWithAccountSelectionObserver 观察请求最终选择的账户

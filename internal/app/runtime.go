@@ -80,6 +80,7 @@ func newRuntime(
 		return nil, nil, nil, errors.Join(err, workers.Close())
 	}
 	refresher := newAuthRuntimeRefresher(workers, headers, requests, cfg.Proxy)
+	workers.refresher = refresher
 	client, err := aistudio.NewClient(aistudio.ClientOptions{
 		Transport:       &authRetryTransport{transport: transport, refresher: refresher},
 		Protected:       &authRetryProtectedTransport{transport: protected, refresher: refresher},
@@ -98,6 +99,8 @@ func newRuntime(
 	}
 	service := newTrackedService(lifecycle, pooled, pool, requests, workers, cfg.RequestTimeout)
 	service.firstEventTimeout.Store(int64(cfg.FirstEventTimeout))
+	// 账户因登录失效退出调度后用合并推送更新管理页，不为单个账户立即推送全部账户状态
+	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
@@ -170,6 +173,10 @@ type accountWorkerManager struct {
 	backgroundMu    sync.Mutex
 	background      context.Context
 	stopBackground  context.CancelFunc
+	// refresher 在 Worker 启动阶段确认登录失效时恢复认证；为空时只把账户标为需要登录
+	refresher *authRuntimeRefresher
+	// launch 启动单个账户的 WAA Worker，为空时使用 newWAAWorker（测试替换为不启动浏览器的实现）
+	launch func(context.Context, string, camoufoxnative.Options) (*aistudio.NativeWorker, error)
 }
 
 type accountWorker struct {
@@ -270,6 +277,8 @@ func (preparer *accountWorkerPreparer) BrowserStorageState(ctx context.Context) 
 // accountWorkerInitError 表示单个账户的 WAA worker 初始化失败
 type accountWorkerInitError struct {
 	err error
+	// authHandled 表示启动阶段已经处理过登录失效（已恢复一次或已标为需要登录），上层不再恢复第二次
+	authHandled bool
 }
 
 func (err *accountWorkerInitError) Error() string {
@@ -1031,7 +1040,11 @@ func (manager *accountWorkerManager) startReservedWorker(
 		step, message := workerStartupProgress(stage)
 		manager.requests.log(label, "INFO", fmt.Sprintf("WAA Worker 启动 | %d/7 | %s", step, message))
 	}
-	worker, initErr := newWAAWorker(initCtx, account.id, options)
+	launch := manager.launch
+	if launch == nil {
+		launch = newWAAWorker
+	}
+	worker, initErr := launch(initCtx, account.id, options)
 	cancel()
 	if initErr != nil {
 		if ownsLease {
@@ -1323,7 +1336,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.openings[accountID] = opening
 			manager.openingSet.Store(accountID, struct{}{})
 			manager.rebalanceMu.Unlock()
-			preparer, err := manager.startReservedWorker(ctx, accountID, bootstrapModel)
+			preparer, err := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
 			manager.rebalanceMu.Lock()
 			if err == nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -1367,7 +1380,7 @@ func (manager *accountWorkerManager) ensureWorker(
 		manager.openings[accountID] = opening
 		manager.openingSet.Store(accountID, struct{}{})
 		manager.rebalanceMu.Unlock()
-		pending, startErr := manager.startReservedWorker(ctx, accountID, bootstrapModel)
+		pending, startErr := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
 		if startErr != nil {
 			manager.rebalanceMu.Lock()
 			manager.finishOpening(accountID, opening)
@@ -1426,6 +1439,62 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 		}
 	}
+}
+
+// startAuthenticatedWorker 启动账户 Worker。启动阶段确认登录失效（登录页跳转、签名 Cookie 失效）时，
+// 在请求租约内恢复一次认证并重新启动；仍失败时账户标为需要登录，错误带 authHandled，上层不再恢复第二次。
+// 预热与后台扩容没有租约，也不为此另取普通租约（会更新 LastUsed、把账户显示为忙碌，干扰 idleWarmVictimFor
+// 与预热轮换选号）：账户保存了续签材料时留给带租约的按需启动恢复，没有续签材料时按启动前的认证代际标为需要登录
+func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Context, accountID string, model string) (*accountWorkerPreparer, error) {
+	generation := manager.pool.AuthGeneration(accountID)
+	startedAt := time.Now()
+	worker, err := manager.startReservedWorker(ctx, accountID, model)
+	if err == nil || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(err) {
+		return worker, err
+	}
+	lease, leased := aistudio.AccountLeaseFromContext(ctx)
+	if !leased || lease.Account().ID != accountID {
+		marked, markErr := manager.markStartupAuthRequired(accountID, generation, startedAt, err)
+		if !marked && markErr == nil {
+			return nil, err
+		}
+		return nil, &accountWorkerInitError{err: errors.Join(err, markErr), authHandled: true}
+	}
+	if manager.refresher == nil {
+		return nil, &accountWorkerInitError{err: errors.Join(err, lease.MarkAuthenticationRequired(err.Error())), authHandled: true}
+	}
+	if recoverErr := manager.refresher.Recover(ctx, err); recoverErr != nil {
+		return nil, &accountWorkerInitError{err: recoverErr, authHandled: true}
+	}
+	worker, err = manager.startReservedWorker(ctx, accountID, model)
+	if err == nil {
+		return worker, nil
+	}
+	if aistudio.DefinitiveAuthenticationFailure(err) {
+		err = manager.refresher.markAuthenticationRequired(ctx, err)
+	}
+	return nil, &accountWorkerInitError{err: err, authHandled: true}
+}
+
+// markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录
+func (manager *accountWorkerManager) markStartupAuthRequired(
+	accountID string,
+	generation uint64,
+	startedAt time.Time,
+	cause error,
+) (bool, error) {
+	account, err := manager.pool.Account(accountID)
+	if err != nil {
+		return false, err
+	}
+	if state, loadErr := aistudio.LoadStorageState(account.StoragePath); loadErr == nil && authRefreshMaterial(state) {
+		return false, nil
+	}
+	marked, err := manager.pool.MarkAuthenticationRequiredIfGeneration(accountID, generation, startedAt, cause.Error())
+	if marked && manager.refresher != nil && manager.refresher.publish != nil {
+		manager.refresher.publish()
+	}
+	return marked, err
 }
 
 func (manager *accountWorkerManager) promote(ctx context.Context, accountID string, modelID string) (aistudio.ProtectedPreparer, error) {
@@ -3060,7 +3129,8 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 				continue
 			}
 			workersChanged := service.workers.schedulingChanged()
-			_, promoteErr := service.workers.promote(ctx, accountID, selection.ModelID)
+			// 带上刚取得的租约：启动阶段确认登录失效时在这个租约内恢复认证，不另取租约
+			_, promoteErr := service.workers.promote(aistudio.ContextWithAccountLease(ctx, lease), accountID, selection.ModelID)
 			if promoteErr == nil {
 				return lease, nil
 			}
@@ -3106,6 +3176,12 @@ func (service *trackedService) acquireWarmLease(ctx context.Context, selection a
 			continue
 		}
 		if promoteFailure != nil {
+			// 候选因启动时登录失效退出调度：按账户需要重新登录返回（503，列出账户与原因），并保留启动失败原因
+			var notReady *aistudio.AccountsNotReadyError
+			if noEligible := service.pool.NoEligibleError(selection); aistudio.DefinitiveAuthenticationFailure(promoteFailure) &&
+				errors.As(noEligible, &notReady) {
+				return nil, errors.Join(noEligible, promoteFailure)
+			}
 			return nil, promoteFailure
 		}
 		if runtimeBusyErr != nil {

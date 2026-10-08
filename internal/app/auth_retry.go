@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -22,7 +23,15 @@ type authRuntimeRefresher struct {
 	prepareHeaders func(string) (func(bool), error)
 	globalProxy    string
 	requests       *requestRegistry
+	// publish 在账户被标为需要登录后推送管理页账户状态，使用生成服务的合并推送；为空时不推送
+	publish func()
+	// waitLimit 为续签等待同账户其他请求结束的上限，为 0 时使用 authRefreshWaitLimit
+	waitLimit time.Duration
 }
+
+// authRefreshWaitLimit 为续签等待同账户其他正常请求结束的上限。同账户的请求可能正在等待本次续签所在的
+// Worker 启动结束（ensureWorker 的 waitForOpening），不设上限会互相等待；超时后放弃本次续签
+const authRefreshWaitLimit = 12 * time.Second
 
 // authRetryTransport 为普通 RPC 执行一次认证续签重试
 type authRetryTransport struct {
@@ -165,49 +174,93 @@ func (provider *accountHeaderProvider) prepareInvalidate(accountID string) (func
 	}, nil
 }
 
-// Do 在 401 后续签同一账户并重放一次请求
-func (transport *authRetryTransport) Do(ctx context.Context, request aistudio.RPCRequest) (*aistudio.RPCResponse, error) {
-	response, err := transport.transport.Do(ctx, request)
-	if err != nil || !authenticationFailed(response) {
-		return response, err
+// markAuthenticationRequired 把当前租约账户标为需要登录并推送账户状态，返回保留原因的错误。
+// 没有租约、请求已取消或错误不是登录失效时原样返回
+func (refresher *authRuntimeRefresher) markAuthenticationRequired(ctx context.Context, cause error) error {
+	lease, ok := aistudio.AccountLeaseFromContext(ctx)
+	if !ok || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(cause) {
+		return cause
 	}
-	if !transport.refresher.Available(ctx) {
-		return response, nil
+	err := lease.MarkAuthenticationRequired(cause.Error())
+	if refresher.publish != nil {
+		refresher.publish()
 	}
-	originalErr, err := readAuthenticationFailure(request.Method, response)
-	if err != nil {
-		return nil, err
-	}
-	if err := transport.refresher.Refresh(ctx); err != nil {
-		return nil, errors.Join(originalErr, err)
-	}
-	return transport.transport.Do(ctx, request)
+	return errors.Join(cause, err)
 }
 
-// DoProtected 在 401 后续签同一账户并重放一次受保护请求
+// Recover 为当前租约账户恢复一次登录：有续签材料时续签并重置 WAA runtime，成功返回 nil；
+// 没有续签材料或续签失败时把账户标为需要登录，返回保留原因的错误。
+// Worker 启动阶段已经处理过的登录失效（authHandled）不再恢复第二次
+func (refresher *authRuntimeRefresher) Recover(ctx context.Context, cause error) error {
+	var startup *accountWorkerInitError
+	if errors.As(cause, &startup) && startup.authHandled {
+		return cause
+	}
+	if refresher.Available(ctx) {
+		err := refresher.Refresh(ctx)
+		if err == nil {
+			return nil
+		}
+		cause = errors.Join(cause, err)
+	}
+	return refresher.markAuthenticationRequired(ctx, cause)
+}
+
+// do 发送普通或受保护 RPC：登录失效（HTTP 401、协议 Code 16、登录页跳转、签名 Cookie 失效）时恢复一次并重放一次，
+// 重放仍失效时把账户标为需要登录。带 WithoutAuthRecovery 标记的请求原样返回，不续签也不改账户状态
+func (refresher *authRuntimeRefresher) do(
+	ctx context.Context,
+	method string,
+	send func() (*aistudio.RPCResponse, error),
+) (*aistudio.RPCResponse, error) {
+	if refresher == nil || aistudio.AuthRecoveryDisabled(ctx) {
+		return send()
+	}
+	for attempt := 0; ; attempt++ {
+		response, err := send()
+		if err == nil && authenticationFailed(response) {
+			original, body, readErr := readAuthenticationFailure(method, response)
+			if readErr != nil {
+				return nil, readErr
+			}
+			if !aistudio.DefinitiveAuthenticationFailure(original) {
+				// Drive 授权缺失等不表示登录失效的 401：还原响应正文，由调用方按原错误处理
+				response.Body = io.NopCloser(bytes.NewReader(body))
+				return response, nil
+			}
+			response, err = nil, original
+		}
+		if !aistudio.DefinitiveAuthenticationFailure(err) {
+			return response, err
+		}
+		if attempt > 0 {
+			return nil, refresher.markAuthenticationRequired(ctx, err)
+		}
+		if recoverErr := refresher.Recover(ctx, err); recoverErr != nil {
+			return nil, recoverErr
+		}
+	}
+}
+
+// Do 在登录失效后恢复同一账户并重放一次请求
+func (transport *authRetryTransport) Do(ctx context.Context, request aistudio.RPCRequest) (*aistudio.RPCResponse, error) {
+	return transport.refresher.do(ctx, request.Method, func() (*aistudio.RPCResponse, error) {
+		return transport.transport.Do(ctx, request)
+	})
+}
+
+// DoProtected 在登录失效后恢复同一账户并重放一次受保护请求
 func (transport *authRetryProtectedTransport) DoProtected(
 	ctx context.Context,
 	request aistudio.GenerateRequest,
 	rpc aistudio.RPCRequest,
 ) (*aistudio.RPCResponse, error) {
-	response, err := transport.transport.DoProtected(ctx, request, rpc)
-	if err != nil || !authenticationFailed(response) {
-		return response, err
-	}
-	if !transport.refresher.Available(ctx) {
-		return response, nil
-	}
-	originalErr, err := readAuthenticationFailure(rpc.Method, response)
-	if err != nil {
-		return nil, err
-	}
-	if err := transport.refresher.Refresh(ctx); err != nil {
-		return nil, errors.Join(originalErr, err)
-	}
-	return transport.transport.DoProtected(ctx, request, rpc)
+	return transport.refresher.do(ctx, rpc.Method, func() (*aistudio.RPCResponse, error) {
+		return transport.transport.DoProtected(ctx, request, rpc)
+	})
 }
 
-// OpenBidiProtected 在 401 后续签同一账户并重新建立 WebChannel
+// OpenBidiProtected 在登录失效后恢复同一账户并重新建立 WebChannel
 func (transport *authRetryProtectedTransport) OpenBidiProtected(
 	ctx context.Context,
 	request aistudio.BidiRequest,
@@ -227,17 +280,21 @@ func (transport *authRetryProtectedTransport) OpenBidiProtected(
 		}
 		return session, nil
 	}
-	if !aistudio.DefinitiveAuthenticationFailure(err) || transport.refresher == nil || !transport.refresher.Available(ctx) {
+	if !aistudio.DefinitiveAuthenticationFailure(err) || transport.refresher == nil || aistudio.AuthRecoveryDisabled(ctx) {
 		return nil, errors.Join(err, gate.Commit())
 	}
 	gate.Abandon()
-	if refreshErr := transport.refresher.Refresh(ctx); refreshErr != nil {
-		return nil, errors.Join(err, refreshErr)
+	if recoverErr := transport.refresher.Recover(ctx, err); recoverErr != nil {
+		return nil, recoverErr
 	}
-	return bidiTransport.OpenBidiProtected(ctx, request, runtime, lease, release)
+	session, err = bidiTransport.OpenBidiProtected(ctx, request, runtime, lease, release)
+	if aistudio.DefinitiveAuthenticationFailure(err) {
+		err = transport.refresher.markAuthenticationRequired(ctx, err)
+	}
+	return session, err
 }
 
-// DoProtectedVideo 在认证失败后续签同一账户并重放 Veo 请求
+// DoProtectedVideo 在登录失效后恢复同一账户并重放 Veo 请求
 func (transport *authRetryProtectedTransport) DoProtectedVideo(
 	ctx context.Context,
 	request aistudio.VideoRequest,
@@ -247,21 +304,9 @@ func (transport *authRetryProtectedTransport) DoProtectedVideo(
 	if !ok {
 		return nil, fmt.Errorf("protected transport 不支持 GenerateVideo")
 	}
-	response, err := videoTransport.DoProtectedVideo(ctx, request, rpc)
-	if err != nil || !authenticationFailed(response) {
-		return response, err
-	}
-	if !transport.refresher.Available(ctx) {
-		return response, nil
-	}
-	originalErr, err := readAuthenticationFailure(rpc.Method, response)
-	if err != nil {
-		return nil, err
-	}
-	if err := transport.refresher.Refresh(ctx); err != nil {
-		return nil, errors.Join(originalErr, err)
-	}
-	return videoTransport.DoProtectedVideo(ctx, request, rpc)
+	return transport.refresher.do(ctx, rpc.Method, func() (*aistudio.RPCResponse, error) {
+		return videoTransport.DoProtectedVideo(ctx, request, rpc)
+	})
 }
 
 // Refresh 续签当前租约账户并保存新的 storage state
@@ -276,6 +321,10 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 	}
 	defer endRefresh()
 	account := lease.Account()
+	if err := refresher.waitForOtherRequests(ctx, lease); err != nil {
+		refresher.requests.log(account.Config.Label, "WARN", "账户认证续签放弃 | 错误="+err.Error())
+		return err
+	}
 	startedAt := time.Now()
 	refresher.requests.log(account.Config.Label, "INFO", "账户认证续签 | 1/2 | 刷新 Cookie")
 	err := lease.RefreshStorageState(func(state *aistudio.StorageState) error {
@@ -291,6 +340,10 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 			return fmt.Errorf("续签账户 %s: %w", account.ID, err)
 		}
 		state.Cookies = cookies
+		// 续签结果必须能生成授权头才提交，否则会用不可用的 Cookie 覆盖原登录状态
+		if _, err := aistudio.NewSigner().Sign(*state); err != nil {
+			return fmt.Errorf("续签账户 %s 的 Cookie 无法签名: %w", account.ID, err)
+		}
 		return nil
 	}, func() (func(bool), error) {
 		refresher.requests.log(account.Config.Label, "INFO", "账户认证续签 | 2/2 | 重置协议运行时")
@@ -318,6 +371,24 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// waitForOtherRequests 在有上限的时间内等待同账户其他正常请求结束（续签会重置它们正在使用的 WAA runtime）。
+// 超时返回 ErrAccountLeased，不重置
+func (refresher *authRuntimeRefresher) waitForOtherRequests(ctx context.Context, lease *aistudio.AccountLease) error {
+	limit := refresher.waitLimit
+	if limit <= 0 {
+		limit = authRefreshWaitLimit
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
+	if err := lease.WaitForAuthRefresh(waitCtx); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("%w: 等待同账户其他请求结束超过 %s", aistudio.ErrAccountLeased, limit)
+	}
+	return nil
+}
+
 // Available 返回当前租约账户是否保存了 Chrome OAuth 续签材料
 func (refresher *authRuntimeRefresher) Available(ctx context.Context) bool {
 	lease, ok := aistudio.AccountLeaseFromContext(ctx)
@@ -328,6 +399,11 @@ func (refresher *authRuntimeRefresher) Available(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
+	return authRefreshMaterial(state)
+}
+
+// authRefreshMaterial 返回认证状态是否带有可原地续签的 Chrome OAuth 材料
+func authRefreshMaterial(state aistudio.StorageState) bool {
 	extension, exists, err := state.AuthExtension()
 	return err == nil && exists && extension.OAuth != nil
 }
@@ -336,13 +412,13 @@ func authenticationFailed(response *aistudio.RPCResponse) bool {
 	return response != nil && response.Body != nil && response.StatusCode == http.StatusUnauthorized
 }
 
-// readAuthenticationFailure 读取并关闭认证失败响应以保留原始原因
-func readAuthenticationFailure(method string, response *aistudio.RPCResponse) (*aistudio.RPCError, error) {
+// readAuthenticationFailure 读取并关闭认证失败响应，返回原始原因与响应正文
+func readAuthenticationFailure(method string, response *aistudio.RPCResponse) (*aistudio.RPCError, []byte, error) {
 	body, readErr := io.ReadAll(response.Body)
 	if err := errors.Join(readErr, response.Body.Close()); err != nil {
-		return nil, fmt.Errorf("读取认证失败响应: %w", err)
+		return nil, nil, fmt.Errorf("读取认证失败响应: %w", err)
 	}
-	return aistudio.DecodeRPCError(method, response.StatusCode, body), nil
+	return aistudio.DecodeRPCError(method, response.StatusCode, body), body, nil
 }
 
 var _ aistudio.RPCTransport = (*authRetryTransport)(nil)

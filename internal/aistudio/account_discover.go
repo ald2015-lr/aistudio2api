@@ -171,13 +171,8 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		if len(models) == 0 || !account.Config.Enabled {
 			continue
 		}
-		state := account.State
-		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 {
-			state = AccountBusy
-		} else if _, cooling := accountCooldown(account, "", now); state == AccountReady && cooling {
-			state = AccountCooldown
-		}
-		if state == AccountReady || state == AccountBusy {
+		// 与 Status 共用状态推导：需要登录的账户即使还有未结束的租约也不计入可预热
+		if state := accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
 			summary.Available++
 		}
 	}

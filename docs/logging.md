@@ -206,13 +206,14 @@ SSE 客户端把该帧作为连接存活信号，正文、推理和 usage 继续
 
 ## 账户事件
 
-HTTP `401` 会使用该 Chrome 导入账户保存的 OAuth/DBSC 材料续签 Cookie、重置 WAA Worker并重放一次请求。
+HTTP `401`、协议 Code 16、Worker 启动时跳转登录页或签名 Cookie 失效会使用该 Chrome 导入账户保存的 OAuth/DBSC 材料续签 Cookie、重置 WAA Worker并重放一次请求。同账户其他请求 12 秒内没有结束时放弃本次续签，记录 `账户认证续签放弃`。
 
 ```text
 INFO  account@example.com  账户认证续签 | 1/2 | 刷新 Cookie
 INFO  account@example.com  账户认证续签 | 2/2 | 重置协议运行时
 INFO  account@example.com  账户认证续签完成 | 耗时=1.116s
 ERROR account@example.com  账户认证续签失败 | 耗时=1.116s | 错误=<ERROR>
+WARN  account@example.com  账户认证续签放弃 | 错误=<ERROR>
 ```
 
 HTTP `403` 与协议 Code 7 保留当前账户和模型的 `verified` 记录，不标记永久权限失败。协议 Code 5、Worker 进程失败或 Worker 被替换时重建当前账户 Worker 并重放一次；其他可重试错误写入临时冷却。

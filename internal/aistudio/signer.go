@@ -73,7 +73,7 @@ func SignAuthorization(cookies []StateCookie, origin string, timestamp int64) (s
 	for _, item := range signatureCookies {
 		value, ok := state.CookieValue(item.name, normalized+"/", now)
 		if !ok {
-			return "", fmt.Errorf("storage state 缺少有效 Cookie: %s", item.name)
+			return "", fmt.Errorf("%w: storage state 缺少有效 Cookie: %s", ErrAuthenticationRequired, item.name)
 		}
 		source := fmt.Sprintf("%d %s %s", timestamp, value, normalized)
 		digest := sha1.Sum([]byte(source))

@@ -413,10 +413,19 @@ func (s *PooledService) cachedModels(accountID string) []Model {
 	return cloneAccountModels(account.Models)
 }
 
-// DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证
+// ErrAuthenticationRequired 表示账户登录态已失效：载入 AI Studio 页面被跳转到 Google 登录页，
+// 或者保存的签名 Cookie 缺失、已过期。与上游 HTTP 401 一样进入认证恢复流程
+var ErrAuthenticationRequired = errors.New("登录态失效")
+
+// DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证。
+// Drive 授权缺失（GenerateAccessToken 返回 401、Code 16、unauthorized_client）只表示没有 Drive 权限，不算登录失效
 func DefinitiveAuthenticationFailure(err error) bool {
+	if errors.Is(err, ErrAuthenticationRequired) {
+		return true
+	}
 	var rpcError *RPCError
-	return errors.As(err, &rpcError) && rpcError.StatusCode == 401
+	return errors.As(err, &rpcError) && !driveAuthorizationMissing(err) &&
+		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
 }
 
 // DefinitiveWAARuntimeFailure 判断上游是否明确拒绝当前 WAA 运行态
@@ -632,6 +641,10 @@ func accountAttemptLimit(pool *AccountPool, pinned bool) int {
 }
 
 func retryableAccountError(err error) bool {
+	// Drive 授权缺失换号也不会好转，按原错误返回
+	if driveAuthorizationMissing(err) {
+		return false
+	}
 	var rpcError *RPCError
 	if !errors.As(err, &rpcError) {
 		return false
@@ -658,7 +671,8 @@ func forwardEventsWithLease(
 			}
 		}
 	}()
-	verified := false
+	// terminal 在 Finish 或 Error 之后为真：之后的事件只排空不转发，也不再写回账户状态
+	terminal := false
 	accountID := lease.Account().ID
 	accessGeneration := lease.ModelAccessGeneration()
 	checkedAt := lease.CheckedAt()
@@ -673,7 +687,11 @@ func forwardEventsWithLease(
 		case <-ctx.Done():
 			return
 		}
+		if terminal {
+			continue
+		}
 		if event.Kind == EventError {
+			terminal = true
 			if DefinitiveAuthenticationFailure(event.Err) {
 				if err := lease.MarkAuthenticationRequired(event.Err.Error()); err != nil {
 					event.Err = errors.Join(event.Err, err)
@@ -694,13 +712,12 @@ func forwardEventsWithLease(
 		case <-ctx.Done():
 			return
 		}
-		if event.Kind != EventError && !verified {
-			verified = true
+		if event.Kind == EventFinish {
+			// 只在正常结束时确认登录有效：正文已经输出后才返回的认证失败不能被首个正文事件的“有效”盖住
+			terminal = true
 			if err := lease.MarkAuthenticationValid(); err != nil {
 				slog.Error("账户认证状态保存失败", "account", accountID, "error", err)
 			}
-		}
-		if event.Kind == EventFinish {
 			go func() {
 				if _, err := pool.MarkModelAccessVerifiedIfGeneration(
 					accountID, lease.CooldownScope(modelID), accessGeneration, checkedAt,
@@ -809,10 +826,12 @@ func minimumPositive(left int64, right int64) int64 {
 }
 
 // CountTokensForLease 在已持有的账户租约上计数（降级判定用）：复用生成请求正在使用的账号，不另外选号、不占用并发名额，
-// 失败也不改变账户状态（不冷却、不标记认证失败）
+// 失败也不改变账户状态（不冷却、不标记认证失败）。计数带 WithoutAuthRecovery 标记，遇到 401 不续签，
+// 否则会重置同一账户正在流式输出的 WAA runtime
 func (s *PooledService) CountTokensForLease(ctx context.Context, lease *AccountLease, request TokenCountRequest) (TokenCount, error) {
 	if lease == nil {
 		return TokenCount{}, fmt.Errorf("计数需要账户租约")
 	}
-	return s.client.CountTokensForAccount(ContextWithAccountLease(ctx, lease), lease.Account().ID, request)
+	ctx = WithoutAuthRecovery(ContextWithAccountLease(ctx, lease))
+	return s.client.CountTokensForAccount(ctx, lease.Account().ID, request)
 }
