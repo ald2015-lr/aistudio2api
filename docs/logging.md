@@ -111,6 +111,8 @@ Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启�
 | `WAA Worker 重建 | 模型=... | 重放当前请求` | 当前账户 Worker 已失效，业务请求在新实例重放；下一行 `原因:` 为触发重建的错误 |
 | `WAA Worker 已更新 | 模型=... | 重放当前请求` | 并发路径已经替换 Worker，当前请求使用新实例 |
 
+按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（权益为 Ultra 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满。保存服务配置后修改了 `ULTRA_EXCLUSIVE` 时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`。
+
 单个 Worker 停止事件：
 
 ```text
@@ -253,15 +255,16 @@ WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash
 
 ## 用量账本
 
-`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta` 与 `/trace/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试，以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）不写入，避免抬高请求数；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由的请求按去掉 `/trace` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
+`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta`、`/trace/` 与 `/ultra/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、号池（`/ultra` 请求为 `ultra`，其余为空，用量接口中显示为 `normal`）、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试，以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）不写入，避免抬高请求数；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由与 Ultra 路由的请求按去掉 `/trace`、`/ultra` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
 
-同一事务按 UTC 小时与服务器本地日累加汇总与耗时分布：完整落在范围与单个分桶内的本地日读取日汇总，其余整小时读取小时汇总，范围边缘与跨分桶的部分读取原始记录。服务器时区变化后，下次启动时从小时汇总与原始记录重建本地日汇总。写入由后台协程批量提交，不阻塞响应：等待写入的记录超过 4096 条时丢弃新记录，写入恢复后输出丢弃数。记录与汇总按服务器本地日整日保留 90 天，启动时与之后每天清理一次。账本打开失败时写一条 WARN，本次运行不记录用量、不注册用量接口，服务照常运行。
+同一事务按 UTC 小时与服务器本地日累加汇总与耗时分布（汇总键包含号池）：完整落在范围与单个分桶内的本地日读取日汇总，其余整小时读取小时汇总，范围边缘与跨分桶的部分读取原始记录。服务器时区变化后，下次启动时从小时汇总与原始记录重建本地日汇总。写入由后台协程批量提交，不阻塞响应：等待写入的记录超过 4096 条时丢弃新记录，写入恢复后输出丢弃数。记录与汇总按服务器本地日整日保留 90 天，启动时与之后每天清理一次。账本打开失败时写一条 WARN，本次运行不记录用量、不注册用量接口，服务照常运行。
 
 降级拦截率为降级判定结论 `rejected` 的请求占经过判定请求的比例；重复回复率为回复正文与 2 小时内某次回复完全相同的请求占回复不少于 50 token 的请求的比例（与请求日志的重复回复检测一致，过短的固定答复不计入）。用量页的请求记录可以按回复指纹搜索同一回复的全部请求。
 
 ```text
 WARN  service  请求账本打开失败，本次运行不记录用量 | 路径=<PATH> | 错误=<ERROR>
 INFO  service  请求账本已按服务器时区重建本地日汇总 | 天数=<COUNT>
+INFO  service  请求账本已加入号池列 | 原始记录=<BOOL> | 重建汇总表=<COUNT>
 WARN  service  请求账本写入队列已满 | 丢弃=<COUNT>
 ERROR service  请求账本写入失败 | 记录=<COUNT> | 错误=<ERROR>
 ERROR service  请求账本清理失败 | 错误=<ERROR>

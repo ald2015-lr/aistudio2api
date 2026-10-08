@@ -154,8 +154,11 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `INIT_TIMEOUT` | 单账户初始化超时 | `2m` |
 | `REQUEST_TIMEOUT` | 单次请求最大执行时间 | `5m` |
 | `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
-| `WARM_WORKER_LIMIT` | 常驻预热账户数 | `5` |
-| `MAX_ACTIVE_WORKERS` | 活动 Worker 容量上限，必须不小于热池目标 | `10` |
+| `WARM_WORKER_LIMIT` | 普通分区（权益不是 Ultra 的账户）的常驻预热账户数，可热更新 | `5` |
+| `MAX_ACTIVE_WORKERS` | 普通分区的活动 Worker 容量上限，必须不小于热池目标，可热更新；浏览器总数最多为两个分区上限之和 | `10` |
+| `ULTRA_EXCLUSIVE` | `true` 时 Ultra 账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户；保存后立即生效 | `true` |
+| `ULTRA_WARM_WORKER_LIMIT` | Ultra 分区（权益为 Ultra 的账户）的常驻预热账户数，`0` 表示只按需启动，可热更新 | `2` |
+| `ULTRA_MAX_ACTIVE_WORKERS` | Ultra 分区的活动 Worker 容量上限，至少为 1 且不小于 `ULTRA_WARM_WORKER_LIMIT`，可热更新 | `5` |
 | `WARM_STARTUP_CONCURRENCY` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，按需冷启动另保留 1 个名额并优先，可热更新；`WAA_BACKEND=go` 不受此限 | `2` |
 | `PER_ACCOUNT_CONCURRENCY` | 单账号同时执行的请求数 | `2` |
 | `ROUTING_STRATEGY` | 账户轮询 `round-robin` 或粘性优先 `fill-first` | `round-robin` |
@@ -166,7 +169,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值，修改后重启程序生效 | `false` |
 | `ADMIN_PASSWORD` | 远程管理密码；非空时非回环请求经 HTTP Basic 认证后可访问管理页面与 `/api/`，同一 IP 10 分钟内错 10 次封禁 15 分钟；管理进程重启后生效 | 空 |
 
-`LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT` 可以为 `0`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`。全局代理 URL 使用 `http`、`https` 或 `socks5` 纯 origin 形状。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
+`LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`。管理页面保存时没有带三个 Ultra 字段（旧版页面）则沿用 `.env` 中的现值。全局代理 URL 使用 `http`、`https` 或 `socks5` 纯 origin 形状。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
 
 `GET /api/config` 与 `PUT /api/config` 同时暴露保存值和当前生效值：
 
@@ -230,6 +233,10 @@ POST /api/control/start
 
 Worker 容量由热池目标、活动上限和单账户并发共同约束。活动数低于 `MAX_ACTIVE_WORKERS` 时直接启动并发布新 Worker。容量已满且存在空闲旧实例时，先启动 pending Worker（正在启动、尚未发布的替代 Worker），再关闭旧实例并发布替代 Worker；对请求模型处于冷却（全局或该模型限额）的空闲实例优先，同类中最久未用者优先，其次为最久未用实例。多个冷却实例可并行替换，每次替换预留独立的旧实例，启动期间新旧进程会短暂共存。启动失败或取消时现有 Worker 继续服务。请求只在取得容量槽位时占用冷账户；没有可立即使用的槽位时释放该账户并重新分类，由任一空闲的热 Worker 或新释放的槽位接收。存在可调度账户但暂时没有空闲槽位的请求按相同选择条件先到先服务排队，在租约释放或 Worker 状态变化时唤醒，直到请求超时。候选账户全部处于冷却时，最早恢复时间在 1 分钟内的请求排队等待恢复，更晚的请求直接返回 429，`Retry-After` 给出距最早恢复时间的秒数。超出 `WARM_WORKER_LIMIT` 的 Worker 空闲 5 分钟后关闭，热池保持目标数量。旧 Worker 与 pending 回收同时失败时，两份进程与租约均保留为 cleanup pending（仍待关闭）并占用容量槽，后续 Stop 会重试关闭。账户的 WAA runtime 租约由其他进程持有时，该账户退出预热与调度候选，首次 5 秒后重新探测，每次仍被占用时间隔翻倍、上限 1 分钟，每段占用只记录一条日志；指定该账户或只剩该类账户的请求返回账户正在使用的错误（对外按 503 服务暂时不可用）。
 
+账户按当前权益分为两个号池：权益为 Ultra 的账户组成 Ultra 号池，其余账户（含权益尚未读取的账户）组成普通号池。请求的号池写在 context 中（`aistudio.ContextWithPoolScope`），`AccountSelection.Pool` 为空时 `AcquireFor`、`TryAcquireFor`、`ClassifyCandidates` 取 context 中的号池；`/ultra` 请求只用 Ultra 号池，`ULTRA_EXCLUSIVE=true` 时普通路径只用普通号池，为 `false` 时普通路径不限号池，预热、轮换与登录检查等后台任务不限号池。选号、模型存在性校验、模型目录与别名解析、换号、跨账户文件复制、上传候选与没有账户时的错误都只看号池内的账户；Ultra 号池为空或账户都不可调度时返回写明 Ultra 号池的 `AccountsNotReadyError`（503），全部冷却仍按 429。文件或视频绑定在号池之外的账户上时返回 `ResourcePoolMismatchError`（400，英文说明资源属于哪个号池），不会改用池外账户。账户权益变化后立即按新权益归入号池。
+
+Worker 同样按账户当前权益分为普通分区与 Ultra 分区（`internal/app/worker_partition.go`）。`WARM_WORKER_LIMIT`、`MAX_ACTIVE_WORKERS` 只约束普通分区，`ULTRA_WARM_WORKER_LIMIT`、`ULTRA_MAX_ACTIVE_WORKERS` 约束 Ultra 分区，浏览器总数最多为两个分区上限之和。预热把每个分区从自己的账户补齐到自己的常驻数（没有可预热的 Ultra 账户时不为 Ultra 分区分类候选），超出分区常驻数的空闲 Worker 按分区回收；按需启动的容量判断、`idleWarmVictimFor` 的淘汰选号与冷却轮换（`tryReserveVictim`）都只在账户所在分区内进行，Ultra 请求不会淘汰普通 Worker，反之亦然；请求调度按备用账户各自的分区判断能否扩容，等待队列按含号池的选择条件分组，同分区的 Worker 空闲或容量释放后唤醒排队请求。冷启动名额（`WARM_STARTUP_CONCURRENCY`）、冷却轮换一轮的替换数与单账户并发两个分区共用。账户权益在持有 Worker 期间变化时，该 Worker 从此按新分区计数，不强制重启。三个 Ultra 设置与普通分区设置一样随服务配置保存立即热更新。
+
 故障重置先等待同账户的活动请求释放租约；等待期间该账户暂停接收新请求。客户端取消只结束自身请求。启动预热在官网 Run 按钮启用后提交，请求在发送前再次检查账户冷却状态。
 
 账户状态：
@@ -292,6 +299,8 @@ Worker 容量由热池目标、活动上限和单账户并发共同约束。活�
 
 `/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。
 
+`/ultra/v1/...` 与 `/ultra/v1beta/...` 去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录，见 `internal/api/ultra.go`），并把请求标记为 Ultra 号池；其余 `/ultra/*` 路径返回 404，`/trace/` 不变。普通路径由 `poolScopeMiddleware` 按 `ULTRA_EXCLUSIVE` 标记为普通号池或不限号池。别名解析的模型目录快照按号池分别缓存；请求日志、活动请求与用量账本带 `pool`（`/ultra` 请求为 `ultra`），日志路径保留 `/ultra` 前缀。
+
 OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 共用当前进程内最多 256 个响应节点，用于重建下一轮完整 contents（Interactions 不保存音频输出）；进程重启后客户端应重新提交完整上下文。Drive 文件、Veo operation 和产物文件的账户绑定写入 `runtime-state.json`，重启后仍可轮询和下载。
 
 新增上游能力从 `internal/aistudio` 开始：编码真实数组槽位、解码服务器事件，再由 `internal/api` 投影到公开协议。模型方法、上下文、输出上限、工具、声音、图片规格和视频规格均来自实时 `ListModels`。
@@ -312,6 +321,8 @@ npm run build
 Vite 将生产产物写入 `internal/webui/dist`。管理端通过本机 `/api` 路由管理生成服务、日志、账户、配置、模型冷却、活动请求和 SSE 状态事件；认证状态与 WAA 对象不进入浏览器存储。
 
 `internal/webui/embed.go` 使用 `//go:embed dist`，因此 Go 构建前必须生成当前前端产物。管理端从 `/api/events` 接收 `status`、`models`、`accounts`、`log`、`cooldowns` 和 `request` 事件。
+
+用量账本（`internal/requestdb`）的原始记录与小时、本地日汇总都有 `pool` 列（`/ultra` 请求为 `ultra`，其余为空），汇总主键包含 `pool`。旧版 `runtime/requests.db` 每次打开时由 `migrate` 检查并升级，可重复执行：原始记录缺少 `pool` 时 `ALTER TABLE ... ADD COLUMN` 并建立 `requests_pool_time` 索引，汇总表缺少 `pool` 时在一个事务内按新主键重建并复制旧汇总，旧数据归入普通号池。用量接口的 `pool` 维度对外取值为 `normal`、`ultra`，可筛选、分组与堆叠；协议归类先去掉 `/trace` 与 `/ultra` 前缀。
 
 用量页（`UsagePanel.vue` 与 `components/usage/`）按需加载：ECharts 只注册用到的折线图、柱状图与组件，单独构建为 `echarts-*.js`，与用量页代码一起在第一次打开用量页时下载，不进入主包。用量页通过 `/api/usage`、`/api/usage/records`、`/api/usage/records.csv` 与 `/api/requests/{id}/body` 读取账本，与其他管理接口一样依靠管理令牌 Cookie；账本未启用时这些接口返回 404，页面显示账本未启用。
 

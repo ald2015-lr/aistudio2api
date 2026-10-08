@@ -179,6 +179,8 @@ Google 邮箱的小写形式同时作为账户目录、管理页面标识和日�
 
 官网为 `GenerateContent`、`CountTokens`、Interaction、Code Assistant 与 Veo RPC 注入该 header。模型 field 83 描述访问方式：`1` 为付费 API key，`3` 为 Pro/Ultra 订阅，`4` 为 Ultra 订阅。公开模型目录合并全部账户的实时 `ListModels` 记录；账户调度使用 AccessModes、BenefitTier 与成功调用历史选择具体账户。
 
+账户按当前权益分为两个号池：权益为 Ultra 的账户组成 Ultra 号池，其余账户（含尚未读取权益的账户，`benefit_tier_known=false`）组成普通号池。`/ultra` 前缀的请求只在 Ultra 号池内选号；`ULTRA_EXCLUSIVE=true`（默认）时普通路径只在普通号池内选号，为 `false` 时普通路径不限号池。号池限定作用于全部选号、模型存在性校验、公开模型目录与别名解析、换号、通道回退、文件复制与上传候选；不和请求关联的预热、轮换、登录检查不限号池。权益在目录同步或运行状态刷新后变化时，账户立即按新权益归入号池。Worker 按同样的划分计入普通分区或 Ultra 分区，两个分区分别受 `WARM_WORKER_LIMIT`/`MAX_ACTIVE_WORKERS` 与 `ULTRA_WARM_WORKER_LIMIT`/`ULTRA_MAX_ACTIVE_WORKERS` 约束，淘汰与轮换不跨分区。
+
 ## 3. WAA challenge、官方 VM 与 fresh proof
 
 受保护请求使用以下链路：
@@ -1088,6 +1090,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | OpenAI 转录 | `POST /v1/audio/transcriptions` |
 | 实时 WebSocket | `GET /v1/live`、`GET /v1/robotics/stream` |
 
+上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 不变，没有 `/ultra/trace` 或 `/trace/ultra`。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 账户的资源同样如此）按各协议格式返回 400，消息说明资源属于哪个号池。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
+
 动态路由的注册形状为 `GET /v1/files/{file}`、`GET /v1/files/{file}/content`、`DELETE /v1/files/{file}`、`GET /v1/videos/{video}`、`GET /v1/videos/{video}/content`、`POST /v1beta/models/{action}` 与 `GET /v1beta/operations/{operation}`；端点表中的 `{id}` 表示对应资源标识。
 
 公开 `/v1` 与 `/v1beta` 接受 `Authorization: Bearer`、`X-API-Key`、`X-Goog-API-Key` 或 `?key=`，读取优先级为 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`Authorization: Bearer`；配置为空时关闭本地 API key 校验，此时 `Origin` 为 `null` 或非 localhost、非回环地址的 http/https 页面请求返回 401，不带 `Origin` 的客户端与其他 scheme 不受限制。`/v1*` 响应允许任意 origin，允许 `GET/POST/PUT/DELETE/OPTIONS` 与 `Authorization`、`Content-Type`、`X-API-Key`、`X-Goog-API-Key`、`Anthropic-Version`、`Anthropic-Beta` headers。`/v1*` 请求体上限约为 684 MiB，可容纳 Base64 编码的 512 MiB 文件。`/api` 控制面要求来源地址为 loopback 且 `Host` 为 localhost 或回环地址，携带 Origin 时执行 same-origin 校验。全部响应携带 `X-Frame-Options: DENY`、`Content-Security-Policy: frame-ancestors 'none'`、`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。`GET /health` 返回 `{"status":"ok"}`。
@@ -1123,24 +1127,26 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |
 | `GET /api/events` | 200 SSE | `{"type":"<TYPE>","data":<DTO>}` |
-| `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state` 筛选 |
-| `GET /api/usage/records`、`records.csv` | 200 | `{"items":[UsageRecord,...],"next_cursor"?}` 或带 BOM 的 UTF-8 CSV；另接受 `status`、`q`（请求 ID、错误或回复指纹）、`cursor`、`limit`（1 到 200） |
+| `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state`、`pool`（`normal` 或 `ultra`）筛选；`stack` 与分项 `groups` 同样包含 `pool` |
+| `GET /api/usage/records`、`records.csv` | 200 | `{"items":[UsageRecord,...],"next_cursor"?}` 或带 BOM 的 UTF-8 CSV；另接受 `status`、`q`（请求 ID、错误或回复指纹）、`cursor`、`limit`（1 到 200）；记录与 CSV 带 `pool`（`normal` 或 `ultra`） |
 | `GET /api/requests/{id}/body` | 200 / 404 | `RequestBody`；只在 `REQUEST_BODY_LOG=true` 时保存 |
 
 管理 DTO 字段：
 
 | DTO | 字段 |
 | --- | --- |
-| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts` |
-| `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required` |
-| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`message` |
+| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers` |
+| `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池账户 |
+| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区 |
+| `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小 |
+| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`）、`message` |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |
 | `ChromeImportProfile` | `id`、`profile`、`display_name`、`email`、`locale` |
 | `ChromeImportInput` | `account_ids`、`proxy`、`locale`、`timezone` |
 | `AdminCooldown` | `account_id`、`account_label`、`model_id`、`until`、可选 `reason` |
-| `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at` |
-| `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
+| `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`） |
+| `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
 | `AdminEvent` | `type`、`data` |
 
 `AdminStatus.state` 为 `STOPPED`、`LAUNCHING` 或 `RUNNING`；`running` 只在 `RUNNING` 为 true；`ready` 要求 `RUNNING` 且至少一个账户处于 ready 或 busy；`version` 来自构建信息；`active_requests` 是当前进程请求注册表数量。`AdminAccount.message` 保存当前状态原因，`models` 是该账户实时目录 ID。`until` 与 `started_at` 使用 RFC 3339 JSON time。
@@ -1157,7 +1163,9 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | --- | --- |
 | `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
-| `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值；下一次启动生成服务时使用 |
+| `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
+| `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 账户；读取时总是返回，提交时省略则沿用现值 |
+| `ultra_warm_worker_limit`、`ultra_max_active_workers` | 保存值，保存后立即热更新：Ultra 分区的常驻数（可以为 0）与峰值数（至少 1 且不小于常驻数）；读取时总是返回，提交时省略则沿用现值 |
 | `temporary_chat` | 保存值；下一次启动生成服务时使用 |
 | `listen_addr`、`proxy_api_key` | 保存值；下一管理进程使用 |
 | `active_listen_addr`、`active_proxy_api_key` | response-only；当前管理进程固定值 |
