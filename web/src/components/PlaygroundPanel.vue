@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
 import { ApiError, runPlayground, type PlaygroundChunk } from '@/api'
+import { copyText } from '@/clipboard'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Model,
@@ -228,9 +229,9 @@ function stop(): void {
   controller?.abort()
 }
 
-// copyOutput 复制当前可见响应
+// copyOutput 复制当前可见响应；非 HTTPS 页面没有 Clipboard API，由 copyText 退回兼容方式
 async function copyOutput(): Promise<void> {
-  await navigator.clipboard.writeText(visibleOutput.value)
+  if (!(await copyText(visibleOutput.value))) return
   copied.value = true
   window.setTimeout(() => {
     copied.value = false

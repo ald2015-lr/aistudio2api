@@ -16,6 +16,7 @@ import {
 import type { AdminLog, RequestLog } from '@/types'
 import RequestLogCard from './RequestLogCard.vue'
 import UiIcon from './UiIcon.vue'
+import { readStorage, writeStorage } from '@/storage'
 
 const props = defineProps<{
   logs: AdminLog[]
@@ -63,7 +64,7 @@ const category = ref<Category>('all')
 const source = ref('ALL')
 const search = ref('')
 const autoScroll = ref(true)
-const compact = ref(window.localStorage.getItem(COMPACT_KEY) !== 'false')
+const compact = ref(readStorage(COMPACT_KEY) !== 'false')
 const selectedKey = ref('')
 const viewport = ref<HTMLElement>()
 const scrollTop = ref(0)
@@ -72,7 +73,7 @@ let resizeObserver: ResizeObserver | undefined
 let scrollFrame = 0
 
 watch(compact, (value) => {
-  window.localStorage.setItem(COMPACT_KEY, String(value))
+  writeStorage(COMPACT_KEY, String(value))
 })
 
 const rows = computed(() => groupLogs(props.logs))
@@ -128,9 +129,13 @@ const levelCounts = computed(() => {
 })
 
 const filtered = computed(() =>
-  level.value === 'ALL' ? base.value : base.value.filter((row) => normalizedLevel(row) === level.value),
+  level.value === 'ALL'
+    ? base.value
+    : base.value.filter((row) => normalizedLevel(row) === level.value),
 )
-const items = computed(() => (compact.value ? aggregateRows(filtered.value) : singleItems(filtered.value)))
+const items = computed(() =>
+  compact.value ? aggregateRows(filtered.value) : singleItems(filtered.value),
+)
 
 const totalHeight = computed(() => items.value.length * ROW_HEIGHT)
 const range = computed(() => {
@@ -199,7 +204,8 @@ function requestChips(row: LogRow): string[] {
   if (request === undefined) return []
   const chips: string[] = []
   if (request.duration_ms !== undefined) chips.push(`${(request.duration_ms / 1000).toFixed(2)}s`)
-  if (request.usage !== undefined) chips.push(`${request.usage.total_tokens.toLocaleString(locale.value)} tok`)
+  if (request.usage !== undefined)
+    chips.push(`${request.usage.total_tokens.toLocaleString(locale.value)} tok`)
   if (request.usage !== undefined && request.usage.average_tokens_per_second > 0) {
     chips.push(`${request.usage.average_tokens_per_second.toFixed(1)} tok/s`)
   }
@@ -212,7 +218,9 @@ function requestChips(row: LogRow): string[] {
 function itemSource(item: LogItem): string {
   if (item.members.length === 1) return item.row.entry.source
   const distinct = new Set(item.members.map((member) => member.entry.source))
-  return distinct.size === 1 ? item.row.entry.source : tf('logs.groupSources', { count: distinct.size })
+  return distinct.size === 1
+    ? item.row.entry.source
+    : tf('logs.groupSources', { count: distinct.size })
 }
 
 function displayTime(value: string): string {
@@ -423,7 +431,9 @@ onBeforeUnmount(() => {
                     </span>
                   </template>
                   <template v-else>
-                    <strong class="log-title">{{ parseMessage(item.row.entry.message).title }}</strong>
+                    <strong class="log-title">{{
+                      parseMessage(item.row.entry.message).title
+                    }}</strong>
                     <span v-if="item.members.length > 1" class="badge badge-blue">
                       ×{{ item.members.length }}
                     </span>
@@ -439,7 +449,8 @@ onBeforeUnmount(() => {
                       :key="`f:${index}`"
                       class="log-chip"
                     >
-                      <span class="log-chip-key">{{ field.key }}</span>{{ field.value }}
+                      <span class="log-chip-key">{{ field.key }}</span
+                      >{{ field.value }}
                     </span>
                   </template>
                 </span>
@@ -513,7 +524,9 @@ onBeforeUnmount(() => {
               >
                 <div class="flex items-center gap-2">
                   <span class="font-mono text-gray-500">{{ displayTime(member.entry.time) }}</span>
-                  <span class="cell-truncate font-mono text-gray-300">{{ member.entry.source }}</span>
+                  <span class="cell-truncate font-mono text-gray-300">{{
+                    member.entry.source
+                  }}</span>
                 </div>
                 <div class="mt-1 flex flex-wrap gap-1">
                   <span
@@ -521,7 +534,8 @@ onBeforeUnmount(() => {
                     :key="`f:${index}`"
                     class="log-chip"
                   >
-                    <span class="log-chip-key">{{ field.key }}</span>{{ field.value }}
+                    <span class="log-chip-key">{{ field.key }}</span
+                    >{{ field.value }}
                   </span>
                   <span
                     v-for="(note, index) in parseMessage(member.entry.message).notes"
@@ -551,8 +565,7 @@ onBeforeUnmount(() => {
               <div class="mb-1 text-gray-500">{{ t('logs.raw') }}</div>
               <pre
                 class="rounded border border-[#21262d] bg-[#0d1117] p-2 font-mono break-words whitespace-pre-wrap text-gray-300"
-                >{{ selectedItem.row.entry.message }}</pre
-              >
+                >{{ selectedItem.row.entry.message }}</pre>
             </div>
           </template>
         </div>

@@ -1,6 +1,7 @@
 import { readonly, ref } from 'vue'
 import { legacyLocales } from '@/legacy-locales'
 import type { Locale, UpstreamChannel } from '@/types'
+import { readStorage, writeStorage } from '@/storage'
 
 const zhCN = {
   'app.title': 'AI Studio 控制台',
@@ -15,6 +16,9 @@ const zhCN = {
   'app.status': '服务状态',
   'app.start': '启动服务',
   'app.stop': '停止服务',
+  'app.eventsReconnecting': '实时连接已断开，正在重连…',
+  'app.eventsClosed': '实时连接已断开（可能是管理令牌失效），请刷新页面',
+  'app.statusUnreachable': '无法连接服务，显示的是上一次的状态',
   'nav.logs': '日志',
   'nav.accounts': '账户',
   'nav.models': '模型目录',
@@ -419,6 +423,9 @@ const en: Record<TranslationKey, string> = {
   'app.status': 'Service status',
   'app.start': 'Start service',
   'app.stop': 'Stop service',
+  'app.eventsReconnecting': 'Live connection lost, reconnecting…',
+  'app.eventsClosed': 'Live connection closed (the admin token may have expired). Please reload the page.',
+  'app.statusUnreachable': 'Cannot reach the service; showing the last known status',
   'nav.logs': 'Logs',
   'nav.accounts': 'Accounts',
   'nav.models': 'Model catalog',
@@ -864,7 +871,7 @@ export const availableLocales = (Object.keys(legacyLocales) as Locale[]).map((co
   label: legacyLocales[code].label,
 }))
 
-const savedLocale = window.localStorage.getItem('user_lang') as Locale | null
+const savedLocale = readStorage('user_lang') as Locale | null
 const locale = ref<Locale>(
   savedLocale !== null && availableLocales.some((item) => item.code === savedLocale)
     ? savedLocale
@@ -905,7 +912,7 @@ export function useI18n() {
   const setLocale = (value: Locale): void => {
     locale.value = value
     document.documentElement.lang = value
-    window.localStorage.setItem('user_lang', value)
+    writeStorage('user_lang', value)
   }
 
   return { availableLocales, locale: readonly(locale), setLocale, t, tf }

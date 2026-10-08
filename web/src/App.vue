@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { api, openAdminEvents, type EventConnection } from '@/api'
+import { api, openAdminEvents, type EventConnection, type EventsState } from '@/api'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
@@ -21,19 +21,19 @@ import RequestsPanel from '@/components/RequestsPanel.vue'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
+import { readStorage, writeStorage } from '@/storage'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
 // 前端最多保留的日志条数；日志面板按可视区域渲染，这里只限制内存占用
 const LOG_LIMIT = 1500
+// 前端最多保留的请求条数；超出时先丢弃最早的已结束请求，进行中的请求始终保留
+const REQUEST_LIMIT = 500
 const TAB_STORAGE_KEY = 'aistudio2api_active_tab'
 const validTabs: TabID[] = ['logs', 'accounts', 'models', 'requests', 'settings', 'playground']
-const savedTab =
-  typeof window !== 'undefined'
-    ? (window.localStorage.getItem(TAB_STORAGE_KEY) as TabID | null)
-    : null
+const savedTab = readStorage(TAB_STORAGE_KEY) as TabID | null
 const currentTab = ref<TabID>(savedTab && validTabs.includes(savedTab) ? savedTab : 'logs')
 watch(currentTab, (tab) => {
-  window.localStorage.setItem(TAB_STORAGE_KEY, tab)
+  writeStorage(TAB_STORAGE_KEY, tab)
 })
 const status = ref<ServiceStatus | null>(null)
 const logs = ref<AdminLog[]>([])
@@ -117,8 +117,10 @@ function showNotice(message: string, tone: 'success' | 'error'): void {
 
 let statusTimer: number | undefined
 
-// pollStatus 定时刷新状态（Worker 数量变化不会单独推送事件）；失败时保留上一次状态
+// pollStatus 定时刷新状态（Worker 数量变化不会单独推送事件）；失败时保留上一次状态并提示连接异常
 let statusPolling = false
+const statusUnreachable = ref(false)
+const eventsState = ref<EventsState>('open')
 
 async function pollStatus(): Promise<void> {
   // 上一次还没返回时跳过本次，避免服务繁忙时请求越积越多
@@ -126,8 +128,10 @@ async function pollStatus(): Promise<void> {
   statusPolling = true
   try {
     status.value = await api.status()
+    statusUnreachable.value = false
   } catch {
-    // 网络抖动时保持现有显示
+    // 网络抖动时保持现有显示，同时提示显示的是上一次的状态
+    statusUnreachable.value = true
   } finally {
     statusPolling = false
   }
@@ -282,6 +286,14 @@ function replaceByID<T extends { id: string }>(items: T[], incoming: T): void {
   else items[index] = incoming
 }
 
+// trimRequests 请求事件包括已结束的请求，原先列表只增不减；超过上限时从最早的已结束请求开始丢弃
+function trimRequests(items: RequestSummary[]): void {
+  for (let index = items.length - 1; index >= 0 && items.length > REQUEST_LIMIT; index--) {
+    const state = items[index]!.state
+    if (state !== 'queued' && state !== 'running') items.splice(index, 1)
+  }
+}
+
 function handleAdminEvent(event: AdminEvent): void {
   if (event.type === 'status') {
     status.value = event.data
@@ -307,21 +319,28 @@ function handleAdminEvent(event: AdminEvent): void {
     return
   }
   replaceByID(requests.value, event.data)
+  trimRequests(requests.value)
 }
 
 onMounted(async () => {
   document.title = t('app.title')
   statusTimer = window.setInterval(() => void pollStatus(), 3000)
   await refreshAll()
-  eventConnection = openAdminEvents(handleAdminEvent, () => {
-    pendingLogs = []
-    if (logFlushTimer !== undefined) {
-      window.clearTimeout(logFlushTimer)
-      logFlushTimer = undefined
-    }
-    logs.value = []
-    requests.value = []
-  })
+  eventConnection = openAdminEvents(
+    handleAdminEvent,
+    () => {
+      pendingLogs = []
+      if (logFlushTimer !== undefined) {
+        window.clearTimeout(logFlushTimer)
+        logFlushTimer = undefined
+      }
+      logs.value = []
+      requests.value = []
+    },
+    (state) => {
+      eventsState.value = state
+    },
+  )
 })
 
 watch(locale, () => {
@@ -426,8 +445,16 @@ onUnmounted(() => {
               {{ tf('app.workersStarting', { count: status.workers.starting }) }}
             </span>
           </div>
-          <div v-if="status.workers" :class="(status.workers.occupied ?? 0) >= status.workers.max ? 'text-yellow-400' : ''">
-            {{ tf('app.workerCapacity', { occupied: status.workers.occupied ?? 0, max: status.workers.max }) }}
+          <div
+            v-if="status.workers"
+            :class="(status.workers.occupied ?? 0) >= status.workers.max ? 'text-yellow-400' : ''"
+          >
+            {{
+              tf('app.workerCapacity', {
+                occupied: status.workers.occupied ?? 0,
+                max: status.workers.max,
+              })
+            }}
           </div>
           <template v-if="status.workers?.prewarm">
             <div v-if="status.workers.prewarm.active" class="text-cyan-300">
@@ -438,7 +465,10 @@ onUnmounted(() => {
                 })
               }}
             </div>
-            <div v-if="status.workers.prewarm.active && status.workers.prewarm.loop_age_seconds > 15" class="text-yellow-400">
+            <div
+              v-if="status.workers.prewarm.active && status.workers.prewarm.loop_age_seconds > 15"
+              class="text-yellow-400"
+            >
               {{ tf('app.prewarmStalled', { seconds: status.workers.prewarm.loop_age_seconds }) }}
             </div>
             <div
@@ -446,7 +476,8 @@ onUnmounted(() => {
               v-tooltip="status.workers.prewarm.reason || ''"
               class="cell-truncate"
             >
-              {{ t('app.prewarmIdle') }}<template v-if="status.workers.prewarm.reason">
+              {{ t('app.prewarmIdle')
+              }}<template v-if="status.workers.prewarm.reason">
                 · {{ status.workers.prewarm.reason }}</template
               >
             </div>
@@ -485,6 +516,16 @@ onUnmounted(() => {
     </aside>
 
     <main class="flex min-w-0 flex-1 flex-col bg-[#0d1117]">
+      <div
+        v-if="eventsState !== 'open' || statusUnreachable"
+        class="flex items-center gap-2 border-b border-yellow-700/60 bg-yellow-900/30 px-4 py-2 text-sm text-yellow-200"
+        role="status"
+      >
+        <UiIcon :name="eventsState === 'reconnecting' ? 'spinner' : 'info'" :size="14" />
+        <span v-if="eventsState === 'closed'">{{ t('app.eventsClosed') }}</span>
+        <span v-else-if="eventsState === 'reconnecting'">{{ t('app.eventsReconnecting') }}</span>
+        <span v-else>{{ t('app.statusUnreachable') }}</span>
+      </div>
       <LogsPanel v-if="currentTab === 'logs'" :logs="logs" @clear="clearLogs" />
       <AccountsPanel
         v-else-if="currentTab === 'accounts'"

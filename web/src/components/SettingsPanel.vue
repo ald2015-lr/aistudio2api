@@ -5,6 +5,7 @@ import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import type { DowngradeGuardConfig, ServiceConfig, UpstreamChannel } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
+import { readStorage, writeStorage } from '@/storage'
 
 const props = defineProps<{
   config: ServiceConfig | null
@@ -59,7 +60,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'downgrade_guard',
 ]
 // 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存
-const BLUR_KEYS: readonly EditableKey[] = ['auth_states', 'listen_addr', 'proxy_api_key']
+const BLUR_KEYS: readonly EditableKey[] = ['auth_states', 'listen_addr', 'proxy_api_key', 'proxy']
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
 // defaultDowngradeGuard 与服务端默认值一致
@@ -109,7 +110,7 @@ const saving = ref(false)
 const saveError = ref('')
 const applying = ref(false)
 const countdown = ref(0)
-const autoApply = ref(window.localStorage.getItem(AUTO_APPLY_KEY) !== 'false')
+const autoApply = ref(readStorage(AUTO_APPLY_KEY) !== 'false')
 const savedConfig = ref<ServiceConfig | null>(null)
 const form = reactive<ServiceConfig>({
   auth_states: 'auth',
@@ -188,6 +189,28 @@ function isPositiveInteger(value: unknown): boolean {
 
 function isDuration(value: string): boolean {
   return DURATION_PATTERN.test(value) && /[1-9]/.test(value)
+}
+
+const DURATION_UNITS: Record<string, number> = {
+  ns: 1e-6,
+  us: 1e-3,
+  µs: 1e-3,
+  ms: 1,
+  s: 1000,
+  m: 60_000,
+  h: 3_600_000,
+}
+
+// durationMillis 把 Go 时长写法（如 3m、1m30s、90s）换算为毫秒；无法解析时返回 NaN
+function durationMillis(value: string): number {
+  const parts = value.trim().matchAll(/(\d+(?:\.\d+)?)(ns|us|µs|ms|s|m|h)/g)
+  let total = 0
+  let matched = ''
+  for (const [text, amount, unit] of parts) {
+    total += Number(amount) * DURATION_UNITS[unit!]!
+    matched += text
+  }
+  return matched !== '' && matched === value.trim() ? total : Number.NaN
 }
 
 function isListenAddress(value: string): boolean {
@@ -304,6 +327,12 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
     savedConfig.value = saved
     // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
     if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
+    // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s），时长相同时表单同步显示，避免一直提示未保存
+    for (const key of ['init_timeout', 'request_timeout'] as const) {
+      if (form[key] !== saved[key] && durationMillis(form[key]) === durationMillis(saved[key])) {
+        form[key] = saved[key]
+      }
+    }
     saveError.value = ''
     emit('saved', saved)
     if (saved.service_restart_required && props.running && autoApply.value && !applying.value) {
@@ -406,7 +435,7 @@ watch(
 )
 
 watch(autoApply, (value) => {
-  window.localStorage.setItem(AUTO_APPLY_KEY, String(value))
+  writeStorage(AUTO_APPLY_KEY, String(value))
   if (!value) cancelCountdown()
 })
 
@@ -547,6 +576,7 @@ onBeforeUnmount(() => {
             class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
             placeholder="http://127.0.0.1:7890"
             autocomplete="off"
+            @change="commitBlurField"
           />
         </label>
       </div>

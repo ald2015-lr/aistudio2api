@@ -1,10 +1,12 @@
 import { computed, ref, watch } from 'vue'
 
+import { readStorage, writeStorage } from '@/storage'
+
 export const PAGE_SIZES = [20, 50, 100, 200] as const
 
 // readPageSize 读取保存的每页条数，无效时使用默认值
 function readPageSize(storageKey: string, fallback: number): number {
-  const stored = Number(window.localStorage.getItem(storageKey))
+  const stored = Number(readStorage(storageKey))
   return PAGE_SIZES.some((size) => size === stored) ? stored : fallback
 }
 
@@ -20,7 +22,7 @@ export function usePaging<T>(source: () => readonly T[], storageKey: string, fal
   })
 
   watch(pageSize, (size) => {
-    window.localStorage.setItem(storageKey, String(size))
+    writeStorage(storageKey, String(size))
     page.value = 1
   })
   watch(pageCount, (count) => {

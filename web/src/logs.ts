@@ -7,18 +7,33 @@ export interface LogRow {
   events: AdminLog[]
 }
 
+// logKeys 为每条非请求日志分配稳定的键。原先用 时间:下标 作键，缓冲区满后从前面丢弃日志，
+// 每来一条新日志所有下标都会变，选中的日志随之消失、详情面板关闭
+const logKeys = new WeakMap<AdminLog, string>()
+let nextLogKey = 0
+
+function logKey(entry: AdminLog): string {
+  let key = logKeys.get(entry)
+  if (key === undefined) {
+    nextLogKey += 1
+    key = `log:${nextLogKey}`
+    logKeys.set(entry, key)
+  }
+  return key
+}
+
 // groupLogs 按请求标识合并生命周期并保持服务事件的原始顺序
 export function groupLogs(logs: readonly AdminLog[]): LogRow[] {
   const rows: LogRow[] = []
   const requests = new Map<string, LogRow>()
-  for (const [index, entry] of logs.entries()) {
+  for (const entry of logs) {
     const id = entry.request?.id
     const row = id ? requests.get(id) : undefined
     if (row) {
       row.events.push(entry)
       row.entry = { ...entry, request: { ...row.entry.request!, ...entry.request! } }
     } else {
-      const next = { key: id || `${entry.time}:${index}`, entry, events: [entry] }
+      const next = { key: id || logKey(entry), entry, events: [entry] }
       rows.push(next)
       if (id) requests.set(id, next)
     }

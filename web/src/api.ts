@@ -170,12 +170,22 @@ export const api = {
 }
 
 // openAdminEvents 建立唯一的管理状态 SSE 连接
+// EventsState 为管理事件流的连接状态：closed 表示浏览器不再自动重连（例如返回 401/403）
+export type EventsState = 'open' | 'reconnecting' | 'closed'
+
 export function openAdminEvents(
   onEvent: (event: AdminEvent) => void,
   onOpen: () => void,
+  onState: (state: EventsState) => void = () => {},
 ): EventConnection {
   const source = new EventSource('/api/events')
-  source.onopen = onOpen
+  source.onopen = () => {
+    onState('open')
+    onOpen()
+  }
+  source.onerror = () => {
+    onState(source.readyState === EventSource.CLOSED ? 'closed' : 'reconnecting')
+  }
   source.onmessage = (message) => {
     const event = parseAdminEvent(message.data)
     if (event !== undefined) {
