@@ -23,6 +23,8 @@ const (
 	officialNotFoundMessage    = "Requested entity was not found."
 	officialInvalidKeyMessage  = "API key not valid. Please pass a valid API key."
 	officialTooLargeMessage    = "Request payload size exceeds the limit."
+	// officialToolContractMessage 用于上游回复不满足客户端要求的工具约束（没有官方原文，措辞与官方风格一致）
+	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
 )
 
 // 错误类别：决定 OpenAI 的 code/param 与 Anthropic 的错误类型、措辞
@@ -88,6 +90,11 @@ func publicErrorFor(err error, model string) publicError {
 	}
 	if errors.Is(err, context.Canceled) {
 		return unavailablePublicError()
+	}
+	// 上游回复违反了客户端要求的工具约束：按网关错误返回，客户端与中转可以重试
+	var contract *aistudio.ToolContractError
+	if errors.As(err, &contract) {
+		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: officialToolContractMessage}
 	}
 	var blocked *aistudio.PromptFeedbackError
 	if errors.As(err, &blocked) {

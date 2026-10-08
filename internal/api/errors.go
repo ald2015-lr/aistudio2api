@@ -104,6 +104,10 @@ func statusFromError(err error) int {
 	if errors.Is(err, aistudio.ErrModelNotFound) {
 		return http.StatusNotFound
 	}
+	var contract *aistudio.ToolContractError
+	if errors.As(err, &contract) {
+		return http.StatusBadGateway
+	}
 	if isUnverifiedProtocolError(err) {
 		return http.StatusBadRequest
 	}

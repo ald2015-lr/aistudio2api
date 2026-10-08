@@ -139,11 +139,18 @@ type FunctionDeclaration struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description,omitempty"`
 	Parameters  json.RawMessage `json:"parameters,omitempty"`
+	// Strict 要求上游返回的参数严格符合 Parameters
+	Strict bool `json:"strict,omitempty"`
 }
 
 // ToolConfig 表示工具启用策略
 type ToolConfig struct {
+	// Mode 为 auto、none、required（必须调用工具）或 validated（Gemini VALIDATED：参数按 Schema 校验）
 	Mode string `json:"mode,omitempty"`
+	// AllowedFunctionNames 限定可调用的函数；required 时为指定函数
+	AllowedFunctionNames []string `json:"allowed_function_names,omitempty"`
+	// ParallelCalls 为 false 时一次回复最多调用一个函数；nil 表示不限制
+	ParallelCalls *bool `json:"parallel_calls,omitempty"`
 }
 
 // GoogleSearchTimeRange 表示 Google Search 的检索时间范围
@@ -157,6 +164,10 @@ type GoogleSearchOptions struct {
 	WebSearch   bool                   `json:"web_search,omitempty"`
 	ImageSearch bool                   `json:"image_search,omitempty"`
 	TimeRange   *GoogleSearchTimeRange `json:"time_range,omitempty"`
+	// ContextSize、UserLocation、AllowedDomains 为客户端的搜索偏好，上游没有对应字段，以系统指令提示的方式传入
+	ContextSize    string          `json:"context_size,omitempty"`
+	UserLocation   json.RawMessage `json:"user_location,omitempty"`
+	AllowedDomains []string        `json:"allowed_domains,omitempty"`
 }
 
 // Tools 表示一次请求启用的工具
@@ -224,6 +235,8 @@ type GenerationConfig struct {
 	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
 	ThinkingBudget      *int64               `json:"thinking_budget,omitempty"`
 	Seed                *int64               `json:"seed,omitempty"`
+	// HideThinking 不返回思考正文，只保留思考签名（Anthropic thinking.type=disabled）
+	HideThinking bool `json:"hide_thinking,omitempty"`
 }
 
 // GenerateRequest 表示供应商无关的生成请求
@@ -241,6 +254,8 @@ type GenerateRequest struct {
 	ImageRoute bool `json:"-"`
 	// Stream 为客户端是否要求流式响应：降级判定按此选择缓存方式（流式严格模式在判定前不发出任何内容）
 	Stream bool `json:"-"`
+	// Truncate 在输入超过模型上下文窗口时按权威计数删除最早的完整对话轮次（Responses truncation=auto）
+	Truncate bool `json:"-"`
 }
 
 // TokenCountRequest 表示计数请求

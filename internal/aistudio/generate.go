@@ -588,6 +588,11 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if err := validateTranscriptionConfig(request.Config.TranscriptionConfig, entry.model); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
+	if request.Truncate && entry.model.InputTokenLimit > 0 {
+		if request, err = c.truncateRequest(ctx, request, entry.model.InputTokenLimit); err != nil {
+			return nil, err
+		}
+	}
 	if entry.defaults.InteractionStream && !build {
 		return c.generateInteraction(ctx, request, entry)
 	}
@@ -664,6 +669,12 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				return nil
 			default:
 				output.observe(event)
+				if request.Config.HideThinking && event.Kind == EventReasoning {
+					if event.ThoughtSignature == "" {
+						return nil
+					}
+					event = hiddenThought(event)
+				}
 				return send(event)
 			}
 		}
@@ -805,4 +816,56 @@ func applyOutputFloor(config GenerationConfig, floor int64, modelLimit int64) Ge
 	value := target
 	config.MaxOutputTokens = &value
 	return config
+}
+
+// hiddenThought 把不返回正文的思考事件换成只带签名的事件，多轮工具调用需要的签名不丢失
+func hiddenThought(event Event) Event {
+	return Event{
+		Kind: EventThoughtSignature, ThoughtSignature: event.ThoughtSignature,
+		Usage: event.Usage, ProviderModel: event.ProviderModel,
+	}
+}
+
+// truncateMaxCounts 为一次截断最多调用 CountTokens 的次数；用完后按当前内容发送，由上游判定是否超限
+const truncateMaxCounts = 6
+
+// truncateRequest 在输入超过模型上下文窗口时按权威计数删除最早的完整对话轮次（Responses truncation=auto）。
+// 本地估算不到上限一半时不计数，避免每个请求都多一次 CountTokens；超出时按超出比例一次删除若干轮
+func (c *Client) truncateRequest(ctx context.Context, request GenerateRequest, limit int64) (GenerateRequest, error) {
+	if EstimatedInputTokens(request)*2 < limit {
+		return request, nil
+	}
+	for attempt := 0; attempt < truncateMaxCounts; attempt++ {
+		count, err := c.CountTokensForAccount(ctx, request.AccountID, TokenCountRequest{
+			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
+		})
+		if err != nil {
+			return request, err
+		}
+		if count.InputTokens <= limit {
+			return request, nil
+		}
+		estimate := EstimatedInputTokens(request)
+		excess := max(estimate*(count.InputTokens-limit)/count.InputTokens, 1)
+		var removed int64
+		for removed < excess {
+			start := nextConversationTurn(request.Contents)
+			if start < 0 {
+				return request, fmt.Errorf("%w: 最新一轮对话已超过模型上下文窗口 %d", ErrInvalidArgument, limit)
+			}
+			removed += localContentsTokens(request.Contents[:start])
+			request.Contents = request.Contents[start:]
+		}
+	}
+	return request, nil
+}
+
+// nextConversationTurn 返回下一轮用户消息的位置（跳过工具结果，保持工具调用与结果的配对）；没有时返回 -1
+func nextConversationTurn(contents []Content) int {
+	for index := 1; index < len(contents); index++ {
+		if contents[index].Role == RoleUser && !slices.ContainsFunc(contents[index].Parts, func(part Part) bool { return part.FunctionResult != nil }) {
+			return index
+		}
+	}
+	return -1
 }

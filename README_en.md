@@ -32,6 +32,7 @@
 - **Two WAA Backends**: Camoufox holds the official WAA lifecycle by default; with `WAA_BACKEND=go`, pure Go generates the official proof and no browser is downloaded or launched at runtime
 - **Four API Protocols**: OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, and Gemini GenerateContent
 - **Mainstream Agent Clients**: Works with Claude Code, Codex, OpenCode, pi, omp, OpenClaw, and Hermes, including file read and write tool calls; native web search works in Claude Code, Codex, and omp
+- **Tool Choice Across Four Protocols**: Required, named, and single function calls, `strict` argument validation, Gemini `VALIDATED`, and Anthropic `thinking.disabled`; tool schemas Playground cannot encode (`$ref`, `uniqueItems`, and similar) are sent as a simplified shape with the full schema handed to the model
 
 ## Features
 

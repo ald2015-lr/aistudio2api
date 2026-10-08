@@ -550,6 +550,10 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	if modelID == "" {
 		return nil, fmt.Errorf("%w: GenerateContent model 不能为空", ErrInvalidArgument)
 	}
+	request, contract, err := prepareToolRequest(request)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
 	resourceID, err := s.pool.ResourceIDForContents(ctx, request.Contents)
 	if err != nil {
 		return nil, err
@@ -577,6 +581,7 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 		request.AccountID = accountID
 		events, err := s.client.Generate(ContextWithAccountLease(ctx, lease), request)
 		if err == nil {
+			events = contract.forward(ctx, events)
 			if !owned {
 				return events, nil
 			}

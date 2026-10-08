@@ -1,10 +1,13 @@
 package aistudio
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -12,9 +15,9 @@ func encodeRequestedTools(tools Tools) ([]any, bool, error) {
 	switch tools.ToolConfig.Mode {
 	case "none":
 		return nil, true, nil
-	case "", "auto":
+	case "", "auto", "required", "validated":
 	default:
-		return nil, false, fmt.Errorf("tool choice 只支持 auto 或 none")
+		return nil, false, fmt.Errorf("未知 tool choice %q", tools.ToolConfig.Mode)
 	}
 	if len(tools.Functions) == 0 && len(tools.Google) == 0 && tools.GoogleSearch == nil {
 		return nil, false, nil
@@ -106,31 +109,162 @@ func encodeGoogleTimestamp(value time.Time) []any {
 	return []any{strconv.FormatInt(value.Unix(), 10)}
 }
 
+// encodeFunctionDeclaration 编码 Playground 函数声明。
+//
+// 参数 Schema 含 Playground 无法编码的写法（$ref/$defs、uniqueItems、examples、数值或 null 常量、非字符串 enum 等）时，
+// 不让整个请求失败：改为只编码层级与类型（toolSchemaShape），并把完整 Schema 附在函数说明里交给模型遵守。
+// strict 函数同样附上完整 Schema。超过大小或嵌套上限的 Schema 仍直接报错
 func encodeFunctionDeclaration(declaration FunctionDeclaration) ([]any, error) {
 	if declaration.Name == "" {
 		return nil, fmt.Errorf("function declaration 缺少名称")
 	}
-	declaration.Parameters = normalizeFunctionParameters(declaration.Parameters)
-	length := 1
-	if declaration.Description != "" {
-		length = 2
-	}
-	if len(declaration.Parameters) > 0 {
-		length = 3
-	}
-	wire := make([]any, length)
-	wire[0] = declaration.Name
-	if declaration.Description != "" {
-		wire[1] = declaration.Description
-	}
-	if len(declaration.Parameters) > 0 {
-		parameters, err := encodeJSONSchema(declaration.Parameters)
+	raw := normalizeFunctionParameters(declaration.Parameters)
+	parameters, err := encodeJSONSchema(raw)
+	degraded := false
+	if err != nil {
+		if isSchemaLimitError(err) {
+			return nil, fmt.Errorf("parameters: %w", err)
+		}
+		var schema any
+		if json.Unmarshal(raw, &schema) != nil {
+			return nil, fmt.Errorf("parameters: %w", err)
+		}
+		shape, marshalErr := json.Marshal(toolSchemaShape(schema, 0))
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		parameters, err = encodeJSONSchema(shape)
 		if err != nil {
 			return nil, fmt.Errorf("parameters: %w", err)
 		}
-		wire[2] = parameters
+		degraded = true
 	}
-	return wire, nil
+	description := declaration.Description
+	if degraded || declaration.Strict {
+		description = appendSchemaHint(description, raw)
+	}
+	var wireDescription any
+	if description != "" {
+		wireDescription = description
+	}
+	return []any{declaration.Name, wireDescription, parameters}, nil
+}
+
+// maxSchemaHintBytes 为附在函数说明里的完整 Schema 的大小上限，超过时不附
+const maxSchemaHintBytes = 16 << 10
+
+// appendSchemaHint 在函数说明末尾附上完整参数 Schema
+func appendSchemaHint(description string, raw json.RawMessage) string {
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil || compact.Len() > maxSchemaHintBytes {
+		return description
+	}
+	return strings.TrimSpace(description + "\nArguments must follow this JSON Schema: " + compact.String())
+}
+
+// toolSchemaShape 提取工具参数的层级与类型，供 Playground 编码；depth 防止病态嵌套
+func toolSchemaShape(value any, depth int) map[string]any {
+	result := map[string]any{}
+	object, ok := value.(map[string]any)
+	if !ok || depth > maxSchemaDepth {
+		return result
+	}
+	for _, key := range []string{
+		"type", "format", "nullable", "description", "required", "minimum", "maximum", "minLength", "maxLength",
+		"pattern", "minItems", "maxItems", "minProperties", "maxProperties", "propertyOrdering",
+	} {
+		if item, exists := object[key]; exists && item != nil {
+			result[key] = item
+		}
+	}
+	if description, ok := result["description"]; ok {
+		if _, isString := description.(string); !isString {
+			delete(result, "description")
+		}
+	}
+	if constant, exists := object["const"]; exists {
+		if constant == nil {
+			result["type"], result["nullable"] = "string", true
+			result["description"] = "The value must be JSON null"
+		} else {
+			encoded, _ := json.Marshal(constant)
+			description, _ := result["description"].(string)
+			result["description"] = strings.TrimSpace(description + "\nThe value must be: " + string(encoded))
+			switch value := constant.(type) {
+			case float64:
+				result["type"] = "number"
+				if math.Trunc(value) == value {
+					result["type"] = "integer"
+				}
+				result["minimum"], result["maximum"] = value, value
+			case bool:
+				result["type"] = "boolean"
+			case string:
+				result["type"], result["enum"] = "string", []any{value}
+			case []any:
+				result["type"] = "array"
+			case map[string]any:
+				result["type"] = "object"
+			}
+		}
+	}
+	if values, ok := object["enum"].([]any); ok && len(values) > 0 {
+		stringsOnly := true
+		for _, value := range values {
+			_, isString := value.(string)
+			stringsOnly = stringsOnly && isString
+		}
+		if stringsOnly {
+			result["enum"] = values
+		} else {
+			encoded, _ := json.Marshal(values)
+			description, _ := result["description"].(string)
+			result["description"] = strings.TrimSpace(description + "\nAllowed values: " + string(encoded))
+		}
+	}
+	if nullOnlyType(result["type"]) {
+		result["type"], result["nullable"] = "string", true
+		result["description"] = "The value must be JSON null"
+	}
+	if properties, ok := object["properties"].(map[string]any); ok {
+		children := make(map[string]any, len(properties))
+		for key, child := range properties {
+			children[key] = toolSchemaShape(child, depth+1)
+		}
+		result["properties"] = children
+	}
+	if child, exists := object["items"]; exists {
+		result["items"] = toolSchemaShape(child, depth+1)
+	}
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if branches, ok := object[key].([]any); ok {
+			children := make([]any, len(branches))
+			for index, branch := range branches {
+				children[index] = toolSchemaShape(branch, depth+1)
+			}
+			result[key] = children
+		}
+	}
+	return result
+}
+
+// nullOnlyType 判断 type 是否只有 null
+func nullOnlyType(value any) bool {
+	switch typed := value.(type) {
+	case string:
+		return strings.EqualFold(typed, "null")
+	case []any:
+		if len(typed) == 0 {
+			return false
+		}
+		for _, name := range typed {
+			if name, ok := name.(string); !ok || !strings.EqualFold(name, "null") {
+				return false
+			}
+		}
+		return true
+	}
+	return false
 }
 
 func hasMethod(model Model, method string) bool {

@@ -62,8 +62,15 @@ func EncodeBuildGenerateRequest(request GenerateRequest, defaults GenerationDefa
 	if len(tools) > 0 {
 		body["tools"] = tools
 	}
+	toolConfig := map[string]any{}
 	if serverSide {
-		body["toolConfig"] = map[string]any{"includeServerSideToolInvocations": true}
+		toolConfig["includeServerSideToolInvocations"] = true
+	}
+	if calling := buildFunctionCallingConfig(request.Tools); calling != nil {
+		toolConfig["functionCallingConfig"] = calling
+	}
+	if len(toolConfig) > 0 {
+		body["toolConfig"] = toolConfig
 	}
 	config, err := encodeBuildGenerationConfig(request.Config, defaults)
 	if err != nil {
@@ -267,9 +274,9 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 	switch tools.ToolConfig.Mode {
 	case "none":
 		return nil, false, nil
-	case "", "auto":
+	case "", "auto", "required", "validated":
 	default:
-		return nil, false, fmt.Errorf("tool choice 只支持 auto 或 none")
+		return nil, false, fmt.Errorf("未知 tool choice %q", tools.ToolConfig.Mode)
 	}
 	var wire []any
 	if len(tools.Functions) > 0 {
@@ -402,7 +409,7 @@ func encodeBuildGenerationConfig(config GenerationConfig, defaults GenerationDef
 	}
 	if len(wire) > 16 && wire[16] != nil {
 		thinking := wire[16].([]any)
-		thinkingConfig := map[string]any{"includeThoughts": true}
+		thinkingConfig := map[string]any{"includeThoughts": !config.HideThinking}
 		if len(thinking) > 1 && thinking[1] != nil {
 			thinkingConfig["thinkingBudget"] = thinking[1]
 		}
@@ -784,6 +791,29 @@ func buildProxyResponseBody(raw json.RawMessage, path string) ([]byte, error) {
 		return data, nil
 	}
 	return nil, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: path, Detail: "代理响应缺少正文", Raw: cloneRaw(raw)}
+}
+
+// buildFunctionCallingConfig 把工具选择写成 Gemini API 原生的 functionCallingConfig：必须调用为 ANY，
+// 指定函数写入 allowedFunctionNames；validated 或任一函数要求 strict 时为 VALIDATED。默认 auto 时不发送
+func buildFunctionCallingConfig(tools Tools) map[string]any {
+	mode := tools.ToolConfig.Mode
+	if len(tools.Functions) == 0 || mode == "none" {
+		return nil
+	}
+	strict := slices.ContainsFunc(tools.Functions, func(declaration FunctionDeclaration) bool { return declaration.Strict })
+	calling := map[string]any{}
+	switch {
+	case mode == "required":
+		calling["mode"] = "ANY"
+		if names := tools.ToolConfig.AllowedFunctionNames; len(names) > 0 {
+			calling["allowedFunctionNames"] = names
+		}
+	case mode == "validated" || strict:
+		calling["mode"] = "VALIDATED"
+	default:
+		return nil
+	}
+	return calling
 }
 
 func buildTrailerError(raw json.RawMessage) error {

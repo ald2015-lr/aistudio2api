@@ -829,15 +829,19 @@ Schema 归一化规则：
 | 组合 Schema 缺少根 `type` | 首个带类型的分支作为根类型，该分支的 `items` 同时写入根节点 |
 | 其他节点缺少 `type` | 含 `properties` 为 object，含 `items` 或 `prefixItems` 为 array，其余为 string |
 | array 缺少 `items` | `prefixItems` 中带类型的项组成 `anyOf`；没有时为 string |
-| 其他 Schema 字段 | 返回 `400 invalid_request` / `INVALID_ARGUMENT` |
+| 其他 Schema 字段 | 结构化输出返回 `400 invalid_request` / `INVALID_ARGUMENT`；函数参数见下文的降级编码 |
 
-AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7 的函数声明，由模型决定是否调用；none 省略 tools。客户端工具选择映射如下：
+函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道原样发送 `parametersJsonSchema`，不经过降级。
 
-| 公开协议 | 接受 | 返回 400 |
-| --- | --- | --- |
-| OpenAI Chat / Responses | 默认、`auto`、`none` | `required`、named function |
-| Anthropic | 默认、`auto`、`none` | `any`、named `tool` |
-| Gemini | 默认、`AUTO`、`NONE` | `ANY`、`allowedFunctionNames` |
+AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7 的函数声明，由模型决定是否调用；none 省略 tools。Playground 没有工具选择字段，必须调用、指定函数与单次调用以系统指令写明要求，再由生成链路核对上游实际返回的调用；Build 通道写入原生 `toolConfig.functionCallingConfig`（必须调用为 `ANY`，指定函数写入 `allowedFunctionNames`，`validated` 或任一函数 `strict` 时为 `VALIDATED`）。客户端工具选择映射如下：
+
+| 公开协议 | 自动 / 不调用 | 必须调用 | 指定函数 | 单次调用 |
+| --- | --- | --- | --- | --- |
+| OpenAI Chat / Responses | 默认、`auto`、`none` | `required` | `{"type":"function","function":{"name"}}`；Responses 为 `{"type":"function","name","namespace"?}` | `parallel_tool_calls:false` |
+| Anthropic | 默认、`auto`、`none` | `any` | `{"type":"tool","name"}` | `disable_parallel_tool_use:true` |
+| Gemini | 默认、`AUTO`、`NONE` | `ANY` | `allowedFunctionNames` | — |
+
+Gemini `VALIDATED` 对所有函数按 Schema 核对参数。核对规则：指定函数时只发送被选中的函数；上游调用了未选择的函数、`strict` 函数的参数不符合 Schema（JSON Schema 2020-12 校验，`pattern` 按 ECMAScript 正则、单次匹配最多 1 秒）、要求调用却没有任何工具调用（声明了 Google 搜索等内置工具且上游使用了它们时视为满足）时，事件流以错误结束，HTTP 状态 502；首个事件之前发生时按非流式返回。要求单次调用而上游返回多个调用时只保留第一个。客户端 Schema 本身无法编译（如引用了未提供的外部定义）时不阻止请求，只是不核对该函数的参数。
 
 函数调用响应 Part 为 `[name, Struct, callId?]`；下一轮 function result 使用同一形状并原样带回 thought signature。tool result 显式提供函数名时保留该值；缺少名称时，先按 call ID 关联当前轮尚未返回结果的调用，未匹配且仅剩一个调用时使用其名称。每个结果对应一个调用，调用与结果之间的助手文本不影响关联，新一轮普通对话开始后重新建立关联；存在歧义或缺少调用记录时返回参数错误。函数参数和结果使用 JSON object，标量或数组结果封装为 `{"result":<VALUE>}`。
 
@@ -1383,14 +1387,13 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | stop sequence 命中 | 协议核心在正文事件流中匹配并返回实际命中的序列 |
 | structured output | MIME type 映射 field 8，Schema 映射 field 9 |
 | OpenAI Chat `n` | 仅接受省略或 `1` |
-| OpenAI Chat `parallel_tool_calls` | 仅接受省略或 `true` |
+| OpenAI Chat `parallel_tool_calls` | `false` 时一次回复最多一个函数调用（见上文工具选择） |
 | OpenAI Chat `logprobs` / `logit_bias` | 分别接受省略或 `false`、省略或空对象 |
 | OpenAI Chat frequency / presence penalty | 仅接受 `0` |
-| OpenAI Chat function `strict` | 接受省略或 `false`；`true` 返回 `400 invalid_request` |
-| Responses `parallel_tool_calls` | 写入响应元数据，函数调用采用 AI Studio auto 模式 |
-| Responses `parallel_tool_calls` 接受值 | 仅接受省略或 `true` |
-| Responses `truncation` | 仅接受省略或 `disabled` |
-| Responses function `strict` | 接受省略或 `false`；`true` 返回 `400 invalid_request` |
+| OpenAI Chat function `strict` | `true` 时核对上游返回的参数（见上文工具选择） |
+| Responses `parallel_tool_calls` | 写入响应元数据；`false` 时一次回复最多一个函数调用 |
+| Responses `truncation` | 省略、`disabled` 或 `auto`；`auto` 在本地估算超过模型输入上限一半时按 CountTokens 权威计数，超出上限则从最早的完整轮次开始删除（不拆开工具调用与结果，最多计数 6 次），最新一轮本身超限时返回 400 |
+| Responses function `strict` | `true` 时核对上游返回的参数 |
 | Responses `store` | 省略或 `true` 时保存当前进程会话节点；`false` 只返回本次结果 |
 | Gemini frequency / presence penalty | 仅接受 `0` |
 | Gemini `candidateCount` | 仅接受省略或 `1` |
@@ -1398,7 +1401,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Gemini `googleSearchRetrieval` | 仅接受空对象；`dynamicRetrievalConfig` 返回 `400 INVALID_ARGUMENT` |
 | Anthropic `thinking` | `enabled` 携带 `budget_tokens`，支持 thinking budget 的模型直接写入预算，只支持 thinking level 的模型按 0、1024、8192 以内与更大预算分别使用 minimal、low、medium、high；`adaptive` 使用模型默认思考 |
 | Anthropic thinking capability | 模型既不支持 thinking budget 也不支持 thinking level 时形成 `invalid_request_error`；非流式返回 HTTP 400，流式返回 Anthropic error event |
-| Anthropic thinking type | `disabled` 与未知 type 返回 `400 invalid_request_error` |
+| Anthropic thinking type | `disabled` 按最低思考强度生成，不返回思考正文（保留思考签名）；未知 type 返回 `400 invalid_request_error` |
 
 ### OpenAI Chat Completions
 
@@ -1411,13 +1414,13 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | `stream` | boolean |
 | `stream_options.include_usage` | 在 finish chunk 后发送 usage-only chunk |
 | `tools` | function 或 Google server tool 数组 |
-| `tool_choice` | 省略/`auto`/`none` |
-| `web_search_options` | 对象，开启 Google Search；`search_context_size` 与 `user_location` 返回 400 |
+| `tool_choice` | 省略/`auto`/`none`/`required`/指定函数 |
+| `web_search_options` | 对象，开启 Google Search；`search_context_size`（low/medium/high）与 `user_location` 以系统指令提示传给上游（软约束） |
 | `temperature`、`top_p` | 可选采样值 |
 | `max_tokens`、`max_completion_tokens` | 后者优先 |
 | `frequency_penalty`、`presence_penalty` | 省略或 `0` |
 | `n` | 省略或 `1` |
-| `parallel_tool_calls` | 省略或 `true` |
+| `parallel_tool_calls` | `false` 时一次回复最多一个函数调用 |
 | `logprobs` | 省略或 `false` |
 | `logit_bias` | 省略、`null` 或空对象 |
 | `stop` | string 或 string array；空字符串从条件中移除 |
@@ -1449,7 +1452,7 @@ message 字段为 `role`、`content`、可选 `name`、`tool_call_id`、`tool_ca
 
 OpenAI `image_url` / `input_image` 值为 Base64 data URL 时形成 inline data，值为 YouTube URL 时形成 external media，其他非 data 字符串按已上传 file ID 解析；适配器不下载普通 HTTP 图片 URL。`video_url` / `input_video` 只接受 YouTube URL。`file_data` 接受 Base64 data URL 或已上传 file ID。
 
-function tool 使用 `{"type":"function","function":{"name","description","parameters","strict"}}`。`strict` 接受省略或 `false`。Google tool type 为 `web_search`、`web_search_preview`、`image_search`、`url_context`、`code_interpreter`、`google_maps`。
+function tool 使用 `{"type":"function","function":{"name","description","parameters","strict"}}`。`strict:true` 时核对上游返回的参数。Google tool type 为 `web_search`、`web_search_preview`、`image_search`、`url_context`、`code_interpreter`、`google_maps`。
 
 非流式响应：
 
@@ -1504,17 +1507,17 @@ Chat SSE 顺序：
 | `input` | string 或 input item 数组 |
 | `instructions` | 顶层 system instruction |
 | `stream` | boolean |
-| `tools`、`tool_choice` | function、namespace 与 Google tools；namespace 内的 function 展开为函数声明，调用结果以 `namespace` 字段标明所属命名空间，函数名重复时返回 400；choice 为 auto/none |
+| `tools`、`tool_choice` | function、namespace 与 Google tools；namespace 内的 function 以 `命名空间.函数名` 的全名发给上游（不同命名空间可以有同名函数），调用结果还原为原函数名并以 `namespace` 字段标明所属命名空间，全名重复时返回 400；choice 为 auto/none/required/指定函数 |
 | `temperature`、`top_p`、`max_output_tokens` | 生成参数 |
 | `reasoning` | `{"effort":"..."}` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
 | `previous_response_id` | 当前进程内已保存的前一响应 ID |
-| `parallel_tool_calls` | 省略或 `true` |
-| `truncation` | 省略或 `disabled` |
+| `parallel_tool_calls` | `false` 时一次回复最多一个函数调用 |
+| `truncation` | 省略、`disabled` 或 `auto`（见上文） |
 | `metadata` | string-to-string object |
 | `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
 
-input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item。message content Part：
+input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item。message content Part：
 
 | type | 字段 |
 | --- | --- |
@@ -1531,7 +1534,7 @@ Responses tool 字段：
 | tool type | 字段 |
 | --- | --- |
 | `function` | `name`、`description`、`parameters`、`strict` |
-| `web_search`、`web_search_2025_08_26`、`web_search_preview`、`web_search_preview_2025_03_11` | 只接受 `type`；`search_context_size`、`user_location`、`filters` 必须省略 |
+| `web_search`、`web_search_2025_08_26`、`web_search_preview`、`web_search_preview_2025_03_11` | `search_context_size`、`user_location`、`filters.allowed_domains` 以系统指令提示传给上游（软约束） |
 | `image_search`、`url_context`、`google_maps` | `type` |
 | `code_interpreter` | `container` 可省略、为 `"auto"`，或为 `{"type":"auto","file_ids":[]}`；非空 `file_ids` 返回 400 |
 
@@ -1629,7 +1632,7 @@ web search 发生时，search call item 排在 message 前；无 grounding query
 | `stop_sequences` | string array |
 | `stream` | boolean |
 | `temperature`、`top_p`、`top_k` | 生成参数 |
-| `tools`、`tool_choice` | custom/server tools 与 auto/none |
+| `tools`、`tool_choice` | custom/server tools 与 auto/none/any/指定 tool |
 | `thinking` | `{type:"enabled",budget_tokens:<INT>}` 或 `{type:"adaptive"}` |
 | `output_config` | `{effort:"..."}` |
 
@@ -1648,7 +1651,7 @@ message content 可以是 string 或 block 数组：
 
 `image` / `document` 的 Base64 source 使用 `type:"base64"`、`media_type`、`data`；URL source 使用 `type:"url"` 与非空 `url`，省略 media type 时 image 默认 `image/*`、document 默认 `application/pdf`。`tool_result.is_error=true` 把合法 JSON content 包装为 `{"error":<CONTENT>}`；普通标量或数组结果包装为 `{"result":<CONTENT>}`。
 
-custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`。server tool 字段：
+custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`；`strict:true` 时核对上游返回的参数，`cache_control`、`defer_loading` 等其他字段只影响 Anthropic 自身的缓存与加载，忽略。server tool 字段：
 
 | type | 必需 name |
 | --- | --- |
@@ -1659,9 +1662,9 @@ custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`。ser
 | `url_context` | `url_context` |
 | `google_maps` | `google_maps` |
 
-`web_search_20250305` 接受 `max_uses`，调用次数由上游决定。
+`web_search_20250305` 接受 `max_uses`，调用次数由上游决定；`allowed_domains` 与 `user_location` 以系统指令提示传给上游（软约束）。
 
-server tool 只接受对应 `type` 与 `name`。`description`、`input_schema` 或额外 option 返回 `invalid_request_error`。tool choice 接受省略、`{"type":"auto"}`、`{"type":"none"}`；`any` 和 named `tool` 返回 400。
+server tool 只接受对应 `type`、`name` 与 `cache_control`（忽略）。`description`、`input_schema` 或其他 option 返回 `invalid_request_error`。tool choice 接受省略、`{"type":"auto"}`、`{"type":"none"}`、`{"type":"any"}` 与 `{"type":"tool","name"}`，以及 `disable_parallel_tool_use`。
 
 非流式响应：
 
@@ -1778,7 +1781,7 @@ tool group 字段：
 | maps | `googleMaps` |
 | image search | `imageSearch` |
 
-`googleSearch.searchTypes` 可以包含 `webSearch` 与 `imageSearch` 空对象；未提供或两项均未启用时默认 web search。`timeRangeFilter.startTime/endTime` 使用 RFC 3339 Nano。`googleSearchRetrieval` 只接受空对象。tool choice 位于 `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`，接受 `AUTO` 与 `NONE`；`ANY` 或非空 `allowedFunctionNames` 返回 400。
+`googleSearch.searchTypes` 可以包含 `webSearch` 与 `imageSearch` 空对象；未提供或两项均未启用时默认 web search。`timeRangeFilter.startTime/endTime` 使用 RFC 3339 Nano。`googleSearchRetrieval` 只接受空对象。tool choice 位于 `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`，接受 `AUTO`、`NONE`、`ANY` 与 `VALIDATED`；`allowedFunctionNames` 限定可调用的函数（见上文工具选择）。
 
 `:countTokens` 返回：
 

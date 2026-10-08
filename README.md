@@ -32,6 +32,7 @@
 - **两种 WAA 后端**: 默认由 Camoufox 持有官方 WAA 生命周期；设置 `WAA_BACKEND=go` 后由纯 Go 生成官方 proof，运行时不下载、不启动浏览器
 - **四套 API 协议**: OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 与 Gemini GenerateContent
 - **主流 agent 客户端**: 支持 Claude Code、Codex、OpenCode、pi、omp、OpenClaw、Hermes 的文件读写工具调用，Claude Code、Codex、omp 的原生联网搜索可直接使用
+- **四协议工具选择**: 必须调用、指定函数、单次调用、`strict` 参数校验、Gemini `VALIDATED` 与 Anthropic `thinking.disabled`；Playground 无法编码的工具 Schema（`$ref`、`uniqueItems` 等）降级编码并把完整 Schema 交给模型
 
 ## 特性
 

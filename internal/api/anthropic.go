@@ -188,9 +188,8 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 			}
 		case "adaptive":
 		case "disabled":
-			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type disabled is not supported by the AI Studio upstream")
 		default:
-			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type must be enabled or adaptive")
+			return aistudio.GenerateRequest{}, fmt.Errorf("thinking.type must be enabled, adaptive or disabled")
 		}
 	}
 	system, err := anthropicSystemText(request.System)
@@ -235,6 +234,11 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	}
 	if request.Thinking != nil && request.Thinking.Type == "enabled" {
 		config.ThinkingBudget = request.Thinking.BudgetTokens
+	}
+	// 关闭思考：AI Studio 的思考模型不能完全关闭，按最低强度生成，不返回思考正文（保留签名）
+	if request.Thinking != nil && request.Thinking.Type == "disabled" {
+		config.ReasoningEffort = "none"
+		config.HideThinking = true
 	}
 	if request.OutputConfig != nil {
 		config.ReasoningEffort = request.OutputConfig.Effort
@@ -426,8 +430,22 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 		switch {
 		case typeName == "web_search_20250305":
 			delete(tool.Options, "max_uses")
+			location, domains := tool.Options["user_location"], tool.Options["allowed_domains"]
+			delete(tool.Options, "user_location")
+			delete(tool.Options, "allowed_domains")
 			if err := validateAnthropicServerTool(tool, "web_search"); err != nil {
 				return aistudio.Tools{}, err
+			}
+			if rawJSONConfigured(location) || rawJSONConfigured(domains) {
+				var filters json.RawMessage
+				if rawJSONConfigured(domains) {
+					filters, _ = json.Marshal(map[string]json.RawMessage{"allowed_domains": domains})
+				}
+				search, err := mapSearchOptions("", location, filters)
+				if err != nil {
+					return aistudio.Tools{}, err
+				}
+				mapped.GoogleSearch = search
 			}
 			mapped.Google = appendUnique(mapped.Google, "google_search")
 		case typeName == "image_search":
@@ -459,20 +477,19 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			if tool.Name == "" {
 				return aistudio.Tools{}, fmt.Errorf("tool name is required")
 			}
-			if len(tool.Options) > 0 {
-				fields := make([]string, 0, len(tool.Options))
-				for field := range tool.Options {
-					fields = append(fields, field)
+			// cache_control、defer_loading、input_examples 等只影响 Anthropic 自身的缓存与加载，忽略即可；strict 按参数校验处理
+			var strict bool
+			if raw := tool.Options["strict"]; rawJSONConfigured(raw) {
+				if err := json.Unmarshal(raw, &strict); err != nil {
+					return aistudio.Tools{}, fmt.Errorf("tool strict must be a boolean")
 				}
-				sort.Strings(fields)
-				return aistudio.Tools{}, fmt.Errorf("custom tool %q has unsupported option %q", tool.Name, fields[0])
 			}
 			parameters := tool.InputSchema
 			if len(parameters) == 0 {
 				parameters = json.RawMessage(`{"type":"object","properties":{}}`)
 			}
 			mapped.Functions = append(mapped.Functions, aistudio.FunctionDeclaration{
-				Name: tool.Name, Description: tool.Description, Parameters: parameters,
+				Name: tool.Name, Description: tool.Description, Parameters: parameters, Strict: strict,
 			})
 		default:
 			return aistudio.Tools{}, fmt.Errorf("unsupported tool type %q", tool.Type)
@@ -481,9 +498,6 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 	config, err := anthropicToolChoice(choice)
 	if err != nil {
 		return aistudio.Tools{}, err
-	}
-	if len(mapped.Functions) == 0 && len(mapped.Google) == 0 {
-		return mapped, nil
 	}
 	mapped.ToolConfig = config
 	return mapped, nil
@@ -496,6 +510,8 @@ func validateAnthropicServerTool(tool anthropicTool, name string) error {
 	if tool.Description != "" || rawJSONConfigured(tool.InputSchema) {
 		return fmt.Errorf("tool type %q does not accept description or input_schema", tool.Type)
 	}
+	// cache_control 只影响 Anthropic 的提示缓存，忽略
+	delete(tool.Options, "cache_control")
 	if len(tool.Options) == 0 {
 		return nil
 	}
@@ -512,24 +528,34 @@ func anthropicToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 		return aistudio.ToolConfig{Mode: "auto"}, nil
 	}
 	var choice struct {
-		Type string `json:"type"`
-		Name string `json:"name"`
+		Type            string `json:"type"`
+		Name            string `json:"name"`
+		DisableParallel *bool  `json:"disable_parallel_tool_use"`
 	}
 	if err := json.Unmarshal(raw, &choice); err != nil {
 		return aistudio.ToolConfig{}, fmt.Errorf("invalid tool_choice: %w", err)
 	}
+	config := aistudio.ToolConfig{}
+	if choice.DisableParallel != nil {
+		parallel := !*choice.DisableParallel
+		config.ParallelCalls = &parallel
+	}
 	switch choice.Type {
 	case "auto":
-		return aistudio.ToolConfig{Mode: "auto"}, nil
+		config.Mode = "auto"
 	case "none":
-		return aistudio.ToolConfig{Mode: "none"}, nil
+		config.Mode = "none"
 	case "any":
-		return aistudio.ToolConfig{}, fmt.Errorf("tool_choice any is not supported by AI Studio Web")
+		config.Mode = "required"
 	case "tool":
-		return aistudio.ToolConfig{}, fmt.Errorf("named tool_choice is not supported by AI Studio Web")
+		if choice.Name == "" {
+			return aistudio.ToolConfig{}, fmt.Errorf("tool_choice name is required")
+		}
+		config.Mode, config.AllowedFunctionNames = "required", []string{choice.Name}
 	default:
 		return aistudio.ToolConfig{}, fmt.Errorf("unsupported tool_choice type %q", choice.Type)
 	}
+	return config, nil
 }
 
 func buildAnthropicResponse(id string, model string, result generationResult, searchKey string) map[string]any {

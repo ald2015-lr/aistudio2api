@@ -3,6 +3,7 @@ package aistudio
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -24,10 +25,22 @@ const maxSchemaDepth = 64
 // maxSchemaBytes 为单个 JSON Schema 的大小上限
 const maxSchemaBytes = 1 << 20
 
+// schemaLimitError 表示 schema 超过大小或嵌套上限：这类 schema 不做降级编码，直接拒绝
+type schemaLimitError struct {
+	message string
+}
+
+func (e *schemaLimitError) Error() string { return e.message }
+
+func isSchemaLimitError(err error) bool {
+	var limit *schemaLimitError
+	return errors.As(err, &limit)
+}
+
 // encodeJSONSchema 把 JSON Schema 转换为 AI Studio 的 Schema 数组
 func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 	if len(raw) > maxSchemaBytes {
-		return nil, fmt.Errorf("schema 超过 %d 字节上限", maxSchemaBytes)
+		return nil, &schemaLimitError{message: fmt.Sprintf("schema 超过 %d 字节上限", maxSchemaBytes)}
 	}
 	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		raw = json.RawMessage(emptyFunctionParameters)
@@ -38,7 +51,7 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 // encodeSchemaNode 转换一个 schema 节点；depth 为当前嵌套层数
 func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if depth > maxSchemaDepth {
-		return nil, fmt.Errorf("schema 嵌套超过 %d 层", maxSchemaDepth)
+		return nil, &schemaLimitError{message: fmt.Sprintf("schema 嵌套超过 %d 层", maxSchemaDepth)}
 	}
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
