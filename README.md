@@ -166,7 +166,7 @@ Build 独有模型计算：Playground 目录按模型 ID 与别名建立索引�
 
 账号 403 自动暂停：同一账号 10 分钟内对至少 2 个不同模型连续 3 次返回 HTTP 403 无权限（中间没有成功请求），自动进入 30 分钟全局冷却，不再参与调度，到期自动恢复；只对单个模型 403（常见于免费账号调用付费模型）不会触发。暂停记录在“冷却与请求”页可见，重启后保留。
 
-Worker 预热采用滑动窗口：按“启动预热并发”同时启动多个 Worker，任意一个完成后立刻补上下一个，单个慢账户不会拖住其他槽位。
+Worker 预热采用滑动窗口：按“启动预热并发”同时启动多个 Worker，任意一个完成后立刻补上下一个，单个慢账户不会拖住其他槽位。请求现场冷启动 Camoufox（包括请求排队时的后台扩容）与预热共用这组名额，另保留 1 个只给请求，有请求排队冷启动时预热让行，预热占满时请求不用等一整轮浏览器启动；调整“启动预热并发”后排队中的启动立即按新值放行。纯 Go 后端不启动浏览器，只受峰值 Worker 数约束。
 
 运行中无需重启的热更新：
 
@@ -485,7 +485,7 @@ cp .env.example .env
 | `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
 | `WARM_WORKER_LIMIT` | `5` | 常驻预热账户数 |
 | `MAX_ACTIVE_WORKERS` | `10` | 高峰期最多同时运行的 Worker 数 |
-| `WARM_STARTUP_CONCURRENCY` | `2` | 同时初始化的预热账户数 |
+| `WARM_STARTUP_CONCURRENCY` | `2` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，请求现场的冷启动另保留 1 个名额并优先；`WAA_BACKEND=go` 不受此限 |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数 |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
@@ -494,7 +494,7 @@ cp .env.example .env
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
 | `ADMIN_PASSWORD` | 空 | 设置后除管理令牌外也可以用密码打开管理页面，浏览器弹出登录框（用户名随意，密码为此值）；同一 IP 10 分钟内错 10 次封禁 15 分钟；留空时只能用管理令牌（`.admin-token`）登录。纯 HTTP 下令牌与密码均为明文传输，建议配合 HTTPS |
 
-服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制启动预热并发，`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
+服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制常驻预热规模，`MAX_ACTIVE_WORKERS` 控制峰值 Worker 上限，`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
 
 ### 端口配置
 

@@ -414,7 +414,7 @@ cp .env.example .env
 | `FIRST_EVENT_TIMEOUT` | `0` (disabled) | How long each attempt waits for its first upstream event after sending upstream; on timeout only that attempt is abandoned and the request retries on another account, returning 504 when no retry is possible. Must be shorter than `REQUEST_TIMEOUT`; models that think for a long time may take a while to emit their first event, so leave plenty of headroom |
 | `WARM_WORKER_LIMIT` | `5` | Number of resident prewarmed accounts |
 | `MAX_ACTIVE_WORKERS` | `10` | Maximum workers active during peak load |
-| `WARM_STARTUP_CONCURRENCY` | `2` | Accounts initialized concurrently during prewarming |
+| `WARM_STARTUP_CONCURRENCY` | `2` | Concurrent Camoufox worker cold starts: prewarming uses at most this many, and cold starts for waiting requests get one extra reserved slot and go first; `WAA_BACKEND=go` is not limited |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | Concurrent requests allowed per account |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` rotates accounts; `fill-first` reuses the first available account |
 | `UPSTREAM_CHANNELS` | `playground,build` | Upstream channels for generation requests; either one can be used alone |
@@ -423,7 +423,7 @@ cp .env.example .env
 | `AUTO_START` | `true` | Start the generation service automatically when the management process starts, retrying transient failures from 5 seconds up to 1 minute apart; `false` keeps it `STOPPED` until started from the management page |
 | `ADMIN_PASSWORD` | empty | When set, the management page can also be opened with HTTP Basic authentication (any username, this value as password); 10 failures within 10 minutes block the IP for 15 minutes. Without it, only the admin token works. The management page and `/api/` always require the admin token stored in `.admin-token`: open the `http://127.0.0.1:2048/?admin_token=<token>` address printed in the startup log once and the browser remembers the login; scripts send it in the `X-Admin-Token` header. Use HTTPS, since plain HTTP sends the token and password in clear text |
 
-The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` controls concurrent prewarming, and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
+The service loads every account from `AISTUDIO_AUTH_STATES`. `WARM_WORKER_LIMIT` sets the resident warm pool, `MAX_ACTIVE_WORKERS` caps peak worker count, `WARM_STARTUP_CONCURRENCY` limits concurrent Camoufox cold starts (prewarming can fill it, cold starts for waiting requests keep one extra slot), and `PER_ACCOUNT_CONCURRENCY` controls request slots per account.
 
 ### Port Configuration
 

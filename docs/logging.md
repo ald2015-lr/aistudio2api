@@ -98,6 +98,8 @@ INFO  account@example.com  WAA Worker 启动 | 7/7 | 执行 WAA Bootstrap
 INFO  account@example.com  WAA Worker 就绪 | 页面模型=gemini-flash-latest | PID=18240 | 耗时=10.842s
 ```
 
+Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启动 | 等待冷启动名额 | 类型=按需|预热 | 占用=N/M`：`M` 为该类型可用的名额，按需启动比预热多 1 个保留名额（见 `WARM_STARTUP_CONCURRENCY`）。预热等待名额超过单个预热任务的时限时按槽位已满处理，不记为账户预热失败。
+
 启动失败记录页面模型、耗时和原始错误。按需容量事件说明当前热池动作：
 
 | 事件 | 语义 |

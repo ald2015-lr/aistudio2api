@@ -173,6 +173,8 @@ type accountWorkerManager struct {
 	backgroundMu    sync.Mutex
 	background      context.Context
 	stopBackground  context.CancelFunc
+	// startupSlots 限制同时冷启动的浏览器 Worker 数，容量随 warmConcurrency 热更新（见 startupSlots）
+	startupSlots startupSlots
 	// refresher 在 Worker 启动阶段确认登录失效时恢复认证；为空时只把账户标为需要登录
 	refresher *authRuntimeRefresher
 	// launch 启动单个账户的 WAA Worker，为空时使用 newWAAWorker（测试替换为不启动浏览器的实现）
@@ -341,7 +343,8 @@ func newAccountWorkerManager(
 	return manager
 }
 
-// expandInBackground 在后台为账户启动 Worker，就绪后由调度信号唤醒排队请求
+// expandInBackground 在后台为账户启动 Worker，就绪后由调度信号唤醒排队请求。
+// 它由正在排队的请求发起，冷启动名额按按需启动计（不加 withBackgroundStartup）
 func (manager *accountWorkerManager) expandInBackground(accountID string, modelID string) {
 	ctx := manager.backgroundContext()
 	go func() {
@@ -1047,6 +1050,14 @@ func (manager *accountWorkerManager) startReservedWorker(
 		ownsLease = true
 		manager.clearRuntimeBusy(account)
 	}
+	releaseSlot, err := manager.acquireStartupSlot(ctx, label, options.ExecutablePath)
+	if err != nil {
+		if ownsLease {
+			_ = runtimeLease.Release()
+		}
+		account.startupMu.Unlock()
+		return nil, err
+	}
 	manager.requests.log(label, "INFO", "WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型="+bootstrapModel)
 	initCtx, cancel := context.WithTimeout(ctx, time.Duration(manager.initTimeout.Load()))
 	options.Model = bootstrapModel
@@ -1060,6 +1071,8 @@ func (manager *accountWorkerManager) startReservedWorker(
 	}
 	worker, initErr := launch(initCtx, account.id, options)
 	cancel()
+	// 名额只覆盖浏览器启动本身，发布、替换与淘汰旧 Worker 不再占用
+	releaseSlot()
 	if initErr != nil {
 		if ownsLease {
 			_ = runtimeLease.Release()
@@ -1682,9 +1695,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 					inflight[accountID] = struct{}{}
 					launched++
 					go func(accountID string) {
-						// 不等待槽位：槽位满时立即返回；单个任务限时，避免个别账户拖住整轮预热
+						// 不等待 Worker 槽位：槽位满时立即返回；冷启动名额按后台启动排队，让给按需启动（见 startupSlots）。
+						// 单个任务限时，避免个别账户拖住整轮预热
 						taskCtx, taskCancel := context.WithTimeout(
-							ctx, time.Duration(manager.initTimeout.Load())+warmTaskGrace,
+							withBackgroundStartup(ctx), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
 						)
 						_, err := manager.ensureWorker(taskCtx, accountID, "", false)
 						taskCancel()

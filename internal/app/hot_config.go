@@ -114,11 +114,13 @@ func (manager *accountWorkerManager) warmConcurrencyValue() int {
 	return int(manager.warmConcurrency.Load())
 }
 
-// applyLiveSettings 更新 Worker 容量与启动参数；调小的常驻数由空闲回收逐步收敛
+// applyLiveSettings 更新 Worker 容量与启动参数；调小的常驻数由空闲回收逐步收敛，
+// 冷启动名额立即按新的启动预热并发放行排队的启动
 func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.warmTarget.Store(int64(cfg.WarmWorkerLimit))
 	manager.maxActive.Store(int64(cfg.MaxActiveWorkers))
 	manager.warmConcurrency.Store(int64(cfg.WarmStartupConcurrency))
+	manager.startupSlots.resized()
 	manager.initTimeout.Store(int64(cfg.InitTimeout))
 	manager.temporaryChat.Store(cfg.TemporaryChat)
 }
