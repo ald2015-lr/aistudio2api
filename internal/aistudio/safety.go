@@ -29,7 +29,15 @@ var harmThresholds = map[string]int64{
 // unspecifiedHarmThreshold 表示沿用该类别的默认阈值
 const unspecifiedHarmThreshold = "HARM_BLOCK_THRESHOLD_UNSPECIFIED"
 
-// NormalizeSafetySettings 统一安全设置写法（去空白、转大写），丢弃无法识别的类别或阈值，并逐条返回说明供调用方记 WARN。
+// 跳过说明最多逐条列出 safetySkipDetailLimit 条，其余只计数；客户端原始名称超过 safetySkipNameLimit 个字符时截断。
+// 说明会写进请求日志与排查时间线，客户端发来大量或超长的名称时不能把单条日志撑到与请求体一样大
+const (
+	safetySkipDetailLimit = 8
+	safetySkipNameLimit   = 64
+)
+
+// NormalizeSafetySettings 统一安全设置写法（去空白、转大写），丢弃无法识别的类别或阈值，并返回说明供调用方记 WARN
+// （最多逐条列出 safetySkipDetailLimit 条，其余合并为一条计数）。
 // 未知名称不返回 400：客户端常把别家或旧版类别一并发来，跳过后其余设置照常生效。
 // 阈值为 HARM_BLOCK_THRESHOLD_UNSPECIFIED 的条目表示沿用默认值，同样不发送，但不算无法识别
 func NormalizeSafetySettings(settings []SafetySetting) ([]SafetySetting, []string) {
@@ -38,20 +46,40 @@ func NormalizeSafetySettings(settings []SafetySetting) ([]SafetySetting, []strin
 	}
 	normalized := make([]SafetySetting, 0, len(settings))
 	var skipped []string
+	dropped := 0
 	for _, setting := range settings {
 		category := strings.ToUpper(strings.TrimSpace(setting.Category))
 		threshold := strings.ToUpper(strings.TrimSpace(setting.Threshold))
 		switch {
 		case harmCategoryCode(category) == 0:
-			skipped = append(skipped, fmt.Sprintf("未知类别 %q", setting.Category))
+			if dropped++; dropped <= safetySkipDetailLimit {
+				skipped = append(skipped, fmt.Sprintf("未知类别 %q", clipSafetyName(setting.Category)))
+			}
 		case threshold == unspecifiedHarmThreshold:
 		case harmThresholds[threshold] == 0:
-			skipped = append(skipped, fmt.Sprintf("类别 %s 的未知阈值 %q", category, setting.Threshold))
+			if dropped++; dropped <= safetySkipDetailLimit {
+				skipped = append(skipped, fmt.Sprintf("类别 %s 的未知阈值 %q", category, clipSafetyName(setting.Threshold)))
+			}
 		default:
 			normalized = append(normalized, SafetySetting{Category: category, Threshold: threshold})
 		}
 	}
+	if dropped > safetySkipDetailLimit {
+		skipped = append(skipped, fmt.Sprintf("另有 %d 条未列出", dropped-safetySkipDetailLimit))
+	}
 	return normalized, skipped
+}
+
+// clipSafetyName 按字符截断写进跳过说明的客户端原始名称，不整体转换超长字符串
+func clipSafetyName(name string) string {
+	count := 0
+	for index := range name {
+		if count == safetySkipNameLimit {
+			return name[:index] + "…"
+		}
+		count++
+	}
+	return name
 }
 
 // resolveSafetySettings 按类别编号顺序返回最终阈值：非图片模型未指定的官网四类为 OFF，客户端阈值只覆盖对应类别，

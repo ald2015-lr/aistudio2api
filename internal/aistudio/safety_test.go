@@ -159,6 +159,34 @@ func TestSafetySettingsUnknownSkipped(t *testing.T) {
 	}
 }
 
+// TestSafetySettingsSkipNoticeBounded 大量或超长的无法识别条目只逐条列出前几条并截断名称，其余合并计数，说明不随请求体增长
+func TestSafetySettingsSkipNoticeBounded(t *testing.T) {
+	long := strings.Repeat("类", 10000)
+	settings := make([]SafetySetting, 0, 1001)
+	for index := 0; index < 1000; index++ {
+		settings = append(settings, SafetySetting{Category: long, Threshold: "OFF"})
+	}
+	settings = append(settings, SafetySetting{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_ONLY_HIGH"})
+	normalized, skipped := NormalizeSafetySettings(settings)
+	if want := []SafetySetting{{Category: "HARM_CATEGORY_HARASSMENT", Threshold: "BLOCK_ONLY_HIGH"}}; !reflect.DeepEqual(normalized, want) {
+		t.Fatalf("保留的安全设置=%+v，期望 %+v", normalized, want)
+	}
+	if len(skipped) != safetySkipDetailLimit+1 {
+		t.Fatalf("跳过说明应只列 %d 条再加一条计数，得到 %d 条", safetySkipDetailLimit, len(skipped))
+	}
+	if last := skipped[len(skipped)-1]; !strings.Contains(last, "992") {
+		t.Fatalf("最后一条应说明其余条数: %q", last)
+	}
+	if notice := strings.Join(skipped, "；"); len(notice) > 4096 || !strings.Contains(skipped[0], strings.Repeat("类", safetySkipNameLimit)+"…") {
+		t.Fatalf("跳过说明应截断超长名称并保持很短，得到 %d 字节: %.200q", len(notice), notice)
+	}
+	// 阈值无法识别时同样截断
+	_, skipped = NormalizeSafetySettings([]SafetySetting{{Category: "HARM_CATEGORY_HATE_SPEECH", Threshold: long}})
+	if len(skipped) != 1 || len(skipped[0]) > 512 || !strings.Contains(skipped[0], "HARM_CATEGORY_HATE_SPEECH") {
+		t.Fatalf("超长阈值的说明=%.200q", skipped)
+	}
+}
+
 // TestMediaResolutionEncoding 输入媒体分辨率在 Playground 写 generation config 字段 18 的编号，在 Build 写 Gemini API 枚举名
 func TestMediaResolutionEncoding(t *testing.T) {
 	defaults := GenerationDefaults{MaxOutputTokens: 1024}
