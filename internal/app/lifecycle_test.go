@@ -102,8 +102,10 @@ func (stoppedService) State() string { return "STOPPED" }
 
 type stoppedAdmin struct{ api.AdminService }
 
-func (stoppedAdmin) Status(context.Context) (api.AdminStatus, error)      { return api.AdminStatus{}, nil }
-func (stoppedAdmin) StopService(context.Context) (api.AdminStatus, error) { return api.AdminStatus{}, nil }
+func (stoppedAdmin) Status(context.Context) (api.AdminStatus, error) { return api.AdminStatus{}, nil }
+func (stoppedAdmin) StopService(context.Context) (api.AdminStatus, error) {
+	return api.AdminStatus{}, nil
+}
 
 // TestUserStopIsNotOverridden 用户停止之后，监督器的自动重启与停止之前排队的启动都不会再把服务拉起来
 func TestUserStopIsNotOverridden(t *testing.T) {

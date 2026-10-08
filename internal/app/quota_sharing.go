@@ -53,7 +53,7 @@ type quotaSharing struct {
 
 func newQuotaSharing(directory string, requests *requestRegistry) *quotaSharing {
 	sharing := &quotaSharing{
-		requests: requests,
+		requests:     requests,
 		models:       make(map[string]*quotaSharingStats),
 		pending:      make(map[string]time.Time),
 		sinceRevisit: make(map[string]int),
