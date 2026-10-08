@@ -46,6 +46,19 @@ func (manager *runtimeManager) activeAPIKey() string {
 	return manager.apiKey.get()
 }
 
+// activeUltraExclusive 返回当前是否独占 Ultra 账户：为真时普通路径的请求不使用 Ultra 账户
+func (manager *runtimeManager) activeUltraExclusive() bool {
+	return manager.ultraExclusive.Load()
+}
+
+// applyUltraExclusive 立即切换 Ultra 独占设置：之后进入的请求按新设置划分号池，进行中的请求不受影响
+func (manager *runtimeManager) applyUltraExclusive(exclusive bool) {
+	if manager.ultraExclusive.Swap(exclusive) == exclusive {
+		return
+	}
+	manager.requests.log("service", "INFO", fmt.Sprintf("Ultra 独占设置已更新并立即生效 | 独占=%t", exclusive))
+}
+
 // applyAPIKey 立即切换公开 API 密钥，无需重启管理进程
 func (manager *runtimeManager) applyAPIKey(key string) {
 	key = config.EffectiveProxyAPIKey(key)
@@ -115,10 +128,11 @@ func (manager *accountWorkerManager) warmConcurrencyValue() int {
 }
 
 // applyLiveSettings 更新 Worker 容量与启动参数；调小的常驻数由空闲回收逐步收敛，
-// 冷启动名额立即按新的启动预热并发放行排队的启动
+// 冷启动名额立即按新的启动预热并发放行排队的启动。普通分区与 Ultra 分区的常驻数、峰值数分别更新
 func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.warmTarget.Store(int64(cfg.WarmWorkerLimit))
 	manager.maxActive.Store(int64(cfg.MaxActiveWorkers))
+	manager.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
 	manager.warmConcurrency.Store(int64(cfg.WarmStartupConcurrency))
 	manager.startupSlots.resized()
 	manager.initTimeout.Store(int64(cfg.InitTimeout))
@@ -148,6 +162,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 	return saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
 		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
+		saved.UltraExclusive == active.UltraExclusive && saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
+		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
 		saved.RoutingStrategy == active.RoutingStrategy && saved.TemporaryChat == active.TemporaryChat &&
@@ -187,10 +203,10 @@ func (manager *runtimeManager) applyLiveConfig() {
 	manager.mu.Unlock()
 
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s",
-		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.WarmStartupConcurrency,
-		saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout, saved.IgnoreClientSeed,
-		downgradeGuardSummary(saved.DowngradeGuard),
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s",
+		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
+		saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
+		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard),
 	))
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()

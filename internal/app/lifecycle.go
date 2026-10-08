@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -72,6 +73,8 @@ type runtimeManager struct {
 	startCancel      context.CancelFunc
 	apiKey           *apiKeyHolder
 	intent           *serviceIntent
+	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 账户，保存配置后立即生效
+	ultraExclusive atomic.Bool
 	// shuttingDown 在进程退出时置为 true（由 mu 保护），之后不再启动生成服务
 	shuttingDown bool
 	// ledger 为用量账本，在开始接收请求之前设置、之后不再改变；打开失败时为 nil（方法对 nil 安全）
@@ -94,6 +97,7 @@ func newRuntimeManager(
 		apiKey: newAPIKeyHolder(cfg.ProxyAPIKey),
 		intent: &serviceIntent{},
 	}
+	manager.ultraExclusive.Store(cfg.UltraExclusive)
 	generation, err := manager.factory(launchCtx, ctx, cfg, requests)
 	if err != nil {
 		return nil, err
@@ -425,8 +429,11 @@ func (manager *runtimeManager) UpdateRuntimeConfig(ctx context.Context, value ap
 	if err != nil {
 		return updated, err
 	}
-	// API 密钥保存后立即生效；Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
+	// API 密钥与 Ultra 独占设置保存后立即生效；Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
 	manager.applyAPIKey(updated.APIKey)
+	if updated.UltraExclusive != nil {
+		manager.applyUltraExclusive(*updated.UltraExclusive)
+	}
 	manager.applyLiveConfig()
 	return manager.decorateCurrent(updated), nil
 }
@@ -509,15 +516,28 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		RoutingStrategy: value.RoutingStrategy, UpstreamChannels: value.UpstreamChannels,
 		WAABackend:     value.WAABackend,
 		DowngradeGuard: active.DowngradeGuard,
+		UltraExclusive: active.UltraExclusive, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
+		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
+	}
+	if value.UltraExclusive != nil {
+		saved.UltraExclusive = *value.UltraExclusive
+	}
+	if value.UltraWarmWorkerLimit != nil {
+		saved.UltraWarmWorkerLimit = *value.UltraWarmWorkerLimit
+	}
+	if value.UltraMaxActiveWorkers != nil {
+		saved.UltraMaxActiveWorkers = *value.UltraMaxActiveWorkers
 	}
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
 		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
 		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
+		saved.UltraExclusive == active.UltraExclusive && saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
+		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&

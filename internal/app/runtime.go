@@ -65,6 +65,7 @@ func newRuntime(
 		pool, accounts, requests, camoufoxPath, cfg.Proxy, cfg.InitTimeout,
 		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, cfg.TemporaryChat,
 	)
+	workers.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
 	protected, err := aistudio.NewWorkerProtectedTransport(aistudio.WorkerProtectedTransportOptions{
 		Transport: transport, Workers: workers, SetupTimeout: cfg.InitTimeout,
 	})
@@ -160,6 +161,8 @@ type accountWorkerManager struct {
 	initTimeout     atomic.Int64
 	warmTarget      atomic.Int64
 	maxActive       atomic.Int64
+	ultraWarmTarget atomic.Int64
+	ultraMaxActive  atomic.Int64
 	warmConcurrency atomic.Int64
 	temporaryChat   atomic.Bool
 	lifecycle       context.Context
@@ -333,6 +336,7 @@ func newAccountWorkerManager(
 	manager.initTimeout.Store(int64(initTimeout))
 	manager.warmTarget.Store(int64(warmTarget))
 	manager.maxActive.Store(int64(maxActive))
+	manager.setUltraCapacity(defaultUltraCapacity())
 	manager.warmConcurrency.Store(int64(warmConcurrency))
 	manager.temporaryChat.Store(temporaryChat)
 	manager.background, manager.stopBackground = context.WithCancel(lifecycle)

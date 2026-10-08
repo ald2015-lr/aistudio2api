@@ -242,6 +242,11 @@ type RuntimeConfig struct {
 	WAABackend                string   `json:"waa_backend"`
 	// DowngradeGuard 为降级判定设置；保存时没有该字段（旧版页面）则沿用现值
 	DowngradeGuard *DowngradeGuardConfig `json:"downgrade_guard,omitempty"`
+	// UltraExclusive、UltraWarmWorkerLimit、UltraMaxActiveWorkers 为 Ultra 号池设置（ULTRA_EXCLUSIVE、ULTRA_WARM_WORKER_LIMIT、
+	// ULTRA_MAX_ACTIVE_WORKERS），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值
+	UltraExclusive        *bool `json:"ultra_exclusive,omitempty"`
+	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
+	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

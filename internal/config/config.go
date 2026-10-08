@@ -24,6 +24,9 @@ const (
 	defaultMaxActiveWorkers   = 10
 	defaultWarmConcurrency    = 2
 	defaultAccountConcurrency = 2
+	// defaultUltraWarmWorkerLimit 与 defaultUltraMaxActiveWorkers 为 Ultra 分区的常驻与峰值 Worker 数
+	defaultUltraWarmWorkerLimit  = 2
+	defaultUltraMaxActiveWorkers = 5
 )
 
 var configKeys = [...]string{
@@ -36,6 +39,9 @@ var configKeys = [...]string{
 	"FIRST_EVENT_TIMEOUT",
 	"WARM_WORKER_LIMIT",
 	"MAX_ACTIVE_WORKERS",
+	"ULTRA_EXCLUSIVE",
+	"ULTRA_WARM_WORKER_LIMIT",
+	"ULTRA_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ROUTING_STRATEGY",
@@ -96,6 +102,13 @@ type Config struct {
 	// FirstEventTimeout 为每次尝试等待首个上游事件的上限：超时只取消这一次尝试并按超时换号重试；0 表示关闭（默认），
 	// 思考很长的模型可能很久才有第一个事件
 	FirstEventTimeout time.Duration `json:"-"`
+	// UltraExclusive 为真（默认）时 Ultra 账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 账户
+	UltraExclusive bool `json:"ultra_exclusive"`
+	// UltraWarmWorkerLimit 与 UltraMaxActiveWorkers 为 Ultra 分区（权益为 Ultra 的账户）的常驻与峰值 Worker 数，
+	// 与普通分区分开计算（WarmWorkerLimit、MaxActiveWorkers 只约束普通分区），浏览器总数最多为两个分区峰值之和；
+	// 常驻数可以为 0（只按需启动）
+	UltraWarmWorkerLimit  int `json:"ultra_warm_worker_limit"`
+	UltraMaxActiveWorkers int `json:"ultra_max_active_workers"`
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
@@ -127,6 +140,9 @@ func Default() Config {
 		RequestTimeout:         defaultRequestTimeout,
 		WarmWorkerLimit:        defaultWarmWorkerLimit,
 		MaxActiveWorkers:       defaultMaxActiveWorkers,
+		UltraExclusive:         true,
+		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
+		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
@@ -191,6 +207,24 @@ func Load(path string) (Config, error) {
 	}
 	if value, ok := values["MAX_ACTIVE_WORKERS"]; ok {
 		cfg.MaxActiveWorkers, err = parsePositiveInt("MAX_ACTIVE_WORKERS", value)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	if value, ok := values["ULTRA_EXCLUSIVE"]; ok && strings.TrimSpace(value) != "" {
+		cfg.UltraExclusive, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("ULTRA_EXCLUSIVE 必须是 true 或 false")
+		}
+	}
+	if value, ok := values["ULTRA_WARM_WORKER_LIMIT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.UltraWarmWorkerLimit, err = parseNonNegativeInt("ULTRA_WARM_WORKER_LIMIT", value)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	if value, ok := values["ULTRA_MAX_ACTIVE_WORKERS"]; ok && strings.TrimSpace(value) != "" {
+		cfg.UltraMaxActiveWorkers, err = parsePositiveInt("ULTRA_MAX_ACTIVE_WORKERS", value)
 		if err != nil {
 			return Config{}, err
 		}
@@ -280,6 +314,9 @@ func (c Config) Save(path string) error {
 		"FIRST_EVENT_TIMEOUT":      c.FirstEventTimeout.String(),
 		"WARM_WORKER_LIMIT":        strconv.Itoa(c.WarmWorkerLimit),
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
+		"ULTRA_EXCLUSIVE":          strconv.FormatBool(c.UltraExclusive),
+		"ULTRA_WARM_WORKER_LIMIT":  strconv.Itoa(c.UltraWarmWorkerLimit),
+		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
@@ -335,6 +372,15 @@ func (c Config) Validate() error {
 	}
 	if c.MaxActiveWorkers < c.WarmWorkerLimit {
 		return fmt.Errorf("MAX_ACTIVE_WORKERS 必须大于或等于 WARM_WORKER_LIMIT")
+	}
+	if c.UltraWarmWorkerLimit < 0 {
+		return fmt.Errorf("ULTRA_WARM_WORKER_LIMIT 必须是 0 或正整数")
+	}
+	if c.UltraMaxActiveWorkers <= 0 {
+		return fmt.Errorf("ULTRA_MAX_ACTIVE_WORKERS 必须是正整数")
+	}
+	if c.UltraMaxActiveWorkers < c.UltraWarmWorkerLimit {
+		return fmt.Errorf("ULTRA_MAX_ACTIVE_WORKERS 必须大于或等于 ULTRA_WARM_WORKER_LIMIT")
 	}
 	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.WarmWorkerLimit {
 		return fmt.Errorf("WARM_STARTUP_CONCURRENCY 必须是 1 到 WARM_WORKER_LIMIT")
@@ -405,6 +451,9 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		FirstEventTimeout      string         `json:"first_event_timeout"`
 		WarmWorkerLimit        int            `json:"warm_worker_limit"`
 		MaxActiveWorkers       int            `json:"max_active_workers"`
+		UltraExclusive         bool           `json:"ultra_exclusive"`
+		UltraWarmWorkerLimit   int            `json:"ultra_warm_worker_limit"`
+		UltraMaxActiveWorkers  int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int            `json:"per_account_concurrency"`
 		RoutingStrategy        string         `json:"routing_strategy"`
@@ -426,6 +475,9 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		FirstEventTimeout:      c.FirstEventTimeout.String(),
 		WarmWorkerLimit:        c.WarmWorkerLimit,
 		MaxActiveWorkers:       c.MaxActiveWorkers,
+		UltraExclusive:         c.UltraExclusive,
+		UltraWarmWorkerLimit:   c.UltraWarmWorkerLimit,
+		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		RoutingStrategy:        c.RoutingStrategy,
@@ -451,6 +503,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		FirstEventTimeout      string          `json:"first_event_timeout"`
 		WarmWorkerLimit        int             `json:"warm_worker_limit"`
 		MaxActiveWorkers       int             `json:"max_active_workers"`
+		UltraExclusive         *bool           `json:"ultra_exclusive"`
+		UltraWarmWorkerLimit   *int            `json:"ultra_warm_worker_limit"`
+		UltraMaxActiveWorkers  *int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int             `json:"per_account_concurrency"`
 		RoutingStrategy        string          `json:"routing_strategy"`
@@ -474,7 +529,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有该字段时按关闭处理
+	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -491,6 +546,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		FirstEventTimeout:      firstEventTimeout,
 		WarmWorkerLimit:        value.WarmWorkerLimit,
 		MaxActiveWorkers:       value.MaxActiveWorkers,
+		UltraExclusive:         value.UltraExclusive == nil || *value.UltraExclusive,
+		UltraWarmWorkerLimit:   intOrDefault(value.UltraWarmWorkerLimit, defaultUltraWarmWorkerLimit),
+		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
@@ -680,6 +738,15 @@ func parsePositiveInt(key string, value string) (int, error) {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("%s 必须是正整数", key)
+	}
+	return parsed, nil
+}
+
+// parseNonNegativeInt 解析可以为 0 的整数，例如 ULTRA_WARM_WORKER_LIMIT（0 表示只按需启动）
+func parseNonNegativeInt(key string, value string) (int, error) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s 必须是 0 或正整数", key)
 	}
 	return parsed, nil
 }
