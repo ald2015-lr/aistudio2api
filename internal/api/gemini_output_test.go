@@ -173,6 +173,74 @@ func TestGeminiOutputParts_SignedPartMerging(t *testing.T) {
 	}
 }
 
+// TestGeminiOutputParts_LeadingSignatureKeepsMerging 前置签名不打断随后正文与思考的合并：
+// 随后的 part 合并完已带签名（带签名的增量或单独到达的签名）时前置签名单独成 part，正文仍是一个 part，
+// 否则 SillyTavern 等客户端拼接时句子中间会多出空行
+func TestGeminiOutputParts_LeadingSignatureKeepsMerging(t *testing.T) {
+	leading := aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-a"}
+	for _, test := range []struct {
+		name   string
+		events []aistudio.Event
+		want   []map[string]any
+	}{
+		{
+			name: "带签名的正文增量",
+			events: []aistudio.Event{
+				leading,
+				{Kind: aistudio.EventText, Text: "Hello "},
+				{Kind: aistudio.EventText, Text: "world", ThoughtSignature: "sig-b"},
+				{Kind: aistudio.EventText, Text: "!"},
+			},
+			want: []map[string]any{
+				{"text": "", "thought": true, "thoughtSignature": "sig-a"},
+				{"text": "Hello world!", "thoughtSignature": "sig-b"},
+			},
+		},
+		{
+			name: "正文中间单独到达的签名",
+			events: []aistudio.Event{
+				leading,
+				{Kind: aistudio.EventText, Text: "Hello "},
+				{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
+				{Kind: aistudio.EventText, Text: "world!"},
+			},
+			want: []map[string]any{
+				{"text": "", "thought": true, "thoughtSignature": "sig-a"},
+				{"text": "Hello world!", "thoughtSignature": "sig-b"},
+			},
+		},
+		{
+			name: "带签名的思考增量",
+			events: []aistudio.Event{
+				leading,
+				{Kind: aistudio.EventReasoning, Text: "step 1 "},
+				{Kind: aistudio.EventReasoning, Text: "step 2", ThoughtSignature: "sig-b"},
+				{Kind: aistudio.EventText, Text: "answer"},
+			},
+			want: []map[string]any{
+				{"text": "", "thought": true, "thoughtSignature": "sig-a"},
+				{"text": "step 1 step 2", "thought": true, "thoughtSignature": "sig-b"},
+				{"text": "answer"},
+			},
+		},
+		{
+			name: "未签名的正文",
+			events: []aistudio.Event{
+				leading,
+				{Kind: aistudio.EventText, Text: "Hello "},
+				{Kind: aistudio.EventText, Text: "world!"},
+				{Kind: aistudio.EventFinish, FinishReason: "STOP"},
+			},
+			want: []map[string]any{{"text": "Hello world!", "thoughtSignature": "sig-a"}},
+		},
+	} {
+		parts := geminiOutputParts(generationResult{events: test.events})
+		if !reflect.DeepEqual(parts, test.want) {
+			t.Fatalf("%s: 前置签名 %+v，期望 %+v", test.name, parts, test.want)
+		}
+	}
+}
+
 // TestGeminiOutputParts_PendingSignature 前置签名遇到自带签名的 part 时单独成 part，两份签名都保留
 func TestGeminiOutputParts_PendingSignature(t *testing.T) {
 	parts := geminiOutputParts(generationResult{events: []aistudio.Event{

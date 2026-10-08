@@ -891,21 +891,9 @@ func geminiOutputParts(result generationResult) []map[string]any {
 	parts := make([]map[string]any, 0)
 	// merging 记录最后一个 part 可以继续追加的文本类型："text"、"thought" 或空（不可追加）
 	merging := ""
-	// leading 暂存输出开头单独到达的签名（如不返回正文的思考留下的签名），它属于随后的内容，
-	// 挂到下一个新建的 part 上；该 part 自带签名时前置签名单独成 part 排在它前面，不覆盖已有签名
-	leading := ""
-	appendPart := func(part map[string]any, signature string) {
-		part = geminiSignedPart(part, signature)
-		if leading != "" {
-			if _, signed := part["thoughtSignature"]; signed {
-				parts = append(parts, geminiSignaturePart(leading))
-			} else {
-				part["thoughtSignature"] = leading
-			}
-			leading = ""
-		}
-		parts = append(parts, part)
-	}
+	// leading 记录第一个 part 是否为输出开头单独到达的签名（如不返回正文的思考留下的签名），它属于随后的内容，
+	// 全部合并完后再决定挂到哪里，见函数末尾
+	leading := false
 	appendText := func(kind string, event aistudio.Event, build func() map[string]any) {
 		if merging == kind && len(parts) > 0 {
 			last := parts[len(parts)-1]
@@ -919,7 +907,7 @@ func geminiOutputParts(result generationResult) []map[string]any {
 				return
 			}
 		}
-		appendPart(build(), event.ThoughtSignature)
+		parts = append(parts, geminiSignedPart(build(), event.ThoughtSignature))
 		merging = kind
 	}
 	for _, event := range result.events {
@@ -927,7 +915,7 @@ func geminiOutputParts(result generationResult) []map[string]any {
 		case aistudio.EventText:
 			if event.Transcript != nil {
 				// 带说话人元数据的转写文本保持独立
-				appendPart(geminiTextPart(event), event.ThoughtSignature)
+				parts = append(parts, geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))
 				merging = ""
 				continue
 			}
@@ -947,16 +935,9 @@ func geminiOutputParts(result generationResult) []map[string]any {
 					continue
 				}
 			}
-			// 输出开头的签名先暂存，见 leading
-			if len(parts) == 0 && leading == "" {
-				leading = event.ThoughtSignature
-				continue
-			}
-			// 前一个 part 已带签名或不是文本时单独成 part，不覆盖已有签名，也不挪到别的 part 上；
-			// 连续多个前置签名无法判断哪一个属于随后的内容，按原顺序各自单独成 part
-			if leading != "" {
-				parts = append(parts, geminiSignaturePart(leading))
-				leading = ""
+			// 前一个 part 已带签名或不是文本时单独成 part，不覆盖已有签名，也不挪到别的 part 上
+			if len(parts) == 0 {
+				leading = true
 			}
 			parts = append(parts, geminiSignaturePart(event.ThoughtSignature))
 			merging = ""
@@ -966,36 +947,43 @@ func geminiOutputParts(result generationResult) []map[string]any {
 		switch event.Kind {
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
-				appendPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature)
+				parts = append(parts, geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))
 			}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode != nil {
-				appendPart(map[string]any{"executableCode": map[string]any{
+				parts = append(parts, geminiSignedPart(map[string]any{"executableCode": map[string]any{
 					"language": event.ExecutableCode.Language, "code": event.ExecutableCode.Code,
-				}}, event.ThoughtSignature)
+				}}, event.ThoughtSignature))
 			}
 		case aistudio.EventCodeExecutionResult:
 			if event.CodeExecutionResult != nil {
-				appendPart(map[string]any{
+				parts = append(parts, geminiSignedPart(map[string]any{
 					"codeExecutionResult": geminiCodeExecutionResult(*event.CodeExecutionResult),
-				}, event.ThoughtSignature)
+				}, event.ThoughtSignature))
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
 				if len(event.Media.Data) > 0 {
-					appendPart(map[string]any{"inlineData": map[string]any{
+					parts = append(parts, geminiSignedPart(map[string]any{"inlineData": map[string]any{
 						"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
-					}}, event.ThoughtSignature)
+					}}, event.ThoughtSignature))
 				} else if event.Media.URL != "" {
-					appendPart(map[string]any{"fileData": map[string]any{
+					parts = append(parts, geminiSignedPart(map[string]any{"fileData": map[string]any{
 						"mimeType": event.Media.MIME, "fileUri": event.Media.URL, "displayName": event.Media.Name,
-					}}, event.ThoughtSignature)
+					}}, event.ThoughtSignature))
 				}
 			}
 		}
 	}
-	if leading != "" {
-		parts = append(parts, geminiSignaturePart(leading))
+	// 前置签名挂到随后的第一个 part 上，前提是该 part 合并完仍没有签名。合并完再决定：新建 part 时就挂上的话，
+	// 随后带签名的增量或单独到达的签名不能再并入，连续的正文会被拆成几段。
+	// 该 part 已带签名时前置签名仍单独成 part，不覆盖已有签名；连续多个前置签名时随后的是签名 part，
+	// 无法判断哪一个属于随后的内容，按原顺序各自单独成 part
+	if leading && len(parts) > 1 {
+		if _, signed := parts[1]["thoughtSignature"]; !signed {
+			parts[1]["thoughtSignature"] = parts[0]["thoughtSignature"]
+			parts = parts[1:]
+		}
 	}
 	return parts
 }
