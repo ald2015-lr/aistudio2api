@@ -87,3 +87,42 @@ func TestStartGenerateRejectsEmptyRequest(t *testing.T) {
 		t.Fatalf("err = %v，期望参数错误", err)
 	}
 }
+
+// TestHeaderProviderAfterClose 关闭后再登记或发布账户出口返回错误，不会因空 map 崩溃
+func TestHeaderProviderAfterClose(t *testing.T) {
+	provider, err := newAccountHeaderProvider(nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	account := &aistudio.Account{ID: "a@example.com"}
+	if err := provider.Add(account); err != nil {
+		t.Fatal(err)
+	}
+	update, err := provider.prepareUpdate(account, aistudio.AccountConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.Close()
+	update.Commit()
+	if err := provider.Add(&aistudio.Account{ID: "b@example.com"}); err == nil {
+		t.Fatal("关闭后 Add 应返回错误")
+	}
+	if _, err := provider.ProtocolHeaders(context.Background(), "a@example.com"); err == nil {
+		t.Fatal("关闭后不应再提供协议头")
+	}
+}
+
+// TestTryReserveVictim 同一个旧 Worker 只能被一次替换或轮换选中
+func TestTryReserveVictim(t *testing.T) {
+	manager := &accountWorkerManager{victims: make(map[string]struct{})}
+	if !manager.tryReserveVictim("a") {
+		t.Fatal("首次标记应成功")
+	}
+	if manager.tryReserveVictim("a") || !manager.victimReserved("a") {
+		t.Fatal("已标记的 Worker 不应再次被选中")
+	}
+	manager.releaseVictim("a")
+	if !manager.tryReserveVictim("a") {
+		t.Fatal("释放后应可再次标记")
+	}
+}

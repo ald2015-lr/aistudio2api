@@ -2,14 +2,17 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 // blockingStartService 在 startGenerate 内暂停，模拟写访问日志之前有写锁排队
@@ -89,5 +92,79 @@ func TestGenerateDoesNotDeadlockWithQueuedWriter(t *testing.T) {
 	case <-writerDone:
 	case <-time.After(3 * time.Second):
 		t.Fatal("写锁没有拿到")
+	}
+}
+
+// stoppedService 为已停止的生成服务
+type stoppedService struct{ aistudio.Service }
+
+func (stoppedService) State() string { return "STOPPED" }
+
+type stoppedAdmin struct{ api.AdminService }
+
+func (stoppedAdmin) Status(context.Context) (api.AdminStatus, error)      { return api.AdminStatus{}, nil }
+func (stoppedAdmin) StopService(context.Context) (api.AdminStatus, error) { return api.AdminStatus{}, nil }
+
+// TestUserStopIsNotOverridden 用户停止之后，监督器的自动重启与停止之前排队的启动都不会再把服务拉起来
+func TestUserStopIsNotOverridden(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	launched := make(chan struct{}, 2)
+	manager := &runtimeManager{
+		lifecycle: ctx, requests: newRequestRegistry(ctx), intent: &serviceIntent{},
+		current: &runtimeGeneration{service: stoppedService{}, admin: stoppedAdmin{}},
+		factory: func(context.Context, context.Context, config.Config, *requestRegistry) (*runtimeGeneration, error) {
+			launched <- struct{}{}
+			return nil, errors.New("不应启动")
+		},
+		configPath: filepath.Join(t.TempDir(), ".env"),
+	}
+	// 监督器：用户期望停止时不启动
+	if _, err := manager.startService(ctx, false); err != nil {
+		t.Fatal(err)
+	}
+	// 用户启动排在另一次启动之后，期间用户按了停止
+	manager.startMu.Lock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := manager.StartService(ctx)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := manager.StopService(ctx); err != nil {
+		t.Fatal(err)
+	}
+	manager.startMu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-launched:
+		t.Fatal("停止之后服务仍被启动")
+	default:
+	}
+	if manager.intent.running.Load() {
+		t.Fatal("停止之后期望状态仍为运行")
+	}
+}
+
+// TestNoStartAfterShutdownBegins 进程开始退出后，启动（含监督器自动重启）直接放弃
+func TestNoStartAfterShutdownBegins(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager := &runtimeManager{
+		lifecycle: ctx, requests: newRequestRegistry(ctx), intent: &serviceIntent{},
+		current: &runtimeGeneration{service: stoppedService{}, admin: stoppedAdmin{}},
+		factory: func(context.Context, context.Context, config.Config, *requestRegistry) (*runtimeGeneration, error) {
+			t.Fatal("退出期间不应再启动")
+			return nil, nil
+		},
+	}
+	manager.beginShutdown()
+	if _, err := manager.StartService(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.startService(ctx, false); err != nil {
+		t.Fatal(err)
 	}
 }

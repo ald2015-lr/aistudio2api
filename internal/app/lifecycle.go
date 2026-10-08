@@ -71,10 +71,14 @@ type runtimeManager struct {
 	startCancel      context.CancelFunc
 	apiKey           *apiKeyHolder
 	intent           *serviceIntent
+	// shuttingDown 在进程退出时置为 true（由 mu 保护），之后不再启动生成服务
+	shuttingDown bool
 }
 
-// newRuntimeManager 创建进程级管理器与初始生成服务
+// newRuntimeManager 创建进程级管理器与初始生成服务。
+// launchCtx 只用于装配初始生成服务（首次运行会下载 Camoufox），收到退出信号时可以中断；ctx 为运行时生命周期
 func newRuntimeManager(
+	launchCtx context.Context,
 	ctx context.Context,
 	configPath string,
 	cfg config.Config,
@@ -87,7 +91,7 @@ func newRuntimeManager(
 		apiKey: newAPIKeyHolder(cfg.ProxyAPIKey),
 		intent: &serviceIntent{},
 	}
-	generation, err := manager.factory(ctx, ctx, cfg, requests)
+	generation, err := manager.factory(launchCtx, ctx, cfg, requests)
 	if err != nil {
 		return nil, err
 	}
@@ -115,13 +119,27 @@ func buildRuntimeGeneration(
 	}, nil
 }
 
-// StartService 从最新配置创建并启动新生成服务
+// StartService 从最新配置创建并启动新生成服务（用户启动、自动启动与应用配置）
 func (manager *runtimeManager) StartService(ctx context.Context) (api.AdminStatus, error) {
-	manager.intent.running.Store(true)
+	return manager.startService(ctx, true)
+}
+
+// startService 启动生成服务。user 为 false 时是监督器的自动重启：不改变用户期望的运行状态，
+// 用户已经停止服务时直接放弃。开始启动之后用户按了停止（stops 变化）时同样放弃
+func (manager *runtimeManager) startService(ctx context.Context, user bool) (api.AdminStatus, error) {
+	if user {
+		manager.intent.running.Store(true)
+	}
+	stops := manager.intent.stops.Load()
 	manager.startMu.Lock()
 	defer manager.startMu.Unlock()
 
 	manager.mu.Lock()
+	// 与 StopService 在同一把锁内检查：要么停止看到 startCancel 并取消启动，要么启动看到停止并放弃
+	if manager.shuttingDown || manager.intent.stops.Load() != stops || !manager.intent.running.Load() {
+		manager.mu.Unlock()
+		return manager.Status(ctx)
+	}
 	current := manager.current
 	if current.service.State() != "STOPPED" {
 		status, err := current.admin.StartService(ctx)
@@ -172,6 +190,18 @@ func (manager *runtimeManager) StartService(ctx context.Context) (api.AdminStatu
 	return status, startErr
 }
 
+// beginShutdown 在进程开始退出时调用：取消正在进行的生成服务启动，之后不再启动（监督器的自动重启也不会），
+// 不改变用户期望的运行状态
+func (manager *runtimeManager) beginShutdown() {
+	manager.mu.Lock()
+	manager.shuttingDown = true
+	cancel := manager.startCancel
+	manager.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // finishStart 清理本轮生成服务启动取消句柄
 func (manager *runtimeManager) finishStart(cancel context.CancelFunc) {
 	manager.mu.Lock()
@@ -182,11 +212,12 @@ func (manager *runtimeManager) finishStart(cancel context.CancelFunc) {
 
 // StopService 停止当前生成服务并保持管理监听器运行
 func (manager *runtimeManager) StopService(ctx context.Context) (api.AdminStatus, error) {
+	manager.mu.Lock()
 	manager.intent.running.Store(false)
-	manager.mu.RLock()
+	manager.intent.stops.Add(1)
 	cancel := manager.startCancel
 	current := manager.current
-	manager.mu.RUnlock()
+	manager.mu.Unlock()
 	if cancel != nil {
 		cancel()
 	}

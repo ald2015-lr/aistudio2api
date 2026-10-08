@@ -22,6 +22,8 @@ const (
 // serviceIntent 记录用户期望的运行状态：启动（含自动启动、应用配置）置为运行，手动停止置为停止
 type serviceIntent struct {
 	running atomic.Bool
+	// stops 为手动停止的次数：启动过程中用户按了停止时，启动据此放弃，不会在停止之后又把服务拉起来
+	stops atomic.Uint64
 }
 
 // superviseService 期望运行、但生成服务停在 STOPPED（启动失败或意外停止）时自动重新启动，
@@ -73,7 +75,7 @@ func (manager *runtimeManager) superviseService() {
 			continue
 		}
 		manager.requests.log("service", "WARN", fmt.Sprintf("生成服务未在运行，自动重新启动 | 第 %d 次", attempt))
-		_, startErr := manager.StartService(ctx)
+		_, startErr := manager.startService(ctx, false)
 		if ctx.Err() != nil {
 			return
 		}

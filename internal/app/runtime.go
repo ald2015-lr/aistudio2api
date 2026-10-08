@@ -188,6 +188,9 @@ type accountWorker struct {
 	busyUntil      time.Time
 	busyDelay      time.Duration
 	busyErr        error
+	// cleanupRetryAt 与 cleanupBackoff 为清理失败后下一次后台重试的时间与间隔（由 account.mu 保护）
+	cleanupRetryAt time.Time
+	cleanupBackoff time.Duration
 }
 
 type accountWorkerPreparer struct {
@@ -1158,6 +1161,18 @@ func (manager *accountWorkerManager) reserveVictim(accountID string) {
 	manager.victimMu.Unlock()
 }
 
+// tryReserveVictim 在旧 Worker 尚未被其他替换选中时标记它，返回是否标记成功。
+// 冷却轮换不经过 rebalanceMu，用它与 ensureWorker 的替换互斥，避免同一个 Worker 被两边同时淘汰
+func (manager *accountWorkerManager) tryReserveVictim(accountID string) bool {
+	manager.victimMu.Lock()
+	defer manager.victimMu.Unlock()
+	if _, reserved := manager.victims[accountID]; reserved {
+		return false
+	}
+	manager.victims[accountID] = struct{}{}
+	return true
+}
+
 // releaseVictim 解除旧 Worker 的替换标记
 func (manager *accountWorkerManager) releaseVictim(accountID string) {
 	manager.victimMu.Lock()
@@ -1789,6 +1804,8 @@ type accountHeaderProvider struct {
 	mu          sync.RWMutex
 	accounts    map[string]*accountHeaderState
 	globalProxy string
+	// closed 在 Close 后为 true：之后的 Add 与 Commit 不再登记（关闭期间目录监视仍可能加入新账户）
+	closed bool
 }
 
 type accountHeaderState struct {
@@ -1832,6 +1849,10 @@ func (provider *accountHeaderProvider) Add(account *aistudio.Account) error {
 	}
 	provider.mu.Lock()
 	defer provider.mu.Unlock()
+	if provider.closed {
+		client.CloseIdleConnections()
+		return fmt.Errorf("账户固定出口已关闭")
+	}
 	if _, exists := provider.accounts[account.ID]; exists {
 		client.CloseIdleConnections()
 		return fmt.Errorf("账户固定出口已存在: %s", account.ID)
@@ -1874,9 +1895,17 @@ func (update *accountHeaderUpdate) Commit() {
 	}
 	update.provider.mu.Lock()
 	current := update.provider.accounts[update.accountID]
-	update.provider.accounts[update.accountID] = update.state
+	// 准备之后账户已被删除或出口已关闭：不再发布，关闭新建的出口
+	stale := update.provider.closed || current == nil
+	if !stale {
+		update.provider.accounts[update.accountID] = update.state
+	}
 	update.provider.mu.Unlock()
 	update.pending = false
+	if stale {
+		update.state.client.CloseIdleConnections()
+		return
+	}
 	current.client.CloseIdleConnections()
 }
 
@@ -1908,7 +1937,8 @@ func (provider *accountHeaderProvider) Remove(accountID string) error {
 func (provider *accountHeaderProvider) Close() {
 	provider.mu.Lock()
 	accounts := provider.accounts
-	provider.accounts = nil
+	provider.accounts = map[string]*accountHeaderState{}
+	provider.closed = true
 	provider.mu.Unlock()
 	for _, account := range accounts {
 		account.client.CloseIdleConnections()

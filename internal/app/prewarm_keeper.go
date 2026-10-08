@@ -18,6 +18,9 @@ const (
 	warmFailureBackoff = 5 * time.Minute
 	// failedWorkerSweepWait 为后台关闭失败 Worker 时等待该账户进行中请求结束的上限；超时则下一轮再试
 	failedWorkerSweepWait = 3 * time.Second
+	// cleanupRetryFirst、cleanupRetryMax 为清理失败（浏览器关不掉、运行时租约释放失败）的账户后台重试间隔
+	cleanupRetryFirst = 30 * time.Second
+	cleanupRetryMax   = 10 * time.Minute
 )
 
 // keepWarm 服务运行期间持续把常驻 Worker 补齐到目标数：
@@ -45,6 +48,7 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 		}
 		workers := service.workers
 		workers.sweepFailedWorkers(dataContext)
+		workers.retryPendingCleanup()
 		if len(workers.WarmAccountIDs())+len(workers.OpeningAccountIDs()) >= workers.PrewarmTarget() {
 			continue
 		}
@@ -214,7 +218,10 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		if rotated >= limit || ctx.Err() != nil {
 			break
 		}
-		if _, victim := victims[accountID]; !victim || workers.victimReserved(accountID) {
+		if _, victim := victims[accountID]; !victim {
+			continue
+		}
+		if _, opening := workers.openingSet.Load(accountID); opening {
 			continue
 		}
 		workers.mu.RLock()
@@ -223,7 +230,12 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		if account == nil || now.Sub(time.Unix(0, account.readyAt.Load())) < rotationWarmupGrace {
 			continue
 		}
+		// 与 ensureWorker 的替换共用淘汰标记：已被选中的不再重复淘汰，淘汰期间替换也不会选中它
+		if !workers.tryReserveVictim(accountID) {
+			continue
+		}
 		evicted, err := workers.evictIdleWorker(ctx, accountID)
+		workers.releaseVictim(accountID)
 		if err != nil {
 			service.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 冷却轮换失败 | 错误=%v", err))
 			continue
@@ -243,6 +255,44 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		"WAA Worker 冷却轮换 | 替换=%d | 预热池中长时间冷却=%s", rotated, strings.Join(details, "，"),
 	))
 	workers.StartPrewarm(ctx)
+}
+
+// retryPendingCleanup 重试清理失败的账户：关闭失败的浏览器或释放失败的运行时租约会让账户停在“待清理”状态，
+// 之后每次 ensureWorker 都失败，替换与回收也跳过它，原先要等停止再启动服务才会恢复。
+// 按账户退避重试（30 秒起翻倍，最长 10 分钟）；账户正被使用时跳过，下一轮再试
+func (manager *accountWorkerManager) retryPendingCleanup() {
+	manager.mu.RLock()
+	accounts := make([]*accountWorker, 0, len(manager.accounts))
+	for _, account := range manager.accounts {
+		accounts = append(accounts, account)
+	}
+	manager.mu.RUnlock()
+	now := time.Now()
+	for _, account := range accounts {
+		if !account.startupMu.TryLock() {
+			continue
+		}
+		if !account.mu.TryLock() {
+			account.startupMu.Unlock()
+			continue
+		}
+		// 只重试明确记录下来的清理失败；正在正常关闭（WorkerClosing）的 Worker 不在这里重复关闭
+		failedCleanup := account.cleanupWorker != nil || account.cleanupLease != nil || account.worker == nil && account.runtimeLease != nil
+		if failedCleanup && !now.Before(account.cleanupRetryAt) {
+			if err := manager.closeAccountWorker(account); err != nil {
+				account.cleanupBackoff = min(max(account.cleanupBackoff*2, cleanupRetryFirst), cleanupRetryMax)
+				account.cleanupRetryAt = now.Add(account.cleanupBackoff)
+				manager.requests.log(account.label, "WARN", fmt.Sprintf(
+					"WAA Worker 清理重试失败 | %s 后再试 | 错误=%s", account.cleanupBackoff, strings.TrimSpace(err.Error()),
+				))
+			} else {
+				account.cleanupBackoff, account.cleanupRetryAt = 0, time.Time{}
+				manager.requests.log(account.label, "INFO", "WAA Worker 清理重试成功，账户恢复可用")
+			}
+		}
+		account.mu.Unlock()
+		account.startupMu.Unlock()
+	}
 }
 
 // sweepFailedWorkers 关闭已失败的常驻 Worker（浏览器退出、控制连接断开等），释放常驻名额，随后由 keepWarm 补齐。

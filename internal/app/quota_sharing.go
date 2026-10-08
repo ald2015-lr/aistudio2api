@@ -27,6 +27,8 @@ const (
 	quotaSharedRatio = 20
 	// quotaPendingTTL 另一个通道在这段时间内没有新的尝试，就放弃这次观察
 	quotaPendingTTL = 30 * time.Minute
+	// quotaRevisitEvery 判定为共用后，每这么多次每日限额放行一次另一个通道作为复核
+	quotaRevisitEvery = 20
 	// dailyQuotaKind 为 aistudio.QuotaCooldownForError 返回的每日限额类型
 	dailyQuotaKind = aistudio.DailyQuotaKind
 )
@@ -45,13 +47,16 @@ type quotaSharing struct {
 	models   map[string]*quotaSharingStats
 	// pending 为等待验证的观察：键为 账户|模型|通道，值为另一个通道达到每日限额的时间
 	pending map[string]time.Time
+	// sinceRevisit 为判定共用后各模型距上次复核的每日限额次数（只在内存中）
+	sinceRevisit map[string]int
 }
 
 func newQuotaSharing(directory string, requests *requestRegistry) *quotaSharing {
 	sharing := &quotaSharing{
 		requests: requests,
-		models:   make(map[string]*quotaSharingStats),
-		pending:  make(map[string]time.Time),
+		models:       make(map[string]*quotaSharingStats),
+		pending:      make(map[string]time.Time),
+		sinceRevisit: make(map[string]int),
 	}
 	if strings.TrimSpace(directory) != "" {
 		sharing.path = filepath.Join(directory, quotaSharingFileName)
@@ -192,7 +197,13 @@ func (sharing *quotaSharing) dailyLimitHit(
 	}
 	other := otherChannel(channel)
 	if sharing.sharedLocked(modelID) {
-		return other, true
+		// 判定为共用后另一个通道总是同时冷却，不再有新的证据，判定原先永远不会改变。
+		// 定期放行一次另一个通道作为复核：额度后来变为独立时，判定随之修正
+		sharing.sinceRevisit[modelID]++
+		if sharing.sinceRevisit[modelID] < quotaRevisitEvery {
+			return other, true
+		}
+		sharing.sinceRevisit[modelID] = 0
 	}
 	sharing.pending[quotaSharingKey(accountID, modelID, other)] = now
 	return other, false

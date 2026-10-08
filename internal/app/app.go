@@ -64,8 +64,12 @@ func runCommand(args []string) error {
 	// 现在收到信号后先停止接收新请求、等进行中的请求完成（见 runServer），再结束运行时
 	lifecycle, cancelLifecycle := context.WithCancel(context.Background())
 	defer cancelLifecycle()
-	manager, err := newRuntimeManager(lifecycle, ".env", cfg, options.overrides)
+	manager, err := newRuntimeManager(ctx, lifecycle, ".env", cfg, options.overrides)
 	if err != nil {
+		if ctx.Err() != nil {
+			// 装配初始生成服务（如首次下载 Camoufox）期间收到退出信号：正常退出
+			return nil
+		}
 		return err
 	}
 	serveErr := runServer(ctx, cfg, options, manager)
@@ -203,6 +207,9 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		}
 		return err
 	case <-ctx.Done():
+		// 正在启动生成服务（自动启动或页面点击）时立即中断启动，不必等浏览器启动完成才能退出
+		cancelAutoStart()
+		manager.beginShutdown()
 		// 停止接收新请求，等进行中的请求完成（原先只等 10 秒，而一次请求中位要二十多秒）
 		grace := shutdownGrace()
 		manager.requests.log("service", "INFO", fmt.Sprintf(
