@@ -277,8 +277,11 @@ func TestPoolAdminCallsScale(t *testing.T) {
 		timeCall("CanonicalModelIDIn(normal, 别名, "+round+")", func() { pool.CanonicalModelIDIn(PoolScopeNormal, scaleAliasModel) })
 		timeCall("CanonicalModelIDIn(ultra, 未知模型, "+round+")", func() { pool.CanonicalModelIDIn(PoolScopeUltra, "no-such-model") })
 		timeCall("BootstrapSummary("+round+")", func() { pool.BootstrapSummary() })
-		timeCall("SpareAccounts("+round+")", func() {
-			pool.SpareAccounts(PoolScopeNormal, map[string]struct{}{}, []string{scaleModel}, 5*time.Minute)
+		timeCall("SpareAccounts(全量, "+round+")", func() {
+			pool.SpareAccounts(PoolScopeNormal, map[string]struct{}{}, []string{scaleModel}, 5*time.Minute, 0)
+		})
+		timeCall("SpareAccounts(limit=8, "+round+")", func() {
+			pool.SpareAccounts(PoolScopeNormal, map[string]struct{}{}, []string{scaleModel}, 5*time.Minute, 8)
 		})
 	}
 	// 状态缓存过期后的重建耗时（缓存 1 秒）

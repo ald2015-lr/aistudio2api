@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -223,6 +225,23 @@ func (capacity *standbyCapacity) expandable(standby []string) string {
 	return ""
 }
 
+// reclaimDead 在备用账户所在的分区已满时现场回收一个对该模型是死槽位（账号长时间冷却）的空闲 Worker，
+// 返回回收的账户与分区；每次调度最多回收一个，每个分区只尝试一次，没有死槽位时返回空，由随后的扩容或替换按原流程处理
+func (capacity *standbyCapacity) reclaimDead(ctx context.Context, standby []string) (string, aistudio.PoolScope) {
+	checked := make(map[aistudio.PoolScope]bool, len(workerPartitions))
+	for _, accountID := range standby {
+		partition := capacity.partition(accountID)
+		if checked[partition] || capacity.room(partition) {
+			continue
+		}
+		checked[partition] = true
+		if victim, _ := capacity.manager.reclaimDeadWorker(ctx, partition, capacity.modelID); victim != "" {
+			return victim, partition
+		}
+	}
+	return "", aistudio.PoolScopeAll
+}
+
 // promotable 返回现场启动 Worker 的备用账户：所在分区未满时优先没有 Worker 的账户；
 // allowVictim 时（没有热候选）分区已满但同分区有可淘汰的空闲 Worker 也可以
 func (capacity *standbyCapacity) promotable(standby []string, allowVictim bool) string {
@@ -244,12 +263,14 @@ func (capacity *standbyCapacity) promotable(standby []string, allowVictim bool) 
 	return ""
 }
 
-// ultraWorkerCounts 返回 Ultra 分区的 Worker 计数，供管理页状态显示
-func (manager *accountWorkerManager) ultraWorkerCounts(ultra map[string]struct{}, warm []string, starting []string, occupied int) api.AdminWorkerPartition {
+// ultraWorkerCounts 返回 Ultra 分区的 Worker 计数，供管理页状态显示；dead 为其中账号长时间冷却的死槽位数
+func (manager *accountWorkerManager) ultraWorkerCounts(
+	ultra map[string]struct{}, warm []string, starting []string, occupied int, dead int,
+) api.AdminWorkerPartition {
 	partition := aistudio.PoolScopeUltra
 	return api.AdminWorkerPartition{
 		Warm: len(inPartition(warm, ultra, partition)), Starting: len(inPartition(starting, ultra, partition)),
-		Occupied: occupied, Target: manager.prewarmTargetFor(partition),
+		Occupied: occupied, Dead: dead, Target: manager.prewarmTargetFor(partition),
 		WarmLimit: manager.warmTargetFor(partition), Max: manager.maxActiveFor(partition),
 	}
 }

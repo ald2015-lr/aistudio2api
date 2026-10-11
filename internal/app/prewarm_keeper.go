@@ -7,6 +7,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -44,6 +46,8 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 		if !running {
 			return
 		}
+		// 全局长时间冷却的空闲 Worker 每个周期清扫，不等 30 秒一轮的按模型轮换
+		service.sweepDeadWorkers(dataContext)
 		if time.Since(lastRotation) >= rotationInterval {
 			lastRotation = time.Now()
 			service.rotateCooledWorkers(dataContext)
@@ -136,7 +140,8 @@ const (
 	// rotationMinRemaining 冷却剩余不少于该时长才视为长时间不可用（排除一分钟内恢复的分钟限额）
 	rotationMinRemaining = 15 * time.Minute
 	// rotationMinShare 与 rotationMinAccounts：一个模型在预热池中长时间冷却的账户达到
-	// max(下限, 预热数×比例) 时才进行轮换，避免为少用的模型反复重启浏览器
+	// max(下限, 预热数×比例) 时才进行轮换，避免为少用的模型反复重启浏览器。
+	// 只约束按模型的冷却：全局冷却的账号对任何模型都是死槽位，由 sweepDeadWorkers 与冷却登记不设阈值地淘汰
 	rotationMinShare    = 0.05
 	rotationMinAccounts = 3
 	// rotationWarmupGrace 刚就绪不久的 Worker 不参与轮换
@@ -180,11 +185,110 @@ func (manager *accountWorkerManager) preferUncooled(accountIDs []string) []strin
 	return result
 }
 
+// sweepDeadWorkers 淘汰预热池中全局长时间冷却（每日限额冻结整个账号）的空闲 Worker。这样的 Worker 对任何模型都是死槽位，
+// 不受 hotModelsIn 按模型的 5% 阈值限制：本进程写入的冷却在 applyQuotaCooldown 时就已登记淘汰（见 worker_retire.go），
+// 这里兜底处理其他进程写入的冷却与登记后仍在重试的 Worker。每个 keepWarm 周期两个分区合计最多关闭 WARM_STARTUP_CONCURRENCY 个，
+// 关闭并发进行；接替的 Worker 由预热经冷启动名额补齐，不会超过启动并发。只在分区内有可接替的账户时淘汰
+func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
+	workers := service.workers
+	allWarm := workers.WarmAccountIDs()
+	dead := service.pool.LongCoolingSet(allWarm, nil, rotationMinRemaining, true)
+	if len(dead) == 0 || ctx.Err() != nil {
+		return 0
+	}
+	budget := max(workers.warmConcurrencyValue(), 1)
+	ultra := service.pool.UltraAccountIDs()
+	opening := workers.OpeningAccountIDs()
+	type victim struct {
+		accountID string
+		partition aistudio.PoolScope
+	}
+	var victims []victim
+	for _, partition := range workerPartitions {
+		if len(victims) >= budget {
+			break
+		}
+		warm := inPartition(allWarm, ultra, partition)
+		candidates := make([]string, 0, len(warm))
+		for _, accountID := range warm {
+			if _, cooled := dead[accountID]; !cooled {
+				continue
+			}
+			if _, starting := workers.openingSet.Load(accountID); starting {
+				continue
+			}
+			workers.mu.RLock()
+			account := workers.accounts[accountID]
+			workers.mu.RUnlock()
+			if account == nil || !account.startupMu.TryLock() {
+				continue
+			}
+			account.startupMu.Unlock()
+			candidates = append(candidates, accountID)
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		occupied := make(map[string]struct{}, len(warm)+len(opening))
+		for _, accountID := range warm {
+			occupied[accountID] = struct{}{}
+		}
+		for _, accountID := range inPartition(opening, ultra, partition) {
+			occupied[accountID] = struct{}{}
+		}
+		limit := min(budget-len(victims), len(candidates))
+		limit = min(limit, service.pool.SpareAccounts(partition, occupied, nil, rotationMinRemaining, limit))
+		for _, accountID := range candidates {
+			if limit <= 0 {
+				break
+			}
+			if !workers.tryReserveVictim(accountID) {
+				continue
+			}
+			victims = append(victims, victim{accountID: accountID, partition: partition})
+			limit--
+		}
+	}
+	if len(victims) == 0 {
+		return 0
+	}
+	var closes sync.WaitGroup
+	var retired atomic.Int32
+	for _, target := range victims {
+		closes.Add(1)
+		go func(target victim) {
+			defer closes.Done()
+			evicted, err := workers.evictIdleWorker(ctx, target.accountID)
+			workers.releaseVictim(target.accountID)
+			if err != nil {
+				if ctx.Err() == nil {
+					service.requests.log(target.accountID, "WARN", fmt.Sprintf("WAA Worker 冷却清扫失败 | 错误=%v", err))
+				}
+				return
+			}
+			if evicted {
+				workers.dropRetirement(target.accountID)
+				retired.Add(1)
+			}
+		}(target)
+	}
+	closes.Wait()
+	count := int(retired.Load())
+	if count == 0 {
+		return 0
+	}
+	service.requests.log("service", "INFO", fmt.Sprintf(
+		"WAA Worker 冷却清扫 | 关闭全局冷却的空闲 Worker=%d | 预热池中全局冷却=%d/%d", count, len(dead), len(allWarm),
+	))
+	workers.StartPrewarm(ctx)
+	return count
+}
+
 // rotateCooledWorkers 把预热池中被长时间冷却占住的空闲 Worker（如当天某模型额度已用完）
 // 换成没有冷却的账户。原先只有请求到来、找不到可用的预热 Worker 时才现场启动或替换浏览器，
 // 这几秒到十几秒都算在请求的等待时间里；这里在后台提前完成。
 // 普通与 Ultra 分区分别统计与轮换：只淘汰本分区的 Worker，接替的账户也按本分区统计，随后由预热按本分区补齐；
-// 一轮最多替换的数量两个分区共用启动预热并发
+// 一轮最多替换的数量两个分区共用启动预热并发。按模型的轮换有阈值；全局冷却的账号见 sweepDeadWorkers
 func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	workers := service.workers
 	ultra := service.pool.UltraAccountIDs()
@@ -254,7 +358,7 @@ func (service *trackedService) rotatePartition(
 	for _, accountID := range openingIDs {
 		occupied[accountID] = struct{}{}
 	}
-	limit = min(limit, service.pool.SpareAccounts(partition, occupied, hot, rotationMinRemaining))
+	limit = min(limit, service.pool.SpareAccounts(partition, occupied, hot, rotationMinRemaining, limit))
 	if limit <= 0 {
 		return 0
 	}

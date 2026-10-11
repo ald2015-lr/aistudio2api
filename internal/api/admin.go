@@ -52,10 +52,12 @@ type AdminStatus struct {
 
 // AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限
 type AdminWorkerPartition struct {
-	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的）
+	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的），
+	// Dead 为 Warm 中账号长时间冷却、等待淘汰的死槽位
 	Warm     int `json:"warm"`
 	Starting int `json:"starting"`
 	Occupied int `json:"occupied"`
+	Dead     int `json:"dead"`
 	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
 	Target    int `json:"target"`
 	WarmLimit int `json:"warm_limit"`
@@ -75,11 +77,13 @@ type AdminPrewarmState struct {
 // AdminWorkerCounts 表示 WAA Worker 的实时数量与对应账户：数量与上限只含普通分区（Ultra 分区见 AdminWorkerPartition），
 // WarmIDs、StartingIDs 包含两个分区；预热循环两个分区共用
 type AdminWorkerCounts struct {
-	Warm        int               `json:"warm"`
-	Starting    int               `json:"starting"`
-	Target      int               `json:"target"`
-	Max         int               `json:"max"`
-	Occupied    int               `json:"occupied"`
+	Warm     int `json:"warm"`
+	Starting int `json:"starting"`
+	Target   int `json:"target"`
+	Max      int `json:"max"`
+	Occupied int `json:"occupied"`
+	// Dead 为 Warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位
+	Dead        int               `json:"dead"`
 	Prewarm     AdminPrewarmState `json:"prewarm"`
 	WarmIDs     []string          `json:"warm_ids,omitempty"`
 	StartingIDs []string          `json:"starting_ids,omitempty"`

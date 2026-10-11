@@ -496,11 +496,19 @@ onUnmounted(() => {
             }}
           </div>
           <div
+            v-if="status.workers && (status.workers.dead ?? 0) > 0"
+            v-tooltip="t('app.workersDeadDetail')"
+            class="text-yellow-400"
+          >
+            {{ tf('app.workersDead', { count: status.workers.dead ?? 0 }) }}
+          </div>
+          <div
             v-if="ultraWorkers"
             v-tooltip="
               tf('app.ultraWorkersDetail', {
                 warm: ultraWorkers.warm,
                 starting: ultraWorkers.starting,
+                dead: ultraWorkers.dead ?? 0,
                 target: ultraWorkers.target,
                 max: ultraWorkers.max,
               })

@@ -110,24 +110,27 @@ export interface PrewarmState {
   reason?: string
 }
 
-// WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户
+// WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户；
+// dead 为 warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位
 export interface WorkerCounters {
   warm: number
   starting: number
   target: number
   max: number
   occupied?: number
+  dead?: number
   prewarm?: PrewarmState
   warm_ids?: string[]
   starting_ids?: string[]
 }
 
 // UltraWorkerCounters 为 Ultra 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
-// warm_limit 与 max 为 Ultra 常驻数与峰值数设置
+// dead 为其中账号长时间冷却、等待淘汰的死槽位，warm_limit 与 max 为 Ultra 常驻数与峰值数设置
 export interface UltraWorkerCounters {
   warm: number
   starting: number
   occupied: number
+  dead?: number
   target: number
   warm_limit: number
   max: number

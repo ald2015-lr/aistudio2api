@@ -305,18 +305,82 @@ func (p *AccountPool) StatusOf(accountID string) (AccountStatus, bool) {
 }
 
 // longCoolingLocked 判断账户在该模型上是否长时间不可用：全局冷却，或所有启用通道都在冷却，
-// 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；调用方持有 p.mu
+// 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu
 func (p *AccountPool) longCoolingLocked(account *Account, modelID string, now time.Time, minRemaining time.Duration) bool {
-	long := func(key string) bool {
-		cooldown, exists := account.runtime.Cooldowns[key]
-		return exists && cooldown.Active(now) && cooldown.Until.Sub(now) >= minRemaining
-	}
-	if long(globalCooldownKey) {
+	if longCooldownActive(account, globalCooldownKey, now, minRemaining) {
 		return true
 	}
-	playground := !p.channelEnabledLocked(ChannelPlayground) || long(modelID)
-	build := !p.channelEnabledLocked(ChannelBuild) || long(ChannelCooldownScope(ChannelBuild, modelID))
+	if modelID == "" {
+		return false
+	}
+	playground := !p.channelEnabledLocked(ChannelPlayground) || longCooldownActive(account, modelID, now, minRemaining)
+	build := !p.channelEnabledLocked(ChannelBuild) ||
+		longCooldownActive(account, ChannelCooldownScope(ChannelBuild, modelID), now, minRemaining)
 	return playground && build
+}
+
+// longCooldownActive 判断账户某个冷却键是否生效且剩余不少于 minRemaining
+func longCooldownActive(account *Account, key string, now time.Time, minRemaining time.Duration) bool {
+	cooldown, exists := account.runtime.Cooldowns[key]
+	return exists && cooldown.Active(now) && cooldown.Until.Sub(now) >= minRemaining
+}
+
+// AccountLongCooling 判断单个账户当前是否长时间不可用：全局冷却，或在该模型上所有启用通道都冷却，剩余不少于 minRemaining；
+// modelID 为空时只看全局冷却。模型按账户目录归一（与 MarkCooldownIfGeneration 写入的键一致）。
+// 账号刚进入每日限额时调度层用它判断该账号的驻留 Worker 是否已成死槽位
+func (p *AccountPool) AccountLongCooling(accountID string, modelID string, minRemaining time.Duration) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return false
+	}
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	if modelID != "" {
+		modelID = canonicalAccountModelID(account, modelID)
+	}
+	return p.longCoolingLocked(account, modelID, time.Now(), minRemaining)
+}
+
+// WarmWorkerState 为淘汰选号用的一个驻留 Worker 账户的调度状态
+type WarmWorkerState struct {
+	// Busy 为账户有进行中的请求、独占操作或认证续签，LastUsed 为最近使用时间
+	Busy     bool
+	LastUsed time.Time
+	// Cooling 为账户在该模型上（或全局）冷却中，不论剩余多久；Dead 为长时间不可用（全局冷却或该模型所有启用通道都冷却），
+	// 这样的 Worker 对该模型是死槽位
+	Cooling bool
+	Dead    bool
+}
+
+// WarmWorkerStates 一次加锁返回给定账户的调度状态，供淘汰选号使用：原先每个驻留 Worker 分别查询活动与冷却，
+// 一次选号要对账户池加锁上百次，账户池锁争用时持有全局调度锁的替换流程会被拖住很久。modelID 为空时只看全局冷却
+func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minRemaining time.Duration) map[string]WarmWorkerState {
+	states := make(map[string]WarmWorkerState, len(accountIDs))
+	if p == nil {
+		return states
+	}
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for _, accountID := range accountIDs {
+		account := p.byID[accountID]
+		if account == nil {
+			continue
+		}
+		_, cooling := accountCooldown(account, modelID, now)
+		states[accountID] = WarmWorkerState{
+			Busy:     account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0,
+			LastUsed: account.LastUsed,
+			Cooling:  cooling,
+			Dead:     p.longCoolingLocked(account, modelID, now, minRemaining),
+		}
+	}
+	return states
 }
 
 // cooldownModelID 从冷却键中取出模型：Playground 键即模型名，Build 键为 build:<模型>
@@ -359,10 +423,11 @@ func (p *AccountPool) LongCooldownModels(accountIDs []string, minRemaining time.
 	return counts
 }
 
-// LongCoolingSet 返回给定账户中在任一指定模型上长时间不可用的账户，一次加锁；idleOnly 时只返回没有进行中请求的
+// LongCoolingSet 返回给定账户中长时间不可用的账户，一次加锁：全局长时间冷却的账户总是计入，
+// 另外计入在任一指定模型上长时间不可用的账户（modelIDs 为空时只看全局冷却）；idleOnly 时只返回没有进行中请求的
 func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, minRemaining time.Duration, idleOnly bool) map[string]struct{} {
 	result := make(map[string]struct{})
-	if p == nil || len(modelIDs) == 0 {
+	if p == nil {
 		return result
 	}
 	p.mu.Lock()
@@ -376,6 +441,10 @@ func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, min
 		if idleOnly && (account.active > 0 || account.exclusive || account.exclusiveWaiters > 0) {
 			continue
 		}
+		if p.longCoolingLocked(account, "", now, minRemaining) {
+			result[accountID] = struct{}{}
+			continue
+		}
 		for _, modelID := range modelIDs {
 			if p.longCoolingLocked(account, modelID, now, minRemaining) {
 				result[accountID] = struct{}{}
@@ -386,9 +455,10 @@ func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, min
 	return result
 }
 
-// SpareAccounts 统计号池内可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型，
-// 并且没有在任一指定模型上长时间不可用，一次加锁
-func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration) int {
+// SpareAccounts 统计号池内可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型、没有全局长时间冷却，
+// 并且没有在任一指定模型上长时间不可用，一次加锁。数到 limit 个就停止（limit 不大于 0 时数完全部）：
+// 轮换与淘汰只需要知道“有没有 N 个可接替的账户”，账户上万时不必在锁内扫完全部
+func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, limit int) int {
 	if p == nil {
 		return 0
 	}
@@ -397,18 +467,21 @@ func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}
 	now := time.Now()
 	spare := 0
 	for _, account := range p.accounts {
+		if limit > 0 && spare >= limit {
+			break
+		}
 		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
 			continue
 		}
 		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModelsLocked(account)) == 0 {
 			continue
 		}
-		cooling := false
+		cooling := p.longCoolingLocked(account, "", now, minRemaining)
 		for _, modelID := range modelIDs {
-			if p.longCoolingLocked(account, modelID, now, minRemaining) {
-				cooling = true
+			if cooling {
 				break
 			}
+			cooling = p.longCoolingLocked(account, modelID, now, minRemaining)
 		}
 		if !cooling {
 			spare++

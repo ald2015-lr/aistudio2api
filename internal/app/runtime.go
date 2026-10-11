@@ -174,9 +174,16 @@ type accountWorkerManager struct {
 	dispatch        *dispatchQueue
 	victimMu        sync.Mutex
 	victims         map[string]struct{}
-	backgroundMu    sync.Mutex
-	background      context.Context
-	stopBackground  context.CancelFunc
+	// retirements 为账号进入长时间冷却、等待空闲后淘汰的驻留 Worker（见 worker_retire.go），retirePending 为其数量的无锁镜像；
+	// retireWake 唤醒淘汰循环（容量 1，重复唤醒合并）；afterRetire 在淘汰成功后补齐预热，由生成服务按运行状态设置
+	retireMu       sync.Mutex
+	retirements    map[string]*retirement
+	retirePending  atomic.Int32
+	retireWake     chan struct{}
+	afterRetire    atomic.Pointer[func()]
+	backgroundMu   sync.Mutex
+	background     context.Context
+	stopBackground context.CancelFunc
 	// startupSlots 限制同时冷启动的浏览器 Worker 数，容量随 warmConcurrency 热更新（见 startupSlots）
 	startupSlots startupSlots
 	// refresher 在 Worker 启动阶段确认登录失效时恢复认证；为空时只把账户标为需要登录
@@ -332,7 +339,7 @@ func newAccountWorkerManager(
 		globalProxy: globalProxy,
 		openings:    make(map[string]chan struct{}),
 		lifecycle:   lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
-		victims: make(map[string]struct{}),
+		victims: make(map[string]struct{}), retirements: make(map[string]*retirement), retireWake: make(chan struct{}, 1),
 	}
 	manager.initTimeout.Store(int64(initTimeout))
 	manager.warmTarget.Store(int64(warmTarget))
@@ -349,6 +356,7 @@ func newAccountWorkerManager(
 	}
 	go manager.forwardPoolChanges()
 	go manager.reapIdleWorkers()
+	go manager.retireLoop()
 	return manager
 }
 
@@ -505,7 +513,7 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 	return evicted
 }
 
-// forwardPoolChanges 在账户池租约或状态变化后唤醒排队请求
+// forwardPoolChanges 在账户池租约或状态变化后唤醒排队请求，并让待淘汰的冷却 Worker 在租约释放后被关闭
 func (manager *accountWorkerManager) forwardPoolChanges() {
 	for {
 		changed := manager.pool.Changed()
@@ -514,6 +522,7 @@ func (manager *accountWorkerManager) forwardPoolChanges() {
 			return
 		case <-changed:
 			manager.dispatch.wakeHeads()
+			manager.wakeRetire()
 		}
 	}
 }
@@ -1251,57 +1260,15 @@ func (manager *accountWorkerManager) victimReserved(accountID string) bool {
 	return reserved
 }
 
-// idleWarmVictimFor 在分区内选择空闲热 Worker，优先冷却中的账户，其次最久未用；coolingOnly 时只返回冷却中的账户。
-// 只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然
+// idleWarmVictimFor 在分区内选择空闲热 Worker：账号长时间冷却的死槽位优先，其次冷却中的账户，再次最久未用；
+// coolingOnly 时只返回冷却中的账户。只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然。
+// 候选的活动与冷却状态由账户池一次加锁给出（见 pickIdleVictim）
 func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID string, coolingOnly bool, partition aistudio.PoolScope) string {
-	warm := manager.warmAccountIDsIn(partition)
-	var selected string
-	var selectedUsed time.Time
-	selectedCooling := false
-	for _, accountID := range warm {
-		if accountID == excludeID || manager.victimReserved(accountID) {
-			continue
-		}
-		manager.mu.RLock()
-		account := manager.accounts[accountID]
-		manager.mu.RUnlock()
-		if account == nil {
-			continue
-		}
-		// 正在启动或替换 Worker 的账户不作为淘汰对象：启动流程持有该账户的 startupMu 之后还要拿 rebalanceMu，
-		// 而淘汰在持有 rebalanceMu 时要拿 startupMu，两边互相等待会让全局调度永久停住
-		if _, opening := manager.openingSet.Load(accountID); opening {
-			continue
-		}
-		if !account.startupMu.TryLock() {
-			continue
-		}
-		account.startupMu.Unlock()
-		// 锁被占用说明该账户的 Worker 正在关闭、发布或核对（WAA proof 在锁外生成，请求占用由下方的租约活动判断），
-		// 直接跳过而不是排队等待
-		if !account.mu.TryLock() {
-			continue
-		}
-		cleanupPending := accountWorkerCleanupPending(account)
-		account.mu.Unlock()
-		if cleanupPending {
-			continue
-		}
-		busy, lastUsed := manager.pool.Activity(accountID)
-		if busy {
-			continue
-		}
-		cooling := manager.pool.AccountCoolingDown(accountID, modelID)
-		if coolingOnly && !cooling {
-			continue
-		}
-		if selected == "" || cooling && !selectedCooling || cooling == selectedCooling && lastUsed.Before(selectedUsed) {
-			selected = accountID
-			selectedUsed = lastUsed
-			selectedCooling = cooling
-		}
+	mode := victimAny
+	if coolingOnly {
+		mode = victimCooling
 	}
-	return selected
+	return manager.pickIdleVictim(excludeID, modelID, mode, partition)
 }
 
 func (manager *accountWorkerManager) evictIdleWorker(ctx context.Context, accountID string) (bool, error) {
@@ -2212,6 +2179,11 @@ func newTrackedService(
 		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(),
 	}
 	tracked.timeout.Store(int64(timeout))
+	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断
+	if workers != nil {
+		refill := tracked.prewarmIfRunning
+		workers.afterRetire.Store(&refill)
+	}
 	return tracked
 }
 
@@ -3243,6 +3215,19 @@ func (service *trackedService) acquireLease(
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)
+		// 没有热 Worker 能服务该模型、备用账户所在的分区又已满，而分区里有对该模型是死槽位的空闲 Worker
+		// （账号长时间冷却，见 worker_retire.go）时，先现场回收一个再重新选号：不等冷却轮换，也不先冷启动替代 Worker
+		// 再等旧 Worker 让位；每轮最多回收一个。还有热 Worker 在忙时不在请求路径上关闭浏览器，交给后台扩容与冷却登记处理
+		if len(groups.StandbyReady) > 0 && warmCandidates == 0 && !fixedAccount && !immediate {
+			if victim, partition := capacity.reclaimDead(ctx, groups.StandbyReady); victim != "" {
+				if requestID := aistudio.TraceFromContext(ctx).RequestID(); requestID != "" {
+					service.requests.logRequestProgress(requestID, "service", "INFO", fmt.Sprintf(
+						"回收冷却占位的 %s，让备用账号启动 | 账号=%s", workerSlotName(partition), victim,
+					))
+				}
+				continue
+			}
+		}
 		// 不等待的选号不做后台扩容再排队，直接按下面的现场启动处理：分区有空槽时现场冷启动，否则返回没有立即可用的账号
 		if len(groups.StandbyReady) > 0 && warmCandidates > 0 && !fixedAccount && !immediate {
 			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
@@ -4058,6 +4043,9 @@ func (service *trackedService) applyQuotaCooldown(
 	); stateErr != nil {
 		return cooldown, true, stateErr
 	}
+	// 账号进入长时间冷却后它的驻留 Worker 成了死槽位：空闲时立即淘汰，忙碌时等请求释放租约后淘汰（见 worker_retire.go）；
+	// 放在函数结束时判断，按模型的冷却要等另一通道同步冷却后才知道是否所有启用通道都已冷却
+	defer service.retireCooledWorker(accountID, modelID, cooldown)
 	suffix := ""
 	if note != "" {
 		suffix = " | " + note
