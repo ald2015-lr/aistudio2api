@@ -3,6 +3,7 @@ package aistudio
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -161,18 +162,13 @@ func (p *AccountPool) PoolOf(accountID string) PoolScope {
 
 // UltraAccountIDs 一次加锁返回当前属于 Ultra 号池的账户，供 Worker 分区计数
 func (p *AccountPool) UltraAccountIDs() map[string]struct{} {
-	ultra := make(map[string]struct{})
 	if p == nil {
-		return ultra
+		return make(map[string]struct{})
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for _, account := range p.accounts {
-		if account != nil && account.BenefitTier == BenefitTierUltra {
-			ultra[account.ID] = struct{}{}
-		}
-	}
-	return ultra
+	// 账户池随权益变化维护 Ultra 账户集合（见 accountChangedLocked），每次请求的分区判断不再扫描全部账户
+	return maps.Clone(p.ultraAccounts)
 }
 
 // CanonicalModelIDIn 与 CanonicalModelID 相同，但只在号池内的账户目录中解析别名
@@ -183,24 +179,15 @@ func (p *AccountPool) CanonicalModelIDIn(scope PoolScope, modelID string) string
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	canonical := ""
-	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
-			continue
-		}
-		for _, model := range account.Models {
-			if model.ID == trimmed {
-				return modelID
-			}
-			if canonical == "" && modelMatchesID(model, trimmed) {
-				canonical = model.ID
-			}
-		}
-	}
-	if canonical == "" {
+	// 号池内任一账户目录有同名正式模型时原样返回，否则取按账户顺序第一个带该别名的模型；解析表按目录版本缓存
+	index := p.canonicalIndexLocked(scope)
+	if _, exists := index.primary[trimmed]; exists {
 		return modelID
 	}
-	return canonical
+	if canonical, exists := index.alias[trimmed]; exists {
+		return canonical
+	}
+	return modelID
 }
 
 // EligibleModelsIn 与 EligibleModels 相同，但只计号池内的启用账户：/ultra 的模型列表只列 Ultra 号池账户可用的模型
@@ -217,20 +204,21 @@ func (p *AccountPool) EligibleModelsIn(scope PoolScope, models []Model) []Model 
 	return eligible
 }
 
-// EnabledAccountsIn 与 EnabledAccounts 相同，但只统计号池内的账户
+// EnabledAccountsIn 与 EnabledAccounts 相同，但只统计号池内的账户。按候选索引的紧凑数组扫描（每个请求都要算一次换号上限）
 func (p *AccountPool) EnabledAccountsIn(scope PoolScope) ([]string, int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
-	ids := make([]string, 0, len(p.accounts))
+	index := p.schedulingLocked()
+	nowNanos := time.Now().UnixNano()
+	ids := make([]string, 0, len(index.ids))
 	schedulable := 0
-	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || !scope.allows(account) {
+	for position := range index.ids {
+		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {
 			continue
 		}
-		ids = append(ids, account.ID)
-		_, cooling := accountCooldown(account, "", now)
-		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0 || account.State == AccountReady && !cooling {
+		ids = append(ids, index.ids[position])
+		if index.blocked[position] || index.active[position] > 0 ||
+			index.state[position] == AccountReady && index.globalUntil[position] <= nowNanos {
 			schedulable++
 		}
 	}
@@ -241,13 +229,14 @@ func (p *AccountPool) EnabledAccountsIn(scope PoolScope) ([]string, int) {
 func (p *AccountPool) attemptCandidatesIn(scope PoolScope) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
+	index := p.schedulingLocked()
+	nowNanos := time.Now().UnixNano()
 	eligible := 0
-	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || !scope.allows(account) {
+	for position := range index.ids {
+		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {
 			continue
 		}
-		if state := accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
+		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {
 			eligible++
 		}
 	}

@@ -37,6 +37,9 @@ func (p *AccountPool) SetUpstreamChannels(channels []Channel) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.channels = append([]Channel(nil), channels...)
+	// 通道顺序决定每个候选集的通道与冷却键，整个候选索引重建
+	p.eligibilityVersion++
+	p.invalidateSchedulingLocked()
 	p.notifyLocked()
 }
 
@@ -49,6 +52,8 @@ func (p *AccountPool) SetBuildCatalog(accountID string, models []Model) error {
 		return ErrAccountNotFound
 	}
 	account.buildModels = cloneAccountModels(models)
+	p.eligibilityVersion++
+	p.accountChangedLocked(account)
 	p.notifyLocked()
 	return nil
 }
@@ -321,11 +326,17 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string, scope P
 	return false
 }
 
-// modelChannelsInLocked 返回号池内至少一个启用账户可以调用模型的通道
+// modelChannelsInLocked 返回号池内至少一个启用账户可以调用模型的通道。结果按目录版本记忆（见 pool_catalog_cache.go）：
+// 目录列表每个模型都要算一次，没有账户支持的模型（如 Ultra 号池列普通目录）要扫完全部账户
 func (p *AccountPool) modelChannelsInLocked(model Model, scope PoolScope) []string {
 	selection := AccountSelection{ModelID: model.ID}
 	if hasMethod(model, "generateContent") {
 		selection.Method = "generateContent"
+	}
+	memo := p.modelChannelsMemoLocked(scope)
+	key := model.ID + "\x00" + selection.Method
+	if channels, done := memo.channels[key]; done {
+		return slices.Clone(channels)
 	}
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {
@@ -336,7 +347,8 @@ func (p *AccountPool) modelChannelsInLocked(model Model, scope PoolScope) []stri
 			}
 		}
 	}
-	return channels
+	memo.channels[key] = channels
+	return slices.Clone(channels)
 }
 
 // AccountChannelAvailable 返回账户是否还有支持选择且未冷却的通道

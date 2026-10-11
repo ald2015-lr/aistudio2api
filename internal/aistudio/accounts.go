@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -254,6 +255,20 @@ type Account struct {
 	modelIndexSource    []Model
 	buildGenerates      map[string]struct{}
 	buildGenerateSource []Model
+	// position 为账户在账户池 accounts 中的下标，候选索引按它存放成员状态，账户增删后由索引重建时重新赋值。
+	// 以下目录派生缓存（预热模型、可生成模型数、排序后的模型 ID、目录内容键）按目录切片身份与权益判断是否重算。
+	// 均受账户池 mu 保护
+	position           int
+	bootstrapModels    []string
+	bootstrapSource    []Model
+	bootstrapTier      BenefitTier
+	warmCoverage       int
+	warmCoverageSource []Model
+	warmCoverageTier   BenefitTier
+	statusModels       []string
+	statusModelsSource []Model
+	catalogKey         uint64
+	catalogKeySource   []Model
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -358,6 +373,18 @@ type AccountPool struct {
 	accountsVersion      uint64
 	sortedIndices        []int
 	sortedIndicesVersion uint64
+	// sched 为候选索引（见 scheduling_index.go），nil 表示下次调度时重建；eligibilityVersion 在影响"号池内哪些账户
+	// 支持哪些模型"的变化时递增（账户增删、目录或权益变化、启用状态、Build 目录、上游通道），按版本缓存的目录汇总、
+	// 别名解析与模型通道（见 pool_catalog_cache.go）在版本变化后重建；ultraAccounts 为当前权益为 Ultra 的账户。
+	// statusCache 为账户多时缓存的状态列表
+	sched              *schedulingIndex
+	eligibilityVersion uint64
+	catalogSummaries   map[PoolScope]*catalogSummary
+	canonicalIndexes   map[PoolScope]*canonicalIndex
+	modelChannelsMemos map[PoolScope]*modelChannelsMemo
+	ultraAccounts      map[string]struct{}
+	statusCache        []AccountStatus
+	statusCacheAt      time.Time
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -839,10 +866,16 @@ func NewAccountPool(accounts []*Account, perAccountConcurrency int) *AccountPool
 		accounts: append([]*Account(nil), accounts...), byID: make(map[string]*Account, len(accounts)),
 		resources: make(map[string]string), perAccountConcurrency: perAccountConcurrency, changed: make(chan struct{}),
 		routingStrategy: "round-robin", lastPicked: make(map[string]string), lastPickedChannel: make(map[string]Channel),
+		catalogSummaries: make(map[PoolScope]*catalogSummary), canonicalIndexes: make(map[PoolScope]*canonicalIndex),
+		modelChannelsMemos: make(map[PoolScope]*modelChannelsMemo), ultraAccounts: make(map[string]struct{}),
 	}
-	for _, account := range p.accounts {
+	for position, account := range p.accounts {
 		if account == nil {
 			continue
+		}
+		account.position = position
+		if account.BenefitTier == BenefitTierUltra {
+			p.ultraAccounts[account.ID] = struct{}{}
 		}
 		if account.runtime.Cooldowns == nil {
 			account.runtime.Cooldowns = make(map[string]CooldownState)
@@ -942,6 +975,9 @@ func (p *AccountPool) Add(account *Account) (resultErr error) {
 	p.byID[account.ID] = account
 	p.catalogVersion++
 	p.accountsVersion++
+	p.eligibilityVersion++
+	p.indexAccountAddedLocked(account)
+	p.invalidateStatusLocked()
 	for resourceID := range account.runtime.Resources {
 		p.resources[resourceID] = account.ID
 	}
@@ -970,12 +1006,14 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		return nil, fmt.Errorf("账户目录删除函数为空")
 	}
 	account.exclusive = true
+	p.busyChangedLocked(account)
 	p.notifyLocked()
 	p.mu.Unlock()
 	leaseLock, _, err := acquireAccountFileLease(account.StoragePath)
 	if err != nil {
 		p.mu.Lock()
 		account.exclusive = false
+		p.busyChangedLocked(account)
 		p.notifyLocked()
 		p.mu.Unlock()
 		if errors.Is(err, errAccountLeaseBusy) {
@@ -992,6 +1030,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		}
 		p.mu.Lock()
 		account.exclusive = false
+		p.busyChangedLocked(account)
 		p.notifyLocked()
 		p.mu.Unlock()
 		return nil, err
@@ -1014,6 +1053,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 	if deleteErr != nil {
 		p.mu.Lock()
 		account.exclusive = false
+		p.busyChangedLocked(account)
 		p.notifyLocked()
 		p.mu.Unlock()
 		return nil, errors.Join(deleteErr, releaseErr)
@@ -1025,6 +1065,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		}
 	}
 	delete(p.byID, accountID)
+	delete(p.ultraAccounts, accountID)
 	for index, candidate := range p.accounts {
 		if candidate != nil && candidate.ID == accountID {
 			p.accounts = append(p.accounts[:index], p.accounts[index+1:]...)
@@ -1033,6 +1074,10 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 			break
 		}
 	}
+	// 后续账户的下标都变了，候选索引整体重建
+	p.eligibilityVersion++
+	p.invalidateSchedulingLocked()
+	p.invalidateStatusLocked()
 	p.notifyLocked()
 	p.mu.Unlock()
 	return account, releaseErr
@@ -1056,11 +1101,13 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
 	}
 	waitingAccount.exclusiveWaiters++
+	p.busyChangedLocked(waitingAccount)
 	p.notifyLocked()
 	p.mu.Unlock()
 	defer func() {
 		p.mu.Lock()
 		waitingAccount.exclusiveWaiters--
+		p.busyChangedLocked(waitingAccount)
 		p.notifyLocked()
 		p.mu.Unlock()
 	}()
@@ -1081,6 +1128,7 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 				account.exclusive = true
 				account.leaseLock = leaseLock
 				account.leasePath = leasePath
+				p.busyChangedLocked(account)
 				p.mu.Unlock()
 				lease := &AccountLease{
 					pool: p, account: account, exclusive: true, authGeneration: account.authGeneration,
@@ -1411,6 +1459,7 @@ func (p *AccountPool) markStaleAccountUnavailable(account *Account) {
 			}
 		}
 		clear(account.runtime.Resources)
+		p.accountChangedLocked(account)
 		p.notifyLocked()
 	}
 }
@@ -1536,6 +1585,7 @@ func (p *AccountPool) markAuthenticationLocked(
 		return false
 	}
 	account.authCheckedAt = checkedAt
+	previous := account.State
 	if !account.Config.Enabled {
 		account.State = AccountDisabled
 	} else if required {
@@ -1547,6 +1597,9 @@ func (p *AccountPool) markAuthenticationLocked(
 		account.stateMessage = strings.TrimSpace(reason)
 	} else if account.State == AccountReady {
 		account.stateMessage = ""
+	}
+	if account.State != previous {
+		p.accountChangedLocked(account)
 	}
 	p.notifyLocked()
 	return true
@@ -1723,6 +1776,7 @@ func (l *AccountLease) BeginAuthRefresh() (func(), bool) {
 		return nil, false
 	}
 	l.account.authRefreshers++
+	l.pool.busyChangedLocked(l.account)
 	l.pool.notifyLocked()
 	l.pool.mu.Unlock()
 	var once sync.Once
@@ -1732,6 +1786,7 @@ func (l *AccountLease) BeginAuthRefresh() (func(), bool) {
 			if l.account.authRefreshers > 0 {
 				l.account.authRefreshers--
 			}
+			l.pool.busyChangedLocked(l.account)
 			l.pool.notifyLocked()
 			l.pool.mu.Unlock()
 		})
@@ -1763,6 +1818,9 @@ func (l *AccountLease) SaveConfig(value AccountConfig) error {
 		l.account.State = initialAccountState(value, l.account.StorageState)
 		l.account.stateMessage = ""
 	}
+	// 启用状态影响模型可用通道的统计与候选资格
+	l.pool.eligibilityVersion++
+	l.pool.accountChangedLocked(l.account)
 	l.pool.notifyLocked()
 	l.pool.mu.Unlock()
 	return nil
@@ -1952,6 +2010,7 @@ func (l *AccountLease) Release() error {
 		} else if l.account.active > 0 {
 			l.account.active--
 		}
+		l.pool.busyChangedLocked(l.account)
 		if l.account.active == 0 && !l.account.exclusive && l.account.authRefreshers == 0 && l.account.leaseLock != nil {
 			if err := l.account.leaseLock.Unlock(); err != nil {
 				l.err = err
@@ -1998,12 +2057,18 @@ func (p *AccountPool) SetCatalog(accountID string, tier BenefitTier, models []Mo
 			}
 			account.BenefitTier = tier
 			account.Models = cloneAccountModels(models)
+			setCatalogKeyLocked(account, fingerprint)
 			p.catalogVersion++
+			if firstCatalog || tierChanged || catalogChanged {
+				// 目录内容或权益确实变了才让按版本缓存的目录派生结果重建；目录同步大多数时候返回相同内容
+				p.eligibilityVersion++
+			}
 			account.initializedAt = time.Now()
 			if account.State == AccountUnavailable {
 				account.State = AccountReady
 				account.stateMessage = ""
 			}
+			p.accountChangedLocked(account)
 		}, nil
 	})
 	if err != nil {
@@ -2188,12 +2253,7 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 		if account == nil {
 			continue
 		}
-		coverage := 0
-		for _, model := range account.Models {
-			if account.SupportsMethod(model.ID, "generateContent") {
-				coverage++
-			}
-		}
+		coverage := accountWarmCoverageLocked(account)
 		priority := benefitTierPriority(account.BenefitTier)
 		groups[priority] = append(groups[priority], warmCandidate{id: accountID, coverage: coverage})
 	}
@@ -2471,14 +2531,23 @@ func (p *AccountPool) Status() []AccountStatus {
 		return nil
 	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	now := time.Now()
+	if cached, ok := p.cachedStatusLocked(now); ok {
+		p.mu.Unlock()
+		return cloneStatuses(cached)
+	}
 	statuses := make([]AccountStatus, 0, len(p.accounts))
 	for _, account := range p.accounts {
 		if account == nil {
 			continue
 		}
 		statuses = append(statuses, accountStatusLocked(account, now))
+	}
+	p.storeStatusLocked(statuses, now)
+	shared := p.statusCache != nil
+	p.mu.Unlock()
+	if shared {
+		return cloneStatuses(statuses)
 	}
 	return statuses
 }
@@ -2501,11 +2570,7 @@ func accountStateLocked(account *Account, now time.Time) AccountState {
 
 // accountStatusLocked 构建单个账户的状态；调用方持有 p.mu
 func accountStatusLocked(account *Account, now time.Time) AccountStatus {
-	models := make([]string, 0, len(account.Models))
-	for _, model := range account.Models {
-		models = append(models, model.ID)
-	}
-	sort.Strings(models)
+	models := accountStatusModelsLocked(account)
 	status := AccountStatus{
 		ID:          account.ID,
 		Label:       account.Config.Label,
@@ -2564,77 +2629,138 @@ func (p *AccountPool) ClassifyCandidates(
 	return AccountCandidateGroups{}, ErrNoEligibleAccount
 }
 
+// classifyCandidatesLocked 按候选索引分类候选账户（见 scheduling_index.go）；调用方持有 p.mu
 func (p *AccountPool) classifyCandidatesLocked(
 	selection AccountSelection,
 	warmAccountIDs []string,
 ) (AccountCandidateGroups, error) {
-	modelID := selection.ModelID
-	if modelID != "" {
-		if !p.hasModelCatalogLocked(selection.Pool) {
-			return AccountCandidateGroups{}, p.catalogMissingErrorLocked(selection.Pool)
-		}
-		if !p.hasModelLocked(modelID, selection.Pool) {
-			return AccountCandidateGroups{}, fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
-		}
-		if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method, selection.Pool) {
-			return AccountCandidateGroups{}, fmt.Errorf("%w: 模型 %s 不支持 %s", ErrModelNotFound, modelID, selection.Method)
-		}
-	}
-	indices, err := p.selectionIndicesLocked(selection)
-	if err != nil {
+	return p.classifyCandidatesAtLocked(selection, warmAccountIDs, time.Now())
+}
+
+// classifyCandidatesAtLocked 按 now 时刻分类候选账户：限定账户或资源的选择只涉及一个账户，直接按该账户判断；
+// 其余选择用候选集，限定账户集合时只看集合内的账户。结果与 classifyCandidatesBruteLocked 相同
+func (p *AccountPool) classifyCandidatesAtLocked(
+	selection AccountSelection,
+	warmAccountIDs []string,
+	now time.Time,
+) (AccountCandidateGroups, error) {
+	if err := p.validateCandidateSelectionLocked(selection); err != nil {
 		return AccountCandidateGroups{}, err
 	}
+	if strings.TrimSpace(selection.AccountID) != "" || selection.ResourceID != "" {
+		indices, err := p.selectionIndicesLocked(selection)
+		if err != nil {
+			return AccountCandidateGroups{}, err
+		}
+		groups := AccountCandidateGroups{}
+		warm := warmAccountSet(warmAccountIDs)
+		channels := p.selectionChannelsLocked(selection)
+		for _, index := range indices {
+			p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now)
+		}
+		return groups, nil
+	}
+	set := p.candidateSetLocked(selection, now)
+	if selection.AllowedAccountIDs != nil {
+		allowed := make(map[string]struct{}, len(selection.AllowedAccountIDs))
+		for _, accountID := range selection.AllowedAccountIDs {
+			if accountID = strings.TrimSpace(accountID); accountID != "" {
+				allowed[accountID] = struct{}{}
+			}
+		}
+		return p.classifyAllowedLocked(set, allowed, warmAccountIDs, now), nil
+	}
+	return p.classifyIndexedLocked(set, warmAccountIDs, now), nil
+}
+
+// validateCandidateSelectionLocked 检查号池内存在请求的模型与方法；调用方持有 p.mu，ModelID 已去掉前缀
+func (p *AccountPool) validateCandidateSelectionLocked(selection AccountSelection) error {
+	modelID := selection.ModelID
+	if modelID == "" {
+		return nil
+	}
+	if !p.hasModelCatalogLocked(selection.Pool) {
+		return p.catalogMissingErrorLocked(selection.Pool)
+	}
+	if !p.hasModelLocked(modelID, selection.Pool) {
+		return fmt.Errorf("%w: %s", ErrModelNotFound, modelID)
+	}
+	if selection.Method != "" && !p.hasModelMethodLocked(modelID, selection.Method, selection.Pool) {
+		return fmt.Errorf("%w: 模型 %s 不支持 %s", ErrModelNotFound, modelID, selection.Method)
+	}
+	return nil
+}
+
+func warmAccountSet(warmAccountIDs []string) map[string]struct{} {
 	warm := make(map[string]struct{}, len(warmAccountIDs))
 	for _, accountID := range warmAccountIDs {
 		if accountID = strings.TrimSpace(accountID); accountID != "" {
 			warm[accountID] = struct{}{}
 		}
 	}
-	now := time.Now()
+	return warm
+}
+
+// classifyCandidatesBruteLocked 为逐个账户判断的参考实现：遍历选择范围内的全部账户，每个账户判断启用、就绪、
+// 各通道支持与冷却后按忙闲分组。只供测试核对候选索引的结果，请求路径不再使用
+func (p *AccountPool) classifyCandidatesBruteLocked(
+	selection AccountSelection,
+	warmAccountIDs []string,
+	now time.Time,
+) (AccountCandidateGroups, error) {
+	if err := p.validateCandidateSelectionLocked(selection); err != nil {
+		return AccountCandidateGroups{}, err
+	}
+	indices, err := p.selectionIndicesBruteLocked(selection)
+	if err != nil {
+		return AccountCandidateGroups{}, err
+	}
+	warm := warmAccountSet(warmAccountIDs)
 	groups := AccountCandidateGroups{}
 	channels := p.selectionChannelsLocked(selection)
 	for _, index := range indices {
-		account := p.accounts[index]
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
-			continue
-		}
-		// 每个账户只判断一次各通道是否支持，结果同时用于资格与冷却判断（原先两处各判断一遍）。
-		// 这段在账户池锁内对全部账户执行，每个请求至少一次
-		var supportedBuffer [4]Channel
-		supported := supportedBuffer[:0]
-		for _, channel := range channels {
-			if p.channelSupportsLocked(account, channel, selection) {
-				supported = append(supported, channel)
-			}
-		}
-		if modelID != "" && len(supported) == 0 {
-			continue
-		}
-		groups.Eligible = true
-		if until, active := accountChannelsCooldown(account, supported, selection, now); active {
-			if groups.EarliestCooldown.IsZero() || until.Before(groups.EarliestCooldown) {
-				groups.EarliestCooldown = until
-			}
-			continue
-		}
-		_, isWarm := warm[account.ID]
-		switch {
-		case isWarm && !account.exclusive && account.exclusiveWaiters == 0 && account.authRefreshers == 0 && account.active == 0:
-			groups.WarmReady = append(groups.WarmReady, account.ID)
-		case isWarm && !account.exclusive && account.exclusiveWaiters == 0 && account.authRefreshers == 0 && account.active < p.perAccountConcurrency:
-			groups.WarmAvailable = append(groups.WarmAvailable, account.ID)
-		case isWarm:
-			groups.WarmBusy = append(groups.WarmBusy, account.ID)
-		case account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0:
-			groups.StandbyBusy = append(groups.StandbyBusy, account.ID)
-		default:
-			groups.StandbyReady = append(groups.StandbyReady, account.ID)
-		}
+		p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now)
 	}
 	return groups, nil
 }
 
+// classifyAccountBruteLocked 逐项判断一个账户并分组：启用、就绪、至少一个通道支持，再看支持通道是否都在冷却
+func (p *AccountPool) classifyAccountBruteLocked(
+	groups *AccountCandidateGroups,
+	account *Account,
+	selection AccountSelection,
+	channels []Channel,
+	warm map[string]struct{},
+	now time.Time,
+) {
+	if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		return
+	}
+	// 每个账户只判断一次各通道是否支持，结果同时用于资格与冷却判断
+	var supportedBuffer [4]Channel
+	supported := supportedBuffer[:0]
+	for _, channel := range channels {
+		if p.channelSupportsLocked(account, channel, selection) {
+			supported = append(supported, channel)
+		}
+	}
+	if selection.ModelID != "" && len(supported) == 0 {
+		return
+	}
+	groups.Eligible = true
+	if until, active := accountChannelsCooldown(account, supported, selection, now); active {
+		if groups.EarliestCooldown.IsZero() || until.Before(groups.EarliestCooldown) {
+			groups.EarliestCooldown = until
+		}
+		return
+	}
+	classifyCandidate(groups, account, warm, p.perAccountConcurrency)
+}
+
 func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
+	if strings.TrimSpace(selection.AccountID) == "" && selection.ResourceID == "" && selection.AllowedAccountIDs == nil {
+		return p.tryAcquireIndexedLocked(selection, now)
+	}
 	indices, err := p.selectionIndicesLocked(selection)
 	if err != nil {
 		return nil, time.Time{}, false, err
@@ -2650,96 +2776,165 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 			continue
 		}
 		waitable = true
-		if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
-			continue
+		lease, err := p.leaseCandidateLocked(account, candidate.channel, selection, now, &earliest)
+		if lease != nil || err != nil {
+			return lease, time.Time{}, true, err
 		}
-		if selection.ResourceID == "" {
-			if cooldown, active := accountCooldown(account, ChannelCooldownScope(candidate.channel, selectionAccessScope(selection)), now); active {
-				if earliest.IsZero() || cooldown.Until.Before(earliest) {
-					earliest = cooldown.Until
-				}
-				continue
-			}
-		}
-		refreshRuntime := false
-		if account.active == 0 {
-			leaseLock, leasePath, err := acquireAccountFileLease(account.StoragePath)
-			if errors.Is(err, errAccountLeaseBusy) {
-				pollAt := now.Add(externalLeasePoll)
-				if earliest.IsZero() || pollAt.Before(earliest) {
-					earliest = pollAt
-				}
-				continue
-			}
-			if err != nil {
-				return nil, time.Time{}, false, err
-			}
-			account.leaseLock = leaseLock
-			account.leasePath = leasePath
-			refreshRuntime = leaseLock != nil
-		}
-		account.active++
-		account.LastUsed = now
-		p.lastPicked[selectionAccessScope(selection)] = account.ID
-		p.lastPickedChannel[selectionAccessScope(selection)] = candidate.channel
-		return &AccountLease{
-			pool: p, account: account, authGeneration: account.authGeneration,
-			modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
-			channel: candidate.channel,
-		}, time.Time{}, true, nil
 	}
 	return nil, earliest, waitable, nil
 }
 
-func (p *AccountPool) hasModelLocked(modelID string, scope PoolScope) bool {
-	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
-			continue
+// leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却或文件租约被其他进程占用时
+// 返回 nil 并把冷却恢复或轮询时间并入 earliest；调用方持有 p.mu
+func (p *AccountPool) leaseCandidateLocked(
+	account *Account, channel Channel, selection AccountSelection, now time.Time, earliest *time.Time,
+) (*AccountLease, error) {
+	if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
+		return nil, nil
+	}
+	if selection.ResourceID == "" {
+		if cooldown, active := accountCooldown(account, ChannelCooldownScope(channel, selectionAccessScope(selection)), now); active {
+			if earliest.IsZero() || cooldown.Until.Before(*earliest) {
+				*earliest = cooldown.Until
+			}
+			return nil, nil
 		}
-		for _, model := range account.Models {
-			if modelMatchesID(model, modelID) {
-				return true
+	}
+	refreshRuntime := false
+	if account.active == 0 {
+		leaseLock, leasePath, err := acquireAccountFileLease(account.StoragePath)
+		if errors.Is(err, errAccountLeaseBusy) {
+			pollAt := now.Add(externalLeasePoll)
+			if earliest.IsZero() || pollAt.Before(*earliest) {
+				*earliest = pollAt
+			}
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		account.leaseLock = leaseLock
+		account.leasePath = leasePath
+		refreshRuntime = leaseLock != nil
+	}
+	account.active++
+	p.busyChangedLocked(account)
+	account.LastUsed = now
+	p.lastPicked[selectionAccessScope(selection)] = account.ID
+	p.lastPickedChannel[selectionAccessScope(selection)] = channel
+	return &AccountLease{
+		pool: p, account: account, authGeneration: account.authGeneration,
+		modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
+		channel: channel,
+	}, nil
+}
+
+// tryAcquireIndexedLocked 为不限账户的选择在候选集中取租约：只遍历未冷却的候选，账户与通道顺序和
+// channelCandidatesLocked 相同（按账户 ID 轮询，上次选中账户在上次通道之后的通道排在最前）。
+// 全部通道都在冷却的候选不再逐个检查，最早恢复时间取自冷却堆（含忙碌账户，等待方至多提前醒来复查一次）
+func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
+	set := p.candidateSetLocked(selection, now)
+	set.expireLocked(p, now.UnixNano())
+	waitable := set.members > 0
+	var earliest time.Time
+	if until, cooling := set.earliestCoolingLocked(); cooling {
+		earliest = time.Unix(0, until).UTC()
+	}
+	channels := p.selectionChannelsLocked(selection)
+	preferPlayground := selection.PreferPlayground && len(channels) > 1 && slices.Contains(channels, ChannelPlayground)
+	if preferPlayground && channels[0] != ChannelPlayground {
+		ordered := make([]Channel, 0, len(channels))
+		ordered = append(ordered, ChannelPlayground)
+		for _, channel := range channels {
+			if channel != ChannelPlayground {
+				ordered = append(ordered, channel)
 			}
 		}
+		channels = ordered
+	}
+	rank := func(channel Channel) int { return slices.Index(channels, channel) }
+	available := set.available
+	start := set.rotationStartLocked(p)
+	lastPosition := -1
+	var lastChannel Channel
+	if p.routingStrategy == "round-robin" && !preferPlayground {
+		key := selectionAccessScope(selection)
+		if lastChannel = p.lastPickedChannel[key]; lastChannel != "" {
+			if at := set.availableSearchLocked(p, p.lastPicked[key]); at < len(available) && p.accounts[available[at]].ID == p.lastPicked[key] {
+				lastPosition = available[at]
+			}
+		}
+	}
+	try := func(position int, channel Channel) (*AccountLease, error) {
+		account := p.accounts[position]
+		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+			return nil, nil
+		}
+		if selection.ModelID != "" && !p.channelSupportsLocked(account, channel, selection) {
+			return nil, nil
+		}
+		return p.leaseCandidateLocked(account, channel, selection, now, &earliest)
+	}
+	if lastPosition >= 0 {
+		for _, channel := range channels {
+			if rank(channel) > rank(lastChannel) {
+				if lease, err := try(lastPosition, channel); lease != nil || err != nil {
+					return lease, time.Time{}, true, err
+				}
+			}
+		}
+	}
+	for offset := range available {
+		position := available[(start+offset)%len(available)]
+		if position == lastPosition {
+			continue
+		}
+		for _, channel := range channels {
+			if lease, err := try(position, channel); lease != nil || err != nil {
+				return lease, time.Time{}, true, err
+			}
+		}
+	}
+	if lastPosition >= 0 {
+		for _, channel := range channels {
+			if rank(channel) <= rank(lastChannel) {
+				if lease, err := try(lastPosition, channel); lease != nil || err != nil {
+					return lease, time.Time{}, true, err
+				}
+			}
+		}
+	}
+	return nil, earliest, waitable, nil
+}
+
+// hasModelLocked 等按号池目录汇总判断模型存在性（见 pool_catalog_cache.go），原先每次扫描全部账户的全部模型
+func (p *AccountPool) hasModelLocked(modelID string, scope PoolScope) bool {
+	if _, exists := p.catalogSummaryLocked(scope).models[modelID]; exists {
+		return true
 	}
 	return p.hasBuildModelLocked(modelID, "", scope)
 }
 
 func (p *AccountPool) hasModelCatalogLocked(scope PoolScope) bool {
-	for _, account := range p.accounts {
-		if account != nil && len(account.Models) > 0 && scope.allows(account) {
-			return true
-		}
-	}
-	return false
+	return p.catalogSummaryLocked(scope).accounts > 0
 }
 
 func (p *AccountPool) hasModelMethodLocked(modelID string, method string, scope PoolScope) bool {
-	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
-			continue
-		}
-		for _, model := range account.Models {
-			if modelMatchesID(model, modelID) && hasMethod(model, method) {
-				return true
-			}
+	if entry := p.catalogSummaryLocked(scope).models[modelID]; entry != nil {
+		if _, exists := entry.methods[method]; exists {
+			return true
 		}
 	}
 	return p.hasBuildModelLocked(modelID, method, scope)
 }
 
 func (p *AccountPool) hasModelCapabilityLocked(modelID string, capability string, scope PoolScope) bool {
-	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
-			continue
-		}
-		for _, model := range account.Models {
-			if modelMatchesID(model, modelID) && model.Capabilities[capability] {
-				return true
-			}
-		}
+	entry := p.catalogSummaryLocked(scope).models[modelID]
+	if entry == nil {
+		return false
 	}
-	return false
+	_, exists := entry.capabilities[capability]
+	return exists
 }
 
 // BootstrapModels 返回账户实时目录中的 WAA 初始化模型
@@ -2750,11 +2945,11 @@ func (p *AccountPool) BootstrapModels(accountID string) ([]string, error) {
 	if account == nil {
 		return nil, fmt.Errorf("账户不存在: %s", accountID)
 	}
-	models := accountBootstrapModels(account)
+	models := accountBootstrapModelsLocked(account)
 	if len(models) == 0 {
 		return nil, fmt.Errorf("账户 %s 的实时目录没有可用 WAA 初始化模型", account.ID)
 	}
-	return models, nil
+	return slices.Clone(models), nil
 }
 
 // BootstrapModel 返回账户使用的通用 WAA 初始化模型
@@ -2765,39 +2960,11 @@ func (p *AccountPool) BootstrapModel(accountID string) (string, error) {
 	if account == nil {
 		return "", fmt.Errorf("账户不存在: %s", accountID)
 	}
-	models := accountBootstrapModels(account)
+	models := accountBootstrapModelsLocked(account)
 	if len(models) > 0 {
 		return models[0], nil
 	}
 	return "", fmt.Errorf("账户 %s 的实时目录没有可用 WAA 初始化模型", account.ID)
-}
-
-func accountBootstrapModels(account *Account) []string {
-	models := make([]string, 0, len(account.Models))
-	seen := make(map[string]struct{}, len(account.Models))
-	appendModel := func(modelID string) {
-		if _, exists := seen[modelID]; exists || !waaBootstrapModelEligible(account, modelID) {
-			return
-		}
-		seen[modelID] = struct{}{}
-		models = append(models, modelID)
-	}
-	appendModel(preferredBootstrapModelID)
-	for _, model := range account.Models {
-		appendModel(model.ID)
-	}
-	return models
-}
-
-func waaBootstrapModelEligible(account *Account, modelID string) bool {
-	for _, model := range account.Models {
-		if !modelMatchesID(model, modelID) || !hasMethod(model, "generateContent") ||
-			!modelAllowedByTier(model, account.BenefitTier) || !model.Capabilities["chat_model"] {
-			continue
-		}
-		return true
-	}
-	return false
 }
 
 func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int, error) {
@@ -2841,7 +3008,60 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		}
 		return nil, ErrNoEligibleAccount
 	}
-	// 按缓存的有序下标过滤，结果与每次收集后按 ID 排序相同；原先每次调度都要对全部账户排序
+	var indices []int
+	if allowed != nil && len(allowed)*4 < len(p.accounts) {
+		// 限定少量账户时只查这些账户的下标再排序；原先过滤全部有序账户，账户上万时每次选号都要扫一遍
+		p.schedulingLocked()
+		indices = make([]int, 0, len(allowed))
+		for accountID := range allowed {
+			account := p.byID[accountID]
+			if account == nil || !selection.Pool.allows(account) {
+				continue
+			}
+			indices = append(indices, account.position)
+		}
+		sort.Slice(indices, func(left, right int) bool { return p.accounts[indices[left]].ID < p.accounts[indices[right]].ID })
+	} else {
+		// 按缓存的有序下标过滤，结果与每次收集后按 ID 排序相同；原先每次调度都要对全部账户排序
+		sorted := p.sortedAccountIndicesLocked()
+		indices = make([]int, 0, len(sorted))
+		for _, index := range sorted {
+			account := p.accounts[index]
+			if account == nil || !selection.Pool.allows(account) {
+				continue
+			}
+			if allowed != nil {
+				if _, exists := allowed[account.ID]; !exists {
+					continue
+				}
+			}
+			indices = append(indices, index)
+		}
+	}
+	return p.rotateIndicesLocked(indices, selection), nil
+}
+
+// rotateIndicesLocked 轮询策略下把有序下标旋转到上次选中账户之后开始
+func (p *AccountPool) rotateIndicesLocked(indices []int, selection AccountSelection) []int {
+	if p.routingStrategy == "round-robin" {
+		last := p.lastPicked[selectionAccessScope(selection)]
+		start := sort.Search(len(indices), func(index int) bool { return p.accounts[indices[index]].ID > last })
+		indices = append(indices[start:], indices[:start]...)
+	}
+	return indices
+}
+
+// selectionIndicesBruteLocked 为 selectionIndicesLocked 的原实现：过滤全部有序账户。只供测试核对候选索引的结果
+func (p *AccountPool) selectionIndicesBruteLocked(selection AccountSelection) ([]int, error) {
+	if strings.TrimSpace(selection.AccountID) != "" || selection.ResourceID != "" || selection.AllowedAccountIDs == nil {
+		return p.selectionIndicesLocked(selection)
+	}
+	allowed := make(map[string]struct{}, len(selection.AllowedAccountIDs))
+	for _, accountID := range selection.AllowedAccountIDs {
+		if accountID = strings.TrimSpace(accountID); accountID != "" {
+			allowed[accountID] = struct{}{}
+		}
+	}
 	sorted := p.sortedAccountIndicesLocked()
 	indices := make([]int, 0, len(sorted))
 	for _, index := range sorted {
@@ -2849,19 +3069,12 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		if account == nil || !selection.Pool.allows(account) {
 			continue
 		}
-		if allowed != nil {
-			if _, exists := allowed[account.ID]; !exists {
-				continue
-			}
+		if _, exists := allowed[account.ID]; !exists {
+			continue
 		}
 		indices = append(indices, index)
 	}
-	if p.routingStrategy == "round-robin" {
-		last := p.lastPicked[selectionAccessScope(selection)]
-		start := sort.Search(len(indices), func(index int) bool { return p.accounts[indices[index]].ID > last })
-		indices = append(indices[start:], indices[:start]...)
-	}
-	return indices, nil
+	return p.rotateIndicesLocked(indices, selection), nil
 }
 
 // SetRoutingStrategy 设置账户轮询或优先填满策略
@@ -2903,6 +3116,7 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 		// 管理操作（重新登录、验证）写入的认证结果同样参与顺序判断：此前开始的请求较晚返回的结果不能覆盖它
 		account.authCheckedAt = time.Now().UTC()
 	}
+	p.accountChangedLocked(account)
 	p.notifyLocked()
 	return nil
 }
@@ -3229,6 +3443,10 @@ func (p *AccountPool) syncAccountRuntimeLocked(account *Account, runtimeState ac
 	}
 	catalogChanged := account.runtime.BenefitTier != runtimeState.BenefitTier ||
 		account.runtime.CatalogFingerprint != runtimeState.CatalogFingerprint
+	if account.BenefitTier != runtimeState.BenefitTier {
+		// 权益变化会把账户换到另一个号池
+		p.eligibilityVersion++
+	}
 	account.runtime = cloneRuntime(runtimeState)
 	account.BenefitTier = runtimeState.BenefitTier
 	for resourceID := range runtimeState.Resources {
@@ -3237,6 +3455,8 @@ func (p *AccountPool) syncAccountRuntimeLocked(account *Account, runtimeState ac
 	if catalogChanged {
 		account.modelAccessGeneration++
 	}
+	// 冷却表或权益变化后更新候选集
+	p.accountChangedLocked(account)
 	return true, nil
 }
 
@@ -3332,17 +3552,24 @@ type accountRuntimeRefreshResult struct {
 	err     error
 }
 
+// runtimeRefreshConcurrency 为同时从磁盘刷新运行态的账户数上限：原先每个账户一个 goroutine，
+// 上万账户一次刷新就是上万个 goroutine 同时抢文件锁与账户池锁
+const runtimeRefreshConcurrency = 32
+
 // refreshAccountRuntimes 并发刷新独立账户运行态
 func (p *AccountPool) refreshAccountRuntimes(ctx context.Context, accounts []*Account) []accountRuntimeRefreshResult {
 	results := make([]accountRuntimeRefreshResult, len(accounts))
 	var refreshes sync.WaitGroup
+	slots := make(chan struct{}, runtimeRefreshConcurrency)
 	for index, account := range accounts {
 		if account == nil {
 			continue
 		}
+		slots <- struct{}{}
 		refreshes.Add(1)
 		go func(index int, account *Account) {
 			defer refreshes.Done()
+			defer func() { <-slots }()
 			results[index] = accountRuntimeRefreshResult{account: account, err: p.refreshAccountRuntime(ctx, account)}
 		}(index, account)
 	}
@@ -3397,34 +3624,44 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 	}
 	requestedAccountID := strings.TrimSpace(selection.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
-	p.mu.Lock()
-	accounts := make([]*Account, 0, len(p.accounts))
-	for _, account := range p.accounts {
+	supports := func(account *Account) bool {
 		if account == nil || !account.Config.Enabled || account.State != AccountReady || !selection.Pool.allows(account) {
-			continue
+			return false
 		}
-		if requestedAccountID != "" && account.ID != requestedAccountID {
-			continue
+		if modelID == "" {
+			return true
 		}
-		if selection.AllowedAccountIDs != nil {
-			if _, exists := allowed[account.ID]; !exists {
-				continue
+		for _, model := range account.Models {
+			if modelMatchesID(model, modelID) && (strings.TrimSpace(selection.Method) == "" || hasMethod(model, selection.Method)) {
+				return true
 			}
 		}
-		if modelID != "" {
-			supported := false
-			for _, model := range account.Models {
-				if modelMatchesID(model, modelID) &&
-					(strings.TrimSpace(selection.Method) == "" || hasMethod(model, selection.Method)) {
-					supported = true
-					break
+		return false
+	}
+	p.mu.Lock()
+	var accounts []*Account
+	if requestedAccountID != "" {
+		if account := p.byID[requestedAccountID]; supports(account) {
+			accounts = append(accounts, account)
+		}
+	} else if selection.ResourceID == "" {
+		// 不限账户时只刷新候选集中冷却中的成员：刷新是为了感知其他进程清除的冷却，未冷却的候选没有可刷新的；
+		// 原先在锁内扫描全部账户的目录，并刷新全部支持该模型的账户
+		now := time.Now()
+		set := p.candidateSetLocked(selection, now)
+		set.expireLocked(p, now.UnixNano())
+		for _, position := range p.candidatePositionsLocked(set) {
+			if set.until[position] <= 0 {
+				continue
+			}
+			account := p.accounts[position]
+			if selection.AllowedAccountIDs != nil {
+				if _, exists := allowed[account.ID]; !exists {
+					continue
 				}
 			}
-			if !supported {
-				continue
-			}
+			accounts = append(accounts, account)
 		}
-		accounts = append(accounts, account)
 	}
 	p.mu.Unlock()
 	var failures []error

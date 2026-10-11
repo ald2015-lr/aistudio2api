@@ -163,7 +163,7 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		if account == nil {
 			continue
 		}
-		models := accountBootstrapModels(account)
+		models := accountBootstrapModelsLocked(account)
 		for _, modelID := range models {
 			if _, exists := seen[modelID]; !exists {
 				seen[modelID] = struct{}{}
@@ -199,20 +199,35 @@ func (s *AccountStore) PrimaryDirectory() string {
 	return absolute
 }
 
-// selectionRefreshInterval 为同一模型两次从磁盘刷新全部账户运行态的最短间隔
-const selectionRefreshInterval = 3 * time.Second
+const (
+	// selectionRefreshInterval 为同一模型两次从磁盘刷新全部账户运行态的最短间隔
+	selectionRefreshInterval = 3 * time.Second
+	// 账户数每超过 selectionRefreshScaleAccounts 一档，刷新间隔多加一个 selectionRefreshInterval，最长 selectionRefreshMaxInterval：
+	// 上万账户一次刷新就是上万次文件锁与读取，全部冷却时每个排队请求都会触发
+	selectionRefreshScaleAccounts = 1000
+	selectionRefreshMaxInterval   = 30 * time.Second
+)
+
+// selectionRefreshIntervalFor 返回账户数对应的刷新间隔
+func selectionRefreshIntervalFor(accounts int) time.Duration {
+	interval := selectionRefreshInterval * time.Duration(1+accounts/selectionRefreshScaleAccounts)
+	return min(interval, selectionRefreshMaxInterval)
+}
 
 // refreshSelectionRuntimesThrottled 限频的运行态刷新。
 // 所有候选都没有空位且有账户在冷却时，调度会从磁盘重读该模型全部账户的运行态（每个账户一次文件锁与读取），
 // 用于感知其他进程改动的冷却。高并发时每个排队请求每秒都会触发一次，几百个账户就是每秒成千上万次文件操作，
-// 并与账户池锁激烈竞争；单进程部署时内存状态本就是最新的，因此同一模型最多每 3 秒刷新一次
+// 并与账户池锁激烈竞争；单进程部署时内存状态本就是最新的，因此同一模型最多每 3 秒刷新一次，账户上万时间隔再按账户数放大
 func (p *AccountPool) refreshSelectionRuntimesThrottled(ctx context.Context, selection AccountSelection) error {
 	// 各号池只刷新自己的账户，限频按号池分开，避免 Ultra 请求的刷新挡住普通号池的刷新
 	key := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/") + "|" + strings.TrimSpace(selection.AccountID) +
 		"|" + selection.Pool.String()
 	now := time.Now()
+	p.mu.Lock()
+	interval := selectionRefreshIntervalFor(len(p.accounts))
+	p.mu.Unlock()
 	p.selectionRefreshMu.Lock()
-	if last, ok := p.selectionRefreshAt[key]; ok && now.Sub(last) < selectionRefreshInterval {
+	if last, ok := p.selectionRefreshAt[key]; ok && now.Sub(last) < interval {
 		p.selectionRefreshMu.Unlock()
 		return nil
 	}
@@ -244,14 +259,16 @@ func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts)
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
-	for _, account := range p.accounts {
-		if account == nil {
+	// 按候选索引的紧凑数组推导状态（与 accountStateLocked 相同），状态接口每几秒调用一次，不再逐个访问账户结构
+	index := p.schedulingLocked()
+	nowNanos := time.Now().UnixNano()
+	for position := range index.ids {
+		if p.accounts[position] == nil {
 			continue
 		}
-		state := accountStateLocked(account, now)
+		state := index.derivedStateAt(position, nowNanos)
 		counts.add(state)
-		if account.BenefitTier == BenefitTierUltra {
+		if index.tier[position] == BenefitTierUltra {
 			ultra.add(state)
 		}
 	}
@@ -383,7 +400,7 @@ func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}
 		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
 			continue
 		}
-		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModels(account)) == 0 {
+		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModelsLocked(account)) == 0 {
 			continue
 		}
 		cooling := false
