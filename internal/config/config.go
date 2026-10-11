@@ -20,6 +20,7 @@ const (
 	defaultListenAddr         = "127.0.0.1:2048"
 	defaultInitTimeout        = 2 * time.Minute
 	defaultRequestTimeout     = 5 * time.Minute
+	defaultPrimaryQueueWait   = 10 * time.Second
 	defaultWarmWorkerLimit    = 5
 	defaultMaxActiveWorkers   = 10
 	defaultWarmConcurrency    = 2
@@ -47,6 +48,8 @@ var configKeys = [...]string{
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
 	"STREAM_PLAYGROUND_MODELS",
+	"PRIMARY_MODELS",
+	"PRIMARY_QUEUE_WAIT",
 	"TEMPORARY_CHAT",
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
@@ -95,7 +98,13 @@ type Config struct {
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
 	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
 	StreamPlaygroundModels []string `json:"stream_playground_models"`
-	TemporaryChat          bool     `json:"temporary_chat"`
+	// PrimaryModels 为主用模型 ID（PRIMARY_MODELS，逗号分隔，默认为空）：列表中的模型的生成请求等空闲账号或 Worker 最多
+	// PrimaryQueueWait，超过即按 429 返回并带 Retry-After，由客户端稍后重试，不再排队到请求超时；为空时所有模型照常排队
+	PrimaryModels []string `json:"primary_models"`
+	// PrimaryQueueWait 为主用模型的排队上限（PRIMARY_QUEUE_WAIT，默认 10s）：只计等待时间，不计冷启动与锁等待；
+	// 0 表示不排队，没有立即可用的账号或 Worker 就返回 429；不能超过 RequestTimeout
+	PrimaryQueueWait time.Duration `json:"-"`
+	TemporaryChat    bool          `json:"temporary_chat"`
 	// IgnoreClientSeed 为真时忽略客户端传入的 seed，每次请求都使用随机种子
 	IgnoreClientSeed bool `json:"ignore_client_seed"`
 	// RepeatPromptNonce 为真时，在最后一条用户消息末尾加入不可见随机后缀（客户端指定 seed 或温度为 0 时除外）。
@@ -151,6 +160,7 @@ func Default() Config {
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       append([]string(nil), upstreamChannels...),
+		PrimaryQueueWait:       defaultPrimaryQueueWait,
 		WAABackend:             WAABackendCamoufox,
 		RepeatPromptNonce:      true,
 		MinOutputTokens:        defaultMinOutputTokens,
@@ -254,6 +264,15 @@ func Load(path string) (Config, error) {
 	if value, ok := values["STREAM_PLAYGROUND_MODELS"]; ok {
 		cfg.StreamPlaygroundModels = ParseModelList(value)
 	}
+	if value, ok := values["PRIMARY_MODELS"]; ok {
+		cfg.PrimaryModels = ParseModelList(value)
+	}
+	if value, ok := values["PRIMARY_QUEUE_WAIT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.PrimaryQueueWait, err = parseOptionalDuration("PRIMARY_QUEUE_WAIT", value)
+		if err != nil {
+			return Config{}, err
+		}
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -329,6 +348,8 @@ func (c Config) Save(path string) error {
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"STREAM_PLAYGROUND_MODELS": strings.Join(c.StreamPlaygroundModels, ","),
+		"PRIMARY_MODELS":           strings.Join(c.PrimaryModels, ","),
+		"PRIMARY_QUEUE_WAIT":       c.PrimaryQueueWait.String(),
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
@@ -408,6 +429,15 @@ func (c Config) Validate() error {
 	if err := validateModelList("STREAM_PLAYGROUND_MODELS", c.StreamPlaygroundModels); err != nil {
 		return err
 	}
+	if err := validateModelList("PRIMARY_MODELS", c.PrimaryModels); err != nil {
+		return err
+	}
+	if c.PrimaryQueueWait < 0 {
+		return fmt.Errorf("PRIMARY_QUEUE_WAIT 必须是 0 或正数时长")
+	}
+	if c.PrimaryQueueWait > c.RequestTimeout {
+		return fmt.Errorf("PRIMARY_QUEUE_WAIT 不能超过 REQUEST_TIMEOUT")
+	}
 	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
 		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
 	}
@@ -470,6 +500,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RoutingStrategy        string         `json:"routing_strategy"`
 		UpstreamChannels       []string       `json:"upstream_channels"`
 		StreamPlaygroundModels []string       `json:"stream_playground_models"`
+		PrimaryModels          []string       `json:"primary_models"`
+		PrimaryQueueWait       string         `json:"primary_queue_wait"`
 		TemporaryChat          bool           `json:"temporary_chat"`
 		IgnoreClientSeed       bool           `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool           `json:"repeat_prompt_nonce"`
@@ -495,6 +527,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
 		StreamPlaygroundModels: c.StreamPlaygroundModels,
+		PrimaryModels:          c.PrimaryModels,
+		PrimaryQueueWait:       c.PrimaryQueueWait.String(),
 		TemporaryChat:          c.TemporaryChat,
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
@@ -524,6 +558,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RoutingStrategy        string          `json:"routing_strategy"`
 		UpstreamChannels       []string        `json:"upstream_channels"`
 		StreamPlaygroundModels []string        `json:"stream_playground_models"`
+		PrimaryModels          []string        `json:"primary_models"`
+		PrimaryQueueWait       string          `json:"primary_queue_wait"`
 		TemporaryChat          bool            `json:"temporary_chat"`
 		IgnoreClientSeed       bool            `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool           `json:"repeat_prompt_nonce"`
@@ -543,10 +579,16 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理
+	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理；没有主用模型排队上限时按默认 10s 处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
+			return err
+		}
+	}
+	primaryQueueWait := defaultPrimaryQueueWait
+	if strings.TrimSpace(value.PrimaryQueueWait) != "" {
+		if primaryQueueWait, err = parseOptionalDuration("PRIMARY_QUEUE_WAIT", value.PrimaryQueueWait); err != nil {
 			return err
 		}
 	}
@@ -568,6 +610,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: NormalizeModelList(value.StreamPlaygroundModels),
+		PrimaryModels:          NormalizeModelList(value.PrimaryModels),
+		PrimaryQueueWait:       primaryQueueWait,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,

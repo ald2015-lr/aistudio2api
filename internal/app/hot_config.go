@@ -169,7 +169,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.RoutingStrategy == active.RoutingStrategy && saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
-		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels)
+		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
+		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait
 }
 
 // applyLiveConfig 读取已保存配置，把可热更新的字段直接应用到当前生成服务，不中断任何请求
@@ -203,14 +204,16 @@ func (manager *runtimeManager) applyLiveConfig() {
 	admin.service.minOutputTokens.Store(int64(saved.MinOutputTokens))
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
+	admin.service.setPrimaryModels(saved.PrimaryModels, saved.PrimaryQueueWait)
 	generation.config = saved
 	manager.mu.Unlock()
 
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
 		saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
+		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait),
 	))
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()

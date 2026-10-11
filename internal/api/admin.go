@@ -278,6 +278,10 @@ type RuntimeConfig struct {
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS），读取时总是返回（可以为空数组）；
 	// 保存时没有该字段（旧版页面）则沿用现值
 	StreamPlaygroundModels *[]string `json:"stream_playground_models,omitempty"`
+	// PrimaryModels 为主用模型（PRIMARY_MODELS），读取时总是返回（可以为空数组）；PrimaryQueueWait 为主用模型的排队上限
+	// （PRIMARY_QUEUE_WAIT，时长文本，0s 表示不排队）；保存时没有这些字段（旧版页面）则沿用现值
+	PrimaryModels    *[]string `json:"primary_models,omitempty"`
+	PrimaryQueueWait string    `json:"primary_queue_wait,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

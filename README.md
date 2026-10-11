@@ -550,6 +550,8 @@ cp .env.example .env
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
 | `STREAM_PLAYGROUND_MODELS` | 空 | 流式请求优先走 Playground 的模型，逗号分隔。需要订阅权益的模型在 Build 通道只能一次性返回整段回复；列表中的模型的流式请求先用 Playground 逐块输出，Playground 账号都在忙时立即改用 Build，不排队等待 Playground。留空时 Playground 与 Build 照常轮询；非流式请求不受影响。管理页“服务配置”会列出目录中需要订阅权益、可经 Playground 调用的模型，保存后立即生效 |
+| `PRIMARY_MODELS` | 空 | 主用模型，逗号分隔。列表中的模型的请求最多等 `PRIMARY_QUEUE_WAIT` 空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`，由客户端稍后重试，不再排队到 `REQUEST_TIMEOUT`；留空时所有模型照常排队。候选全部冷却仍按原规则处理。管理页“服务配置”可修改，保存后立即生效 |
+| `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限：只计等待空闲账号或 Worker 的时间（不计 Worker 启动）；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT` |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
@@ -559,6 +561,8 @@ cp .env.example .env
 管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。
 
 服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制普通号池的常驻预热规模，`MAX_ACTIVE_WORKERS` 控制普通号池的峰值 Worker 上限，Ultra 号池由 `ULTRA_WARM_WORKER_LIMIT` 与 `ULTRA_MAX_ACTIVE_WORKERS` 单独控制（见 [Ultra 号池](#ultra-号池ultra-前缀)），这些 Worker 设置与 `ULTRA_EXCLUSIVE` 在管理页保存后立即生效；`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
+
+号池的同时生成数约为 `MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`（Ultra 号池为 `ULTRA_MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`）。并发请求超过它时，多出来的请求在选号时排队等空闲的账号或 Worker，首字延迟随之拉长，直到 `REQUEST_TIMEOUT` 到期返回 504；账号因每日限额冷却却仍占着 Worker 时可用容量更少。`PRIMARY_MODELS` 的快速失败只是对症状的处理：列表中的模型排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429 让客户端稍后重试，不会增加容量；长期高于容量时应提高 `MAX_ACTIVE_WORKERS` 或 `PER_ACCOUNT_CONCURRENCY`，或减少并发。
 
 ### 端口配置
 

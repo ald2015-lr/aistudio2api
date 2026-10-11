@@ -103,7 +103,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		inputTokens := aistudio.EstimatedInputTokens(generateRequest)
 		events, err := s.service.Generate(r.Context(), generateRequest)
 		if err == nil {
-			events, err = awaitStreamStart(r.Context(), events)
+			events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generateRequest.Model))
 		}
 		if err != nil {
 			if shouldWriteRequestError(r, err) {

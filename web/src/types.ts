@@ -302,6 +302,9 @@ export interface ServiceConfig {
   upstream_channels: UpstreamChannel[]
   // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段
   stream_playground_models?: string[]
+  // primary_models 为主用模型，primary_queue_wait 为它们等空闲账号或 Worker 的上限（0s 表示不排队）；旧版服务端不返回这两个字段
+  primary_models?: string[]
+  primary_queue_wait?: string
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   ignore_client_seed: boolean

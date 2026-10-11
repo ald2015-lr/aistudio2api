@@ -1246,7 +1246,7 @@ POST /api/control/stop
 | --- | --- |
 | `ready` | 认证有效且存在可用槽位 |
 | `busy` | 就绪账户存在独占操作、认证刷新或活动请求；调度仍按 `PER_ACCOUNT_CONCURRENCY` 判断剩余槽位。需要登录或不可用的账户有活动请求时仍显示原状态 |
-| `cooldown` | 账户的全局 `*` 冷却仍有效；模型 scope 冷却只影响对应请求的候选分类 |
+| `cooldown` | 账户的全局 `*` 冷却仍有效，或至少有一个模型在账户可用的每个启用通道上都在冷却（Playground 键为模型 ID，Build 键为 `build:<模型>`；只有一个通道冷却、另一个通道还能用时仍为 `ready`）；忙碌优先于冷却。状态摘要 `accounts.cooldown` 按同一口径计数；单个模型 scope 的冷却只影响对应请求的候选分类 |
 | `auth_required` | 账户级认证失败 |
 | `unavailable` | 当前运行时不可用 |
 | `disabled` | 配置已停用 |
@@ -1276,7 +1276,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 
 按需热替换先启动 pending Worker（正在启动、尚未发布的替代 Worker），再关闭旧 Worker；旧实例成功退出后，替代 Worker 才成为当前 Worker。旧实例关闭和替代 Worker 回收同时失败时，两者都保留等待再次清理，并各占一个活动容量槽；达到容量上限后停止新建 Worker。完整生成服务 Stop/Start 的顺序为：Start 创建新生成服务实例前先重试停止旧实例，旧 PID 未退出时返回停止错误并保留原实例。
 
-管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker 并在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。
+管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker 并在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。`PRIMARY_MODELS` 中的模型排队超过 `PRIMARY_QUEUE_WAIT` 仍没有空闲的账号或 Worker 时同样返回 HTTP 429 与 `Retry-After`（排队上限限定在 1 到 30 秒，上限为 0 时 5 秒），不换号；管理日志、请求列表与用量账本记录“号池繁忙：模型 X 暂时没有空闲的账号或 Worker，请稍后重试”，客户端只收到官方的限流措辞。
 
 模型目录重试的 pending 集合保存等待再次同步的账户 ID。启动期全账户 fan-out、以及新增、登录或验证后的单账户同步，遇到任意错误或成功返回空目录时加入；返回非空目录时移除；删除账户同时移除。全账户后台同步结束后启动单个 30 秒 ticker（Go 定时器），每次对排序后的待重试账户列表再次并发 fan-out，并在任务开始时复核该 ID 仍在 pending 集合中。错误或空目录继续保留；每个非空成功立即更新账户缓存与公共目录快照、发布 `accounts` 和 `models`，并在 `RUNNING` 状态触发 Worker 预热。批次结束时，`auth_required` 集合发生变化会补发当前账户与模型快照；即时单账户同步无论成功或失败都立即发布当前快照。
 
@@ -1374,7 +1374,7 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 
 Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理：以模型文字消息结尾的历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（见上文分轮修正）。以工具调用结尾的历史仍按缺少工具结果处理。
 
-流式请求在写出响应头前最多等待首个事件 10 秒：首个事件之前出现的参数错误、无可用账号、全部冷却、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；10 秒内没有事件时照常开始推流，之后的错误仍在流内返回。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
+流式请求在写出响应头前最多等待首个事件 10 秒（`PRIMARY_MODELS` 中的模型为 `PRIMARY_QUEUE_WAIT` 加 5 秒与 10 秒中的较大者）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
 
 四套生成入口共享同一规范请求，输入映射如下：
 
@@ -2172,6 +2172,7 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 文件超过 512 MiB | 413 | `file_too_large` | `request_too_large` | `INTERNAL` |
 | 上游配额或限流 | 429 | `upstream_error` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 候选账户均在冷却且 1 分钟内不恢复 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| 主用模型（`PRIMARY_MODELS`）排队超过 `PRIMARY_QUEUE_WAIT` 没有空闲的账号或 Worker（号池繁忙） | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 上游过载 | 529 | `upstream_error` | `overloaded_error` | `INTERNAL` |
 | 当前客户端请求被管理端取消 | 503 | `request_canceled` | `api_error` | `UNAVAILABLE` |
 | 生成服务已停止 | 503 | `service_stopped` | `api_error` | `UNAVAILABLE` |

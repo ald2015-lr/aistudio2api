@@ -38,6 +38,8 @@ type EditableKey =
   | 'routing_strategy'
   | 'upstream_channels'
   | 'stream_playground_models'
+  | 'primary_models'
+  | 'primary_queue_wait'
   | 'waa_backend'
   | 'temporary_chat'
   | 'ignore_client_seed'
@@ -63,6 +65,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'routing_strategy',
   'upstream_channels',
   'stream_playground_models',
+  'primary_models',
+  'primary_queue_wait',
   'waa_backend',
   'temporary_chat',
   'ignore_client_seed',
@@ -145,6 +149,8 @@ const form = reactive<ServiceConfig>({
   routing_strategy: 'round-robin',
   upstream_channels: ['playground', 'build'],
   stream_playground_models: [],
+  primary_models: [],
+  primary_queue_wait: '10s',
   waa_backend: 'camoufox',
   temporary_chat: false,
   ignore_client_seed: false,
@@ -170,6 +176,15 @@ function onStreamModelsInput(event: Event): void {
   const value = (event.target as HTMLInputElement).value
   streamModelsText.value = value
   form.stream_playground_models = parseModelList(value)
+}
+
+// 主用模型的输入框同样单独保存文字
+const primaryModelsText = ref('')
+
+function onPrimaryModelsInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value
+  primaryModelsText.value = value
+  form.primary_models = parseModelList(value)
 }
 
 // subscriptionModels 为目录中需要订阅权益、可经 Build 调用（在 Build 通道一次性返回整段回复）且可经 Playground 流式调用的模型，
@@ -298,6 +313,11 @@ function validate(value: ServiceConfig): string {
   ) {
     return t('settings.invalidFirstEventTimeout')
   }
+  // 主用模型的排队上限可以为 0（不排队），不能超过请求超时
+  const primaryWait = durationMillis(value.primary_queue_wait ?? '0s')
+  if (Number.isNaN(primaryWait) || primaryWait > durationMillis(value.request_timeout)) {
+    return t('settings.invalidPrimaryQueueWait')
+  }
   const numbers: [unknown, TranslationKey][] = [
     [value.warm_worker_limit, 'settings.warmWorkerLimit'],
     [value.max_active_workers, 'settings.maxActiveWorkers'],
@@ -405,6 +425,14 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
         form[key] = saved[key]
       }
     }
+    if (
+      form.primary_queue_wait !== undefined &&
+      saved.primary_queue_wait !== undefined &&
+      form.primary_queue_wait !== saved.primary_queue_wait &&
+      durationMillis(form.primary_queue_wait) === durationMillis(saved.primary_queue_wait)
+    ) {
+      form.primary_queue_wait = saved.primary_queue_wait
+    }
     saveError.value = ''
     emit('saved', saved)
     if (saved.service_restart_required && props.running && autoApply.value && !applying.value) {
@@ -492,6 +520,10 @@ watch(
       guardModelsText.value = form.downgrade_guard.models.join(', ')
       form.stream_playground_models = [...(config.stream_playground_models ?? [])]
       streamModelsText.value = form.stream_playground_models.join(', ')
+      // 旧版服务端不返回主用模型字段时按默认值显示，保存时也不会带上（见 payload），不会重置服务端现值
+      form.primary_models = [...(config.primary_models ?? [])]
+      primaryModelsText.value = form.primary_models.join(', ')
+      form.primary_queue_wait = config.primary_queue_wait ?? '10s'
     }
     savedConfig.value = config
   },
@@ -875,6 +907,38 @@ onBeforeUnmount(() => {
             {{ model }}
           </button>
         </div>
+      </div>
+
+      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.primaryTitle') }}</span>
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <label class="block md:col-span-2">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.primaryModels')
+            }}</span>
+            <input
+              :value="primaryModelsText"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              @input="onPrimaryModelsInput"
+            />
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.primaryQueueWait')
+            }}</span>
+            <input
+              v-model.trim="form.primary_queue_wait"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              placeholder="10s"
+              required
+              autocomplete="off"
+            />
+          </label>
+        </div>
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.primaryHelp') }}</span>
       </div>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">

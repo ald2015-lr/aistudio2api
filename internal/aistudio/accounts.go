@@ -97,6 +97,46 @@ func (e *AllCoolingError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
+// CapacityBusyError 表示主用模型（PRIMARY_MODELS）的请求在排队上限（PRIMARY_QUEUE_WAIT）内没有等到空闲的账号或 Worker 槽位：
+// 号池容量（峰值 Worker 数 × 单账户并发）低于当前并发时，请求不再排队到请求超时，立即按 429 返回并带 Retry-After，
+// 由客户端稍后重试。只在等待原因是账号忙碌、没有空闲槽位、Worker 启动或扩容中时产生；候选全部冷却仍按 AllCoolingError 处理
+type CapacityBusyError struct {
+	ModelID string
+	// Pool 为请求限定的号池；Ultra 号池的错误写明 Ultra 号池
+	Pool PoolScope
+	// Reason 为最后一次等待的原因（账号全部忙碌、没有空闲的 Worker 槽位等）
+	Reason string
+	// Waited 为实际排队的时间，Limit 为排队上限
+	Waited time.Duration
+	Limit  time.Duration
+	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
+	Until time.Time
+}
+
+func (e *CapacityBusyError) Error() string {
+	pool := ""
+	if e.Pool == PoolScopeUltra {
+		pool = e.Pool.Label() + "，"
+	}
+	return fmt.Sprintf("号池繁忙：模型 %s 暂时没有空闲的账号或 Worker，请稍后重试（%s已排队 %s，上限 %s，最后等待原因：%s）",
+		e.ModelID, pool, e.Waited.Round(time.Millisecond), e.Limit, e.Reason)
+}
+
+// RetryAt 返回建议重试时间，供对外错误写 Retry-After
+func (e *CapacityBusyError) RetryAt() time.Time {
+	return e.Until
+}
+
+// HTTPStatus 返回号池繁忙对应的公开状态码：与全部冷却一样按限流 429 返回
+func (e *CapacityBusyError) HTTPStatus() int {
+	return http.StatusTooManyRequests
+}
+
+// ErrorCode 返回 OpenAI 兼容的限流错误代码
+func (e *CapacityBusyError) ErrorCode() string {
+	return "rate_limit_exceeded"
+}
+
 // AccountsNotReadyError 表示号池暂时无法调度请求：支持请求的账户都需要重新登录、不可用、已停用或被其他进程占用，
 // 或者号池为空、模型目录尚未加载、候选账户在调度期间被移除。这些是号池一侧的原因，对外按 503 返回，
 // 不能让客户端当成自己的请求错误

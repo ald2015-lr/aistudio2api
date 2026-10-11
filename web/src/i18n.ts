@@ -184,6 +184,11 @@ const zhCN = {
     '需要订阅权益的模型在 Build 通道只能一次性返回整段回复，流式输出会在最后一次性出现。列表中的模型的流式请求先用 Playground（逐块返回）；Playground 账号都在忙时立即改用 Build，不排队等待 Playground。逗号分隔的模型 ID；留空时 Playground 与 Build 照常轮询（默认）。非流式请求不受影响，降级判定拦截的模型按降级判定处理。修改后立即生效。',
   'settings.streamPlaygroundModelsHint':
     '目录中需要订阅权益、可经 Playground 调用的模型（点击加入）：',
+  'settings.primaryTitle': '主用模型',
+  'settings.primaryModels': '主用模型列表',
+  'settings.primaryQueueWait': '排队上限',
+  'settings.primaryHelp':
+    '列表中的模型的请求最多等这么久空闲的账号或 Worker，超过即返回 429 并带 Retry-After，让客户端稍后重试，而不是在这里排队到请求超时。同时生成数约为 峰值 Worker 上限 × 单账户请求并发，并发超过它时请求就会排队；这只是对症状的处理，长期不够用应加 Worker 或并发。逗号分隔的模型 ID；留空时所有模型照常排队（默认）。排队上限为 0 表示不排队，没有立即可用的账号就返回 429；只计等待时间（不计 Worker 启动），不能超过请求超时。候选全部冷却仍按原规则处理。修改后立即生效。',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': '通道',
@@ -414,6 +419,7 @@ const zhCN = {
   'settings.invalidNumber': '{field}必须是正整数',
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
   'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
+  'settings.invalidPrimaryQueueWait': '主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
   'settings.invalidListen': '监听地址格式应为 主机:端口',
   'settings.invalidMaxWorkers': '峰值 Worker 上限不能小于常驻 Worker 数',
   'settings.invalidWarmConcurrency': '启动预热并发应在 1 到常驻 Worker 数之间',
@@ -789,6 +795,11 @@ const en: Record<TranslationKey, string> = {
     'Models that need a subscription return the whole reply at once on the Build channel, so streamed output appears all at once at the end. Streaming requests for the listed models use Playground first (streamed chunk by chunk) and switch to Build immediately when every Playground account is busy, without waiting for Playground. Comma-separated model IDs; leave empty to let Playground and Build rotate as usual (default). Non-streaming requests are not affected, and models covered by the downgrade guard follow the downgrade guard. Changes apply immediately.',
   'settings.streamPlaygroundModelsHint':
     'Catalog models that need a subscription and are available on Playground (click to add):',
+  'settings.primaryTitle': 'Primary models',
+  'settings.primaryModels': 'Primary model list',
+  'settings.primaryQueueWait': 'Queue limit',
+  'settings.primaryHelp':
+    'Requests for the listed models wait at most this long for a free account or worker, then get a 429 with Retry-After so the client retries later instead of queuing here until the request timeout. Concurrent generations are roughly the active worker limit × concurrent requests per account; beyond that, requests queue. This only treats the symptom: add workers or per-account concurrency when capacity is short for long. Comma-separated model IDs; empty keeps every model queuing as usual (default). A limit of 0 never queues and returns 429 when nothing is free right away; only waiting time counts (worker start-up does not), and the limit cannot exceed the request timeout. When every candidate is cooling down the usual rules still apply. Changes apply immediately.',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': 'Channel',
@@ -1026,6 +1037,8 @@ const en: Record<TranslationKey, string> = {
   'settings.invalidDuration': '{field} must be a duration such as 30s, 2m or 1h30m',
   'settings.invalidFirstEventTimeout':
     'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',
+  'settings.invalidPrimaryQueueWait':
+    'Primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
   'settings.invalidListen': 'Listen address must be host:port',
   'settings.invalidMaxWorkers': 'Peak worker limit cannot be lower than the resident worker count',
   'settings.invalidWarmConcurrency': 'Warm-up concurrency must be between 1 and the resident worker count',

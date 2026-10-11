@@ -118,6 +118,11 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.As(err, &cooling) {
 		return rateLimitPublicError()
 	}
+	// 主用模型排队超过上限（号池繁忙）：与全部冷却一样按 429 返回，Retry-After 由 setRetryAfter 按 RetryAt 写入
+	var busy *aistudio.CapacityBusyError
+	if errors.As(err, &busy) {
+		return rateLimitPublicError()
+	}
 	// 号池一侧的暂时性原因（账户需要重新登录、已停用、被占用，号池为空或目录尚未加载）：按服务暂时不可用返回
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {

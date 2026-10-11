@@ -57,7 +57,7 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	generate.Stream = request.Stream
 	events, err := s.service.Generate(r.Context(), generate)
 	if err == nil && request.Stream {
-		events, err = awaitStreamStart(r.Context(), events)
+		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generate.Model))
 	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {

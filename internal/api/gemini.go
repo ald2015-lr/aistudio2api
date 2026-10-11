@@ -855,7 +855,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	request.Stream = stream
 	events, err := s.service.Generate(r.Context(), request)
 	if err == nil && stream {
-		events, err = awaitStreamStart(r.Context(), events)
+		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(request.Model))
 	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {

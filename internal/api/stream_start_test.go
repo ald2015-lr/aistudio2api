@@ -78,7 +78,7 @@ func TestAwaitStreamStartReplaysEvents(t *testing.T) {
 	source <- aistudio.Event{Kind: aistudio.EventText, Text: "b"}
 	source <- aistudio.Event{Kind: aistudio.EventFinish}
 	close(source)
-	events, err := awaitStreamStart(context.Background(), source)
+	events, err := awaitStreamStart(context.Background(), source, streamHeartbeatInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestAwaitStreamStartReplaysEvents(t *testing.T) {
 	}
 	empty := make(chan aistudio.Event)
 	close(empty)
-	if _, err := awaitStreamStart(context.Background(), empty); err == nil {
+	if _, err := awaitStreamStart(context.Background(), empty, streamHeartbeatInterval); err == nil {
 		t.Fatal("首个事件前流结束应返回错误")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -294,6 +295,16 @@ func (manager *runtimeManager) Generate(ctx context.Context, request aistudio.Ge
 	return events, nil
 }
 
+// StreamStartWait 由当前生成服务给出流式请求写出响应头前等待首个事件的下限（主用模型的排队上限加余量，见 primary_models.go）；
+// 生成服务不支持时为 0
+func (manager *runtimeManager) StreamStartWait(model string) time.Duration {
+	provider, ok := manager.generation().service.(interface{ StreamStartWait(string) time.Duration })
+	if !ok {
+		return 0
+	}
+	return provider.StreamStartWait(model)
+}
+
 // GenerateVideo 由当前生成服务创建视频任务
 func (manager *runtimeManager) GenerateVideo(ctx context.Context, request aistudio.VideoRequest) (aistudio.VideoOperation, error) {
 	service, ok := manager.generation().service.(aistudio.VideoService)
@@ -506,6 +517,15 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if initErr != nil || requestErr != nil || firstEventErr != nil {
 		return false
 	}
+	// 主用模型的排队上限：提交时省略按生效值比较
+	primaryQueueWait := active.PrimaryQueueWait
+	if strings.TrimSpace(value.PrimaryQueueWait) != "" {
+		parsed, err := time.ParseDuration(strings.TrimSpace(value.PrimaryQueueWait))
+		if err != nil {
+			return false
+		}
+		primaryQueueWait = parsed
+	}
 	saved := config.Config{
 		AuthStates: value.AuthStates, Proxy: value.Proxy,
 		InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
@@ -519,6 +539,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		DowngradeGuard: active.DowngradeGuard,
 		UltraExclusive: active.UltraExclusive, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
+		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -535,6 +556,9 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.StreamPlaygroundModels != nil {
 		saved.StreamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
 	}
+	if value.PrimaryModels != nil {
+		saved.PrimaryModels = config.NormalizeModelList(*value.PrimaryModels)
+	}
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
 		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
@@ -549,7 +573,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.WAABackend == active.WAABackend &&
 		saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
-		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels)
+		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
+		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

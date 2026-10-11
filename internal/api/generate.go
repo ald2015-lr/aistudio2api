@@ -103,11 +103,26 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	return nil
 }
 
-// awaitStreamStart 在写出流式响应头前等待首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
-// HTTP 状态和错误对象（参数错误、无可用账号、全部冷却、降级拒绝等不再变成 200 之后的流内错误）；
-// 心跳间隔内没有事件时照常开始推流，返回的事件流从首个事件开始重放
-func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event) (<-chan aistudio.Event, error) {
-	timer := time.NewTimer(streamHeartbeatInterval)
+// streamStartWaitProvider 由生成服务实现：返回模型在写出流式响应头前至少要等首个事件多久（主用模型为排队上限加余量），
+// 保证排队超限的 429 以 HTTP 状态返回，不是 200 之后的流内错误；返回 0 表示按默认心跳间隔
+type streamStartWaitProvider interface {
+	StreamStartWait(model string) time.Duration
+}
+
+// streamStartWait 返回写出流式响应头前等待首个事件的时间：默认一个心跳间隔，生成服务要求更久时按它
+func (s *server) streamStartWait(model string) time.Duration {
+	wait := streamHeartbeatInterval
+	if provider, ok := s.service.(streamStartWaitProvider); ok {
+		wait = max(wait, provider.StreamStartWait(model))
+	}
+	return wait
+}
+
+// awaitStreamStart 在写出流式响应头前最多等待 wait 等首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
+// HTTP 状态和错误对象（参数错误、无可用账号、全部冷却、号池繁忙、降级拒绝等不再变成 200 之后的流内错误）；
+// wait 内没有事件时照常开始推流，返回的事件流从首个事件开始重放
+func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event, wait time.Duration) (<-chan aistudio.Event, error) {
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	var first aistudio.Event
 	select {

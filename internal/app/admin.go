@@ -796,6 +796,17 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.StreamPlaygroundModels != nil {
 		streamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
 	}
+	// 主用模型与排队上限：旧版页面保存时不带这些字段，沿用现值；空数组表示清空，排队上限 0 表示不排队
+	primaryModels := saved.PrimaryModels
+	if value.PrimaryModels != nil {
+		primaryModels = config.NormalizeModelList(*value.PrimaryModels)
+	}
+	primaryQueueWait := saved.PrimaryQueueWait
+	if strings.TrimSpace(value.PrimaryQueueWait) != "" {
+		if primaryQueueWait, err = time.ParseDuration(strings.TrimSpace(value.PrimaryQueueWait)); err != nil {
+			return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("PRIMARY_QUEUE_WAIT 无效: %w", err))
+		}
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
 		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
@@ -806,6 +817,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: streamPlaygroundModels,
+		PrimaryModels:          primaryModels,
+		PrimaryQueueWait:       primaryQueueWait,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
@@ -1395,6 +1408,7 @@ func buildVersion() string {
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
+	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
@@ -1414,6 +1428,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
 		StreamPlaygroundModels: &streamPlaygroundModels,
+		PrimaryModels:          &primaryModels,
+		PrimaryQueueWait:       cfg.PrimaryQueueWait.String(),
 	}
 }
 

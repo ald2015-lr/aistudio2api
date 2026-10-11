@@ -108,6 +108,7 @@ func newRuntime(
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
+	service.setPrimaryModels(cfg.PrimaryModels, cfg.PrimaryQueueWait)
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	accountDisableNotes.load(store.PrimaryDirectory())
@@ -2157,6 +2158,8 @@ type trackedService struct {
 
 	// streamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS，可热更新，见 stream_channel.go）
 	streamPlaygroundModels atomic.Pointer[map[string]struct{}]
+	// primaryModels 为主用模型列表与排队上限（PRIMARY_MODELS / PRIMARY_QUEUE_WAIT，可热更新，见 primary_models.go）
+	primaryModels atomic.Pointer[primaryModelSettings]
 }
 
 type modelCatalogService interface {
@@ -3160,6 +3163,8 @@ func (service *trackedService) acquireLease(
 		failures = newWorkerStartupFailures()
 	}
 	failedWorkers := failures.accounts
+	// 主用模型的选号带排队预算（见 primary_models.go）：容量原因的等待累计超过上限时 wait 返回 CapacityBusyError，没有预算时不限时
+	budget := leaseWaitBudgetFromContext(ctx)
 	var waiter *dispatchWaiter
 	defer func() { service.workers.dispatch.leave(waiter) }()
 	wait := func(delay time.Duration, reason string) error {
@@ -3169,7 +3174,7 @@ func (service *trackedService) acquireLease(
 		if waiter == nil {
 			waiter = service.workers.dispatch.join(dispatchKey(selection))
 		}
-		return waitScheduling(ctx, waiter.wake, delay)
+		return budget.wait(ctx, waiter.wake, delay, reason)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
@@ -3275,7 +3280,7 @@ func (service *trackedService) acquireLease(
 				if immediate {
 					return nil, &noImmediateLeaseError{reason: "Worker 容量已满"}
 				}
-				if err := waitScheduling(ctx, workersChanged, schedulingRecheck); err != nil {
+				if err := budget.wait(ctx, workersChanged, schedulingRecheck, "Worker 容量已满"); err != nil {
 					return nil, err
 				}
 				continue
@@ -3298,7 +3303,7 @@ func (service *trackedService) acquireLease(
 			if remaining > cooldownQueueLimit {
 				return nil, &aistudio.AllCoolingError{ModelID: selection.ModelID, Until: groups.EarliestCooldown}
 			}
-			if err := wait(min(remaining, schedulingRecheck), "账号冷却中"); err != nil {
+			if err := wait(min(remaining, schedulingRecheck), waitReasonCooling); err != nil {
 				return nil, err
 			}
 			continue
@@ -3672,21 +3677,30 @@ func (service *trackedService) generateWithRetry(
 		}
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
+		// 主用模型（PRIMARY_MODELS）的选号带排队预算：排队超过上限按 429 结束（见 primary_models.go），其他模型原样
+		acquireCtx := service.primaryAcquireContext(requestCtx, selection)
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		if service.streamPrefersPlayground(request, selection) {
-			nextLease, acquireErr = service.acquireStreamPlaygroundLease(requestCtx, request.ID, selection)
+			nextLease, acquireErr = service.acquireStreamPlaygroundLease(acquireCtx, request.ID, selection)
 		} else {
-			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
+			nextLease, acquireErr = service.acquireWarmLease(acquireCtx, selection)
 		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && playgroundUnavailable(acquireErr) {
 			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定
 			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
-			nextLease, acquireErr = service.acquireWarmLease(requestCtx, selection)
+			nextLease, acquireErr = service.acquireWarmLease(acquireCtx, selection)
 		}
 		if acquireErr != nil {
 			trace.Note("获取账号失败: " + acquireErr.Error())
+			var capacityBusy *aistudio.CapacityBusyError
+			if errors.As(acquireErr, &capacityBusy) {
+				// 主用模型排队超过上限：立即按 429 结束，不换号、不复制文件、不冷却、不退避
+				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryQueueExceededMessage(capacityBusy))
+				err = acquireErr
+				break
+			}
 			var ownerCooling *aistudio.AllCoolingError
 			if fileBound && !copyFiles && (errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling)) && requestCtx.Err() == nil {
 				// 文件所属账号不可用：改为把文件复制到其他账号再试一次。这次重试不占用换号次数，

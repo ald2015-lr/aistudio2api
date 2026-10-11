@@ -169,7 +169,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	generateRequest.Stream = request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
 	if err == nil && request.Stream {
-		events, err = awaitStreamStart(r.Context(), events)
+		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generateRequest.Model))
 	}
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
