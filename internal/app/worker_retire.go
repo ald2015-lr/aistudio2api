@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,23 +36,47 @@ const (
 
 // retirement 为一条待淘汰登记
 type retirement struct {
-	// modelID 为导致登记的冷却模型（该模型所有启用通道都冷却），全局冷却为空
-	modelID string
-	since   time.Time
+	// models 为导致登记的冷却模型（每个模型的所有启用通道都冷却），按 ID 排序；全局冷却为空。
+	// 同一账号可能先后在几个模型上成为死槽位，其中一个解除冷却时登记仍要为其余模型保留
+	models []string
+	since  time.Time
 	// retryAt 为上次淘汰未成功后下一次尝试的时间，零值为随时可试
 	retryAt time.Time
 }
 
+// global 判断登记是否为全局冷却
+func (entry retirement) global() bool {
+	return len(entry.models) == 0
+}
+
+// snapshot 返回登记的副本，模型列表另拷一份，淘汰循环读取时不与新的登记互相干扰
+func (entry retirement) snapshot() retirement {
+	entry.models = slices.Clone(entry.models)
+	return entry
+}
+
 // scopeLabel 返回登记范围在日志里的写法
 func (entry retirement) scopeLabel() string {
-	if entry.modelID == "" {
+	if entry.global() {
 		return "全局"
 	}
-	return entry.modelID
+	return strings.Join(entry.models, ",")
+}
+
+// stillCooling 返回登记中账号仍长时间冷却的范围：全局登记按全局冷却判断，按模型的登记只保留仍冷却的模型；
+// 返回的 ok 为假表示登记已没有理由保留
+func (entry retirement) stillCooling(pool *aistudio.AccountPool, accountID string) (retirement, bool) {
+	if entry.global() {
+		return entry, pool.AccountLongCooling(accountID, "", rotationMinRemaining)
+	}
+	entry.models = slices.DeleteFunc(slices.Clone(entry.models), func(modelID string) bool {
+		return !pool.AccountLongCooling(accountID, modelID, rotationMinRemaining)
+	})
+	return entry, len(entry.models) > 0
 }
 
 // retireWorker 登记账号的驻留 Worker 待淘汰并唤醒淘汰循环；账号没有驻留 Worker 时不登记。
-// modelID 为空表示全局冷却，会覆盖同一账号先前按模型的登记
+// modelID 为空表示全局冷却，会覆盖同一账号先前按模型的登记；再按别的模型登记时并入同一条登记
 func (manager *accountWorkerManager) retireWorker(accountID string, modelID string) bool {
 	manager.mu.RLock()
 	account := manager.accounts[accountID]
@@ -63,13 +89,22 @@ func (manager *accountWorkerManager) retireWorker(accountID string, modelID stri
 		manager.retirements = make(map[string]*retirement)
 	}
 	if existing := manager.retirements[accountID]; existing != nil {
-		if modelID == "" {
-			existing.modelID = ""
+		switch {
+		case modelID == "":
+			existing.models = nil
+		case existing.global():
+		case !slices.Contains(existing.models, modelID):
+			existing.models = append(slices.Clone(existing.models), modelID)
+			slices.Sort(existing.models)
 		}
 		manager.retireMu.Unlock()
 		return true
 	}
-	manager.retirements[accountID] = &retirement{modelID: modelID, since: time.Now()}
+	entry := &retirement{since: time.Now()}
+	if modelID != "" {
+		entry.models = []string{modelID}
+	}
+	manager.retirements[accountID] = entry
 	manager.retirePending.Store(int32(len(manager.retirements)))
 	manager.retireMu.Unlock()
 	manager.wakeRetire()
@@ -152,7 +187,7 @@ func (manager *accountWorkerManager) retirePass() int {
 		if now.Before(entry.retryAt) {
 			continue
 		}
-		candidates = append(candidates, retirementCandidate{accountID: accountID, entry: *entry})
+		candidates = append(candidates, retirementCandidate{accountID: accountID, entry: entry.snapshot()})
 	}
 	manager.retireMu.Unlock()
 	if len(candidates) == 0 {
@@ -181,11 +216,17 @@ func (manager *accountWorkerManager) retirePass() int {
 		manager.mu.RLock()
 		account := manager.accounts[accountID]
 		manager.mu.RUnlock()
-		if account == nil || !account.warm.Load() ||
-			!manager.pool.AccountLongCooling(accountID, candidate.entry.modelID, rotationMinRemaining) {
+		if account == nil || !account.warm.Load() {
 			manager.dropRetirement(accountID)
 			continue
 		}
+		// 只要登记里还有一个模型（或全局）仍长时间冷却，账号就仍是死槽位；日志只写仍在冷却的范围
+		cooling, ok := candidate.entry.stillCooling(manager.pool, accountID)
+		if !ok {
+			manager.dropRetirement(accountID)
+			continue
+		}
+		candidate.entry = cooling
 		if _, starting := manager.openingSet.Load(accountID); starting {
 			continue
 		}
