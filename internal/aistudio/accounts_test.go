@@ -24,6 +24,8 @@ func testPoolWithAccount(t *testing.T, id string) *AccountPool {
 	t.Helper()
 	store := NewAccountStore(t.TempDir())
 	pool := NewAccountPool(nil, 2)
+	// 后台运行态写入要在 TempDir 删除目录前结束（清理按注册的逆序执行）
+	t.Cleanup(pool.WaitBackground)
 	account, publish, err := store.Create(DefaultAccountConfig(id), testStorageState("OLD"))
 	if err != nil {
 		t.Fatal(err)

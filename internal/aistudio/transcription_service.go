@@ -117,13 +117,11 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 				return result, stateErr
 			}
 			if transcriptionVerifiesModelAccess(result) {
-				go func() {
-					if _, err := s.pool.MarkModelAccessVerifiedIfGeneration(
-						accountID, modelID, accessGeneration, checkedAt,
-					); err != nil {
+				s.pool.MarkModelAccessVerifiedAsync(accountID, modelID, accessGeneration, checkedAt, func(_ bool, err error) {
+					if err != nil {
 						slog.Error("账户模型资格保存失败", "account", accountID, "model", modelID, "error", err)
 					}
-				}()
+				})
 			}
 			return result, nil
 		}

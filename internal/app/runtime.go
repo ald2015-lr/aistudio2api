@@ -2428,10 +2428,8 @@ func (service *trackedService) markModelAccessVerifiedAsync(
 	accessGeneration uint64,
 	checkedAt time.Time,
 ) {
-	go func() {
-		changed, err := service.pool.MarkModelAccessVerifiedIfGeneration(
-			accountID, modelID, accessGeneration, checkedAt,
-		)
+	// 写入由账户池登记为后台写入，停止或测试清理账户目录前可用 pool.WaitBackground 等待结束
+	service.pool.MarkModelAccessVerifiedAsync(accountID, modelID, accessGeneration, checkedAt, func(changed bool, err error) {
 		if err != nil {
 			service.requests.log(accountLabel, "ERROR", fmt.Sprintf(
 				"模型资格保存失败 | 模型=%s | 错误=%s", modelID, strings.TrimSpace(err.Error()),
@@ -2441,7 +2439,7 @@ func (service *trackedService) markModelAccessVerifiedAsync(
 		if changed {
 			service.publishModelAccess()
 		}
-	}()
+	})
 }
 
 // Stop 停止公开生成服务并释放活动 worker

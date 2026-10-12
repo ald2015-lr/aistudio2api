@@ -1048,10 +1048,7 @@ func (s *BidiSession) recordScopedModelAccess(event *BidiEvent) {
 	accountID := s.accountID
 	accessScope := s.modelAccessScope
 	generation := s.lease.ModelAccessGeneration()
-	go func() {
-		changed, err := s.lease.pool.MarkModelAccessVerifiedIfGeneration(
-			accountID, accessScope, generation, checkedAt,
-		)
+	s.lease.pool.MarkModelAccessVerifiedAsync(accountID, accessScope, generation, checkedAt, func(changed bool, err error) {
 		if err != nil {
 			slog.Error("Bidi 媒体资格保存失败", "account", accountID, "model", s.model, "error", err)
 			return
@@ -1059,7 +1056,7 @@ func (s *BidiSession) recordScopedModelAccess(event *BidiEvent) {
 		if changed {
 			s.notifyModelAccessChanged()
 		}
-	}()
+	})
 }
 
 // beginQualificationAttempt 登记当前双向轮次中的资格请求

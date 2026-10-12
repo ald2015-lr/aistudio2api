@@ -43,6 +43,7 @@ func authTestPool(t *testing.T, oauth bool) (*aistudio.AccountPool, *aistudio.Ac
 	t.Helper()
 	store := aistudio.NewAccountStore(t.TempDir())
 	pool := aistudio.NewAccountPool(nil, 2)
+	t.Cleanup(pool.WaitBackground)
 	account, publish, err := store.Create(aistudio.DefaultAccountConfig(authTestAccount), authTestState(t, "OLD", oauth))
 	if err != nil {
 		t.Fatal(err)

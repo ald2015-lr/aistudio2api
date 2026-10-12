@@ -24,6 +24,7 @@ func scopeTestPool(t *testing.T, tiers map[string]BenefitTier) *AccountPool {
 	t.Helper()
 	store := NewAccountStore(t.TempDir())
 	pool := NewAccountPool(nil, 2)
+	t.Cleanup(pool.WaitBackground)
 	for accountID, tier := range tiers {
 		account, publish, err := store.Create(DefaultAccountConfig(accountID), testStorageState("OLD"))
 		if err != nil {

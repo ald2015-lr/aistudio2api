@@ -425,6 +425,8 @@ type AccountPool struct {
 	ultraAccounts      map[string]struct{}
 	statusCache        []AccountStatus
 	statusCacheAt      time.Time
+	// background 记录后台运行态写入（见 pool_background.go），WaitBackground 等待它们结束
+	background backgroundWrites
 }
 
 // AccountLease 表示一个账户请求槽位

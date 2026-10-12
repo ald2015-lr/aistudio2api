@@ -16,6 +16,8 @@ func testAccountPool(t *testing.T, accountIDs ...string) (*aistudio.AccountPool,
 	t.Helper()
 	store := aistudio.NewAccountStore(t.TempDir())
 	pool := aistudio.NewAccountPool(nil, 2)
+	// 生成成功后模型资格在后台写入账户目录，先等写入结束再让 TempDir 删除目录（清理按注册的逆序执行）
+	t.Cleanup(pool.WaitBackground)
 	accounts := make([]*aistudio.Account, 0, len(accountIDs))
 	for _, accountID := range accountIDs {
 		cookies := make([]aistudio.StateCookie, 0, 3)

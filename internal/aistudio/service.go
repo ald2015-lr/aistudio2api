@@ -714,13 +714,11 @@ func forwardEventsWithLease(
 			if err := lease.MarkAuthenticationValid(); err != nil {
 				slog.Error("账户认证状态保存失败", "account", accountID, "error", err)
 			}
-			go func() {
-				if _, err := pool.MarkModelAccessVerifiedIfGeneration(
-					accountID, lease.CooldownScope(modelID), accessGeneration, checkedAt,
-				); err != nil {
+			pool.MarkModelAccessVerifiedAsync(accountID, lease.CooldownScope(modelID), accessGeneration, checkedAt, func(_ bool, err error) {
+				if err != nil {
 					slog.Error("账户模型资格保存失败", "account", accountID, "model", modelID, "error", err)
 				}
-			}()
+			})
 		}
 	}
 }
