@@ -3,6 +3,7 @@ package aistudio
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 )
@@ -55,5 +56,44 @@ func TestInputTokenLimitNotQuota(t *testing.T) {
 	}
 	if !retryableAccountError(quota) {
 		t.Fatal("额度 429 仍应换号")
+	}
+}
+
+// TestInputTokenCapError 只有账号上限的写法算账号上限；带计数的模型上限不算（任何账号都放不下）
+func TestInputTokenCapError(t *testing.T) {
+	cap429 := &RPCError{Method: "ProxyStreamedCall", StatusCode: http.StatusTooManyRequests, Code: 8, Message: "The input token count exceeds the maximum number of tokens allowed 131072"}
+	model400 := &RPCError{Method: "GenerateContent", StatusCode: http.StatusBadRequest, Code: 3, Message: "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576)."}
+	if !InputTokenCapError(cap429) || !InputTokenCapError(fmt.Errorf("包装: %w", cap429)) {
+		t.Fatal("131072 写法应识别为账号上限")
+	}
+	if InputTokenCapError(model400) || !InputTokenLimitError(model400) {
+		t.Fatal("带计数的模型上限不是账号上限，但仍是输入超限")
+	}
+	if InputTokenCapError(nil) {
+		t.Fatal("nil 不应识别为账号上限")
+	}
+}
+
+// TestEnabledAccountsAboveTierOf 返回号池内权益高于指定账号的启用账号：Free < Plus < Pro < Ultra，受号池范围限制
+func TestEnabledAccountsAboveTierOf(t *testing.T) {
+	pool := scopeTestPool(t, map[string]BenefitTier{
+		"free@example.com": BenefitTierFree, "plus@example.com": BenefitTierPlus,
+		"pro@example.com": BenefitTierPro, "ultra@example.com": BenefitTierUltra,
+	})
+	sorted := func(ids []string) []string { slices.Sort(ids); return ids }
+	if got := sorted(pool.EnabledAccountsAboveTierOf(PoolScopeAll, "free@example.com")); !slices.Equal(got, []string{"plus@example.com", "pro@example.com", "ultra@example.com"}) {
+		t.Fatalf("高于 Free = %v", got)
+	}
+	if got := sorted(pool.EnabledAccountsAboveTierOf(PoolScopeAll, "plus@example.com")); !slices.Equal(got, []string{"pro@example.com", "ultra@example.com"}) {
+		t.Fatalf("高于 Plus = %v", got)
+	}
+	if got := sorted(pool.EnabledAccountsAboveTierOf(PoolScopeNormal, "free@example.com")); !slices.Equal(got, []string{"plus@example.com", "pro@example.com"}) {
+		t.Fatalf("普通号池内高于 Free = %v（不含 Ultra）", got)
+	}
+	if got := pool.EnabledAccountsAboveTierOf(PoolScopeAll, "ultra@example.com"); len(got) != 0 {
+		t.Fatalf("高于 Ultra = %v，期望为空", got)
+	}
+	if got := pool.EnabledAccountsAboveTierOf(PoolScopeAll, "missing@example.com"); got != nil {
+		t.Fatalf("不存在的账号 = %v，期望 nil", got)
 	}
 }

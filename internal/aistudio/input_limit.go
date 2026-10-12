@@ -19,3 +19,51 @@ func InputTokenLimitError(err error) bool {
 	}
 	return strings.Contains(message, "exceeds the maximum number of tokens allowed")
 }
+
+// InputTokenCapError 判断是否为部分账号的输入上限错误（"The input token count exceeds the maximum number of tokens allowed 131072"）：
+// 这是账号权益带来的上限，换通道（Playground 改走 Build）或换更高权益的账号可能有更高的上限。
+// 带具体计数的模型本身上限（"The input token count (N) exceeds the maximum number of tokens allowed (M)."）不算：任何账号都放不下
+func InputTokenCapError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "input token count exceeds the maximum number of tokens allowed")
+}
+
+// benefitTierRank 按账号输入上限大致由低到高给权益排序：Free < Plus < Pro < Ultra（未知权益按 Free）
+func benefitTierRank(tier BenefitTier) int {
+	switch tier {
+	case BenefitTierPlus:
+		return 1
+	case BenefitTierPro:
+		return 2
+	case BenefitTierUltra:
+		return 3
+	default:
+		return 0
+	}
+}
+
+// EnabledAccountsAboveTierOf 返回号池内启用、权益高于 accountID 所属账号权益的账户 ID（按候选索引顺序）。
+// 输入 token 超过账号上限时用它找一次更高权益的账号再试；accountID 不存在或没有更高权益的账号时返回 nil
+func (p *AccountPool) EnabledAccountsAboveTierOf(scope PoolScope, accountID string) []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return nil
+	}
+	rank := benefitTierRank(account.BenefitTier)
+	index := p.schedulingLocked()
+	var ids []string
+	for position := range index.ids {
+		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) || benefitTierRank(index.tier[position]) <= rank {
+			continue
+		}
+		ids = append(ids, index.ids[position])
+	}
+	return ids
+}

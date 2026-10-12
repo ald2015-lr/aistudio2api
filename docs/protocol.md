@@ -2162,6 +2162,7 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 情况 | HTTP | OpenAI | Anthropic | Gemini |
 | --- | ---: | --- | --- | --- |
 | 参数、Schema、tool choice 无效 | 400 | `invalid_request` | `invalid_request_error` | `INVALID_ARGUMENT` |
+| 输入 token 超过上限（提示词过长；上游以 400 或 429 返回都算，不冷却账号） | 400 | `context_length_exceeded` | `invalid_request_error`（消息以 `prompt is too long:` 开头） | `INVALID_ARGUMENT` |
 | 没有符合条件的账户 | 400 | `account_required` | `invalid_request_error` | `INVALID_ARGUMENT` |
 | 支持请求的账户均不可调度 | 503 | `account_unavailable` | `api_error` | `UNAVAILABLE` |
 | 本地 API key 无效 | 401 | `invalid_api_key` | `authentication_error` | `UNAUTHENTICATED` |
@@ -2170,7 +2171,7 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 上游拒绝权限 | 403 | `upstream_error` | `permission_error` | `PERMISSION_DENIED` |
 | 视频仍在生成 | 409 | `video_not_ready` | `api_error` | `INTERNAL` |
 | 文件超过 512 MiB | 413 | `file_too_large` | `request_too_large` | `INTERNAL` |
-| 上游配额或限流 | 429 | `upstream_error` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| 上游配额或限流（输入超限的 429 除外，见上） | 429 | `upstream_error` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 候选账户均在冷却且 1 分钟内不恢复 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 主用模型（`PRIMARY_MODELS`）排队超过 `PRIMARY_QUEUE_WAIT` 没有空闲的账号或 Worker（号池繁忙） | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 上游过载 | 529 | `upstream_error` | `overloaded_error` | `INTERNAL` |

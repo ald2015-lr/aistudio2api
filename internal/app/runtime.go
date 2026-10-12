@@ -3636,6 +3636,12 @@ func (service *trackedService) generateWithRetry(
 	copyFiles := false
 	// buildOnly：Playground 返回输入 token 超过上限后，后续尝试只走 Build 通道
 	buildOnly := false
+	// inputLimitErr 为最近一次"输入 token 超过上限"的上游错误：为它安排的再试（改走 Build、改用更高权益账号）没有立即可用的账号时
+	// 按这个错误结束，不排队等待，也不换成限流返回；immediateRetry 让下一次选号不等待；tierRetryAccountIDs 限定下一次选号的账号；
+	// tierRetried 保证更高权益账号只试一次
+	var inputLimitErr error
+	var tierRetryAccountIDs []string
+	immediateRetry, tierRetried := false, false
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、403、超时等）。
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
 	hardFailures := 0
@@ -3673,13 +3679,22 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
+		if tierRetryAccountIDs != nil {
+			selection.AllowedAccountIDs = tierRetryAccountIDs
+			tierRetryAccountIDs = nil
+		}
+		useImmediate := immediateRetry
+		immediateRetry = false
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
 		// 主用模型（PRIMARY_MODELS）的选号带排队预算：排队超过上限按 429 结束（见 primary_models.go），其他模型原样
 		acquireCtx := service.primaryAcquireContext(requestCtx, selection)
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
-		if service.streamPrefersPlayground(request, selection) {
+		// 输入超限后的再试只接受现在就能取得的账号，不排队
+		if useImmediate {
+			nextLease, acquireErr = service.acquireWarmLeaseNow(acquireCtx, selection, nil)
+		} else if service.streamPrefersPlayground(request, selection) {
 			nextLease, acquireErr = service.acquireStreamPlaygroundLease(acquireCtx, request.ID, selection)
 		} else {
 			nextLease, acquireErr = service.acquireWarmLease(acquireCtx, selection)
@@ -3692,6 +3707,13 @@ func (service *trackedService) generateWithRetry(
 		}
 		if acquireErr != nil {
 			trace.Note("获取账号失败: " + acquireErr.Error())
+			if inputLimitErr != nil {
+				// 输入超限后的再试（改走 Build、改用更高权益账号）没有立即可用的账号：按输入超限的原错误结束（对外 400），
+				// 不排队等冷却或 Worker，也不把它换成全部冷却、号池繁忙等限流错误
+				service.requests.logRequestProgress(request.ID, "service", "WARN", "输入超限后的再试没有立即可用的账号，按 400 返回 | 原因="+progressReason(acquireErr))
+				err = inputLimitErr
+				break
+			}
 			var capacityBusy *aistudio.CapacityBusyError
 			if errors.As(acquireErr, &capacityBusy) {
 				// 主用模型排队超过上限：立即按 429 结束，不换号、不复制文件、不冷却、不退避
@@ -3895,6 +3917,9 @@ func (service *trackedService) generateWithRetry(
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
 		localWorkerFailure := (workerFailed || workerReplaced) && requestCtx.Err() == nil
 		retryable := retryableGenerateAccountError(requestCtx, err) || localWorkerFailure
+		if !inputTokenLimitError(err) {
+			inputLimitErr = nil
+		}
 		recoverWorker := false
 		if aistudio.DefinitiveAuthenticationFailure(err) {
 			if stateErr := lease.MarkAuthenticationRequired(err.Error()); stateErr != nil {
@@ -3902,7 +3927,7 @@ func (service *trackedService) generateWithRetry(
 				retryable = false
 			}
 		}
-		cooled, switchedToBuild := false, false
+		cooled, switchedToBuild, inputLimitRetry := false, false, false
 		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, err, ""); ok {
 			cooled = true
 			if stateErr != nil {
@@ -3931,19 +3956,37 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		// Playground 对部分账号的模型输入另有上限（如 131072 token），Build 通道按模型本身的上限处理：
-		// 改走 Build 再试，同一账号也可以用。Build 也失败时按原错误返回：提示词过长与账号无关，不换号、不冷却，
-		// 对外按 400 返回（上游有时按 429 返回这个错误，见 aistudio.InputTokenLimitError）
+		// 输入 token 超过上限（提示词过长）与账号无关：不冷却、不按一般失败换号，对外按 400 返回（上游有时按 429 返回这个错误，
+		// 见 aistudio.InputTokenLimitError）。部分账号另有权益带来的输入上限（如 131072 token，见 InputTokenCapError）：
+		// Playground 超限改走 Build 再试一次（同一账号也可以用），仍超限且号池里有更高权益的账号时再用它们试一次；两次再试都只接受
+		// 现在就能取得的账号，不排队。带具体计数的模型本身上限任何账号都放不下，直接结束
 		if inputTokenLimitError(err) {
-			if !buildOnly && lease.Channel() == aistudio.ChannelPlayground {
-				buildOnly = true
-				switchedToBuild = true
-				retryable = true
+			inputLimitErr = err
+			capError := inputTokenCapError(err)
+			var higherTier []string
+			if capError && !tierRetried {
+				for _, accountID := range service.pool.EnabledAccountsAboveTierOf(scope, request.AccountID) {
+					if _, done := attempted[accountID]; !done {
+						higherTier = append(higherTier, accountID)
+					}
+				}
+			}
+			switch {
+			case capError && !buildOnly && !selection.PlaygroundOnly && lease.Channel() == aistudio.ChannelPlayground && service.pool.BuildEnabled():
+				buildOnly, switchedToBuild, retryable, immediateRetry = true, true, true, true
 				delete(attempted, request.AccountID)
 				maxAttempts++
-				trace.Note("Playground 返回输入 token 超过上限，改用 Build 通道重试")
+				trace.Note("Playground 返回输入 token 超过账号上限，改用 Build 通道再试一次")
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "Playground 输入超过上限，改用 Build 通道重试 | 原因="+progressReason(err))
-			} else {
+			case len(higherTier) > 0:
+				tierRetried, inputLimitRetry, retryable, immediateRetry = true, true, true, true
+				buildOnly = false
+				tierRetryAccountIDs = higherTier
+				maxAttempts++
+				trace.Note(fmt.Sprintf("输入 token 超过账号上限，改用更高权益的账号再试一次 | 候选=%d", len(higherTier)))
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+					"输入超过本账号上限，改用更高权益的账号再试一次 | 候选=%d | 原因=%s", len(higherTier), progressReason(err)))
+			default:
 				retryable = false
 				trace.Note("输入 token 超过模型上限（提示词过长），不换号、不冷却，按 400 返回")
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "输入超过模型上限（提示词过长），不换号、不冷却，按 400 返回 | 原因="+progressReason(err))
@@ -3978,7 +4021,7 @@ func (service *trackedService) generateWithRetry(
 		if attempt+1 == maxAttempts {
 			break
 		}
-		if !recoverWorker && !cooled && !switchedToBuild {
+		if !recoverWorker && !cooled && !switchedToBuild && !inputLimitRetry {
 			hardFailures++
 			if hardFailures >= generateFailureLimit {
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
@@ -4254,6 +4297,11 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 // inputTokenLimitError 判断上游返回的"输入 token 超过上限"（提示词过长）错误，400 与 429 两种写法都识别
 func inputTokenLimitError(err error) bool {
 	return aistudio.InputTokenLimitError(err)
+}
+
+// inputTokenCapError 判断是否为部分账号的输入上限错误（换通道或换更高权益账号可能放得下），见 aistudio.InputTokenCapError
+func inputTokenCapError(err error) bool {
+	return aistudio.InputTokenCapError(err)
 }
 
 func retryableGenerateAccountError(ctx context.Context, err error) bool {

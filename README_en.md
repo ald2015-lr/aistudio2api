@@ -550,7 +550,7 @@ With `WAA_BACKEND=go`, WAA runs inside the service process, emulates the Firefox
 - **AI Studio History**: API requests are not saved to website history; `TEMPORARY_CHAT=true` also disables autosave for the WAA prewarm page
 - **Responses and Interactions Sessions**: `previous_response_id` and `previous_interaction_id` are stored only in the current process and are cleared on restart
 - **Authentication Expiry**: Chrome imports retain DBSC renewal material; isolated-login accounts must log in again after authentication expires
-- **Input Length Cap**: Some accounts have a separate input cap on Playground and Build (for example 131072 tokens). A Playground cap error retries once on Build; when that also exceeds the cap the request returns 400 (`context_length_exceeded` for OpenAI, `prompt is too long` for Anthropic) even if upstream reported it as 429, and no account is switched or cooled down
+- **Input Length Cap**: Some accounts have a separate input cap on Playground and Build (for example 131072 tokens). A Playground cap error retries once on Build, and once more on a higher-tier account when the pool has one; both retries only take accounts available right now. If the input still exceeds the cap the request returns 400 (`context_length_exceeded` for OpenAI, `prompt is too long` for Anthropic) even if upstream reported it as 429, and no account is cooled down. A model hard limit (`(2000000) exceeds … (1048576)`) returns 400 immediately without retrying
 
 ## Troubleshooting
 
