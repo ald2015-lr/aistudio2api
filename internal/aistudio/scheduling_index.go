@@ -130,8 +130,10 @@ type candidateSet struct {
 	members   int
 	builtAt   time.Time
 	lastUsed  time.Time
-	// eligibilityVersion 为上次重建时的目录版本，只有含 Build 通道的候选集按它节流重建
+	// eligibilityVersion 为上次重建时的目录版本，只有含 Build 通道的候选集按它节流重建；playgroundStale 记录重建时
+	// Playground 模型索引仍在节流中（落后于目录版本），节流过后要再重建一次，不把旧索引的结论留到下一次目录变化
 	eligibilityVersion uint64
+	playgroundStale    bool
 }
 
 // schedulingIndex 为账户池的候选索引
@@ -217,6 +219,11 @@ func (index *schedulingIndex) refreshCoolingLocked(p *AccountPool, now time.Time
 	if now.Sub(index.coolSyncedAt) < schedulingBuildRebuildInterval {
 		return
 	}
+	// Playground 模型索引还在节流中时这一轮不重算：用旧索引算出的期限会一直留到下一次目录变化，与 StatusOf 的现算结果不一致；
+	// 下一次调用在索引重建后补上（账户多时最多晚一秒）
+	if !p.playgroundIndexCurrentLocked() {
+		return
+	}
 	for position, account := range p.accounts {
 		if account != nil && position < len(index.coolUntil) {
 			index.coolUntil[position] = p.accountCoolingUntilLocked(account)
@@ -288,7 +295,7 @@ func (p *AccountPool) candidateSetLocked(selection AccountSelection, now time.Ti
 		index.sets[key] = set
 		p.rebuildCandidateSetLocked(set, now)
 	} else if len(set.until) != len(p.accounts) || now.Sub(set.builtAt) >= schedulingSetMaxAge ||
-		set.eligibilityVersion != p.eligibilityVersion && slices.Contains(set.channels, ChannelBuild) &&
+		(set.eligibilityVersion != p.eligibilityVersion || set.playgroundStale) && slices.Contains(set.channels, ChannelBuild) &&
 			now.Sub(set.builtAt) >= schedulingBuildRebuildInterval {
 		p.rebuildCandidateSetLocked(set, now)
 	}
@@ -312,6 +319,8 @@ func (index *schedulingIndex) evictLocked() {
 func (p *AccountPool) rebuildCandidateSetLocked(set *candidateSet, now time.Time) {
 	// selectionChannelsLocked 可能直接返回账户池共用的通道切片，另存一份
 	set.channels = append(set.channels[:0], p.selectionChannelsLocked(set.selection)...)
+	// 含 Build 通道的候选集按 Playground 模型索引判断通道支持：索引仍在节流中时记下，节流过后再重建一次
+	set.playgroundStale = slices.Contains(set.channels, ChannelBuild) && !p.playgroundIndexCurrentLocked()
 	if cap(set.until) >= len(p.accounts) {
 		set.until = set.until[:len(p.accounts)]
 		clear(set.until)
@@ -408,8 +417,8 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 	p.accountChangedLocked(account)
 }
 
-// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集与 Ultra 账户集合；调用方持有 p.mu。
-// 每条修改这些字段的路径都必须调用，否则候选集要等下次全量重建才能反映变化
+// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集、Ultra 账户集合与缓存的状态列表；调用方持有 p.mu。
+// 每条修改这些字段的路径都必须调用，否则候选集要等下次全量重建才能反映变化，Status() 要等缓存过期才与 StatusOf 一致
 func (p *AccountPool) accountChangedLocked(account *Account) {
 	if account == nil {
 		return
@@ -419,15 +428,15 @@ func (p *AccountPool) accountChangedLocked(account *Account) {
 	} else {
 		delete(p.ultraAccounts, account.ID)
 	}
-	if p.sched == nil {
-		return
+	if p.sched != nil {
+		if p.sched.positionValid(p, account) {
+			p.sched.syncAccount(p, account)
+		}
+		for _, set := range p.sched.sets {
+			p.updateCandidateLocked(set, account)
+		}
 	}
-	if p.sched.positionValid(p, account) {
-		p.sched.syncAccount(p, account)
-	}
-	for _, set := range p.sched.sets {
-		p.updateCandidateLocked(set, account)
-	}
+	p.refreshStatusEntryLocked(account)
 }
 
 // derivedStateAt 按数组推导账户对外状态，与 accountStateLocked 相同：停用、忙碌、冷却或原始状态；

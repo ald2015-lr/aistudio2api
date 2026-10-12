@@ -237,29 +237,44 @@ func (p *AccountPool) buildSupportsModelLocked(account *Account, modelID string)
 // 找到的第一个模型相同。原实现每次都扫描全部账户的全部模型；buildOnlyModelsLocked 对每个启用账户、
 // 每个 Build 模型都要调用一次，账户上千时是随账户数平方增长的计算，并且全程占着账户池锁
 func (p *AccountPool) playgroundModelLocked(modelID string) (Model, bool) {
-	if p.playgroundIndex == nil || p.playgroundIndexVersion != p.catalogVersion && p.playgroundIndexRebuildDue() {
-		index := make(map[string]Model)
-		for _, account := range p.accounts {
-			if account == nil {
-				continue
+	p.ensurePlaygroundIndexLocked()
+	model, exists := p.playgroundIndex[modelID]
+	return model, exists
+}
+
+// ensurePlaygroundIndexLocked 在索引缺失，或目录版本变化且节流允许时重建 Playground 模型索引；调用方持有 p.mu
+func (p *AccountPool) ensurePlaygroundIndexLocked() {
+	if p.playgroundIndex != nil && (p.playgroundIndexVersion == p.catalogVersion || !p.playgroundIndexRebuildDue()) {
+		return
+	}
+	index := make(map[string]Model)
+	for _, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if _, exists := index[model.ID]; !exists {
+				index[model.ID] = model
 			}
-			for _, model := range account.Models {
-				if _, exists := index[model.ID]; !exists {
-					index[model.ID] = model
-				}
-				for _, alias := range model.CapabilityOptions["aliases"] {
-					if _, exists := index[alias]; !exists {
-						index[alias] = model
-					}
+			for _, alias := range model.CapabilityOptions["aliases"] {
+				if _, exists := index[alias]; !exists {
+					index[alias] = model
 				}
 			}
 		}
-		p.playgroundIndex = index
-		p.playgroundIndexVersion = p.catalogVersion
-		p.playgroundIndexBuiltAt = time.Now()
 	}
-	model, exists := p.playgroundIndex[modelID]
-	return model, exists
+	p.playgroundIndex = index
+	p.playgroundIndexVersion = p.catalogVersion
+	p.playgroundIndexBuiltAt = time.Now()
+}
+
+// playgroundIndexCurrentLocked 返回 Playground 模型索引（节流允许时先重建）是否与当前目录版本一致。Build 通道能否调用模型
+// 要查这个索引（见 buildSupportsModelLocked）：按目录版本缓存的派生结果（状态口径的冷却期限、含 Build 通道的候选集）重算时
+// 必须以同一版本的索引为准，否则会把节流中的旧索引烙进缓存，要等下一次目录变化才纠正；索引落后时调用方跳过这一轮、
+// 节流过后再算，不额外重建索引；调用方持有 p.mu
+func (p *AccountPool) playgroundIndexCurrentLocked() bool {
+	p.ensurePlaygroundIndexLocked()
+	return p.playgroundIndexVersion == p.catalogVersion
 }
 
 // buildExcludedPlaygroundModel 判断 Playground 目录模型是否使用 Build 未接入的专用路由

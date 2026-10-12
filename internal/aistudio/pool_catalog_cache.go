@@ -292,6 +292,26 @@ func (p *AccountPool) invalidateStatusLocked() {
 	p.statusCache = nil
 }
 
+// refreshStatusEntryLocked 在账户的启用、状态、目录、权益或冷却变化后就地更新缓存列表中该账户的一项：管理操作的返回值与账户列表
+// 都来自 Status()，变化要在缓存期内立刻可见，又不必因为一个账户的变化丢掉整份列表（账户上万时重建要几十毫秒，冷却与目录同步
+// 每秒都有几次）。缓存已过期时直接丢弃，下次调用重建；下标与缓存项对不上（账户增删后尚未重编号）时整份作废；调用方持有 p.mu
+func (p *AccountPool) refreshStatusEntryLocked(account *Account) {
+	if p.statusCache == nil {
+		return
+	}
+	now := time.Now()
+	if now.Sub(p.statusCacheAt) >= statusCacheTTL {
+		p.invalidateStatusLocked()
+		return
+	}
+	position := account.position
+	if position < 0 || position >= len(p.statusCache) || p.statusCache[position].ID != account.ID {
+		p.invalidateStatusLocked()
+		return
+	}
+	p.statusCache[position] = p.accountStatusLocked(account, now)
+}
+
 // cloneStatuses 拷贝状态列表，调用方各自持有一份
 func cloneStatuses(statuses []AccountStatus) []AccountStatus {
 	return slices.Clone(statuses)

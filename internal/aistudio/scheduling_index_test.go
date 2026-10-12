@@ -245,9 +245,17 @@ func (fuzzer *indexFuzzer) randomID() string {
 	return fuzzer.ids[fuzzer.random.Intn(len(fuzzer.ids))]
 }
 
+// randomModels 随机抽取目录；Ultra 专用模型很少出现，让“Playground 里有没有它”在变更中来回翻转：
+// 它出现在任一账户的 Playground 目录后，Free 账户的 Build 通道对它不再可用（跨账户依赖，见 buildSupportsModelLocked）
 func (fuzzer *indexFuzzer) randomModels() []Model {
 	var models []Model
 	for _, model := range fuzzer.catalog {
+		if model.ID == indexTestUltraOnly {
+			if fuzzer.random.Intn(50) == 0 {
+				models = append(models, model)
+			}
+			continue
+		}
 		if fuzzer.random.Intn(4) != 0 {
 			models = append(models, model)
 		}
@@ -260,7 +268,22 @@ func (fuzzer *indexFuzzer) randomTier() BenefitTier {
 }
 
 func (fuzzer *indexFuzzer) randomScope() string {
-	return []string{"", indexTestModel, indexTestFlash, "build:" + indexTestModel, "count-tokens:" + indexTestModel}[fuzzer.random.Intn(5)]
+	return []string{
+		"", indexTestModel, indexTestFlash, "build:" + indexTestModel, "count-tokens:" + indexTestModel, "build:" + indexTestUltraOnly,
+	}[fuzzer.random.Intn(6)]
+}
+
+// syncDerivedLocked 跳过节流，把目录变化对其他账户 Build 通道的影响同步到候选索引：状态口径的冷却期限重算、含 Build 通道的候选集重建。
+// 生产路径按 schedulingBuildRebuildInterval 节流（最多晚一秒），核对前先同步再与逐个账户现算的参考实现比较
+func (p *AccountPool) syncDerivedLocked(now time.Time) {
+	index := p.schedulingLocked()
+	index.coolSyncedAt = time.Time{}
+	index.refreshCoolingLocked(p, now)
+	for _, set := range index.sets {
+		if (set.eligibilityVersion != p.eligibilityVersion || set.playgroundStale) && slices.Contains(set.channels, ChannelBuild) {
+			p.rebuildCandidateSetLocked(set, now)
+		}
+	}
 }
 
 // mutate 执行一次随机变更
@@ -442,6 +465,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 	pool, t := fuzzer.pool, fuzzer.t
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+	pool.syncDerivedLocked(time.Now())
 	if err := pool.verifySchedulingIndexLocked(); err != nil {
 		t.Fatalf("第 %d 轮：候选索引与账户状态不一致: %v", round, err)
 	}

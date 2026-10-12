@@ -674,11 +674,10 @@ func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status ap
 	admin.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
 }
 
+// account 返回单个账户的管理视图：直接构建这一个账户的状态，不经过 Status() 的全量列表与缓存，管理操作刚写入的变化立即可见
 func (admin *runtimeAdmin) account(accountID string) (api.AdminAccount, error) {
-	for _, status := range admin.pool.Status() {
-		if status.ID == accountID {
-			return adminAccountDTO(status), nil
-		}
+	if status, ok := admin.pool.StatusOf(accountID); ok {
+		return adminAccountDTO(status), nil
 	}
 	return api.AdminAccount{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, accountID))
 }

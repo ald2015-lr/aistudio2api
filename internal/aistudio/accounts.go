@@ -1169,10 +1169,12 @@ func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*Ac
 				account.leaseLock = leaseLock
 				account.leasePath = leasePath
 				p.busyChangedLocked(account)
+				// 代际在锁内读取：目录同步与认证结果在锁内递增它们，解锁后再读会与之竞争
+				authGeneration, modelAccessGeneration := account.authGeneration, account.modelAccessGeneration
 				p.mu.Unlock()
 				lease := &AccountLease{
-					pool: p, account: account, exclusive: true, authGeneration: account.authGeneration,
-					modelAccessGeneration: account.modelAccessGeneration, checkedAt: checkedAt,
+					pool: p, account: account, exclusive: true, authGeneration: authGeneration,
+					modelAccessGeneration: modelAccessGeneration, checkedAt: checkedAt,
 				}
 				if err := p.refreshAccountRuntime(ctx, account); err != nil {
 					releaseErr := lease.Release()
@@ -2576,6 +2578,8 @@ func (p *AccountPool) Status() []AccountStatus {
 		p.mu.Unlock()
 		return cloneStatuses(cached)
 	}
+	// 先让候选索引给账户编号：缓存的列表按账户下标就地更新单个账户（见 refreshStatusEntryLocked）
+	p.schedulingLocked()
 	statuses := make([]AccountStatus, 0, len(p.accounts))
 	for _, account := range p.accounts {
 		if account == nil {
@@ -3113,20 +3117,22 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		accountID = owner
 	}
 	if accountID != "" {
-		for index, account := range p.accounts {
-			if account != nil && account.ID == accountID {
-				if allowed != nil {
-					if _, exists := allowed[accountID]; !exists {
-						return nil, ErrNoEligibleAccount
-					}
-				}
-				if !selection.Pool.allows(account) {
-					return nil, ErrNoEligibleAccount
-				}
-				return []int{index}, nil
+		// 指定账户按账户表定位，下标由候选索引维护（账户增删后重建时重新编号）；原先逐个比对全部账户的 ID，
+		// 账户上万时每次备用账户晋升为 Worker 的选号都要在锁内扫一遍
+		account := p.byID[accountID]
+		if account == nil {
+			return nil, ErrNoEligibleAccount
+		}
+		if allowed != nil {
+			if _, exists := allowed[accountID]; !exists {
+				return nil, ErrNoEligibleAccount
 			}
 		}
-		return nil, ErrNoEligibleAccount
+		if !selection.Pool.allows(account) {
+			return nil, ErrNoEligibleAccount
+		}
+		p.schedulingLocked()
+		return []int{account.position}, nil
 	}
 	var indices []int
 	if allowed != nil && len(allowed)*4 < len(p.accounts) {

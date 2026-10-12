@@ -310,4 +310,19 @@ func TestPoolAdminCallsScale(t *testing.T) {
 			_ = lease.Release()
 		}
 	})
+	// 指定账户的选号（备用账户晋升为 Worker 时的路径）按账户表定位，耗时不随账户在列表中的位置增长
+	for _, accountID := range []string{"free-00001@example.com", "free-14850@example.com", "ultra-076@example.com"} {
+		timeCall("TryAcquireFor(AccountID="+accountID+")", func() {
+			lease, _, err := pool.TryAcquireFor(context.Background(), AccountSelection{
+				ModelID: scaleModel, Method: "generateContent", AccountID: accountID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if lease == nil || lease.Account().ID != accountID {
+				t.Fatalf("指定账户 %s 的租约 = %v", accountID, lease)
+			}
+			_ = lease.Release()
+		})
+	}
 }
