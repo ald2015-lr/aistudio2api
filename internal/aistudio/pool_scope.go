@@ -229,8 +229,9 @@ func (p *AccountPool) EnabledAccountsIn(scope PoolScope) ([]string, int) {
 func (p *AccountPool) attemptCandidatesIn(scope PoolScope) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	index := p.schedulingLocked()
-	nowNanos := time.Now().UnixNano()
+	now := time.Now()
+	index := p.derivedStatesLocked(now)
+	nowNanos := now.UnixNano()
 	eligible := 0
 	for position := range index.ids {
 		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {

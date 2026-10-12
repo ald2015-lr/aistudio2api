@@ -157,9 +157,11 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	index := p.derivedStatesLocked(now)
+	nowNanos := now.UnixNano()
 	summary := BootstrapSummary{}
 	seen := make(map[string]struct{})
-	for _, account := range p.accounts {
+	for position, account := range p.accounts {
 		if account == nil {
 			continue
 		}
@@ -173,8 +175,8 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		if len(models) == 0 || !account.Config.Enabled {
 			continue
 		}
-		// 与 Status 共用状态推导：需要登录的账户即使还有未结束的租约也不计入可预热
-		if state := accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
+		// 与 Status 共用状态推导（按候选索引的紧凑数组）：需要登录的账户即使还有未结束的租约也不计入可预热
+		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {
 			summary.Available++
 			if account.BenefitTier == BenefitTierUltra {
 				summary.UltraAvailable++
@@ -260,8 +262,9 @@ func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// 按候选索引的紧凑数组推导状态（与 accountStateLocked 相同），状态接口每几秒调用一次，不再逐个访问账户结构
-	index := p.schedulingLocked()
-	nowNanos := time.Now().UnixNano()
+	now := time.Now()
+	index := p.derivedStatesLocked(now)
+	nowNanos := now.UnixNano()
 	for position := range index.ids {
 		if p.accounts[position] == nil {
 			continue
@@ -301,11 +304,13 @@ func (p *AccountPool) StatusOf(accountID string) (AccountStatus, bool) {
 	if account == nil {
 		return AccountStatus{}, false
 	}
-	return accountStatusLocked(account, time.Now()), true
+	return p.accountStatusLocked(account, time.Now()), true
 }
 
 // longCoolingLocked 判断账户在该模型上是否长时间不可用：全局冷却，或所有启用通道都在冷却，
-// 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu
+// 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu。
+// 这是 Worker 淘汰与轮换的口径（针对指定模型、不看通道是否支持该模型、有剩余时间门槛）；状态页与状态摘要的 cooldown
+// 另按 accountCoolingLocked 判断（任一模型、只看账户可用的通道、不设门槛），两者有意不同
 func (p *AccountPool) longCoolingLocked(account *Account, modelID string, now time.Time, minRemaining time.Duration) bool {
 	if longCooldownActive(account, globalCooldownKey, now, minRemaining) {
 		return true
@@ -457,7 +462,8 @@ func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, min
 
 // SpareAccounts 统计号池内可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型、没有全局长时间冷却，
 // 并且没有在任一指定模型上长时间不可用，一次加锁。数到 limit 个就停止（limit 不大于 0 时数完全部）：
-// 轮换与淘汰只需要知道“有没有 N 个可接替的账户”，账户上万时不必在锁内扫完全部
+// 轮换与淘汰只需要知道“有没有 N 个可接替的账户”，账户上万时不必在锁内扫完全部。
+// 停用、未就绪、不在号池与全局长时间冷却的账户先按候选索引的紧凑数组排除（上万账户、大半处于每日限额时只剩少数要逐个判断）
 func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, limit int) int {
 	if p == nil {
 		return 0
@@ -465,12 +471,17 @@ func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
+	index := p.schedulingLocked()
+	nowNanos, minNanos := now.UnixNano(), int64(max(minRemaining, 0))
 	spare := 0
-	for _, account := range p.accounts {
+	for position, account := range p.accounts {
 		if limit > 0 && spare >= limit {
 			break
 		}
-		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
+		if account == nil || !index.enabled[position] || index.state[position] != AccountReady || !scope.allowsTier(index.tier[position]) {
+			continue
+		}
+		if global := index.globalUntil[position]; global > nowNanos && global-nowNanos >= minNanos {
 			continue
 		}
 		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModelsLocked(account)) == 0 {

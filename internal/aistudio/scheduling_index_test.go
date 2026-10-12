@@ -154,7 +154,7 @@ func bruteStateCounts(p *AccountPool, now time.Time) (AccountStateCounts, Accoun
 		if account == nil {
 			continue
 		}
-		state := accountStateLocked(account, now)
+		state := p.accountStateLocked(account, now)
 		counts.add(state)
 		if account.BenefitTier == BenefitTierUltra {
 			ultra.add(state)
@@ -185,7 +185,7 @@ func bruteAttemptCandidates(p *AccountPool, scope PoolScope, now time.Time) int 
 		if account == nil || !account.Config.Enabled || !scope.allows(account) {
 			continue
 		}
-		if state := accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
+		if state := p.accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
 			eligible++
 		}
 	}
@@ -500,7 +500,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 		}
 		// 状态统计与换号上限用同一时刻比较
 		nowNanos := now.UnixNano()
-		index := pool.schedulingLocked()
+		index := pool.derivedStatesLocked(now)
 		ids, schedulable := make([]string, 0), 0
 		eligible := 0
 		for position := range index.ids {
@@ -523,7 +523,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 			t.Fatalf("第 %d 轮：号池 %v 的换号上限 %d，期望 %d", round, scope, eligible, want)
 		}
 	}
-	index := pool.schedulingLocked()
+	index := pool.derivedStatesLocked(now)
 	var counts, ultra AccountStateCounts
 	for position := range index.ids {
 		if pool.accounts[position] == nil {

@@ -76,7 +76,7 @@ func (p *AccountPool) LoginSummaries() []AccountLoginSummary {
 			continue
 		}
 		summaries = append(summaries, AccountLoginSummary{
-			ID: account.ID, Enabled: account.Config.Enabled, State: accountStateLocked(account, now),
+			ID: account.ID, Enabled: account.Config.Enabled, State: p.accountStateLocked(account, now),
 			StoragePath: account.StoragePath, Directory: account.Directory,
 			FilesMissing: account.State == AccountUnavailable && account.stateMessage == ErrAccountNotFound.Error(),
 		})

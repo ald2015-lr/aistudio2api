@@ -139,15 +139,21 @@ type schedulingIndex struct {
 	accountsVersion uint64
 	sets            map[selectionKey]*candidateSet
 	// 按账户下标的紧凑数组：ids 为账户 ID；enabled、state、tier、globalUntil 为启用、状态、权益与全局冷却期限
-	// （UnixNano，0 为没有），由 accountChangedLocked 更新；blocked 为独占、等待独占或认证刷新中，active 为进行中的租约数，
+	// （UnixNano，0 为没有）；coolUntil 为账户按状态口径冷却到的时刻（全局冷却，或某个模型在账户可用的每个启用通道上都冷却，
+	// 见 accountCoolingUntilLocked），由 accountChangedLocked 更新；blocked 为独占、等待独占或认证刷新中，active 为进行中的租约数，
 	// 由 busyChangedLocked 更新。状态统计与换号上限按这些数组顺序扫描，不再逐个访问账户结构
 	ids         []string
 	enabled     []bool
 	state       []AccountState
 	tier        []BenefitTier
 	globalUntil []int64
+	coolUntil   []int64
 	blocked     []bool
 	active      []int32
+	// coolVersion 为上次按目录版本核对 coolUntil 时的 eligibilityVersion，coolSyncedAt 为核对时刻：Build 通道是否可用于某模型
+	// 还取决于其他账户的 Playground 目录（见 buildSupportsModelLocked），这个跨账户依赖按节流全量重算（见 refreshCoolingLocked）
+	coolVersion  uint64
+	coolSyncedAt time.Time
 	// warmStamp 记录最近一次分类把该账户标为热账户时的代数；lastWarm 为上次标记用的热账户列表，列表不变时直接沿用代数：
 	// 每次分类都按 ID 查一遍上万条目的账户表要几十微秒，而热账户列表只在 Worker 启停时变化
 	warmStamp      []uint32
@@ -162,8 +168,9 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 		index := &schedulingIndex{
 			accountsVersion: p.accountsVersion, sets: make(map[selectionKey]*candidateSet),
 			ids: make([]string, size), enabled: make([]bool, size), state: make([]AccountState, size),
-			tier: make([]BenefitTier, size), globalUntil: make([]int64, size),
+			tier: make([]BenefitTier, size), globalUntil: make([]int64, size), coolUntil: make([]int64, size),
 			blocked: make([]bool, size), active: make([]int32, size), warmStamp: make([]uint32, size),
+			coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
 		}
 		for position, account := range p.accounts {
 			if account == nil {
@@ -171,7 +178,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			}
 			account.position = position
 			index.ids[position] = account.ID
-			index.syncAccount(account)
+			index.syncAccount(p, account)
 			index.blocked[position] = accountBlocked(account)
 			index.active[position] = int32(account.active)
 		}
@@ -180,13 +187,43 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 	return p.sched
 }
 
-// syncAccount 把账户的启用、状态、权益与全局冷却期限写进数组；调用方已确认下标有效
-func (index *schedulingIndex) syncAccount(account *Account) {
+// derivedStatesLocked 返回用于推导账户对外状态的候选索引：先按目录版本核对 coolUntil；调用方持有 p.mu
+func (p *AccountPool) derivedStatesLocked(now time.Time) *schedulingIndex {
+	index := p.schedulingLocked()
+	index.refreshCoolingLocked(p, now)
+	return index
+}
+
+// syncAccount 把账户的启用、状态、权益、全局冷却期限与状态口径的冷却期限写进数组；调用方已确认下标有效
+func (index *schedulingIndex) syncAccount(p *AccountPool, account *Account) {
 	position := account.position
 	index.enabled[position] = account.Config.Enabled
 	index.state[position] = account.State
 	index.tier[position] = account.BenefitTier
 	index.globalUntil[position] = cooldownNanos(account.runtime.Cooldowns[globalCooldownKey])
+	index.coolUntil[position] = p.accountCoolingUntilLocked(account)
+}
+
+// refreshCoolingLocked 在目录版本变化后按节流重算全部账户的 coolUntil：账户自己的冷却表、目录与权益变化时 accountChangedLocked
+// 已逐个同步，这里只兜底 Build 通道对其他账户 Playground 目录的依赖，因此只启用 Playground 时不需要重算；调用方持有 p.mu
+func (index *schedulingIndex) refreshCoolingLocked(p *AccountPool, now time.Time) {
+	if index.coolVersion == p.eligibilityVersion {
+		return
+	}
+	if !p.channelEnabledLocked(ChannelBuild) {
+		index.coolVersion = p.eligibilityVersion
+		return
+	}
+	if now.Sub(index.coolSyncedAt) < schedulingBuildRebuildInterval {
+		return
+	}
+	for position, account := range p.accounts {
+		if account != nil && position < len(index.coolUntil) {
+			index.coolUntil[position] = p.accountCoolingUntilLocked(account)
+		}
+	}
+	index.coolVersion = p.eligibilityVersion
+	index.coolSyncedAt = now
 }
 
 // accountBlocked 判断账户是否因独占、等待独占或认证刷新而不能接请求
@@ -357,6 +394,7 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 		index.state = append(index.state, "")
 		index.tier = append(index.tier, 0)
 		index.globalUntil = append(index.globalUntil, 0)
+		index.coolUntil = append(index.coolUntil, 0)
 		index.blocked = append(index.blocked, accountBlocked(account))
 		index.active = append(index.active, int32(account.active))
 		index.warmStamp = append(index.warmStamp, 0)
@@ -385,14 +423,15 @@ func (p *AccountPool) accountChangedLocked(account *Account) {
 		return
 	}
 	if p.sched.positionValid(p, account) {
-		p.sched.syncAccount(account)
+		p.sched.syncAccount(p, account)
 	}
 	for _, set := range p.sched.sets {
 		p.updateCandidateLocked(set, account)
 	}
 }
 
-// derivedStateAt 按数组推导账户对外状态，与 accountStateLocked 相同：停用、忙碌、冷却或原始状态
+// derivedStateAt 按数组推导账户对外状态，与 accountStateLocked 相同：停用、忙碌、冷却或原始状态；
+// 冷却按状态口径的期限 coolUntil 判断（全局冷却，或某个模型在每个可用通道上都冷却）
 func (index *schedulingIndex) derivedStateAt(position int, nowNanos int64) AccountState {
 	state := index.state[position]
 	if !index.enabled[position] {
@@ -401,7 +440,7 @@ func (index *schedulingIndex) derivedStateAt(position int, nowNanos int64) Accou
 	if state == AccountReady && (index.blocked[position] || index.active[position] > 0) {
 		return AccountBusy
 	}
-	if state == AccountReady && index.globalUntil[position] > nowNanos {
+	if state == AccountReady && index.coolUntil[position] > nowNanos {
 		return AccountCooldown
 	}
 	return state
@@ -633,9 +672,11 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 		}
 		if index.enabled[position] != account.Config.Enabled || index.state[position] != account.State ||
 			index.tier[position] != account.BenefitTier ||
-			index.globalUntil[position] != cooldownNanos(account.runtime.Cooldowns[globalCooldownKey]) {
-			return fmt.Errorf("账户 %s 的状态数组（启用=%v 状态=%s 权益=%d 全局冷却=%d）与账户字段不符",
-				account.ID, index.enabled[position], index.state[position], index.tier[position], index.globalUntil[position])
+			index.globalUntil[position] != cooldownNanos(account.runtime.Cooldowns[globalCooldownKey]) ||
+			index.coolUntil[position] != p.accountCoolingUntilLocked(account) {
+			return fmt.Errorf("账户 %s 的状态数组（启用=%v 状态=%s 权益=%d 全局冷却=%d 状态冷却=%d）与账户字段不符",
+				account.ID, index.enabled[position], index.state[position], index.tier[position],
+				index.globalUntil[position], index.coolUntil[position])
 		}
 	}
 	nowNanos := time.Now().UnixNano()

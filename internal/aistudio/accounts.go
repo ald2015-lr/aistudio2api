@@ -2541,7 +2541,7 @@ func (p *AccountPool) Status() []AccountStatus {
 		if account == nil {
 			continue
 		}
-		statuses = append(statuses, accountStatusLocked(account, now))
+		statuses = append(statuses, p.accountStatusLocked(account, now))
 	}
 	p.storeStatusLocked(statuses, now)
 	shared := p.statusCache != nil
@@ -2553,28 +2553,108 @@ func (p *AccountPool) Status() []AccountStatus {
 }
 
 // accountStateLocked 推导账户对外状态：停用、忙碌、冷却或原始状态；调用方持有 p.mu。
-// 只有就绪账户会显示为忙碌：需要登录或不可用的账户即使还有未结束的租约也显示原状态，不被“忙碌”盖住
-func accountStateLocked(account *Account, now time.Time) AccountState {
+// 只有就绪账户会显示为忙碌：需要登录或不可用的账户即使还有未结束的租约也显示原状态，不被“忙碌”盖住。
+// 冷却按调度上是否还能用来判断：全局 "*" 冷却仍有效，或至少有一个模型在账户可用的每个启用通道上都在冷却
+// （见 accountCoolingLocked）。原先只看全局冷却：每日限额按模型与通道记录，账户在主用模型上两个通道都冷却到次日时
+// 状态页仍显示就绪、冷却计数为 0，上万条冷却被摘要掩盖
+func (p *AccountPool) accountStateLocked(account *Account, now time.Time) AccountState {
 	state := account.State
-	_, active := accountCooldown(account, "", now)
 	if !account.Config.Enabled {
 		state = AccountDisabled
 	} else if state == AccountReady &&
 		(account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0) {
 		state = AccountBusy
-	} else if state == AccountReady && active {
+	} else if state == AccountReady && p.accountCoolingLocked(account, now) {
 		state = AccountCooldown
 	}
 	return state
 }
 
+// accountCoolingLocked 判断账户是否处于冷却状态：全局 "*" 冷却仍有效，或任一有效冷却所在的模型在账户可用的每个启用通道上
+// 都在冷却。只遍历账户自己的冷却表（通常几条），每条按目录索引判断通道支持，账户上万时状态统计仍很快；调用方持有 p.mu
+func (p *AccountPool) accountCoolingLocked(account *Account, now time.Time) bool {
+	if _, active := accountCooldown(account, "", now); active {
+		return true
+	}
+	for key, cooldown := range account.runtime.Cooldowns {
+		if key == globalCooldownKey || !cooldown.Active(now) {
+			continue
+		}
+		if p.accountModelCoolingLocked(account, cooldownModelID(key), now) {
+			return true
+		}
+	}
+	return false
+}
+
+// accountModelCoolingLocked 判断账户在模型上的每个可用通道是否都在冷却：Playground 要求通道启用、目录含该模型且权益允许，
+// 冷却键为模型 ID；Build 要求通道启用且 Build 目录支持，冷却键为 build:<模型>。没有可用通道时按不冷却处理
+// （目录已不含该模型，冷却记录不再影响调度）；只有一个通道冷却、另一个通道还能用时同样不算冷却；调用方持有 p.mu
+func (p *AccountPool) accountModelCoolingLocked(account *Account, modelID string, now time.Time) bool {
+	usable := false
+	if p.channelEnabledLocked(ChannelPlayground) {
+		if model, exists := accountModelLocked(account, modelID); exists && modelAllowedByTier(model, account.BenefitTier) {
+			usable = true
+			if _, active := accountCooldown(account, modelID, now); !active {
+				return false
+			}
+		}
+	}
+	if p.channelEnabledLocked(ChannelBuild) && p.buildSupportsModelLocked(account, modelID) {
+		usable = true
+		if _, active := accountCooldown(account, ChannelCooldownScope(ChannelBuild, modelID), now); !active {
+			return false
+		}
+	}
+	return usable
+}
+
+// accountCoolingUntilLocked 返回账户按状态口径冷却到的时刻（UnixNano，0 为没有），与 accountCoolingLocked 同口径：
+// 全局 "*" 冷却的期限，与每个有冷却记录的模型在账户可用的每个启用通道上都冷却到的时刻，取其中最晚者；
+// 时刻之前账户为冷却状态、之后不是。候选索引按下标保存这个时刻（见 schedulingIndex.coolUntil），状态统计与换号上限
+// 只比较数组，不用逐个账户遍历冷却表；调用方持有 p.mu
+func (p *AccountPool) accountCoolingUntilLocked(account *Account) int64 {
+	until := cooldownNanos(account.runtime.Cooldowns[globalCooldownKey])
+	for key := range account.runtime.Cooldowns {
+		if key == globalCooldownKey {
+			continue
+		}
+		until = max(until, p.accountModelCoolingUntilLocked(account, cooldownModelID(key)))
+	}
+	return until
+}
+
+// accountModelCoolingUntilLocked 返回模型在账户每个可用通道上都冷却到的时刻：各可用通道冷却期限中最早的；
+// 没有可用通道或任一可用通道没有冷却为 0。通道是否可用与 accountModelCoolingLocked 相同；调用方持有 p.mu
+func (p *AccountPool) accountModelCoolingUntilLocked(account *Account, modelID string) int64 {
+	until := int64(-1)
+	if p.channelEnabledLocked(ChannelPlayground) {
+		if model, exists := accountModelLocked(account, modelID); exists && modelAllowedByTier(model, account.BenefitTier) {
+			until = cooldownNanos(account.runtime.Cooldowns[modelID])
+			if until <= 0 {
+				return 0
+			}
+		}
+	}
+	if p.channelEnabledLocked(ChannelBuild) && p.buildSupportsModelLocked(account, modelID) {
+		channelUntil := cooldownNanos(account.runtime.Cooldowns[ChannelCooldownScope(ChannelBuild, modelID)])
+		if channelUntil <= 0 {
+			return 0
+		}
+		if until < 0 || channelUntil < until {
+			until = channelUntil
+		}
+	}
+	return max(until, 0)
+}
+
 // accountStatusLocked 构建单个账户的状态；调用方持有 p.mu
-func accountStatusLocked(account *Account, now time.Time) AccountStatus {
+func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) AccountStatus {
 	models := accountStatusModelsLocked(account)
 	status := AccountStatus{
 		ID:          account.ID,
 		Label:       account.Config.Label,
-		State:       accountStateLocked(account, now),
+		State:       p.accountStateLocked(account, now),
 		Enabled:     account.Config.Enabled,
 		Proxy:       account.Config.Proxy,
 		Locale:      account.Config.Locale,
