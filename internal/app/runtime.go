@@ -3932,15 +3932,22 @@ func (service *trackedService) generateWithRetry(
 			}
 		}
 		// Playground 对部分账号的模型输入另有上限（如 131072 token），Build 通道按模型本身的上限处理：
-		// 改走 Build 再试，同一账号也可以用。Build 也失败时按原错误返回
-		if !buildOnly && lease.Channel() == aistudio.ChannelPlayground && inputTokenLimitError(err) {
-			buildOnly = true
-			switchedToBuild = true
-			retryable = true
-			delete(attempted, request.AccountID)
-			maxAttempts++
-			trace.Note("Playground 返回输入 token 超过上限，改用 Build 通道重试")
-			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "Playground 输入超过上限，改用 Build 通道重试 | 原因="+progressReason(err))
+		// 改走 Build 再试，同一账号也可以用。Build 也失败时按原错误返回：提示词过长与账号无关，不换号、不冷却，
+		// 对外按 400 返回（上游有时按 429 返回这个错误，见 aistudio.InputTokenLimitError）
+		if inputTokenLimitError(err) {
+			if !buildOnly && lease.Channel() == aistudio.ChannelPlayground {
+				buildOnly = true
+				switchedToBuild = true
+				retryable = true
+				delete(attempted, request.AccountID)
+				maxAttempts++
+				trace.Note("Playground 返回输入 token 超过上限，改用 Build 通道重试")
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "Playground 输入超过上限，改用 Build 通道重试 | 原因="+progressReason(err))
+			} else {
+				retryable = false
+				trace.Note("输入 token 超过模型上限（提示词过长），不换号、不冷却，按 400 返回")
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "输入超过模型上限（提示词过长），不换号、不冷却，按 400 返回 | 原因="+progressReason(err))
+			}
 		}
 		releaseErr := lease.Release()
 		lease = nil
@@ -4244,14 +4251,18 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 	}
 }
 
-// inputTokenLimitError 判断上游返回的"输入 token 超过上限"错误
+// inputTokenLimitError 判断上游返回的"输入 token 超过上限"（提示词过长）错误，400 与 429 两种写法都识别
 func inputTokenLimitError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "input token count exceeds the maximum number of tokens allowed")
+	return aistudio.InputTokenLimitError(err)
 }
 
 func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.Is(err, errStreamClosedBeforeFirstEvent) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return true
+	}
+	// 输入 token 超过上限与账号无关：即使上游按 429 返回也不换号（Playground 超限改走 Build 的那一次重试另行处理）
+	if inputTokenLimitError(err) {
+		return false
 	}
 	var workerInitError *accountWorkerInitError
 	if errors.As(err, &workerInitError) {

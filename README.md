@@ -665,7 +665,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 
 | 情况 | 状态码 | 返回的消息 |
 |---|---|---|
-| 输入超过模型 token 上限等参数错误 | 400 | 谷歌原文（去掉 `[original: …]`、`(qos=…)` 等内部标记）；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头 |
+| 输入超过模型 token 上限（提示词过长）等参数错误 | 400 | 谷歌原文（去掉 `[original: …]`、`(qos=…)` 等内部标记）；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头。部分账号的 Playground 与 Build 对输入另有上限（如 131072 token），上游把这个错误按 429 返回时同样按 400 返回，不换号、不冷却账号 |
 | 输入被安全策略拦截 | 400 | 如 `Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)` |
 | 模型不存在或没有账号能提供 | 404 | `models/<模型> is not found for API version v1beta, …` |
 | 号池全部冷却、上游限流 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数） |
@@ -678,7 +678,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 
 ### 上游降级与输入上限
 
-Build 通道响应的每一块都带 `modelVersion`：前面的内容块沿用请求的模型名，最后一块（含最终用量）报告实际服务的模型。实测有的对话请求 `gemini-3.1-pro-preview`，最后一块标明为 `3.1-flash-lite-preview-03-2026`，同时出字速度约为 Pro 的两倍。发现这种情况时写一条警告，管理日志里记 `served_model`，`./start.sh diag` 统计降级比例；Playground 通道的响应里没有模型名，只能按出字速度推测。Playground 对部分账号的输入长度另有上限（如 131072 token），返回这个错误时自动改走 Build 通道重试一次。
+Build 通道响应的每一块都带 `modelVersion`：前面的内容块沿用请求的模型名，最后一块（含最终用量）报告实际服务的模型。实测有的对话请求 `gemini-3.1-pro-preview`，最后一块标明为 `3.1-flash-lite-preview-03-2026`，同时出字速度约为 Pro 的两倍。发现这种情况时写一条警告，管理日志里记 `served_model`，`./start.sh diag` 统计降级比例；Playground 通道的响应里没有模型名，只能按出字速度推测。Playground 对部分账号的输入长度另有上限（如 131072 token），返回这个错误时自动改走 Build 通道重试一次；Build 也超限时按 400 返回给客户端（上游有时把它按 429 返回，但它与账号无关：不按额度冷却账号，也不再换号）。
 
 测试某段对话是否被降级：`python3 tools/test_downgrade.py --key 你的APIKey [--trace] [--request 请求体或排查记录.json]`，逐次报告首字、出字速度和上游标明的模型，并用普通提示词做对照。
 

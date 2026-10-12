@@ -40,10 +40,15 @@ type QuotaCooldown struct {
 // 否则只冷却失败的模型或通道。
 //
 // 上游给出 RetryInfo 或 Retry-After 时：分钟限额和无周期证据的 429 以它为准；
-// 每日限额取它与太平洋时间次日零点中较晚的一个，避免额度耗尽的账号每隔几十秒被重新选中
+// 每日限额取它与太平洋时间次日零点中较晚的一个，避免额度耗尽的账号每隔几十秒被重新选中。
+//
+// 输入 token 超过上限（提示词过长，见 InputTokenLimitError）即使按 429 返回也不是额度问题：不冷却账号
 func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 	var rpcError *RPCError
 	if !errors.As(err, &rpcError) || rpcError.StatusCode != http.StatusTooManyRequests {
+		return QuotaCooldown{}, false
+	}
+	if InputTokenLimitError(rpcError) {
 		return QuotaCooldown{}, false
 	}
 	metadata := strings.ToLower(strings.Join([]string{

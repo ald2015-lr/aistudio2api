@@ -23,9 +23,11 @@ const (
 	officialExhaustedMessage   = "Resource has been exhausted (e.g. check quota)."
 	officialDeadlineMessage    = "Deadline expired before operation could complete."
 	officialInvalidMessage     = "Request contains an invalid argument."
-	officialNotFoundMessage    = "Requested entity was not found."
-	officialInvalidKeyMessage  = "API key not valid. Please pass a valid API key."
-	officialTooLargeMessage    = "Request payload size exceeds the limit."
+	// officialContextLengthMessage 为输入超过模型上限、上游原文不可用时的措辞
+	officialContextLengthMessage = "The input token count exceeds the maximum number of tokens allowed."
+	officialNotFoundMessage      = "Requested entity was not found."
+	officialInvalidKeyMessage    = "API key not valid. Please pass a valid API key."
+	officialTooLargeMessage      = "Request payload size exceeds the limit."
 	// officialToolContractMessage 用于上游回复不满足客户端要求的工具约束（没有官方原文，措辞与官方风格一致）
 	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
 	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
@@ -148,10 +150,18 @@ func publicErrorFor(err error, model string) publicError {
 	return statusPublicError(statusFromError(err), err)
 }
 
-// upstreamPublicError 映射 AI Studio 返回的上游错误：优先按 RPC 状态码判断，其次按 HTTP 状态码
+// upstreamPublicError 映射 AI Studio 返回的上游错误：优先按 RPC 状态码判断，其次按 HTTP 状态码。
+// 输入 token 超过上限（提示词过长）不看上游状态码：部分账号的 131072 输入上限由上游按 429 RESOURCE_EXHAUSTED 返回，
+// 客户端按 429 重试或中转按限流处理都没有意义，一律按 400 返回谷歌原文，OpenAI 附 context_length_exceeded
 func upstreamPublicError(rpcError *aistudio.RPCError) publicError {
 	name := rpcStatusNames[rpcError.Code]
 	status := rpcError.StatusCode
+	if aistudio.InputTokenLimitError(rpcError) {
+		return publicError{
+			Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT",
+			Message: upstreamMessageOr(rpcError, officialContextLengthMessage), Kind: publicKindContextLength,
+		}
+	}
 	switch {
 	case name == "RESOURCE_EXHAUSTED" || name == "" && status == http.StatusTooManyRequests:
 		return rateLimitPublicError()

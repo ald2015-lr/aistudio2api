@@ -645,6 +645,10 @@ func retryableAccountError(err error) bool {
 	if !errors.As(err, &rpcError) {
 		return false
 	}
+	// 输入 token 超过上限（提示词过长）与账号无关：即使上游按 429 返回也不换号
+	if InputTokenLimitError(rpcError) {
+		return false
+	}
 	return rpcError.StatusCode == http.StatusUnauthorized || rpcError.StatusCode == http.StatusForbidden ||
 		rpcError.StatusCode == http.StatusTooManyRequests || rpcError.StatusCode >= http.StatusInternalServerError
 }
