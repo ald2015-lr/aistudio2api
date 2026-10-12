@@ -520,7 +520,8 @@ watch(
       guardModelsText.value = form.downgrade_guard.models.join(', ')
       form.stream_playground_models = [...(config.stream_playground_models ?? [])]
       streamModelsText.value = form.stream_playground_models.join(', ')
-      // 旧版服务端不返回主用模型字段时按默认值显示，保存时也不会带上（见 payload），不会重置服务端现值
+      // 旧版服务端不返回主用模型字段时按默认值显示；payload 保存时总会带上这两个键，旧版服务端忽略未知字段，
+      // 新版服务端读取时总是返回它们，不存在“新版服务端 + 字段缺失”的组合，不会重置服务端现值
       form.primary_models = [...(config.primary_models ?? [])]
       primaryModelsText.value = form.primary_models.join(', ')
       form.primary_queue_wait = config.primary_queue_wait ?? '10s'

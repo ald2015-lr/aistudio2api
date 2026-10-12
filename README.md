@@ -551,7 +551,7 @@ cp .env.example .env
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
 | `STREAM_PLAYGROUND_MODELS` | 空 | 流式请求优先走 Playground 的模型，逗号分隔。需要订阅权益的模型在 Build 通道只能一次性返回整段回复；列表中的模型的流式请求先用 Playground 逐块输出，Playground 账号都在忙时立即改用 Build，不排队等待 Playground。留空时 Playground 与 Build 照常轮询；非流式请求不受影响。管理页“服务配置”会列出目录中需要订阅权益、可经 Playground 调用的模型，保存后立即生效 |
 | `PRIMARY_MODELS` | 空 | 主用模型，逗号分隔。列表中的模型的请求最多等 `PRIMARY_QUEUE_WAIT` 空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`，由客户端稍后重试，不再排队到 `REQUEST_TIMEOUT`；留空时所有模型照常排队。候选全部冷却仍按原规则处理。管理页“服务配置”可修改，保存后立即生效 |
-| `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限：只计等待空闲账号或 Worker 的时间（不计 Worker 启动）；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT` |
+| `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限：只计等待空闲账号、Worker 或冷启动名额的时间（不计浏览器启动本身）；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |

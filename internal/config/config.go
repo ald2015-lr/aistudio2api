@@ -101,7 +101,8 @@ type Config struct {
 	// PrimaryModels 为主用模型 ID（PRIMARY_MODELS，逗号分隔，默认为空）：列表中的模型的生成请求等空闲账号或 Worker 最多
 	// PrimaryQueueWait，超过即按 429 返回并带 Retry-After，由客户端稍后重试，不再排队到请求超时；为空时所有模型照常排队
 	PrimaryModels []string `json:"primary_models"`
-	// PrimaryQueueWait 为主用模型的排队上限（PRIMARY_QUEUE_WAIT，默认 10s）：只计等待时间，不计冷启动与锁等待；
+	// PrimaryQueueWait 为主用模型的排队上限（PRIMARY_QUEUE_WAIT，默认 10s，未配置时不超过 REQUEST_TIMEOUT）：只计等待时间
+	// （含等待冷启动名额），不计浏览器启动本身与锁等待；
 	// 0 表示不排队，没有立即可用的账号或 Worker 就返回 429；不能超过 RequestTimeout
 	PrimaryQueueWait time.Duration `json:"-"`
 	TemporaryChat    bool          `json:"temporary_chat"`
@@ -272,6 +273,8 @@ func Load(path string) (Config, error) {
 		if err != nil {
 			return Config{}, err
 		}
+	} else {
+		cfg.PrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
 	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
@@ -447,6 +450,15 @@ func (c Config) Validate() error {
 	return nil
 }
 
+// defaultPrimaryQueueWaitFor 返回没有配置 PRIMARY_QUEUE_WAIT 时的排队上限：默认 10s，但不超过请求超时。
+// 排队上限不能超过 REQUEST_TIMEOUT，旧配置的请求超时短于 10s 时若固定取 10s，升级后 .env 与保存的 JSON 都无法载入，整个服务起不来
+func defaultPrimaryQueueWaitFor(requestTimeout time.Duration) time.Duration {
+	if requestTimeout > 0 && requestTimeout < defaultPrimaryQueueWait {
+		return requestTimeout
+	}
+	return defaultPrimaryQueueWait
+}
+
 // ParseUpstreamChannels 把逗号分隔的通道列表拆成去空白的小写名称
 func ParseUpstreamChannels(value string) []string {
 	var channels []string
@@ -586,7 +598,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
-	primaryQueueWait := defaultPrimaryQueueWait
+	primaryQueueWait := defaultPrimaryQueueWaitFor(requestTimeout)
 	if strings.TrimSpace(value.PrimaryQueueWait) != "" {
 		if primaryQueueWait, err = parseOptionalDuration("PRIMARY_QUEUE_WAIT", value.PrimaryQueueWait); err != nil {
 			return err

@@ -805,6 +805,9 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		if primaryQueueWait, err = time.ParseDuration(strings.TrimSpace(value.PrimaryQueueWait)); err != nil {
 			return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("PRIMARY_QUEUE_WAIT 无效: %w", err))
 		}
+	} else if primaryQueueWait > requestTimeout {
+		// 旧版页面看不到排队上限：它把请求超时调到现值以下时按请求超时封顶，而不是报一个页面上没有的字段无效
+		primaryQueueWait = requestTimeout
 	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
