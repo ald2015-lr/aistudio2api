@@ -5,10 +5,12 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
 // globalDailyQuotaError 构造上游“每日限额、整个账号冻结”的 429：quota_id 带 PerProjectPerUser 且没有按模型标记，
@@ -510,4 +512,61 @@ func TestRetirementDroppedWhenCooldownCleared(t *testing.T) {
 	if !slices.Contains(manager.WarmAccountIDs(), partitionNormalA) {
 		t.Fatal("冷却清除后不应淘汰 Worker")
 	}
+}
+
+// TestReclaimStartsNoReplacement 现场回收不启动替补：调用的请求随后自己启动备用账号补上空出的槽位，另起替补会与它争同一个槽位
+// （替补先占到时请求按替换流程再淘汰一个空闲 Worker：一个空槽两次冷启动、多淘汰一个 Worker）。
+// WARM_WORKER_LIMIT（1）低于驻留数（3）时原先替补每次都会启动
+func TestReclaimStartsNoReplacement(t *testing.T) {
+	a, b, x, c, d := "drain-a@example.com", "drain-b@example.com", "drain-x@example.com", "drain-c@example.com", "drain-d@example.com"
+	t.Run("只回收", func(t *testing.T) {
+		env := newDrainEnv(t, []string{a, b, x, c, d}, 1, 3)
+		env.promote(t, a, b, x)
+		env.coolPro(t, a)
+		if victim, err := env.manager.reclaimDeadWorker(env.ctx, aistudio.PoolScopeNormal, drainProModel); err != nil || victim != a {
+			t.Fatalf("应回收 A: victim=%q err=%v", victim, err)
+		}
+		time.Sleep(300 * time.Millisecond)
+		if got := sortedWarm(env.manager); !slices.Equal(got, []string{b, x}) || len(env.manager.OpeningAccountIDs()) != 0 {
+			t.Fatalf("回收后不应启动替补，驻留 Worker = %v，启动中 = %v", got, env.manager.OpeningAccountIDs())
+		}
+		if hasLogContaining(env.requests, "替补启动") {
+			t.Fatalf("回收后不应记录替补，日志 = %v", serviceLogMessages(env.requests))
+		}
+	})
+	t.Run("请求路径", func(t *testing.T) {
+		env := newDrainEnv(t, []string{a, b, x, c, d}, 1, 3)
+		// B 不支持其他模型；A 在其他模型上每日限额冷却（死槽位），X 只冷却 1 分钟：分区已满、没有热 Worker 能服务请求
+		if err := env.pool.SetCatalog(b, aistudio.BenefitTierFree, []aistudio.Model{
+			{ID: drainProModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		env.promote(t, a, b, x)
+		holdLease(t, env.pool, b)()
+		holdLease(t, env.pool, x)()
+		now := time.Now()
+		if err := env.pool.MarkCooldownIfGeneration(a, testRuntimeModel, env.pool.ModelAccessGeneration(a), now, now.Add(2*time.Hour), "每日限额"); err != nil {
+			t.Fatal(err)
+		}
+		if err := env.pool.MarkCooldownIfGeneration(x, testRuntimeModel, env.pool.ModelAccessGeneration(x), now, now.Add(time.Minute), "每分钟限额"); err != nil {
+			t.Fatal(err)
+		}
+		var launches atomic.Int32
+		launch := env.manager.launch
+		env.manager.launch = func(ctx context.Context, accountID string, options camoufoxnative.Options) (*aistudio.NativeWorker, error) {
+			launches.Add(1)
+			time.Sleep(150 * time.Millisecond)
+			return launch(ctx, accountID, options)
+		}
+		lease, err := env.service.acquireWarmLease(env.ctx, aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = lease.Release()
+		time.Sleep(500 * time.Millisecond)
+		if got := sortedWarm(env.manager); launches.Load() != 1 || !slices.Contains(got, x) || slices.Contains(got, a) {
+			t.Fatalf("回收 A 后只应冷启动请求自己的备用账号、不淘汰 X：冷启动 %d 次，驻留 Worker = %v", launches.Load(), got)
+		}
+	})
 }

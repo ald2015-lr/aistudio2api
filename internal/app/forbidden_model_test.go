@@ -124,18 +124,18 @@ func modelCooldownUntil(t *testing.T, pool *aistudio.AccountPool, accountID stri
 	return cooldown.Until, cooldown.Reason, true
 }
 
-// expireModelCooldown 模拟单模型 403 冷却到期：清除账号在该模型上的冷却，并把冷却档位记录的到期时间移到过去
-// （档位按距上一次 403 的时间计，记录本身保留）
-func expireModelCooldown(t *testing.T, service *trackedService, accountID string, modelID string) {
+// expireModelCooldown 模拟单模型 403 冷却到期：清除账号在该冷却作用域（Playground 为模型 ID）上的冷却，并把冷却档位记录的
+// 到期时间移到过去（档位按距上一次 403 的时间计，记录本身保留）
+func expireModelCooldown(t *testing.T, service *trackedService, accountID string, scope string) {
 	t.Helper()
 	pool := service.pool
-	if err := pool.ClearCooldownIfGeneration(accountID, modelID, pool.ModelAccessGeneration(accountID), time.Now()); err != nil {
+	if err := pool.ClearCooldownIfGeneration(accountID, scope, pool.ModelAccessGeneration(accountID), time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	tracker := service.forbidden
 	tracker.mu.Lock()
 	defer tracker.mu.Unlock()
-	key := forbiddenModelKey{accountID: accountID, modelID: modelID}
+	key := forbiddenModelKey{accountID: accountID, scope: scope}
 	if strike, exists := tracker.models[key]; exists {
 		strike.until = time.Now().Add(-time.Second)
 		tracker.models[key] = strike
@@ -190,9 +190,9 @@ func TestModelForbiddenCoolsAccount(t *testing.T) {
 	}
 }
 
-// TestModelForbiddenNoHardFailureLimit 多个账号对该模型都返回 403：每个都写入冷却、不计入连续失败上限、不退避，
-// 请求在第 7 个账号上完成（原先 5 次后放弃并返回 403，期间退避合计 3s）
-func TestModelForbiddenNoHardFailureLimit(t *testing.T) {
+// TestModelForbiddenCountsTowardFailureLimit 多个账号对该模型都返回 403：每个都写入冷却、换号不退避，但仍计入连续失败上限，
+// 一个请求最多试 generateFailureLimit 个账号后按 403 结束，不会把号池逐个试完；下一个请求跳过已冷却的账号，在没有 403 的账号上完成
+func TestModelForbiddenCountsTowardFailureLimit(t *testing.T) {
 	ids := make([]string, 0, 7)
 	denied := make(map[string]bool)
 	for index := range 6 {
@@ -204,21 +204,121 @@ func TestModelForbiddenNoHardFailureLimit(t *testing.T) {
 	upstream := &forbiddenUpstream{denied: denied}
 	service, pool := primaryBusyService(t, upstream, ids...)
 	preverifyRuntimeModelAccess(t, pool, forbiddenGood)
-	text, err, elapsed := runAccountRequest(t, service, "req-forbidden-many", "")
-	if err != nil || text != "hello" {
-		t.Fatalf("应在没有 403 的账号上完成：text=%q err=%v calls=%v", text, err, upstream.called())
+	// 号池里该模型刚成功过：这些 403 是各账号没有权限，不是号池级 403
+	service.forbidden.modelSucceeded(aistudio.PoolScopeAll, testRuntimeModel, time.Now())
+	_, err, elapsed := runAccountRequest(t, service, "req-forbidden-many", "")
+	var rpc *aistudio.RPCError
+	if !errors.As(err, &rpc) || rpc.StatusCode != http.StatusForbidden {
+		t.Fatalf("连续 %d 次 403 后应按 403 结束，err=%v calls=%v", generateFailureLimit, err, upstream.called())
 	}
-	if calls := upstream.called(); len(calls) != 7 || calls[6] != forbiddenGood {
-		t.Fatalf("尝试 = %v，期望 6 个 403 账号各一次后到 %s", calls, forbiddenGood)
+	calls := upstream.called()
+	if len(calls) != generateFailureLimit {
+		t.Fatalf("尝试 = %v，期望最多 %d 次", calls, generateFailureLimit)
 	}
 	if elapsed > 1500*time.Millisecond {
 		t.Fatalf("请求用时 %s，期望单模型 403 换号不退避", elapsed)
 	}
-	for id := range denied {
+	for _, id := range calls {
 		if _, _, cooling := modelCooldownUntil(t, pool, id, testRuntimeModel); !cooling {
 			t.Fatalf("账号 %s 返回 403 后应冷却该模型", id)
 		}
 	}
+	text, err, _ := runAccountRequest(t, service, "req-forbidden-many-2", "")
+	if err != nil || text != "hello" {
+		t.Fatalf("下一个请求应跳过已冷却的账号并完成：text=%q err=%v calls=%v", text, err, upstream.called())
+	}
+	if calls := upstream.called(); len(calls) != 7 || calls[6] != forbiddenGood {
+		t.Fatalf("尝试 = %v，期望第二个请求只试剩下的 403 账号后到 %s", calls, forbiddenGood)
+	}
+}
+
+// TestSystemicForbiddenNotCooled 号池级 403（纯 Go proof、请求形态等失效时号池里所有账号都 403）：同一号池同一模型 10 分钟内
+// 第 5 个不同账号的 403 起、这段时间又没有任何成功时不再写冷却、不升档，按一般失败计入连续失败；故障持续到第一档冷却到期后
+// 不会升到 6 小时，修复后下一个请求立即成功。号池里该模型成功之后，单个账号的 403 照常按账号冷却
+func TestSystemicForbiddenNotCooled(t *testing.T) {
+	ids := make([]string, 0, 8)
+	denied := make(map[string]bool)
+	for index := range 8 {
+		id := fmt.Sprintf("a-outage-%d@example.com", index)
+		ids = append(ids, id)
+		denied[id] = true
+	}
+	upstream := &forbiddenUpstream{denied: denied}
+	service, pool := primaryBusyService(t, upstream, ids...)
+	var rpc *aistudio.RPCError
+	if _, err, _ := runAccountRequest(t, service, "req-outage-1", ""); !errors.As(err, &rpc) || rpc.StatusCode != http.StatusForbidden {
+		t.Fatalf("故障期间应按 403 结束，err=%v", err)
+	}
+	calls := upstream.called()
+	if len(calls) != generateFailureLimit {
+		t.Fatalf("尝试 = %v，期望 %d 次", calls, generateFailureLimit)
+	}
+	for index, id := range calls {
+		_, _, cooling := modelCooldownUntil(t, pool, id, testRuntimeModel)
+		if want := index < forbiddenSystemicAccounts-1; cooling != want {
+			t.Fatalf("第 %d 个 403 的账号 %s 冷却=%v，期望 %v（第 %d 个不同账号起按号池级 403）", index+1, id, cooling, want, forbiddenSystemicAccounts)
+		}
+	}
+	// 故障持续到第一档冷却到期：再 403 不升档、不冷却
+	for _, id := range calls[:forbiddenSystemicAccounts-1] {
+		expireModelCooldown(t, service, id, testRuntimeModel)
+	}
+	if _, err, _ := runAccountRequest(t, service, "req-outage-2", calls[0]); !errors.As(err, &rpc) {
+		t.Fatalf("故障期间应按 403 结束，err=%v", err)
+	}
+	if _, _, cooling := modelCooldownUntil(t, pool, calls[0], testRuntimeModel); cooling {
+		t.Fatal("号池级 403 不应写冷却、升档")
+	}
+	// 修复上线：下一个请求立即成功
+	for _, id := range ids {
+		upstream.setDenied(id, false)
+	}
+	if text, err, _ := runAccountRequest(t, service, "req-outage-fixed", ""); err != nil || text != "hello" {
+		t.Fatalf("修复后应立即成功：text=%q err=%v", text, err)
+	}
+	for _, id := range ids {
+		if until, _, cooling := modelCooldownUntil(t, pool, id, testRuntimeModel); cooling && time.Until(until) > forbiddenModelFirstCooldown {
+			t.Fatalf("账号 %s 不应留下超过第一档的冷却：%s", id, until)
+		}
+	}
+	// 成功之后单个账号的 403 照常按账号冷却
+	upstream.setDenied(calls[1], true)
+	if _, err, _ := runAccountRequest(t, service, "req-single-denied", calls[1]); !errors.As(err, &rpc) {
+		t.Fatalf("应按 403 结束，err=%v", err)
+	}
+	if _, _, cooling := modelCooldownUntil(t, pool, calls[1], testRuntimeModel); !cooling {
+		t.Fatal("号池里该模型成功之后，单个账号的 403 应冷却")
+	}
+}
+
+// TestForbiddenSystemicTracker 号池级 403 的判定：同一号池同一模型 10 分钟内不同账号达到 5 个、这段时间没有成功；同一账号重复只算一个，
+// 超过窗口的不算；成功一次即清空；号池与模型分开计
+func TestForbiddenSystemicTracker(t *testing.T) {
+	tracker := newForbiddenTracker()
+	start := time.Date(2026, 10, 13, 10, 0, 0, 0, time.UTC)
+	observe := func(at time.Time, pool aistudio.PoolScope, accountID string, modelID string, want bool) {
+		t.Helper()
+		if got := tracker.observeModelDenied(pool, accountID, modelID, at); got != want {
+			t.Fatalf("%s %s/%s/%s：号池级=%v，期望 %v", at.Format(time.RFC3339), pool.String(), accountID, modelID, got, want)
+		}
+	}
+	for index := range forbiddenSystemicAccounts - 1 {
+		observe(start, aistudio.PoolScopeNormal, fmt.Sprintf("a%d", index), "pro", false)
+	}
+	observe(start, aistudio.PoolScopeNormal, "a0", "pro", false)
+	observe(start, aistudio.PoolScopeUltra, "u0", "pro", false)
+	observe(start, aistudio.PoolScopeNormal, "b0", "flash", false)
+	observe(start.Add(time.Minute), aistudio.PoolScopeNormal, "a4", "pro", true)
+	// 超过窗口的记录不再算：只剩 a4 与新的两个
+	later := start.Add(forbiddenWindow + 2*time.Minute)
+	observe(later, aistudio.PoolScopeNormal, "a5", "pro", false)
+	observe(later, aistudio.PoolScopeNormal, "a6", "pro", false)
+	// 成功一次即清空，且成功后窗口内不判为号池级
+	tracker.modelSucceeded(aistudio.PoolScopeNormal, "pro", later)
+	for index := range forbiddenSystemicAccounts {
+		observe(later.Add(time.Minute), aistudio.PoolScopeNormal, fmt.Sprintf("c%d", index), "pro", false)
+	}
+	observe(later.Add(forbiddenWindow+2*time.Minute), aistudio.PoolScopeNormal, "c9", "pro", false)
 }
 
 // TestModelForbiddenEscalatesAndResets 同一账号同一模型的 403 冷却逐次加长：第一次 30 分钟，冷却到期后再 403 为 6 小时；
@@ -264,7 +364,7 @@ func TestModelForbiddenEscalatesAndResets(t *testing.T) {
 }
 
 // TestForbiddenModelTrackerLevels 单模型 403 的冷却档位：30 分钟、6 小时、到太平洋时间次日零点（至少 6 小时）；
-// 本档冷却未到期时再次 403（另一通道或在途请求）不升档；距上一次超过 24 小时从第一档重新计；成功后清零；不同模型、不同账号分开计
+// 同一通道本档冷却未到期时再次 403（在途请求）不升档；距上一次超过 24 小时从第一档重新计；成功后清零；不同模型、不同账号分开计
 func TestForbiddenModelTrackerLevels(t *testing.T) {
 	tracker := newForbiddenTracker()
 	start := time.Date(2026, 10, 13, 10, 0, 0, 0, time.UTC)
@@ -277,7 +377,7 @@ func TestForbiddenModelTrackerLevels(t *testing.T) {
 		}
 	}
 	check(start, "a", "pro", 1, start.Add(30*time.Minute))
-	// 冷却期内另一通道又 403：不升档，从现在起重新计
+	// 冷却期内同一通道的在途请求又 403：不升档，从现在起重新计
 	check(start.Add(time.Minute), "a", "pro", 1, start.Add(31*time.Minute))
 	// 不同模型、不同账号分开计
 	check(start.Add(2*time.Minute), "a", "flash", 1, start.Add(32*time.Minute))
@@ -312,11 +412,32 @@ func TestForbiddenModelTrackerLevels(t *testing.T) {
 	check(far, "a", "pro", 1, far.Add(30*time.Minute))
 	// 过期记录在下一次记录时清理
 	tracker.mu.Lock()
-	_, kept := tracker.models[forbiddenModelKey{accountID: "b", modelID: "pro"}]
+	_, kept := tracker.models[forbiddenModelKey{accountID: "b", scope: "pro"}]
 	tracker.mu.Unlock()
 	if kept {
 		t.Fatal("超过 24 小时且冷却已到期的记录应被清理")
 	}
+}
+
+// TestForbiddenModelLevelsPerChannel 两个通道分别计档：Playground 与 Build 的 403 错开 10 分钟时，各自冷却到期后再 403 都升档
+// （共用一份档位时，一个通道到期后的 403 总落在另一通道刚续上的到期时间之内，档位永远停在 30 分钟）；一个通道成功只清除该通道的档位
+func TestForbiddenModelLevelsPerChannel(t *testing.T) {
+	tracker := newForbiddenTracker()
+	start := time.Date(2026, 10, 13, 10, 0, 0, 0, time.UTC)
+	playground, build := "pro", aistudio.ChannelCooldownScope(aistudio.ChannelBuild, "pro")
+	check := func(at time.Time, scope string, wantLevel int) {
+		t.Helper()
+		if _, level := tracker.recordModel("a", scope, at); level != wantLevel {
+			t.Fatalf("%s 记录 %s：档位=%d，期望 %d", at.Format(time.RFC3339), scope, level, wantLevel)
+		}
+	}
+	check(start, playground, 1)
+	check(start.Add(10*time.Minute), build, 1)
+	check(start.Add(30*time.Minute+5*time.Second), playground, 2)
+	check(start.Add(40*time.Minute+5*time.Second), build, 2)
+	tracker.resetModel("a", playground)
+	check(start.Add(7*time.Hour), build, 3)
+	check(start.Add(7*time.Hour), playground, 1)
 }
 
 // playgroundForbiddenUpstream 对 Playground 通道的每次生成返回 403 无权限，Build 通道正常返回；记录"账号/通道"
@@ -369,6 +490,54 @@ func TestModelForbiddenFallsBackToOtherChannel(t *testing.T) {
 	}
 	if got := service.workers.retirementCount(); got != 0 {
 		t.Fatalf("另一通道仍能服务该模型时不应登记淘汰，登记数 = %d", got)
+	}
+}
+
+// TestModelForbiddenStrikesPerChannel 生成请求按通道记档：同一请求先后在 Playground 与 Build 上 403，两个通道各记一份第一档
+// （同一请求换通道不会直接升到 6 小时）；Build 上成功只清除 Build 的档位，Playground 的档位保留
+func TestModelForbiddenStrikesPerChannel(t *testing.T) {
+	upstream := &forbiddenUpstream{denied: map[string]bool{forbiddenBad: true}}
+	service, pool := primaryBusyService(t, upstream, forbiddenBad)
+	pool.SetUpstreamChannels([]aistudio.Channel{aistudio.ChannelPlayground, aistudio.ChannelBuild})
+	target := aistudio.Model{ID: streamTestModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}}
+	if err := pool.SetCatalog(forbiddenBad, aistudio.BenefitTierFree, []aistudio.Model{target}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetBuildCatalog(forbiddenBad, []aistudio.Model{target}); err != nil {
+		t.Fatal(err)
+	}
+	playground, build := streamTestModel, aistudio.ChannelCooldownScope(aistudio.ChannelBuild, streamTestModel)
+	strike := func(scope string) (forbiddenModelStrike, bool) {
+		service.forbidden.mu.Lock()
+		defer service.forbidden.mu.Unlock()
+		value, ok := service.forbidden.models[forbiddenModelKey{accountID: forbiddenBad, scope: scope}]
+		return value, ok
+	}
+	if _, err, _ := runModelRequest(t, service, "req-strike-both", forbiddenBad, streamTestModel); !isPermissionDenied(err) {
+		t.Fatalf("两个通道都 403 时应返回 403，err=%v calls=%v", err, upstream.called())
+	}
+	for _, scope := range []string{playground, build} {
+		value, ok := strike(scope)
+		if !ok || value.level != 1 {
+			t.Fatalf("%s 应记第一档：%+v ok=%v", scope, value, ok)
+		}
+		until, _, cooling := modelCooldownUntil(t, pool, forbiddenBad, scope)
+		if !cooling {
+			t.Fatalf("%s 应冷却", scope)
+		}
+		assertCooldownAround(t, until, forbiddenModelFirstCooldown, scope)
+	}
+	// Build 冷却到期、恢复权限后在 Build 上成功：只清除 Build 的档位
+	expireModelCooldown(t, service, forbiddenBad, build)
+	upstream.setDenied(forbiddenBad, false)
+	if text, err, _ := runModelRequest(t, service, "req-strike-build-ok", forbiddenBad, streamTestModel); err != nil || text != "hello" {
+		t.Fatalf("Build 上应成功：text=%q err=%v", text, err)
+	}
+	if _, ok := strike(build); ok {
+		t.Fatal("Build 成功后应清除 Build 的档位")
+	}
+	if _, ok := strike(playground); !ok {
+		t.Fatal("Build 成功不应清除 Playground 的档位")
 	}
 }
 

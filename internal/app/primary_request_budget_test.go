@@ -338,3 +338,137 @@ func woken(waiter *dispatchWaiter) bool {
 		return false
 	}
 }
+
+// TestExcludedHeadYieldsDuringPromote 带排除列表的队首（换号重试）现场冷启动备用账号期间不看调度信号：开始前离开等待队列并把唤醒
+// 交给下一个请求。原先它一直占着队首，空出的账户（被它排除）的唤醒只落在它身上，后面的主用模型请求等不到兜底复查就按 429 返回，
+// 而那个账户一直空闲
+func TestExcludedHeadYieldsDuringPromote(t *testing.T) {
+	const a, s1 = "a@example.com", "s1@example.com"
+	service := coldStartTestService(t, 4*time.Second, nil, a, s1)
+	service.workers.maxActive.Store(1)
+	stub, _ := aistudio.NewStubWorker(a, 0)
+	service.workers.accounts[a].worker = stub
+	service.workers.accounts[a].warm.Store(true)
+	service.setPrimaryModels([]string{testRuntimeModel}, 1500*time.Millisecond)
+	releaseA := holdLease(t, service.pool, a)
+	ctx, cancel := context.WithTimeout(service.lifecycle, 15*time.Second)
+	defer cancel()
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeNormal}
+	retried := selection
+	retried.ExcludedAccountIDs = []string{a}
+	go func() {
+		if lease, _ := service.acquireWarmLease(ctx, retried); lease != nil {
+			_ = lease.Release()
+		}
+	}()
+	if !waitUntil(2*time.Second, func() bool { return dispatchWaiters(service) == 1 }) {
+		t.Fatal("带排除列表的请求应排进等待队列")
+	}
+	type result struct {
+		lease *aistudio.AccountLease
+		err   error
+		at    time.Time
+	}
+	done := make(chan result, 1)
+	startedAt := time.Now()
+	go func() {
+		lease, err := service.acquireWarmLease(withLeaseWaitBudget(ctx, service.primaryBudget(testRuntimeModel, aistudio.PoolScopeNormal)), selection)
+		done <- result{lease: lease, err: err, at: time.Now()}
+	}()
+	if !waitUntil(2*time.Second, func() bool { return dispatchWaiters(service) == 2 }) {
+		t.Fatal("主用模型的请求应排在同一队列")
+	}
+	// A 在主用模型请求第一次兜底复查之后、截止时间之前空闲
+	time.Sleep(time.Until(startedAt.Add(1100 * time.Millisecond)))
+	releasedAt := time.Now()
+	releaseA()
+	got := <-done
+	if got.lease != nil {
+		defer got.lease.Release()
+	}
+	if got.err != nil || got.lease == nil || got.lease.Account().ID != a {
+		t.Fatalf("A 空闲后主用模型的请求应取得 A：lease=%v err=%v", got.lease, got.err)
+	}
+	if waited := got.at.Sub(releasedAt); waited >= 300*time.Millisecond {
+		t.Fatalf("A 空闲后 %s 才取得，期望队首冷启动前把唤醒交给后面的请求", waited)
+	}
+}
+
+// retryQueueUpstream 让 forbiddenBad 600ms 后返回 403 无权限，其余账号 300ms 后正常返回；调用在等待之前记录
+type retryQueueUpstream struct {
+	forbiddenUpstream
+}
+
+func (upstream *retryQueueUpstream) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	upstream.mu.Lock()
+	upstream.calls = append(upstream.calls, request.AccountID)
+	upstream.mu.Unlock()
+	delay := 300 * time.Millisecond
+	if request.AccountID == forbiddenBad {
+		delay = 600 * time.Millisecond
+	}
+	select {
+	case <-time.After(delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	if request.AccountID == forbiddenBad {
+		return nil, &aistudio.RPCError{
+			Method: "GenerateContent", StatusCode: http.StatusForbidden, Code: 7, Message: "The caller does not have permission",
+		}
+	}
+	events := make(chan aistudio.Event, 2)
+	events <- aistudio.Event{Kind: aistudio.EventText, Text: "hello"}
+	events <- aistudio.Event{Kind: aistudio.EventFinish, FinishReason: "STOP"}
+	close(events)
+	return events, nil
+}
+
+// TestRetryKeepsQueuePosition 换号重试按请求到达的先后排回队列：R 先到、第一次尝试 403 时 N1-N3 已在排队，R 的重试排在它们前面，
+// 先取得空出的账号。原先重试排到队尾，主用模型的截止时间却照常从请求开始计，最早到的 R 反而 429，按到达顺序四个请求都来得及
+func TestRetryKeepsQueuePosition(t *testing.T) {
+	upstream := &retryQueueUpstream{}
+	service, pool := primaryBusyService(t, upstream, forbiddenBad, forbiddenGood)
+	service.setPrimaryModels([]string{testRuntimeModel}, 1500*time.Millisecond)
+	releaseGood := holdLease(t, pool, forbiddenGood)
+	startedAt := time.Now()
+	type result struct {
+		name string
+		err  error
+		at   time.Duration
+	}
+	results := make(chan result, 4)
+	run := func(name string) {
+		_, err, _ := runPrimaryRequest(t, service, "req-"+name)
+		results <- result{name: name, err: err, at: time.Since(startedAt)}
+	}
+	go run("R")
+	if !waitUntil(2*time.Second, func() bool { return len(upstream.called()) == 1 }) {
+		t.Fatal("R 应先取得 forbiddenBad")
+	}
+	time.Sleep(time.Until(startedAt.Add(350 * time.Millisecond)))
+	for index, name := range []string{"N1", "N2", "N3"} {
+		go run(name)
+		if !waitUntil(2*time.Second, func() bool { return dispatchWaiters(service) == index+1 }) {
+			t.Fatalf("%s 应排队", name)
+		}
+	}
+	if !waitUntil(2*time.Second, func() bool { return dispatchWaiters(service) == 4 }) {
+		t.Fatal("R 的换号重试应排队")
+	}
+	time.Sleep(time.Until(startedAt.Add(700 * time.Millisecond)))
+	releaseGood()
+	finished := make(map[string]time.Duration, 4)
+	for range 4 {
+		got := <-results
+		if got.err != nil {
+			t.Errorf("%s 在 %s 失败：%v", got.name, got.at.Round(time.Millisecond), got.err)
+		}
+		finished[got.name] = got.at
+	}
+	for _, name := range []string{"N1", "N2", "N3"} {
+		if finished["R"] >= finished[name] {
+			t.Fatalf("先到的 R 应先完成：%v", finished)
+		}
+	}
+}

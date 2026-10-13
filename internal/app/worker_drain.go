@@ -16,7 +16,8 @@ import (
 // 排空与替补（死槽位先启后停）。
 //
 // 饱和时死槽位（账号在主用或热门模型上长时间冷却，还能服务其他模型）一直有其他模型的请求在用，永远等不到空闲；
-// 原先的淘汰路径都只关闭空闲 Worker，它们就一直占着名额。retirePass 遇到忙碌的登记时把账号标记排空（aistudio.AccountPool.SetDraining）：
+// 原先的淘汰路径都只关闭空闲 Worker，它们就一直占着名额。retirePass 遇到忙碌的登记（全局冷却，或在主用、热门模型上冷却；
+// 只在其他模型上冷却的 Worker 还能服务主用模型，不排空，空闲后照常淘汰）时把账号标记排空（aistudio.AccountPool.SetDraining）：
 // 不固定账户的请求不再取得它的新租约，进行中的请求照常结束，最后一个租约释放后由原有的唤醒 → retirePass → finishRetirement 关闭；
 // 指定账户与文件绑定的请求照常使用。每个分区同时排空的数量不超过 drainLimit，最老的登记先排空，并且要求分区内有按登记模型
 // 统计的可接替账户（见 SpareAccounts），不会为换上另一个同样的死槽位而排空。
@@ -26,7 +27,7 @@ import (
 // 排空在每条退出路径上清除：Worker 关闭（含 ResetAll 与 Close，见 closeCleanupLeftovers）、登记被放弃（冷却被清除或缩短）、
 // 淘汰出错、排空超时（REQUEST_TIMEOUT + 30 秒后仍有请求，多半是固定账户或文件绑定的请求一直在用：清除标记，1 分钟后再试）。
 //
-// 替补：淘汰（排空开始、空闲淘汰、清扫、轮换、现场回收）之后在同一分区挑一个能服务登记模型、对热门与主用模型都没有长时间冷却的
+// 替补：淘汰（排空开始、空闲淘汰、清扫、轮换）之后在同一分区挑一个能服务登记模型、对热门与主用模型都没有长时间冷却的
 // 备用账号，经后台冷启动名额启动。WARM_WORKER_LIMIT 低于驻留数时预热不会补齐空出的槽位，驻留数靠替补保持；分区低于预热目标时
 // 由预热补齐，替补只补其余部分（在调用预热之前统计，见 replacementsFor；排空开始时除外：旧 Worker 仍驻留，预热不会为它补）。
 // 替补只在分区有空槽（含排空让出的）时启动，不替换其他账号的空闲 Worker
@@ -91,11 +92,20 @@ func (manager *accountWorkerManager) drainLimit(partition aistudio.PoolScope) in
 	return min(max(manager.warmConcurrencyValue(), 1)*2, max(1, maxActive/4))
 }
 
-// startDrain 在分区排空数低于上限时把账号标记排空并返回排空状态；已在排空、达到上限或账号已不在账户池时返回 nil
+// startDrain 在分区排空数低于上限时把账号标记排空并返回排空状态；已在排空、达到上限、账号已没有驻留 Worker、
+// 已被其他路径选中淘汰或已不在账户池时返回 nil
 func (manager *accountWorkerManager) startDrain(accountID string, partition aistudio.PoolScope) *drainState {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	if manager.drains[accountID] != nil || manager.drainCountLocked(partition) >= manager.drainLimit(partition) {
+		return nil
+	}
+	// 在 drainMu 内核对账号仍有驻留 Worker、没有被其他路径选中淘汰：retirePass 核对驻留之后，现场回收或清扫可能已关闭 Worker 并删除登记，
+	// 此时写入的排空没有任何路径再清除。closeCleanupLeftovers 先把 warm 置为假再经 drainMu 清除排空，这里看到 warm 为真时随后的关闭一定会清除这次写入
+	manager.mu.RLock()
+	account := manager.accounts[accountID]
+	manager.mu.RUnlock()
+	if account == nil || !account.warm.Load() || manager.victimReserved(accountID) {
 		return nil
 	}
 	if !manager.pool.SetDraining(accountID, true) && !manager.pool.Draining(accountID) {

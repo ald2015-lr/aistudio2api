@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"errors"
+	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -339,7 +341,8 @@ func TestDrainClearedOnExit(t *testing.T) {
 		if !waitUntil(5*time.Second, func() bool { return !env.pool.Draining(accounts[0]) }) {
 			t.Fatal("排空超时后标记应被清除")
 		}
-		if !hasLogContaining(env.requests, "排空超时") {
+		// 日志在清除标记之后写入
+		if !waitUntil(time.Second, func() bool { return hasLogContaining(env.requests, "排空超时") }) {
 			t.Fatalf("应记录排空超时，日志 = %v", serviceLogMessages(env.requests))
 		}
 		env.manager.retireMu.Lock()
@@ -671,5 +674,157 @@ func TestRetiredSlotReplacedAboveWarmLimit(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if got := len(env.manager.WarmAccountIDs()); got != 4 {
 		t.Fatalf("每个淘汰只补一个，驻留数应为 4，实际 %d", got)
+	}
+}
+
+// TestDrainRefusedAfterWorkerClosed 排空只写给仍有驻留 Worker、没有被其他路径选中淘汰的账号：retirePass 核对驻留之后，
+// 现场回收或清扫可能已关闭 Worker 并删除登记，随后写入的排空没有任何路径再清除（账号一直按排空中计、占着 drainLimit，
+// 不再参与不固定账户的调度），startDrain 因此在 drainMu 内再核对一次
+func TestDrainRefusedAfterWorkerClosed(t *testing.T) {
+	accounts := []string{"drain-a@example.com", "drain-b@example.com", "drain-c@example.com", "drain-d@example.com"}
+	env := newDrainEnv(t, accounts, 2, 4)
+	env.promote(t, accounts[0], accounts[1])
+	env.coolPro(t, accounts[0])
+	// 现场回收关闭 A（retirePass 已核对过 A 驻留、正要排空）
+	if victim, err := env.manager.reclaimDeadWorker(env.ctx, aistudio.PoolScopeNormal, drainProModel); err != nil || victim != accounts[0] {
+		t.Fatalf("应回收 A: victim=%q err=%v", victim, err)
+	}
+	if drain := env.manager.startDrain(accounts[0], aistudio.PoolScopeNormal); drain != nil {
+		t.Fatal("Worker 已关闭的账号不应再排空")
+	}
+	if env.pool.Draining(accounts[0]) || env.manager.drainOf(accounts[0]) != nil || env.manager.drainCount(aistudio.PoolScopeNormal) != 0 {
+		t.Fatalf("不应留下排空: 账户池=%v 排空状态=%v 排空数=%d",
+			env.pool.Draining(accounts[0]), env.manager.drainOf(accounts[0]), env.manager.drainCount(aistudio.PoolScopeNormal))
+	}
+	// 已被其他路径选中淘汰的账号同样不排空（不另起排空的替补）
+	if !env.manager.tryReserveVictim(accounts[1]) {
+		t.Fatal("应能预留 B")
+	}
+	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal); drain != nil {
+		t.Fatal("已被选中淘汰的账号不应排空")
+	}
+	env.manager.releaseVictim(accounts[1])
+	if env.pool.Draining(accounts[1]) {
+		t.Fatal("已被选中淘汰的账号不应标记排空")
+	}
+	// 对照：仍驻留、没有被选中的账号照常排空
+	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal); drain == nil || !env.pool.Draining(accounts[1]) {
+		t.Fatal("驻留的账号应能排空")
+	}
+	env.manager.clearDrain(accounts[1])
+}
+
+// TestReaperSkipsRecentlyUsedDeadSlots 空闲回收只在空闲超时的 Worker 中挑选：其他模型的请求经调度落在主用模型的死槽位上
+// （先用死槽位），死槽位刚用过时回收不因它们排在最前而整轮放弃，空闲超时、超出常驻数的 Worker 照常关闭，刚用过的死槽位保留
+func TestReaperSkipsRecentlyUsedDeadSlots(t *testing.T) {
+	accounts := []string{"drain-a@example.com", "drain-b@example.com", "drain-c@example.com", "drain-d@example.com"}
+	env := newDrainEnv(t, accounts, 1, 4)
+	env.promote(t, accounts...)
+	env.coolPro(t, accounts[0])
+	env.coolPro(t, accounts[1])
+	for _, accountID := range accounts {
+		holdLease(t, env.pool, accountID)()
+	}
+	time.Sleep(20 * time.Millisecond)
+	cutoff := time.Now()
+	time.Sleep(20 * time.Millisecond)
+	flash := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"}
+	for range 6 {
+		lease, err := env.service.acquireWarmLease(env.ctx, flash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id := lease.Account().ID; id != accounts[0] && id != accounts[1] {
+			t.Fatalf("其他模型的请求应先用死槽位，实际 %s", id)
+		}
+		_ = lease.Release()
+	}
+	reaped := 0
+	for env.manager.reapIdleWorker(cutoff) {
+		reaped++
+	}
+	if got := sortedWarm(env.manager); reaped != 2 || !slices.Equal(got, accounts[:2]) {
+		t.Fatalf("应回收空闲超时的 C、D，保留刚用过的死槽位：回收 %d，驻留 Worker = %v", reaped, got)
+	}
+}
+
+// drainNicheModel 为既不是主用也不是热门的模型
+const drainNicheModel = "drain-niche-model"
+
+// TestNicheModelForbiddenDoesNotDrain 只在少用的模型上冷却的 Worker（如账号对该模型没有权限的 403）还能服务主用模型：忙碌时不排空，
+// 不固定账户的主用模型请求照常分给它；登记保留，空闲后照常淘汰
+func TestNicheModelForbiddenDoesNotDrain(t *testing.T) {
+	a, b := "drain-a@example.com", "drain-b@example.com"
+	// 换号时 C、D 可能都被扩容启动（峰值 4），E 保证 A 空闲后仍有可接替的账号
+	accounts := []string{a, b, "drain-c@example.com", "drain-d@example.com", "drain-e@example.com"}
+	env := newDrainEnv(t, accounts, 2, 4)
+	catalog := []aistudio.Model{
+		{ID: testRuntimeModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+		{ID: drainProModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+		{ID: drainNicheModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+	}
+	for _, accountID := range accounts {
+		if err := env.pool.SetCatalog(accountID, aistudio.BenefitTierFree, catalog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.pool.SetPerAccountConcurrency(2)
+	upstream := &forbiddenUpstream{}
+	env.service.service = &modelDeniedUpstream{forbiddenUpstream: upstream, accountID: a, modelID: drainNicheModel}
+	env.service.timeout.Store(int64(time.Minute))
+	env.promote(t, a, b)
+	// A 正在服务一个请求，B 满载：少用模型的请求落在 A 上，403 后换号完成
+	releaseA := holdLease(t, env.pool, a)
+	defer releaseA()
+	releaseB1 := holdLease(t, env.pool, b)
+	releaseB2 := holdLease(t, env.pool, b)
+	if text, err, _ := runModelRequest(t, env.service, "req-niche", "", drainNicheModel); err != nil || text != "hello" {
+		t.Fatalf("少用模型的请求应换号完成：text=%q err=%v calls=%v", text, err, upstream.called())
+	}
+	if calls := upstream.called(); len(calls) == 0 || calls[0] != a {
+		t.Fatalf("第一次尝试应落在 A 上：%v", calls)
+	}
+	if env.manager.retirementCount() != 1 {
+		t.Fatalf("A 在少用模型上冷却后应登记淘汰，登记数 = %d", env.manager.retirementCount())
+	}
+	env.manager.wakeRetire()
+	time.Sleep(600 * time.Millisecond)
+	if env.pool.Draining(a) || env.manager.drainCount(aistudio.PoolScopeNormal) != 0 {
+		t.Fatal("只在少用模型上冷却的忙碌 Worker 不应排空")
+	}
+	releaseB1()
+	releaseB2()
+	lease, _, err := env.pool.TryAcquireFor(env.ctx, aistudio.AccountSelection{
+		ModelID: drainProModel, Method: "generateContent", AllowedAccountIDs: []string{a},
+	})
+	if err != nil || lease == nil {
+		t.Fatalf("不固定账户的主用模型请求应照常分给 A：lease=%v err=%v", lease, err)
+	}
+	_ = lease.Release()
+	if env.manager.retirementCount() != 1 {
+		t.Fatalf("登记应保留，登记数 = %d", env.manager.retirementCount())
+	}
+	releaseA()
+	if !waitUntil(3*time.Second, func() bool { return !slices.Contains(env.manager.WarmAccountIDs(), a) }) {
+		t.Fatalf("A 空闲后应照常淘汰，驻留 Worker = %v", sortedWarm(env.manager))
+	}
+}
+
+// modelDeniedUpstream 只让 accountID 对 modelID 返回 403 无权限，其余照常；调用记在 forbiddenUpstream 中
+type modelDeniedUpstream struct {
+	*forbiddenUpstream
+	accountID string
+	modelID   string
+}
+
+func (upstream *modelDeniedUpstream) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	if request.AccountID != upstream.accountID || strings.TrimPrefix(request.Model, "models/") != upstream.modelID {
+		return upstream.forbiddenUpstream.Generate(ctx, request)
+	}
+	upstream.mu.Lock()
+	upstream.calls = append(upstream.calls, request.AccountID)
+	upstream.mu.Unlock()
+	return nil, &aistudio.RPCError{
+		Method: "GenerateContent", StatusCode: http.StatusForbidden, Code: 7, Message: "The caller does not have permission",
 	}
 }

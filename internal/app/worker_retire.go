@@ -50,6 +50,23 @@ func (entry retirement) global() bool {
 	return len(entry.models) == 0
 }
 
+// drainable 判断忙碌的登记能否排空：全局冷却，或登记的模型中有一个是判断死槽位用的模型（deadSlotModels，热门与主用模型）。
+// 模型按降级判定的规则比较（主用模型已整理为小写）
+func (entry retirement) drainable(deadModels []string) bool {
+	if entry.global() {
+		return true
+	}
+	for _, modelID := range entry.models {
+		name := normalizeGuardModel(modelID)
+		for _, deadModel := range deadModels {
+			if normalizeGuardModel(deadModel) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // snapshot 返回登记的副本，模型列表另拷一份，淘汰循环读取时不与新的登记互相干扰
 func (entry retirement) snapshot() retirement {
 	entry.models = slices.Clone(entry.models)
@@ -209,8 +226,9 @@ func (candidate retirementCandidate) spareKey() string {
 
 // retirePass 处理一轮登记，返回处理后仍待淘汰的登记数。每条登记先核对账号仍有驻留 Worker、仍在长时间冷却
 // （冷却被清除或缩短时放弃淘汰并清除排空），再要求分区内有能服务登记模型的可接替账户（按登记的模型统计，不会换上同一模型的
-// 另一个死槽位）；账号正在启动或被其他路径选中时留到下一轮。忙碌的登记在分区排空数低于 drainLimit 时标记排空（最老的登记先排空）
-// 并立即启动替补，排空中的账号空闲后关闭，超过排空超时仍忙碌时清除排空、1 分钟后再试。关闭并发进行，数量不超过启动并发
+// 另一个死槽位）；账号正在启动或被其他路径选中时留到下一轮。忙碌的登记（全局冷却，或在主用、热门模型上冷却，见 drainable）
+// 在分区排空数低于 drainLimit 时标记排空（最老的登记先排空）并立即启动替补，排空中的账号空闲后关闭，超过排空超时仍忙碌时
+// 清除排空、1 分钟后再试；只在其他模型上冷却的忙碌登记不排空，空闲后照常淘汰。关闭并发进行，数量不超过启动并发
 func (manager *accountWorkerManager) retirePass() int {
 	now := time.Now()
 	manager.retireMu.Lock()
@@ -261,6 +279,7 @@ func (manager *accountWorkerManager) retirePass() int {
 		occupied[partition] = held
 		return held
 	}
+	deadModels := manager.deadSlotModels()
 	var victims []retirementCandidate
 	for _, candidate := range candidates {
 		if manager.lifecycle.Err() != nil {
@@ -306,6 +325,11 @@ func (manager *accountWorkerManager) retirePass() int {
 				continue
 			}
 		} else {
+			// 只有全局冷却、或在主用模型与热门模型上冷却的死槽位才排空；只在别的模型上冷却的（少用的模型、单个账号无权限的模型）
+			// 还能服务主用与热门模型，忙碌时不排空，空闲后照常淘汰
+			if busy && !candidate.entry.drainable(deadModels) {
+				continue
+			}
 			key := candidate.spareKey()
 			if !spareKnown[key] {
 				spareKnown[key] = true
@@ -470,13 +494,14 @@ const (
 // pickIdleVictim 在分区内按 mode 选择空闲热 Worker。账户池只加锁一次取得全部候选的活动与冷却状态；
 // 正在启动、替换、关闭或被其他路径选中的账户不作为候选（原因见 idleWarmVictimFor 的注释）
 func (manager *accountWorkerManager) pickIdleVictim(excludeID string, modelID string, mode victimMode, partition aistudio.PoolScope) string {
-	return manager.pickIdleVictimFor(excludeID, modelID, nil, mode, partition)
+	return manager.pickIdleVictimFor(excludeID, modelID, nil, mode, partition, time.Time{})
 }
 
 // pickIdleVictimFor 与 pickIdleVictim 相同，另把在 deadModels 任一模型上长时间冷却的账户也算作死槽位（再多加锁一次）：
-// 空闲回收不针对某个模型，按热门与主用模型判断死槽位，先关死槽位，留下还能服务主用模型的 Worker
+// 空闲回收不针对某个模型，按热门与主用模型判断死槽位，先关死槽位，留下还能服务主用模型的 Worker。
+// idleBefore 非零时只在最近使用与就绪时间都早于它的 Worker 中挑选（空闲回收）
 func (manager *accountWorkerManager) pickIdleVictimFor(
-	excludeID string, modelID string, deadModels []string, mode victimMode, partition aistudio.PoolScope,
+	excludeID string, modelID string, deadModels []string, mode victimMode, partition aistudio.PoolScope, idleBefore time.Time,
 ) string {
 	warm := manager.warmAccountIDsIn(partition)
 	candidates := make([]string, 0, len(warm))
@@ -488,6 +513,11 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 		account := manager.accounts[accountID]
 		manager.mu.RUnlock()
 		if account == nil {
+			continue
+		}
+		// idleBefore 非零时（空闲回收）只在空闲超时的 Worker 中挑选：死槽位优先只在这些 Worker 之间生效，
+		// 否则刚被其他模型的请求用过的死槽位排在最前，回收整轮放弃，真正空闲超时的 Worker 一直不被关闭
+		if !idleBefore.IsZero() && time.Unix(0, account.readyAt.Load()).After(idleBefore) {
 			continue
 		}
 		// 正在启动或替换 Worker 的账户不作为淘汰对象：启动流程持有该账户的 startupMu 之后还要拿 rebalanceMu，
@@ -539,6 +569,9 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 		if state.Busy || mode == victimCooling && !state.Cooling || mode == victimDead && !state.Dead {
 			continue
 		}
+		if !idleBefore.IsZero() && state.LastUsed.After(idleBefore) {
+			continue
+		}
 		if selected == "" || rank(state) > rank(selectedState) ||
 			rank(state) == rank(selectedState) && state.LastUsed.Before(selectedState.LastUsed) {
 			selected, selectedState = accountID, state
@@ -548,15 +581,14 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 }
 
 // reclaimDeadWorker 现场回收分区内一个对该模型是死槽位的空闲 Worker，返回回收的账户；
-// 没有死槽位、已被其他路径选中或淘汰时账号又忙碌时返回空。回收后同样启动替补（请求随后自己启动的备用账号先占到空槽时，
-// 替补按容量已满结束）
+// 没有死槽位、已被其他路径选中或淘汰时账号又忙碌时返回空。回收后不启动替补：调用的请求随后自己启动备用账号补上空出的槽位，
+// 另起替补会与它争同一个槽位，替补先占到时请求按替换流程再淘汰一个空闲 Worker，或只能等替补冷启动、主用模型排队超限返回 429
 func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, partition aistudio.PoolScope, modelID string) (string, error) {
 	victim := manager.pickIdleVictim("", modelID, victimDead, partition)
 	if victim == "" || !manager.tryReserveVictim(victim) {
 		return "", nil
 	}
 	defer manager.releaseVictim(victim)
-	drain := manager.drainOf(victim)
 	evicted, err := manager.evictIdleWorker(ctx, victim)
 	if err != nil {
 		manager.requests.log(victim, "WARN", fmt.Sprintf("WAA Worker 回收冷却占位失败 | 错误=%v", err))
@@ -570,16 +602,7 @@ func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, part
 		"WAA Worker 回收冷却占位 | 模型=%s | %s=%d/%d",
 		modelID, workerSlotName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
 	))
-	manager.startReplacements(manager.replacementsFor([]evictedWorker{{partition: partition, models: singleModel(modelID), drain: drain}}), "回收冷却占位")
 	return victim, nil
-}
-
-// singleModel 把一个模型转成登记用的模型列表，空模型为全局（nil）
-func singleModel(modelID string) []string {
-	if modelID = strings.TrimSpace(modelID); modelID == "" {
-		return nil
-	}
-	return []string{modelID}
 }
 
 // deadWarmCounts 统计各分区驻留 Worker 中的死槽位数（账号全局长时间冷却，或在预热池的热门冷却模型、主用模型上长时间不可用），
