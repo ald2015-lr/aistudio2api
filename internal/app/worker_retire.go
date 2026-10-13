@@ -154,6 +154,20 @@ func (manager *accountWorkerManager) retirementCount() int {
 	return int(manager.retirePending.Load())
 }
 
+// retirementCounts 按分区返回待淘汰登记数（供状态接口显示）
+func (manager *accountWorkerManager) retirementCounts(ultra map[string]struct{}) (normal int, ultraCount int) {
+	manager.retireMu.Lock()
+	defer manager.retireMu.Unlock()
+	for accountID := range manager.retirements {
+		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
+			ultraCount++
+		} else {
+			normal++
+		}
+	}
+	return normal, ultraCount
+}
+
 // retireLoop 处理待淘汰登记：由 retireWorker 与账户池变化（租约释放）唤醒，仍有登记时按兜底间隔重试
 func (manager *accountWorkerManager) retireLoop() {
 	retry := time.NewTimer(time.Hour)

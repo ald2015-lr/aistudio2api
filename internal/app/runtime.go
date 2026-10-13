@@ -190,6 +190,8 @@ type accountWorkerManager struct {
 	primaryModels  atomic.Pointer[[]string]
 	requestTimeout atomic.Int64
 	serviceActive  atomic.Pointer[func() bool]
+	// primarySupply 为 keepWarm 定期统计的主用模型供给（见 primary_supply.go），状态接口只读缓存
+	primarySupply  atomic.Pointer[primarySupplySnapshot]
 	backgroundMu   sync.Mutex
 	background     context.Context
 	stopBackground context.CancelFunc
@@ -745,8 +747,9 @@ func (manager *accountWorkerManager) ResetAll() error {
 	}
 	resets.Wait()
 	close(resetResults)
-	// 关闭失败的 Worker 不再排空：生成服务停止后不会有淘汰来清除它们的标记
+	// 关闭失败的 Worker 不再排空：生成服务停止后不会有淘汰来清除它们的标记；主用模型供给按 Worker 统计，一并清空
 	manager.clearAllDrains()
+	manager.clearPrimarySupply()
 	var resetErrors []error
 	for resetErr := range resetResults {
 		resetErrors = append(resetErrors, resetErr)

@@ -1135,10 +1135,11 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 | DTO | 字段 |
 | --- | --- |
-| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers` |
+| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，每个 `PRIMARY_MODELS` 模型一项；没有主用模型、服务未运行或还没统计过时省略） |
 | `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池账户 |
-| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、主用模型上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致 |
-| `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小 |
+| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、主用模型上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数 |
+| `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`draining`、`retiring`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小，其余字段口径同 `AdminWorkerCounts` |
+| `AdminPrimarySupply` | `model`、`warm`、`standby`、可选 `standby_capped`；一个主用模型在普通分区的可用供给，由 `keepWarm` 约每 30 秒统计一次并缓存（主用模型列表变化后的下一个周期立即重新统计），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；模型在号池里找不到时两项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
 | `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`）、`message` |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |

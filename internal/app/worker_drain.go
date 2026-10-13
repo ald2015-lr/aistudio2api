@@ -144,6 +144,31 @@ func (manager *accountWorkerManager) drainCount(partition aistudio.PoolScope) in
 	return manager.drainCountLocked(partition)
 }
 
+// drainCounts 按分区返回排空中的账号数（供状态接口显示），一次加锁
+func (manager *accountWorkerManager) drainCounts() (normal int, ultra int) {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	for _, drain := range manager.drains {
+		if drain.partition == aistudio.PoolScopeUltra {
+			ultra++
+		} else {
+			normal++
+		}
+	}
+	return normal, ultra
+}
+
+// drainingAccounts 返回排空中的账号
+func (manager *accountWorkerManager) drainingAccounts() map[string]struct{} {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	accounts := make(map[string]struct{}, len(manager.drains))
+	for accountID := range manager.drains {
+		accounts[accountID] = struct{}{}
+	}
+	return accounts
+}
+
 func (manager *accountWorkerManager) drainCountLocked(partition aistudio.PoolScope) int {
 	count := 0
 	for _, drain := range manager.drains {

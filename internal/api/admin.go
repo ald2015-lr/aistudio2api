@@ -48,16 +48,32 @@ type AdminStatus struct {
 	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
 	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含两个分区）
 	UltraWorkers AdminWorkerPartition `json:"ultra_workers"`
+	// PrimarySupply 为每个主用模型（PRIMARY_MODELS）在普通分区的可用供给，keepWarm 约每 30 秒统计一次并缓存；
+	// 没有主用模型或服务还没统计过时为空
+	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
+}
+
+// AdminPrimarySupply 表示一个主用模型在普通分区的可用供给：Warm 为能服务它的驻留 Worker（对它没有冷却、不在排空中），
+// Standby 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、对它没有冷却），最多统计 1000 个，达到上限时 StandbyCapped 为真。
+// Standby 为 0 表示没有还能服务该模型的空闲账号（多半是当天额度已用完，太平洋时间零点重置）
+type AdminPrimarySupply struct {
+	Model         string `json:"model"`
+	Warm          int    `json:"warm"`
+	Standby       int    `json:"standby"`
+	StandbyCapped bool   `json:"standby_capped,omitempty"`
 }
 
 // AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限
 type AdminWorkerPartition struct {
-	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的），
-	// Dead 为 Warm 中账号长时间冷却、等待淘汰的死槽位
+	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的，排空中的按已让出计），
+	// Dead 为 Warm 中账号长时间冷却、等待淘汰的死槽位；Draining 为其中排空中的 Worker（不再接不固定账户的新请求，
+	// 进行中的请求结束后关闭，替补已先启动），Retiring 为待淘汰登记数
 	Warm     int `json:"warm"`
 	Starting int `json:"starting"`
 	Occupied int `json:"occupied"`
 	Dead     int `json:"dead"`
+	Draining int `json:"draining"`
+	Retiring int `json:"retiring"`
 	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
 	Target    int `json:"target"`
 	WarmLimit int `json:"warm_limit"`
@@ -82,8 +98,11 @@ type AdminWorkerCounts struct {
 	Target   int `json:"target"`
 	Max      int `json:"max"`
 	Occupied int `json:"occupied"`
-	// Dead 为 Warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位
+	// Dead 为 Warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位；
+	// Draining 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动），Retiring 为待淘汰登记数
 	Dead        int               `json:"dead"`
+	Draining    int               `json:"draining"`
+	Retiring    int               `json:"retiring"`
 	Prewarm     AdminPrewarmState `json:"prewarm"`
 	WarmIDs     []string          `json:"warm_ids,omitempty"`
 	StartingIDs []string          `json:"starting_ids,omitempty"`

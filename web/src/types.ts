@@ -111,7 +111,8 @@ export interface PrewarmState {
 }
 
 // WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户；
-// dead 为 warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位
+// dead 为 warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位；
+// draining 为其中排空中的 Worker（不再接新请求，正在服务的请求结束后关闭，替补已先启动），retiring 为待淘汰登记数
 export interface WorkerCounters {
   warm: number
   starting: number
@@ -119,21 +120,35 @@ export interface WorkerCounters {
   max: number
   occupied?: number
   dead?: number
+  draining?: number
+  retiring?: number
   prewarm?: PrewarmState
   warm_ids?: string[]
   starting_ids?: string[]
 }
 
 // UltraWorkerCounters 为 Ultra 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
-// dead 为其中账号长时间冷却、等待淘汰的死槽位，warm_limit 与 max 为 Ultra 常驻数与峰值数设置
+// dead 为其中账号长时间冷却、等待淘汰的死槽位，draining 为其中排空中的，retiring 为待淘汰登记数，
+// warm_limit 与 max 为 Ultra 常驻数与峰值数设置
 export interface UltraWorkerCounters {
   warm: number
   starting: number
   occupied: number
   dead?: number
+  draining?: number
+  retiring?: number
   target: number
   warm_limit: number
   max: number
+}
+
+// PrimarySupply 为一个主用模型在普通分区的可用供给（约每 30 秒统计一次）：warm 为能服务它的常驻 Worker，
+// standby 为还能服务它的空闲备用账号，最多统计 1000 个，达到上限时 standby_capped 为 true
+export interface PrimarySupply {
+  model: string
+  warm: number
+  standby: number
+  standby_capped?: boolean
 }
 
 export interface ServiceStatus {
@@ -148,6 +163,8 @@ export interface ServiceStatus {
   // ultra_accounts 为 Ultra 号池的账户计数，ultra_workers 为 Ultra 分区的 Worker 计数
   ultra_accounts?: AccountCounters
   ultra_workers?: UltraWorkerCounters
+  // primary_supply 为每个主用模型（PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有
+  primary_supply?: PrimarySupply[]
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'

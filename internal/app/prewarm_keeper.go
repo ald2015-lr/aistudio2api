@@ -46,23 +46,30 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 		if !running {
 			return
 		}
-		// 驻留 Worker 中的死槽位每个周期补登记淘汰（忙碌的由淘汰循环排空），全局长时间冷却的空闲 Worker 每个周期清扫，
-		// 不等 30 秒一轮的按模型轮换
-		service.registerDeadWorkers()
-		service.sweepDeadWorkers(dataContext)
-		if time.Since(lastRotation) >= rotationInterval {
-			lastRotation = time.Now()
-			service.rotateCooledWorkers(dataContext)
-		}
-		workers := service.workers
-		workers.sweepFailedWorkers(dataContext)
-		workers.retryPendingCleanup()
-		// 普通与 Ultra 分区各自按自己的预热目标判断
-		if !workers.prewarmNeeded() {
-			continue
-		}
+		lastRotation = service.keepWarmPass(dataContext, lastRotation)
+	}
+}
+
+// keepWarmPass 为 keepWarm 的一个周期，返回最近一次冷却轮换的时间
+func (service *trackedService) keepWarmPass(dataContext context.Context, lastRotation time.Time) time.Time {
+	// 驻留 Worker 中的死槽位每个周期补登记淘汰（忙碌的由淘汰循环排空），全局长时间冷却的空闲 Worker 每个周期清扫，
+	// 不等 30 秒一轮的按模型轮换
+	service.registerDeadWorkers()
+	service.sweepDeadWorkers(dataContext)
+	if time.Since(lastRotation) >= rotationInterval {
+		lastRotation = time.Now()
+		service.rotateCooledWorkers(dataContext)
+	}
+	workers := service.workers
+	workers.sweepFailedWorkers(dataContext)
+	workers.retryPendingCleanup()
+	// 主用模型供给约每 30 秒统计一次（主用模型列表变化时立即重新统计），状态接口只读缓存
+	workers.refreshPrimarySupply(time.Now())
+	// 普通与 Ultra 分区各自按自己的预热目标判断
+	if workers.prewarmNeeded() {
 		workers.StartPrewarm(dataContext)
 	}
+	return lastRotation
 }
 
 // noteWarmFailure 记录一次预热失败

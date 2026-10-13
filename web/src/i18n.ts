@@ -333,12 +333,21 @@ const zhCN = {
   'app.workersStarting': '启动中 {count}',
   'app.workerCapacity': '槽位 {occupied} / 峰值 {max}',
   'app.workersDead': '冷却占位 {count} · 待淘汰',
-  'app.workersDeadDetail': '账号已长时间冷却（如每日限额）的常驻 Worker：占着名额却服务不了请求，空闲后立即关闭并由预热换上没有冷却的账号',
+  'app.workersDeadDetail':
+    '账号已长时间冷却（如每日限额，或主用、热门模型的当天额度已用完）的常驻 Worker：占着名额却服务不了这些请求。空闲时立即关闭，忙碌时先排空再关闭，并换上没有冷却的账号',
+  'app.workersDraining': '排空中 {count}',
+  'app.workersDrainingDetail':
+    '冷却占位的 Worker 不再接新请求，正在服务的请求结束后关闭，替补已先启动',
+  'app.primarySupplyModel': '主用 {model}：',
+  'app.primarySupply': '热 {warm} · 备用 {standby}',
+  'app.primarySupplyDetail':
+    '主用模型 {model}：热为能服务它的常驻 Worker，备用为还能服务它的空闲账号（最多统计 1000 个），约每 30 秒更新。备用为 0 表示没有还能服务该模型的空闲账号（当天额度可能已用完，太平洋时间零点重置）',
   'app.prewarmActive': '预热中 · 进行 {inflight} · 本轮 {launched}',
   'app.prewarmStalled': '预热循环 {seconds}s 无进展',
   'app.prewarmIdle': '预热空闲',
   'app.ultraWorkers': 'Ultra Worker {occupied} / {max}',
-  'app.ultraWorkersDetail': 'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 预热目标 {target} · 峰值 {max}',
+  'app.ultraWorkersDetail':
+    'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 预热目标 {target} · 峰值 {max}',
   'onboard.title': '新账户自动处理',
   'onboard.off': '已关闭',
   'onboard.idle': '队列为空',
@@ -949,12 +958,21 @@ const en: Record<TranslationKey, string> = {
   'app.workersStarting': '{count} starting',
   'app.workerCapacity': 'Slots {occupied} / peak {max}',
   'app.workersDead': '{count} dead slots · retiring',
-  'app.workersDeadDetail': 'Warm workers whose account is in a long cooldown (e.g. daily quota): they hold a slot but cannot serve requests; closed as soon as idle and replaced by prewarm with an uncooled account',
+  'app.workersDeadDetail':
+    "Warm workers whose account is in a long cooldown (e.g. daily quota, or the day's quota of a primary or hot model is used up): they hold a slot but cannot serve those requests. Closed at once when idle, drained first when busy, and replaced with an uncooled account",
+  'app.workersDraining': '{count} draining',
+  'app.workersDrainingDetail':
+    'These dead-slot workers take no new requests and close once their in-flight requests finish; their replacements have already been started',
+  'app.primarySupplyModel': 'Primary {model}:',
+  'app.primarySupply': '{warm} warm · {standby} standby',
+  'app.primarySupplyDetail':
+    "Primary model {model}: warm is the number of resident workers that can serve it, standby the number of idle accounts that still can (counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time)",
   'app.prewarmActive': 'Prewarming · {inflight} running · {launched} this round',
   'app.prewarmStalled': 'Prewarm loop stalled {seconds}s',
   'app.prewarmIdle': 'Prewarm idle',
   'app.ultraWorkers': 'Ultra workers {occupied} / {max}',
-  'app.ultraWorkersDetail': 'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · prewarm target {target} · limit {max}',
+  'app.ultraWorkersDetail':
+    'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · prewarm target {target} · limit {max}',
   'onboard.title': 'New account automation',
   'onboard.off': 'Off',
   'onboard.idle': 'Queue empty',

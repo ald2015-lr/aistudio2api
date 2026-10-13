@@ -132,6 +132,16 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	normalOccupied, ultraOccupied := admin.workers.occupiedSlotsApprox(ultra)
 	// 死槽位：驻留 Worker 的账号长时间冷却（见 worker_retire.go），占着名额却服务不了请求，等待淘汰
 	normalDead, ultraDead := admin.workers.deadWarmCounts(warm, ultra)
+	// 排空中（见 worker_drain.go）与待淘汰登记的数量
+	normalDraining, ultraDraining := admin.workers.drainCounts()
+	normalRetiring, ultraRetiring := admin.workers.retirementCounts(ultra)
+	ultraWorkers := admin.workers.ultraWorkerCounts(ultra, warm, starting, ultraOccupied, ultraDead)
+	ultraWorkers.Draining, ultraWorkers.Retiring = ultraDraining, ultraRetiring
+	// 主用模型供给读 keepWarm 的缓存（见 primary_supply.go），不在状态请求里对账户分类；服务没有运行时不显示
+	var primarySupply []api.AdminPrimarySupply
+	if running {
+		primarySupply = admin.workers.primarySupplyStatus()
+	}
 	normal := aistudio.PoolScopeNormal
 	return api.AdminStatus{
 		State:          state,
@@ -144,11 +154,12 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Workers: api.AdminWorkerCounts{
 			Warm: len(inPartition(warm, ultra, normal)), Starting: len(inPartition(starting, ultra, normal)),
 			Target: admin.workers.prewarmTargetFor(normal), Max: admin.workers.maxActiveFor(normal),
-			Occupied: normalOccupied, Dead: normalDead,
+			Occupied: normalOccupied, Dead: normalDead, Draining: normalDraining, Retiring: normalRetiring,
 			Prewarm: admin.workers.prewarmState(),
 			WarmIDs: warm, StartingIDs: starting,
 		},
-		UltraWorkers: admin.workers.ultraWorkerCounts(ultra, warm, starting, ultraOccupied, ultraDead),
+		UltraWorkers:  ultraWorkers,
+		PrimarySupply: primarySupply,
 	}, nil
 }
 

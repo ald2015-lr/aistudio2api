@@ -123,6 +123,14 @@ const ultraWorkers = computed(() => {
   return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0 ? workers : null
 })
 
+// primarySupply 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+
+const primarySupply = computed(() =>
+  (status.value?.primary_supply ?? []).map((supply) => ({
+    ...supply,
+    standbyLabel: supply.standby_capped ? `${supply.standby}+` : String(supply.standby),
+  })),
+)
+
 // navBadge 在导航项旁显示账户就绪数与活动请求数
 function navBadge(id: TabID): string {
   if (status.value === null) return ''
@@ -496,11 +504,37 @@ onUnmounted(() => {
             }}
           </div>
           <div
-            v-if="status.workers && (status.workers.dead ?? 0) > 0"
-            v-tooltip="t('app.workersDeadDetail')"
-            class="text-yellow-400"
+            v-if="
+              status.workers &&
+              ((status.workers.dead ?? 0) > 0 || (status.workers.draining ?? 0) > 0)
+            "
+            class="flex items-center gap-2 text-yellow-400"
           >
-            {{ tf('app.workersDead', { count: status.workers.dead ?? 0 }) }}
+            <span v-tooltip="t('app.workersDeadDetail')">
+              {{ tf('app.workersDead', { count: status.workers.dead ?? 0 }) }}
+            </span>
+            <span
+              v-if="(status.workers.draining ?? 0) > 0"
+              v-tooltip="t('app.workersDrainingDetail')"
+              class="text-cyan-300"
+            >
+              {{ tf('app.workersDraining', { count: status.workers.draining ?? 0 }) }}
+            </span>
+          </div>
+          <!-- 模型名过长时数量换到下一行，不被截断 -->
+          <div
+            v-for="supply in primarySupply"
+            :key="supply.model"
+            v-tooltip="tf('app.primarySupplyDetail', { model: supply.model })"
+            class="flex flex-wrap items-baseline gap-x-1"
+            :class="supply.standby === 0 ? 'text-yellow-400' : ''"
+          >
+            <span class="max-w-full min-w-0 truncate">
+              {{ tf('app.primarySupplyModel', { model: supply.model }) }}
+            </span>
+            <span class="whitespace-nowrap">
+              {{ tf('app.primarySupply', { warm: supply.warm, standby: supply.standbyLabel }) }}
+            </span>
           </div>
           <div
             v-if="ultraWorkers"
@@ -509,6 +543,7 @@ onUnmounted(() => {
                 warm: ultraWorkers.warm,
                 starting: ultraWorkers.starting,
                 dead: ultraWorkers.dead ?? 0,
+                draining: ultraWorkers.draining ?? 0,
                 target: ultraWorkers.target,
                 max: ultraWorkers.max,
               })
