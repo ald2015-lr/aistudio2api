@@ -2162,7 +2162,8 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 情况 | HTTP | OpenAI | Anthropic | Gemini |
 | --- | ---: | --- | --- | --- |
 | 参数、Schema、tool choice 无效 | 400 | `invalid_request` | `invalid_request_error` | `INVALID_ARGUMENT` |
-| 输入 token 超过上限（提示词过长；上游以 400 或 429 返回都算，不冷却账号） | 400 | `context_length_exceeded` | `invalid_request_error`（消息以 `prompt is too long:` 开头） | `INVALID_ARGUMENT` |
+| 输入超过模型本身的 token 上限（带计数的谷歌原文） | 400 | `context_length_exceeded` | `invalid_request_error`（消息以 `prompt is too long:` 开头） | `INVALID_ARGUMENT` |
+| 输入超过账号的输入上限（`… allowed 131072`；上游以 400 或 429 返回都算，不冷却账号）：文案与安全拦截相同 | 400 | `content_policy_violation` | `invalid_request_error` | `INVALID_ARGUMENT` |
 | 没有符合条件的账户 | 400 | `account_required` | `invalid_request_error` | `INVALID_ARGUMENT` |
 | 支持请求的账户均不可调度 | 503 | `account_unavailable` | `api_error` | `UNAVAILABLE` |
 | 本地 API key 无效 | 401 | `invalid_api_key` | `authentication_error` | `UNAUTHENTICATED` |

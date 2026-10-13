@@ -33,10 +33,13 @@ func TestDowngradeRejectStatus(t *testing.T) {
 	}
 }
 
-// TestInputTokenLimitAlways400 输入 token 超过上限（提示词过长）不看上游状态码：部分账号的 131072 输入上限由上游按 429 返回，
-// 也一律按 400 返回谷歌原文，OpenAI 附 context_length_exceeded，Anthropic 以 prompt is too long 开头；普通额度 429 仍按 429
+// TestInputTokenLimitAlways400 输入 token 超过上限（提示词过长）不看上游状态码，一律按 400 返回：
+// 账号上限（131072 写法，上游常按 429 返回）按与安全拦截相同的文案与类别返回（OpenAI code 为 content_policy_violation），
+// 不暴露账号的输入上限；带计数的模型本身上限返回谷歌原文，OpenAI 附 context_length_exceeded，Anthropic 以 prompt is too long 开头；
+// 普通额度 429 仍按 429
 func TestInputTokenLimitAlways400(t *testing.T) {
-	const capMessage = "The input token count exceeds the maximum number of tokens allowed 131072"
+	const capMessage = "The input token count exceeds the maximum number of tokens allowed 131072."
+	const blockedMessage = "Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)"
 	for _, test := range []struct {
 		name string
 		err  *aistudio.RPCError
@@ -44,26 +47,37 @@ func TestInputTokenLimitAlways400(t *testing.T) {
 		{name: "Playground 429", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: capMessage}},
 		{name: "Build 429", err: &aistudio.RPCError{Method: "ProxyStreamedCall", StatusCode: http.StatusTooManyRequests, Code: 8, Message: capMessage}},
 		{name: "Build 502 无协议码", err: &aistudio.RPCError{Method: "ProxyStreamedCall", StatusCode: http.StatusBadGateway, Message: capMessage}},
-		{name: "400", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusBadRequest, Code: 3, Message: "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576)."}},
+		{name: "Playground 400", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusBadRequest, Code: 3, Message: capMessage}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			public := publicErrorFor(test.err, "gemini-3.1-pro-preview")
-			if public.Status != http.StatusBadRequest || public.RPC != "INVALID_ARGUMENT" || public.Kind != publicKindContextLength || public.Message != test.err.Message {
-				t.Fatalf("得到 %+v，期望 400 INVALID_ARGUMENT、context_length 且保留谷歌原文", public)
+			if public.Status != http.StatusBadRequest || public.RPC != "INVALID_ARGUMENT" || public.Kind != publicKindBlocked || public.Message != blockedMessage {
+				t.Fatalf("得到 %+v，期望 400 INVALID_ARGUMENT、blocked 且文案与安全拦截相同", public)
 			}
 			openai := openAIErrorBody(public)["error"].(map[string]any)
-			if openai["code"] != "context_length_exceeded" || openai["param"] != "messages" {
-				t.Fatalf("OpenAI 错误 = %v，期望 code=context_length_exceeded param=messages", openai)
+			if openai["code"] != "content_policy_violation" || openai["message"] != blockedMessage {
+				t.Fatalf("OpenAI 错误 = %v，期望 code=content_policy_violation 且文案与安全拦截相同", openai)
 			}
 			anthropic := anthropicErrorBody(public, "req-1")["error"].(map[string]string)
-			if anthropic["type"] != "invalid_request_error" || !strings.HasPrefix(anthropic["message"], "prompt is too long: ") {
-				t.Fatalf("Anthropic 错误 = %v，期望 invalid_request_error 且以 prompt is too long: 开头", anthropic)
+			if anthropic["type"] != "invalid_request_error" || anthropic["message"] != blockedMessage {
+				t.Fatalf("Anthropic 错误 = %v，期望 invalid_request_error 且文案与安全拦截相同", anthropic)
 			}
 			gemini := geminiErrorBody(public)["error"].(map[string]any)
-			if gemini["code"] != http.StatusBadRequest || gemini["status"] != "INVALID_ARGUMENT" {
-				t.Fatalf("Gemini 错误 = %v，期望 400 INVALID_ARGUMENT", gemini)
+			if gemini["code"] != http.StatusBadRequest || gemini["status"] != "INVALID_ARGUMENT" || gemini["message"] != blockedMessage {
+				t.Fatalf("Gemini 错误 = %v，期望 400 INVALID_ARGUMENT 且文案与安全拦截相同", gemini)
 			}
 		})
+	}
+	modelLimit := &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusBadRequest, Code: 3, Message: "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576)."}
+	public := publicErrorFor(modelLimit, "gemini-3.1-pro-preview")
+	if public.Status != http.StatusBadRequest || public.Kind != publicKindContextLength || public.Message != modelLimit.Message {
+		t.Fatalf("模型上限得到 %+v，期望 400 context_length 且保留谷歌原文", public)
+	}
+	if openai := openAIErrorBody(public)["error"].(map[string]any); openai["code"] != "context_length_exceeded" || openai["param"] != "messages" {
+		t.Fatalf("模型上限 OpenAI 错误 = %v，期望 code=context_length_exceeded param=messages", openai)
+	}
+	if anthropic := anthropicErrorBody(public, "req-1")["error"].(map[string]string); !strings.HasPrefix(anthropic["message"], "prompt is too long: ") {
+		t.Fatalf("模型上限 Anthropic 错误 = %v，期望以 prompt is too long: 开头", anthropic)
 	}
 	quota := publicErrorFor(&aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: "You exceeded your current quota"}, "gemini-3.1-pro-preview")
 	if quota.Status != http.StatusTooManyRequests || quota.Kind != publicKindRateLimit {

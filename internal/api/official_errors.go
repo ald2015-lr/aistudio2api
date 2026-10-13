@@ -152,10 +152,19 @@ func publicErrorFor(err error, model string) publicError {
 
 // upstreamPublicError 映射 AI Studio 返回的上游错误：优先按 RPC 状态码判断，其次按 HTTP 状态码。
 // 输入 token 超过上限（提示词过长）不看上游状态码：部分账号的 131072 输入上限由上游按 429 RESOURCE_EXHAUSTED 返回，
-// 客户端按 429 重试或中转按限流处理都没有意义，一律按 400 返回谷歌原文，OpenAI 附 context_length_exceeded
+// 客户端按 429 重试或中转按限流处理都没有意义，一律按 400 返回。其中账号上限（131072 写法，见 aistudio.InputTokenCapError）
+// 按与安全拦截相同的文案返回（"Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)"，
+// OpenAI code 为 content_policy_violation），不向客户端暴露账号的输入上限；带具体计数的模型本身上限仍返回谷歌原文，
+// OpenAI 附 context_length_exceeded 以便 Codex 等客户端自动压缩上下文
 func upstreamPublicError(rpcError *aistudio.RPCError) publicError {
 	name := rpcStatusNames[rpcError.Code]
 	status := rpcError.StatusCode
+	if aistudio.InputTokenCapError(rpcError) {
+		return publicError{
+			Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT",
+			Message: blockedPromptMessage("PROHIBITED_CONTENT"), Kind: publicKindBlocked,
+		}
+	}
 	if aistudio.InputTokenLimitError(rpcError) {
 		return publicError{
 			Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT",
