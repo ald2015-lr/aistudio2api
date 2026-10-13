@@ -3,6 +3,8 @@ package app
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -43,7 +45,8 @@ type primaryModelSettings struct {
 	queueWait time.Duration
 }
 
-// setPrimaryModels 应用主用模型列表与排队上限（启动时与服务配置页保存后，立即生效）
+// setPrimaryModels 应用主用模型列表与排队上限（启动时与服务配置页保存后，立即生效）；主用模型同步给 Worker 管理器，
+// 用来判断死槽位、挑替补与放置其他模型的请求（见 worker_drain.go）
 func (service *trackedService) setPrimaryModels(models []string, queueWait time.Duration) {
 	settings := &primaryModelSettings{models: make(map[string]struct{}, len(models)), queueWait: max(queueWait, 0)}
 	for _, model := range models {
@@ -52,6 +55,9 @@ func (service *trackedService) setPrimaryModels(models []string, queueWait time.
 		}
 	}
 	service.primaryModels.Store(settings)
+	if service.workers != nil {
+		service.workers.setPrimaryModels(slices.Sorted(maps.Keys(settings.models)))
+	}
 }
 
 // primaryQueueWait 返回模型（别名已解析为规范 ID）是否为主用模型，以及它的排队上限

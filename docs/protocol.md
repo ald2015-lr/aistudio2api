@@ -1137,7 +1137,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | --- | --- |
 | `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers` |
 | `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池账户 |
-| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`dead` 为 `warm` 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位 |
+| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、主用模型上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致 |
 | `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小 |
 | `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`）、`message` |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |

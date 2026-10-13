@@ -46,7 +46,9 @@ func (service *trackedService) keepWarm(dataContext context.Context) {
 		if !running {
 			return
 		}
-		// 全局长时间冷却的空闲 Worker 每个周期清扫，不等 30 秒一轮的按模型轮换
+		// 驻留 Worker 中的死槽位每个周期补登记淘汰（忙碌的由淘汰循环排空），全局长时间冷却的空闲 Worker 每个周期清扫，
+		// 不等 30 秒一轮的按模型轮换
+		service.registerDeadWorkers()
 		service.sweepDeadWorkers(dataContext)
 		if time.Since(lastRotation) >= rotationInterval {
 			lastRotation = time.Now()
@@ -160,14 +162,14 @@ func (manager *accountWorkerManager) hotModelList() []string {
 	return nil
 }
 
-// preferUncooled 把候选账户中没有在热门模型上长时间冷却的排在前面，预热时优先使用。
-// 全部都在冷却时仍然保留，它们还能服务其他模型
+// preferUncooled 把候选账户中没有在热门模型与主用模型上长时间冷却的排在前面，预热时优先使用（主用模型在重启后热门模型
+// 还没学到时同样有效）。全部都在冷却时仍然保留，它们还能服务其他模型
 func (manager *accountWorkerManager) preferUncooled(accountIDs []string) []string {
-	hot := manager.hotModelList()
-	if len(hot) == 0 || len(accountIDs) == 0 {
+	models := manager.deadSlotModels()
+	if len(models) == 0 || len(accountIDs) == 0 {
 		return accountIDs
 	}
-	cooling := manager.pool.LongCoolingSet(accountIDs, hot, rotationMinRemaining, false)
+	cooling := manager.pool.LongCoolingSet(accountIDs, models, rotationMinRemaining, false)
 	if len(cooling) == 0 {
 		return accountIDs
 	}
@@ -254,9 +256,12 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 	}
 	var closes sync.WaitGroup
 	var retired atomic.Int32
-	for _, target := range victims {
+	closed := make([]bool, len(victims))
+	drains := make([]*drainState, len(victims))
+	for index, target := range victims {
 		closes.Add(1)
-		go func(target victim) {
+		drains[index] = workers.drainOf(target.accountID)
+		go func(index int, target victim) {
 			defer closes.Done()
 			evicted, err := workers.evictIdleWorker(ctx, target.accountID)
 			workers.releaseVictim(target.accountID)
@@ -268,9 +273,10 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 			}
 			if evicted {
 				workers.dropRetirement(target.accountID)
+				closed[index] = true
 				retired.Add(1)
 			}
-		}(target)
+		}(index, target)
 	}
 	closes.Wait()
 	count := int(retired.Load())
@@ -280,7 +286,16 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 	service.requests.log("service", "INFO", fmt.Sprintf(
 		"WAA Worker 冷却清扫 | 关闭全局冷却的空闲 Worker=%d | 预热池中全局冷却=%d/%d", count, len(dead), len(allWarm),
 	))
+	// 低于预热目标的部分由预热补齐，其余（WARM_WORKER_LIMIT 低于驻留数时预热不补）由替补保持驻留数；在预热开始前统计
+	evicted := make([]evictedWorker, 0, count)
+	for index, target := range victims {
+		if closed[index] {
+			evicted = append(evicted, evictedWorker{partition: target.partition, drain: drains[index]})
+		}
+	}
+	plan := workers.replacementsFor(evicted)
 	workers.StartPrewarm(ctx)
+	workers.startReplacements(plan, "冷却清扫")
 	return count
 }
 
@@ -296,6 +311,8 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	opening := workers.OpeningAccountIDs()
 	var allHot []string
 	var details []string
+	// evicted 为本轮被淘汰的 Worker，随后按 replacementsFor 启动替补
+	var evicted []evictedWorker
 	rotated := 0
 	budget := workers.warmConcurrencyValue()
 	for _, partition := range workerPartitions {
@@ -308,9 +325,12 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 		if len(hot) == 0 || budget-rotated <= 0 || ctx.Err() != nil {
 			continue
 		}
-		count := service.rotatePartition(ctx, partition, warm, opening, hot, budget-rotated)
+		count, drains := service.rotatePartition(ctx, partition, warm, opening, hot, budget-rotated)
 		if count == 0 {
 			continue
+		}
+		for _, drain := range drains {
+			evicted = append(evicted, evictedWorker{partition: partition, models: hot, drain: drain})
 		}
 		rotated += count
 		prefix := ""
@@ -329,7 +349,10 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	service.requests.log("service", "INFO", fmt.Sprintf(
 		"WAA Worker 冷却轮换 | 替换=%d | 预热池中长时间冷却=%s", rotated, strings.Join(details, "，"),
 	))
+	// 低于预热目标的部分由预热补齐，其余（WARM_WORKER_LIMIT 低于驻留数时预热不补）由替补保持驻留数；在预热开始前统计
+	plan := workers.replacementsFor(evicted)
 	workers.StartPrewarm(ctx)
+	workers.startReplacements(plan, "冷却轮换")
 }
 
 // hotModelsIn 返回分区预热池中被大量 Worker 长时间冷却的模型与各模型的冷却数
@@ -346,10 +369,11 @@ func (service *trackedService) hotModelsIn(warm []string) ([]string, map[string]
 	return hot, counts
 }
 
-// rotatePartition 在分区内淘汰最多 limit 个在热门模型上长时间冷却的空闲 Worker，返回淘汰数
+// rotatePartition 在分区内淘汰最多 limit 个在热门模型上长时间冷却的空闲 Worker，返回淘汰数与被淘汰账号淘汰前的排空状态
+// （每个被淘汰的 Worker 一项，不在排空时为 nil，供随后启动替补）
 func (service *trackedService) rotatePartition(
 	ctx context.Context, partition aistudio.PoolScope, warm []string, openingIDs []string, hot []string, limit int,
-) int {
+) (int, []*drainState) {
 	workers := service.workers
 	occupied := make(map[string]struct{}, len(warm)+len(openingIDs))
 	for _, accountID := range warm {
@@ -360,10 +384,11 @@ func (service *trackedService) rotatePartition(
 	}
 	limit = min(limit, service.pool.SpareAccounts(partition, occupied, hot, rotationMinRemaining, limit))
 	if limit <= 0 {
-		return 0
+		return 0, nil
 	}
 	victims := service.pool.LongCoolingSet(warm, hot, rotationMinRemaining, true)
 	rotated := 0
+	var drains []*drainState
 	now := time.Now()
 	for _, accountID := range warm {
 		if rotated >= limit || ctx.Err() != nil {
@@ -385,6 +410,7 @@ func (service *trackedService) rotatePartition(
 		if !workers.tryReserveVictim(accountID) {
 			continue
 		}
+		drain := workers.drainOf(accountID)
 		evicted, err := workers.evictIdleWorker(ctx, accountID)
 		workers.releaseVictim(accountID)
 		if err != nil {
@@ -393,9 +419,10 @@ func (service *trackedService) rotatePartition(
 		}
 		if evicted {
 			rotated++
+			drains = append(drains, drain)
 		}
 	}
-	return rotated
+	return rotated, drains
 }
 
 // retryPendingCleanup 重试清理失败的账户：关闭失败的浏览器或释放失败的运行时租约会让账户停在“待清理”状态，

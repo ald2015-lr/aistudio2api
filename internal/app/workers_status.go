@@ -23,7 +23,8 @@ func (manager *accountWorkerManager) OpeningAccountIDs() []string {
 }
 
 // occupiedSlotsApprox 按分区统计占用的 Worker 槽位，供状态接口使用，不会阻塞：
-// 关闭或替换 Worker 期间会持有账户锁（关闭浏览器可能几秒，WAA proof 在锁外生成），拿不到锁的账户按占用 1 个槽位计。
+// 关闭或替换 Worker 期间会持有账户锁（关闭浏览器可能几秒，WAA proof 在锁外生成），拿不到锁的账户按占用 1 个槽位计；
+// 排空中的 Worker 按已让出计，与调度的容量判断口径一致（排空期间浏览器数可以比槽位数多 drainLimit 个）。
 // 调度路径仍使用精确的 occupiedWorkersIn
 func (manager *accountWorkerManager) occupiedSlotsApprox(ultra map[string]struct{}) (normal int, ultraSlots int) {
 	manager.mu.RLock()
@@ -57,6 +58,9 @@ func (manager *accountWorkerManager) occupiedSlotsApprox(ultra map[string]struct
 			normal += slots
 		}
 	}
+	// 与调度的容量判断一致：排空中的 Worker 按已让出槽位计（先启后停，见 worker_drain.go）
+	normal -= manager.drainCredit(aistudio.PoolScopeNormal, nil)
+	ultraSlots -= manager.drainCredit(aistudio.PoolScopeUltra, nil)
 	return normal, ultraSlots
 }
 

@@ -155,7 +155,9 @@ func fullPartition(capacityFull map[aistudio.PoolScope]bool) (aistudio.PoolScope
 }
 
 // standbyCapacity 在一次调度中按 Worker 分区判断备用账户能否启动 Worker：分区未满，或分区已满但有可淘汰的空闲 Worker。
-// 分区归属在第一次需要时才读取（没有备用账户时不扫描账户池），每个分区的淘汰检查只做一次（要逐个尝试账户锁）
+// 分区归属在第一次需要时才读取（没有备用账户时不扫描账户池），每个分区的淘汰检查只做一次（要逐个尝试账户锁）。
+// 占用与 ensureWorker 口径一致：驻留与正在启动的 Worker 都占槽位，排空中的 Worker 按已让出计（最多 drainLimit 个）；
+// 原先只数驻留的 Worker，分区被启动中的 Worker 占满时排队的请求每秒都会发起一次注定按容量已满结束的后台扩容
 type standbyCapacity struct {
 	manager  *accountWorkerManager
 	modelID  string
@@ -164,6 +166,8 @@ type standbyCapacity struct {
 	active   map[aistudio.PoolScope]int
 	cooling  map[aistudio.PoolScope]bool
 	idle     map[aistudio.PoolScope]bool
+	// avoid 为已核对过的备用账户是否在热门或主用模型上长时间冷却（见 preferred），一次调度内每个账户最多核对一次
+	avoid map[string]bool
 }
 
 // standbyCapacity 按当前驻留的 Worker 创建分区容量判断
@@ -171,18 +175,67 @@ func (manager *accountWorkerManager) standbyCapacity(active []string, modelID st
 	return &standbyCapacity{manager: manager, modelID: modelID, resident: active}
 }
 
-// partition 返回账户所在的分区；第一次调用时读取 Ultra 账户并按分区统计驻留的 Worker
+// partition 返回账户所在的分区；第一次调用时读取 Ultra 账户并按分区统计占用的 Worker（驻留与正在启动，减去排空让出的）
 func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope {
 	if capacity.ultra == nil {
 		capacity.ultra = capacity.manager.pool.UltraAccountIDs()
 		capacity.active = make(map[aistudio.PoolScope]int, len(workerPartitions))
 		capacity.cooling = make(map[aistudio.PoolScope]bool, len(workerPartitions))
 		capacity.idle = make(map[aistudio.PoolScope]bool, len(workerPartitions))
+		occupied := make(map[string]struct{}, len(capacity.resident))
 		for _, resident := range capacity.resident {
-			capacity.active[partitionOf(resident, capacity.ultra)]++
+			occupied[resident] = struct{}{}
+		}
+		for _, opening := range capacity.manager.OpeningAccountIDs() {
+			occupied[opening] = struct{}{}
+		}
+		for accountID := range occupied {
+			capacity.active[partitionOf(accountID, capacity.ultra)]++
+		}
+		for _, partition := range workerPartitions {
+			capacity.active[partition] -= capacity.manager.drainCredit(partition, occupied)
 		}
 	}
 	return partitionOf(accountID, capacity.ultra)
+}
+
+// preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个中没有在热门或主用模型上长时间冷却的账户在前、冷却的在后，
+// 第二段为其余候选，保持原顺序且不复制（备用账户可能有上万个）。为其他模型的请求启动的备用账号也优先选还能服务主用模型的，
+// 不直接启动一个主用模型已冷却的死槽位；只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），全部都在冷却时仍按原顺序使用
+func (capacity *standbyCapacity) preferred(list []string) [2][]string {
+	models := capacity.manager.deadSlotModels()
+	if len(models) == 0 || len(list) <= 1 {
+		return [2][]string{list, nil}
+	}
+	head := list[:min(standbyPreferLimit, len(list))]
+	unknown := make([]string, 0, len(head))
+	for _, accountID := range head {
+		if _, checked := capacity.avoid[accountID]; !checked {
+			unknown = append(unknown, accountID)
+		}
+	}
+	if len(unknown) > 0 {
+		if capacity.avoid == nil {
+			capacity.avoid = make(map[string]bool, len(unknown))
+		}
+		cooling := capacity.manager.pool.LongCoolingSet(unknown, models, rotationMinRemaining, false)
+		for _, accountID := range unknown {
+			_, cooled := cooling[accountID]
+			capacity.avoid[accountID] = cooled
+		}
+	}
+	ordered := make([]string, 0, len(head))
+	for _, accountID := range head {
+		if !capacity.avoid[accountID] {
+			ordered = append(ordered, accountID)
+		}
+	}
+	for _, accountID := range head {
+		if capacity.avoid[accountID] {
+			ordered = append(ordered, accountID)
+		}
+	}
+	return [2][]string{ordered, list[len(head):]}
 }
 
 func (capacity *standbyCapacity) room(partition aistudio.PoolScope) bool {
@@ -212,13 +265,16 @@ func (capacity *standbyCapacity) idleVictim(partition aistudio.PoolScope) bool {
 	return found
 }
 
-// expandable 返回可以在后台扩容的备用账户：所在分区未满，或分区已满但有冷却中的空闲 Worker 可以替换；优先没有 Worker 的账户
+// expandable 返回可以在后台扩容的备用账户：所在分区未满，或分区已满但有冷却中的空闲 Worker 可以替换；优先没有 Worker 的账户，
+// 其次优先没有在热门或主用模型上长时间冷却的账户（见 preferred）
 func (capacity *standbyCapacity) expandable(standby []string) string {
 	for _, candidates := range [][]string{capacity.manager.coldAccounts(standby), standby} {
-		for _, accountID := range candidates {
-			partition := capacity.partition(accountID)
-			if capacity.room(partition) || capacity.coolingVictim(partition) {
-				return accountID
+		for _, segment := range capacity.preferred(candidates) {
+			for _, accountID := range segment {
+				partition := capacity.partition(accountID)
+				if capacity.room(partition) || capacity.coolingVictim(partition) {
+					return accountID
+				}
 			}
 		}
 	}
@@ -243,21 +299,25 @@ func (capacity *standbyCapacity) reclaimDead(ctx context.Context, standby []stri
 }
 
 // promotable 返回现场启动 Worker 的备用账户：所在分区未满时优先没有 Worker 的账户；
-// allowVictim 时（没有热候选）分区已满但同分区有可淘汰的空闲 Worker 也可以
+// allowVictim 时（没有热候选）分区已满但同分区有可淘汰的空闲 Worker 也可以。同样优先没有在热门或主用模型上长时间冷却的账户
 func (capacity *standbyCapacity) promotable(standby []string, allowVictim bool) string {
 	for _, candidates := range [][]string{capacity.manager.coldAccounts(standby), standby} {
-		for _, accountID := range candidates {
-			if capacity.room(capacity.partition(accountID)) {
-				return accountID
+		for _, segment := range capacity.preferred(candidates) {
+			for _, accountID := range segment {
+				if capacity.room(capacity.partition(accountID)) {
+					return accountID
+				}
 			}
 		}
 	}
 	if !allowVictim {
 		return ""
 	}
-	for _, accountID := range standby {
-		if capacity.idleVictim(capacity.partition(accountID)) {
-			return accountID
+	for _, segment := range capacity.preferred(standby) {
+		for _, accountID := range segment {
+			if capacity.idleVictim(capacity.partition(accountID)) {
+				return accountID
+			}
 		}
 	}
 	return ""

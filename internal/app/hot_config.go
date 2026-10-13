@@ -197,7 +197,7 @@ func (manager *runtimeManager) applyLiveConfig() {
 	admin.pool.SetPerAccountConcurrency(saved.PerAccountConcurrency)
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
 	admin.workers.applyLiveSettings(saved)
-	admin.service.timeout.Store(int64(saved.RequestTimeout))
+	admin.service.setRequestTimeout(saved.RequestTimeout)
 	admin.service.firstEventTimeout.Store(int64(saved.FirstEventTimeout))
 	admin.service.ignoreSeed.Store(saved.IgnoreClientSeed)
 	admin.service.repeatNonce.Store(saved.RepeatPromptNonce)

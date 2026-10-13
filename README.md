@@ -541,7 +541,7 @@ cp .env.example .env
 | `REQUEST_TIMEOUT` | `5m` | 单次请求最大执行时间 |
 | `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
 | `WARM_WORKER_LIMIT` | `5` | 普通号池的常驻预热账户数（不含 Ultra 账户） |
-| `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS` 之和 |
+| `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS` 之和。淘汰仍在服务请求的冷却占位时替补先启动，排空期间每个分区最多再多 `min(WARM_STARTUP_CONCURRENCY×2, 峰值/4)` 个（至少 1 个） |
 | `ULTRA_EXCLUSIVE` | `true` | `true` 时 Ultra 账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户 |
 | `ULTRA_WARM_WORKER_LIMIT` | `2` | Ultra 号池的常驻预热 Worker 数，可以为 `0`（只按需启动） |
 | `ULTRA_MAX_ACTIVE_WORKERS` | `5` | Ultra 号池高峰期最多同时运行的 Worker 数，至少为 1 且不小于 `ULTRA_WARM_WORKER_LIMIT` |
@@ -562,7 +562,7 @@ cp .env.example .env
 
 服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制普通号池的常驻预热规模，`MAX_ACTIVE_WORKERS` 控制普通号池的峰值 Worker 上限，Ultra 号池由 `ULTRA_WARM_WORKER_LIMIT` 与 `ULTRA_MAX_ACTIVE_WORKERS` 单独控制（见 [Ultra 号池](#ultra-号池ultra-前缀)），这些 Worker 设置与 `ULTRA_EXCLUSIVE` 在管理页保存后立即生效；`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位。
 
-号池的同时生成数约为 `MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`（Ultra 号池为 `ULTRA_MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`）。并发请求超过它时，多出来的请求在选号时排队等空闲的账号或 Worker，首字延迟随之拉长，直到 `REQUEST_TIMEOUT` 到期返回 504；账号因每日限额冷却却仍占着 Worker 时可用容量更少。`PRIMARY_MODELS` 的快速失败只是对症状的处理：列表中的模型排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429 让客户端稍后重试，不会增加容量；长期高于容量时应提高 `MAX_ACTIVE_WORKERS` 或 `PER_ACCOUNT_CONCURRENCY`，或减少并发。
+号池的同时生成数约为 `MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`（Ultra 号池为 `ULTRA_MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`）。并发请求超过它时，多出来的请求在选号时排队等空闲的账号或 Worker，首字延迟随之拉长，直到 `REQUEST_TIMEOUT` 到期返回 504；账号因每日限额冷却却仍占着 Worker 时可用容量更少。这样的冷却占位（账号全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）即使一直有其他模型的请求在用，也会被排空：不再接新的请求，替补账号先启动，进行中的请求结束后关闭；其他模型的请求优先分给冷却占位，把还能服务主用模型的 Worker 留给主用模型。`PRIMARY_MODELS` 的快速失败只是对症状的处理：列表中的模型排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429 让客户端稍后重试，不会增加容量；长期高于容量时应提高 `MAX_ACTIVE_WORKERS` 或 `PER_ACCOUNT_CONCURRENCY`，或减少并发。
 
 ### 端口配置
 

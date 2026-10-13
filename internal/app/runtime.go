@@ -177,11 +177,19 @@ type accountWorkerManager struct {
 	victims         map[string]struct{}
 	// retirements 为账号进入长时间冷却、等待空闲后淘汰的驻留 Worker（见 worker_retire.go），retirePending 为其数量的无锁镜像；
 	// retireWake 唤醒淘汰循环（容量 1，重复唤醒合并）；afterRetire 在淘汰成功后补齐预热，由生成服务按运行状态设置
-	retireMu       sync.Mutex
-	retirements    map[string]*retirement
-	retirePending  atomic.Int32
-	retireWake     chan struct{}
-	afterRetire    atomic.Pointer[func()]
+	retireMu      sync.Mutex
+	retirements   map[string]*retirement
+	retirePending atomic.Int32
+	retireWake    chan struct{}
+	afterRetire   atomic.Pointer[func()]
+	// drains 为排空中的账号（见 worker_drain.go），由 drainMu 保护；账户池的排空标记只在 drainMu 内设置与清除，两边始终一致
+	drainMu sync.Mutex
+	drains  map[string]*drainState
+	// primaryModels 为主用模型（PRIMARY_MODELS，由生成服务设置），与热门模型一起判断死槽位、挑替补与放置请求；
+	// requestTimeout 为请求超时（REQUEST_TIMEOUT），排空超时按它计算；serviceActive 返回生成服务是否在运行，替补只在运行时启动
+	primaryModels  atomic.Pointer[[]string]
+	requestTimeout atomic.Int64
+	serviceActive  atomic.Pointer[func() bool]
 	backgroundMu   sync.Mutex
 	background     context.Context
 	stopBackground context.CancelFunc
@@ -341,6 +349,7 @@ func newAccountWorkerManager(
 		openings:    make(map[string]chan struct{}),
 		lifecycle:   lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
 		victims: make(map[string]struct{}), retirements: make(map[string]*retirement), retireWake: make(chan struct{}, 1),
+		drains: make(map[string]*drainState),
 	}
 	manager.initTimeout.Store(int64(initTimeout))
 	manager.warmTarget.Store(int64(warmTarget))
@@ -482,7 +491,8 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	return false
 }
 
-// reapIdleWorkerIn 在分区的 Worker 超出该分区常驻数时关闭其中一个空闲超时的 Worker
+// reapIdleWorkerIn 在分区的 Worker 超出该分区常驻数时关闭其中一个空闲超时的 Worker：在热门或主用模型上长时间冷却的死槽位优先，
+// 留下还能服务主用模型的 Worker
 func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolScope, before time.Time) bool {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
@@ -490,7 +500,7 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 	if manager.openingIn(partition, ultra) || len(inPartition(manager.WarmAccountIDs(), ultra, partition)) <= manager.warmTargetFor(partition) {
 		return false
 	}
-	victim := manager.idleWarmVictimFor("", "", false, partition)
+	victim := manager.pickIdleVictimFor("", "", manager.deadSlotModels(), victimAny, partition)
 	if victim == "" {
 		return false
 	}
@@ -735,6 +745,8 @@ func (manager *accountWorkerManager) ResetAll() error {
 	}
 	resets.Wait()
 	close(resetResults)
+	// 关闭失败的 Worker 不再排空：生成服务停止后不会有淘汰来清除它们的标记
+	manager.clearAllDrains()
 	var resetErrors []error
 	for resetErr := range resetResults {
 		resetErrors = append(resetErrors, resetErr)
@@ -810,6 +822,15 @@ func (manager *accountWorkerManager) WarmAccountIDs() []string {
 type workerOccupancy struct {
 	accountIDs []string
 	slots      int
+	// lockBusy 为账户锁被占用、按占用 1 个槽位估计的账户（锁内可能正在启动、发布或关闭 Worker）
+	lockBusy map[string]struct{}
+	// drainCredit 为其中排空中、视为已让出的槽位数（见 drainCredit，只按单个分区统计时计算）：容量按 slots - drainCredit 与峰值比较
+	drainCredit int
+}
+
+// effectiveSlots 返回容量判断用的占用数：排空中的 Worker 按已让出计（先启后停，见 worker_drain.go）
+func (occupancy workerOccupancy) effectiveSlots() int {
+	return occupancy.slots - occupancy.drainCredit
 }
 
 // occupiedWorkers 返回仍持有进程或运行锁的账户与容量槽位
@@ -817,7 +838,7 @@ func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
 	return manager.occupiedWorkersIn(aistudio.PoolScopeAll, nil)
 }
 
-// occupiedWorkersIn 返回分区内仍持有进程或运行锁的账户与容量槽位；partition 为不限号池时统计全部分区
+// occupiedWorkersIn 返回分区内仍持有进程或运行锁的账户与容量槽位；partition 为不限号池时统计全部分区（不计排空让出的槽位）
 func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolScope, ultra map[string]struct{}) workerOccupancy {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
@@ -833,6 +854,10 @@ func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolSc
 		if !account.mu.TryLock() {
 			occupied.accountIDs = append(occupied.accountIDs, account.id)
 			occupied.slots++
+			if occupied.lockBusy == nil {
+				occupied.lockBusy = make(map[string]struct{})
+			}
+			occupied.lockBusy[account.id] = struct{}{}
 			continue
 		}
 		if account.worker != nil || account.cleanupWorker != nil || account.runtimeLease != nil || account.cleanupLease != nil {
@@ -851,6 +876,13 @@ func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolSc
 			occupied.slots++
 		}
 		account.mu.Unlock()
+	}
+	if partition != aistudio.PoolScopeAll {
+		held := make(map[string]struct{}, len(occupied.accountIDs))
+		for _, accountID := range occupied.accountIDs {
+			held[accountID] = struct{}{}
+		}
+		occupied.drainCredit = manager.drainCredit(partition, held)
 	}
 	return occupied
 }
@@ -1367,10 +1399,15 @@ func (manager *accountWorkerManager) ensureWorker(
 				continue
 			}
 			occupied[openingAccountID] = struct{}{}
-			occupancy.slots++
+			// 正在启动的账户锁被占用时（启动流程短暂持有账户锁）上面已按 1 个槽位估计，不再重复计入：
+			// 否则两个账户同时启动时后一个会把前一个算成两个槽位，分区还有空槽却按已满返回
+			if _, estimated := occupancy.lockBusy[openingAccountID]; !estimated {
+				occupancy.slots++
+			}
 		}
 		_, replacing := occupied[accountID]
-		if replacing || occupancy.slots < manager.maxActiveFor(partition) {
+		// 排空中的 Worker 按已让出槽位计（最多 drainLimit 个）：替补可以在旧 Worker 排空前启动，分区浏览器总数不超过 峰值 + drainLimit
+		if replacing || occupancy.effectiveSlots() < manager.maxActiveFor(partition) {
 			opening := make(chan struct{})
 			manager.openings[accountID] = opening
 			manager.openingSet.Store(accountID, struct{}{})
@@ -1387,15 +1424,17 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.finishOpening(accountID, opening)
 			warmCount := len(manager.warmAccountIDsIn(partition))
 			manager.rebalanceMu.Unlock()
-			if err == nil && warmCount > manager.warmTargetFor(partition) {
+			// 替补由 startReplacement 自己记录，不算按需扩容
+			if err == nil && warmCount > manager.warmTargetFor(partition) && !replacementStartup(ctx) {
 				manager.requests.log("service", "INFO", fmt.Sprintf(
 					"%s 按需扩容 | Worker=%d/%d", workerLogName(partition), warmCount, manager.maxActiveFor(partition),
 				))
 			}
 			return preparer, err
 		}
-		// 不等待的选号（acquireWarmLeaseNow）只在分区有空槽时现场启动：替换空闲 Worker 要等旧 Worker 让出，按容量已满返回
-		if immediateStartup(ctx) {
+		// 不等待的选号（acquireWarmLeaseNow）只在分区有空槽时现场启动：替换空闲 Worker 要等旧 Worker 让出，按容量已满返回；
+		// 替补（startReplacement）同样只用空槽，不替换其他账号的空闲 Worker
+		if immediateStartup(ctx) || replacementStartup(ctx) {
 			manager.rebalanceMu.Unlock()
 			return nil, errAccountWorkerCapacity
 		}
@@ -1772,7 +1811,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				switch {
 				case anyFull:
 					occupancy := manager.occupiedWorkersIn(full, manager.pool.UltraAccountIDs())
-					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.slots, manager.maxActiveFor(full))
+					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.effectiveSlots(), manager.maxActiveFor(full))
 					level = "WARN"
 				case classifyErr != nil:
 					reason = "候选账户分类失败: " + strings.TrimSpace(classifyErr.Error())
@@ -1891,6 +1930,7 @@ func (manager *accountWorkerManager) Close() error {
 	}
 	closes.Wait()
 	close(closeResults)
+	manager.clearAllDrains()
 	var closeErrors []error
 	for closeErr := range closeResults {
 		closeErrors = append(closeErrors, closeErr)
@@ -1937,6 +1977,8 @@ func (manager *accountWorkerManager) closeCleanupLeftovers(account *accountWorke
 	}
 	if account.worker == nil && account.cleanupWorker == nil && account.runtimeLease == nil && account.cleanupLease == nil {
 		account.warm.Store(false)
+		// Worker 已关闭：排空随之结束（淘汰、清扫、回收、ResetAll、Close 等任何关闭路径），账号以后再启动 Worker 时照常接受请求
+		manager.clearDrain(account.id)
 		manager.notifyScheduling()
 	}
 	return errors.Join(closeErrors...)
@@ -2187,13 +2229,24 @@ func newTrackedService(
 		lifecycle: lifecycle, service: service, catalog: catalog, pool: pool, requests: requests, workers: workers,
 		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(),
 	}
-	tracked.timeout.Store(int64(timeout))
-	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断
+	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断。
+	// 替补只在生成服务运行时启动，排空超时按请求超时计算（见 worker_drain.go）
 	if workers != nil {
 		refill := tracked.prewarmIfRunning
 		workers.afterRetire.Store(&refill)
+		running := tracked.Running
+		workers.serviceActive.Store(&running)
 	}
+	tracked.setRequestTimeout(timeout)
 	return tracked
+}
+
+// setRequestTimeout 更新请求超时（REQUEST_TIMEOUT），同步给 Worker 管理器计算排空超时
+func (service *trackedService) setRequestTimeout(timeout time.Duration) {
+	service.timeout.Store(int64(timeout))
+	if service.workers != nil {
+		service.workers.requestTimeout.Store(int64(timeout))
+	}
 }
 
 type serviceStoppedError struct{}
@@ -3209,6 +3262,15 @@ func (service *trackedService) acquireLease(
 		groups.StandbyReady = standbyReady
 		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
 		if len(warmAvailable) > 0 {
+			// 不在主用与热门模型里的请求先用对这些模型是死槽位的热 Worker（它们本来就服务不了主用模型），
+			// 取不到再用其余热 Worker：还能服务主用模型的 Worker 的租约位留给主用模型
+			if dead := service.deadSlotWorkers(selection, fixedAccount, warmAvailable); len(dead) > 0 {
+				candidate := selection
+				candidate.AllowedAccountIDs = dead
+				if lease, _, _ := service.pool.TryAcquireFor(ctx, candidate); lease != nil {
+					return lease, nil
+				}
+			}
 			candidate := selection
 			candidate.AllowedAccountIDs = warmAvailable
 			lease, _, acquireErr := service.pool.TryAcquireFor(ctx, candidate)
@@ -3337,6 +3399,35 @@ func (service *trackedService) acquireLease(
 		}
 		return nil, service.pool.NoEligibleError(selection)
 	}
+}
+
+// deadSlotWorkers 返回 warmAvailable 中对热门或主用模型是死槽位（长时间冷却）的账户，一次 LongCoolingSet：
+// 只用于不固定账户、模型不在主用与热门模型里的请求；没有死槽位或全部都是死槽位（与直接选号相同）时返回 nil
+func (service *trackedService) deadSlotWorkers(selection aistudio.AccountSelection, fixedAccount bool, warmAvailable []string) []string {
+	if fixedAccount || service.workers == nil || len(warmAvailable) < 2 {
+		return nil
+	}
+	models := service.workers.deadSlotModels()
+	modelID := normalizeGuardModel(selection.ModelID)
+	if len(models) == 0 || modelID == "" {
+		return nil
+	}
+	for _, deadModel := range models {
+		if normalizeGuardModel(deadModel) == modelID {
+			return nil
+		}
+	}
+	dead := service.pool.LongCoolingSet(warmAvailable, models, rotationMinRemaining, false)
+	if len(dead) == 0 || len(dead) == len(warmAvailable) {
+		return nil
+	}
+	result := make([]string, 0, len(dead))
+	for _, accountID := range warmAvailable {
+		if _, ok := dead[accountID]; ok {
+			result = append(result, accountID)
+		}
+	}
+	return result
 }
 
 // schedulingRecheck 为等待调度信号时的兜底复查间隔
