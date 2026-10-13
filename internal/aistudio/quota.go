@@ -118,6 +118,12 @@ func minuteQuotaReset(windowStart string, now time.Time) time.Time {
 	return now.Add(time.Minute)
 }
 
+// NextQuotaDay 返回 now 之后下一个额度日的开始时间（太平洋时间零点，每日限额在这时恢复）：
+// app 层单模型 403 的长时间冷却按它计算
+func NextQuotaDay(now time.Time) time.Time {
+	return nextQuotaDay(now)
+}
+
 func nextQuotaDay(now time.Time) time.Time {
 	location, err := time.LoadLocation(quotaResetTimezone)
 	if err != nil {

@@ -620,7 +620,7 @@ bootstrap 模型只负责建立账户 Worker，不是业务模型白名单，一
 | proof 生成失败：snapshot 异常、提示词未同步、前缀不是 `!`、VM 刷新失败 | Worker 进入 `failed`；同账户重建 Worker 并重放一次 |
 | 受保护请求网络错误 | 同上 |
 | `GenerateContent`、`GenerateVideo`、Bidi 返回 HTTP 404、Code 5 且消息含 `Ambiguous request for service ''` | 同账户重建 Worker 并重放一次 |
-| HTTP 403 或 Code 7 | 保留账户与模型资格，首个上游事件前切换到未尝试的同能力账户；不重建 Worker |
+| HTTP 403 或 Code 7 | 保留账户与模型资格，首个上游事件前切换到未尝试的同能力账户；没有文件绑定的生成请求对该账号该通道的这个模型写入递增冷却（30 分钟、6 小时、到太平洋时间次日零点），换号不退避；不重建 Worker |
 | HTTP 429 | 按分钟或每日限额写入冷却（Build 通道为 `build:<模型>`；周期判定与 RetryInfo/Retry-After 规则见 build.md），同账户另一通道可用时在同账户重试；已输出内容后与 Live 会话中的 429 也写回冷却 |
 | HTTP 401、Code 16、签名 Cookie 失效 | Chrome 导入账户在同一出口续签，重建 WAA runtime 后重放一次；没有续签材料或续签后仍失效的账户进入 `auth_required` |
 | Worker 启动时跳转登录页（纯 Go 后端） | 按需启动在请求租约内续签一次并重新启动，仍失败时进入 `auth_required`；预热没有租约，只把没有续签材料的账户标为 `auth_required` |

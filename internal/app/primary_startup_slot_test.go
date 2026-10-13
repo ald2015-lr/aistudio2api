@@ -35,7 +35,7 @@ func TestPrimaryQueueWaitBoundsStartupSlotQueue(t *testing.T) {
 	service.setPrimaryModels([]string{testRuntimeModel}, 300*time.Millisecond)
 	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeNormal}
 	startedAt := time.Now()
-	lease, err := service.acquireWarmLease(service.primaryAcquireContext(ctx, selection), selection)
+	lease, err := service.acquireWarmLease(withLeaseWaitBudget(ctx, service.primaryBudget(selection.ModelID, selection.Pool)), selection)
 	elapsed := time.Since(startedAt)
 	var busy *aistudio.CapacityBusyError
 	if lease != nil || !errors.As(err, &busy) {

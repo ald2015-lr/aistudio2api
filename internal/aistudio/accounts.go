@@ -106,9 +106,14 @@ type CapacityBusyError struct {
 	Pool PoolScope
 	// Reason 为最后一次等待的原因（账号全部忙碌、没有空闲的 Worker 槽位等）
 	Reason string
-	// Waited 为实际排队的时间，Limit 为排队上限
+	// Waited 为计入排队上限的时间（整个请求共用一份预算：总耗时减去请求自己现场冷启动与候选冷却的等待），Limit 为排队上限
 	Waited time.Duration
 	Limit  time.Duration
+	// Elapsed 为请求从第一次选号起的总耗时（含失败的尝试、换号退避与现场冷启动），ColdStart 为其中请求自己现场冷启动的时长，
+	// Attempt 为返回时是第几次尝试；为 0 的项不写进错误文案
+	Elapsed   time.Duration
+	ColdStart time.Duration
+	Attempt   int
 	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
 	Until time.Time
 }
@@ -118,8 +123,26 @@ func (e *CapacityBusyError) Error() string {
 	if e.Pool == PoolScopeUltra {
 		pool = e.Pool.Label() + "，"
 	}
-	return fmt.Sprintf("号池繁忙：模型 %s 暂时没有空闲的账号或 Worker，请稍后重试（%s已排队 %s，上限 %s，最后等待原因：%s）",
-		e.ModelID, pool, e.Waited.Round(time.Millisecond), e.Limit, e.Reason)
+	detail := ""
+	if e.Elapsed > 0 {
+		detail = fmt.Sprintf("，总耗时 %s", roundBusyDuration(e.Elapsed))
+		if e.ColdStart > 0 {
+			detail += fmt.Sprintf("（含现场冷启动 %s）", roundBusyDuration(e.ColdStart))
+		}
+	}
+	if e.Attempt > 0 {
+		detail += fmt.Sprintf("，第 %d 次尝试", e.Attempt)
+	}
+	return fmt.Sprintf("号池繁忙：模型 %s 暂时没有空闲的账号或 Worker，请稍后重试（%s已排队 %s，上限 %s%s，最后等待原因：%s）",
+		e.ModelID, pool, roundBusyDuration(e.Waited), e.Limit, detail, e.Reason)
+}
+
+// roundBusyDuration 为号池繁忙文案里的时长取整：1 秒以上到 0.1 秒，以下到毫秒
+func roundBusyDuration(value time.Duration) time.Duration {
+	if value >= time.Second {
+		return value.Round(100 * time.Millisecond)
+	}
+	return value.Round(time.Millisecond)
 }
 
 // RetryAt 返回建议重试时间，供对外错误写 Retry-After

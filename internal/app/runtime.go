@@ -1113,10 +1113,16 @@ func (manager *accountWorkerManager) startReservedWorker(
 	if launch == nil {
 		launch = newWAAWorker
 	}
+	launchStartedAt := time.Now()
 	worker, initErr := launch(initCtx, account.id, options)
 	cancel()
 	// 名额只覆盖浏览器启动本身，发布、替换与淘汰旧 Worker 不再占用
 	releaseSlot()
+	// 主用模型请求自己的现场冷启动：浏览器启动本身按实测时长延后排队截止时间（请求在等自己的 Worker，不是在排队，
+	// 合计不超过 INIT_TIMEOUT，见 primary_models.go）；预热与后台扩容没有预算
+	if !backgroundStartup(ctx) {
+		leaseWaitBudgetFromContext(ctx).creditColdStart(time.Since(launchStartedAt), time.Duration(manager.initTimeout.Load()))
+	}
 	if initErr != nil {
 		if ownsLease {
 			_ = runtimeLease.Release()
@@ -3171,6 +3177,10 @@ func (service *trackedService) acquireLease(
 		}
 		if waiter == nil {
 			waiter = service.workers.dispatch.join(dispatchKey(selection))
+		} else if len(selection.ExcludedAccountIDs) > 0 {
+			// 排除列表不进队列键，换号重试的请求与同模型的请求同队：复查后仍要等待时把唤醒交给下一个请求，
+			// 不让排除了刚空出槽位的账户的队首挡住后面能用它的请求
+			service.workers.dispatch.passOn(waiter)
 		}
 		return budget.wait(ctx, waiter.wake, delay, reason)
 	}
@@ -3642,10 +3652,16 @@ func (service *trackedService) generateWithRetry(
 	var inputLimitErr error
 	var tierRetryAccountIDs []string
 	immediateRetry, tierRetried := false, false
-	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、403、超时等）。
+	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
+	// 单模型 403 写入冷却，不计入）。
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
 	hardFailures := 0
+	// 主用模型（PRIMARY_MODELS）的请求带一份排队预算，整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
+	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
+	budget := service.primaryBudget(modelID, scope)
+	acquireCtx := withLeaseWaitBudget(requestCtx, budget)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		budget.beginAttempt()
 		request.Contents = originalContents
 		selectionAccountID := requestedAccountID
 		recoveringAccount := recoveryAccountID != ""
@@ -3671,14 +3687,15 @@ func (service *trackedService) generateWithRetry(
 		if diag.guard() != nil && !selection.BuildOnly && !selection.PlaygroundOnly {
 			selection.PlaygroundFirst = true
 		}
+		// 换号重试排除已尝试过的账户（通常只有几个）：选号留在候选索引的快路径上，与同模型的请求同队排队；
+		// 原先把"全部启用账户减去已尝试的"作为限定列表，3 万多个账户时每次复查候选都在账户池锁内建表排序几十毫秒
 		if (unbound || fileBound) && len(attempted) > 0 {
-			enabled, _ := service.pool.EnabledAccountsIn(scope)
-			for _, accountID := range enabled {
-				if _, exists := attempted[accountID]; !exists {
-					selection.AllowedAccountIDs = append(selection.AllowedAccountIDs, accountID)
-				}
+			selection.ExcludedAccountIDs = make([]string, 0, len(attempted))
+			for accountID := range attempted {
+				selection.ExcludedAccountIDs = append(selection.ExcludedAccountIDs, accountID)
 			}
 		}
+		// 更高权益账号的再试限定在一小组账号上（见下文输入超限的处理），仍用限定列表
 		if tierRetryAccountIDs != nil {
 			selection.AllowedAccountIDs = tierRetryAccountIDs
 			tierRetryAccountIDs = nil
@@ -3687,8 +3704,6 @@ func (service *trackedService) generateWithRetry(
 		immediateRetry = false
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
-		// 主用模型（PRIMARY_MODELS）的选号带排队预算：排队超过上限按 429 结束（见 primary_models.go），其他模型原样
-		acquireCtx := service.primaryAcquireContext(requestCtx, selection)
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		// 输入超限后的再试只接受现在就能取得的账号，不排队
@@ -3827,7 +3842,10 @@ func (service *trackedService) generateWithRetry(
 		if gate := diag.guard(); gate != nil {
 			attemptCtx = aistudio.ContextWithSentInputObserver(attemptCtx, gate.observeSentInput)
 		}
+		// generated 表示本次尝试已经向上游发出生成请求：之后的错误来自生成本身，不是文件复制或附件上传
+		generated := false
 		if err == nil {
+			generated = true
 			source, err = service.service.Generate(attemptCtx, request)
 		}
 		if err == nil && copiedFileCount > 0 {
@@ -3898,6 +3916,7 @@ func (service *trackedService) generateWithRetry(
 			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
 			temporaryCopies = attemptCopies
 			service.forbidden.reset(request.AccountID)
+			service.forbidden.resetModel(request.AccountID, modelID)
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
 			finishAttempt = cancelAttempt
@@ -3954,6 +3973,34 @@ func (service *trackedService) generateWithRetry(
 						reason, forbiddenPause, until.Format(time.RFC3339),
 					))
 				}
+			}
+		}
+		// 单个模型返回 403 无权限（常见于免费账号调用付费模型）：对该账号该通道的这个模型写入冷却，时长按 24 小时内的次数递增
+		// （30 分钟、6 小时、到太平洋时间次日零点），该模型成功一次即从头计（见 forbidden_guard.go）。原先不冷却，账号一直留在
+		// 候选里，空出的槽位又最多，几乎每个新请求的第一次尝试都落在它上面白耗一次。冷却后按额度冷却处理：不计入连续失败、
+		// 不退避，同一账号另一通道可用时在那里再试一次，驻留 Worker 因此成了死槽位时登记淘汰。只处理没有文件绑定、错误来自
+		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理
+		if isPermissionDenied(err) && resourceID == "" && generated && requestCtx.Err() == nil &&
+			!aistudio.DefinitiveAuthenticationFailure(err) && !waaRuntimeFailed {
+			until, level := service.forbidden.recordModel(request.AccountID, modelID, time.Now())
+			cooldownScope := lease.CooldownScope(modelID)
+			reason := "无权限（模型）: " + err.Error()
+			if stateErr := service.pool.MarkCooldownIfGeneration(
+				request.AccountID, cooldownScope, lease.ModelAccessGeneration(), lease.CheckedAt(), until, reason,
+			); stateErr != nil {
+				err = errors.Join(err, stateErr)
+				retryable = false
+			} else {
+				cooled = true
+				service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+					"账号冷却 | 类型=无权限 | 范围=%s | 恢复=%s | 档位=%d",
+					cooldownScope, until.Format(time.RFC3339), level,
+				))
+				if service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
+					delete(attempted, request.AccountID)
+					maxAttempts++
+				}
+				service.retireCooledWorker(request.AccountID, modelID, aistudio.QuotaCooldown{Until: until, Kind: "无权限", Reason: reason})
 			}
 		}
 		// 输入 token 超过上限（提示词过长）与账号无关：不冷却、不按一般失败换号，对外按 400 返回（上游有时按 429 返回这个错误，
@@ -4028,8 +4075,11 @@ func (service *trackedService) generateWithRetry(
 					"已连续 %d 次失败，不再换号 | 原因=%s", hardFailures, progressReason(err)))
 				break
 			}
-			if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
-				break
+			// 主用模型的排队截止时间已过时不退避：下一次尝试只接受立即可用的账号，退避只会推迟 429
+			if !budget.expired() {
+				if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
+					break
+				}
 			}
 		}
 		if recoverWorker {

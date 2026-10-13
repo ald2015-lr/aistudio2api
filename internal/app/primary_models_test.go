@@ -33,7 +33,7 @@ func primaryBusyService(t *testing.T, upstream aistudio.Service, accountIDs ...s
 func acquirePrimary(ctx context.Context, service *trackedService, pool aistudio.PoolScope) (*aistudio.AccountLease, error, time.Duration) {
 	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: pool}
 	startedAt := time.Now()
-	lease, err := service.acquireWarmLease(service.primaryAcquireContext(ctx, selection), selection)
+	lease, err := service.acquireWarmLease(withLeaseWaitBudget(ctx, service.primaryBudget(selection.ModelID, selection.Pool)), selection)
 	return lease, err, time.Since(startedAt)
 }
 

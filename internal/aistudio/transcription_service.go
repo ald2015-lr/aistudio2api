@@ -85,10 +85,18 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 	var requestErr error
 	startedAt := time.Now()
 	recoveryAccountID := ""
+	// 候选列表整个请求不变，换号排除已尝试过的账户（通常只有几个），不再每次尝试重建"候选减去已尝试"的列表
+	selection.AllowedAccountIDs = request.CandidateAccountIDs
+	candidates := make(map[string]struct{}, len(request.CandidateAccountIDs))
+	for _, accountID := range request.CandidateAccountIDs {
+		candidates[accountID] = struct{}{}
+	}
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		selection.AllowedAccountIDs = remainingTranscriptionCandidates(request.CandidateAccountIDs, attempted)
-		if request.CandidateAccountIDs != nil && len(selection.AllowedAccountIDs) == 0 {
-			break
+		if request.CandidateAccountIDs != nil {
+			if transcriptionCandidatesExhausted(candidates, attempted) {
+				break
+			}
+			selection.ExcludedAccountIDs = attemptedTranscriptionAccounts(attempted)
 		}
 		selection.AccountID = recoveryAccountID
 		recoveryAccountID = ""
@@ -273,15 +281,21 @@ func collectTranscription(ctx context.Context, events <-chan Event, startedAt ti
 	}
 }
 
-func remainingTranscriptionCandidates(candidates []string, attempted map[string]struct{}) []string {
-	if candidates == nil {
-		return nil
-	}
-	result := make([]string, 0, len(candidates))
-	for _, accountID := range candidates {
-		if _, exists := attempted[accountID]; exists {
-			continue
+// transcriptionCandidatesExhausted 判断候选是否都已尝试过（已尝试的账户都来自候选列表，按集合计数，不扫描候选列表）
+func transcriptionCandidatesExhausted(candidates map[string]struct{}, attempted map[string]struct{}) bool {
+	tried := 0
+	for accountID := range attempted {
+		if _, exists := candidates[accountID]; exists {
+			tried++
 		}
+	}
+	return tried >= len(candidates)
+}
+
+// attemptedTranscriptionAccounts 返回本次请求已尝试过的账户，作为下一次选号的排除列表
+func attemptedTranscriptionAccounts(attempted map[string]struct{}) []string {
+	result := make([]string, 0, len(attempted))
+	for accountID := range attempted {
 		result = append(result, accountID)
 	}
 	return result

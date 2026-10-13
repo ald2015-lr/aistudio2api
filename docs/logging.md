@@ -221,7 +221,7 @@ WARN  account@example.com  账户认证续签 | 同账户其他请求 12s 内没
 WARN  account@example.com  账户认证续签放弃 | 错误=<ERROR>
 ```
 
-HTTP `403` 与协议 Code 7 保留当前账户和模型的 `verified` 记录，不标记永久权限失败。协议 Code 5、Worker 进程失败或 Worker 被替换时重建当前账户 Worker 并重放一次；其他可重试错误写入临时冷却。
+HTTP `403` 与协议 Code 7 保留当前账户和模型的 `verified` 记录，不标记永久权限失败；没有文件绑定的生成请求对该账号该通道的这个模型写入冷却并记 `账号冷却 | 类型=无权限 | 范围=<模型或 build:模型> | 恢复=<时间> | 档位=<1..>`（30 分钟、6 小时、到太平洋时间次日零点，该模型成功一次即从头计）。协议 Code 5、Worker 进程失败或 Worker 被替换时重建当前账户 Worker 并重放一次；其他可重试错误写入临时冷却。
 
 ```text
 WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash

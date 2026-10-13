@@ -13,10 +13,15 @@ import (
 //
 // 号池的同时生成数约为 峰值 Worker 数 × 单账户并发（MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY，Ultra 分区另算）。并发超过它时
 // 请求在 acquireLease 里排队等空闲的账号或 Worker，原先一直等到请求超时（REQUEST_TIMEOUT，默认 5 分钟）：客户端看到的是几分钟的
-// 首字延迟与随后的 504，排队的请求越积越多。列表中的模型的生成请求改为只排队 PRIMARY_QUEUE_WAIT：预算只计 acquireLease 里 wait()
-// 的等待时间（冷启动、Worker 替换、账户池锁等待都不计，也不用 context 超时，不会取消进行中的启动），用尽后按 CapacityBusyError
+// 首字延迟与随后的 504，排队的请求越积越多。列表中的模型的生成请求改为最多排队 PRIMARY_QUEUE_WAIT，超过后按 CapacityBusyError
 // 结束（对外 429 + Retry-After），由客户端稍后重试，不换号、不冷却、不记降级记忆、不退避；候选全部冷却仍按原规则排队或返回 429。
-// 每次选号（含换号重试）各一份预算，Ultra 请求同样受限；不等待的选号（acquireWarmLeaseNow）本来就不排队。
+//
+// 预算按请求计：generateWithRetry 在第一次选号前创建一份，换号重试共用，不再每次选号各一份（原先 403 或额度 429 换号后
+// 又是一份完整预算，加上失败尝试与退避，10s 的上限实际 24s 以上才返回 429）。截止时间按墙钟计 = 创建时间 + 排队上限：
+// 选号的分类与复查、等待冷启动名额、失败的上游尝试（403、额度 429）、换号退避都计入；请求自己现场冷启动的浏览器启动本身
+// 按实测时长延后截止时间（请求在等自己的 Worker，不是在排队；合计不超过 INIT_TIMEOUT），候选全部冷却的等待同样不计入。
+// 截止时间已过后容量原因的等待立即返回 CapacityBusyError：失败后的下一次尝试只接受立即可用的账号，否则按 429 结束。
+// 预算不用 context 超时，不会取消进行中的启动；Ultra 请求同样受限；不等待的选号（acquireWarmLeaseNow）本来就不排队。
 // 这只是对症状的处理：根本上要让容量跟上并发（更多 Worker、更高的单账户并发），或让冷却的账号及时让出 Worker。
 
 const (
@@ -25,10 +30,10 @@ const (
 	// primaryRetryMin 与 primaryRetryMax 为 Retry-After 建议间隔的范围
 	primaryRetryMin = time.Second
 	primaryRetryMax = 30 * time.Second
-	// primaryStreamStartGrace 为流式请求写出响应头前，在排队上限之外再多等首个事件的余量：预算用尽后还要复查一次候选、
+	// primaryStreamStartGrace 为流式请求写出响应头前，在排队上限之外再多等首个事件的余量：截止时间到后还要复查一次候选、
 	// 经过账户池锁才返回错误，留出余量让 429 以 HTTP 状态返回而不是 200 之后的流内错误
 	primaryStreamStartGrace = 5 * time.Second
-	// waitReasonCooling 为候选全部冷却时的等待原因：这类等待不计入排队预算，沿用原有的冷却排队规则
+	// waitReasonCooling 为候选全部冷却时的等待原因：这类等待不受排队上限限制，等待的时间延后截止时间，沿用原有的冷却排队规则
 	waitReasonCooling = "账号冷却中"
 )
 
@@ -59,8 +64,9 @@ func (service *trackedService) primaryQueueWait(model string) (time.Duration, bo
 	return settings.queueWait, listed
 }
 
-// StreamStartWait 返回流式请求写出响应头前等待首个事件的下限：主用模型为排队上限加余量，保证排队超限的 429 以 HTTP 状态返回，
-// 不是 200 之后的流内错误；其他模型返回 0，由 API 层按默认心跳间隔处理
+// StreamStartWait 返回流式请求写出响应头前等待首个事件的下限：主用模型为排队上限加余量。预算按请求计，失败的尝试与退避
+// 都计入截止时间，排队超限的 429 在这之前以 HTTP 状态返回，不是 200 之后的流内错误（请求自己现场冷启动或候选冷却而延后
+// 截止时间时除外）；其他模型返回 0，由 API 层按默认心跳间隔处理
 func (service *trackedService) StreamStartWait(model string) time.Duration {
 	wait, listed := service.primaryQueueWait(model)
 	if !listed {
@@ -69,36 +75,47 @@ func (service *trackedService) StreamStartWait(model string) time.Duration {
 	return wait + primaryStreamStartGrace
 }
 
-// primaryAcquireContext 为主用模型的选号附上排队预算：每次尝试一份新预算（换号重试同样受限），不在列表里时原样返回
-func (service *trackedService) primaryAcquireContext(ctx context.Context, selection aistudio.AccountSelection) context.Context {
-	wait, listed := service.primaryQueueWait(selection.ModelID)
+// primaryBudget 为主用模型的请求创建排队预算（整个请求共用一份，换号重试不重新计时）；不在列表里时返回 nil
+func (service *trackedService) primaryBudget(modelID string, pool aistudio.PoolScope) *leaseWaitBudget {
+	wait, listed := service.primaryQueueWait(modelID)
 	if !listed {
-		return ctx
+		return nil
 	}
-	return withLeaseWaitBudget(ctx, &leaseWaitBudget{limit: wait, modelID: selection.ModelID, pool: selection.Pool})
+	return &leaseWaitBudget{limit: wait, startedAt: time.Now(), modelID: modelID, pool: pool}
 }
 
 // primaryQueueExceededMessage 为排队超限时写进请求进度的一句话
 func primaryQueueExceededMessage(busy *aistudio.CapacityBusyError) string {
 	if busy.Limit <= 0 {
-		return "主用模型不排队，立即返回 429 | 原因=" + busy.Reason
+		return fmt.Sprintf("主用模型不排队，立即返回 429 | 原因=%s | 总耗时=%s | 尝试=%d",
+			busy.Reason, busy.Elapsed.Round(time.Millisecond), busy.Attempt)
 	}
-	return fmt.Sprintf("主用模型排队超过 %s，立即返回 429 | 原因=%s | 已排队=%s", busy.Limit, busy.Reason, busy.Waited.Round(time.Millisecond))
+	return fmt.Sprintf("主用模型排队超过 %s，立即返回 429 | 原因=%s | 已排队=%s | 总耗时=%s | 尝试=%d",
+		busy.Limit, busy.Reason, busy.Waited.Round(time.Millisecond), busy.Elapsed.Round(time.Millisecond), busy.Attempt)
 }
 
-// leaseWaitBudget 为一次选号的排队预算：累计 acquireLease 里 wait() 的等待时间，用尽后对账号忙碌、没有空闲槽位、Worker 启动或
-// 扩容中这些容量原因返回 CapacityBusyError；冷却原因不计入、不受限。只在选号 goroutine 内使用，不需要加锁
+// leaseWaitBudget 为一个主用模型请求的排队预算：截止时间 = 创建时间 + 排队上限 + 现场冷启动抵扣 + 冷却等待，按墙钟计。
+// 截止时间已过后对账号忙碌、没有空闲槽位、Worker 启动或扩容中这些容量原因返回 CapacityBusyError；冷却原因不受限，
+// 等待的时间也不计入。只在请求 goroutine 内使用（generateWithRetry 与它同步调用的选号、现场冷启动），不需要加锁
 type leaseWaitBudget struct {
-	limit   time.Duration
-	waited  time.Duration
-	modelID string
-	pool    aistudio.PoolScope
+	limit     time.Duration
+	startedAt time.Time
+	// coldStart 为请求自己现场冷启动的浏览器启动时长（合计不超过 INIT_TIMEOUT），cooling 为候选全部冷却时排队的时间：都延后截止时间
+	coldStart time.Duration
+	cooling   time.Duration
+	// attempts 为已开始的尝试次数（每次选号加一），写进排队超限的错误
+	attempts int
+	modelID  string
+	pool     aistudio.PoolScope
 }
 
 type leaseWaitBudgetKey struct{}
 
-// withLeaseWaitBudget 把排队预算放进选号上下文：acquireLease 的签名不变，不等待的选号与其他调用方不受影响
+// withLeaseWaitBudget 把排队预算放进选号上下文：acquireLease 的签名不变，不等待的选号与其他调用方不受影响；budget 为 nil 时原样返回
 func withLeaseWaitBudget(ctx context.Context, budget *leaseWaitBudget) context.Context {
+	if budget == nil {
+		return ctx
+	}
 	return context.WithValue(ctx, leaseWaitBudgetKey{}, budget)
 }
 
@@ -108,45 +125,82 @@ func leaseWaitBudgetFromContext(ctx context.Context) *leaseWaitBudget {
 	return budget
 }
 
-// wait 在预算内等待调度信号、兜底复查或请求取消：没有预算或等待原因是冷却时与 waitScheduling 相同；预算已用尽时立即返回
-// CapacityBusyError；等到兜底复查计时器结束且刚好用尽预算时同样返回；被调度信号唤醒时返回 nil，让调用方再复查一次候选
+// deadline 返回排队截止时间
+func (budget *leaseWaitBudget) deadline() time.Time {
+	return budget.startedAt.Add(budget.limit + budget.coldStart + budget.cooling)
+}
+
+// remaining 返回距排队截止时间还有多久（已过时不大于 0）
+func (budget *leaseWaitBudget) remaining() time.Duration {
+	return time.Until(budget.deadline())
+}
+
+// expired 判断排队截止时间是否已过；没有预算时为 false
+func (budget *leaseWaitBudget) expired() bool {
+	return budget != nil && budget.remaining() <= 0
+}
+
+// beginAttempt 记一次尝试（generateWithRetry 每次选号前调用）；没有预算时不做任何事
+func (budget *leaseWaitBudget) beginAttempt() {
+	if budget != nil {
+		budget.attempts++
+	}
+}
+
+// creditColdStart 把请求自己现场冷启动的浏览器启动时长从排队预算中抵扣（延后截止时间），合计不超过 limit（INIT_TIMEOUT）。
+// 等待冷启动名额照常计入；没有预算时不做任何事
+func (budget *leaseWaitBudget) creditColdStart(elapsed time.Duration, limit time.Duration) {
+	if budget == nil || elapsed <= 0 {
+		return
+	}
+	budget.coldStart = max(budget.coldStart, min(budget.coldStart+elapsed, limit))
+}
+
+// wait 在截止时间前等待调度信号、兜底复查或请求取消：没有预算时与 waitScheduling 相同；等待原因是冷却时同样不限时，
+// 等待的时间延后截止时间；截止时间已过时立即返回 CapacityBusyError；兜底复查计时器到期时刚好过了截止时间同样返回；
+// 被调度信号唤醒时返回 nil，让调用方再复查一次候选
 func (budget *leaseWaitBudget) wait(ctx context.Context, changed <-chan struct{}, delay time.Duration, reason string) error {
-	if budget == nil || reason == waitReasonCooling {
+	if budget == nil {
 		return waitScheduling(ctx, changed, delay)
 	}
-	remaining := budget.limit - budget.waited
+	if reason == waitReasonCooling {
+		startedAt := time.Now()
+		err := waitScheduling(ctx, changed, delay)
+		budget.cooling += time.Since(startedAt)
+		return err
+	}
+	remaining := budget.remaining()
 	if remaining <= 0 {
 		return budget.exhausted(reason)
 	}
 	timer := time.NewTimer(min(delay, remaining))
 	defer timer.Stop()
-	startedAt := time.Now()
 	select {
 	case <-ctx.Done():
-		budget.waited += time.Since(startedAt)
 		return ctx.Err()
 	case <-changed:
-		budget.waited += time.Since(startedAt)
 		return nil
 	case <-timer.C:
-		budget.waited += time.Since(startedAt)
-		if budget.waited >= budget.limit {
+		if budget.expired() {
 			return budget.exhausted(reason)
 		}
 		return nil
 	}
 }
 
-// exhausted 构造排队超限错误：建议重试间隔为排队上限（为 0 时 5s），限定在 1s 到 30s
+// exhausted 构造排队超限错误：已排队为总耗时减去现场冷启动与冷却等待，建议重试间隔为排队上限（为 0 时 5s），限定在 1s 到 30s
 func (budget *leaseWaitBudget) exhausted(reason string) error {
 	retry := budget.limit
 	if retry <= 0 {
 		retry = primaryRetryFallback
 	}
 	retry = min(max(retry, primaryRetryMin), primaryRetryMax)
+	now := time.Now()
+	elapsed := now.Sub(budget.startedAt)
 	return &aistudio.CapacityBusyError{
 		ModelID: budget.modelID, Pool: budget.pool, Reason: reason,
-		Waited: budget.waited, Limit: budget.limit, Until: time.Now().Add(retry),
+		Waited: max(elapsed-budget.coldStart-budget.cooling, 0), Limit: budget.limit,
+		Elapsed: elapsed, ColdStart: budget.coldStart, Attempt: budget.attempts, Until: now.Add(retry),
 	}
 }
 

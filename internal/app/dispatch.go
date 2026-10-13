@@ -72,6 +72,20 @@ func (queue *dispatchQueue) leave(waiter *dispatchWaiter) {
 	}
 }
 
+// passOn 唤醒同队里排在 waiter 之后的下一个请求。带排除列表的请求（换号重试）被唤醒复查后仍要等待时调用：
+// 刚空出的槽位可能在它排除的账户上，而号池变化只唤醒队首，不传下去时后面能用这个槽位的请求要等到兜底复查
+func (queue *dispatchQueue) passOn(waiter *dispatchWaiter) {
+	if waiter == nil {
+		return
+	}
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	waiters := queue.queues[waiter.key]
+	if index := slices.Index(waiters, waiter); index >= 0 && index+1 < len(waiters) {
+		waiters[index+1].signal()
+	}
+}
+
 // wakeHeads 在账户或 Worker 状态变化后唤醒每个队列的队首
 func (queue *dispatchQueue) wakeHeads() {
 	queue.mu.Lock()

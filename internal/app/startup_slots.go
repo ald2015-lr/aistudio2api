@@ -168,16 +168,16 @@ func (manager *accountWorkerManager) acquireStartupSlot(ctx context.Context, lab
 		return release, nil
 	}
 	background := backgroundStartup(ctx)
-	// 主用模型的现场冷启动带排队预算（见 primary_models.go）：等待冷启动名额的时间计入预算，名额被占满而预算用尽时按容量已满返回，
-	// 由选号按号池繁忙结束，不在名额队列里等前面的浏览器启动完成（热 Worker 都成死槽位时每个请求都走这条路，原先排队几分钟后 504）；
-	// 名额到手后的浏览器启动本身不计入预算。后台启动没有预算
+	// 主用模型的现场冷启动带排队预算（见 primary_models.go）：等待冷启动名额的时间计入预算，最多等到排队截止时间，名额被占满而
+	// 截止时间已过时按容量已满返回，由选号按号池繁忙结束，不在名额队列里等前面的浏览器启动完成（热 Worker 都成死槽位时每个请求
+	// 都走这条路，原先排队几分钟后 504）；名额到手后的浏览器启动本身按实测时长延后截止时间（见 startReservedWorker）。后台启动没有预算
 	var budget *leaseWaitBudget
 	if !background {
 		budget = leaseWaitBudgetFromContext(ctx)
 	}
 	slotCtx := ctx
 	if budget != nil {
-		remaining := budget.limit - budget.waited
+		remaining := budget.remaining()
 		if remaining <= 0 {
 			release, ok := manager.startupSlots.tryAcquire(manager.warmConcurrencyValue)
 			if !ok {
@@ -199,12 +199,8 @@ func (manager *accountWorkerManager) acquireStartupSlot(ctx context.Context, lab
 			"WAA Worker 启动 | 等待冷启动名额 | 类型=%s | 占用=%d/%d", kind, active, limit,
 		))
 	})
-	if budget != nil {
-		waited := time.Since(startedAt)
-		budget.waited += waited
-		if err != nil && ctx.Err() == nil {
-			return nil, fmt.Errorf("%w: 等待冷启动名额 %s 后排队预算已用尽", errAccountWorkerCapacity, waited.Round(time.Millisecond))
-		}
+	if budget != nil && err != nil && ctx.Err() == nil {
+		return nil, fmt.Errorf("%w: 等待冷启动名额 %s 后排队预算已用尽", errAccountWorkerCapacity, time.Since(startedAt).Round(time.Millisecond))
 	}
 	if err != nil && background {
 		return nil, fmt.Errorf("%w: 等待冷启动名额: %w", errAccountWorkerCapacity, err)

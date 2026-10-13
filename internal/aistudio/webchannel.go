@@ -274,19 +274,10 @@ func (s *PooledService) OpenBidi(ctx context.Context, request BidiRequest) (*Bid
 		if stateErr != nil {
 			return nil, errors.Join(requestErr, stateErr)
 		}
-		selection.AllowedAccountIDs = removeBidiAccount(selection.AllowedAccountIDs, request.AccountID)
+		// 候选列表不变，换号排除失败的账户（通常只有几个），不再每次重建候选列表
+		selection.ExcludedAccountIDs = append(selection.ExcludedAccountIDs, request.AccountID)
 	}
 	return nil, requestErr
-}
-
-func removeBidiAccount(accountIDs []string, accountID string) []string {
-	result := accountIDs[:0]
-	for _, candidate := range accountIDs {
-		if candidate != accountID {
-			result = append(result, candidate)
-		}
-	}
-	return result
 }
 
 func retryableBidiOpenError(ctx context.Context, err error) bool {
