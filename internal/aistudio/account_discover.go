@@ -461,18 +461,28 @@ func (p *AccountPool) LongCoolingSet(accountIDs []string, modelIDs []string, min
 }
 
 // SpareAccounts 统计号池内可以接替的账户数：不在 exclude 中、启用且就绪、有 WAA 初始化模型、没有全局长时间冷却，
-// 并且没有在任一指定模型上长时间不可用，一次加锁。数到 limit 个就停止（limit 不大于 0 时数完全部）：
-// 轮换与淘汰只需要知道“有没有 N 个可接替的账户”，账户上万时不必在锁内扫完全部。
-// 停用、未就绪、不在号池与全局长时间冷却的账户先按候选索引的紧凑数组排除（上万账户、大半处于每日限额时只剩少数要逐个判断）
+// 并且对每个指定模型都能接替：是该模型生成请求的候选（属于号池、至少一个启用通道的目录支持它），支持的通道中至少有一个
+// 没有长时间冷却（按候选集的恢复时间），也不按淘汰口径在该模型上长时间不可用（见 longCoolingLocked）。
+// 不支持指定模型的账户不算可接替：换上它同样服务不了该模型，等于换上另一个死槽位。一次加锁，数到 limit 个就停止
+// （limit 不大于 0 时数完全部）：轮换与淘汰只需要知道“有没有 N 个可接替的账户”，账户上万时不必在锁内扫完全部。
+// 停用、未就绪、不在号池与全局长时间冷却的账户先按候选索引的紧凑数组排除，指定模型的支持与冷却按候选集的下标数组判断
+// （上万账户、大半处于每日限额时只剩少数要逐个判断）
 func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, limit int) int {
 	if p == nil {
 		return 0
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	now := time.Now()
+	return p.spareAccountsAtLocked(scope, exclude, modelIDs, minRemaining, limit, time.Now())
+}
+
+// spareAccountsAtLocked 按 now 时刻统计可接替的账户数（见 SpareAccounts）；调用方持有 p.mu
+func (p *AccountPool) spareAccountsAtLocked(
+	scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, limit int, now time.Time,
+) int {
 	index := p.schedulingLocked()
 	nowNanos, minNanos := now.UnixNano(), int64(max(minRemaining, 0))
+	sets := p.spareSetsLocked(scope, modelIDs, now)
 	spare := 0
 	for position, account := range p.accounts {
 		if limit > 0 && spare >= limit {
@@ -482,6 +492,9 @@ func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}
 			continue
 		}
 		if global := index.globalUntil[position]; global > nowNanos && global-nowNanos >= minNanos {
+			continue
+		}
+		if !spareForSets(sets, position, nowNanos, minNanos) {
 			continue
 		}
 		if _, excluded := exclude[account.ID]; excluded || len(accountBootstrapModelsLocked(account)) == 0 {
@@ -499,4 +512,28 @@ func (p *AccountPool) SpareAccounts(scope PoolScope, exclude map[string]struct{}
 		}
 	}
 	return spare
+}
+
+// spareSetsLocked 返回各指定模型生成请求在号池内的候选集，供判断账户能否接替；调用方持有 p.mu
+func (p *AccountPool) spareSetsLocked(scope PoolScope, modelIDs []string, now time.Time) []*candidateSet {
+	sets := make([]*candidateSet, 0, len(modelIDs))
+	for _, modelID := range modelIDs {
+		modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+		if modelID == "" {
+			continue
+		}
+		sets = append(sets, p.candidateSetLocked(AccountSelection{ModelID: modelID, Method: "generateContent", Pool: scope}, now))
+	}
+	return sets
+}
+
+// spareForSets 判断下标处的账户在每个候选集中都是候选，且恢复时间距 now 不足 minNanos（未冷却、已到期或很快恢复）
+func spareForSets(sets []*candidateSet, position int, nowNanos int64, minNanos int64) bool {
+	for _, set := range sets {
+		until := set.until[position]
+		if until == 0 || until > nowNanos && until-nowNanos >= minNanos {
+			return false
+		}
+	}
+	return true
 }

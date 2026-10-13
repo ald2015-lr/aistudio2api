@@ -25,7 +25,9 @@ func newDispatchQueue() *dispatchQueue {
 	return &dispatchQueue{queues: make(map[string][]*dispatchWaiter)}
 }
 
-// dispatchKey 返回可互相替代的请求共用的队列键；号池不同的请求分开排队，Ultra 请求不会排在普通请求之后，反之亦然
+// dispatchKey 返回可互相替代的请求共用的队列键；号池不同的请求分开排队，Ultra 请求不会排在普通请求之后，反之亦然。
+// 排除列表（ExcludedAccountIDs，换号重试排除已尝试的账户）不进键：换号重试的请求与同模型的请求同队先到先得，
+// 不再各占一个队列、每次号池变化都被唤醒
 func dispatchKey(selection aistudio.AccountSelection) string {
 	allowed := slices.Clone(selection.AllowedAccountIDs)
 	slices.Sort(allowed)

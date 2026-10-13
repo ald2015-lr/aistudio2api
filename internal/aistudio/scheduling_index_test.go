@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// 候选索引的差分测试：在随机变更（冷却、状态、启用、目录、权益、通道、增删、租约）之后，
+// 候选索引的差分测试：在随机变更（冷却、状态、启用、目录、权益、通道、增删、租约、排空）之后，
 // 用索引分类的结果必须与逐个账户判断的参考实现（classifyCandidatesBruteLocked）完全一致，
 // 目录派生缓存与状态统计也要与按原实现逐个扫描的结果一致
 
@@ -290,7 +290,7 @@ func (p *AccountPool) syncDerivedLocked(now time.Time) {
 func (fuzzer *indexFuzzer) mutate() {
 	pool, random := fuzzer.pool, fuzzer.random
 	now := time.Now()
-	switch random.Intn(16) {
+	switch random.Intn(17) {
 	case 0, 1, 2:
 		accountID := fuzzer.randomID()
 		until := now.Add(time.Duration(5+random.Intn(60)) * time.Millisecond)
@@ -408,6 +408,15 @@ func (fuzzer *indexFuzzer) mutate() {
 		} else {
 			time.Sleep(time.Duration(1+random.Intn(8)) * time.Millisecond)
 		}
+	case 16:
+		// 排空：约三分之一的时间处于排空，覆盖热账户与备用账户
+		accountID := fuzzer.randomID()
+		on := random.Intn(3) != 0
+		before := pool.Draining(accountID)
+		changed := pool.SetDraining(accountID, on)
+		if changed != (before != on) || pool.Draining(accountID) != on {
+			fuzzer.t.Fatalf("SetDraining(%s, %v) = %v，之前 %v，之后 %v", accountID, on, changed, before, pool.Draining(accountID))
+		}
 	}
 }
 
@@ -443,6 +452,23 @@ func (fuzzer *indexFuzzer) randomSelection() AccountSelection {
 			}
 		}
 		selection.AllowedAccountIDs = append(selection.AllowedAccountIDs, "missing@example.com", " ")
+	}
+	// 排除列表：多数选择带 0-5 个排除账户（含重复、不存在与空白 ID），偶尔超过逐个比较的上限
+	switch random.Intn(6) {
+	case 0, 1:
+	case 2:
+		for _, id := range fuzzer.ids {
+			if random.Intn(3) == 0 {
+				selection.ExcludedAccountIDs = append(selection.ExcludedAccountIDs, id)
+			}
+		}
+	default:
+		for count := 1 + random.Intn(5); count > 0; count-- {
+			selection.ExcludedAccountIDs = append(selection.ExcludedAccountIDs, fuzzer.randomID())
+		}
+		if random.Intn(3) == 0 {
+			selection.ExcludedAccountIDs = append(selection.ExcludedAccountIDs, "missing@example.com", " ", selection.ExcludedAccountIDs[0])
+		}
 	}
 	if random.Intn(8) == 0 {
 		selection.AccountID = fuzzer.randomID()
@@ -484,6 +510,23 @@ func (fuzzer *indexFuzzer) check(round int) {
 		}
 	}
 	now := time.Now()
+	for attempt := 0; attempt < 4; attempt++ {
+		scope := []PoolScope{PoolScopeAll, PoolScopeNormal, PoolScopeUltra}[fuzzer.random.Intn(3)]
+		models := [][]string{nil, {indexTestModel}, {indexTestFlash}, {indexTestModel, indexTestFlash}, {indexTestUltraOnly}}[fuzzer.random.Intn(5)]
+		exclude := make(map[string]struct{})
+		for _, id := range fuzzer.randomWarm() {
+			exclude[id] = struct{}{}
+		}
+		minRemaining := []time.Duration{0, 30 * time.Millisecond, time.Minute}[fuzzer.random.Intn(3)]
+		got := pool.spareAccountsAtLocked(scope, exclude, models, minRemaining, 0, now)
+		if want := bruteSpareAccounts(pool, scope, exclude, models, minRemaining, now); got != want {
+			t.Fatalf("第 %d 轮：号池 %v 模型 %v 排除 %d 个 的可接替账户 %d，期望 %d", round, scope, models, len(exclude), got, want)
+		}
+		if limited := pool.spareAccountsAtLocked(scope, exclude, models, minRemaining, 2, now); limited != min(got, 2) {
+			t.Fatalf("第 %d 轮：号池 %v 模型 %v 限 2 个时可接替账户 %d，期望 %d", round, scope, models, limited, min(got, 2))
+		}
+	}
+	now = time.Now()
 	for _, scope := range []PoolScope{PoolScopeAll, PoolScopeNormal, PoolScopeUltra} {
 		for _, modelID := range []string{indexTestModel, indexTestFlash, indexTestFlashAlias, indexTestImage, indexTestUltraOnly, "unknown-model"} {
 			for _, method := range []string{"", "generateContent", "predict"} {
@@ -585,6 +628,45 @@ func (fuzzer *indexFuzzer) check(round int) {
 			t.Fatalf("第 %d 轮：账户 %s 的可生成模型数 %d，期望 %d", round, account.ID, got, want)
 		}
 	}
+}
+
+// bruteSpareAccounts 为 SpareAccounts 的参考实现：逐个账户按通道判断是否为各模型生成请求的候选，
+// 支持的通道中是否有一个没有长时间冷却；调用方持有 p.mu
+func bruteSpareAccounts(p *AccountPool, scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, now time.Time) int {
+	spare := 0
+	for _, account := range p.accounts {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
+			continue
+		}
+		if _, excluded := exclude[account.ID]; excluded || len(bruteBootstrapModels(account)) == 0 {
+			continue
+		}
+		if p.longCoolingLocked(account, "", now, minRemaining) {
+			continue
+		}
+		ok := true
+		for _, modelID := range modelIDs {
+			selection := AccountSelection{ModelID: modelID, Method: "generateContent", Pool: scope}
+			usable := false
+			for _, channel := range p.selectionChannelsLocked(selection) {
+				if !p.channelSupportsLocked(account, channel, selection) {
+					continue
+				}
+				cooldown, active := accountCooldown(account, ChannelCooldownScope(channel, modelID), now)
+				if !active || cooldown.Until.Sub(now) < minRemaining {
+					usable = true
+				}
+			}
+			if !usable || p.longCoolingLocked(account, modelID, now, minRemaining) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			spare++
+		}
+	}
+	return spare
 }
 
 func bruteHasCatalog(p *AccountPool, scope PoolScope) bool {

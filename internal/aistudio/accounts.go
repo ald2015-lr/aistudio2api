@@ -309,6 +309,9 @@ type Account struct {
 	statusModelsSource []Model
 	catalogKey         uint64
 	catalogKeySource   []Model
+	// draining 为排空中（见 SetDraining）：不固定账户的选号不再给它新租约，分类时按忙碌处理；
+	// 指定账户与文件绑定的请求照常使用。只影响调度，不改变对外状态、Activity 与预热概况。受账户池 mu 保护
+	draining bool
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -340,7 +343,11 @@ type AccountSelection struct {
 	AccountID         string
 	ResourceID        string
 	AllowedAccountIDs []string
-	PlaygroundOnly    bool
+	// ExcludedAccountIDs 为不能使用的账户，换号重试时排除已尝试过的账户（通常只有几个）。与 AllowedAccountIDs 不同，
+	// 只有排除列表时仍按候选索引分类与选号，只跳过这些账户的下标，不为整个号池建允许集合；
+	// 排除列表不进候选集的键，也不进调度等待队列的键（见 app/dispatch.go），换号重试的请求与同模型的请求同队排队
+	ExcludedAccountIDs []string
+	PlaygroundOnly     bool
 	// BuildOnly 只使用 Build 通道（Playground 对输入长度另有上限时改走 Build）
 	BuildOnly bool
 	// PlaygroundFirst 只用 Playground 通道选号（降级判定：该通道每块都带累计正文数，判定最准）；
@@ -1108,6 +1115,8 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 	}
 	delete(p.byID, accountID)
 	delete(p.ultraAccounts, accountID)
+	// 移出号池的账户不再排空：调用方另建同 ID 账户时从未排空开始
+	account.draining = false
 	for index, candidate := range p.accounts {
 		if candidate != nil && candidate.ID == accountID {
 			p.accounts = append(p.accounts[:index], p.accounts[index+1:]...)
@@ -2764,7 +2773,7 @@ func (p *AccountPool) classifyCandidatesLocked(
 }
 
 // classifyCandidatesAtLocked 按 now 时刻分类候选账户：限定账户或资源的选择只涉及一个账户，直接按该账户判断；
-// 其余选择用候选集，限定账户集合时只看集合内的账户。结果与 classifyCandidatesBruteLocked 相同
+// 其余选择用候选集，限定账户集合时只看集合内的账户，排除列表中的账户跳过。结果与 classifyCandidatesBruteLocked 相同
 func (p *AccountPool) classifyCandidatesAtLocked(
 	selection AccountSelection,
 	warmAccountIDs []string,
@@ -2787,6 +2796,7 @@ func (p *AccountPool) classifyCandidatesAtLocked(
 		return groups, nil
 	}
 	set := p.candidateSetLocked(selection, now)
+	exclusion := p.exclusionLocked(selection)
 	if selection.AllowedAccountIDs != nil {
 		allowed := make(map[string]struct{}, len(selection.AllowedAccountIDs))
 		for _, accountID := range selection.AllowedAccountIDs {
@@ -2794,9 +2804,9 @@ func (p *AccountPool) classifyCandidatesAtLocked(
 				allowed[accountID] = struct{}{}
 			}
 		}
-		return p.classifyAllowedLocked(set, allowed, warmAccountIDs, now), nil
+		return p.classifyAllowedLocked(set, allowed, warmAccountIDs, now, exclusion), nil
 	}
-	return p.classifyIndexedLocked(set, warmAccountIDs, now), nil
+	return p.classifyIndexedLocked(set, warmAccountIDs, now, exclusion), nil
 }
 
 // validateCandidateSelectionLocked 检查号池内存在请求的模型与方法；调用方持有 p.mu，ModelID 已去掉前缀
@@ -2880,7 +2890,12 @@ func (p *AccountPool) classifyAccountBruteLocked(
 		}
 		return
 	}
-	classifyCandidate(groups, account, warm, p.perAccountConcurrency)
+	classifyCandidate(groups, account, warm, p.perAccountConcurrency, sharedSelection(selection))
+}
+
+// sharedSelection 判断选择不固定账户：既没有指定账户，也没有绑定文件资源。排空标记只对这类选择生效
+func sharedSelection(selection AccountSelection) bool {
+	return strings.TrimSpace(selection.AccountID) == "" && selection.ResourceID == ""
 }
 
 func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
@@ -2911,11 +2926,15 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 }
 
 // leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却或文件租约被其他进程占用时
-// 返回 nil 并把冷却恢复或轮询时间并入 earliest；调用方持有 p.mu
+// 返回 nil 并把冷却恢复或轮询时间并入 earliest；排空中的账户不给不固定账户的选择新租约（排空结束时唤醒等待方）。
+// 调用方持有 p.mu
 func (p *AccountPool) leaseCandidateLocked(
 	account *Account, channel Channel, selection AccountSelection, now time.Time, earliest *time.Time,
 ) (*AccountLease, error) {
 	if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
+		return nil, nil
+	}
+	if account.draining && sharedSelection(selection) {
 		return nil, nil
 	}
 	if selection.ResourceID == "" {
@@ -2957,13 +2976,15 @@ func (p *AccountPool) leaseCandidateLocked(
 
 // tryAcquireIndexedLocked 为不限账户的选择在候选集中取租约：只遍历未冷却的候选，账户与通道顺序和
 // channelCandidatesLocked 相同（按账户 ID 轮询，上次选中账户在上次通道之后的通道排在最前）。
-// 全部通道都在冷却的候选不再逐个检查，最早恢复时间取自冷却堆（含忙碌账户，等待方至多提前醒来复查一次）
+// 全部通道都在冷却的候选不再逐个检查，最早恢复时间取自冷却堆（含忙碌账户，等待方至多提前醒来复查一次）。
+// 排除列表中的账户跳过，不计入可等待与最早恢复时间
 func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
 	set := p.candidateSetLocked(selection, now)
 	set.expireLocked(p, now.UnixNano())
-	waitable := set.members > 0
+	exclusion := p.exclusionLocked(selection)
+	waitable := set.liveMembersLocked(exclusion)
 	var earliest time.Time
-	if until, cooling := set.earliestCoolingLocked(); cooling {
+	if until, cooling := set.earliestCoolingLocked(exclusion); cooling {
 		earliest = time.Unix(0, until).UTC()
 	}
 	channels := p.selectionChannelsLocked(selection)
@@ -2993,7 +3014,7 @@ func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now ti
 	}
 	try := func(position int, channel Channel) (*AccountLease, error) {
 		account := p.accounts[position]
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || exclusion.has(position) {
 			return nil, nil
 		}
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, channel, selection) {
@@ -3093,6 +3114,7 @@ func (p *AccountPool) BootstrapModel(accountID string) (string, error) {
 	return "", fmt.Errorf("账户 %s 的实时目录没有可用 WAA 初始化模型", account.ID)
 }
 
+// selectionIndicesLocked 返回选择范围内的账户下标（号池、指定账户或资源、限定账户集合、排除列表），按轮询起点旋转
 func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int, error) {
 	var allowed map[string]struct{}
 	if selection.AllowedAccountIDs != nil {
@@ -3103,6 +3125,7 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 			}
 		}
 	}
+	excluded := excludedAccountSet(selection)
 	accountID := strings.TrimSpace(selection.AccountID)
 	if selection.ResourceID != "" {
 		owner, exists := p.resources[selection.ResourceID]
@@ -3130,6 +3153,9 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 				return nil, ErrNoEligibleAccount
 			}
 		}
+		if _, exists := excluded[accountID]; exists {
+			return nil, ErrNoEligibleAccount
+		}
 		if !selection.Pool.allows(account) {
 			return nil, ErrNoEligibleAccount
 		}
@@ -3144,6 +3170,9 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		for accountID := range allowed {
 			account := p.byID[accountID]
 			if account == nil || !selection.Pool.allows(account) {
+				continue
+			}
+			if _, exists := excluded[accountID]; exists {
 				continue
 			}
 			indices = append(indices, account.position)
@@ -3163,6 +3192,9 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 					continue
 				}
 			}
+			if _, exists := excluded[account.ID]; exists {
+				continue
+			}
 			indices = append(indices, index)
 		}
 	}
@@ -3179,16 +3211,24 @@ func (p *AccountPool) rotateIndicesLocked(indices []int, selection AccountSelect
 	return indices
 }
 
-// selectionIndicesBruteLocked 为 selectionIndicesLocked 的原实现：过滤全部有序账户。只供测试核对候选索引的结果
+// selectionIndicesBruteLocked 为 selectionIndicesLocked 的原实现：过滤全部有序账户，按 ID 逐个判断限定集合与排除列表。
+// 只供测试核对候选索引的结果
 func (p *AccountPool) selectionIndicesBruteLocked(selection AccountSelection) ([]int, error) {
-	if strings.TrimSpace(selection.AccountID) != "" || selection.ResourceID != "" || selection.AllowedAccountIDs == nil {
+	if strings.TrimSpace(selection.AccountID) != "" || selection.ResourceID != "" {
 		return p.selectionIndicesLocked(selection)
 	}
-	allowed := make(map[string]struct{}, len(selection.AllowedAccountIDs))
-	for _, accountID := range selection.AllowedAccountIDs {
-		if accountID = strings.TrimSpace(accountID); accountID != "" {
-			allowed[accountID] = struct{}{}
+	var allowed map[string]struct{}
+	if selection.AllowedAccountIDs != nil {
+		allowed = make(map[string]struct{}, len(selection.AllowedAccountIDs))
+		for _, accountID := range selection.AllowedAccountIDs {
+			if accountID = strings.TrimSpace(accountID); accountID != "" {
+				allowed[accountID] = struct{}{}
+			}
 		}
+	}
+	excluded := make(map[string]struct{}, len(selection.ExcludedAccountIDs))
+	for _, accountID := range selection.ExcludedAccountIDs {
+		excluded[strings.TrimSpace(accountID)] = struct{}{}
 	}
 	sorted := p.sortedAccountIndicesLocked()
 	indices := make([]int, 0, len(sorted))
@@ -3197,7 +3237,10 @@ func (p *AccountPool) selectionIndicesBruteLocked(selection AccountSelection) ([
 		if account == nil || !selection.Pool.allows(account) {
 			continue
 		}
-		if _, exists := allowed[account.ID]; !exists {
+		if _, exists := allowed[account.ID]; allowed != nil && !exists {
+			continue
+		}
+		if _, exists := excluded[account.ID]; exists {
 			continue
 		}
 		indices = append(indices, index)
@@ -3252,6 +3295,37 @@ func (p *AccountPool) setAccountState(accountID string, state AccountState, reas
 // EnabledAccounts 返回已启用账户 ID 与其中 ready 或 busy 的账户数量
 func (p *AccountPool) EnabledAccounts() ([]string, int) {
 	return p.EnabledAccountsIn(PoolScopeAll)
+}
+
+// SetDraining 设置账户是否排空，返回标记是否变化（账户不存在时为 false）。排空中的账户不再给不固定账户的选择
+// （AccountID 与 ResourceID 都为空）新租约，分类时热账户分进 WarmBusy、备用账户分进 StandbyBusy，进行中的租约照常结束；
+// 指定账户与文件绑定的请求照常使用。排空不改变对外状态、Activity 与预热概况，由调用方在 Worker 关闭或放弃淘汰时清除；
+// 账户移出号池时自动清除。标记变化时唤醒等待槽位的请求
+func (p *AccountPool) SetDraining(accountID string, on bool) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil || account.draining == on {
+		return false
+	}
+	account.draining = on
+	p.busyChangedLocked(account)
+	p.notifyLocked()
+	return true
+}
+
+// Draining 返回账户是否在排空中
+func (p *AccountPool) Draining(accountID string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	return account != nil && account.draining
 }
 
 // Activity 返回账户是否存在活动租约或独占操作及最近使用时间
@@ -3750,6 +3824,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 			allowed[accountID] = struct{}{}
 		}
 	}
+	excluded := excludedAccountSet(selection)
 	requestedAccountID := strings.TrimSpace(selection.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	supports := func(account *Account) bool {
@@ -3787,6 +3862,9 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 				if _, exists := allowed[account.ID]; !exists {
 					continue
 				}
+			}
+			if _, exists := excluded[account.ID]; exists {
+				continue
 			}
 			accounts = append(accounts, account)
 		}

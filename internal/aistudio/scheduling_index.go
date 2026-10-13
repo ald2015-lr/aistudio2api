@@ -41,7 +41,7 @@ const (
 
 // selectionKey 为候选集的键：影响"账户是否支持选择、按哪些冷却键判断"的全部选择条件。
 // 方法、能力与资格范围按原值参与（原实现用原值匹配目录、按资格范围是否为空区分生成请求），
-// 账户与资源限定不进索引，PreferPlayground 只影响顺序
+// 账户与资源限定、排除列表不进索引（排除列表在分类与选号时跳过对应下标），PreferPlayground 只影响顺序
 type selectionKey struct {
 	modelID         string
 	accessScope     string
@@ -143,7 +143,8 @@ type schedulingIndex struct {
 	// 按账户下标的紧凑数组：ids 为账户 ID；enabled、state、tier、globalUntil 为启用、状态、权益与全局冷却期限
 	// （UnixNano，0 为没有）；coolUntil 为账户按状态口径冷却到的时刻（全局冷却，或某个模型在账户可用的每个启用通道上都冷却，
 	// 见 accountCoolingUntilLocked），由 accountChangedLocked 更新；blocked 为独占、等待独占或认证刷新中，active 为进行中的租约数，
-	// 由 busyChangedLocked 更新。状态统计与换号上限按这些数组顺序扫描，不再逐个访问账户结构
+	// draining 为排空中（见 SetDraining），均由 busyChangedLocked 更新。状态统计与换号上限按这些数组顺序扫描，不再逐个访问账户结构。
+	// draining 与 blocked 分开：排空只让不固定账户的分类按忙碌处理，不改变派生状态
 	ids         []string
 	enabled     []bool
 	state       []AccountState
@@ -152,6 +153,7 @@ type schedulingIndex struct {
 	coolUntil   []int64
 	blocked     []bool
 	active      []int32
+	draining    []bool
 	// coolVersion 为上次按目录版本核对 coolUntil 时的 eligibilityVersion，coolSyncedAt 为核对时刻：Build 通道是否可用于某模型
 	// 还取决于其他账户的 Playground 目录（见 buildSupportsModelLocked），这个跨账户依赖按节流全量重算（见 refreshCoolingLocked）
 	coolVersion  uint64
@@ -171,7 +173,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			accountsVersion: p.accountsVersion, sets: make(map[selectionKey]*candidateSet),
 			ids: make([]string, size), enabled: make([]bool, size), state: make([]AccountState, size),
 			tier: make([]BenefitTier, size), globalUntil: make([]int64, size), coolUntil: make([]int64, size),
-			blocked: make([]bool, size), active: make([]int32, size), warmStamp: make([]uint32, size),
+			blocked: make([]bool, size), active: make([]int32, size), draining: make([]bool, size), warmStamp: make([]uint32, size),
 			coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
 		}
 		for position, account := range p.accounts {
@@ -183,6 +185,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			index.syncAccount(p, account)
 			index.blocked[position] = accountBlocked(account)
 			index.active[position] = int32(account.active)
+			index.draining[position] = account.draining
 		}
 		p.sched = index
 	}
@@ -249,7 +252,7 @@ func (index *schedulingIndex) positionValid(p *AccountPool, account *Account) bo
 	return position >= 0 && position < len(index.ids) && position < len(p.accounts) && p.accounts[position] == account
 }
 
-// busyChangedLocked 在账户的租约数、独占或认证刷新状态变化后更新忙闲数组；调用方持有 p.mu。
+// busyChangedLocked 在账户的租约数、独占、认证刷新或排空状态变化后更新忙闲数组；调用方持有 p.mu。
 // 每条修改这些字段的路径都必须调用
 func (p *AccountPool) busyChangedLocked(account *Account) {
 	if p.sched == nil || account == nil || !p.sched.positionValid(p, account) {
@@ -257,6 +260,7 @@ func (p *AccountPool) busyChangedLocked(account *Account) {
 	}
 	p.sched.blocked[account.position] = accountBlocked(account)
 	p.sched.active[account.position] = int32(account.active)
+	p.sched.draining[account.position] = account.draining
 }
 
 // stampWarmLocked 把热账户标上新的代数，返回该代数；分类时按代数判断账户是否为热账户。列表与上次相同时沿用上次的代数
@@ -406,6 +410,7 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 		index.coolUntil = append(index.coolUntil, 0)
 		index.blocked = append(index.blocked, accountBlocked(account))
 		index.active = append(index.active, int32(account.active))
+		index.draining = append(index.draining, account.draining)
 		index.warmStamp = append(index.warmStamp, 0)
 		// 新账户可能已在热账户列表里，下次分类重新标记
 		index.lastWarm = nil
@@ -519,16 +524,102 @@ func (set *candidateSet) expireLocked(p *AccountPool, nowNanos int64) {
 	}
 }
 
-// earliestCoolingLocked 返回仍在冷却的候选中最早的恢复时间；调用方已先执行 expireLocked
-func (set *candidateSet) earliestCoolingLocked() (int64, bool) {
+// earliestCoolingLocked 返回仍在冷却、且不在 exclusion 中的候选里最早的恢复时间；调用方已先执行 expireLocked。
+// 堆顶与 until 不符的旧项直接丢弃；被排除账户的堆项先弹出，找到结果后放回（排除的账户通常只有几个）
+func (set *candidateSet) earliestCoolingLocked(exclusion accountExclusion) (int64, bool) {
+	var held []coolingEntry
+	until, found := int64(0), false
 	for len(set.cooling) > 0 {
 		top := set.cooling[0]
-		if set.until[top.position] == top.until {
-			return top.until, true
+		if set.until[top.position] != top.until {
+			set.cooling.pop()
+			continue
 		}
-		set.cooling.pop()
+		if exclusion.has(top.position) {
+			held = append(held, set.cooling.pop())
+			continue
+		}
+		until, found = top.until, true
+		break
 	}
-	return 0, false
+	for _, entry := range held {
+		set.cooling.push(entry)
+	}
+	return until, found
+}
+
+// liveMembersLocked 判断候选集除去被排除的账户后还有成员（含冷却中的）
+func (set *candidateSet) liveMembersLocked(exclusion accountExclusion) bool {
+	excluded := 0
+	for _, position := range exclusion.positions {
+		if position < len(set.until) && set.until[position] != 0 {
+			excluded++
+		}
+	}
+	return set.members > excluded
+}
+
+// accountExclusion 为选择排除的账户（ExcludedAccountIDs）在账户池中的下标：已去重，只含池中存在的账户。
+// 下标随候选索引重建而变，只在同一次持锁内有效
+type accountExclusion struct {
+	positions []int
+	lookup    map[int]struct{}
+}
+
+// exclusionLinearLimit 以内的排除账户逐个比较下标，更多时建集合
+const exclusionLinearLimit = 8
+
+// exclusionLocked 把选择的排除列表换成账户下标；没有排除时不分配。调用方持有 p.mu
+func (p *AccountPool) exclusionLocked(selection AccountSelection) accountExclusion {
+	if len(selection.ExcludedAccountIDs) == 0 {
+		return accountExclusion{}
+	}
+	index := p.schedulingLocked()
+	var exclusion accountExclusion
+	for _, accountID := range selection.ExcludedAccountIDs {
+		account := p.byID[strings.TrimSpace(accountID)]
+		if account == nil || !index.positionValid(p, account) || exclusion.has(account.position) {
+			continue
+		}
+		exclusion.positions = append(exclusion.positions, account.position)
+		if exclusion.lookup != nil {
+			exclusion.lookup[account.position] = struct{}{}
+		} else if len(exclusion.positions) > exclusionLinearLimit {
+			exclusion.lookup = make(map[int]struct{}, len(selection.ExcludedAccountIDs))
+			for _, position := range exclusion.positions {
+				exclusion.lookup[position] = struct{}{}
+			}
+		}
+	}
+	return exclusion
+}
+
+// has 判断下标是否被排除
+func (exclusion accountExclusion) has(position int) bool {
+	if exclusion.lookup != nil {
+		_, excluded := exclusion.lookup[position]
+		return excluded
+	}
+	for _, excluded := range exclusion.positions {
+		if excluded == position {
+			return true
+		}
+	}
+	return false
+}
+
+// excludedAccountSet 返回选择排除的账户 ID 集合；没有排除时为 nil。供按账户 ID 过滤的路径使用
+func excludedAccountSet(selection AccountSelection) map[string]struct{} {
+	if len(selection.ExcludedAccountIDs) == 0 {
+		return nil
+	}
+	excluded := make(map[string]struct{}, len(selection.ExcludedAccountIDs))
+	for _, accountID := range selection.ExcludedAccountIDs {
+		if accountID = strings.TrimSpace(accountID); accountID != "" {
+			excluded[accountID] = struct{}{}
+		}
+	}
+	return excluded
 }
 
 // rotationStartLocked 返回轮询起点：available 中第一个 ID 大于上次选中账户的位置；非轮询策略从头开始
@@ -542,14 +633,15 @@ func (set *candidateSet) rotationStartLocked(p *AccountPool) int {
 	})
 }
 
-// classifyIndexedLocked 用候选集完成不限账户的分类（AllowedAccountIDs 为 nil）；调用方持有 p.mu
+// classifyIndexedLocked 用候选集完成不限账户的分类（AllowedAccountIDs 为 nil）；exclusion 中的账户跳过，
+// 不参与资格、最早恢复时间与分组。只有排除列表的换号重试也走这里，不改走限定账户集合的路径；调用方持有 p.mu
 func (p *AccountPool) classifyIndexedLocked(
-	set *candidateSet, warmAccountIDs []string, now time.Time,
+	set *candidateSet, warmAccountIDs []string, now time.Time, exclusion accountExclusion,
 ) AccountCandidateGroups {
 	index := p.sched
 	set.expireLocked(p, now.UnixNano())
-	groups := AccountCandidateGroups{Eligible: set.members > 0}
-	if until, cooling := set.earliestCoolingLocked(); cooling {
+	groups := AccountCandidateGroups{Eligible: set.liveMembersLocked(exclusion)}
+	if until, cooling := set.earliestCoolingLocked(exclusion); cooling {
 		groups.EarliestCooldown = time.Unix(0, until).UTC()
 	}
 	generation := index.stampWarmLocked(p, warmAccountIDs)
@@ -559,18 +651,23 @@ func (p *AccountPool) classifyIndexedLocked(
 	// 备用账户通常占候选的绝大多数，一次分配够
 	groups.StandbyReady = make([]string, 0, len(available))
 	for _, position := range available[start:] {
-		classifyIndexedCandidate(&groups, index, position, generation, limit)
+		if !exclusion.has(position) {
+			classifyIndexedCandidate(&groups, index, position, generation, limit)
+		}
 	}
 	for _, position := range available[:start] {
-		classifyIndexedCandidate(&groups, index, position, generation, limit)
+		if !exclusion.has(position) {
+			classifyIndexedCandidate(&groups, index, position, generation, limit)
+		}
 	}
 	return groups
 }
 
-// classifyIndexedCandidate 按忙闲数组与热账户代数把候选分进对应分组
+// classifyIndexedCandidate 按忙闲数组与热账户代数把候选分进对应分组；只用于不固定账户的选择，
+// 排空中的账户（见 SetDraining）按忙碌处理：热账户分进 WarmBusy，备用账户分进 StandbyBusy
 func classifyIndexedCandidate(groups *AccountCandidateGroups, index *schedulingIndex, position int, generation uint32, limit int32) {
 	isWarm := index.warmStamp[position] == generation
-	blocked := index.blocked[position]
+	blocked := index.blocked[position] || index.draining[position]
 	active := index.active[position]
 	accountID := index.ids[position]
 	switch {
@@ -587,17 +684,17 @@ func classifyIndexedCandidate(groups *AccountCandidateGroups, index *schedulingI
 	}
 }
 
-// classifyAllowedLocked 用候选集完成限定账户集合的分类：只看 AllowedAccountIDs 中的账户，顺序与成员判断同不限账户时；
-// 调用方持有 p.mu
+// classifyAllowedLocked 用候选集完成限定账户集合的分类：只看 AllowedAccountIDs 中、不在 exclusion 中的账户，
+// 顺序与成员判断同不限账户时；调用方持有 p.mu
 func (p *AccountPool) classifyAllowedLocked(
-	set *candidateSet, allowed map[string]struct{}, warmAccountIDs []string, now time.Time,
+	set *candidateSet, allowed map[string]struct{}, warmAccountIDs []string, now time.Time, exclusion accountExclusion,
 ) AccountCandidateGroups {
 	index := p.sched
 	nowNanos := now.UnixNano()
 	set.expireLocked(p, nowNanos)
 	positions := make([]int, 0, len(allowed))
 	for accountID := range allowed {
-		if account := p.byID[accountID]; account != nil && set.until[account.position] != 0 {
+		if account := p.byID[accountID]; account != nil && set.until[account.position] != 0 && !exclusion.has(account.position) {
 			positions = append(positions, account.position)
 		}
 	}
@@ -624,10 +721,11 @@ func (p *AccountPool) classifyAllowedLocked(
 	return groups
 }
 
-// classifyCandidate 按账户字段的忙闲与是否为热账户把候选分进对应分组（逐个账户判断的路径使用）
-func classifyCandidate(groups *AccountCandidateGroups, account *Account, warm map[string]struct{}, perAccountConcurrency int) {
+// classifyCandidate 按账户字段的忙闲与是否为热账户把候选分进对应分组（逐个账户判断的路径使用）；
+// shared 为不固定账户的选择，这时排空中的账户按忙碌处理，指定账户或文件绑定的选择不看排空
+func classifyCandidate(groups *AccountCandidateGroups, account *Account, warm map[string]struct{}, perAccountConcurrency int, shared bool) {
 	_, isWarm := warm[account.ID]
-	blocked := accountBlocked(account)
+	blocked := accountBlocked(account) || shared && account.draining
 	switch {
 	case isWarm && !blocked && account.active == 0:
 		groups.WarmReady = append(groups.WarmReady, account.ID)
@@ -662,7 +760,8 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 	if index.accountsVersion != p.accountsVersion {
 		return fmt.Errorf("候选索引账户版本 %d 与账户池 %d 不符", index.accountsVersion, p.accountsVersion)
 	}
-	if len(index.ids) != len(p.accounts) || len(index.blocked) != len(p.accounts) || len(index.active) != len(p.accounts) {
+	if len(index.ids) != len(p.accounts) || len(index.blocked) != len(p.accounts) || len(index.active) != len(p.accounts) ||
+		len(index.draining) != len(p.accounts) {
 		return fmt.Errorf("候选索引数组长度与账户数 %d 不符", len(p.accounts))
 	}
 	for position, account := range p.accounts {
@@ -675,9 +774,11 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 		if index.ids[position] != account.ID {
 			return fmt.Errorf("下标 %d 的账户 ID %q，期望 %q", position, index.ids[position], account.ID)
 		}
-		if index.blocked[position] != accountBlocked(account) || index.active[position] != int32(account.active) {
-			return fmt.Errorf("账户 %s 的忙闲数组（阻塞=%v 活动=%d）与账户字段（阻塞=%v 活动=%d）不符",
-				account.ID, index.blocked[position], index.active[position], accountBlocked(account), account.active)
+		if index.blocked[position] != accountBlocked(account) || index.active[position] != int32(account.active) ||
+			index.draining[position] != account.draining {
+			return fmt.Errorf("账户 %s 的忙闲数组（阻塞=%v 活动=%d 排空=%v）与账户字段（阻塞=%v 活动=%d 排空=%v）不符",
+				account.ID, index.blocked[position], index.active[position], index.draining[position],
+				accountBlocked(account), account.active, account.draining)
 		}
 		if index.enabled[position] != account.Config.Enabled || index.state[position] != account.State ||
 			index.tier[position] != account.BenefitTier ||

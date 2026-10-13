@@ -309,6 +309,22 @@ func TestUltraRequestWaitsForUltraCapacity(t *testing.T) {
 	}
 }
 
+// TestDispatchKeyIgnoresExclusions 换号重试的排除列表不进队列键：排除了已尝试账户的请求与同模型的请求同队先到先得，
+// 限定账户集合的请求仍分开排队
+func TestDispatchKeyIgnoresExclusions(t *testing.T) {
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeNormal}
+	retried := selection
+	retried.ExcludedAccountIDs = []string{"b@example.com", "a@example.com"}
+	if dispatchKey(retried) != dispatchKey(selection) {
+		t.Fatal("带排除列表的请求应与同模型请求共用队列键")
+	}
+	allowed := selection
+	allowed.AllowedAccountIDs = []string{"a@example.com"}
+	if dispatchKey(allowed) == dispatchKey(selection) {
+		t.Fatal("限定账户集合的请求应分开排队")
+	}
+}
+
 // TestDispatchKeySeparatesPools 号池不同的请求分开排队：Ultra 请求等待 Ultra 分区时不会挡住普通请求的队首
 func TestDispatchKeySeparatesPools(t *testing.T) {
 	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"}

@@ -350,6 +350,9 @@ func validateLeaseSelection(lease *AccountLease, selection AccountSelection) err
 			return ErrNoEligibleAccount
 		}
 	}
+	if _, excluded := excludedAccountSet(selection)[account.ID]; excluded {
+		return ErrNoEligibleAccount
+	}
 	if resourceID := strings.TrimSpace(selection.ResourceID); resourceID != "" {
 		owner, exists := lease.pool.resources[resourceID]
 		if !exists {
