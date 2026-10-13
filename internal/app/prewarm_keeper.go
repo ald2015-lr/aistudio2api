@@ -169,28 +169,19 @@ func (manager *accountWorkerManager) hotModelList() []string {
 	return nil
 }
 
-// preferUncooled 把候选账户中没有在热门模型与主用模型上长时间冷却的排在前面，预热时优先使用（主用模型在重启后热门模型
-// 还没学到时同样有效）。全部都在冷却时仍然保留，它们还能服务其他模型
+// preferUncooled 把候选账户按能服务的热门与主用模型个数从多到少排列（同数保持原顺序），预热时优先启动还能服务主用模型的账户。
+// 能否服务按候选集成员判断（目录、权益、启用通道都支持且没有长时间冷却，见 aistudio.ServeableCounts）：只看冷却键会把目录里根本没有
+// 主用模型的账户当成“没冷却”排在前面。都服务不了时仍然保留原顺序，它们还能服务其他模型
 func (manager *accountWorkerManager) preferUncooled(accountIDs []string) []string {
 	models := manager.deadSlotModels()
-	if len(models) == 0 || len(accountIDs) == 0 {
+	if len(models) == 0 || len(accountIDs) <= 1 {
 		return accountIDs
 	}
-	cooling := manager.pool.LongCoolingSet(accountIDs, models, rotationMinRemaining, false)
-	if len(cooling) == 0 {
-		return accountIDs
-	}
-	result := make([]string, 0, len(accountIDs))
-	for _, accountID := range accountIDs {
-		if _, cooled := cooling[accountID]; !cooled {
-			result = append(result, accountID)
-		}
-	}
-	for _, accountID := range accountIDs {
-		if _, cooled := cooling[accountID]; cooled {
-			result = append(result, accountID)
-		}
-	}
+	counts := manager.pool.ServeableCounts(accountIDs, models, rotationMinRemaining)
+	result := slices.Clone(accountIDs)
+	slices.SortStableFunc(result, func(left string, right string) int {
+		return counts[right] - counts[left]
+	})
 	return result
 }
 

@@ -529,3 +529,51 @@ func TestSpareAccountsRequiresModelSupport(t *testing.T) {
 		t.Fatalf("d 的 Build 通道可用后可接替账户 %d，期望 3", got)
 	}
 }
+
+// TestServeableCounts 按候选集成员统计账户能服务几个模型：目录里没有该模型的账户计 0（不能因为“没冷却”就算能服务），
+// 所有支持它的通道都长时间冷却计 0，短冷却仍计入，全局长时间冷却的账户对所有模型计 0，号池不认识的模型对谁都计 0
+func TestServeableCounts(t *testing.T) {
+	catalog := indexTestCatalog()
+	withoutModel := slices.DeleteFunc(slices.Clone(catalog), func(model Model) bool { return model.ID == indexTestModel })
+	now := time.Now()
+	long, short := CooldownState{Until: now.Add(2 * time.Hour)}, CooldownState{Until: now.Add(time.Minute)}
+	accounts := []*Account{
+		indexTestAccount("a@example.com", BenefitTierFree, catalog),
+		indexTestAccount("b@example.com", BenefitTierFree, withoutModel),
+		indexTestAccount("c@example.com", BenefitTierFree, catalog),
+		indexTestAccount("e@example.com", BenefitTierFree, catalog),
+		indexTestAccount("g@example.com", BenefitTierFree, catalog),
+	}
+	// c 在两个通道上都长时间冷却该模型；e 只冷却一分钟；g 全局长时间冷却
+	accounts[2].runtime.Cooldowns[indexTestModel] = long
+	accounts[2].runtime.Cooldowns[ChannelCooldownScope(ChannelBuild, indexTestModel)] = long
+	accounts[3].runtime.Cooldowns[indexTestModel] = short
+	accounts[3].runtime.Cooldowns[ChannelCooldownScope(ChannelBuild, indexTestModel)] = short
+	accounts[4].runtime.Cooldowns[globalCooldownKey] = long
+	pool := NewAccountPool(accounts, 2)
+	pool.SetUpstreamChannels([]Channel{ChannelPlayground, ChannelBuild})
+	ids := []string{"a@example.com", "b@example.com", "c@example.com", "e@example.com", "g@example.com", "missing@example.com"}
+	minRemaining := 15 * time.Minute
+
+	counts := pool.ServeableCounts(ids, []string{indexTestModel}, minRemaining)
+	want := map[string]int{"a@example.com": 1, "b@example.com": 0, "c@example.com": 0, "e@example.com": 1, "g@example.com": 0}
+	for id, expected := range want {
+		if counts[id] != expected {
+			t.Fatalf("%s 能服务 %d 个模型，期望 %d（全部：%v）", id, counts[id], expected, counts)
+		}
+	}
+	if _, present := counts["missing@example.com"]; present {
+		t.Fatalf("不存在的账户不应出现在结果里：%v", counts)
+	}
+
+	counts = pool.ServeableCounts(ids, []string{indexTestModel, indexTestFlash, "unknown-model"}, minRemaining)
+	want = map[string]int{"a@example.com": 2, "b@example.com": 1, "c@example.com": 1, "e@example.com": 2, "g@example.com": 0}
+	for id, expected := range want {
+		if counts[id] != expected {
+			t.Fatalf("多个模型时 %s 能服务 %d 个，期望 %d（全部：%v）", id, counts[id], expected, counts)
+		}
+	}
+	if got := pool.ServeableCounts(ids, nil, minRemaining); len(got) != 0 {
+		t.Fatalf("没有模型时应返回空结果：%v", got)
+	}
+}

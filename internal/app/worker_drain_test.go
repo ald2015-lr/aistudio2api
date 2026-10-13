@@ -828,3 +828,37 @@ func (upstream *modelDeniedUpstream) Generate(ctx context.Context, request aistu
 		Method: "GenerateContent", StatusCode: http.StatusForbidden, Code: 7, Message: "The caller does not have permission",
 	}
 }
+
+// TestStandbyPreferenceNeedsPrimarySupport 备用账号与预热的排序按“能否服务主用模型”判断，不是只看有没有冷却：
+// 目录里根本没有主用模型的账号（没有冷却记录）排在能服务主用模型的账号之后，不会因为“没冷却”被优先启动成一个服务不了主用模型的 Worker
+func TestStandbyPreferenceNeedsPrimarySupport(t *testing.T) {
+	accounts := []string{"drain-n1@example.com", "drain-n2@example.com", "drain-w@example.com"}
+	env := newDrainEnv(t, accounts, 1, 3)
+	// n1 的目录只有其他模型，没有主用模型，也没有任何冷却；n2 能服务主用模型
+	if err := env.pool.SetCatalog(accounts[0], aistudio.BenefitTierFree, []aistudio.Model{
+		{ID: testRuntimeModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	env.promote(t, accounts[2])
+	groups, err := env.pool.ClassifyCandidates(env.ctx, aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"}, env.manager.ReadyWarmAccountIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(groups.StandbyReady, accounts[:2]) {
+		t.Fatalf("备用账号应按 ID 排列: %v", groups.StandbyReady)
+	}
+	if env.pool.AccountLongCooling(accounts[0], drainProModel, rotationMinRemaining) {
+		t.Fatalf("%s 没有冷却记录，只看冷却会把它当成能服务主用模型", accounts[0])
+	}
+	capacity := env.manager.standbyCapacity(env.manager.WarmAccountIDs(), testRuntimeModel)
+	if got := capacity.expandable(groups.StandbyReady); got != accounts[1] {
+		t.Fatalf("后台扩容应选能服务主用模型的 %s，实际 %q", accounts[1], got)
+	}
+	if got := capacity.promotable(groups.StandbyReady, false); got != accounts[1] {
+		t.Fatalf("现场启动应选能服务主用模型的 %s，实际 %q", accounts[1], got)
+	}
+	if got := env.manager.preferUncooled(groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
+		t.Fatalf("预热排序应把能服务主用模型的账号排在前面: %v", got)
+	}
+}

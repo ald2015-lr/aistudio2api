@@ -514,6 +514,51 @@ func (p *AccountPool) spareAccountsAtLocked(
 	return spare
 }
 
+// ServeableCounts 返回 accountIDs 中每个账户能服务 modelIDs 里几个模型：账户在该模型生成请求的候选集里（目录、权益、启用通道都支持，
+// 按账户所属号池判断），且至少一个支持它的通道没有长时间冷却（剩余不少于 minRemaining 的冷却视为不能服务），全局长时间冷却的账户计 0。
+// 只看冷却键的 LongCoolingSet 会把目录里根本没有该模型的账户当成“没冷却”，预热与备用账号排序据此会启动一个服务不了主用模型的 Worker；
+// 这里按候选集成员判断。号池不认识的模型对所有账户都计 0，不影响排序。单次加锁，候选集已缓存时每个账户是常数时间
+func (p *AccountPool) ServeableCounts(accountIDs []string, modelIDs []string, minRemaining time.Duration) map[string]int {
+	counts := make(map[string]int, len(accountIDs))
+	if p == nil || len(accountIDs) == 0 || len(modelIDs) == 0 {
+		return counts
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	index := p.schedulingLocked()
+	nowNanos, minNanos := now.UnixNano(), int64(max(minRemaining, 0))
+	sets := make(map[PoolScope][]*candidateSet, 2)
+	for _, accountID := range accountIDs {
+		account := p.byID[strings.TrimSpace(accountID)]
+		if account == nil || !index.positionValid(p, account) {
+			continue
+		}
+		position := account.position
+		if global := index.globalUntil[position]; global > nowNanos && global-nowNanos >= minNanos {
+			counts[account.ID] = 0
+			continue
+		}
+		scope := PoolScopeNormal
+		if index.tier[position] == BenefitTierUltra {
+			scope = PoolScopeUltra
+		}
+		scoped, built := sets[scope]
+		if !built {
+			scoped = p.spareSetsLocked(scope, modelIDs, now)
+			sets[scope] = scoped
+		}
+		served := 0
+		for _, set := range scoped {
+			if serveableIn(set, position, nowNanos, minNanos) {
+				served++
+			}
+		}
+		counts[account.ID] = served
+	}
+	return counts
+}
+
 // spareSetsLocked 返回各指定模型生成请求在号池内的候选集，供判断账户能否接替；调用方持有 p.mu
 func (p *AccountPool) spareSetsLocked(scope PoolScope, modelIDs []string, now time.Time) []*candidateSet {
 	sets := make([]*candidateSet, 0, len(modelIDs))
@@ -530,10 +575,18 @@ func (p *AccountPool) spareSetsLocked(scope PoolScope, modelIDs []string, now ti
 // spareForSets 判断下标处的账户在每个候选集中都是候选，且恢复时间距 now 不足 minNanos（未冷却、已到期或很快恢复）
 func spareForSets(sets []*candidateSet, position int, nowNanos int64, minNanos int64) bool {
 	for _, set := range sets {
-		until := set.until[position]
-		if until == 0 || until > nowNanos && until-nowNanos >= minNanos {
+		if !serveableIn(set, position, nowNanos, minNanos) {
 			return false
 		}
 	}
 	return true
+}
+
+// serveableIn 判断下标处的账户是候选集的成员，且恢复时间距 now 不足 minNanos（候选集里 0 为非成员、-1 为可用、正数为冷却到期时刻）
+func serveableIn(set *candidateSet, position int, nowNanos int64, minNanos int64) bool {
+	if position < 0 || position >= len(set.until) {
+		return false
+	}
+	until := set.until[position]
+	return until != 0 && !(until > nowNanos && until-nowNanos >= minNanos)
 }

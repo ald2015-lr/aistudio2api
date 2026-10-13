@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"slices"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
@@ -166,8 +167,8 @@ type standbyCapacity struct {
 	active   map[aistudio.PoolScope]int
 	cooling  map[aistudio.PoolScope]bool
 	idle     map[aistudio.PoolScope]bool
-	// avoid 为已核对过的备用账户是否在热门或主用模型上长时间冷却（见 preferred），一次调度内每个账户最多核对一次
-	avoid map[string]bool
+	// serveable 为已核对过的备用账户能服务几个热门或主用模型（见 preferred），一次调度内每个账户最多核对一次
+	serveable map[string]int
 }
 
 // standbyCapacity 按当前驻留的 Worker 创建分区容量判断
@@ -199,9 +200,10 @@ func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope 
 	return partitionOf(accountID, capacity.ultra)
 }
 
-// preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个中没有在热门或主用模型上长时间冷却的账户在前、冷却的在后，
+// preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个按能服务的热门与主用模型个数从多到少排列（同数保持原顺序），
 // 第二段为其余候选，保持原顺序且不复制（备用账户可能有上万个）。为其他模型的请求启动的备用账号也优先选还能服务主用模型的，
-// 不直接启动一个主用模型已冷却的死槽位；只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），全部都在冷却时仍按原顺序使用
+// 不直接启动一个服务不了主用模型的 Worker（目录里没有、权益不够或已长时间冷却，按候选集成员判断，见 aistudio.ServeableCounts）；
+// 只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），都服务不了时仍按原顺序使用
 func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	models := capacity.manager.deadSlotModels()
 	if len(models) == 0 || len(list) <= 1 {
@@ -210,31 +212,23 @@ func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	head := list[:min(standbyPreferLimit, len(list))]
 	unknown := make([]string, 0, len(head))
 	for _, accountID := range head {
-		if _, checked := capacity.avoid[accountID]; !checked {
+		if _, checked := capacity.serveable[accountID]; !checked {
 			unknown = append(unknown, accountID)
 		}
 	}
 	if len(unknown) > 0 {
-		if capacity.avoid == nil {
-			capacity.avoid = make(map[string]bool, len(unknown))
+		if capacity.serveable == nil {
+			capacity.serveable = make(map[string]int, len(unknown))
 		}
-		cooling := capacity.manager.pool.LongCoolingSet(unknown, models, rotationMinRemaining, false)
+		counts := capacity.manager.pool.ServeableCounts(unknown, models, rotationMinRemaining)
 		for _, accountID := range unknown {
-			_, cooled := cooling[accountID]
-			capacity.avoid[accountID] = cooled
+			capacity.serveable[accountID] = counts[accountID]
 		}
 	}
-	ordered := make([]string, 0, len(head))
-	for _, accountID := range head {
-		if !capacity.avoid[accountID] {
-			ordered = append(ordered, accountID)
-		}
-	}
-	for _, accountID := range head {
-		if capacity.avoid[accountID] {
-			ordered = append(ordered, accountID)
-		}
-	}
+	ordered := slices.Clone(head)
+	slices.SortStableFunc(ordered, func(left string, right string) int {
+		return capacity.serveable[right] - capacity.serveable[left]
+	})
 	return [2][]string{ordered, list[len(head):]}
 }
 
