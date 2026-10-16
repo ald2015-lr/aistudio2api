@@ -25,6 +25,10 @@ type authRuntimeRefresher struct {
 	requests       *requestRegistry
 	// publish 在账户被标为需要登录后推送管理页账户状态，使用生成服务的合并推送；为空时不推送
 	publish func()
+	// renewed 在续签提交新的认证状态后调用，参数为账户与新的登录签名指纹（aistudio.LoginIdentity）；为空时不调用。
+	// 续签会换掉登录签名 Cookie，403 无权限登记要在提交时更新记下的登录签名：原先要等账户目录扫描发现磁盘与内存一起变了才更新，
+	// 扫描第一次看到这个文件之前（启动后几十秒内）或停止前十几秒内续签的，会被当作重新上传，清除登记与 403 冷却、冷却档位从头计
+	renewed func(accountID string, identity string)
 	// waitLimit 为续签等待同账户其他请求结束的上限，为 0 时使用 authRefreshWaitLimit
 	waitLimit time.Duration
 }
@@ -327,6 +331,8 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 	}
 	startedAt := time.Now()
 	refresher.requests.log(account.Config.Label, "INFO", "账户认证续签 | 1/2 | 刷新 Cookie")
+	// renewedIdentity 为本次提交的登录签名指纹；其他租约已经提交过续签时 RefreshStorageState 不调用 update，保持为空（由那次续签更新）
+	renewedIdentity := ""
 	err := lease.RefreshStorageState(func(state *aistudio.StorageState) error {
 		extension, exists, err := state.AuthExtension()
 		if err != nil {
@@ -344,6 +350,7 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 		if _, err := aistudio.NewSigner().Sign(*state); err != nil {
 			return fmt.Errorf("续签账户 %s 的 Cookie 无法签名: %w", account.ID, err)
 		}
+		renewedIdentity = aistudio.LoginIdentity(*state)
 		return nil
 	}, func() (func(bool), error) {
 		refresher.requests.log(account.Config.Label, "INFO", "账户认证续签 | 2/2 | 重置协议运行时")
@@ -363,6 +370,9 @@ func (refresher *authRuntimeRefresher) Refresh(ctx context.Context) error {
 			time.Since(startedAt).Round(time.Millisecond), wrapped.Error(),
 		))
 		return wrapped
+	}
+	if renewedIdentity != "" && refresher.renewed != nil {
+		refresher.renewed(account.ID, renewedIdentity)
 	}
 	refresher.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
 		"账户认证续签完成 | 耗时=%s",

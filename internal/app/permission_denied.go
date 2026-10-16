@@ -590,9 +590,25 @@ func (service *trackedService) reconcilePermissionDenied() {
 	}
 }
 
-// storageStateDigest 返回登录状态全部内容（Cookie、本地存储与扩展字段）的摘要。同一登录会话里重新导出认证文件时登录签名 Cookie 不变，
-// 只能按内容判断；本服务写回认证文件时同时更新内存，磁盘上的内容与内存不同才是外部更新
+// rotatingCookies 为 Google 用 Set-Cookie 定期轮换的会话 Cookie：同一登录会话里一直在变，每个进程都会把它们回写到认证文件
+// （AccountLease.MergeSetCookieHeaders）
+var rotatingCookies = map[string]struct{}{
+	"__Secure-1PSIDTS": {}, "__Secure-3PSIDTS": {},
+	"SIDCC": {}, "__Secure-1PSIDCC": {}, "__Secure-3PSIDCC": {},
+}
+
+// storageStateDigest 返回登录状态内容（Cookie、本地存储与扩展字段）的摘要，不计 rotatingCookies。同一登录会话里重新导出认证文件时
+// 登录签名 Cookie 不变，只能按内容判断；本服务写回认证文件时同时更新内存，磁盘上的内容与内存不同才是外部更新。
+// 轮换 Cookie 不计入：多个进程共用一个账户目录时，另一个进程回写它们后磁盘与本进程内存不同，原先按重新上传处理，
+// 清除登记与 403 冷却、冷却档位从头计，每次回写都这样，列表在进程之间来回出现。只有轮换 Cookie 不同的重新导出因此发现不了
 func storageStateDigest(state aistudio.StorageState) string {
+	cookies := make([]aistudio.StateCookie, 0, len(state.Cookies))
+	for _, cookie := range state.Cookies {
+		if _, rotating := rotatingCookies[cookie.Name]; !rotating {
+			cookies = append(cookies, cookie)
+		}
+	}
+	state.Cookies = cookies
 	data, err := json.Marshal(state)
 	if err != nil {
 		return ""

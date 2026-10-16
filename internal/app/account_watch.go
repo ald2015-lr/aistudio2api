@@ -299,7 +299,7 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 					watcher.authFiles[summary.ID] = stat
 					continue
 				}
-				refresh, settled := watcher.deniedAuthUpdated(summary, state, stat, true)
+				refresh, settled := watcher.deniedAuthUpdated(summary, state, stat)
 				if !settled {
 					continue
 				}
@@ -334,7 +334,7 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 			found = append(found, summary.ID)
 			continue
 		}
-		refresh, settled := watcher.deniedAuthUpdated(summary, state, stat, false)
+		refresh, settled := watcher.deniedAuthUpdated(summary, state, stat)
 		if !settled {
 			// 比较期间文件又被改写：恢复上一次的基准，下一轮重新检查
 			watcher.authFiles[summary.ID] = previous
@@ -362,14 +362,17 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 // deniedAuthUpdated 检查 403 无权限账户磁盘上的认证文件（调用方已确认文件稳定、已读入 disk），返回是否要载入它
 // （由 startLoginRefresh 载入，载入时清除登记与 403 冷却），以及本轮能否下结论。不在登记表里的账户不检查：
 //   - 磁盘上的内容与内存不同：本服务写回认证文件时同时更新内存，不同说明文件被外部更新了。同一登录会话里重新导出
-//     （在已登录的浏览器里同意政策后重新获取）时登录签名 Cookie 不变，只比较它发现不了，按说明重新上传后账户仍然列着、仍在冷却
-//   - 第一次看到（baseline）时磁盘与内存相同、但登录签名与登记时记下的不同：内存里已经是新的登录状态，直接清除登记与 403 冷却。
-//     之后的变化只看磁盘与内存是否相同：两者一起变了是本服务自己写回的（续签会换掉登录签名 Cookie），不算重新上传，
-//     只更新登记时记下的登录签名，免得下次启动时被当作服务停止期间替换了认证文件
+//     （在已登录的浏览器里同意政策后重新获取）时登录签名 Cookie 不变，只比较它发现不了，按说明重新上传后账户仍然列着、仍在冷却。
+//     内容比较不计 Google 定期轮换的 Cookie（见 storageStateDigest）：共用账户目录的其他进程回写它们不算重新上传
+//   - 磁盘与内存相同（第一次看到时也一样）：内存里就是本服务自己的登录状态，不算重新上传。登录签名与登记时记下的不同时
+//     （本服务自己写回时换掉了登录签名 Cookie；续签已在提交时更新，见 authRuntimeRefresher.renewed）只更新记下的登录签名，
+//     免得下次启动时被当作服务停止期间替换了认证文件。原先第一次看到时按重新上传清除：扫描第一次看到文件之前续签的账户
+//     （启动后几十秒内）被移出列表、解除 403 冷却，冷却档位从头计，永远升不到 6 小时与次日零点两档。服务停止期间替换的
+//     认证文件由启动时的 reconcilePermissionDenied 处理，载入账户池之后替换的由上一条（磁盘与内存不同）发现
 //
 // 比较期间文件又被改写（多半是本服务正在写回 Cookie，写盘与更新内存之间可能被读到）时不下结论，由调用方下一轮重新检查
 func (watcher *accountWatcher) deniedAuthUpdated(
-	summary aistudio.AccountLoginSummary, disk aistudio.StorageState, stat authFileStat, baseline bool,
+	summary aistudio.AccountLoginSummary, disk aistudio.StorageState, stat authFileStat,
 ) (bool, bool) {
 	stored, listed := watcher.admin.service.permissionDeniedIdentity(summary.ID)
 	if !listed {
@@ -386,11 +389,7 @@ func (watcher *accountWatcher) deniedAuthUpdated(
 	if identity != aistudio.LoginIdentity(memory) || storageStateDigest(disk) != storageStateDigest(memory) {
 		return true, true
 	}
-	switch {
-	case stored == "" || identity == stored:
-	case baseline:
-		watcher.admin.service.forgetPermissionDenied(summary.ID, "认证文件更新")
-	default:
+	if stored != "" && identity != stored {
 		watcher.admin.service.permissionDenied.setIdentity(summary.ID, identity)
 	}
 	return false, true

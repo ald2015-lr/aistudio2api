@@ -689,7 +689,7 @@ func TestPermissionDeniedWatcherSameSessionReexport(t *testing.T) {
 		t.Fatal("本服务自己续签之后重启，不应当作服务停止期间替换了认证文件")
 	}
 
-	// 外部在同一登录会话里重新导出：登录签名 Cookie 不变，其他 Cookie 变了
+	// 外部在同一登录会话里重新导出：登录签名 Cookie 不变，轮换 Cookie 与其他 Cookie 变了
 	plainBefore := memoryDigest(t, pool, plain)
 	for _, accountID := range []string{listed, plain} {
 		account, err := pool.Account(accountID)
@@ -700,7 +700,8 @@ func TestPermissionDeniedWatcherSameSessionReexport(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := aistudio.WriteStorageState(account.StoragePath, withCookie(state, "__Secure-1PSIDTS", "browser-reexport")); err != nil {
+		reexported := withCookie(withCookie(state, "__Secure-1PSIDTS", "browser-reexport"), "NID", "browser-reexport")
+		if err := aistudio.WriteStorageState(account.StoragePath, reexported); err != nil {
 			t.Fatal(err)
 		}
 		settleAuthFile(t, pool, accountID, base.Add(20*time.Second))
@@ -730,12 +731,13 @@ func TestPermissionDeniedWatcherSameSessionReexport(t *testing.T) {
 
 // TestPermissionDeniedWatcherBaseline 账户目录扫描第一次看到的认证文件原先只记作基准：载入账户池之后、第一次扫描之前被替换的认证文件
 // （例如重启生成服务时正好在等待文件稳定）再也发现不了。403 无权限账户第一次看到时就对照：磁盘与内存不同时载入新的认证文件；
-// 内存里已经是新的登录状态、只是与登记时记下的登录签名不同时直接清除；都没变的保留
+// 磁盘与内存相同、只是登录签名与登记时记下的不同（本服务自己写回换掉了登录签名 Cookie）时不算重新上传，保留登记与冷却、
+// 只更新记下的登录签名；都没变的保留
 func TestPermissionDeniedWatcherBaseline(t *testing.T) {
 	const replaced, relogged, kept = "replaced@example.com", "relogged@example.com", "kept@example.com"
 	admin, registry := deniedWatcherAdmin(t, []string{replaced, relogged, kept})
 	pool := admin.pool
-	// relogged 登记时用的是之前的登录状态
+	// relogged 登记时用的是之前的登录状态，之后本服务自己换掉了登录签名 Cookie（磁盘与内存一起变）
 	registry.record(relogged, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", "previous-identity", time.Now())
 	account, err := pool.Account(replaced)
 	if err != nil {
@@ -749,19 +751,26 @@ func TestPermissionDeniedWatcherBaseline(t *testing.T) {
 		settleAuthFile(t, pool, accountID, base)
 	}
 	scanAndWait(t, newTestAccountWatcher(admin))
-	for _, accountID := range []string{replaced, relogged} {
-		if _, ok := registry.identityOf(accountID); ok {
-			t.Fatalf("%s 的认证文件已更新，第一次扫描应清除登记：%+v", accountID, registry.list())
-		}
-		if _, reason, cooling := modelCooldownUntil(t, pool, accountID, testRuntimeModel); cooling {
-			t.Fatalf("%s 的认证文件已更新，应解除 403 冷却，仍有：%s", accountID, reason)
-		}
+	if _, ok := registry.identityOf(replaced); ok {
+		t.Fatalf("%s 的认证文件已更新，第一次扫描应清除登记：%+v", replaced, registry.list())
+	}
+	if _, reason, cooling := modelCooldownUntil(t, pool, replaced, testRuntimeModel); cooling {
+		t.Fatalf("%s 的认证文件已更新，应解除 403 冷却，仍有：%s", replaced, reason)
 	}
 	if identity, _ := pool.LoginIdentity(replaced); identity != aistudio.LoginIdentity(authTestState(t, "NEW", false)) {
 		t.Fatal("应载入替换后的认证文件")
 	}
-	if _, ok := registry.identityOf(kept); !ok {
-		t.Fatal("认证文件没变的账户应保留登记")
+	current, _ := pool.LoginIdentity(relogged)
+	if identity, ok := registry.identityOf(relogged); !ok || identity != current {
+		t.Fatalf("磁盘与内存相同时不算重新上传，应保留登记并更新登录签名：listed=%v identity=%q", ok, identity)
+	}
+	for _, accountID := range []string{relogged, kept} {
+		if _, ok := registry.identityOf(accountID); !ok {
+			t.Fatalf("%s 应保留登记", accountID)
+		}
+		if _, _, cooling := modelCooldownUntil(t, pool, accountID, testRuntimeModel); !cooling {
+			t.Fatalf("%s 的 403 冷却应保持", accountID)
+		}
 	}
 }
 
@@ -851,5 +860,199 @@ func TestPermissionDeniedRegistryLocking(t *testing.T) {
 	}
 	if labels["listed@example.com"] != "Listed.Account@Example.com" || labels["late@example.com"] != "late@example.com" {
 		t.Fatalf("显示名称 = %v，期望账户池里的名称，不在账户池里的显示 ID", labels)
+	}
+}
+
+// TestPermissionDeniedRenewalKeepsListing 本服务自己续签换掉了登录签名 Cookie，不是重新上传。原先启动对照保留登记之后、账户目录扫描
+// 第一次看到认证文件之前（启动后几十秒内）续签的账户，第一次扫描时磁盘与内存相同、登录签名与登记时不同，按重新上传清除：移出列表、
+// 解除 403 冷却、冷却档位从头计，永远升不到后两档；停止前十几秒内续签、扫描还没更新记下的登录签名时，下次启动的对照同样清除。
+// 续签提交时更新记下的登录签名；扫描第一次看到磁盘与内存相同的文件也不再清除（续签已提交、还没更新登记时被扫描到的同样保留）
+func TestPermissionDeniedRenewalKeepsListing(t *testing.T) {
+	isolateDisableNotes(t)
+	root := filepath.Join(t.TempDir(), "auth")
+	const renewed, committed = "renewed@example.com", "committed@example.com"
+	reason := forbiddenModelReasonPrefix + "The caller does not have permission"
+	for _, accountID := range []string{renewed, committed} {
+		directory := writeEnableTestAccount(t, root, accountID, true)
+		// 带 Chrome 续签材料，登录签名 Cookie 与 writeEnableTestAccount 写入的相同
+		if err := aistudio.WriteStorageState(aistudio.StorageStatePath(directory), authTestState(t, "V", true)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	{
+		// 停止之前的一代：两个账户都返回过 403，登记并写入单模型 403 冷却
+		accounts, failures := aistudio.NewAccountStore(root).LoadTolerant()
+		if len(failures) > 0 {
+			t.Fatal(failures)
+		}
+		previous := aistudio.NewAccountPool(accounts, 1)
+		registry := newPermissionDeniedRegistry(root, nil)
+		until := time.Now().Add(forbiddenModelRepeatCooldown)
+		for _, accountID := range []string{renewed, committed} {
+			if err := previous.MarkCooldownIfGeneration(
+				accountID, testRuntimeModel, previous.ModelAccessGeneration(accountID), time.Now(), until, reason,
+			); err != nil {
+				t.Fatal(err)
+			}
+			identity, _ := previous.LoginIdentity(accountID)
+			registry.record(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", identity, time.Now())
+		}
+		registry.flush()
+		previous.WaitBackground()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	cfg := config.Default()
+	cfg.AuthStates = root
+	cfg.WAABackend = config.WAABackendGo
+	lifecycle, stop := context.WithCancel(ctx)
+	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.pool.WaitBackground)
+	defer func() {
+		stop()
+		if err := closeRuntime(); err != nil {
+			t.Error(err)
+		}
+	}()
+	registry := admin.service.permissionDenied
+	if entries := registry.list(); len(entries) != 2 {
+		t.Fatalf("启动对照不应清除认证文件没变的账户：%+v", entries)
+	}
+
+	// renewed：请求遇到登录失效，经生成服务的续签器续签（与请求路径相同，只替换向 Google 续签的那一步）
+	refresher := admin.workers.refresher
+	refresher.refresh = func(context.Context, aistudio.ChromeOAuthMaterial, string) ([]aistudio.StateCookie, error) {
+		return authTestState(t, "RENEWED", false).Cookies, nil
+	}
+	lease, err := admin.pool.AcquireAccount(ctx, renewed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(refresher.Refresh(aistudio.ContextWithAccountLease(ctx, lease)), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	renewedIdentity := aistudio.LoginIdentity(authTestState(t, "RENEWED", false))
+	if identity, _ := admin.pool.LoginIdentity(renewed); identity != renewedIdentity {
+		t.Fatal("续签应换掉登录签名 Cookie")
+	}
+	if identity, ok := registry.identityOf(renewed); !ok || identity != renewedIdentity {
+		t.Fatalf("续签提交时应更新记下的登录签名：listed=%v identity=%q", ok, identity)
+	}
+	// 扫描看到这个文件之前停止、再次启动：对照不应当作停止期间替换了认证文件
+	admin.service.reconcilePermissionDenied()
+	if _, ok := registry.identityOf(renewed); !ok {
+		t.Fatal("续签之后重启，启动对照不应清除登记")
+	}
+
+	// committed：续签已经提交、还没更新登记时被扫描看到（直接在租约内提交，不经续签器）
+	lease, err = admin.pool.AcquireAccount(ctx, committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = lease.RefreshStorageState(func(state *aistudio.StorageState) error {
+		state.Cookies = authTestState(t, "COMMITTED", false).Cookies
+		return nil
+	}, func() (func(bool), error) { return func(bool) {}, nil })
+	if err := errors.Join(err, lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+
+	// 账户目录扫描第一次看到这两个认证文件
+	base := time.Now().Add(-time.Minute)
+	for _, accountID := range []string{renewed, committed} {
+		settleAuthFile(t, admin.pool, accountID, base)
+	}
+	scanAndWait(t, newTestAccountWatcher(admin))
+	for _, accountID := range []string{renewed, committed} {
+		current, _ := admin.pool.LoginIdentity(accountID)
+		if identity, ok := registry.identityOf(accountID); !ok || identity != current {
+			t.Fatalf("%s 自己续签后第一次扫描应保留登记并记下新的登录签名：listed=%v identity=%q", accountID, ok, identity)
+		}
+		if _, cooldownReason, cooling := modelCooldownUntil(t, admin.pool, accountID, testRuntimeModel); !cooling || cooldownReason != reason {
+			t.Fatalf("%s 自己续签后 403 冷却应保持：cooling=%v reason=%q", accountID, cooling, cooldownReason)
+		}
+	}
+	if hasLogContaining(requests, "清除 403 无权限记录与冷却") {
+		t.Fatalf("自己续签不应清除 403 无权限记录，日志 = %v", serviceLogMessages(requests))
+	}
+}
+
+// TestPermissionDeniedSharedDirectoryWriteBack 多个进程共用一个账户目录时，另一个进程回写 Google 轮换的 Cookie（__Secure-1PSIDTS、SIDCC 等）
+// 后磁盘与本进程内存不同。原先按重新上传处理：移出列表、解除 403 冷却、冷却档位从头计，另一个进程每回写一次就这样一次。
+// 轮换 Cookie 不计入内容比较；外部重新导出改了轮换 Cookie 之外的内容时仍按重新上传清除
+func TestPermissionDeniedSharedDirectoryWriteBack(t *testing.T) {
+	const listed = "listed@example.com"
+	admin, registry := deniedWatcherAdmin(t, []string{listed})
+	pool := admin.pool
+	account, err := pool.Account(listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 另一个进程：同一账户目录上的另一个账户池
+	accounts, failures := aistudio.NewAccountStore(filepath.Dir(account.Directory)).LoadTolerant()
+	if len(failures) > 0 {
+		t.Fatal(failures)
+	}
+	other := aistudio.NewAccountPool(accounts, 1)
+	t.Cleanup(other.WaitBackground)
+	base := time.Now().Add(-time.Minute)
+	settleAuthFile(t, pool, listed, base)
+	watcher := newTestAccountWatcher(admin)
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatal("认证文件没有变化时第一次扫描不应清除登记")
+	}
+
+	lease, err := other.AcquireAccount(context.Background(), listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := make([]string, 0, 5)
+	for _, name := range []string{"__Secure-1PSIDTS", "__Secure-3PSIDTS", "SIDCC", "__Secure-1PSIDCC", "__Secure-3PSIDCC"} {
+		rotated = append(rotated, name+"=other-process; Domain=.google.com; Path=/; Secure")
+	}
+	if err := lease.MergeSetCookieHeaders(rotated, "https://aistudio.google.com/", time.Now()); err != nil {
+		t.Fatal(errors.Join(err, lease.Release()))
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	disk, err := aistudio.LoadStorageState(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memory, _ := pool.StorageStateOf(listed); len(disk.Cookies) != len(memory.Cookies)+len(rotated) {
+		t.Fatalf("另一个进程应把轮换 Cookie 写进认证文件：磁盘 %d 个，内存 %d 个", len(disk.Cookies), len(memory.Cookies))
+	}
+	settleAuthFile(t, pool, listed, base.Add(10*time.Second))
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatalf("另一个进程回写轮换 Cookie 不应当作重新上传：%+v", registry.list())
+	}
+	if _, _, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); !cooling {
+		t.Fatal("另一个进程回写轮换 Cookie 后 403 冷却应保持")
+	}
+	if hasLogContaining(admin.requests, "清除 403 无权限记录与冷却") {
+		t.Fatalf("另一个进程回写轮换 Cookie 不应清除记录，日志 = %v", serviceLogMessages(admin.requests))
+	}
+
+	// 外部在同一登录会话里重新导出：登录签名 Cookie 不变，轮换 Cookie 之外的 Cookie 也变了
+	if err := aistudio.WriteStorageState(
+		account.StoragePath, withCookie(withCookie(disk, "__Secure-1PSIDTS", "browser-reexport"), "NID", "browser-reexport"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	settleAuthFile(t, pool, listed, base.Add(20*time.Second))
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); ok {
+		t.Fatalf("重新导出的认证文件应清除登记：%+v", registry.list())
+	}
+	if _, reason, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); cooling {
+		t.Fatalf("重新导出的认证文件应解除 403 冷却，仍有：%s", reason)
 	}
 }

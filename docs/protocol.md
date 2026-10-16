@@ -1165,6 +1165,8 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 
 `POST /api/accounts/bulk-enable` 一次请求启用一批账户：去重后只处理停用的账户，单次最多 1000 个（其余计入 `remaining`），16 个并行取得账户独占租约（最多等 3 秒，等不到记为 `account_busy`）并只把 `account.json` 的 `enabled` 改为 `true`，代理、语言、时区不变，不重建固定出口与 Worker 配置，清除停用原因；全部写完后登记一次模型变化、合并并推送一次快照，再在后台为没有模型目录的账户同步目录（与单个启用共用 16 个并发名额，整批同步完合并一次）。启用不等待目录，登录已失效的账户由目录同步标为 `auth_required`。请求体缺少 `account_ids` 且 `all_disabled` 不为 `true` 时返回 400 `invalid_account`。管理页“一键启用”与选中账户的启用按 500 个一批依次提交，两批之间可以停止。
 
+`GET /api/accounts/permission-denied` 列出的账户在认证文件更新时移出，同时解除它的 403 冷却与暂停：账户目录扫描发现登录签名 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`）变了，或者列出的账户磁盘上的 `storage-state.json` 与本进程内存中的登录状态不同（同一登录会话里重新导出时登录签名不变）；内容比较不计 Google 定期轮换的 `__Secure-1PSIDTS`、`__Secure-3PSIDTS`、`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`，只有这些不同的重新导出不算更新。本服务自己写回认证文件（回写 Cookie、续签）时同时更新内存，续签提交时还更新登记时记下的登录签名，都不算更新；服务停止期间换上的认证文件在启动时按登录签名对照。这套判断假定只有本进程写这个账户目录：多个进程共用一个 auth 目录时，另一个进程回写轮换 Cookie 不算更新，但它写进认证文件的其他变化（轮换 Cookie 之外的 Cookie、本地存储）在本进程看来与内存不同，仍按重新上传清除本进程的记录与 403 冷却；`.permission-denied.json` 也由各进程整份写出，不做合并。
+
 `PUT /api/accounts/{id}` 的提交顺序固定为：校验不可变邮箱 ID，取得账户独占租约，创建未发布的新固定出口，关闭当前 Worker 并把新 Worker 配置标记为 `pending`（尚未发布），在模型目录写锁内原子写入 `account.json` 并更新账户池，随后发布 Worker 配置、替换固定出口、释放租约并重建模型缓存。`account.json` 写入是唯一持久提交点。提交前的出口创建、Worker 关闭或写入错误会丢弃这份待发布配置并保持旧配置；已经关闭的 Worker 由后续请求按旧配置重建。持久写入后，新配置、Worker 配置与固定出口共同成为已提交状态。租约释放错误保留该提交状态并返回原始 unlock 错误；释放成功后记录完成日志并同步模型缓存；账户由停用改为启用且没有模型目录时，在后台补一次目录同步。
 
 `RuntimeConfig` 字段。`response-only` 表示字段由服务器填充，客户端提交的值不参与保存：

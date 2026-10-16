@@ -108,6 +108,8 @@ func newRuntime(
 	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.permissionDenied = openPermissionDeniedRegistry(store.PrimaryDirectory(), requests)
+	// 续签换掉登录签名 Cookie 时在提交处更新登记记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
+	refresher.renewed = service.permissionDenied.setIdentity
 	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
 	service.reconcilePermissionDenied()
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
