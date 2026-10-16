@@ -597,7 +597,7 @@ Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于�
 
 OpenAI Chat 的 assistant tool call 未带 `extra_content` 时，服务按调用 ID、函数名和参数补回本进程最近签发的签名；查不到时写入 `skip_thought_signature_validator`。
 
-Anthropic redacted thinking block 以 `data` 承载同一份不透明状态；适配器在输入与输出两侧保留该值。正文块打开时单独到达的签名（流式与非流式）先暂存，正文块结束后按到达顺序输出为 `redacted_thinking`，与上一个相同的签名只输出一次，正文不会被切成多个文本块；正文分片自带的签名不输出。
+Anthropic redacted thinking block 以 `data` 承载同一份不透明状态；适配器在输入与输出两侧保留该值。正文块打开时单独到达的签名（流式与非流式）先暂存，正文块结束后按到达顺序输出为 `redacted_thinking`，与上一个相同的签名只输出一次，正文不会被切成多个文本块；随后是不带签名的工具调用时排在该调用之后输出（紧挨在 `tool_use` 前的 `redacted_thinking` 回传时会成为该调用的签名）。正文分片自带的签名不输出。
 
 reasoning summary 是服务端返回的摘要文本。thought signature 作为下一轮请求的协议状态字段原样回传。
 
@@ -1767,7 +1767,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps` 与 `usage`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
 
-SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
+SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；随后是不带签名的函数调用时排在该调用之后，回传时不会成为该调用的签名；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
 
 ### Gemini GenerateContent
 

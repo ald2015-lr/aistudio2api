@@ -235,3 +235,51 @@ func TestGeminiStreamFormats(t *testing.T) {
 		}
 	}
 }
+
+// TestAnthropicDeferredSignatureSkipsUnsignedCall 正文中途暂存的签名排在不带签名的工具调用之后（流式与非流式），
+// 回传时不会变成该调用的签名
+func TestAnthropicDeferredSignatureSkipsUnsignedCall(t *testing.T) {
+	events := []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "Now"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "s2"},
+		{Kind: aistudio.EventText, Text: " checking"},
+		{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: "c2", Name: "lookup", Arguments: json.RawMessage(`{}`)}},
+	}
+	blocks := anthropicBlocks(generationResult{events: events})
+	var shape []string
+	for _, block := range blocks {
+		shape = append(shape, block.Type+":"+block.Text+block.Data+block.ID)
+	}
+	if want := []string{"text:Now checking", "tool_use:c2", "redacted_thinking:s2"}; !reflect.DeepEqual(shape, want) {
+		t.Fatalf("内容块 %q，期望 %q", shape, want)
+	}
+	raw, err := json.Marshal(blocks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts, err := anthropicParts(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range parts {
+		if part.FunctionCall != nil && part.FunctionCall.ThoughtSignature != "" {
+			t.Fatalf("回传后调用带上了正文的签名: %+v", parts)
+		}
+	}
+
+	recorder := httptest.NewRecorder()
+	writer := &anthropicStreamWriter{w: recorder, id: "msg_1", model: "m"}
+	for _, event := range events {
+		if err := writer.live(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.finish(generationResult{}); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	toolUse, signature := strings.Index(body, `"tool_use"`), strings.Index(body, "s2")
+	if toolUse < 0 || signature < toolUse || strings.Count(body, `"type":"text"}`) != 1 {
+		t.Fatalf("流式签名应在工具调用之后、正文保持一个块: %s", body)
+	}
+}

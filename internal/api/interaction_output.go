@@ -132,6 +132,15 @@ func signatureOnlyStep(step map[string]any) bool {
 	return signedThoughtStep(step) && !summary
 }
 
+// flushesSignatures 判断输出该步骤前是否要先输出暂存的签名：继续当前 model_output 时不输出；不带签名的函数调用也不输出，
+// 回传时紧挨在函数调用前的 thought 签名会成为该调用的签名，暂存的签名留到调用之后的下一步或输出结束时再输出
+func flushesSignatures(event aistudio.Event, step map[string]any, activeOutput bool) bool {
+	if step["type"] == "model_output" && activeOutput {
+		return false
+	}
+	return event.Kind != aistudio.EventToolCall || interactionCallSignature(event) != ""
+}
+
 // signatureStep 生成只带签名的 thought 步骤及其增量
 func signatureStep(signature string) (map[string]any, []map[string]any) {
 	return map[string]any{"type": "thought", "signature": signature},
@@ -202,11 +211,12 @@ func interactionSteps(result generationResult, audioFormat string, summaries boo
 			if step == nil {
 				continue
 			}
-			if signatureOnlyStep(step) && len(steps) > 0 && steps[len(steps)-1]["type"] == "model_output" {
+			activeOutput := len(steps) > 0 && steps[len(steps)-1]["type"] == "model_output"
+			if signatureOnlyStep(step) && activeOutput {
 				pending.add(step["signature"].(string))
 				continue
 			}
-			if step["type"] != "model_output" {
+			if flushesSignatures(event, step, activeOutput) {
 				flush()
 			}
 			appendStep(step)
@@ -296,7 +306,7 @@ func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, reque
 				pending.add(step["signature"].(string))
 				continue
 			}
-			if step["type"] != "model_output" {
+			if flushesSignatures(event, step, active == "model_output") {
 				if err := flush(); err != nil {
 					return err
 				}

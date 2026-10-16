@@ -569,3 +569,68 @@ func TestInteractionTrailingSignatureFlushed(t *testing.T) {
 		t.Fatalf("流式事件 %v", names)
 	}
 }
+
+// TestInteractionDeferredSignatureSkipsUnsignedCall 正文中途暂存的签名不紧挨在不带签名的函数调用前输出，
+// 回传时不会变成该调用的签名；之后带签名的调用仍拿到自己的签名
+func TestInteractionDeferredSignatureSkipsUnsignedCall(t *testing.T) {
+	events := []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "Now"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "s2"},
+		{Kind: aistudio.EventText, Text: " checking"},
+		{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: "c2", Name: "lookup", Arguments: json.RawMessage(`{}`)}},
+		{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: "c3", Name: "lookup", Arguments: json.RawMessage(`{}`), ThoughtSignature: "s3"}, ThoughtSignature: "s3"},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}
+	steps, err := interactionSteps(generationResult{events: events}, "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shape []string
+	for _, step := range steps {
+		switch step["type"] {
+		case "thought":
+			shape = append(shape, fmt.Sprintf("thought:%v", step["signature"]))
+		case "function_call":
+			shape = append(shape, fmt.Sprintf("function_call:%v", step["id"]))
+		default:
+			shape = append(shape, step["type"].(string))
+		}
+	}
+	if got := strings.Join(shape, ","); got != "model_output,function_call:c2,thought:s2,thought:s3,function_call:c3" {
+		t.Fatalf("步骤 %s", got)
+	}
+	raw, err := json.Marshal(steps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := interactionContents(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signatures := map[string]string{}
+	for _, content := range contents {
+		for _, part := range content.Parts {
+			if part.FunctionCall != nil {
+				signatures[part.FunctionCall.ID] = part.FunctionCall.ThoughtSignature
+			}
+		}
+	}
+	if signatures["c2"] != "" || signatures["c3"] != "s3" {
+		t.Fatalf("回传后的调用签名 %v", signatures)
+	}
+
+	stream := postJSON(t, NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"}), "/v1beta/interactions", `{"model":"test-model","input":"hi","stream":true,"store":false}`, nil)
+	names := interactionEventNames(interactionSSE(t, stream.Body.String()))
+	want := []string{
+		"interaction.created",
+		"step.start:model_output", "step.delta:text", "step.delta:text", "step.stop",
+		"step.start:function_call", "step.stop",
+		"step.start:thought", "step.delta:thought_signature", "step.stop",
+		"step.start:thought", "step.delta:thought_signature", "step.stop",
+		"step.start:function_call", "step.stop",
+		"interaction.completed",
+	}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("流式事件 %v，期望 %v", names, want)
+	}
+}

@@ -604,13 +604,18 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 		}
 	}
 	textOpen := func() bool { return len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" }
+	// openText 另起一个文本块，先输出暂存的签名
+	openText := func(text string) {
+		flush()
+		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
+	}
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
 			if textOpen() {
 				blocks[len(blocks)-1].Text += event.Text
 			} else {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: event.Text})
+				openText(event.Text)
 			}
 		case aistudio.EventReasoning:
 			flush()
@@ -631,10 +636,15 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 				pending.add(event.ThoughtSignature)
 				continue
 			}
+			flush()
 			blocks = append(blocks, anthropicContentBlock{Type: "redacted_thinking", Data: event.ThoughtSignature})
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
-				flush()
+				// 暂存的签名不能紧挨在不带签名的工具调用前面：回传时紧邻 tool_use 的 redacted_thinking 会成为该调用的签名。
+				// 带签名的调用先输出暂存的签名，再输出它自己的签名；不带签名的调用之后再输出
+				if event.ToolCall.ThoughtSignature != "" {
+					flush()
+				}
 				if event.ToolCall.ThoughtSignature != "" {
 					if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
 						blocks[len(blocks)-1].Signature = event.ToolCall.ThoughtSignature
@@ -650,8 +660,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
-				flush()
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: renderMediaMarkdown(*event.Media)})
+				openText(renderMediaMarkdown(*event.Media))
 			}
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
@@ -661,7 +670,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			if textOpen() {
 				blocks[len(blocks)-1].Text += "\n" + rendered + "\n"
 			} else {
-				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: rendered + "\n"})
+				openText(rendered + "\n")
 			}
 		}
 	}
@@ -669,7 +678,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 		if textOpen() {
 			blocks[len(blocks)-1].Text += "\n\n" + sources
 		} else {
-			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: sources})
+			openText(sources)
 		}
 	}
 	flush()
@@ -861,6 +870,9 @@ func (writer *anthropicStreamWriter) ensureBlock(blockType string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
+	if err := writer.flushSignatures(); err != nil {
+		return err
+	}
 	block := map[string]any{"type": blockType}
 	if blockType == "thinking" {
 		block["thinking"] = ""
@@ -880,7 +892,22 @@ func (writer *anthropicStreamWriter) redactedThinking(data string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
+	if err := writer.flushSignatures(); err != nil {
+		return err
+	}
 	return writer.redactedBlock(data)
+}
+
+// flushSignatures 输出正文中途暂存的签名，调用方保证当前没有打开的块。
+// 不在关闭正文块时立即输出：随后是不带签名的工具调用时，紧邻 tool_use 的 redacted_thinking 在回传时会成为该调用的签名，
+// 所以等到下一个块（正文、思考、redacted_thinking）开始前或输出结束时再输出
+func (writer *anthropicStreamWriter) flushSignatures() error {
+	for _, signature := range writer.pendingSignatures.take() {
+		if err := writer.redactedBlock(signature); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // redactedBlock 输出一个 redacted_thinking 块，调用方保证当前没有打开的块
@@ -920,11 +947,6 @@ func (writer *anthropicStreamWriter) closeBlock() error {
 	writer.blockIndex++
 	writer.currentBlock = ""
 	writer.thinkingSignature = ""
-	for _, signature := range writer.pendingSignatures.take() {
-		if err := writer.redactedBlock(signature); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -968,6 +990,9 @@ func (writer *anthropicStreamWriter) finish(result generationResult) error {
 		}
 	}
 	if err := writer.closeBlock(); err != nil {
+		return err
+	}
+	if err := writer.flushSignatures(); err != nil {
 		return err
 	}
 	for _, block := range searchBlocks {
