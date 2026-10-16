@@ -878,11 +878,13 @@ func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry m
 
 // buildModelEntry 返回 Build 请求使用的目录条目：Playground 目录模型复用官网默认值，Build 独有模型按 Build 目录推导
 func (c *Client) buildModelEntry(ctx context.Context, request GenerateRequest, lease *AccountLease) (modelEntry, error) {
-	// 账户的 Playground 目录已缓存但没有该模型（gemini-4-argon 等 Build 独有模型）时直接按 Build 目录推导：
-	// 原先每次 Build 请求都因目录里查不到而重新拉一次 ListModels，多一次往返，拉取失败还会让这次尝试失败。
-	// Playground 目录由账户发现定期刷新，模型之后出现在 Playground 时照常改用 Playground 目录的默认值
+	// Build 独有模型（gemini-4-argon 等）直接按 Build 目录推导：原先每次 Build 请求都因账户的 Playground 目录里查不到
+	// 而重新拉一次 ListModels，多一次往返，拉取失败还会让这次尝试失败。
+	// Playground 目录缓存只在启动、账户同步与这里查不到时重新拉取，不定期刷新，所以只有本账户缓存非空、且号池里
+	// 所有账户的 Playground 目录都没有该模型时才跳过拉取；缓存为空，或别的账户的 Playground 目录已列出该模型
+	// （本账户缓存可能过期）时照常拉取，用 Playground 目录的默认值与一次性返回判断
 	if c.cachedCatalogLacks(request.AccountID, request.Model) {
-		if model, ok := lease.buildModel(request.Model); ok {
+		if model, ok := lease.buildOnlyModel(request.Model); ok {
 			return modelEntry{model: model, defaults: buildModelDefaults(model)}, nil
 		}
 	}
@@ -897,13 +899,13 @@ func (c *Client) buildModelEntry(ctx context.Context, request GenerateRequest, l
 	return modelEntry{model: model, defaults: buildModelDefaults(model)}, nil
 }
 
-// cachedCatalogLacks 判断账户的 Playground 目录已经缓存且其中没有该模型；没有缓存时返回 false，由调用方照常拉取
+// cachedCatalogLacks 判断账户的 Playground 目录已经缓存、不为空且其中没有该模型；没有缓存或缓存为空时返回 false，由调用方照常拉取
 func (c *Client) cachedCatalogLacks(accountID string, modelID string) bool {
 	normalized := strings.TrimPrefix(modelID, "models/")
 	c.catalogMu.RLock()
 	defer c.catalogMu.RUnlock()
 	catalog, found := c.catalogs[accountID]
-	if !found {
+	if !found || len(catalog.models) == 0 {
 		return false
 	}
 	_, exists := catalog.lookup(normalized)
@@ -912,12 +914,26 @@ func (c *Client) cachedCatalogLacks(accountID string, modelID string) bool {
 
 // buildModel 返回租约账户 Build 目录中的模型
 func (l *AccountLease) buildModel(modelID string) (Model, bool) {
+	return l.findBuildModel(modelID, false)
+}
+
+// buildOnlyModel 返回租约账户 Build 目录中的模型，前提是号池里所有账户的 Playground 目录都没有它
+func (l *AccountLease) buildOnlyModel(modelID string) (Model, bool) {
+	return l.findBuildModel(modelID, true)
+}
+
+func (l *AccountLease) findBuildModel(modelID string, buildOnly bool) (Model, bool) {
 	if l == nil || l.pool == nil || l.account == nil {
 		return Model{}, false
 	}
 	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
 	l.pool.mu.Lock()
 	defer l.pool.mu.Unlock()
+	if buildOnly {
+		if _, listed := l.pool.playgroundModelLocked(modelID); listed {
+			return Model{}, false
+		}
+	}
 	for _, model := range l.account.buildModels {
 		if model.ID == modelID {
 			return cloneAccountModels([]Model{model})[0], true

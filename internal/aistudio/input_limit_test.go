@@ -156,4 +156,22 @@ func TestBuildOnlyModelEntrySkipsCatalogReload(t *testing.T) {
 	if err != nil || entry.model.ID != "pg-model" || transport.calls != 0 {
 		t.Fatalf("Playground 模型 entry=%+v err=%v ListModels 调用 %d 次", entry.model, err, transport.calls)
 	}
+
+	// 号池里有账户的 Playground 目录列出该模型时，本账户的缓存可能过期，照常重新拉取
+	if err := pool.SetCatalog(accountID, BenefitTierFree, []Model{playground, buildOnly}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = client.buildModelEntry(context.Background(), GenerateRequest{Model: "build-only", AccountID: accountID}, lease)
+	if transport.calls != 1 {
+		t.Fatalf("Playground 已列出该模型时应重新拉取目录，ListModels 调用 %d 次", transport.calls)
+	}
+	// 本账户缓存为空（上次拉取得到空目录）时同样重新拉取
+	if err := pool.SetCatalog(accountID, BenefitTierFree, []Model{playground}); err != nil {
+		t.Fatal(err)
+	}
+	client.catalogs[accountID] = modelCatalog{}
+	_, _ = client.buildModelEntry(context.Background(), GenerateRequest{Model: "build-only", AccountID: accountID}, lease)
+	if transport.calls != 2 {
+		t.Fatalf("缓存为空时应重新拉取目录，ListModels 调用 %d 次", transport.calls)
+	}
 }
