@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -124,5 +125,35 @@ func TestBuildOnlyModelThinkingLevel(t *testing.T) {
 		if got != want {
 			t.Fatalf("reasoning_effort=%q 发出的 thinkingLevel = %q，期望 %q（请求体 %s）", effort, got, want, body)
 		}
+	}
+}
+
+// TestBuildOnlyModelEntrySkipsCatalogReload Playground 目录已缓存但没有该模型时，Build 请求直接按 Build 目录推导，
+// 不再每次都重新拉取 Playground 目录；目录里有的模型照常用 Playground 目录的条目
+func TestBuildOnlyModelEntrySkipsCatalogReload(t *testing.T) {
+	const accountID = "alice@example.com"
+	playground := Model{ID: "pg-model", Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}}
+	buildOnly := Model{ID: "build-only", Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true, "thinking": true}}
+	pool := testPoolWithAccount(t, accountID)
+	if err := pool.SetCatalog(accountID, BenefitTierFree, []Model{playground}); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.SetBuildCatalog(accountID, []Model{buildOnly}); err != nil {
+		t.Fatal(err)
+	}
+	client, transport := truncateClient(t, 0)
+	client.catalogs[accountID] = modelCatalog{models: []Model{playground}, entries: map[string]modelEntry{"pg-model": {model: playground}}}
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: accountID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	entry, err := client.buildModelEntry(context.Background(), GenerateRequest{Model: "models/build-only", AccountID: accountID}, lease)
+	if err != nil || entry.model.ID != "build-only" || transport.calls != 0 {
+		t.Fatalf("Build 独有模型 entry=%+v err=%v ListModels 调用 %d 次", entry.model, err, transport.calls)
+	}
+	entry, err = client.buildModelEntry(context.Background(), GenerateRequest{Model: "pg-model", AccountID: accountID}, lease)
+	if err != nil || entry.model.ID != "pg-model" || transport.calls != 0 {
+		t.Fatalf("Playground 模型 entry=%+v err=%v ListModels 调用 %d 次", entry.model, err, transport.calls)
 	}
 }

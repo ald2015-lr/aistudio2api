@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,7 +114,7 @@ func serve(handler http.Handler, request *http.Request) *httptest.ResponseRecord
 }
 
 // TestUltraRouting /ultra/v1 与 /ultra/v1beta 走与主路由相同的处理链并标记 Ultra 号池；普通路径按 ULTRA_EXCLUSIVE 标记
-// 普通号池或不限号池；其余 /ultra/* 路径（含 /ultra/trace 与 /trace/ultra）返回 404
+// 普通号池或不限号池；/trace/ultra/v1 为 Ultra 号池的排查路由；其余 /ultra/* 路径（含 /ultra/trace）返回 404
 func TestUltraRouting(t *testing.T) {
 	service := &poolRecordingService{}
 	exclusive := &atomic.Bool{}
@@ -130,6 +132,8 @@ func TestUltraRouting(t *testing.T) {
 		{path: "/v1beta/models", exclusive: true, want: aistudio.PoolScopeNormal},
 		{path: "/v1/models", exclusive: false, want: aistudio.PoolScopeAll},
 		{path: "/trace/v1/models", exclusive: true, want: aistudio.PoolScopeNormal},
+		{path: "/trace/ultra/v1/models", exclusive: true, want: aistudio.PoolScopeUltra},
+		{path: "/trace/ultra/v1beta/models", exclusive: false, want: aistudio.PoolScopeUltra},
 	} {
 		exclusive.Store(test.exclusive)
 		recorder := serve(handler, authorizedRequest(http.MethodGet, test.path, ""))
@@ -140,7 +144,7 @@ func TestUltraRouting(t *testing.T) {
 			t.Fatalf("%s（独占=%t）的号池 = %q，期望 %q", test.path, test.exclusive, got.String(), test.want.String())
 		}
 	}
-	for _, path := range []string{"/ultra/", "/ultra/api/status", "/ultra/trace/v1/models", "/trace/ultra/v1/models", "/ultra/health", "/ultra/v2/models"} {
+	for _, path := range []string{"/ultra/", "/ultra/api/status", "/ultra/trace/v1/models", "/trace/ultra/", "/trace/ultra/api/status", "/ultra/health", "/ultra/v2/models"} {
 		if recorder := serve(handler, authorizedRequest(http.MethodGet, path, "")); recorder.Code != http.StatusNotFound {
 			t.Fatalf("%s 状态码 = %d，期望 404", path, recorder.Code)
 		}
@@ -420,5 +424,34 @@ func TestPrefixRoutesKeepEscapedPath(t *testing.T) {
 	}
 	if got := service.lastScope(t); got != aistudio.PoolScopeUltra {
 		t.Fatalf("/ultra/v1/files/a%%2Fb 的号池 = %q，期望 Ultra", got.String())
+	}
+}
+
+// TestTraceUltraRoute /trace/ultra 的 POST 请求走 Ultra 号池并写排查记录，管理日志路径为 /trace/ultra/...、号池为 ultra
+func TestTraceUltraRoute(t *testing.T) {
+	admin := &capturingAdmin{}
+	service := &poolRecordingService{}
+	exclusive := &atomic.Bool{}
+	exclusive.Store(true)
+	dir := t.TempDir()
+	handler := NewHandler(service, Config{APIKey: "sk-test", Admin: admin, UltraExclusive: exclusive.Load, TraceDir: dir})
+	recorder := serve(handler, authorizedRequest(http.MethodPost, "/trace/ultra/v1/chat/completions", `{"model":"ultra-model","messages":[{"role":"user","content":"hi"}]}`))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if got := service.lastScope(t); got != aistudio.PoolScopeUltra {
+		t.Fatalf("号池 = %q，期望 Ultra", got.String())
+	}
+	entries := admin.finished()
+	if len(entries) != 1 || entries[0].Path != "/trace/ultra/v1/chat/completions" || entries[0].Pool != "ultra" {
+		t.Fatalf("请求日志 %+v", entries)
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 1 {
+		t.Fatalf("排查记录 %v err=%v", files, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, files[0].Name()))
+	if err != nil || !strings.Contains(string(raw), `"/trace/ultra/v1/chat/completions"`) {
+		t.Fatalf("排查记录没有带 /trace/ultra 的路径: %s err=%v", raw, err)
 	}
 }

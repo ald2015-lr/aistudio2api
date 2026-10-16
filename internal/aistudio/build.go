@@ -878,6 +878,14 @@ func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry m
 
 // buildModelEntry 返回 Build 请求使用的目录条目：Playground 目录模型复用官网默认值，Build 独有模型按 Build 目录推导
 func (c *Client) buildModelEntry(ctx context.Context, request GenerateRequest, lease *AccountLease) (modelEntry, error) {
+	// 账户的 Playground 目录已缓存但没有该模型（gemini-4-argon 等 Build 独有模型）时直接按 Build 目录推导：
+	// 原先每次 Build 请求都因目录里查不到而重新拉一次 ListModels，多一次往返，拉取失败还会让这次尝试失败。
+	// Playground 目录由账户发现定期刷新，模型之后出现在 Playground 时照常改用 Playground 目录的默认值
+	if c.cachedCatalogLacks(request.AccountID, request.Model) {
+		if model, ok := lease.buildModel(request.Model); ok {
+			return modelEntry{model: model, defaults: buildModelDefaults(model)}, nil
+		}
+	}
 	entry, err := c.modelEntry(ctx, request.AccountID, request.Model)
 	if err == nil || !errors.Is(err, ErrModelNotFound) {
 		return entry, err
@@ -887,6 +895,19 @@ func (c *Client) buildModelEntry(ctx context.Context, request GenerateRequest, l
 		return modelEntry{}, err
 	}
 	return modelEntry{model: model, defaults: buildModelDefaults(model)}, nil
+}
+
+// cachedCatalogLacks 判断账户的 Playground 目录已经缓存且其中没有该模型；没有缓存时返回 false，由调用方照常拉取
+func (c *Client) cachedCatalogLacks(accountID string, modelID string) bool {
+	normalized := strings.TrimPrefix(modelID, "models/")
+	c.catalogMu.RLock()
+	defer c.catalogMu.RUnlock()
+	catalog, found := c.catalogs[accountID]
+	if !found {
+		return false
+	}
+	_, exists := catalog.lookup(normalized)
+	return !exists
 }
 
 // buildModel 返回租约账户 Build 目录中的模型

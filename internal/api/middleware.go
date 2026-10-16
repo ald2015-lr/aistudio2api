@@ -539,14 +539,14 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		started := time.Now()
 		path := r.URL.Path
 		pool := ""
-		if aistudio.TraceFromContext(r.Context()) != nil {
-			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径
-			path = tracePrefix + path
-		}
 		if ultraRequest(r) {
 			// Ultra 路由的请求在管理日志里显示带 /ultra 前缀的路径，并标记号池
 			path = ultraPrefix + path
 			pool = aistudio.PoolScopeUltra.String()
+		}
+		if aistudio.TraceFromContext(r.Context()) != nil {
+			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径（/trace/ultra/... 保持原顺序）
+			path = tracePrefix + path
 		}
 		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, pool: pool, requestID: newID("req"), startedAt: started}
 		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}

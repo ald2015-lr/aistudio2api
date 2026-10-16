@@ -72,3 +72,11 @@ func (config Config) ultraExclusive() bool {
 func ultraRequest(r *http.Request) bool {
 	return aistudio.PoolScopeFromContext(r.Context()) == aistudio.PoolScopeUltra
 }
+
+// routePoolPrefix 返回请求原路径中号池前缀：Ultra 号池的请求为 /ultra，其余为空
+func routePoolPrefix(r *http.Request) string {
+	if ultraRequest(r) {
+		return ultraPrefix
+	}
+	return ""
+}

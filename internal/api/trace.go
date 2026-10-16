@@ -137,15 +137,22 @@ func (store *traceStore) list() ([]traceFile, error) {
 	return files, nil
 }
 
-// traceEntry 处理 /trace/ 前缀：去掉前缀后交给与主路由相同的处理链，POST 请求结束后写出排查记录
+// traceEntry 处理 /trace/ 前缀：去掉前缀后交给与主路由相同的处理链，POST 请求结束后写出排查记录。
+// /trace/ultra/v1/... 同时去掉 /ultra 并标记为 Ultra 号池，Ultra 号池的请求也能写排查记录
 func (s *server) traceEntry(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		path, rawPath, ok := stripRoutePrefix(r.URL, tracePrefix)
+		if !ok {
+			if path, rawPath, ok = stripRoutePrefix(r.URL, tracePrefix+ultraPrefix); ok {
+				ctx = aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra)
+			}
+		}
 		if !ok {
 			http.NotFound(w, r)
 			return
 		}
-		inner := r.Clone(r.Context())
+		inner := r.Clone(ctx)
 		inner.URL.Path = path
 		inner.URL.RawPath = rawPath
 		if r.Method != http.MethodPost {
@@ -181,7 +188,7 @@ func traceCaptureMiddleware(next http.Handler) http.Handler {
 		}
 		trace.Activate()
 		trace.SetClient(aistudio.TraceClient{
-			Method: r.Method, Path: tracePrefix + r.URL.Path, Query: traceQuery(r),
+			Method: r.Method, Path: tracePrefix + routePoolPrefix(r) + r.URL.Path, Query: traceQuery(r),
 			RemoteAddr: r.RemoteAddr, Headers: traceHeaders(r.Header), Body: aistudio.NewTracePayload(body),
 		})
 		capture := &traceResponseWriter{ResponseWriter: w}
