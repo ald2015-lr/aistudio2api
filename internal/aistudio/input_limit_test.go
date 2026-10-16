@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -95,5 +96,33 @@ func TestEnabledAccountsAboveTierOf(t *testing.T) {
 	}
 	if got := pool.EnabledAccountsAboveTierOf(PoolScopeAll, "missing@example.com"); got != nil {
 		t.Fatalf("不存在的账号 = %v，期望 nil", got)
+	}
+}
+
+// TestBuildOnlyModelThinkingLevel 只在 Build 可用的思考模型（默认值按 buildModelDefaults）按请求的思考等级发送 thinkingConfig.thinkingLevel：
+// gemini-4-argon-low、-medium 的后缀在 API 层换成 reasoning_effort 后，发给上游的是 LOW、MEDIUM；没有指定时不发等级（由上游默认）
+func TestBuildOnlyModelThinkingLevel(t *testing.T) {
+	model := Model{ID: "gemini-4-argon", OutputTokenLimit: 65536, Capabilities: map[string]bool{"chat_model": true, "thinking": true}}
+	defaults := buildModelDefaults(model)
+	for effort, want := range map[string]string{"low": "LOW", "medium": "MEDIUM", "high": "HIGH", "": ""} {
+		request := GenerateRequest{
+			Model:    "gemini-4-argon",
+			Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "hi"}}}},
+			Config:   GenerationConfig{ReasoningEffort: effort},
+		}
+		_, body, err := EncodeBuildGenerateRequest(request, defaults, false, false)
+		if err != nil {
+			t.Fatalf("%q: %v", effort, err)
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		config, _ := decoded["generationConfig"].(map[string]any)
+		thinking, _ := config["thinkingConfig"].(map[string]any)
+		got, _ := thinking["thinkingLevel"].(string)
+		if got != want {
+			t.Fatalf("reasoning_effort=%q 发出的 thinkingLevel = %q，期望 %q（请求体 %s）", effort, got, want, body)
+		}
 	}
 }

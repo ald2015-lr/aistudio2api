@@ -1750,7 +1750,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 | 字段 | 映射 |
 | --- | --- |
-| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-128`、`-nothinking`、`-online` 后缀与其他入口一样解析，交互资源的 `model` 报告请求的原名 |
+| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-low`、`-medium`、`-high`、`-minimal`、`-128`、`-nothinking`、`-online` 后缀与其他入口一样解析，交互资源的 `model` 报告请求的原名 |
 | `input` | 字符串、单个内容块、内容块数组或步骤数组；内容类型为 `text`、`image`、`audio`、`video`、`document`。没有输入、续接历史和系统指令时选号前返回 400，只有系统指令时按用户消息生成 |
 | 媒体内容 | `mime_type` 与 `data`（Base64）或 `uri` 二选一，复用 Gemini 文件与内联媒体解析 |
 | 输入步骤 | `user_input`、`model_output`、`thought`、`function_call`、`function_result`；`function_call` 必须带 `id`，函数结果通过 `call_id` 匹配历史调用并补齐名称，对不上任何调用时返回 400；`thought.signature` 挂到随后的模型内容或函数调用上，连续多个签名各自保留 |

@@ -268,14 +268,19 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 
 模型名称从 `GET /v1/models` 或 `GET /v1beta/models` 读取。
 
-文本对话模型支持在模型名后加后缀，可组合、顺序不限（例如 `gemini-3.1-pro-preview-128-nothinking-online`），`/v1/models` 与 `/v1beta/models` 会同时列出这些别名：
+文本对话模型支持在模型名后加后缀，可组合、顺序不限（例如 `gemini-3.1-pro-preview-128-nothinking-online`、`gemini-4-argon-low-nothinking`），`/v1/models` 与 `/v1beta/models` 会同时列出这些别名：
 
 | 写法 | 效果 |
 | --- | --- |
 | 不带后缀 | 思考强度设为最高；客户端显式传了 `reasoning_effort`、`thinking` 等思考参数时以客户端为准 |
-| `-128` | 最低思考：支持思考等级的模型用最低等级，只支持思考预算的模型用 128 token |
+| `-low`、`-medium`、`-high`、`-minimal` | 按名称指定思考等级，优先于客户端传入的思考参数，例如 `gemini-4-argon-low`、`gemini-4-argon-medium`；模型不支持该等级时取最接近的等级，只支持思考预算的模型换算为 1024、8192 token、最大预算与 128 token |
+| `-128` | 最低思考，与 `-minimal` 相同：支持思考等级的模型用最低等级，只支持思考预算的模型用 128 token |
 | `-nothinking` | 模型照常思考，但不返回思维链（保留多轮工具调用需要的思考签名） |
-| `-online` | 开启 Google 搜索（模型支持时） |调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。
+| `-online` | 开启 Google 搜索（模型支持时） |
+
+模型列表为每个可调节思考的文本模型列出 `-low`、`-medium`、`-128` 等别名；目录里的模型 ID 本身以等级结尾时（例如 `xxx-low`）按 ID 里的等级设置，不再强制最高思考。
+
+调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。
 
 以 Cherry Studio 为例：
 

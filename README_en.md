@@ -204,7 +204,21 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | Anthropic Messages | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 | Gemini | `http://127.0.0.1:2048` | `PROXY_API_KEY` from `.env` |
 
-Read model names from `GET /v1/models` or `GET /v1beta/models`. Every API call must send `PROXY_API_KEY` (default `sk-onechat-fun-fun`, editable in the Settings page). With the default key, only pages on this machine can call the API from a browser; web clients need a custom key.
+Read model names from `GET /v1/models` or `GET /v1beta/models`.
+
+Text chat models accept name suffixes, combinable in any order (for example `gemini-3.1-pro-preview-128-nothinking-online` or `gemini-4-argon-low-nothinking`); the model lists include these aliases:
+
+| Suffix | Effect |
+| --- | --- |
+| none | Highest thinking level; an explicit `reasoning_effort`, `thinking` or similar client setting wins |
+| `-low`, `-medium`, `-high`, `-minimal` | Thinking level chosen by name, overriding client thinking settings, e.g. `gemini-4-argon-low`, `gemini-4-argon-medium`; an unsupported level falls back to the closest supported one, and budget-only models use 1024, 8192, the maximum or 128 tokens |
+| `-128` | Lowest thinking, same as `-minimal` |
+| `-nothinking` | The model still thinks but the thought text is not returned (thought signatures are kept) |
+| `-online` | Enables Google Search when the model supports it |
+
+A catalog model ID that already ends in a level (for example `xxx-low`) uses that level instead of being forced to the highest.
+
+Every API call must send `PROXY_API_KEY` (default `sk-onechat-fun-fun`, editable in the Settings page). With the default key, only pages on this machine can call the API from a browser; web clients need a custom key.
 
 For Cherry Studio:
 
