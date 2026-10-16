@@ -597,7 +597,7 @@ Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于�
 
 OpenAI Chat 的 assistant tool call 未带 `extra_content` 时，服务按调用 ID、函数名和参数补回本进程最近签发的签名；查不到时写入 `skip_thought_signature_validator`。
 
-Anthropic redacted thinking block 以 `data` 承载同一份不透明状态；适配器在输入与输出两侧保留该值。流式响应不输出文本之后到达的签名。
+Anthropic redacted thinking block 以 `data` 承载同一份不透明状态；适配器在输入与输出两侧保留该值。正文块打开时单独到达的签名（流式与非流式）先暂存，正文块结束后按到达顺序输出为 `redacted_thinking`，与上一个相同的签名只输出一次，正文不会被切成多个文本块；正文分片自带的签名不输出。
 
 reasoning summary 是服务端返回的摘要文本。thought signature 作为下一轮请求的协议状态字段原样回传。
 
@@ -1767,7 +1767,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps` 与 `usage`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
 
-SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
+SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
 
 ### Gemini GenerateContent
 
@@ -1896,7 +1896,7 @@ tool group 字段：
 
 `groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`retrievedContext:{uri,title,text}` 或 `maps:{uri,title,text,placeId}`；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
 
-非流式响应把相邻的同类正文或思考片段合并为一个 Part，已带签名的 Part 不再并入带签名的片段；工具调用、媒体与带转录元数据的 Part 保持独立。单独到达的签名挂到前一个未签名的文本 Part 上；输出开头的单个签名在合并完成后挂到随后的第一个 Part 上，该 Part 合并后已带签名时前置签名单独成 Part，不因前置签名拆开连续正文。签名不覆盖、不挪位，其余独立签名（含流式响应中的独立签名）以 `{"text":"","thought":true,"thoughtSignature":"..."}` 承载，作为输入回传时还原为纯签名 Part。
+非流式响应把相邻的同类正文或思考片段合并为一个 Part，不论片段是否带签名；同一段里出现多个签名时保留最后一个（gemini-4 等模型给许多正文分片都带签名，按签名拆开时 new-api、SillyTavern 拼接多个 Part 会在句子中间断行）。工具调用、媒体与带转录元数据的 Part 保持独立；引用、搜索来源与用量不产生 Part，也不打断合并。正文或思考中途单独到达的签名挂到正在合并的 Part 上；输出开头的单个签名在合并完成后挂到随后的第一个 Part 上，该 Part 合并后已带签名时前置签名单独成 Part，不因前置签名拆开连续正文。其余无处可挂的独立签名（工具调用、媒体之后，以及流式响应中的独立签名）以 `{"text":"","thought":true,"thoughtSignature":"..."}` 承载，作为输入回传时还原为纯签名 Part。
 
 `:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`，元素之间的空行用作心跳）。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 

@@ -905,8 +905,11 @@ func buildGeminiResponse(request aistudio.GenerateRequest, result generationResu
 
 // geminiOutputParts 生成非流式响应的 parts。
 // 上游按流式返回，正文是许多小段增量；这里把连续的正文（以及连续的思考）合并为一个 part，
-// 与 Gemini API 非流式响应一致。逐段各成一个 part 时，SillyTavern 等客户端会用换行或空行拼接多个 part，
-// 导致句子中间断行、数字被拆开、出现多余空行
+// 与 Gemini API 非流式响应一致。逐段各成一个 part 时，new-api、SillyTavern 等客户端会用换行或空行拼接多个 part，
+// 导致句子中间断行、数字被拆开、出现多余空行。
+// 合并不看签名：gemini-4 等模型给许多正文分片都带签名（可能每片不同，也可能重复同一个），按签名拆开时
+// 一段连续正文会变成几十个 part。同一段里的多个签名只保留最后一个，不再拆段，
+// 也不把多余签名另放成空思考 part：每片一个签名时会多出几十个空思考 part，客户端的思考内容会多出空行或被清空
 func geminiOutputParts(result generationResult) []map[string]any {
 	parts := make([]map[string]any, 0)
 	// merging 记录最后一个 part 可以继续追加的文本类型："text"、"thought" 或空（不可追加）
@@ -914,12 +917,15 @@ func geminiOutputParts(result generationResult) []map[string]any {
 	// leading 记录第一个 part 是否为输出开头单独到达的签名（如不返回正文的思考留下的签名），它属于随后的内容，
 	// 全部合并完后再决定挂到哪里，见函数末尾
 	leading := false
+	// appendPart 追加不能续写的 part（工具调用、代码、媒体、转写文本），随后的文本另起一个 part
+	appendPart := func(part map[string]any, signature string) {
+		parts = append(parts, geminiSignedPart(part, signature))
+		merging = ""
+	}
 	appendText := func(kind string, event aistudio.Event, build func() map[string]any) {
 		if merging == kind && len(parts) > 0 {
 			last := parts[len(parts)-1]
-			_, signed := last["thoughtSignature"]
-			// 已带签名的 part 再遇到新签名时另起一个，避免覆盖签名
-			if text, ok := last["text"].(string); ok && !(signed && event.ThoughtSignature != "") {
+			if text, ok := last["text"].(string); ok {
 				last["text"] = text + event.Text
 				if event.ThoughtSignature != "" {
 					last["thoughtSignature"] = event.ThoughtSignature
@@ -935,68 +941,60 @@ func geminiOutputParts(result generationResult) []map[string]any {
 		case aistudio.EventText:
 			if event.Transcript != nil {
 				// 带说话人元数据的转写文本保持独立
-				parts = append(parts, geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))
-				merging = ""
+				appendPart(geminiTextPart(event), event.ThoughtSignature)
 				continue
 			}
 			appendText("text", event, func() map[string]any { return geminiTextPart(event) })
-			continue
 		case aistudio.EventReasoning:
 			appendText("thought", event, func() map[string]any { return map[string]any{"text": event.Text, "thought": true} })
-			continue
 		case aistudio.EventThoughtSignature:
 			if event.ThoughtSignature == "" {
 				continue
 			}
-			// 单独到达的签名挂到前一个未签名的文本 part 上：单独成 part 时客户端拼接会多出一处空行
+			// 正文或思考中途单独到达的签名挂到正在合并的文本 part 上，随后的增量继续并入，不另起 part：
+			// 单独成 part 时随后的正文也会另起一个 part，客户端拼接时句子中间断行
 			if merging != "" && len(parts) > 0 {
-				if _, signed := parts[len(parts)-1]["thoughtSignature"]; !signed {
-					parts[len(parts)-1]["thoughtSignature"] = event.ThoughtSignature
-					continue
-				}
+				parts[len(parts)-1]["thoughtSignature"] = event.ThoughtSignature
+				continue
 			}
-			// 前一个 part 已带签名或不是文本时单独成 part，不覆盖已有签名，也不挪到别的 part 上
+			// 前面没有可续写的文本 part（输出开头、工具调用或媒体之后）时单独成 part，不挪到别的 part 上
 			if len(parts) == 0 {
 				leading = true
 			}
-			parts = append(parts, geminiSignaturePart(event.ThoughtSignature))
-			merging = ""
-			continue
-		}
-		merging = ""
-		switch event.Kind {
+			appendPart(geminiSignaturePart(event.ThoughtSignature), "")
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
-				parts = append(parts, geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))
+				appendPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature)
 			}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{"executableCode": map[string]any{
+				appendPart(map[string]any{"executableCode": map[string]any{
 					"language": event.ExecutableCode.Language, "code": event.ExecutableCode.Code,
-				}}, event.ThoughtSignature))
+				}}, event.ThoughtSignature)
 			}
 		case aistudio.EventCodeExecutionResult:
 			if event.CodeExecutionResult != nil {
-				parts = append(parts, geminiSignedPart(map[string]any{
+				appendPart(map[string]any{
 					"codeExecutionResult": geminiCodeExecutionResult(*event.CodeExecutionResult),
-				}, event.ThoughtSignature))
+				}, event.ThoughtSignature)
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
 				if len(event.Media.Data) > 0 {
-					parts = append(parts, geminiSignedPart(map[string]any{"inlineData": map[string]any{
+					appendPart(map[string]any{"inlineData": map[string]any{
 						"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
-					}}, event.ThoughtSignature))
+					}}, event.ThoughtSignature)
 				} else if event.Media.URL != "" {
-					parts = append(parts, geminiSignedPart(map[string]any{"fileData": map[string]any{
+					appendPart(map[string]any{"fileData": map[string]any{
 						"mimeType": event.Media.MIME, "fileUri": event.Media.URL, "displayName": event.Media.Name,
-					}}, event.ThoughtSignature))
+					}}, event.ThoughtSignature)
 				}
 			}
 		}
+		// 引用、搜索来源、用量、结束等事件不产生 part，也不打断正文合并：正文中途到达的引用原先会让随后的正文另起一个 part
 	}
 	// 前置签名挂到随后的第一个 part 上，前提是该 part 合并完仍没有签名。合并完再决定：新建 part 时就挂上的话，
-	// 随后带签名的增量或单独到达的签名不能再并入，连续的正文会被拆成几段。
+	// 随后带签名的增量或单独到达的签名会覆盖它。
 	// 该 part 已带签名时前置签名仍单独成 part，不覆盖已有签名；连续多个前置签名时随后的是签名 part，
 	// 无法判断哪一个属于随后的内容，按原顺序各自单独成 part
 	if leading && len(parts) > 1 {

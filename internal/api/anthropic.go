@@ -596,15 +596,24 @@ func buildAnthropicResponse(id string, model string, result generationResult, se
 
 func anthropicBlocks(result generationResult) []anthropicContentBlock {
 	blocks := make([]anthropicContentBlock, 0)
+	// pending 暂存正文块打开时单独到达的签名，正文块结束后再作为 redacted_thinking 输出，见 deferredSignatures
+	var pending deferredSignatures
+	flush := func() {
+		for _, signature := range pending.take() {
+			blocks = append(blocks, anthropicContentBlock{Type: "redacted_thinking", Data: signature})
+		}
+	}
+	textOpen := func() bool { return len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" }
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
-			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
+			if textOpen() {
 				blocks[len(blocks)-1].Text += event.Text
 			} else {
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: event.Text})
 			}
 		case aistudio.EventReasoning:
+			flush()
 			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
 				*blocks[len(blocks)-1].Thinking += event.Text
 				if event.ThoughtSignature != "" {
@@ -618,9 +627,14 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			if event.ThoughtSignature == "" {
 				continue
 			}
+			if textOpen() {
+				pending.add(event.ThoughtSignature)
+				continue
+			}
 			blocks = append(blocks, anthropicContentBlock{Type: "redacted_thinking", Data: event.ThoughtSignature})
 		case aistudio.EventToolCall:
 			if event.ToolCall != nil {
+				flush()
 				if event.ToolCall.ThoughtSignature != "" {
 					if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
 						blocks[len(blocks)-1].Signature = event.ToolCall.ThoughtSignature
@@ -636,6 +650,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
+				flush()
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: renderMediaMarkdown(*event.Media)})
 			}
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
@@ -643,7 +658,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			if rendered == "" {
 				continue
 			}
-			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
+			if textOpen() {
 				blocks[len(blocks)-1].Text += "\n" + rendered + "\n"
 			} else {
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: rendered + "\n"})
@@ -651,12 +666,13 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 		}
 	}
 	if sources := renderCitationsMarkdown(result.citations); sources != "" {
-		if len(blocks) > 0 && blocks[len(blocks)-1].Type == "text" {
+		if textOpen() {
 			blocks[len(blocks)-1].Text += "\n\n" + sources
 		} else {
 			blocks = append(blocks, anthropicContentBlock{Type: "text", Text: sources})
 		}
 	}
+	flush()
 	return blocks
 }
 
@@ -716,6 +732,8 @@ type anthropicStreamWriter struct {
 	currentBlock      string
 	thinkingSignature string
 	searchKey         string
+	// pendingSignatures 暂存正文块打开时单独到达的签名，正文块关闭后再输出 redacted_thinking
+	pendingSignatures deferredSignatures
 }
 
 func (s *server) streamAnthropic(r *http.Request, writer *anthropicStreamWriter, events <-chan aistudio.Event) {
@@ -769,8 +787,13 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		if event.ThoughtSignature == "" {
 			return nil
 		}
-		// 与非流式一致：正文块打开时也关闭它并输出 redacted_thinking，签名随下一轮带回上游。
-		// 原先流式在正文块打开时直接丢弃独立签名，非流式却保留
+		// 与非流式一致：签名以 redacted_thinking 输出，随下一轮带回上游。正文块打开时先暂存，正文块关闭后再输出：
+		// gemini-4 等模型在正文分片之间夹带只有签名的分片，立即输出会把一段正文切成许多个文本块，
+		// 按块分段显示的客户端会在句子中间断行
+		if writer.currentBlock == "text" {
+			writer.pendingSignatures.add(event.ThoughtSignature)
+			return nil
+		}
 		return writer.redactedThinking(event.ThoughtSignature)
 	case aistudio.EventToolCall:
 		if event.ToolCall == nil {
@@ -857,6 +880,11 @@ func (writer *anthropicStreamWriter) redactedThinking(data string) error {
 	if err := writer.closeBlock(); err != nil {
 		return err
 	}
+	return writer.redactedBlock(data)
+}
+
+// redactedBlock 输出一个 redacted_thinking 块，调用方保证当前没有打开的块
+func (writer *anthropicStreamWriter) redactedBlock(data string) error {
 	if err := writer.emit("content_block_start", map[string]any{
 		"type": "content_block_start", "index": writer.blockIndex,
 		"content_block": map[string]any{"type": "redacted_thinking", "data": data},
@@ -892,7 +920,31 @@ func (writer *anthropicStreamWriter) closeBlock() error {
 	writer.blockIndex++
 	writer.currentBlock = ""
 	writer.thinkingSignature = ""
+	for _, signature := range writer.pendingSignatures.take() {
+		if err := writer.redactedBlock(signature); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// deferredSignatures 暂存一段正文中途单独到达的思考签名，正文结束后按到达顺序输出；与上一个相同的签名不重复保存
+type deferredSignatures struct {
+	values []string
+}
+
+func (pending *deferredSignatures) add(signature string) {
+	if count := len(pending.values); count > 0 && pending.values[count-1] == signature {
+		return
+	}
+	pending.values = append(pending.values, signature)
+}
+
+// take 返回暂存的签名并清空
+func (pending *deferredSignatures) take() []string {
+	values := pending.values
+	pending.values = nil
+	return values
 }
 
 func (writer *anthropicStreamWriter) finish(result generationResult) error {

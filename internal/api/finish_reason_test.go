@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -142,18 +143,59 @@ func TestToolResultDocumentsBecomeAttachments(t *testing.T) {
 	}
 }
 
-// TestAnthropicStreamKeepsSignatureAfterText 流式在正文块打开时收到独立签名也输出 redacted_thinking
+// TestAnthropicStreamKeepsSignatureAfterText 流式在正文块打开时收到独立签名也输出 redacted_thinking：
+// 先暂存，正文块关闭后再输出，正文不被切成多个文本块；与上一个相同的签名只输出一次
 func TestAnthropicStreamKeepsSignatureAfterText(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	writer := &anthropicStreamWriter{w: recorder, id: "msg_1", model: "m"}
-	if err := writer.live(aistudio.Event{Kind: aistudio.EventText, Text: "hello"}); err != nil {
+	for _, event := range []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "六"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventText, Text: "月的"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventText, Text: "云海市"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-2"},
+	} {
+		if err := writer.live(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.finish(generationResult{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.live(aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"}); err != nil {
-		t.Fatal(err)
+	body := recorder.Body.String()
+	if count := strings.Count(body, `"content_block":{"text":"","type":"text"}`); count != 1 {
+		t.Fatalf("正文被切成 %d 个文本块: %s", count, body)
 	}
-	if !strings.Contains(recorder.Body.String(), `"redacted_thinking"`) || !strings.Contains(recorder.Body.String(), "sig-1") {
-		t.Fatalf("签名被丢弃: %s", recorder.Body.String())
+	if strings.Count(body, "sig-1") != 1 || strings.Count(body, "sig-2") != 1 {
+		t.Fatalf("签名输出次数不对: %s", body)
+	}
+	textStop := strings.Index(body, `"content_block_stop"`)
+	if textStop < 0 || strings.Index(body, "sig-1") < textStop || strings.Index(body, "sig-2") < strings.Index(body, "sig-1") {
+		t.Fatalf("签名应在正文块关闭后按顺序输出: %s", body)
+	}
+}
+
+// TestAnthropicBlocksDeferSignaturesInText 非流式：正文中途单独到达的签名排在正文块之后，正文保持一个块；
+// 工具调用前先输出暂存的签名
+func TestAnthropicBlocksDeferSignaturesInText(t *testing.T) {
+	call := aistudio.FunctionCall{ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{}`), ThoughtSignature: "sig-call"}
+	blocks := anthropicBlocks(generationResult{events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "六"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventText, Text: "月"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-2"},
+		{Kind: aistudio.EventText, Text: "的"},
+		{Kind: aistudio.EventToolCall, ToolCall: &call, ThoughtSignature: "sig-call"},
+	}})
+	var shape []string
+	for _, block := range blocks {
+		shape = append(shape, block.Type+":"+block.Text+block.Data)
+	}
+	want := []string{"text:六月的", "redacted_thinking:sig-1", "redacted_thinking:sig-2", "redacted_thinking:sig-call", "tool_use:"}
+	if !reflect.DeepEqual(shape, want) {
+		t.Fatalf("内容块 %q，期望 %q", shape, want)
 	}
 }
 

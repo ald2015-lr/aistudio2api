@@ -506,3 +506,66 @@ func TestInteractionStatus(t *testing.T) {
 		t.Fatalf("有函数调用时状态为 %s", got)
 	}
 }
+
+// TestInteractionSignaturesInsideText 正文分片之间夹带只有签名的分片时，正文仍是一个 model_output 步骤，
+// 签名排在正文之后（相同签名只保留一次）；函数调用前先输出暂存的签名
+func TestInteractionSignaturesInsideText(t *testing.T) {
+	events := []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "六"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventText, Text: "月的"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-1"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-2"},
+		{Kind: aistudio.EventText, Text: "云海市"},
+		{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: "c1", Name: "lookup", Arguments: json.RawMessage(`{}`), ThoughtSignature: "sig-call"}, ThoughtSignature: "sig-call"},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}
+	handler := NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"})
+	body := decodeInteraction(t, postJSON(t, handler, "/v1beta/interactions", `{"model":"test-model","input":"hi","store":false}`, nil))
+	var shape []string
+	for _, step := range interactionResponseSteps(t, body) {
+		switch step["type"] {
+		case "model_output":
+			content := step["content"].([]any)
+			shape = append(shape, fmt.Sprintf("model_output:%d:%v", len(content), content[0].(map[string]any)["text"]))
+		case "thought":
+			shape = append(shape, fmt.Sprintf("thought:%v", step["signature"]))
+		default:
+			shape = append(shape, step["type"].(string))
+		}
+	}
+	want := "model_output:1:六月的云海市,thought:sig-1,thought:sig-2,thought:sig-call,function_call"
+	if strings.Join(shape, ",") != want {
+		t.Fatalf("非流式步骤 %v，期望 %s", shape, want)
+	}
+
+	stream := postJSON(t, NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"}), "/v1beta/interactions", `{"model":"test-model","input":"hi","stream":true,"store":false}`, nil)
+	names := interactionEventNames(interactionSSE(t, stream.Body.String()))
+	wantNames := []string{
+		"interaction.created",
+		"step.start:model_output", "step.delta:text", "step.delta:text", "step.delta:text", "step.stop",
+		"step.start:thought", "step.delta:thought_signature", "step.stop",
+		"step.start:thought", "step.delta:thought_signature", "step.stop",
+		"step.start:thought", "step.delta:thought_signature", "step.stop",
+		"step.start:function_call", "step.stop",
+		"interaction.completed",
+	}
+	if strings.Join(names, ",") != strings.Join(wantNames, ",") {
+		t.Fatalf("流式事件 %v，期望 %v", names, wantNames)
+	}
+}
+
+// TestInteractionTrailingSignatureFlushed 正文结束时暂存的签名在 interaction.completed 之前输出
+func TestInteractionTrailingSignatureFlushed(t *testing.T) {
+	handler := NewHandler(&scriptedService{events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "ok"},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-end"},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}}, Config{APIKey: "sk-test"})
+	stream := postJSON(t, handler, "/v1beta/interactions", `{"model":"test-model","input":"hi","stream":true,"store":false}`, nil)
+	names := interactionEventNames(interactionSSE(t, stream.Body.String()))
+	want := "interaction.created,step.start:model_output,step.delta:text,step.stop,step.start:thought,step.delta:thought_signature,step.stop,interaction.completed"
+	if strings.Join(names, ",") != want || !strings.Contains(stream.Body.String(), "sig-end") {
+		t.Fatalf("流式事件 %v", names)
+	}
+}

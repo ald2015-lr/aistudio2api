@@ -141,22 +141,21 @@ func TestGeminiOutputParts_WithToolCall(t *testing.T) {
 	}
 }
 
-// TestGeminiOutputParts_SignedBoundaries 相邻两段各带签名时保持两个 part，签名不被覆盖
-func TestGeminiOutputParts_SignedBoundaries(t *testing.T) {
+// TestGeminiOutputParts_SignedDeltasMerge 相邻两段各带签名时仍合并为一个 part，签名取最后一个；
+// 原先按签名拆成两个 part，new-api、SillyTavern 拼接时句子中间断行
+func TestGeminiOutputParts_SignedDeltasMerge(t *testing.T) {
 	for _, kind := range []aistudio.EventKind{aistudio.EventText, aistudio.EventReasoning} {
 		parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 			{Kind: kind, Text: "first", ThoughtSignature: "sig-a"},
 			{Kind: kind, Text: "second", ThoughtSignature: "sig-b"},
 		}})
-		if len(parts) != 2 || parts[0]["text"] != "first" || parts[1]["text"] != "second" ||
-			parts[0]["thoughtSignature"] != "sig-a" || parts[1]["thoughtSignature"] != "sig-b" {
-			t.Fatalf("kind=%s: 签名边界 %+v", kind, parts)
+		if len(parts) != 1 || parts[0]["text"] != "firstsecond" || parts[0]["thoughtSignature"] != "sig-b" {
+			t.Fatalf("kind=%s: 带签名的增量 %+v", kind, parts)
 		}
 	}
 }
 
-// TestGeminiOutputParts_SignedPartMerging 未签名的增量照常并入（含已带签名的 part），
-// 已带签名的 part 不再追加带签名的增量
+// TestGeminiOutputParts_SignedPartMerging 带签名与不带签名的增量都并入同一个 part，签名取最后一个
 func TestGeminiOutputParts_SignedPartMerging(t *testing.T) {
 	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 		{Kind: aistudio.EventText, Text: "a"},
@@ -164,9 +163,107 @@ func TestGeminiOutputParts_SignedPartMerging(t *testing.T) {
 		{Kind: aistudio.EventText, Text: "c"},
 		{Kind: aistudio.EventText, Text: "d", ThoughtSignature: "sig-d"},
 	}})
+	want := []map[string]any{{"text": "abcd", "thoughtSignature": "sig-d"}}
+	if !reflect.DeepEqual(parts, want) {
+		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
+	}
+}
+
+// TestGeminiOutputParts_EveryChunkSigned gemini-4 给每个正文分片都带签名（各不相同、重复同一个、正文之间夹着
+// 只带签名的分片）时正文仍是一个 part，客户端拼接后不会在句子中间断行
+func TestGeminiOutputParts_EveryChunkSigned(t *testing.T) {
+	chunks := []string{"六", "月的云海市，", "随着最后一门外语考试结束", "的铃声敲响，", "走出", "考场时，", "这两", "年里。"}
+	joined := strings.Join(chunks, "")
+	for _, test := range []struct {
+		name      string
+		events    func() []aistudio.Event
+		signature string
+	}{
+		{name: "各不相同", signature: "sig-7", events: func() []aistudio.Event {
+			var events []aistudio.Event
+			for index, chunk := range chunks {
+				events = append(events, aistudio.Event{Kind: aistudio.EventText, Text: chunk, ThoughtSignature: "sig-" + string(rune('0'+index))})
+			}
+			return events
+		}},
+		{name: "重复同一个", signature: "same", events: func() []aistudio.Event {
+			var events []aistudio.Event
+			for _, chunk := range chunks {
+				events = append(events, aistudio.Event{Kind: aistudio.EventText, Text: chunk, ThoughtSignature: "same"})
+			}
+			return events
+		}},
+		{name: "夹着只带签名的分片", signature: "sig-7", events: func() []aistudio.Event {
+			var events []aistudio.Event
+			for index, chunk := range chunks {
+				events = append(events,
+					aistudio.Event{Kind: aistudio.EventText, Text: chunk},
+					aistudio.Event{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-" + string(rune('0'+index))})
+			}
+			return events
+		}},
+		{name: "思考之后", signature: "sig-7", events: func() []aistudio.Event {
+			events := []aistudio.Event{
+				{Kind: aistudio.EventReasoning, Text: "想一想", ThoughtSignature: "r-0"},
+				{Kind: aistudio.EventReasoning, Text: "再想想", ThoughtSignature: "r-1"},
+			}
+			for index, chunk := range chunks {
+				events = append(events, aistudio.Event{Kind: aistudio.EventText, Text: chunk, ThoughtSignature: "sig-" + string(rune('0'+index))})
+			}
+			return events
+		}},
+	} {
+		parts := geminiOutputParts(generationResult{events: test.events()})
+		var texts []string
+		for _, part := range parts {
+			if part["thought"] == true {
+				continue
+			}
+			text, _ := part["text"].(string)
+			texts = append(texts, text)
+		}
+		if len(texts) != 1 || texts[0] != joined {
+			t.Fatalf("%s: 正文 part %q，期望一个 %q；parts=%+v", test.name, texts, joined, parts)
+		}
+		if last := parts[len(parts)-1]; last["thoughtSignature"] != test.signature {
+			t.Fatalf("%s: 正文签名 %v，期望 %s", test.name, last["thoughtSignature"], test.signature)
+		}
+		if test.name == "思考之后" && (len(parts) != 2 || parts[0]["text"] != "想一想再想想" || parts[0]["thoughtSignature"] != "r-1") {
+			t.Fatalf("思考 part %+v", parts)
+		}
+	}
+}
+
+// TestGeminiOutputParts_CitationKeepsMerging 正文中途到达的引用、搜索来源与用量不产生 part，也不打断正文合并
+func TestGeminiOutputParts_CitationKeepsMerging(t *testing.T) {
+	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "六"},
+		{Kind: aistudio.EventCitation, Citation: &aistudio.Citation{URL: "https://example.com"}},
+		{Kind: aistudio.EventGrounding, Grounding: &aistudio.GroundingMetadata{}},
+		{Kind: aistudio.EventText, Text: "月"},
+		{Kind: aistudio.EventUsage, Usage: &aistudio.Usage{TotalTokens: 1}},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}})
+	want := []map[string]any{{"text": "六月"}}
+	if !reflect.DeepEqual(parts, want) {
+		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
+	}
+}
+
+// TestGeminiOutputParts_PartBreaksMerging 工具调用与媒体之后的正文另起一个 part，之后单独到达的签名单独成 part
+func TestGeminiOutputParts_PartBreaksMerging(t *testing.T) {
+	call := aistudio.FunctionCall{ID: "call_1", Name: "lookup", Arguments: json.RawMessage(`{}`)}
+	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "before"},
+		{Kind: aistudio.EventToolCall, ToolCall: &call},
+		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-after-call"},
+		{Kind: aistudio.EventText, Text: "after"},
+	}})
 	want := []map[string]any{
-		{"text": "abc", "thoughtSignature": "sig-b"},
-		{"text": "d", "thoughtSignature": "sig-d"},
+		{"text": "before"},
+		{"functionCall": map[string]any{"id": "call_1", "name": "lookup", "args": json.RawMessage(`{}`)}},
+		{"text": "", "thought": true, "thoughtSignature": "sig-after-call"},
+		{"text": "after"},
 	}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
@@ -258,16 +355,13 @@ func TestGeminiOutputParts_PendingSignature(t *testing.T) {
 	}
 }
 
-// TestGeminiOutputParts_TrailingSignatures 前一个 part 已带签名时，尾部签名单独成 part，不覆盖已有签名
+// TestGeminiOutputParts_TrailingSignatures 正文之后单独到达的签名挂到正文 part 上，前一个签名被替换，不另成 part
 func TestGeminiOutputParts_TrailingSignatures(t *testing.T) {
 	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 		{Kind: aistudio.EventText, Text: "answer", ThoughtSignature: "sig-a"},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
 	}})
-	want := []map[string]any{
-		{"text": "answer", "thoughtSignature": "sig-a"},
-		{"text": "", "thought": true, "thoughtSignature": "sig-b"},
-	}
+	want := []map[string]any{{"text": "answer", "thoughtSignature": "sig-b"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("尾部签名 %+v，期望 %+v", parts, want)
 	}
@@ -403,8 +497,8 @@ func geminiChunkPart(chunk map[string]any) map[string]any {
 // TestGeminiSignaturePartRoundTrip 输出的空思考签名 part 回传时还原为纯签名 Part，正文 part 的签名原样保留
 func TestGeminiSignaturePartRoundTrip(t *testing.T) {
 	output := geminiOutputParts(generationResult{events: []aistudio.Event{
-		{Kind: aistudio.EventText, Text: "answer", ThoughtSignature: "sig-a"},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
+		{Kind: aistudio.EventText, Text: "answer", ThoughtSignature: "sig-a"},
 	}})
 	raw, err := json.Marshal(output)
 	if err != nil {
@@ -418,7 +512,7 @@ func TestGeminiSignaturePartRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []aistudio.Part{{Text: "answer", ThoughtSignature: "sig-a"}, {ThoughtSignature: "sig-b"}}
+	want := []aistudio.Part{{ThoughtSignature: "sig-b"}, {Text: "answer", ThoughtSignature: "sig-a"}}
 	if hasResult || !reflect.DeepEqual(parts, want) {
 		t.Fatalf("回传解析 %+v，期望 %+v", parts, want)
 	}
