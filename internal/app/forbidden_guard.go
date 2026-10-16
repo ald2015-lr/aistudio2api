@@ -220,19 +220,21 @@ func (tracker *forbiddenTracker) reset(accountID string) {
 	tracker.mu.Unlock()
 }
 
-// deniedAccounts 返回号池内最近对该模型返回 403 的账号（号池级 403 判定窗口内的记录）
-func (tracker *forbiddenTracker) deniedAccounts(pool aistudio.PoolScope, modelID string) []string {
+// systemicSince 返回号池级 403 判定成立时撤销 403 无权限登记的起点：号池里该模型最近一次成功的时间。判定要求 forbiddenWindow 内
+// 没有成功，故障紧接着成功开始时，这之前的 403 都已按账户级登记，起点取判定窗口的起点会漏掉它们；成功之后登记的账户没有别的成功
+// 能证明是它自己没有权限。启动以来没有成功过时为判定窗口的起点（更早的登记保留）
+func (tracker *forbiddenTracker) systemicSince(pool aistudio.PoolScope, modelID string, now time.Time) time.Time {
+	since := now.Add(-forbiddenWindow)
 	if tracker == nil {
-		return nil
+		return since
 	}
 	tracker.mu.Lock()
-	defer tracker.mu.Unlock()
-	state := tracker.scopes[forbiddenScopeKey{pool: pool, modelID: modelID}]
-	accountIDs := make([]string, 0, len(state.denied))
-	for _, denial := range state.denied {
-		accountIDs = append(accountIDs, denial.accountID)
+	lastSuccess := tracker.scopes[forbiddenScopeKey{pool: pool, modelID: modelID}].lastSuccess
+	tracker.mu.Unlock()
+	if !lastSuccess.IsZero() && lastSuccess.Before(since) {
+		return lastSuccess
 	}
-	return accountIDs
+	return since
 }
 
 // forgetAccount 认证文件更新后清除账号的连续 403 计数与全部单模型 403 冷却档位：新的登录状态再 403 时从第一档重新计

@@ -1126,7 +1126,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `GET /api/config`、`PUT /api/config` | 200 | `RuntimeConfig` |
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
 | `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...]}`，按最近一次 403 从新到旧 |
-| `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
+| `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400；账户 ID 只去掉首尾空白，匹配不区分大小写）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
 | `GET /api/requests` | 200 | `{"requests":[AdminRequest,...]}` |
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |

@@ -108,6 +108,8 @@ func newRuntime(
 	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.permissionDenied = openPermissionDeniedRegistry(store.PrimaryDirectory(), requests)
+	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
+	service.reconcilePermissionDenied()
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -4231,10 +4233,9 @@ func (service *trackedService) generateWithRetry(
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
 		if modelDenied && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
 			modelDenied = false
-			// 判定成立之前几个账号的 403 已经登记为无权限账户：一并撤销窗口内新登记的条目，免得修复后列表里留下一批正常账户
-			service.permissionDenied.dropSystemic(
-				service.forbidden.deniedAccounts(scope, modelID), modelID, time.Now().Add(-forbiddenWindow),
-			)
+			// 判定成立之前号池里的 403 已经登记为无权限账户：撤销号池里该模型自最近一次成功以来登记的全部条目（不只是判定记着的
+			// 几个账号），免得修复后列表里留下一批正常账户
+			service.dropSystemicPermissionDenied(scope, modelID, time.Now())
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 				"号池内 %d 分钟内至少 %d 个账号对模型 %s 返回 403 且没有成功，按号池级 403 处理，不冷却账号",
 				int(forbiddenWindow/time.Minute), forbiddenSystemicAccounts, modelID,
@@ -4242,7 +4243,7 @@ func (service *trackedService) generateWithRetry(
 		}
 		if modelDenied {
 			// 登记为 403 无权限账户，管理页单独列出（多半是没有同意 Google 的政策，重新获取认证文件上传后清除，见 permission_denied.go）
-			service.permissionDenied.record(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now())
+			service.recordPermissionDenied(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now())
 			cooldownScope := lease.CooldownScope(modelID)
 			until, level := service.forbidden.recordModel(request.AccountID, cooldownScope, time.Now())
 			reason := forbiddenModelReasonPrefix + err.Error()

@@ -270,7 +270,7 @@ func (watcher *accountWatcher) detachMissing(summaries []aistudio.AccountLoginSu
 //   - 回写 Cookie 时已经发现磁盘上的登录状态与内存不同（由 aistudio 记录）
 //   - 认证文件的修改时间或大小变了，并且文件里的登录签名 Cookie 与内存中的不同
 //
-// 只比较登录签名 Cookie（SAPISID 等），本服务自己回写的轮换 Cookie 不会触发。
+// 只比较登录签名 Cookie（SAPISID 等），本服务自己回写的轮换 Cookie 不会触发；403 无权限账户另按文件内容判断（见 deniedAuthUpdated）。
 // 没有变化的文件只做一次 stat，不读取内容；整个过程不在请求路径上
 func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLoginSummary, now time.Time) {
 	found := aistudio.TakeExternalLoginChanges()
@@ -287,6 +287,26 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 		stat := authFileStat{modTime: info.ModTime(), size: info.Size()}
 		previous, seen := watcher.authFiles[summary.ID]
 		if !seen {
+			// 第一次看到的认证文件只记作基准、不读取内容（启动时可能有上万个账户）。403 无权限账户例外：载入账户池之后、
+			// 第一次扫描之前被替换的文件（例如重启生成服务时正好在等待文件稳定），只记作基准就再也发现不了
+			if _, listed := watcher.admin.service.permissionDeniedIdentity(summary.ID); listed {
+				if now.Sub(stat.modTime) < accountSettleTime {
+					// 仍在写入，下一轮再看
+					continue
+				}
+				state, err := aistudio.LoadStorageState(summary.StoragePath)
+				if err != nil {
+					watcher.authFiles[summary.ID] = stat
+					continue
+				}
+				refresh, settled := watcher.deniedAuthUpdated(summary, state, stat, true)
+				if !settled {
+					continue
+				}
+				if refresh {
+					found = append(found, summary.ID)
+				}
+			}
 			watcher.authFiles[summary.ID] = stat
 			continue
 		}
@@ -307,7 +327,20 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 		}
 		delete(watcher.failures, "login:"+summary.ID)
 		memory, ok := watcher.admin.pool.LoginIdentity(summary.ID)
-		if ok && memory != aistudio.LoginIdentity(state) {
+		if !ok {
+			continue
+		}
+		if memory != aistudio.LoginIdentity(state) {
+			found = append(found, summary.ID)
+			continue
+		}
+		refresh, settled := watcher.deniedAuthUpdated(summary, state, stat, false)
+		if !settled {
+			// 比较期间文件又被改写：恢复上一次的基准，下一轮重新检查
+			watcher.authFiles[summary.ID] = previous
+			continue
+		}
+		if refresh {
 			found = append(found, summary.ID)
 		}
 	}
@@ -324,6 +357,43 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 		watcher.loginPending[id] = struct{}{}
 	}
 	watcher.loginMu.Unlock()
+}
+
+// deniedAuthUpdated 检查 403 无权限账户磁盘上的认证文件（调用方已确认文件稳定、已读入 disk），返回是否要载入它
+// （由 startLoginRefresh 载入，载入时清除登记与 403 冷却），以及本轮能否下结论。不在登记表里的账户不检查：
+//   - 磁盘上的内容与内存不同：本服务写回认证文件时同时更新内存，不同说明文件被外部更新了。同一登录会话里重新导出
+//     （在已登录的浏览器里同意政策后重新获取）时登录签名 Cookie 不变，只比较它发现不了，按说明重新上传后账户仍然列着、仍在冷却
+//   - 第一次看到（baseline）时磁盘与内存相同、但登录签名与登记时记下的不同：内存里已经是新的登录状态，直接清除登记与 403 冷却。
+//     之后的变化只看磁盘与内存是否相同：两者一起变了是本服务自己写回的（续签会换掉登录签名 Cookie），不算重新上传，
+//     只更新登记时记下的登录签名，免得下次启动时被当作服务停止期间替换了认证文件
+//
+// 比较期间文件又被改写（多半是本服务正在写回 Cookie，写盘与更新内存之间可能被读到）时不下结论，由调用方下一轮重新检查
+func (watcher *accountWatcher) deniedAuthUpdated(
+	summary aistudio.AccountLoginSummary, disk aistudio.StorageState, stat authFileStat, baseline bool,
+) (bool, bool) {
+	stored, listed := watcher.admin.service.permissionDeniedIdentity(summary.ID)
+	if !listed {
+		return false, true
+	}
+	memory, ok := watcher.admin.pool.StorageStateOf(summary.ID)
+	if !ok {
+		return false, true
+	}
+	if info, err := os.Stat(summary.StoragePath); err != nil || !info.ModTime().Equal(stat.modTime) || info.Size() != stat.size {
+		return false, false
+	}
+	identity := aistudio.LoginIdentity(disk)
+	if identity != aistudio.LoginIdentity(memory) || storageStateDigest(disk) != storageStateDigest(memory) {
+		return true, true
+	}
+	switch {
+	case stored == "" || identity == stored:
+	case baseline:
+		watcher.admin.service.forgetPermissionDenied(summary.ID, "认证文件更新")
+	default:
+		watcher.admin.service.permissionDenied.setIdentity(summary.ID, identity)
+	}
+	return false, true
 }
 
 // startLoginRefresh 在后台载入检测到的登录状态更新；上一批未完成时不启动新的一批

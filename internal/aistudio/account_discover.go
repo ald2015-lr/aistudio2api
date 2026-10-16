@@ -307,6 +307,22 @@ func (p *AccountPool) StatusOf(accountID string) (AccountStatus, bool) {
 	return p.accountStatusLocked(account, time.Now()), true
 }
 
+// Labels 一次加锁返回这些账户的显示名称，不存在的账户不返回。管理页列出一批账户时用它，不为每个账户构建一次完整状态
+func (p *AccountPool) Labels(accountIDs []string) map[string]string {
+	labels := make(map[string]string, len(accountIDs))
+	if p == nil {
+		return labels
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, accountID := range accountIDs {
+		if account := p.byID[accountID]; account != nil {
+			labels[accountID] = account.Config.Label
+		}
+	}
+	return labels
+}
+
 // longCoolingLocked 判断账户在该模型上是否长时间不可用：全局冷却，或所有启用通道都在冷却，
 // 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu。
 // 这是 Worker 淘汰与轮换的口径（针对指定模型、不看通道是否支持该模型、有剩余时间门槛）；状态页与状态摘要的 cooldown

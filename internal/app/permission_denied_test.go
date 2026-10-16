@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 // withPermissionDenied 给测试服务挂上保存在临时目录的 403 无权限账户登记表
@@ -109,7 +111,7 @@ func TestPermissionDeniedSkipsSystemicForbidden(t *testing.T) {
 	registry := withPermissionDenied(t, service)
 	// 判定之前更早就登记过的账户保留
 	earlier := time.Now().Add(-2 * forbiddenWindow)
-	registry.record(ids[0], testRuntimeModel, aistudio.ChannelPlayground, "earlier", earlier)
+	registry.record(ids[0], testRuntimeModel, aistudio.ChannelPlayground, "earlier", "", earlier)
 	var rpc *aistudio.RPCError
 	if _, err, _ := runAccountRequest(t, service, "req-denied-outage", ""); !errors.As(err, &rpc) || rpc.StatusCode != http.StatusForbidden {
 		t.Fatalf("故障期间应按 403 结束，err=%v", err)
@@ -296,9 +298,9 @@ func TestPermissionDeniedPersistence(t *testing.T) {
 	directory := t.TempDir()
 	first := newPermissionDeniedRegistry(directory, nil)
 	at := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
-	first.record("a@example.com", "pro", aistudio.ChannelBuild, "The caller does not have permission", at)
-	first.record("a@example.com", "pro", aistudio.ChannelPlayground, "The caller does not have permission", at.Add(time.Minute))
-	first.record("b@example.com", "flash", aistudio.ChannelPlayground, strings.Repeat("x", permissionDeniedMessageLimit+50), at.Add(2*time.Minute))
+	first.record("a@example.com", "pro", aistudio.ChannelBuild, "The caller does not have permission", "identity-a", at)
+	first.record("a@example.com", "pro", aistudio.ChannelPlayground, "The caller does not have permission", "", at.Add(time.Minute))
+	first.record("b@example.com", "flash", aistudio.ChannelPlayground, strings.Repeat("x", permissionDeniedMessageLimit+50), "", at.Add(2*time.Minute))
 	first.flush()
 	path := filepath.Join(directory, permissionDeniedFileName)
 	if _, err := os.Stat(path); err != nil {
@@ -316,6 +318,10 @@ func TestPermissionDeniedPersistence(t *testing.T) {
 	}
 	if message := entries[0].models[0].model.Message; len([]rune(message)) != permissionDeniedMessageLimit+1 {
 		t.Fatalf("上游原文应截断到 %d 字符，长度 %d", permissionDeniedMessageLimit, len([]rune(message)))
+	}
+	// 登记时记下的登录签名一并保存（启动时据此判断服务停止期间是否替换了认证文件）；之后没有给出时保留之前的
+	if identity, _ := second.identityOf("a@example.com"); identity != "identity-a" {
+		t.Fatalf("重新打开后的登录签名 = %q，期望 identity-a", identity)
 	}
 	// 清除后同样持久化
 	if cleared := second.clear([]string{"a@example.com", "missing@example.com"}, false); cleared != 1 {
@@ -354,7 +360,7 @@ func TestClearPermissionDeniedAdmin(t *testing.T) {
 	registry := newPermissionDeniedRegistry("", requests)
 	now := time.Now()
 	for _, accountID := range []string{"a@example.com", "b@example.com", "c@example.com"} {
-		registry.record(accountID, "pro", aistudio.ChannelPlayground, "denied", now)
+		registry.record(accountID, "pro", aistudio.ChannelPlayground, "denied", "", now)
 	}
 	admin := &runtimeAdmin{service: &trackedService{permissionDenied: registry, requests: requests}, requests: requests}
 	var operation *adminOperationError
@@ -371,5 +377,479 @@ func TestClearPermissionDeniedAdmin(t *testing.T) {
 	cleared, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{All: true})
 	if err != nil || cleared != 2 || len(registry.list()) != 0 {
 		t.Fatalf("全部清除：cleared=%d err=%v 剩余=%+v", cleared, err, registry.list())
+	}
+}
+
+// TestClearPermissionDeniedMixedCaseIDs 从磁盘导入的账户以目录名为 ID，不一定是小写：按 account_ids 清除时只去掉首尾空白、不转小写，
+// 原样传入的混合大小写 ID 能清除；大小写不同的写法同样能清除（不区分大小写）
+func TestClearPermissionDeniedMixedCaseIDs(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	registry := newPermissionDeniedRegistry("", requests)
+	now := time.Now()
+	for _, accountID := range []string{"John.Doe@Gmail.com", "Jane.Roe@Gmail.com", "other@example.com"} {
+		registry.record(accountID, "pro", aistudio.ChannelPlayground, "denied", "", now)
+	}
+	admin := &runtimeAdmin{service: &trackedService{permissionDenied: registry, requests: requests}, requests: requests}
+	cleared, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{" John.Doe@Gmail.com "}})
+	if err != nil || cleared != 1 {
+		t.Fatalf("按列表返回的 ID 清除：cleared=%d err=%v，期望 1", cleared, err)
+	}
+	cleared, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{"jane.roe@gmail.com"}})
+	if err != nil || cleared != 1 {
+		t.Fatalf("大小写不同的 ID 清除：cleared=%d err=%v，期望 1", cleared, err)
+	}
+	if entries := registry.list(); len(entries) != 1 || entries[0].accountID != "other@example.com" {
+		t.Fatalf("清除后剩余 = %+v，期望只剩 other@example.com", entries)
+	}
+}
+
+// runScopedRequest 执行一次固定账户的 testRuntimeModel 生成请求，请求 context 带号池（号池级 403 按请求的号池判断），返回错误
+func runScopedRequest(t *testing.T, service *trackedService, requestID string, accountID string, scope aistudio.PoolScope) error {
+	t.Helper()
+	request := aistudio.GenerateRequest{
+		ID: requestID, Model: testRuntimeModel, AccountID: accountID,
+		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
+	}
+	requestCtx, requestCancel := context.WithTimeout(aistudio.ContextWithPoolScope(service.lifecycle, scope), 20*time.Second)
+	defer requestCancel()
+	events := make(chan aistudio.Event, 8)
+	go service.generateWithRetry(service.lifecycle, requestCtx, requestCancel, time.Now(), request, "", events, newGenerationDiagnostics(request, "未发送"))
+	var err error
+	for event := range events {
+		if event.Kind == aistudio.EventError {
+			err = event.Err
+		}
+	}
+	return err
+}
+
+// TestPermissionDeniedSystemicDropsWholeWindow 故障紧接着一次成功开始时，号池级 403 判定要等号池里该模型 10 分钟没有成功才成立，
+// 这之前每个 403 都按账户级登记（这里是成功之后约 9 分钟内的 40 个账户）。判定成立后撤销号池里该模型自那次成功以来登记的全部条目，
+// 不只是判定记着的几个账户；成功之前就登记的、其他号池（Ultra）账户的、其他模型的保留；判定成立之后才写入的登记
+// （与判定同时进行的请求）在下一次号池级 403 时同样撤销
+func TestPermissionDeniedSystemicDropsWholeWindow(t *testing.T) {
+	const trigger, ultra = "z-trigger@example.com", "u-ultra@example.com"
+	upstream := &forbiddenUpstream{denied: map[string]bool{trigger: true}}
+	service, pool := primaryBusyService(t, upstream, trigger, ultra)
+	registry := withPermissionDenied(t, service)
+	ultraCatalog := []aistudio.Model{{ID: testRuntimeModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}}}
+	if err := pool.SetCatalog(ultra, aistudio.BenefitTierUltra, ultraCatalog); err != nil {
+		t.Fatal(err)
+	}
+	scope := aistudio.PoolScopeNormal
+	success := time.Now().Add(-forbiddenWindow - 30*time.Second)
+	service.forbidden.modelSucceeded(scope, testRuntimeModel, success)
+	registry.record("before@example.com", testRuntimeModel, aistudio.ChannelPlayground, "denied", "", success.Add(-time.Minute))
+	healthy := make([]string, 0, 40)
+	for index := range 40 {
+		accountID := fmt.Sprintf("a-healthy-%02d@example.com", index)
+		at := success.Add(time.Duration(index) * 14 * time.Second)
+		if service.forbidden.observeModelDenied(scope, accountID, testRuntimeModel, at) {
+			t.Fatalf("第 %d 个 403 距成功不到 %s，不应按号池级 403", index, forbiddenWindow)
+		}
+		registry.record(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", "", at)
+		healthy = append(healthy, accountID)
+	}
+	registry.record(healthy[0], "other-model", aistudio.ChannelPlayground, "denied", "", success.Add(time.Minute))
+	registry.record(ultra, testRuntimeModel, aistudio.ChannelPlayground, "denied", "", success.Add(time.Minute))
+	if entries := registry.list(); len(entries) != 42 {
+		t.Fatalf("判定之前登记 %d 个账户，期望 42", len(entries))
+	}
+
+	var rpc *aistudio.RPCError
+	if err := runScopedRequest(t, service, "req-systemic-window", trigger, scope); !errors.As(err, &rpc) || rpc.StatusCode != http.StatusForbidden {
+		t.Fatalf("应按 403 结束，err=%v", err)
+	}
+	for _, accountID := range append(slices.Clone(healthy), trigger) {
+		entry, listed := permissionDeniedEntryOf(registry, accountID)
+		if _, ok := permissionDeniedModelOf(entry, testRuntimeModel); listed && ok {
+			t.Fatalf("号池级 403 判定成立后 %s 在该模型上的登记应撤销", accountID)
+		}
+	}
+	remaining := make([]string, 0)
+	for _, entry := range registry.list() {
+		remaining = append(remaining, entry.accountID)
+	}
+	slices.Sort(remaining)
+	if want := []string{healthy[0], "before@example.com", ultra}; !slices.Equal(remaining, want) {
+		t.Fatalf("剩余登记 = %v，期望 %v（成功之前的、其他模型的、Ultra 号池的保留）", remaining, want)
+	}
+	if entry, _ := permissionDeniedEntryOf(registry, healthy[0]); len(entry.models) != 1 || entry.models[0].modelID != "other-model" {
+		t.Fatalf("其他模型的登记应保留：%+v", entry)
+	}
+	if !hasLogContaining(service.requests, "撤销 403 无权限账户记录", "账户=40") {
+		t.Fatalf("应记录撤销了 40 个账户，日志 = %v", serviceLogMessages(service.requests))
+	}
+
+	registry.record("late@example.com", testRuntimeModel, aistudio.ChannelPlayground, "denied", "", time.Now())
+	service.dropSystemicPermissionDenied(scope, testRuntimeModel, time.Now())
+	if _, listed := permissionDeniedEntryOf(registry, "late@example.com"); listed {
+		t.Fatal("判定成立之后才写入的登记应在下一次号池级 403 时撤销")
+	}
+}
+
+// TestPermissionDeniedReconciledAtStartup 按说明在服务停止期间覆盖认证文件后启动：启动时登录签名 Cookie 的指纹与登记时不同的账户
+// 移出列表，单模型 403 冷却（持久化在 runtime-state.json）一并解除；认证文件没变的账户仍然列着、仍在冷却；
+// 服务停止期间删除了目录的账户的登记直接清除
+func TestPermissionDeniedReconciledAtStartup(t *testing.T) {
+	isolateDisableNotes(t)
+	root := filepath.Join(t.TempDir(), "auth")
+	const replaced, kept, gone = "replaced@example.com", "kept@example.com", "gone@example.com"
+	replacedDirectory := writeEnableTestAccount(t, root, replaced, true)
+	writeEnableTestAccount(t, root, kept, true)
+	reason := forbiddenModelReasonPrefix + "The caller does not have permission"
+	until := time.Now().Add(forbiddenModelRepeatCooldown)
+	{
+		// 停止之前的一代：两个账户都返回过 403，登记并写入单模型 403 冷却
+		accounts, failures := aistudio.NewAccountStore(root).LoadTolerant()
+		if len(failures) > 0 {
+			t.Fatal(failures)
+		}
+		previous := aistudio.NewAccountPool(accounts, 1)
+		registry := newPermissionDeniedRegistry(root, nil)
+		for _, accountID := range []string{replaced, kept} {
+			if err := previous.MarkCooldownIfGeneration(
+				accountID, testRuntimeModel, previous.ModelAccessGeneration(accountID), time.Now(), until, reason,
+			); err != nil {
+				t.Fatal(err)
+			}
+			identity, _ := previous.LoginIdentity(accountID)
+			registry.record(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", identity, time.Now())
+		}
+		identity, _ := previous.LoginIdentity(kept)
+		registry.record(gone, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", identity, time.Now())
+		registry.flush()
+		previous.WaitBackground()
+	}
+	// 服务停止期间：重新获取 replaced 的认证文件覆盖上传
+	if err := aistudio.WriteStorageState(aistudio.StorageStatePath(replacedDirectory), authTestState(t, "NEW", false)); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	cfg := config.Default()
+	cfg.AuthStates = root
+	cfg.WAABackend = config.WAABackendGo
+	lifecycle, stop := context.WithCancel(ctx)
+	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(admin.pool.WaitBackground)
+	defer func() {
+		stop()
+		if err := closeRuntime(); err != nil {
+			t.Error(err)
+		}
+	}()
+	registry := admin.service.permissionDenied
+	if entries := registry.list(); len(entries) != 1 || entries[0].accountID != kept {
+		t.Fatalf("启动后登记 = %+v，期望只剩认证文件没变的 %s", entries, kept)
+	}
+	if _, reason, cooling := modelCooldownUntil(t, admin.pool, replaced, testRuntimeModel); cooling {
+		t.Fatalf("认证文件已更新的账户启动后应解除 403 冷却，仍有：%s", reason)
+	}
+	if _, cooldownReason, cooling := modelCooldownUntil(t, admin.pool, kept, testRuntimeModel); !cooling || cooldownReason != reason {
+		t.Fatalf("认证文件没变的账户应保持 403 冷却：cooling=%v reason=%q", cooling, cooldownReason)
+	}
+	if !hasLogContaining(requests, "清除 403 无权限记录与冷却", "来源=启动时发现认证文件已更新") ||
+		!hasLogContaining(requests, "已不在账户池中的账户", "账户=1") {
+		t.Fatalf("应记录启动时的清除，日志 = %v", serviceLogMessages(requests))
+	}
+}
+
+// deniedWatcherAdmin 返回带 403 无权限登记表的管理端；账户都已登记（记下当前登录签名指纹）并有单模型 403 冷却
+func deniedWatcherAdmin(t *testing.T, listed []string, accountIDs ...string) (*runtimeAdmin, *permissionDeniedRegistry) {
+	t.Helper()
+	admin, _, _ := enableTestAdmin(t, append(slices.Clone(listed), accountIDs...)...)
+	registry := newPermissionDeniedRegistry("", admin.requests)
+	admin.service.permissionDenied = registry
+	until := time.Now().Add(forbiddenModelRepeatCooldown)
+	for _, accountID := range listed {
+		if err := admin.pool.MarkCooldownIfGeneration(
+			accountID, testRuntimeModel, admin.pool.ModelAccessGeneration(accountID), time.Now(), until,
+			forbiddenModelReasonPrefix+"The caller does not have permission",
+		); err != nil {
+			t.Fatal(err)
+		}
+		admin.service.recordPermissionDenied(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", time.Now())
+	}
+	return admin, registry
+}
+
+// newTestAccountWatcher 返回基准为空的账户目录扫描器（与生成服务刚启动时一样）
+func newTestAccountWatcher(admin *runtimeAdmin) *accountWatcher {
+	return &accountWatcher{
+		admin: admin, failures: map[string]string{}, missing: map[string]int{},
+		authFiles: map[string]authFileStat{}, loginPending: map[string]struct{}{},
+	}
+}
+
+// settleAuthFile 把账户认证文件的修改时间改到 at，模拟文件已经写完、不再变化
+func settleAuthFile(t *testing.T, pool *aistudio.AccountPool, accountID string, at time.Time) {
+	t.Helper()
+	account, err := pool.Account(accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(account.StoragePath, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// scanAndWait 扫描一轮账户目录，并等后台载入登录状态更新结束
+func scanAndWait(t *testing.T, watcher *accountWatcher) {
+	t.Helper()
+	watcher.scan(watcher.admin.lifecycle)
+	waitFor(t, "后台载入认证文件更新结束", func() bool { return !watcher.refreshing.Load() })
+}
+
+// withCookie 返回加上（或替换）一个 Cookie 后的登录状态，登录签名 Cookie 不变
+func withCookie(state aistudio.StorageState, name string, value string) aistudio.StorageState {
+	cookies := make([]aistudio.StateCookie, 0, len(state.Cookies)+1)
+	for _, cookie := range state.Cookies {
+		if cookie.Name != name {
+			cookies = append(cookies, cookie)
+		}
+	}
+	state.Cookies = append(cookies, aistudio.StateCookie{
+		Name: name, Value: value, Domain: ".google.com", Path: "/", Expires: -1, Secure: true, SameSite: "None",
+	})
+	return state
+}
+
+// memoryDigest 返回账户内存中登录状态的摘要
+func memoryDigest(t *testing.T, pool *aistudio.AccountPool, accountID string) string {
+	t.Helper()
+	state, ok := pool.StorageStateOf(accountID)
+	if !ok {
+		t.Fatalf("账户 %s 不存在", accountID)
+	}
+	return storageStateDigest(state)
+}
+
+// TestPermissionDeniedWatcherSameSessionReexport 在已登录的浏览器里同意政策后重新导出认证文件时登录签名 Cookie 不变：403 无权限账户的
+// 认证文件内容与内存不同就按认证文件更新载入，移出列表并解除 403 冷却。本服务自己写回 Cookie（内存随之更新）不算更新；
+// 不在列表里的账户仍只比较登录签名 Cookie，内容变化不重新载入
+func TestPermissionDeniedWatcherSameSessionReexport(t *testing.T) {
+	const listed, plain = "listed@example.com", "plain@example.com"
+	admin, registry := deniedWatcherAdmin(t, []string{listed}, plain)
+	pool := admin.pool
+	base := time.Now().Add(-time.Minute)
+	settleAuthFile(t, pool, listed, base)
+	settleAuthFile(t, pool, plain, base)
+	watcher := newTestAccountWatcher(admin)
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatal("认证文件没有变化时第一次扫描不应清除登记")
+	}
+
+	// 本服务自己写回 Cookie：磁盘与内存一起变化
+	lease, err := pool.AcquireAccount(context.Background(), listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.MergeSetCookieHeaders(
+		[]string{"__Secure-1PSIDTS=service-rotated; Domain=.google.com; Path=/; Secure"}, "https://aistudio.google.com/", time.Now(),
+	); err != nil {
+		t.Fatal(errors.Join(err, lease.Release()))
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	settleAuthFile(t, pool, listed, base.Add(10*time.Second))
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatal("本服务自己写回 Cookie 不应当作认证文件更新")
+	}
+	if _, _, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); !cooling {
+		t.Fatal("本服务自己写回 Cookie 后 403 冷却应保持")
+	}
+
+	// 本服务自己续签：登录签名 Cookie 换了，磁盘与内存一起变化。不算重新上传，只更新记下的登录签名，下次启动时也不会被当作替换了认证文件
+	renewed := authTestState(t, "RENEWED", false)
+	lease, err = pool.AcquireAccount(context.Background(), listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveStorageState(renewed), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	settleAuthFile(t, pool, listed, base.Add(15*time.Second))
+	scanAndWait(t, watcher)
+	if identity, ok := registry.identityOf(listed); !ok || identity != aistudio.LoginIdentity(renewed) {
+		t.Fatalf("本服务自己续签后应保留登记并更新登录签名：listed=%v identity=%q", ok, identity)
+	}
+	admin.service.reconcilePermissionDenied()
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatal("本服务自己续签之后重启，不应当作服务停止期间替换了认证文件")
+	}
+
+	// 外部在同一登录会话里重新导出：登录签名 Cookie 不变，其他 Cookie 变了
+	plainBefore := memoryDigest(t, pool, plain)
+	for _, accountID := range []string{listed, plain} {
+		account, err := pool.Account(accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		state, err := aistudio.LoadStorageState(account.StoragePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := aistudio.WriteStorageState(account.StoragePath, withCookie(state, "__Secure-1PSIDTS", "browser-reexport")); err != nil {
+			t.Fatal(err)
+		}
+		settleAuthFile(t, pool, accountID, base.Add(20*time.Second))
+	}
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); ok {
+		t.Fatalf("同一会话重新导出的认证文件应清除登记：%+v", registry.list())
+	}
+	if _, reason, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); cooling {
+		t.Fatalf("同一会话重新导出的认证文件应解除 403 冷却，仍有：%s", reason)
+	}
+	account, err := pool.Account(listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disk, err := aistudio.LoadStorageState(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memoryDigest(t, pool, listed) != storageStateDigest(disk) {
+		t.Fatal("应载入重新导出的认证文件")
+	}
+	if memoryDigest(t, pool, plain) != plainBefore {
+		t.Fatal("不在列表里的账户只比较登录签名 Cookie，内容变化不应重新载入")
+	}
+}
+
+// TestPermissionDeniedWatcherBaseline 账户目录扫描第一次看到的认证文件原先只记作基准：载入账户池之后、第一次扫描之前被替换的认证文件
+// （例如重启生成服务时正好在等待文件稳定）再也发现不了。403 无权限账户第一次看到时就对照：磁盘与内存不同时载入新的认证文件；
+// 内存里已经是新的登录状态、只是与登记时记下的登录签名不同时直接清除；都没变的保留
+func TestPermissionDeniedWatcherBaseline(t *testing.T) {
+	const replaced, relogged, kept = "replaced@example.com", "relogged@example.com", "kept@example.com"
+	admin, registry := deniedWatcherAdmin(t, []string{replaced, relogged, kept})
+	pool := admin.pool
+	// relogged 登记时用的是之前的登录状态
+	registry.record(relogged, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", "previous-identity", time.Now())
+	account, err := pool.Account(replaced)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := aistudio.WriteStorageState(account.StoragePath, authTestState(t, "NEW", false)); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Minute)
+	for _, accountID := range []string{replaced, relogged, kept} {
+		settleAuthFile(t, pool, accountID, base)
+	}
+	scanAndWait(t, newTestAccountWatcher(admin))
+	for _, accountID := range []string{replaced, relogged} {
+		if _, ok := registry.identityOf(accountID); ok {
+			t.Fatalf("%s 的认证文件已更新，第一次扫描应清除登记：%+v", accountID, registry.list())
+		}
+		if _, reason, cooling := modelCooldownUntil(t, pool, accountID, testRuntimeModel); cooling {
+			t.Fatalf("%s 的认证文件已更新，应解除 403 冷却，仍有：%s", accountID, reason)
+		}
+	}
+	if identity, _ := pool.LoginIdentity(replaced); identity != aistudio.LoginIdentity(authTestState(t, "NEW", false)) {
+		t.Fatal("应载入替换后的认证文件")
+	}
+	if _, ok := registry.identityOf(kept); !ok {
+		t.Fatal("认证文件没变的账户应保留登记")
+	}
+}
+
+// TestPermissionDeniedRegistryLocking 每个成功的请求都要查一次登记表：没有这个账户这个模型的登记时只取读锁，别的请求持有读锁时
+// （列出登记、复制快照）不必等待。写文件时编码整张表在锁外进行（登记表可能有上万个账户），编码期间的新登记不混进这份快照、
+// 稍后另写一次；管理接口一次取得账户的显示名称，不在账户池里的账户显示 ID
+func TestPermissionDeniedRegistryLocking(t *testing.T) {
+	directory := t.TempDir()
+	registry := newPermissionDeniedRegistry(directory, nil)
+	registry.record("listed@example.com", "pro", aistudio.ChannelPlayground, "denied", "", time.Now())
+
+	registry.mu.RLock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		registry.succeeded("other@example.com", "pro", aistudio.ChannelPlayground)
+		registry.succeeded("listed@example.com", "flash", aistudio.ChannelPlayground)
+		registry.succeeded("listed@example.com", "pro", aistudio.ChannelBuild)
+	}()
+	select {
+	case <-done:
+		registry.mu.RUnlock()
+	case <-time.After(2 * time.Second):
+		registry.mu.RUnlock()
+		<-done
+		t.Fatal("没有登记的成功请求不应等待其他读者")
+	}
+
+	registry.mu.Lock()
+	registry.encode = func(file permissionDeniedFile) ([]byte, error) {
+		if !registry.mu.TryLock() {
+			t.Error("编码登记时不应持有登记表的锁")
+		} else {
+			registry.mu.Unlock()
+			registry.record("late@example.com", "pro", aistudio.ChannelPlayground, "denied", "", time.Now())
+		}
+		return json.MarshalIndent(file, "", "  ")
+	}
+	registry.mu.Unlock()
+	saved := func() []string {
+		t.Helper()
+		content, err := os.ReadFile(filepath.Join(directory, permissionDeniedFileName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stored permissionDeniedFile
+		if err := json.Unmarshal(content, &stored); err != nil {
+			t.Fatal(err)
+		}
+		accountIDs := make([]string, 0, len(stored.Accounts))
+		for accountID := range stored.Accounts {
+			accountIDs = append(accountIDs, accountID)
+		}
+		slices.Sort(accountIDs)
+		return accountIDs
+	}
+	registry.flush()
+	if got := saved(); !slices.Equal(got, []string{"listed@example.com"}) {
+		t.Fatalf("写入的登记 = %v，编码期间的新登记不应混进这份快照", got)
+	}
+	registry.mu.Lock()
+	registry.encode = nil
+	registry.mu.Unlock()
+	registry.flush()
+	if got := saved(); !slices.Equal(got, []string{"late@example.com", "listed@example.com"}) {
+		t.Fatalf("再次写入的登记 = %v，编码期间的新登记应稍后写入", got)
+	}
+
+	pool, _ := testAccountPool(t, "listed@example.com")
+	lease, err := pool.AcquireAccount(context.Background(), "listed@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountConfig := lease.Account().Config
+	accountConfig.Label = "Listed.Account@Example.com"
+	if err := errors.Join(lease.SaveConfig(accountConfig), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	admin := &runtimeAdmin{pool: pool, service: &trackedService{permissionDenied: registry}}
+	listedEntries, err := admin.PermissionDenied(context.Background())
+	if err != nil || len(listedEntries) != 2 {
+		t.Fatalf("管理接口返回 %+v err=%v", listedEntries, err)
+	}
+	labels := map[string]string{}
+	for _, entry := range listedEntries {
+		labels[entry.ID] = entry.Label
+	}
+	if labels["listed@example.com"] != "Listed.Account@Example.com" || labels["late@example.com"] != "late@example.com" {
+		t.Fatalf("显示名称 = %v，期望账户池里的名称，不在账户池里的显示 ID", labels)
 	}
 }

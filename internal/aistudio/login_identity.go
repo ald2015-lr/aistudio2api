@@ -98,3 +98,15 @@ func (p *AccountPool) LoginIdentity(accountID string) (string, bool) {
 	}
 	return LoginIdentity(state), true
 }
+
+// StorageStateOf 返回账户内存中的登录状态（磁盘上认证文件最近一次被本服务载入或写入的内容）。只在认证文件发生变化时调用：
+// 本服务写回认证文件时同时更新内存，磁盘上的内容与它不同说明文件被外部更新了
+func (p *AccountPool) StorageStateOf(accountID string) (StorageState, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[accountID]
+	if account == nil {
+		return StorageState{}, false
+	}
+	return account.StorageState, true
+}
