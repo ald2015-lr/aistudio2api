@@ -1164,27 +1164,67 @@ func (p *AccountPool) Acquire(ctx context.Context, model string) (*AccountLease,
 
 // AcquireAccount 为管理操作获取不受调度状态限制的指定账户租约
 func (p *AccountPool) AcquireAccount(ctx context.Context, accountID string) (*AccountLease, error) {
+	reservation, err := p.ReserveAccount(accountID)
+	if err != nil {
+		return nil, err
+	}
+	return reservation.Wait(ctx)
+}
+
+// AccountReservation 为已登记的独占等待（AcquireAccount 的前半段）：登记期间账户不再发出新租约，
+// 进行中的租约照常使用；Wait 等它们都释放后取得独占租约，Cancel 撤销登记
+type AccountReservation struct {
+	pool    *AccountPool
+	account *Account
+	once    sync.Once
+}
+
+// ReserveAccount 立即为指定账户登记独占等待，不等待进行中的租约
+func (p *AccountPool) ReserveAccount(accountID string) (*AccountReservation, error) {
 	if p == nil {
 		return nil, ErrAccountNotFound
 	}
 	accountID = strings.TrimSpace(accountID)
 	p.mu.Lock()
-	waitingAccount := p.byID[accountID]
-	if waitingAccount == nil {
-		p.mu.Unlock()
+	defer p.mu.Unlock()
+	account := p.byID[accountID]
+	if account == nil {
 		return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
 	}
-	waitingAccount.exclusiveWaiters++
-	p.busyChangedLocked(waitingAccount)
+	return p.reserveLocked(account), nil
+}
+
+// reserveLocked 登记独占等待（调用方持有 p.mu）
+func (p *AccountPool) reserveLocked(account *Account) *AccountReservation {
+	account.exclusiveWaiters++
+	p.busyChangedLocked(account)
 	p.notifyLocked()
-	p.mu.Unlock()
-	defer func() {
-		p.mu.Lock()
-		waitingAccount.exclusiveWaiters--
-		p.busyChangedLocked(waitingAccount)
-		p.notifyLocked()
-		p.mu.Unlock()
-	}()
+	return &AccountReservation{pool: p, account: account}
+}
+
+// Cancel 撤销独占等待登记；已撤销（含 Wait 返回后）时不做任何事
+func (r *AccountReservation) Cancel() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		r.pool.mu.Lock()
+		r.account.exclusiveWaiters--
+		r.pool.busyChangedLocked(r.account)
+		r.pool.notifyLocked()
+		r.pool.mu.Unlock()
+	})
+}
+
+// Wait 等账户上进行中的租约都释放后取得独占租约（与 AcquireAccount 相同），返回时撤销登记：
+// 取得租约时账户已处于独占状态，撤销登记与取得租约之间没有空档
+func (r *AccountReservation) Wait(ctx context.Context) (*AccountLease, error) {
+	if r == nil {
+		return nil, fmt.Errorf("账户独占等待未初始化")
+	}
+	defer r.Cancel()
+	p := r.pool
+	accountID := r.account.ID
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -2081,23 +2121,52 @@ func (l *AccountLease) Release() error {
 		defer l.operation.Unlock()
 		l.released = true
 		l.pool.mu.Lock()
-		if l.exclusive {
-			l.account.exclusive = false
-		} else if l.account.active > 0 {
-			l.account.active--
-		}
-		l.pool.busyChangedLocked(l.account)
-		if l.account.active == 0 && !l.account.exclusive && l.account.authRefreshers == 0 && l.account.leaseLock != nil {
-			if err := l.account.leaseLock.Unlock(); err != nil {
-				l.err = err
-			}
-			l.account.leaseLock = nil
-			l.account.leasePath = ""
-		}
-		l.pool.notifyLocked()
+		l.releaseLocked()
 		l.pool.mu.Unlock()
 	})
 	return l.err
+}
+
+// ReleaseToExclusiveReservation 释放租约，并在同一次加锁内为该账户登记独占等待（见 AccountReservation）。
+// 用于关闭出错的 Worker：请求释放自己的租约后要等账户上其他请求结束才能关闭，原先先释放、再由 AcquireAccount 另行登记，
+// 释放唤醒的排队请求可能在两者之间取得这个账户，落到坏掉的 Worker 上（Worker 已失败时还会原地替换浏览器、切断同账户进行中的流）；
+// 现在排队请求被唤醒时看到的已经是登记后的账户。租约已释放时返回错误、不登记；释放账户文件锁失败时已经登记，与错误一起返回
+func (l *AccountLease) ReleaseToExclusiveReservation() (*AccountReservation, error) {
+	if l == nil || l.pool == nil || l.account == nil {
+		return nil, fmt.Errorf("账户租约未初始化")
+	}
+	var reservation *AccountReservation
+	l.once.Do(func() {
+		l.operation.Lock()
+		defer l.operation.Unlock()
+		l.released = true
+		l.pool.mu.Lock()
+		reservation = l.pool.reserveLocked(l.account)
+		l.releaseLocked()
+		l.pool.mu.Unlock()
+	})
+	if reservation == nil {
+		return nil, fmt.Errorf("账户租约已释放")
+	}
+	return reservation, l.err
+}
+
+// releaseLocked 归还租约占用的槽位或独占状态，账户空闲时释放账户文件锁（调用方持有 l.operation 与 p.mu）
+func (l *AccountLease) releaseLocked() {
+	if l.exclusive {
+		l.account.exclusive = false
+	} else if l.account.active > 0 {
+		l.account.active--
+	}
+	l.pool.busyChangedLocked(l.account)
+	if l.account.active == 0 && !l.account.exclusive && l.account.authRefreshers == 0 && l.account.leaseLock != nil {
+		if err := l.account.leaseLock.Unlock(); err != nil {
+			l.err = err
+		}
+		l.account.leaseLock = nil
+		l.account.leasePath = ""
+	}
+	l.pool.notifyLocked()
 }
 
 // SetCatalog 替换账户的权益等级与实时模型目录

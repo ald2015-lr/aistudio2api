@@ -617,9 +617,9 @@ bootstrap 模型只负责建立账户 Worker，不是业务模型白名单，一
 
 | 信号 | 处理 |
 | --- | --- |
-| proof 生成失败：snapshot 异常、提示词未同步、前缀不是 `!`、VM 刷新失败 | Worker 进入 `failed`；同账户重建 Worker 并重放一次 |
+| proof 生成失败：snapshot 异常、提示词未同步、前缀不是 `!`、VM 刷新失败 | Worker 进入 `failed`；后台关闭失败的 Worker（同一版本只关闭一次，等同账户其他请求结束，期间账户不接新请求），关闭完成后在同账户新 Worker 上重放一次；不固定账户的生成请求最多等 2 秒，等不到就换号，没有其他可用账户时回到原账户等关闭完成 |
 | 受保护请求网络错误 | 同上 |
-| `GenerateContent`、`GenerateVideo`、Bidi 返回 HTTP 404、Code 5 且消息含 `Ambiguous request for service ''` | 同账户重建 Worker 并重放一次 |
+| `GenerateContent`、`GenerateVideo`、Bidi 返回 HTTP 404、Code 5 且消息含 `Ambiguous request for service ''` | 同上（Worker 状态不变，失败 Worker 巡检不处理；后台关闭超时放弃后，再有请求在它上面失败时重新登记） |
 | HTTP 403 或 Code 7 | 保留账户与模型资格，首个上游事件前切换到未尝试的同能力账户；没有文件绑定的生成请求对该账号该通道的这个模型写入递增冷却（30 分钟、6 小时、到太平洋时间次日零点，两个通道分别计档），换号不退避但计入连续失败上限；同一号池 10 分钟内至少 5 个不同账号对同一模型 403 且没有任何成功时按号池级 403 处理（纯 Go proof、请求形态失效等），不写冷却；不重建 Worker |
 | HTTP 429 | 按分钟或每日限额写入冷却（Build 通道为 `build:<模型>`；周期判定与 RetryInfo/Retry-After 规则见 build.md），同账户另一通道可用时在同账户重试；已输出内容后与 Live 会话中的 429 也写回冷却 |
 | HTTP 401、Code 16、签名 Cookie 失效 | Chrome 导入账户在同一出口续签，重建 WAA runtime 后重放一次；没有续签材料或续签后仍失效的账户进入 `auth_required` |

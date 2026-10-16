@@ -194,6 +194,15 @@ type accountWorkerManager struct {
 	// drains 为排空中的账号（见 worker_drain.go），由 drainMu 保护；账户池的排空标记只在 drainMu 内设置与清除，两边始终一致
 	drainMu sync.Mutex
 	drains  map[string]*drainState
+	// resets 为进行中的后台关闭失败 Worker（见 worker_reset.go），按账户与 Worker 版本登记，由 resetMu 保护（只在登记与移除时短暂持有）；
+	// resetHolds 为 ResetAll 暂停登记的层数，resetClosed 在 Close 后为真，这两种情况下不再登记；resetWG 跟踪后台 goroutine，
+	// ResetAll 与 Close 取消后等它们退出；resetLimit 为后台等待独占租约的上限（纳秒，0 为排空超时），测试调低
+	resetMu     sync.Mutex
+	resets      map[workerResetKey]*workerReset
+	resetHolds  int
+	resetClosed bool
+	resetWG     sync.WaitGroup
+	resetLimit  atomic.Int64
 	// primaryModels 为主用模型（PRIMARY_MODELS，由生成服务设置），与热门模型一起判断死槽位、挑替补与放置请求；
 	// requestTimeout 为请求超时（REQUEST_TIMEOUT），排空超时按它计算；serviceActive 返回生成服务是否在运行，替补只在运行时启动
 	primaryModels  atomic.Pointer[[]string]
@@ -363,7 +372,7 @@ func newAccountWorkerManager(
 		openings:    make(map[string]chan struct{}),
 		lifecycle:   lifecycle, cancel: cancel, signal: make(chan struct{}), dispatch: newDispatchQueue(),
 		victims: make(map[string]struct{}), retirements: make(map[string]*retirement), retireWake: make(chan struct{}, 1),
-		drains: make(map[string]*drainState),
+		drains: make(map[string]*drainState), resets: make(map[workerResetKey]*workerReset),
 	}
 	manager.initTimeout.Store(int64(initTimeout))
 	manager.warmTarget.Store(int64(warmTarget))
@@ -648,9 +657,12 @@ func (manager *accountWorkerManager) WorkerGeneration(accountID string) uint64 {
 	return account.generation.Load()
 }
 
-// ResetIfGeneration 等待活动请求结束后仅关闭产生当前失败的 Worker
-func (manager *accountWorkerManager) ResetIfGeneration(ctx context.Context, accountID string, generation uint64) (reset bool, err error) {
-	lease, err := manager.pool.AcquireAccount(ctx, accountID)
+// ResetIfGeneration 在已登记的独占等待上等账户的活动请求结束、取得独占租约后，仅关闭产生当前失败的 Worker 版本
+// （由 scheduleWorkerReset 在后台调用，见 worker_reset.go）
+func (manager *accountWorkerManager) ResetIfGeneration(
+	ctx context.Context, reservation *aistudio.AccountReservation, accountID string, generation uint64,
+) (reset bool, err error) {
+	lease, err := reservation.Wait(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -747,7 +759,11 @@ func (update *accountWorkerUpdate) Discard() {
 
 // ResetAll 关闭全部账户当前 worker 并保留后续按需重建能力
 func (manager *accountWorkerManager) ResetAll() error {
+	// 先暂停登记后台关闭失败 Worker 再取消后台 context：进行中的后台关闭随之放弃，等它们退出后再逐个关闭（这里直接关闭全部 Worker）
+	resumeResets := manager.pauseWorkerResets()
+	defer resumeResets()
 	manager.cancelBackgroundStartups()
+	manager.resetWG.Wait()
 	manager.mu.RLock()
 	accountIDs := make([]string, 0, len(manager.accounts))
 	for accountID := range manager.accounts {
@@ -1933,6 +1949,9 @@ func (manager *accountWorkerManager) Close() error {
 		accounts = append(accounts, account)
 	}
 	manager.mu.Unlock()
+	// 后台关闭失败 Worker 的 context 随 lifecycle 取消：不再登记新的，等进行中的退出后再关闭全部 Worker，
+	// Close 返回后不再有 goroutine 访问账户目录
+	manager.closeWorkerResets()
 	manager.waitPrewarm()
 	closeResults := make(chan error, len(accounts))
 	var closes sync.WaitGroup
@@ -2233,6 +2252,8 @@ type trackedService struct {
 	primaryModels atomic.Pointer[primaryModelSettings]
 	// queueProgress 为重复的排队进度日志全进程共用的限流（见 queue_progress.go）
 	queueProgress queueProgressLimiter
+	// resetWait 为不固定账号的请求等待同账号关闭失败 Worker 的上限，nil 时为 defaultWorkerResetWait（见 worker_reset.go，测试调整）
+	resetWait atomic.Pointer[time.Duration]
 }
 
 type modelCatalogService interface {
@@ -3090,9 +3111,9 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 		}
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(cause)
 		expectedGeneration := workerGenerations[accountID]
-		recovered, _, recoveryErr := service.recoverWorkerOnce(
-			recoveryCtx, accountID, expectedGeneration, recoveredWorkers,
-			recoverCurrentGeneration, workerFailed || waaRuntimeFailed,
+		recovered, _, _, recoveryErr := service.recoverWorkerOnce(
+			recoveryCtx, nil, accountID, expectedGeneration, recoveredWorkers,
+			recoverCurrentGeneration, workerFailed || waaRuntimeFailed, workerResetWaitUnbounded,
 		)
 		return recovered, recoveryErr
 	}
@@ -3117,37 +3138,55 @@ func needsWAARuntimeRecovery(cause error, generationChanged bool, workerFailed b
 		aistudio.DefinitiveWAARuntimeFailure(cause)
 }
 
-// recoverWorkerOnce 对指定账户的失败 Worker 版本执行至多一次恢复
+// recoverWorkerOnce 对指定账户的失败 Worker 版本执行至多一次恢复。
+// lease 为调用方仍持有的失败租约（已释放时为 nil），返回前一定已经释放：要关闭这个 Worker 版本时原子地转成独占等待交给后台关闭
+// （见 scheduleWorkerReset），其余情况照常释放，释放的错误作为 err 返回。关闭在后台进行，同一版本只关闭一次，请求取消后照常继续；
+// wait 为本次最多等多久（0 为不等待，workerResetWaitUnbounded 为一直等），有上限表示调用方可以换号。
+// 等不到、后台放弃，或关闭出错而调用方可以换号时返回 deferred：本次不在原账号重放（账号同样记为已恢复），
+// 调用方换号找不到可用账号时可以等它结束后回到原账号重放
 func (service *trackedService) recoverWorkerOnce(
 	ctx context.Context,
+	lease *aistudio.AccountLease,
 	accountID string,
 	expectedGeneration uint64,
 	recoveredWorkers map[string]struct{},
 	currentGenerationEligible bool,
 	resetCurrentGeneration bool,
-) (recovered bool, currentGeneration bool, err error) {
+	wait time.Duration,
+) (recovered bool, currentGeneration bool, deferred *workerReset, err error) {
 	if _, recovered := recoveredWorkers[accountID]; recovered {
-		return false, false, nil
+		return false, false, nil, lease.Release()
 	}
 	if service.workers.WorkerGeneration(accountID) != expectedGeneration {
 		recoveredWorkers[accountID] = struct{}{}
-		return true, false, nil
+		return true, false, nil, lease.Release()
 	}
 	if !currentGenerationEligible {
-		return false, false, nil
+		return false, false, nil, lease.Release()
 	}
 	if resetCurrentGeneration {
-		reset, err := service.workers.ResetIfGeneration(ctx, accountID, expectedGeneration)
-		if err != nil {
-			return false, false, err
+		pending, releaseErr := service.workers.scheduleWorkerReset(accountID, expectedGeneration, lease, workerResetRequest)
+		if releaseErr != nil {
+			return false, false, nil, releaseErr
 		}
-		if !reset {
+		finished, waitErr := pending.wait(ctx, wait)
+		if waitErr != nil {
+			return false, false, nil, waitErr
+		}
+		switch {
+		case !finished || pending.expired:
 			recoveredWorkers[accountID] = struct{}{}
-			return true, true, nil
+			return false, false, pending, nil
+		case pending.err != nil && wait >= 0:
+			// 调用方还能换号：关闭出错（多半是浏览器关不掉）时同样换号，不按这个错误结束请求；错误已由后台写入日志
+			recoveredWorkers[accountID] = struct{}{}
+			return false, false, pending, nil
+		case pending.err != nil:
+			return false, false, nil, pending.err
 		}
 	}
 	recoveredWorkers[accountID] = struct{}{}
-	return true, true, nil
+	return true, true, nil, nil
 }
 
 // GetGenerateVideoOperation 读取 Veo 长任务状态
@@ -3832,9 +3871,13 @@ func (service *trackedService) generateWithRetry(
 	var tierRetryAccountIDs []string
 	immediateRetry, tierRetried := false, false
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
-	// 单模型 403 写入冷却后同样计入，但不退避）。
+	// 单模型 403 写入冷却后同样计入，但不退避；没等到同账号关闭失败的 Worker 就换号时同样计入，已经等过，不再退避）。
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
 	hardFailures := 0
+	// deferredReset、deferredAccountID 为最近一次没等到关闭失败 Worker 就换号的账号与它的后台关闭（见 worker_reset.go）：
+	// 换号找不到可用账号时回到这个账号，等关闭结束后在原账号重放
+	var deferredReset *workerReset
+	deferredAccountID := ""
 	// 主用模型（PRIMARY_MODELS）的请求带一份排队预算，整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
 	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
 	budget := service.primaryBudget(modelID, scope)
@@ -3917,6 +3960,21 @@ func (service *trackedService) generateWithRetry(
 				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryQueueExceededMessage(capacityBusy))
 				err = acquireErr
 				break
+			}
+			if deferredReset != nil && requestCtx.Err() == nil && switchUnavailable(acquireErr) {
+				// 没等到同账号关闭失败的 Worker 就换号，换号却没有可用账号（例如只有原账号支持该模型、其余账号都在冷却）：
+				// 回到原账号，一直等后台关闭结束后在原账号重放，与固定账号的请求相同；后台放弃或关闭出错时按原来的错误结束
+				pending, accountID := deferredReset, deferredAccountID
+				deferredReset, deferredAccountID = nil, ""
+				trace.Note("换号没有可用账号，回到原账号等待 Worker 恢复: " + acquireErr.Error())
+				service.requests.logRequestProgress(request.ID, "service", "WARN",
+					"换号没有可用账号，回到原账号等待 Worker 恢复后重放 | 原因="+progressReason(acquireErr))
+				if finished, _ := pending.wait(requestCtx, workerResetWaitUnbounded); finished && pending.replayable() {
+					recoveryAccountID = accountID
+					delete(attempted, accountID)
+					maxAttempts++
+					continue
+				}
 			}
 			var ownerCooling *aistudio.AllCoolingError
 			if fileBound && !copyFiles && (errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling)) && requestCtx.Err() == nil {
@@ -4242,31 +4300,48 @@ func (service *trackedService) generateWithRetry(
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "输入超过模型上限（提示词过长），不换号、不冷却，按 400 返回 | 原因="+progressReason(err))
 			}
 		}
-		releaseErr := lease.Release()
-		lease = nil
-		if releaseErr != nil {
-			err = errors.Join(err, releaseErr)
-			break
+		// 租约由 recoverWorkerOnce 释放：本次失败要关闭这个 Worker 版本时原子地转成独占等待交给后台关闭（见 worker_reset.go），
+		// 排队的请求不会在释放与登记之间落到坏掉的 Worker 上；其余情况照常释放，释放出错时结束。
+		// 等待关闭的上限：请求已取消或不再重试时只登记后台关闭、不等待；不固定账号、还能换号的请求只等一小会儿（见 workerResetWaitFor），
+		// 等不到就换号；固定账号与文件绑定的请求只能用这个账号，等关闭结束后在原账号重放
+		resetWait := workerResetWaitUnbounded
+		if requestCtx.Err() != nil || !retryable {
+			resetWait = 0
+		} else if unbound && attempt+1 < maxAttempts {
+			resetWait = service.workerResetWaitFor(budget)
 		}
-		if requestCtx.Err() == nil {
-			var resetErr error
-			recoverWorker, _, resetErr = service.recoverWorkerOnce(
-				requestCtx, request.AccountID, workerGeneration, recoveredWorker,
-				needsWAARuntimeRecovery(err, false, workerFailed, workerReplaced),
-				workerFailed || waaRuntimeFailed,
-			)
-			if resetErr != nil {
-				err = errors.Join(err, resetErr)
-				retryable = false
-			}
+		recovered, _, resetDeferred, recoveryErr := service.recoverWorkerOnce(
+			requestCtx, lease, request.AccountID, workerGeneration, recoveredWorker,
+			needsWAARuntimeRecovery(err, false, workerFailed, workerReplaced),
+			workerFailed || waaRuntimeFailed, resetWait,
+		)
+		lease = nil
+		if recoveryErr != nil {
+			err = errors.Join(err, recoveryErr)
+			retryable = false
 		}
 		if !retryable {
 			break
+		}
+		// 请求已取消时只登记了后台关闭，不重放也不换号（与原先不恢复相同）
+		if requestCtx.Err() == nil {
+			recoverWorker = recovered
+		} else {
+			resetDeferred = nil
 		}
 		if recoverWorker {
 			recoveryAccountID = request.AccountID
 			delete(attempted, request.AccountID)
 			maxAttempts++
+		}
+		if resetDeferred != nil {
+			// 没等到同账号关闭失败的 Worker：后台继续关闭，期间账号不接新请求，本请求换号。原账号重新记为已尝试：同一次失败的额度冷却、
+			// 单模型 403 与改走 Build 可能刚把它移出；换号找不到可用账号时再回到这里等关闭结束（见上文选号失败的处理）
+			attempted[request.AccountID] = struct{}{}
+			deferredReset, deferredAccountID = resetDeferred, request.AccountID
+			note := resetDeferred.deferralNote(resetWait)
+			trace.Note(note + "，换号重试")
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", note+"，换号重试 | 原因="+progressReason(err))
 		}
 		if attempt+1 == maxAttempts {
 			break
@@ -4278,9 +4353,9 @@ func (service *trackedService) generateWithRetry(
 					"已连续 %d 次失败，不再换号 | 原因=%s", hardFailures, progressReason(err)))
 				break
 			}
-			// 单模型 403 已冷却该账号，换号不退避；主用模型的排队截止时间已过时同样不退避：下一次尝试只接受立即可用的账号，
-			// 退避只会推迟 429
-			if !modelForbidden && !budget.expired() {
+			// 单模型 403 已冷却该账号，换号不退避；没等到 Worker 关闭就换号时已经等过，同样不退避；
+			// 主用模型的排队截止时间已过时同样不退避：下一次尝试只接受立即可用的账号，退避只会推迟 429
+			if !modelForbidden && resetDeferred == nil && !budget.expired() {
 				if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
 					break
 				}

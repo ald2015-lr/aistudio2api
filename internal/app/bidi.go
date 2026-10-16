@@ -55,9 +55,9 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 			return false, nil
 		}
 		expectedGeneration := workerGenerations[accountID]
-		recovered, _, recoveryErr := service.recoverWorkerOnce(
-			recoveryCtx, accountID, expectedGeneration, recoveredWorkers,
-			recoverCurrentGeneration, workerFailed || waaRuntimeFailed,
+		recovered, _, _, recoveryErr := service.recoverWorkerOnce(
+			recoveryCtx, nil, accountID, expectedGeneration, recoveredWorkers,
+			recoverCurrentGeneration, workerFailed || waaRuntimeFailed, workerResetWaitUnbounded,
 		)
 		return recovered, recoveryErr
 	}

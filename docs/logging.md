@@ -109,7 +109,12 @@ Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启�
 | `WAA Worker 空闲回收 | Worker=N/M` | 超出热池目标的 Worker 空闲 5 分钟后关闭 |
 | `WAA Worker 旧实例停止失败` | 旧实例关闭失败，发布中止并开始关闭 pending Worker |
 | `WAA Worker 重建 | 模型=... | 重放当前请求` | 当前账户 Worker 已失效，业务请求在新实例重放；下一行 `原因:` 为触发重建的错误 |
+| `WAA Worker 后台恢复放弃 | 等待=<DURATION> | ...` | 后台关闭失败的 Worker 时超过 `REQUEST_TIMEOUT` + 30 秒仍有同账户请求在用，放弃这次关闭、账户恢复接受请求；浏览器已失败的 Worker 由失败 Worker 巡检重新登记，协议 Code 5 的 Worker 在再次失败时重新登记 |
+| `WAA Worker 后台恢复出错 | 错误=...` | 后台关闭失败的 Worker 出错（浏览器关不掉时另有 `WAA Worker 停止失败`）；不固定账户的请求已经换号 |
+| `常驻 Worker 已失败，后台关闭以便重新预热` | 失败 Worker 巡检登记的后台关闭完成，随后由预热补齐；出错时为 `关闭失败的常驻 Worker 出错 | ...` |
 | `WAA Worker 已更新 | 模型=... | 重放当前请求` | 并发路径已经替换 Worker，当前请求使用新实例 |
+
+不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`。
 
 按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（权益为 Ultra 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`。
 

@@ -62,8 +62,9 @@ func (service *trackedService) Transcribe(
 		}
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(cause)
 		expectedGeneration := workerGenerations[accountID]
-		recovered, currentGeneration, recoveryErr := service.recoverWorkerOnce(
-			recoveryCtx, accountID, expectedGeneration, recoveredWorkers, true, workerFailed || waaRuntimeFailed,
+		recovered, currentGeneration, _, recoveryErr := service.recoverWorkerOnce(
+			recoveryCtx, nil, accountID, expectedGeneration, recoveredWorkers, true, workerFailed || waaRuntimeFailed,
+			workerResetWaitUnbounded,
 		)
 		if recoveryErr != nil {
 			return false, recoveryErr

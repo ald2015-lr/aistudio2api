@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -20,8 +19,6 @@ const (
 	keepWarmInterval = 5 * time.Second
 	// warmFailureBackoff 为预热失败的账户在此期间内不再被自动预热
 	warmFailureBackoff = 5 * time.Minute
-	// failedWorkerSweepWait 为后台关闭失败 Worker 时等待该账户进行中请求结束的上限；超时则下一轮再试
-	failedWorkerSweepWait = 3 * time.Second
 	// cleanupRetryFirst、cleanupRetryMax 为清理失败（浏览器关不掉、运行时租约释放失败）的账户后台重试间隔
 	cleanupRetryFirst = 30 * time.Second
 	cleanupRetryMax   = 10 * time.Minute
@@ -468,7 +465,10 @@ func (manager *accountWorkerManager) retryPendingCleanup() {
 }
 
 // sweepFailedWorkers 关闭已失败的常驻 Worker（浏览器退出、控制连接断开等），释放常驻名额，随后由 keepWarm 补齐。
-// 原先失败的 Worker 只看 warm 标志仍计入常驻数，也没有巡检，可用容量会悄悄缩水，只能等请求到来时现场重建
+// 原先失败的 Worker 只看 warm 标志仍计入常驻数，也没有巡检，可用容量会悄悄缩水，只能等请求到来时现场重建。
+// 这里只登记后台关闭、不等待（见 scheduleWorkerReset，结束时由后台写日志）：原先逐个账号最多等 3 秒，每个仍有请求在用的失败账号
+// 都把 keepWarm 这一轮（随后的清理重试与预热补齐）推迟 3 秒，等不到时又放开账号约 2 秒、让新请求落到坏掉的 Worker 上；
+// 现在后台关闭期间账号一直不接新请求，同一版本已在关闭（请求失败时登记的）时沿用那一次
 func (manager *accountWorkerManager) sweepFailedWorkers(ctx context.Context) {
 	for _, accountID := range manager.WarmAccountIDs() {
 		if ctx.Err() != nil {
@@ -477,15 +477,6 @@ func (manager *accountWorkerManager) sweepFailedWorkers(ctx context.Context) {
 		if !manager.WorkerFailed(accountID) {
 			continue
 		}
-		generation := manager.WorkerGeneration(accountID)
-		sweepCtx, cancel := context.WithTimeout(ctx, failedWorkerSweepWait)
-		reset, err := manager.ResetIfGeneration(sweepCtx, accountID, generation)
-		cancel()
-		switch {
-		case reset:
-			manager.requests.log(accountID, "WARN", "常驻 Worker 已失败，后台关闭以便重新预热")
-		case err != nil && ctx.Err() == nil && !errors.Is(err, context.DeadlineExceeded):
-			manager.requests.log(accountID, "WARN", "关闭失败的常驻 Worker 出错 | "+strings.TrimSpace(err.Error()))
-		}
+		_, _ = manager.scheduleWorkerReset(accountID, manager.WorkerGeneration(accountID), nil, workerResetSweep)
 	}
 }
