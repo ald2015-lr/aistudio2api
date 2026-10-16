@@ -218,7 +218,7 @@ Text chat models accept name suffixes, combinable in any order (for example `gem
 
 A catalog model ID that already ends in a level (for example `xxx-low`) uses that level instead of being forced to the highest.
 
-The model name in responses (`model` for OpenAI, Anthropic, Responses and Interactions; `modelVersion` for Gemini) is the requested name with these suffixes removed: requests for `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-128` and `gemini-3.1-pro-preview-low` all return `gemini-3.1-pro-preview`; names not in the catalog are returned as requested. The upstream-reported serving model version is not returned there; it only appears in the `provider_model` field of OpenAI and Responses and in the admin logs.
+The model name in responses (`model` for OpenAI, Anthropic, Responses and Interactions; `modelVersion` for Gemini) is the requested name with these suffixes removed: requests for `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-128` and `gemini-3.1-pro-preview-low` all return `gemini-3.1-pro-preview`; names not in the catalog are returned as requested. Names with a `models/` prefix (such as `models/gemini-3.1-pro-preview-low`) are resolved after removing the prefix, the same in every protocol. The upstream-reported serving model version is not returned there; it only appears in the `provider_model` field of OpenAI, Responses and non-streaming Anthropic responses, and the admin log records `served_model` when the serving model belongs to a different family than the requested one.
 
 Every API call must send `PROXY_API_KEY` (default `sk-onechat-fun-fun`, editable in the Settings page). With the default key, only pages on this machine can call the API from a browser; web clients need a custom key.
 

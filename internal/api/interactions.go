@@ -170,7 +170,7 @@ func resolveInteractionResults(contents []aistudio.Content) error {
 	return nil
 }
 
-// interactionObject 构造 SDK 使用的资源标识、状态与用量；model 为客户端请求的模型名（含后缀）
+// interactionObject 构造 SDK 使用的资源标识、状态与用量；model 为请求的模型名去掉后缀（见 responseModel）
 func interactionObject(id string, model string, created string, status string, usage *aistudio.Usage) map[string]any {
 	object := map[string]any{
 		"id": id, "object": "interaction", "model": model,

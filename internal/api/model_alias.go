@@ -116,8 +116,10 @@ func resolveModelAlias(models []aistudio.Model, name string) (aistudio.Model, mo
 		}
 		return aistudio.Model{}, false
 	}
-	// 客户端配置里复制粘贴的模型名常带首尾空白：先去掉再解析，改写后的 request.Model 也是干净的目录 ID
-	name = strings.TrimSpace(name)
+	// 客户端配置里复制粘贴的模型名常带首尾空白：先去掉再解析，改写后的 request.Model 也是干净的目录 ID。
+	// 去掉 models/ 前缀后再解析：Gemini 与 Interactions 入口已经去掉，OpenAI、Anthropic、Responses 原先带着前缀解析不到，
+	// 后缀不生效、响应里的模型名也与其他协议不一致
+	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
 	alias := modelAlias{base: name}
 	for {
 		if model, ok := byID(alias.base); ok {

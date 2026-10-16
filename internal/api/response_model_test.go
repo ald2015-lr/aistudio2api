@@ -64,6 +64,7 @@ func TestResponseModelReportsRequestedBaseName(t *testing.T) {
 		{requested: base + "-low", want: base},
 		{requested: base + "-medium-nothinking-online", want: base},
 		{requested: " " + base + "-high ", want: base},
+		{requested: "models/" + base + "-low", want: base},
 		{requested: "unknown-model-low", want: "unknown-model-low"},
 	} {
 		name, err := json.Marshal(test.requested)
@@ -113,8 +114,8 @@ func TestResponseModelReportsRequestedBaseName(t *testing.T) {
 		interaction := postJSON(t, handler, "/v1beta/interactions", `{"model":`+model+`,"input":"hi","store":false}`, nil)
 		check("Interactions", []string{decode("Interactions", interaction.Body.String())["model"].(string)})
 
-		if strings.TrimSpace(test.requested) != test.requested {
-			continue // Gemini 的模型名在路径里，不带空白
+		if strings.TrimSpace(test.requested) != test.requested || strings.HasPrefix(test.requested, "models/") {
+			continue // Gemini 的模型名在路径里，不带空白，也不再带 models/ 前缀
 		}
 		gemini := postJSON(t, handler, "/v1beta/models/"+test.requested+":generateContent", `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, nil)
 		check("Gemini", []string{decode("Gemini", gemini.Body.String())["modelVersion"].(string)})
