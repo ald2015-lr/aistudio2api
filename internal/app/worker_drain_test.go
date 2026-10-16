@@ -111,14 +111,36 @@ func leaseCount(counts *sync.Map, accountID string) int64 {
 	return value.(*atomic.Int64).Load()
 }
 
-// browsers 返回分区内占用浏览器的数量：持有进程或运行锁的槽位，加上还没发布的启动中账户
+// browsers 精确返回分区内真正持有浏览器的账户数：在账户锁内看 Worker 或待关闭的 Worker，加上还没有 Worker 的启动中账户。
+// 不用 occupiedWorkersIn：它把锁被占用的账户按 1 个槽位估计（容量判断宁可多算），测试取样时会把正被短暂加锁、
+// 并没有浏览器的账户也算进去，误报超过 峰值 + drainLimit
 func (env *drainEnv) browsers() int {
-	occupancy := env.manager.occupiedWorkersIn(aistudio.PoolScopeNormal, env.pool.UltraAccountIDs())
-	count := occupancy.slots
-	for _, accountID := range env.manager.OpeningAccountIDs() {
-		if !slices.Contains(occupancy.accountIDs, accountID) {
-			count++
+	manager := env.manager
+	ultra := env.pool.UltraAccountIDs()
+	manager.mu.RLock()
+	accounts := make([]*accountWorker, 0, len(manager.accounts))
+	for _, account := range manager.accounts {
+		if partitionOf(account.id, ultra) == aistudio.PoolScopeNormal {
+			accounts = append(accounts, account)
 		}
+	}
+	manager.mu.RUnlock()
+	opening := manager.OpeningAccountIDs()
+	count := 0
+	for _, account := range accounts {
+		account.mu.Lock()
+		held := 0
+		if account.worker != nil {
+			held++
+		}
+		if account.cleanupWorker != nil {
+			held++
+		}
+		account.mu.Unlock()
+		if held == 0 && slices.Contains(opening, account.id) {
+			held = 1
+		}
+		count += held
 	}
 	return count
 }
@@ -860,5 +882,40 @@ func TestStandbyPreferenceNeedsPrimarySupport(t *testing.T) {
 	}
 	if got := env.manager.preferUncooled(groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
 		t.Fatalf("预热排序应把能服务主用模型的账号排在前面: %v", got)
+	}
+}
+
+// TestRuntimeAvailableLockFree 调度过滤占用退避中的账户只读原子值、不取账户锁：账户锁被别处占着时也不阻塞，
+// 也就不会让 occupiedWorkersIn 把正被读取的备用账户误算成浏览器槽位；占用退避期内的账户被排除并返回原因，解除后恢复
+func TestRuntimeAvailableLockFree(t *testing.T) {
+	accounts := []string{"drain-x@example.com", "drain-y@example.com"}
+	env := newDrainEnv(t, accounts, 1, 2)
+	env.manager.mu.RLock()
+	busy := env.manager.accounts[accounts[0]]
+	env.manager.mu.RUnlock()
+	if err := env.manager.markRuntimeBusy(busy, errors.New("另一个进程持有运行锁")); !errors.Is(err, errAccountRuntimeBusy) {
+		t.Fatalf("markRuntimeBusy 返回 %v", err)
+	}
+	busy.mu.Lock()
+	result := make(chan []string, 1)
+	var reason error
+	go func() {
+		available, err := env.manager.runtimeAvailable(accounts)
+		reason = err
+		result <- available
+	}()
+	select {
+	case available := <-result:
+		busy.mu.Unlock()
+		if !slices.Equal(available, accounts[1:]) || !errors.Is(reason, errAccountRuntimeBusy) || !strings.Contains(reason.Error(), "另一个进程持有运行锁") {
+			t.Fatalf("可用账户 %v，原因 %v；期望排除占用中的 %s 并返回原因", available, reason, accounts[0])
+		}
+	case <-time.After(2 * time.Second):
+		busy.mu.Unlock()
+		t.Fatal("runtimeAvailable 不应等待账户锁")
+	}
+	env.manager.clearRuntimeBusy(busy)
+	if available, err := env.manager.runtimeAvailable(accounts); !slices.Equal(available, accounts) || err != nil {
+		t.Fatalf("解除占用后可用账户 %v，原因 %v", available, err)
 	}
 }

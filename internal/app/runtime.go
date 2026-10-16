@@ -217,9 +217,12 @@ type accountWorker struct {
 	warm           atomic.Bool
 	readyAt        atomic.Int64
 	generation     atomic.Uint64
-	busyUntil      time.Time
-	busyDelay      time.Duration
-	busyErr        error
+	// busyUntil（UnixNano，0 为没有）与 busyErr 为被其他进程占用时的退避期限与原因：每次调度都要对上万个备用账户读一遍，
+	// 用原子值读取，不取账户锁（取账户锁会让 occupiedWorkersIn 把正被读取的备用账户误算成占用的浏览器槽位）；
+	// 写入与 busyDelay 一样在账户锁内进行
+	busyUntil atomic.Int64
+	busyDelay time.Duration
+	busyErr   atomic.Pointer[error]
 	// cleanupRetryAt 与 cleanupBackoff 为清理失败后下一次后台重试的时间与间隔（由 account.mu 保护）
 	cleanupRetryAt time.Time
 	cleanupBackoff time.Duration
@@ -411,9 +414,10 @@ func (manager *accountWorkerManager) markRuntimeBusy(account *accountWorker, cau
 		account.busyDelay = min(account.busyDelay*2, runtimeBusyMaxDelay)
 	}
 	delay := account.busyDelay
-	account.busyUntil = time.Now().Add(delay)
-	account.busyErr = fmt.Errorf("%w: %w", errAccountRuntimeBusy, cause)
-	busyErr := account.busyErr
+	busyErr := fmt.Errorf("%w: %w", errAccountRuntimeBusy, cause)
+	// 先写原因再写期限：读到期限未到的一方总能拿到原因
+	account.busyErr.Store(&busyErr)
+	account.busyUntil.Store(time.Now().Add(delay).UnixNano())
 	label := account.label
 	account.mu.Unlock()
 	if first {
@@ -430,8 +434,8 @@ func (manager *accountWorkerManager) clearRuntimeBusy(account *accountWorker) {
 	account.mu.Lock()
 	wasBusy := account.busyDelay != 0
 	account.busyDelay = 0
-	account.busyUntil = time.Time{}
-	account.busyErr = nil
+	account.busyUntil.Store(0)
+	account.busyErr.Store(nil)
 	label := account.label
 	account.mu.Unlock()
 	if wasBusy {
@@ -439,27 +443,28 @@ func (manager *accountWorkerManager) clearRuntimeBusy(account *accountWorker) {
 	}
 }
 
-// runtimeAvailable 过滤仍在占用退避期内的账户，并返回其中一个占用原因
+// runtimeAvailable 过滤仍在占用退避期内的账户，并返回其中一个占用原因。只读原子值、不取账户锁：
+// 每次调度都要对上万个备用账户调用，原先逐个取账户锁，同时让 occupiedWorkersIn 把正被读取的账户按“锁被占用”误算成浏览器槽位
 func (manager *accountWorkerManager) runtimeAvailable(accountIDs []string) ([]string, error) {
-	now := time.Now()
+	nowNanos := time.Now().UnixNano()
 	available := make([]string, 0, len(accountIDs))
 	var busyErr error
+	manager.mu.RLock()
+	defer manager.mu.RUnlock()
 	for _, accountID := range accountIDs {
-		manager.mu.RLock()
 		account := manager.accounts[accountID]
-		manager.mu.RUnlock()
 		if account == nil {
 			available = append(available, accountID)
 			continue
 		}
-		account.mu.Lock()
-		busy := now.Before(account.busyUntil)
-		if busy && busyErr == nil {
-			busyErr = account.busyErr
-		}
-		account.mu.Unlock()
-		if !busy {
+		if until := account.busyUntil.Load(); until == 0 || nowNanos >= until {
 			available = append(available, accountID)
+			continue
+		}
+		if busyErr == nil {
+			if stored := account.busyErr.Load(); stored != nil {
+				busyErr = *stored
+			}
 		}
 	}
 	return available, busyErr
