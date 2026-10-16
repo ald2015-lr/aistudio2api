@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -25,12 +26,13 @@ func waaRuntimeFailure(method string) error {
 }
 
 // workerFailureService 是测试用的上游：failures 中账户的前几次调用先执行 beforeFail（模拟同账号还有请求在输出、等其他请求到齐等），
-// 再返回协议 Code 5；其余调用正常返回一段正文
+// 再返回协议 Code 5；serverErrors 中账户的前几次调用返回 HTTP 500（与 Worker 无关的一般失败）；其余调用正常返回一段正文
 type workerFailureService struct {
-	mu         sync.Mutex
-	failures   map[string]int
-	beforeFail func(accountID string)
-	calls      []string
+	mu           sync.Mutex
+	failures     map[string]int
+	serverErrors map[string]int
+	beforeFail   func(accountID string)
+	calls        []string
 }
 
 func newWorkerFailureService(failures map[string]int) *workerFailureService {
@@ -52,8 +54,15 @@ func (service *workerFailureService) Generate(_ context.Context, request aistudi
 	if fail {
 		service.failures[request.AccountID]--
 	}
+	serverError := !fail && service.serverErrors[request.AccountID] > 0
+	if serverError {
+		service.serverErrors[request.AccountID]--
+	}
 	hook := service.beforeFail
 	service.mu.Unlock()
+	if serverError {
+		return nil, &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusInternalServerError, Message: "internal error"}
+	}
 	if fail {
 		if hook != nil {
 			hook(request.AccountID)
@@ -119,6 +128,13 @@ type resetTestResult struct {
 
 // startResetTestRequest 在后台执行一次生成（accountID 非空时固定账号），返回结果通道
 func startResetTestRequest(ctx context.Context, service *trackedService, id string, accountID string) <-chan resetTestResult {
+	return startResetTestRequestWithin(ctx, service, id, accountID, 20*time.Second)
+}
+
+// startResetTestRequestWithin 与 startResetTestRequest 相同，请求上下文 timeout 后超时
+func startResetTestRequestWithin(
+	ctx context.Context, service *trackedService, id string, accountID string, timeout time.Duration,
+) <-chan resetTestResult {
 	request := aistudio.GenerateRequest{
 		ID: id, Model: testRuntimeModel, AccountID: accountID,
 		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
@@ -126,7 +142,7 @@ func startResetTestRequest(ctx context.Context, service *trackedService, id stri
 	results := make(chan resetTestResult, 1)
 	startedAt := time.Now()
 	go func() {
-		requestCtx, requestCancel := context.WithTimeout(ctx, 20*time.Second)
+		requestCtx, requestCancel := context.WithTimeout(ctx, timeout)
 		defer requestCancel()
 		events := make(chan aistudio.Event, 8)
 		done := make(chan struct{})
@@ -170,7 +186,12 @@ type siblingHolder struct {
 }
 
 func newSiblingHolder(pool *aistudio.AccountPool) *siblingHolder {
-	return &siblingHolder{pool: pool, held: make(chan *aistudio.AccountLease, 4), fails: make(chan error, 4)}
+	return newSiblingHolderFor(pool, 4)
+}
+
+// newSiblingHolderFor 返回最多占住 capacity 个槽位的 siblingHolder（多个账号依次失败时使用）
+func newSiblingHolderFor(pool *aistudio.AccountPool, capacity int) *siblingHolder {
+	return &siblingHolder{pool: pool, held: make(chan *aistudio.AccountLease, capacity), fails: make(chan error, capacity)}
 }
 
 func (holder *siblingHolder) hold(accountID string) {
@@ -411,6 +432,221 @@ func TestWorkerResetFallsBackWhenSwitchFindsNothing(t *testing.T) {
 	}
 }
 
+// resetTestAccounts 返回 n 个按 ID 排序的测试账户（fill-first 下依次使用）
+func resetTestAccounts(n int) []string {
+	accountIDs := make([]string, n)
+	for index := range accountIDs {
+		accountIDs[index] = fmt.Sprintf("acct%02d@example.com", index)
+	}
+	return accountIDs
+}
+
+// TestWorkerResetAtFailureLimitWaitsForReset 连续 Code 5、每个账号都还有其他请求在输出：前 4 次只等一小会儿就换号，
+// 第 5 次失败计入连续失败上限后就不能再换号，一直等这个账号关闭结束后在原账号重放，不按 Code 5 结束。
+// 原先"还能换号"只看换号次数（启用账号数），第 5 次同样只等一小会儿，随后到上限按 Code 5 失败（约 250ms、5 次调用）
+func TestWorkerResetAtFailureLimitWaitsForReset(t *testing.T) {
+	accountIDs := resetTestAccounts(generateFailureLimit + 1)
+	failures := make(map[string]int, len(accountIDs))
+	for _, accountID := range accountIDs {
+		failures[accountID] = 1
+	}
+	upstream := newWorkerFailureService(failures)
+	service, _ := workerResetTestService(t, upstream, accountIDs...)
+	holder := newSiblingHolderFor(service.pool, len(accountIDs))
+	upstream.beforeFail = holder.hold
+
+	results := startResetTestRequest(service.lifecycle, service, "req-reset-limit", "")
+	siblings := make([]*aistudio.AccountLease, 0, generateFailureLimit)
+	for range generateFailureLimit {
+		siblings = append(siblings, holder.lease(t))
+	}
+	select {
+	case result := <-results:
+		t.Fatalf("到连续失败上限的请求不应在关闭完成前结束: text=%q err=%v calls=%v", result.text, result.err, upstream.called())
+	case <-time.After(500 * time.Millisecond):
+	}
+	if calls := upstream.called(); !slices.Equal(calls, accountIDs[:generateFailureLimit]) {
+		t.Fatalf("上游调用 = %v，期望前 %d 个账号各失败一次", calls, generateFailureLimit)
+	}
+	if got := queueProgressCount(service, "WARN", "后台继续关闭失败的 Worker，换号重试"); got != generateFailureLimit-1 {
+		t.Fatalf("没等到关闭就换号 %d 次，期望 %d 次（第 %d 次失败已不能再换号）", got, generateFailureLimit-1, generateFailureLimit)
+	}
+	for _, sibling := range siblings {
+		if err := sibling.Release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := awaitResetTestResult(t, results, 10*time.Second)
+	if result.err != nil || result.text != "hello" {
+		t.Fatalf("text=%q err=%v，期望关闭后在原账号重放成功", result.text, result.err)
+	}
+	last := accountIDs[generateFailureLimit-1]
+	if calls := upstream.called(); !slices.Equal(calls, append(slices.Clone(accountIDs[:generateFailureLimit]), last)) {
+		t.Fatalf("上游调用 = %v，期望在 %s 上重放", calls, last)
+	}
+	if progressLogged(service, "不再换号") {
+		t.Fatal("等到关闭后在原账号重放，不应按连续失败上限结束")
+	}
+	waitResetsSettled(t, service.workers)
+}
+
+// TestWorkerResetReturnsWhenSwitchingEnds 没等到关闭就换号之后其他账号接连一般失败（HTTP 500）：到连续失败上限或换号次数用完时
+// 回到原账号一直等关闭结束后重放，不按最后一次的失败结束（原先只在换号没有可用账号时回去）
+func TestWorkerResetReturnsWhenSwitchingEnds(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		accounts int
+		why      string
+	}{
+		// 6 个账号：第 5 次失败到连续失败上限
+		{name: "failure-limit", accounts: generateFailureLimit + 1, why: fmt.Sprintf("已连续 %d 次失败", generateFailureLimit)},
+		// 3 个账号：最后一次尝试换号次数用完
+		{name: "attempts", accounts: 3, why: "换号次数已用完"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			accountIDs := resetTestAccounts(test.accounts)
+			upstream := newWorkerFailureService(map[string]int{accountIDs[0]: 1})
+			upstream.serverErrors = make(map[string]int)
+			for _, accountID := range accountIDs[1:] {
+				upstream.serverErrors[accountID] = 1
+			}
+			service, closed := workerResetTestService(t, upstream, accountIDs...)
+			holder := newSiblingHolder(service.pool)
+			upstream.beforeFail = holder.hold
+
+			results := startResetTestRequest(service.lifecycle, service, "req-reset-ends-"+test.name, "")
+			sibling := holder.lease(t)
+			if !waitUntil(10*time.Second, func() bool {
+				return progressLogged(service, test.why+"，回到原账号等待 Worker 恢复后重放")
+			}) {
+				t.Fatalf("应写明%s后回到原账号等待，上游调用 = %v", test.why, upstream.called())
+			}
+			select {
+			case result := <-results:
+				t.Fatalf("关闭完成前请求不应结束: text=%q err=%v", result.text, result.err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			if err := sibling.Release(); err != nil {
+				t.Fatal(err)
+			}
+			result := awaitResetTestResult(t, results, 10*time.Second)
+			if result.err != nil || result.text != "hello" {
+				t.Fatalf("text=%q err=%v，期望回到原账号重放成功", result.text, result.err)
+			}
+			want := append(slices.Clone(accountIDs[:min(test.accounts, generateFailureLimit)]), accountIDs[0])
+			if calls := upstream.called(); !slices.Equal(calls, want) {
+				t.Fatalf("上游调用 = %v，期望 %v（最后在 %s 上重放）", calls, want, accountIDs[0])
+			}
+			if got := closed[accountIDs[0]](); got != 1 {
+				t.Fatalf("Worker 关闭 %d 次，期望 1 次", got)
+			}
+		})
+	}
+}
+
+// TestWorkerResetFallbackWaitEndsWithRequest 回到原账号等关闭结束时请求超时或被取消：按请求结束的错误结束（errors.Is 的 504/499、
+// cancelled 状态不变），错误写明在等 WAA Worker 恢复；原先丢掉 ctx 错误，按上次的 Code 5 失败对外 502
+func TestWorkerResetFallbackWaitEndsWithRequest(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		timeout time.Duration
+		cancel  bool
+		want    error
+		outcome string
+		state   string
+	}{
+		{name: "timeout", timeout: time.Second, want: context.DeadlineExceeded, outcome: "请求超时", state: "failed"},
+		{name: "cancel", timeout: 20 * time.Second, cancel: true, want: context.Canceled, outcome: "请求已取消", state: "cancelled"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream := newWorkerFailureService(map[string]int{resetTestAlice: 1})
+			service, _ := workerResetTestService(t, upstream, resetTestAlice, resetTestBob)
+			// bob 不支持该模型：换号找不到账号，回到原账号等待
+			if err := service.pool.SetCatalog(resetTestBob, aistudio.BenefitTierFree, []aistudio.Model{{
+				ID: "other-model", Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true},
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			holder := newSiblingHolder(service.pool)
+			upstream.beforeFail = holder.hold
+			ctx, cancel := context.WithCancel(service.lifecycle)
+			defer cancel()
+
+			results := startResetTestRequestWithin(ctx, service, "req-reset-fallback-"+test.name, "", test.timeout)
+			sibling := holder.lease(t)
+			defer func() { _ = sibling.Release() }()
+			if !waitUntil(5*time.Second, func() bool {
+				return progressLogged(service, "换号没有可用账号，回到原账号等待 Worker 恢复后重放")
+			}) {
+				t.Fatal("换号找不到账号时应回到原账号等待")
+			}
+			if test.cancel {
+				cancel()
+			}
+			result := awaitResetTestResult(t, results, 10*time.Second)
+			if !errors.Is(result.err, test.want) || finalRequestState(result.err) != test.state {
+				t.Fatalf("err = %v，期望满足 %v、状态 %s", result.err, test.want, test.state)
+			}
+			if message := result.err.Error(); !strings.HasPrefix(message, "回到原账号等待 ") ||
+				!strings.Contains(message, "后"+test.outcome+"（最后原因=WAA Worker 恢复，上次失败=") ||
+				!strings.Contains(message, "协议错误码 5") {
+				t.Fatalf("错误文案 = %q，期望写明在等 WAA Worker 恢复与上次的失败", message)
+			}
+			if calls := upstream.called(); !slices.Equal(calls, []string{resetTestAlice}) {
+				t.Fatalf("上游调用 = %v，期望请求结束后不再重放", calls)
+			}
+		})
+	}
+}
+
+// TestSwitchQueueReturnsWhenDeferredResetFinishes 没等到关闭就换号、其他账号都满了而排队：原账号的关闭结束后不再等其他账号空出槽位，
+// 回到原账号重放。原先原账号在这次选号里一直被排除，关闭完成、空闲着也用不上，只能等 bob 空出槽位或请求超时
+func TestSwitchQueueReturnsWhenDeferredResetFinishes(t *testing.T) {
+	upstream := newWorkerFailureService(map[string]int{resetTestAlice: 1})
+	service, closed := workerResetTestService(t, upstream, resetTestAlice, resetTestBob)
+	// 占满 bob 的两个并发槽位：换号后的选号只能排队
+	releaseBob := []func(){holdLease(t, service.pool, resetTestBob), holdLease(t, service.pool, resetTestBob)}
+	defer func() {
+		for _, release := range releaseBob {
+			release()
+		}
+	}()
+	holder := newSiblingHolder(service.pool)
+	upstream.beforeFail = holder.hold
+
+	results := startResetTestRequest(service.lifecycle, service, "req-reset-switch-queue", "")
+	sibling := holder.lease(t)
+	if !waitUntil(5*time.Second, func() bool {
+		return progressLogged(service, "后台继续关闭失败的 Worker，换号重试") && dispatchWaiters(service) > 0
+	}) {
+		t.Fatal("换号后应在 bob 上排队")
+	}
+	select {
+	case result := <-results:
+		t.Fatalf("bob 满着、alice 关闭前请求不应结束: text=%q err=%v", result.text, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := sibling.Release(); err != nil {
+		t.Fatal(err)
+	}
+	result := awaitResetTestResult(t, results, 5*time.Second)
+	if result.err != nil || result.text != "hello" {
+		t.Fatalf("text=%q err=%v，期望 alice 关闭后回到 alice 重放成功", result.text, result.err)
+	}
+	if calls := upstream.called(); !slices.Equal(calls, []string{resetTestAlice, resetTestAlice}) {
+		t.Fatalf("上游调用 = %v，期望在 alice 上重放（bob 一直满着）", calls)
+	}
+	if !progressLogged(service, "换号排队中原账号的 WAA Worker 已恢复，回到原账号重放") {
+		t.Fatal("请求进度应写明换号排队中回到原账号")
+	}
+	if got := closed[resetTestAlice](); got != 1 {
+		t.Fatalf("Worker 关闭 %d 次，期望 1 次", got)
+	}
+	if waiters := dispatchWaiters(service); waiters != 0 {
+		t.Fatalf("请求结束后仍有 %d 个等待者", waiters)
+	}
+}
+
 // TestPrimaryBudgetLimitsWorkerResetWait 主用模型的请求带排队预算：等待关闭最多 1 秒且不超过剩余预算的四分之一，
 // 不在等关闭上用完预算（用完后只接受立即可用的账号，否则按 429 结束）
 func TestPrimaryBudgetLimitsWorkerResetWait(t *testing.T) {
@@ -457,6 +693,70 @@ func TestWorkerResetWaitFor(t *testing.T) {
 	expired := &leaseWaitBudget{limit: time.Second, startedAt: time.Now().Add(-2 * time.Second)}
 	if got := service.workerResetWaitFor(expired); got != 0 {
 		t.Fatalf("预算用完时等待 = %s，期望不等待", got)
+	}
+}
+
+// TestWorkerResetWakeWait 换号排队时原账号关闭结束的唤醒：结束且能重放时返回 errWorkerResetReady（已结束时不再等待），
+// 结束但不能重放时按一次调度信号返回 nil；唤醒经派生的等待上下文，请求上下文不取消，请求超时时仍返回 context.DeadlineExceeded
+func TestWorkerResetWakeWait(t *testing.T) {
+	blockingWait := func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	waitCalled := false
+	signalWait := func(context.Context) error {
+		waitCalled = true
+		return nil
+	}
+
+	// 没有要等的原账号：只是原来的等待
+	var none *workerReset
+	if err := none.wakeWait(context.Background(), signalWait); err != nil || !waitCalled {
+		t.Fatalf("pending 为 nil 时 err=%v waitCalled=%v，期望原样等待", err, waitCalled)
+	}
+	base := context.Background()
+	if withWorkerResetWake(base, nil) != base || workerResetWakeFromContext(base) != nil {
+		t.Fatal("没有原账号时选号上下文应原样返回")
+	}
+
+	// 已经结束：能重放时不再等待，不能重放时照常等待、也不放进选号上下文
+	waitCalled = false
+	if err := finishedWorkerReset(true, false, nil).wakeWait(base, signalWait); !errors.Is(err, errWorkerResetReady) || waitCalled {
+		t.Fatalf("已结束且能重放时 err=%v waitCalled=%v，期望不等待直接返回 errWorkerResetReady", err, waitCalled)
+	}
+	expired := finishedWorkerReset(false, true, nil)
+	if err := expired.wakeWait(base, signalWait); err != nil || !waitCalled {
+		t.Fatalf("已结束但不能重放时 err=%v waitCalled=%v，期望照常等待", err, waitCalled)
+	}
+	if withWorkerResetWake(base, expired) != base {
+		t.Fatal("不能重放的关闭不应放进选号上下文")
+	}
+
+	// 等待中结束且能重放：提前返回 errWorkerResetReady，请求上下文不受影响
+	ctx, cancel := context.WithCancel(base)
+	defer cancel()
+	pending := &workerReset{done: make(chan struct{})}
+	if workerResetWakeFromContext(withWorkerResetWake(ctx, pending)) != pending {
+		t.Fatal("还没结束的关闭应放进选号上下文")
+	}
+	time.AfterFunc(50*time.Millisecond, func() { pending.reset = true; close(pending.done) })
+	if err := pending.wakeWait(ctx, blockingWait); !errors.Is(err, errWorkerResetReady) || ctx.Err() != nil {
+		t.Fatalf("等待中关闭完成时 err=%v ctx.Err=%v，期望 errWorkerResetReady 且请求上下文不取消", err, ctx.Err())
+	}
+
+	// 等待中结束但后台放弃：按一次调度信号返回 nil，调用方复查候选
+	gaveUp := &workerReset{done: make(chan struct{})}
+	time.AfterFunc(50*time.Millisecond, func() { gaveUp.expired = true; close(gaveUp.done) })
+	if err := gaveUp.wakeWait(ctx, blockingWait); err != nil {
+		t.Fatalf("等待中后台放弃时 err=%v，期望 nil（复查候选）", err)
+	}
+
+	// 请求在等待中超时：返回请求的 ctx 错误
+	timeout, cancelTimeout := context.WithTimeout(base, 50*time.Millisecond)
+	defer cancelTimeout()
+	open := &workerReset{done: make(chan struct{})}
+	if err := open.wakeWait(timeout, blockingWait); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("请求超时时 err=%v，期望 context.DeadlineExceeded", err)
 	}
 }
 

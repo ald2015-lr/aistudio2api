@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,8 +81,8 @@ func queueProgressContext(ctx context.Context, requestID string, firstDelay, int
 	return withLeaseWaitProgress(ctx, progress), progress
 }
 
-// TestLeaseWaitProgressThrottle 排队进度的节奏：每次尝试排队满宽限才写第一条，之后每个间隔最多一条；已等待按墙钟从请求第一次
-// 排队算起（换号重试不重新计时），按毫秒取整；原因每次等待都更新；所有方法对 nil 安全
+// TestLeaseWaitProgressThrottle 排队进度的节奏：每次尝试排队满宽限才写第一条，之后每个间隔最多一条；已等待累计各次选号排队的
+// 墙钟时间（换号重试接着累加，两次选号之间不算），按毫秒取整；原因每次等待都更新；所有方法对 nil 安全
 func TestLeaseWaitProgressThrottle(t *testing.T) {
 	progress := newLeaseWaitProgress(" req-x ")
 	if progress == nil || progress.requestID != "req-x" || progress.firstDelay != queueProgressFirstDelay || progress.interval != queueProgressInterval {
@@ -120,7 +121,17 @@ func TestLeaseWaitProgressThrottle(t *testing.T) {
 		t.Fatalf("重复的进度应带当前原因与墙钟已等待：%q", got)
 	}
 
-	// 换号重试：宽限重新计，已等待不重新计时
+	// 18s 时取得账号，之后到 40s 是上游处理与退避：不算排队
+	progress.acquireEnded(at(18 * time.Second))
+	if got := progress.waited(at(30 * time.Second)); got != 18*time.Second {
+		t.Fatalf("两次选号之间已等待 = %s，期望停在 18s", got)
+	}
+	progress.acquireEnded(at(35 * time.Second))
+	if got := progress.waited(at(35 * time.Second)); got != 18*time.Second {
+		t.Fatalf("没有排队的选号结束后已等待 = %s，期望不变", got)
+	}
+
+	// 换号重试：宽限重新计，已等待接着累加
 	progress.beginAttempt()
 	progress.track(at(40*time.Second), "账号全部忙碌")
 	if _, ok := progress.due(at(41 * time.Second)); ok {
@@ -129,14 +140,15 @@ func TestLeaseWaitProgressThrottle(t *testing.T) {
 	if first, ok := progress.due(at(42 * time.Second)); !first || !ok {
 		t.Fatal("新一次尝试排队满宽限后应写第一条")
 	}
-	if got := progress.message(at(42*time.Second), ""); !strings.Contains(got, "已等待=42s | 尝试=2") {
-		t.Fatalf("已等待应从请求第一次排队算起：%q", got)
+	if got := progress.message(at(42*time.Second), ""); !strings.Contains(got, "已等待=20s | 尝试=2") {
+		t.Fatalf("已等待应为两次选号排队之和（18s + 2s），不含中间上游处理的 22s：%q", got)
 	}
 
 	// nil 安全
 	var none *leaseWaitProgress
 	none.beginAttempt()
 	none.track(t0, "账号全部忙碌")
+	none.acquireEnded(t0)
 	if first, ok := none.due(t0); first || ok || none.message(t0, "x") != "" || none.waited(t0) != 0 {
 		t.Fatal("nil 进度不应写任何东西")
 	}
@@ -342,6 +354,64 @@ func TestQueueWaitTimeoutKeepsErrorsIs(t *testing.T) {
 	canceled, _ = queueProgressContext(canceled, "req-queue-none", 0, time.Hour)
 	if _, err := service.acquireWarmLease(canceled, aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"}); err != context.Canceled {
 		t.Fatalf("没有排队过时 err = %v，期望原样的 context.Canceled", err)
+	}
+}
+
+// TestQueueWaitExcludesUpstreamTime 换号重试排队中超时：错误里的"排队 X"只算各次选号排队的时间，不含上一次尝试在上游处理的时间。
+// 原先从第一次排队一直按墙钟算，上游处理了几分钟、换号排队十几秒就超时的请求报成"排队 5m0s 后请求超时"
+func TestQueueWaitExcludesUpstreamTime(t *testing.T) {
+	const (
+		timeout      = 4 * time.Second
+		firstQueue   = time.Second
+		upstreamTime = 1500 * time.Millisecond
+	)
+	// primary-a 收到请求后一直不发事件，首事件超时（upstreamTime）后换号；primary-b 一直满着，换号后排队到请求超时
+	upstream := newStallingService(primaryTestA)
+	service, pool := primaryBusyService(t, upstream, primaryTestA, primaryTestB)
+	service.firstEventTimeout.Store(int64(upstreamTime))
+	releaseA := holdLease(t, pool, primaryTestA)
+	releaseB := holdLease(t, pool, primaryTestB)
+	defer releaseB()
+	startedAt := time.Now()
+	result, cancel := startQueuedRequest(service, "req-queue-upstream", timeout)
+	defer cancel()
+	if !waitUntil(3*time.Second, func() bool { return dispatchWaiters(service) > 0 }) {
+		releaseA()
+		t.Fatal("请求应进入调度等待队列")
+	}
+	time.Sleep(firstQueue - time.Since(startedAt))
+	releaseA()
+	var got queuedResult
+	select {
+	case got = <-result:
+	case <-time.After(timeout + 5*time.Second):
+		t.Fatal("请求超时后没有结束")
+	}
+	elapsed := time.Since(startedAt)
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v，期望仍满足 context.DeadlineExceeded", got.err)
+	}
+	match := regexp.MustCompile(`^排队 (\S+) 后请求超时（最后原因=账号全部忙碌）: context deadline exceeded$`).FindStringSubmatch(got.err.Error())
+	if match == nil {
+		t.Fatalf("超时错误文案 = %q", got.err.Error())
+	}
+	waited, err := time.ParseDuration(match[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	upstream.mu.Lock()
+	calls := slices.Clone(upstream.calls)
+	upstream.mu.Unlock()
+	if !slices.Equal(calls, []string{primaryTestA}) {
+		t.Fatalf("上游调用 = %v，期望只在 primary-a 上首事件超时一次", calls)
+	}
+	t.Logf("报告排队 %s，总时长 %s", waited, elapsed)
+	// 排队 = 第一次排队（约 1s）+ 换号后排队（总时长减去上游处理与退避）：不含上游处理的 1.5s，也不只算第二次排队
+	if limit := elapsed - upstreamTime + 300*time.Millisecond; waited > limit {
+		t.Fatalf("报告排队 %s，超过总时长 %s 减去上游处理 %s：上游处理的时间被算成了排队", waited, elapsed, upstreamTime)
+	}
+	if waited < firstQueue+500*time.Millisecond {
+		t.Fatalf("报告排队 %s，期望累计两次选号的排队（第一次约 %s）", waited, firstQueue)
 	}
 }
 

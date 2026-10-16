@@ -3299,7 +3299,11 @@ func (service *trackedService) acquireLease(
 	// 生成请求的选号带排队进度（见 queue_progress.go）：排队满宽限后写明原因，请求在排队中结束时错误带上最后的原因；没有时不写
 	progress := leaseWaitProgressFromContext(ctx)
 	var waiter *dispatchWaiter
-	defer func() { service.workers.dispatch.leave(waiter) }()
+	// 选号结束时把这次排队的时间计入已等待：之后上游处理与退避的时间不算排队（见 queue_progress.go）
+	defer func() {
+		progress.acquireEnded(time.Now())
+		service.workers.dispatch.leave(waiter)
+	}()
 	// snapshot 为本轮复查的候选计数，detail 只在真正写排队进度时调用（含同条件队列位置，队列内逐个查找）
 	var snapshot queueSnapshot
 	detail := func(now time.Time) string {
@@ -3877,9 +3881,36 @@ func (service *trackedService) generateWithRetry(
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
 	hardFailures := 0
 	// deferredReset、deferredAccountID 为最近一次没等到关闭失败 Worker 就换号的账号与它的后台关闭（见 worker_reset.go）：
-	// 换号找不到可用账号时回到这个账号，等关闭结束后在原账号重放
+	// 换号找不到可用账号、换号次数用完或到连续失败上限时回到这个账号，等关闭结束后在原账号重放；换号的选号排队时关闭结束、
+	// 可以重放就不再等其他账号，同样回到原账号重放
 	var deferredReset *workerReset
 	deferredAccountID := ""
+	// returnToDeferred 在请求不能再换号时（why 为原因，reason 为写进进度的错误）回到 deferredReset 的原账号：一直等后台关闭结束，
+	// 能重放时安排下一次尝试在原账号重放（replay）；请求在等待中超时或被取消时把 err 换成带等待原因的 ctx 错误（ended，504/499 映射不变，
+	// 原先丢掉 ctx 错误、按上次的 Code 5 失败对外 502）；没有要等的原账号、请求已结束、后台放弃或关闭出错时两者都为 false，按原来的错误结束
+	returnToDeferred := func(why string, reason error) (replay bool, ended bool) {
+		if deferredReset == nil || !deferredReset.awaitable() || requestCtx.Err() != nil {
+			return false, false
+		}
+		pending, accountID := deferredReset, deferredAccountID
+		deferredReset, deferredAccountID = nil, ""
+		trace.Note(why + "，回到原账号等待 Worker 恢复: " + reason.Error())
+		service.requests.logRequestProgress(request.ID, "service", "WARN",
+			why+"，回到原账号等待 Worker 恢复后重放 | 原因="+progressReason(reason))
+		waitStartedAt := time.Now()
+		finished, waitErr := pending.wait(requestCtx, workerResetWaitUnbounded)
+		if waitErr != nil {
+			err = workerResetWaitEnded(err, waitErr, time.Since(waitStartedAt))
+			return false, true
+		}
+		if !finished || !pending.replayable() {
+			return false, false
+		}
+		recoveryAccountID = accountID
+		delete(attempted, accountID)
+		maxAttempts++
+		return true, false
+	}
 	// 主用模型（PRIMARY_MODELS）的请求带一份排队预算，整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
 	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
 	budget := service.primaryBudget(modelID, scope)
@@ -3929,23 +3960,41 @@ func (service *trackedService) generateWithRetry(
 		}
 		useImmediate := immediateRetry
 		immediateRetry = false
+		// 没等到关闭就换走的原账号在这次选号里仍被排除：选号排队时它的关闭结束、可以重放就提前结束（errWorkerResetReady），
+		// 回到原账号重放，不再等其他账号空出槽位（原账号关闭完成后空闲着也用不上，可能一直等到请求超时）
+		selectCtx := withWorkerResetWake(acquireCtx, deferredReset)
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		// 输入超限后的再试只接受现在就能取得的账号，不排队
 		if useImmediate {
-			nextLease, acquireErr = service.acquireWarmLeaseNow(acquireCtx, selection, nil)
+			nextLease, acquireErr = service.acquireWarmLeaseNow(selectCtx, selection, nil)
 		} else if service.streamPrefersPlayground(request, selection) {
-			nextLease, acquireErr = service.acquireStreamPlaygroundLease(acquireCtx, request.ID, selection)
+			nextLease, acquireErr = service.acquireStreamPlaygroundLease(selectCtx, request.ID, selection)
 		} else {
-			nextLease, acquireErr = service.acquireWarmLease(acquireCtx, selection)
+			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
 		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && playgroundUnavailable(acquireErr) {
 			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定
 			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
-			nextLease, acquireErr = service.acquireWarmLease(acquireCtx, selection)
+			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
+		}
+		if errors.Is(acquireErr, errWorkerResetReady) {
+			if requestCtx.Err() == nil {
+				// 换号的选号在排队，原账号的失败 Worker 已关闭：回到原账号重放，与换号没有可用账号时相同
+				accountID := deferredAccountID
+				deferredReset, deferredAccountID = nil, ""
+				trace.Note("换号排队中原账号的 Worker 已恢复，回到原账号重放")
+				service.requests.logRequestProgress(request.ID, "service", "WARN", "换号排队中原账号的 WAA Worker 已恢复，回到原账号重放")
+				recoveryAccountID = accountID
+				delete(attempted, accountID)
+				maxAttempts++
+				continue
+			}
+			// 请求恰好同时结束：按请求结束的错误处理
+			acquireErr = progress.queueEnded(requestCtx.Err())
 		}
 		if acquireErr != nil {
 			trace.Note("获取账号失败: " + acquireErr.Error())
@@ -3963,19 +4012,16 @@ func (service *trackedService) generateWithRetry(
 				err = acquireErr
 				break
 			}
-			if deferredReset != nil && requestCtx.Err() == nil && switchUnavailable(acquireErr) {
+			if switchUnavailable(acquireErr) {
 				// 没等到同账号关闭失败的 Worker 就换号，换号却没有可用账号（例如只有原账号支持该模型、其余账号都在冷却）：
-				// 回到原账号，一直等后台关闭结束后在原账号重放，与固定账号的请求相同；后台放弃或关闭出错时按原来的错误结束
-				pending, accountID := deferredReset, deferredAccountID
-				deferredReset, deferredAccountID = nil, ""
-				trace.Note("换号没有可用账号，回到原账号等待 Worker 恢复: " + acquireErr.Error())
-				service.requests.logRequestProgress(request.ID, "service", "WARN",
-					"换号没有可用账号，回到原账号等待 Worker 恢复后重放 | 原因="+progressReason(acquireErr))
-				if finished, _ := pending.wait(requestCtx, workerResetWaitUnbounded); finished && pending.replayable() {
-					recoveryAccountID = accountID
-					delete(attempted, accountID)
-					maxAttempts++
+				// 回到原账号，一直等后台关闭结束后在原账号重放，与固定账号的请求相同；后台放弃或关闭出错时按原来的错误结束；
+				// 请求在等待中超时或被取消时按请求结束的错误结束，不再落到下面按选号错误处理
+				replay, ended := returnToDeferred("换号没有可用账号", acquireErr)
+				if replay {
 					continue
+				}
+				if ended {
+					break
 				}
 			}
 			var ownerCooling *aistudio.AllCoolingError
@@ -4301,14 +4347,20 @@ func (service *trackedService) generateWithRetry(
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "输入超过模型上限（提示词过长），不换号、不冷却，按 400 返回 | 原因="+progressReason(err))
 			}
 		}
+		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
+		// 是否计入只看这几项
+		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry
 		// 租约由 recoverWorkerOnce 释放：本次失败要关闭这个 Worker 版本时原子地转成独占等待交给后台关闭（见 worker_reset.go），
 		// 排队的请求不会在释放与登记之间落到坏掉的 Worker 上；其余情况照常释放，释放出错时结束。
 		// 等待关闭的上限：请求已取消或不再重试时只登记后台关闭、不等待；不固定账号、还能换号的请求只等一小会儿（见 workerResetWaitFor），
-		// 等不到就换号；固定账号与文件绑定的请求只能用这个账号，等关闭结束后在原账号重放
+		// 等不到就换号；固定账号与文件绑定的请求只能用这个账号，等关闭结束后在原账号重放。
+		// 还能换号要看换号次数与连续失败上限：这次失败计入上限后就到上限的请求不会再换号，同样一直等关闭结束后在原账号重放。
+		// 原先只看换号次数（不固定账号时为启用账号数，生产上几万），连续 5 个账号 Code 5 且都有其他请求在输出时每个只等 2 秒，
+		// 第 5 次换号到上限按 Code 5 失败，既没换号也没等原账号恢复
 		resetWait := workerResetWaitUnbounded
 		if requestCtx.Err() != nil || !retryable {
 			resetWait = 0
-		} else if unbound && attempt+1 < maxAttempts {
+		} else if unbound && attempt+1 < maxAttempts && (!countsHard || hardFailures+1 < generateFailureLimit) {
 			resetWait = service.workerResetWaitFor(budget)
 		}
 		recovered, _, resetDeferred, recoveryErr := service.recoverWorkerOnce(
@@ -4344,14 +4396,22 @@ func (service *trackedService) generateWithRetry(
 			trace.Note(note + "，换号重试")
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", note+"，换号重试 | 原因="+progressReason(err))
 		}
+		// 不再换号（换号次数用完或到连续失败上限）时还有没等到关闭就换走的原账号：回到那里一直等关闭结束后重放，
+		// 与换号没有可用账号时相同，不按这次的失败结束（原先只在换号没有可用账号时回去）
 		if attempt+1 == maxAttempts {
+			if replay, _ := returnToDeferred("换号次数已用完", err); replay {
+				continue
+			}
 			break
 		}
-		if !recoverWorker && (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry {
+		if !recoverWorker && countsHard {
 			hardFailures++
 			if hardFailures >= generateFailureLimit {
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 					"已连续 %d 次失败，不再换号 | 原因=%s", hardFailures, progressReason(err)))
+				if replay, _ := returnToDeferred(fmt.Sprintf("已连续 %d 次失败", hardFailures), err); replay {
+					continue
+				}
 				break
 			}
 			// 单模型 403 已冷却该账号，换号不退避；没等到 Worker 关闭就换号时已经等过，同样不退避；

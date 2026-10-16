@@ -25,7 +25,10 @@ import (
 //   - 请求在排队中超时或被取消时，选号返回的 ctx 错误带上最后的等待原因与已等待时间（%w 包装，errors.Is 的 504/499 映射不变），
 //     原因随之写进 request.finished 与用量账本。
 //
-// 现场启动（promote）内部的等待（替换空闲 Worker、等待冷启动名额、浏览器启动）不单独写，时间按墙钟计入已等待。
+// 已等待只算排队的时间：每次选号从第一次等待到这次选号结束（acquireLease 返回）按墙钟计，各次选号累加；两次选号之间
+// 上游处理、退避与 Worker 恢复的时间不算。原先从请求第一次排队一直按墙钟算，上游输出了几分钟后失败、换号又排队十几秒就超时的请求
+// 报成“排队 5m0s 后请求超时”，看起来像号池饱和了五分钟。
+// 现场启动（promote）内部的等待（替换空闲 Worker、等待冷启动名额、浏览器启动）不单独写，排队之后的现场启动按墙钟计入已等待。
 // 进度只在请求 goroutine 内修改（generateWithRetry 与它同步调用的选号，与排队预算相同），不加锁；requestID 构造后不变
 
 const (
@@ -38,14 +41,16 @@ const (
 	queueProgressBurst = 30.0
 )
 
-// leaseWaitProgress 为一个请求在选号中的排队进度，整个请求共用一份（换号重试不重新计时）
+// leaseWaitProgress 为一个请求在选号中的排队进度，整个请求共用一份（换号重试的已等待接着累加）
 type leaseWaitProgress struct {
 	requestID string
 	// firstDelay 为每次尝试第一条进度的宽限，interval 为之后的最短间隔
 	firstDelay time.Duration
 	interval   time.Duration
-	// startedAt 为请求第一次排队的时刻：已等待从这里按墙钟算
-	startedAt time.Time
+	// queued 为此前已结束的各次选号排队的时间之和；queuedSince 为本次选号第一次排队的时刻，选号结束（acquireEnded）时计入 queued
+	// 并清零：已等待 = queued + 本次选号已排队的时间，不含两次选号之间上游处理与退避的时间
+	queued      time.Duration
+	queuedSince time.Time
 	// attemptStartedAt 为本次尝试第一次排队的时刻（宽限从这里算），loggedAt 为本次尝试最近一次该写进度的时刻
 	// （被全局限流省略时同样推进，每个请求最多每 interval 尝试一次）；都在 beginAttempt 时清零
 	attemptStartedAt time.Time
@@ -88,7 +93,7 @@ func leaseRequestID(ctx context.Context) string {
 	return aistudio.TraceFromContext(ctx).RequestID()
 }
 
-// beginAttempt 记一次尝试（generateWithRetry 每次选号前调用）：本次尝试的宽限与间隔重新计，已等待不重新计时
+// beginAttempt 记一次尝试（generateWithRetry 每次选号前调用）：本次尝试的宽限与间隔重新计，已等待接着此前各次选号累加
 func (progress *leaseWaitProgress) beginAttempt() {
 	if progress == nil {
 		return
@@ -98,18 +103,28 @@ func (progress *leaseWaitProgress) beginAttempt() {
 	progress.loggedAt = time.Time{}
 }
 
-// track 记录一次等待的原因（每次等待都调用），第一次等待时记下开始时刻
+// track 记录一次等待的原因（每次等待都调用），本次选号与本次尝试的第一次等待时记下开始时刻
 func (progress *leaseWaitProgress) track(now time.Time, reason string) {
 	if progress == nil {
 		return
 	}
 	progress.reason = reason
-	if progress.startedAt.IsZero() {
-		progress.startedAt = now
+	if progress.queuedSince.IsZero() {
+		progress.queuedSince = now
 	}
 	if progress.attemptStartedAt.IsZero() {
 		progress.attemptStartedAt = now
 	}
+}
+
+// acquireEnded 在一次选号结束时（acquireLease 返回，取得租约或出错）把这次选号排队的时间计入已等待；没有排队过时不变。
+// 之后到下一次选号第一次等待之间（上游处理、退避、Worker 恢复）不计入
+func (progress *leaseWaitProgress) acquireEnded(now time.Time) {
+	if progress == nil || progress.queuedSince.IsZero() {
+		return
+	}
+	progress.queued += max(now.Sub(progress.queuedSince), 0)
+	progress.queuedSince = time.Time{}
 }
 
 // due 判断这次等待是否该写进度，该写时推进 loggedAt：first 为本次尝试的第一条（排队满宽限后），之后每 interval 最多一次
@@ -131,12 +146,16 @@ func (progress *leaseWaitProgress) due(now time.Time) (first bool, ok bool) {
 	return false, true
 }
 
-// waited 返回从请求第一次排队到 now 的墙钟时间；没有排队过时为 0
+// waited 返回到 now 为止排队的时间：此前各次选号排队的时间之和，加上本次选号已排队的时间；没有排队过时为 0
 func (progress *leaseWaitProgress) waited(now time.Time) time.Duration {
-	if progress == nil || progress.startedAt.IsZero() {
+	if progress == nil {
 		return 0
 	}
-	return max(now.Sub(progress.startedAt), 0)
+	waited := progress.queued
+	if !progress.queuedSince.IsZero() {
+		waited += max(now.Sub(progress.queuedSince), 0)
+	}
+	return waited
 }
 
 // message 为一条排队进度；detail 为选号补充的模型、队列位置与候选计数（以 " | " 开头）
@@ -225,13 +244,17 @@ func (snapshot queueSnapshot) text(now time.Time) string {
 }
 
 // waitQueued 为 acquireLease 的一次等待：等待本身与 budget.wait 完全相同（同一个唤醒通道、复查间隔与原因），
-// 只在等待前按需写排队进度；请求在等待中超时或被取消时返回的 ctx 错误带上最后的等待原因
+// 只在等待前按需写排队进度；请求在等待中超时或被取消时返回的 ctx 错误带上最后的等待原因。
+// 换号的选号带着没等到关闭就换走的原账号时另有一个唤醒：原账号关闭结束、可以重放时返回 errWorkerResetReady
 func (service *trackedService) waitQueued(
 	ctx context.Context, progress *leaseWaitProgress, budget *leaseWaitBudget, changed <-chan struct{},
 	delay time.Duration, reason string, detail func(time.Time) string,
 ) error {
 	service.noteQueueWait(progress, budget, time.Now(), reason, detail)
-	err := budget.wait(ctx, changed, delay, reason)
+	// 换号的选号带着没等到关闭就换走的原账号时，原账号关闭结束、可以重放就提前结束（errWorkerResetReady，见 worker_reset.go）
+	err := workerResetWakeFromContext(ctx).wakeWait(ctx, func(waitCtx context.Context) error {
+		return budget.wait(waitCtx, changed, delay, reason)
+	})
 	if err != nil && ctx.Err() != nil {
 		return progress.queueEnded(err)
 	}

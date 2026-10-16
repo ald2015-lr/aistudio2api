@@ -22,6 +22,9 @@ import (
 //
 // 请求只等一小会儿（见 workerResetWaitFor）：不固定账号、还能换号的请求等不到就换号（原账号仍算已尝试），换号找不到可用账号时
 // 回到原账号一直等关闭结束后重放；固定账号与文件绑定的请求只能用这个账号，照旧等关闭结束后在原账号重放。
+// "还能换号"同时看换号次数与连续失败上限：这次失败计入上限后就到上限的请求不再换号，同样一直等关闭结束后在原账号重放；
+// 换号次数用完或到连续失败上限时还有没等到关闭就换走的原账号，也回到那里等关闭结束后重放，不按上次的失败结束。
+// 换号后的选号在排队时（其他账号都忙），原账号的关闭结束、可以重放就不再等其他账号空出槽位，回到原账号重放（见 wakeWait）。
 // 换号的取舍：解释器更新后整个号池的驻留 Worker 都可能返回 Code 5，换号会落到另一个同样过时的 Worker 上，原账号重放才是新实例；
 // 每次换号仍计入连续失败上限，没有其他进行中请求的账号通常在等待时间内关闭完成、直接在新实例重放，不受影响
 
@@ -99,6 +102,93 @@ func (pending *workerReset) wait(ctx context.Context, limit time.Duration) (bool
 	case <-ctx.Done():
 		return false, ctx.Err()
 	}
+}
+
+// awaitable 判断回到原账号等这次关闭是否还有意义：关闭还没结束，或已经结束且能在原账号重放
+func (pending *workerReset) awaitable() bool {
+	select {
+	case <-pending.done:
+		return pending.replayable()
+	default:
+		return true
+	}
+}
+
+// errWorkerResetReady 为换号的选号在排队中提前结束：没等到关闭就换走的原账号已经关闭完成、可以重放（见 wakeWait），
+// 调用方回到原账号重放。只在选号上下文带着这次关闭时返回
+var errWorkerResetReady = errors.New("原账号的失败 Worker 已关闭，回到原账号重放")
+
+type workerResetWakeKey struct{}
+
+// withWorkerResetWake 把没等到关闭就换走的原账号的后台关闭放进换号的选号上下文：选号排队时关闭结束、可以重放就提前结束（见 wakeWait）。
+// 换号的选号仍排除原账号，否则原账号关闭完成、空闲着也用不上，只能等其他账号空出槽位或请求超时。
+// 关闭已经结束且不能重放时原样返回
+func withWorkerResetWake(ctx context.Context, pending *workerReset) context.Context {
+	if pending == nil || !pending.awaitable() {
+		return ctx
+	}
+	return context.WithValue(ctx, workerResetWakeKey{}, pending)
+}
+
+// workerResetWakeFromContext 返回选号上下文里待等的原账号后台关闭；没有时为 nil
+func workerResetWakeFromContext(ctx context.Context) *workerReset {
+	pending, _ := ctx.Value(workerResetWakeKey{}).(*workerReset)
+	return pending
+}
+
+// wakeWait 为选号的一次排队等待（wait）加上原账号关闭结束的唤醒：关闭已经结束、可以重放时不再等待，等待中结束且可以重放时
+// 提前结束，都返回 errWorkerResetReady；结束了但不能重放时按一次调度信号返回 nil，调用方照常复查候选。
+// 唤醒经派生的等待上下文传给 wait，请求上下文本身不取消：请求超时或取消时仍返回请求的 ctx 错误。pending 为 nil 时只是 wait(ctx)
+func (pending *workerReset) wakeWait(ctx context.Context, wait func(context.Context) error) error {
+	if pending == nil {
+		return wait(ctx)
+	}
+	select {
+	case <-pending.done:
+		if pending.replayable() && ctx.Err() == nil {
+			return errWorkerResetReady
+		}
+		return wait(ctx)
+	default:
+	}
+	waitCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	go func() {
+		select {
+		case <-pending.done:
+			cancel(errWorkerResetReady)
+		case <-waitCtx.Done():
+		}
+	}()
+	err := wait(waitCtx)
+	if errors.Is(context.Cause(waitCtx), errWorkerResetReady) {
+		// 被原账号关闭结束唤醒（err 多半是派生上下文的取消）：请求恰好同时结束时按请求的 ctx 错误返回，不把超时报成取消
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if pending.replayable() {
+			return errWorkerResetReady
+		}
+		return nil
+	}
+	return err
+}
+
+// workerResetWaitEnded 为回到原账号等关闭结束时请求超时或被取消的错误：带上等待原因、已等待时间与上次的失败（%w 只包装 ctx 错误，
+// errors.Is 的 504/499 映射与 cancelled 状态不变）。原先丢掉 ctx 错误、按上次的 Code 5 失败结束，等满 REQUEST_TIMEOUT 后对外 502
+func workerResetWaitEnded(cause error, waitErr error, waited time.Duration) error {
+	outcome := "请求已结束"
+	switch {
+	case errors.Is(waitErr, context.DeadlineExceeded):
+		outcome = "请求超时"
+	case errors.Is(waitErr, context.Canceled):
+		outcome = "请求已取消"
+	}
+	reason := "WAA Worker 恢复"
+	if cause != nil {
+		reason += "，上次失败=" + strings.TrimSpace(cause.Error())
+	}
+	return fmt.Errorf("回到原账号等待 %s 后%s（最后原因=%s）: %w", waited.Round(time.Millisecond), outcome, reason, waitErr)
 }
 
 // deferralNote 为请求不等关闭结束就换号时写进请求进度的说明（调用方接着写“，换号重试”）
