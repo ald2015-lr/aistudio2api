@@ -47,7 +47,7 @@ func newRuntime(
 	}
 	// 账户默认启用：先载入停用原因（载入前写出上一代实例未保存的变化），再在建立账户池、固定出口与 Worker 之前
 	// 把没有手动停用记录的停用账户改为启用，后续的状态推导与模型目录同步把它们当作普通的启用账户
-	accountDisableNotes.load(store.PrimaryDirectory())
+	accountDisableNotes.load(store.PrimaryDirectory(), requests)
 	enableUnmarkedAccounts(accounts, requests, "启动时")
 
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")

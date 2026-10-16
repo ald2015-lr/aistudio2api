@@ -14,10 +14,11 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
 
-// verifyTestLogin 为测试用隔离浏览器：验证返回固定结果并计数
+// verifyTestLogin 为测试用隔离浏览器：验证返回固定结果并计数；onVerify 非空时在验证中（仍持有账户租约）调用
 type verifyTestLogin struct {
 	verification aistudio.LoginVerification
 	calls        atomic.Int32
+	onVerify     func()
 }
 
 func (login *verifyTestLogin) Login(context.Context, aistudio.IsolatedLoginRequest) (aistudio.IsolatedLoginResult, error) {
@@ -28,6 +29,9 @@ func (login *verifyTestLogin) Verify(
 	context.Context, aistudio.IsolatedLoginRequest, aistudio.StorageState,
 ) (aistudio.LoginVerification, error) {
 	login.calls.Add(1)
+	if login.onVerify != nil {
+		login.onVerify()
+	}
 	verification := login.verification
 	verification.VerifiedAt = time.Now()
 	return verification, nil

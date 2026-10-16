@@ -20,12 +20,29 @@ const defaultEnableConcurrency = 16
 //
 // 只能在账户加入账户池之前调用（启动时建立账户池之前、目录扫描导入之前）：直接修改账户字段，不构建账户状态、
 // 不推送快照；写回按 defaultEnableConcurrency 并行，上万个账户也只需几秒，全部完成后只写一条汇总日志。
-// 写回失败的账户内存中同样启用，下次载入时按同样的规则再次启用。返回启用的账户 ID
+// 写回失败的账户内存中同样启用，下次载入时按同样的规则再次启用。返回启用的账户 ID。
+//
+// 停用记录文件无法读取时（见 disableNotes.load）分不出哪些是手动停用的：没有记录的停用账户一律保持停用，
+// 并补记为手动停用（管理页显示原因，需要启用的在管理页启用）
 func enableUnmarkedAccounts(accounts []*aistudio.Account, requests *requestRegistry, stage string) []string {
 	targets := make([]*aistudio.Account, 0)
+	presumed := make([]string, 0)
 	for _, account := range accounts {
-		if account != nil && !account.Config.Enabled && !accountDisableNotes.manual(account.ID) {
+		if account == nil || account.Config.Enabled {
+			continue
+		}
+		if !accountDisableNotes.keepDisabled(account.ID) {
 			targets = append(targets, account)
+		} else if !accountDisableNotes.manual(account.ID) {
+			presumed = append(presumed, account.ID)
+		}
+	}
+	if len(presumed) > 0 {
+		accountDisableNotes.presumeManual(presumed)
+		if requests != nil {
+			requests.log("auth", "WARN", fmt.Sprintf(
+				"%s保留 %d 个没有停用记录的停用账户：停用记录文件无法读取，无法确认是否为手动停用，已按手动停用记录", stage, len(presumed),
+			))
 		}
 	}
 	if len(targets) == 0 {

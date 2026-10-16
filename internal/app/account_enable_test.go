@@ -394,24 +394,24 @@ func TestLoginUpdateEnablesUnmarkedDisabledAccount(t *testing.T) {
 	}
 }
 
-// TestDisableNotesFlushBeforeLoad 停用原因合并几秒才写文件：flush 立即写出；重新载入（重建生成服务）前先写出
+// TestDisableNotesFlushBeforeLoad 自动停用原因合并几秒才写文件：flush 立即写出；重新载入（重建生成服务）前先写出
 // 未保存的变化，不会被文件中的旧内容覆盖
 func TestDisableNotesFlushBeforeLoad(t *testing.T) {
 	directory := t.TempDir()
 	store := &disableNotes{notes: make(map[string]disableNote)}
-	store.load(directory)
-	store.set("a@example.com", "通过管理页或管理接口停用", false)
+	store.load(directory, nil)
+	store.set("a@example.com", "新账户自动处理验证未通过", true)
 	path := filepath.Join(directory, disableNotesFileName)
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("设置后不应立即写文件")
+		t.Fatal("自动停用记录设置后不应立即写文件")
 	}
 	store.flush()
 	if content, err := os.ReadFile(path); err != nil || !strings.Contains(string(content), "a@example.com") {
 		t.Fatalf("flush 后文件应包含记录：%s %v", content, err)
 	}
-	store.set("b@example.com", "通过管理页或管理接口停用", false)
-	store.load(directory)
-	if !store.manual("b@example.com") {
+	store.set("b@example.com", "新账户自动处理验证未通过", true)
+	store.load(directory, nil)
+	if !store.automatic("b@example.com") {
 		t.Fatal("重新载入前应先写出未保存的停用记录")
 	}
 }

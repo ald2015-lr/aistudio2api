@@ -363,6 +363,27 @@ func (admin *runtimeAdmin) addAccount(
 }
 
 func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, input api.AccountInput) (api.AdminAccount, error) {
+	return admin.updateAccount(ctx, accountID, input, nil)
+}
+
+// errAccountManuallyDisabled 表示账户是手动停用的，自动启用（新账户自动处理、认证文件更新）不启用它
+var errAccountManuallyDisabled = errors.New("账户是手动停用的，保持停用")
+
+// automaticEnable 为新账户自动处理启用账户时交给 updateAccount 的约束
+type automaticEnable struct {
+	// explicitAt 非零表示管理员在这一时间用“处理现有停用账户”把账户加入队列（见 disableNotes.blocksAutoEnable）
+	explicitAt time.Time
+}
+
+// updateAccount 更新账户配置。automatic 非空表示由新账户自动处理启用账户：在账户租约内再看一次停用记录，
+// 手动停用的不启用，返回 errAccountManuallyDisabled。原先只在租约外看账户状态，排队或验证期间被手动停用的账户
+// 验证通过后又被启用，手动停用记录也随之清除，重启后同样不再保持停用；手动停用记录只在租约内写入，这里再看一次就没有空档
+func (admin *runtimeAdmin) updateAccount(
+	ctx context.Context,
+	accountID string,
+	input api.AccountInput,
+	automatic *automaticEnable,
+) (api.AdminAccount, error) {
 	if !strings.EqualFold(strings.TrimSpace(input.Label), strings.TrimSpace(accountID)) {
 		return api.AdminAccount{}, invalidAccount(fmt.Errorf("账户邮箱不可修改"))
 	}
@@ -380,6 +401,10 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	}
 	account := lease.Account()
 	wasEnabled := account.Config.Enabled
+	if automatic != nil && input.Enabled && !wasEnabled &&
+		accountDisableNotes.blocksAutoEnable(account.ID, automatic.explicitAt) {
+		return api.AdminAccount{}, errors.Join(errAccountManuallyDisabled, lease.Release())
+	}
 	headerUpdate, err := admin.headers.prepareUpdate(account, accountConfig)
 	if err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
@@ -398,14 +423,23 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 	}
 	workerUpdate.Commit()
 	headerUpdate.Commit()
-	if wasEnabled && !input.Enabled {
+	switch {
+	case !input.Enabled:
+		// 已经停用的账户再次停用（批量停用选中了它、改代理后仍保存为停用）同样记为手动停用：原先只在启用改为停用时记录，
+		// 新账户自动处理留下的自动停用记录不变，重启或认证文件更新后账户又被按默认启用。已有手动停用记录的更新为这次的
+		// 时间：管理员“处理现有停用账户”之后再次停用的仍保持停用（见 disableNotes.blocksAutoEnable）
 		reason := "通过管理页或管理接口停用"
 		if caller := api.AdminCaller(ctx); caller != "" {
 			reason += "（来源 " + caller + "）"
 		}
 		accountDisableNotes.set(account.ID, reason, false)
-		admin.requests.log(account.ID, "WARN", "账户已停用 | "+reason)
-	} else if input.Enabled {
+		if wasEnabled {
+			admin.requests.log(account.ID, "WARN", "账户已停用 | "+reason)
+		} else {
+			admin.requests.log(account.ID, "INFO", "停用账户记为手动停用，重启与认证文件更新后保持停用 | "+reason)
+		}
+	case input.Enabled:
+		// 管理员启用时清除包括手动停用在内的记录；新账户自动处理走到这里时上面已确认没有挡住启用的手动停用记录
 		accountDisableNotes.clear(account.ID)
 	}
 	if err := lease.Release(); err != nil {

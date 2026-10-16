@@ -18,7 +18,8 @@ import (
 // 批量启用（POST /api/accounts/bulk-enable）：原先管理页逐个账户发 PUT，每启用一个都要写一次配置、合并一次全部账户的
 // 模型目录、构建并推送一次全部账户的状态，账户上万时 O(N²)，一万多个账户要几个小时；等待账户空闲没有超时，
 // 碰上正在验证的账户请求会一直挂着。现在一次请求处理一批：逐个账户只写 account.json，全部写完后只合并、推送一次，
-// 没有模型目录的账户在后台限流同步
+// 没有模型目录的账户在后台限流同步。
+// 批量启用是管理员的明确操作，与在账户页逐个启用一样：手动停用的账户也会启用，并清除它的手动停用记录
 const (
 	// bulkEnableConcurrency 为同时写回 account.json 的账户数
 	bulkEnableConcurrency = 16
@@ -59,8 +60,12 @@ func accountBusyError(err error) bool {
 
 // enableAccountConfig 只把账户改为启用并写回 account.json：代理、语言、时区不变，不重建固定出口与 Worker 配置
 // （它们只取决于这些字段），不登记模型变化、不合并模型目录、不推送账户状态，由调用方在一批结束后统一处理；
-// 清除账户的停用原因。账户最多等 bulkEnableAcquireWait 空闲，等不到返回 account_busy。返回是否由本次启用
-func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID string) (bool, error) {
+// 清除账户的停用原因。账户最多等 bulkEnableAcquireWait 空闲，等不到返回 account_busy。返回是否由本次启用。
+//
+// automatic 为假时是管理员的明确操作（批量启用），手动停用的账户同样启用并清除记录；为真时是按默认启用的自动启用
+// （认证文件更新后），在账户租约内再看一次停用记录，手动停用的不启用、返回 errAccountManuallyDisabled：
+// 原先只在租约外判断，判断后、启用前被手动停用的账户仍被启用，手动停用记录也被清除
+func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID string, automatic bool) (bool, error) {
 	acquireCtx, cancel := context.WithTimeout(ctx, bulkEnableAcquireWait)
 	defer cancel()
 	lease, err := admin.pool.AcquireAccount(acquireCtx, accountID)
@@ -73,6 +78,9 @@ func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID st
 	accountConfig := lease.Account().Config
 	if accountConfig.Enabled {
 		return false, lease.Release()
+	}
+	if automatic && accountDisableNotes.keepDisabled(accountID) {
+		return false, errors.Join(errAccountManuallyDisabled, lease.Release())
 	}
 	accountConfig.Enabled = true
 	if err := lease.SaveConfig(accountConfig); err != nil {
@@ -136,7 +144,7 @@ func (admin *runtimeAdmin) EnableAccounts(ctx context.Context, input api.BulkEna
 		go func() {
 			defer workers.Done()
 			for accountID := range jobs {
-				enabled, err := admin.enableAccountConfig(ctx, accountID)
+				enabled, err := admin.enableAccountConfig(ctx, accountID, false)
 				resultMu.Lock()
 				switch {
 				case err != nil:

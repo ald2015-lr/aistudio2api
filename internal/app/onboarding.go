@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -23,6 +24,8 @@ import (
 //   - 之后新增的目录（包括服务停止期间上传的）都会进入队列
 //   - 目录被删除后记录随之移除，同一账户重新上传会再次处理
 //   - 管理页浏览器登录、Chrome 导入创建的账户记为手动添加，不自动处理
+//   - 手动停用的账户（有手动停用记录）不自动启用：导入时直接记为跳过，排队或验证期间被手动停用的也保持停用；
+//     只有管理页“处理现有停用账户”（确认框写明手动停用的也会启用）加入的例外
 const (
 	onboardingFileName = ".onboarding.json"
 	// onboardingTick 为检查队列的周期
@@ -72,7 +75,13 @@ type onboardPending struct {
 	queuedAt  time.Time
 	attempts  int
 	notBefore time.Time
+	// explicitAt 非零表示由管理页“处理现有停用账户”在这一时间加入：在这之前手动停用的账户验证通过后也启用
+	// （见 disableNotes.blocksAutoEnable）。不保存到文件，重启后重新进入队列的按普通新账户处理
+	explicitAt time.Time
 }
+
+// onboardManuallyDisabled 为手动停用的账户不自动启用时记下的说明
+const onboardManuallyDisabled = "账户是手动停用的，保持停用"
 
 // accountOnboarder 维护新账户队列并按批处理
 type accountOnboarder struct {
@@ -246,6 +255,32 @@ func (onboarder *accountOnboarder) enqueue(accountIDs []string) {
 	onboarder.signal()
 }
 
+// skipManuallyDisabled 把目录扫描导入时保持停用的账户（有手动停用记录）直接记为跳过，不进入队列：
+// 原先与其他新账户一起排队，验证通过后被启用，手动停用记录也被清除
+func (onboarder *accountOnboarder) skipManuallyDisabled(accountIDs []string) {
+	if onboarder == nil || len(accountIDs) == 0 {
+		return
+	}
+	onboarder.mu.Lock()
+	defer onboarder.mu.Unlock()
+	now := time.Now()
+	changed := false
+	for _, id := range accountIDs {
+		if _, done := onboarder.records[id]; done {
+			continue
+		}
+		if _, active := onboarder.processing[id]; active {
+			continue
+		}
+		delete(onboarder.pending, id)
+		onboarder.records[id] = onboardRecord{Result: onboardSkipped, Detail: onboardManuallyDisabled, At: now}
+		changed = true
+	}
+	if changed {
+		onboarder.saveLocked()
+	}
+}
+
 // markManual 记录管理页手动添加的账户，不做自动处理
 func (onboarder *accountOnboarder) markManual(accountID string) {
 	if onboarder == nil {
@@ -377,7 +412,20 @@ func (onboarder *accountOnboarder) processBatch(ctx context.Context, batch []str
 	))
 }
 
-// process 处理单个账户：先验证（账户仍保持原状态），通过后再启用
+// explicitAt 返回处理中的账户由“处理现有停用账户”加入的时间；普通新账户为零
+func (onboarder *accountOnboarder) explicitAt(accountID string) time.Time {
+	onboarder.mu.Lock()
+	defer onboarder.mu.Unlock()
+	if item := onboarder.processing[accountID]; item != nil {
+		return item.explicitAt
+	}
+	return time.Time{}
+}
+
+// process 处理单个账户：先验证（账户仍保持原状态），通过后再启用。手动停用的账户不启用：处理开始时就是手动停用的
+// 直接跳过（不启动浏览器验证）；处理开始时是启用的、验证期间被停用的也不启用（只有管理页或管理接口会停用账户）；
+// 启用时在账户租约内再看一次停用记录（见 updateAccount）。原先验证后只看账户是否停用，排队等待（最长 2 分钟，
+// 批量导入时可达几个小时）或验证期间被手动停用的账户也会被启用，手动停用记录随之清除
 func (onboarder *accountOnboarder) process(
 	ctx context.Context,
 	accountID string,
@@ -388,6 +436,12 @@ func (onboarder *accountOnboarder) process(
 		return "", "", false
 	}
 	label := status.Label
+	explicitAt := onboarder.explicitAt(accountID)
+	if !status.Enabled && accountDisableNotes.blocksAutoEnable(accountID, explicitAt) {
+		onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | "+onboardManuallyDisabled)
+		return onboardSkipped, onboardManuallyDisabled, false
+	}
+	initiallyEnabled := status.Enabled
 	verified := false
 	if policy.AutoVerify {
 		verification, err := onboarder.admin.verifyLogin(ctx, accountID)
@@ -408,11 +462,20 @@ func (onboarder *accountOnboarder) process(
 		verified = true
 	}
 	if policy.AutoEnable && !status.Enabled {
-		// 启用后还没有模型目录时（未经验证直接启用、验证时目录同步失败），UpdateAccount 会在后台补一次同步
+		if initiallyEnabled {
+			onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | 处理期间被停用，"+onboardManuallyDisabled)
+			return onboardSkipped, onboardManuallyDisabled, false
+		}
+		// 启用后还没有模型目录时（未经验证直接启用、验证时目录同步失败），updateAccount 会在后台补一次同步
 		dto := adminAccountDTO(status)
-		if _, err := onboarder.admin.UpdateAccount(ctx, accountID, api.AccountInput{
+		_, err := onboarder.admin.updateAccount(ctx, accountID, api.AccountInput{
 			Label: dto.Label, Enabled: true, Proxy: dto.Proxy, Locale: dto.Locale, Timezone: dto.Timezone,
-		}); err != nil {
+		}, &automaticEnable{explicitAt: explicitAt})
+		if errors.Is(err, errAccountManuallyDisabled) {
+			onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | "+onboardManuallyDisabled)
+			return onboardSkipped, onboardManuallyDisabled, false
+		}
+		if err != nil {
 			return onboardError, strings.TrimSpace(err.Error()), true
 		}
 		onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | 已启用")
@@ -473,14 +536,14 @@ func (onboarder *accountOnboarder) finish(accountID string, result string, detai
 		return ""
 	}
 	onboarder.records[accountID] = onboardRecord{Result: result, Detail: detail, At: now}
-	// 停用原因：验证未通过或出错的账户保持停用，在管理页显示原因；启用后清除
+	// 停用原因：验证未通过或出错的账户保持停用，在管理页显示原因（已有的手动停用记录不被改为自动停用）。
+	// 启用时已在账户租约内清除记录（见 updateAccount）；原先在这里再清除一次，启用后、这里之前刚被手动停用的账户
+	// 记录会被抹掉
 	switch result {
 	case onboardVerifyFailed:
 		accountDisableNotes.set(accountID, "新账户自动处理验证未通过（"+detail+"），认证文件更新或重启后按默认启用", true)
 	case onboardError:
 		accountDisableNotes.set(accountID, "新账户自动处理验证出错（"+detail+"），认证文件更新或重启后按默认启用", true)
-	case onboardEnabled:
-		accountDisableNotes.clear(accountID)
 	}
 	onboarder.recent = append([]api.OnboardingEvent{{
 		AccountID: accountID, Result: result, Detail: detail, At: now,
@@ -542,7 +605,8 @@ func (onboarder *accountOnboarder) status() api.OnboardingStatus {
 }
 
 // queueDisabled 把当前停用的账户加入队列（管理页手动添加的除外），返回加入数量。
-// 用于处理功能开启前就已上传、被记为基线的停用账户；验证通过的会被启用
+// 用于处理功能开启前就已上传、被记为基线的停用账户；验证通过的会被启用。这是管理员的明确操作，确认框写明
+// 手动停用的账户验证通过也会启用：记下加入时间，之前的手动停用不挡住启用，之后才手动停用的仍保持停用
 func (onboarder *accountOnboarder) queueDisabled() int {
 	statuses := onboarder.admin.pool.Status()
 	onboarder.mu.Lock()
@@ -555,7 +619,9 @@ func (onboarder *accountOnboarder) queueDisabled() int {
 		if record, done := onboarder.records[status.ID]; done && record.Result == onboardManual {
 			continue
 		}
-		if _, queued := onboarder.pending[status.ID]; queued {
+		if item, queued := onboarder.pending[status.ID]; queued {
+			// 已在队列中的（例如重启后重新排队的）同样按管理员这次的要求处理
+			item.explicitAt = now
 			continue
 		}
 		if _, active := onboarder.processing[status.ID]; active {
@@ -563,7 +629,7 @@ func (onboarder *accountOnboarder) queueDisabled() int {
 		}
 		delete(onboarder.records, status.ID)
 		// 手动触发的立即开始，不等攒批
-		onboarder.pending[status.ID] = &onboardPending{queuedAt: now.Add(-onboardingMaxWait)}
+		onboarder.pending[status.ID] = &onboardPending{queuedAt: now.Add(-onboardingMaxWait), explicitAt: now}
 		added++
 	}
 	onboarder.saveLocked()

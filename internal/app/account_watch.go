@@ -109,6 +109,7 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	changed := false
 	imported := make([]*aistudio.Account, 0)
 	importedIDs := make([]string, 0)
+	keptDisabled := make([]string, 0)
 	now := time.Now()
 	loaded := make([]*aistudio.Account, 0)
 	loadedDirectories := make([]string, 0)
@@ -149,15 +150,17 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 		message := "自动导入账户 | 账户=" + account.Config.Label
 		if account.Config.Enabled {
 			imported = append(imported, account)
+			importedIDs = append(importedIDs, account.ID)
 		} else {
-			// 只有手动停用过的账户（目录被移走后又放回）还是停用
+			// 只有手动停用过的账户（目录被移走后又放回）还是停用；不进入自动处理队列，原先排进队列后验证通过又被启用
 			message += " | 账户是手动停用的，保持停用"
+			keptDisabled = append(keptDisabled, account.ID)
 		}
-		importedIDs = append(importedIDs, account.ID)
 		watcher.admin.requests.log("auth", "INFO", message)
 	}
-	// 新账户进入自动处理队列（攒够一批后验证、通过后启用）
+	// 新账户进入自动处理队列（攒够一批后验证、通过后启用）；手动停用的直接记为跳过
 	watcher.admin.onboard.enqueue(importedIDs)
+	watcher.admin.onboard.skipManuallyDisabled(keptDisabled)
 	// 模型目录要走网络，放到后台并发同步，不阻塞本轮扫描；批量上传几百个账户时也不会卡住扫描
 	if len(imported) > 0 {
 		go watcher.admin.syncImportedCatalogs(ctx, imported)
@@ -402,7 +405,7 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 	switch {
 	case summary.Enabled:
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie | 账户="+summary.ID)
-	case accountDisableNotes.manual(summary.ID):
+	case accountDisableNotes.keepDisabled(summary.ID):
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户是手动停用的，保持停用 | 账户="+summary.ID)
 	default:
 		// 账户默认启用：自动停用（新账户自动处理验证未通过等）或没有停用记录的账户换了新的登录后直接启用并同步模型目录，
@@ -412,12 +415,17 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 	return true
 }
 
-// enableAfterLoginUpdate 启用认证文件刚更新的停用账户并同步它的模型目录；返回 false 表示账户正忙，下一轮再试
+// enableAfterLoginUpdate 启用认证文件刚更新的停用账户并同步它的模型目录；返回 false 表示账户正忙，下一轮再试。
+// 按默认启用属于自动启用：在账户租约内再看一次停用记录，刚被手动停用的账户保持停用、记录保留
 func (admin *runtimeAdmin) enableAfterLoginUpdate(ctx context.Context, accountID string) bool {
-	enabled, err := admin.enableAccountConfig(ctx, accountID)
+	enabled, err := admin.enableAccountConfig(ctx, accountID, true)
 	if err != nil {
 		if accountBusyError(err) {
 			return false
+		}
+		if errors.Is(err, errAccountManuallyDisabled) {
+			admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户是手动停用的，保持停用 | 账户="+accountID)
+			return true
 		}
 		admin.requests.log("auth", "WARN", fmt.Sprintf(
 			"检测到认证文件更新，启用账户失败 | 账户=%s | 错误=%s", accountID, strings.TrimSpace(err.Error()),
@@ -537,7 +545,10 @@ func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	}
 	admin.service.removeAccountModelRetry(accountID)
 	admin.onboard.forget(accountID)
-	accountDisableNotes.clear(accountID)
+	// 只清除自动停用记录：手动停用记录要留到目录放回之后，账户随 account.json 的停用状态保持停用。原先一并清除，
+	// 整体替换账户目录、rsync 较慢时，手动停用的账户放回后没有记录，按默认启用。手动停用记录只在删除账户
+	// （DeleteAccount）或管理员启用时清除
+	accountDisableNotes.clearAutomatic(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
 	return errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID))
 }
