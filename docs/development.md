@@ -308,6 +308,7 @@ Worker 同样按账户当前权益分为普通分区与 Ultra 分区（`internal
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
+| 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 
 `/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。

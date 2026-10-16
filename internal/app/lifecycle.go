@@ -471,6 +471,16 @@ func (manager *runtimeManager) Cooldowns(ctx context.Context) ([]api.AdminCooldo
 	return manager.generation().admin.Cooldowns(ctx)
 }
 
+// PermissionDenied 返回当前生成服务的 403 无权限账户列表
+func (manager *runtimeManager) PermissionDenied(ctx context.Context) ([]api.AdminPermissionDenied, error) {
+	return manager.generation().admin.PermissionDenied(ctx)
+}
+
+// ClearPermissionDenied 清除当前生成服务的 403 无权限账户记录
+func (manager *runtimeManager) ClearPermissionDenied(ctx context.Context, input api.PermissionDeniedClearInput) (int, error) {
+	return manager.generation().admin.ClearPermissionDenied(ctx, input)
+}
+
 // Requests 返回进程级活动请求
 func (manager *runtimeManager) Requests(ctx context.Context) ([]api.AdminRequest, error) {
 	return manager.generation().admin.Requests(ctx)

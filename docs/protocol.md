@@ -1104,6 +1104,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 账户认证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
+| 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 | 用量账本 | `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv`、`GET /api/requests/{id}/body`（账本打开失败时不注册） |
 
@@ -1124,6 +1125,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/control/start`、`stop` | 200 | `AdminStatus` |
 | `GET /api/config`、`PUT /api/config` | 200 | `RuntimeConfig` |
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
+| `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...]}`，按最近一次 403 从新到旧 |
+| `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
 | `GET /api/requests` | 200 | `{"requests":[AdminRequest,...]}` |
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |
@@ -1149,6 +1152,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `BulkEnableInput` | `account_ids`、`all_disabled`（为 `true` 时启用全部停用账户，忽略 `account_ids`） |
 | `BulkEnableResult` | `enabled`（本次启用数）、`skipped`（原本已启用数）、`failed`（`{id,code,message}` 数组，`code` 为 `account_busy`、`account_not_found` 等）、`remaining`（超过单次上限 1000、本次没有处理的停用账户数） |
 | `AdminCooldown` | `account_id`、`account_label`、`model_id`、`until`、可选 `reason` |
+| `AdminPermissionDenied` | `id`、`label`、`models`、`count`（各模型次数之和）、`first_at`、`last_at`；`models` 每项为 `model`、`channels`（返回过 403、之后还没有成功过的通道）、`count`、`first_at`、`last_at`、可选 `message`（上游原文，最多 300 字符） |
 | `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`） |
 | `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
 | `AdminEvent` | `type`、`data` |

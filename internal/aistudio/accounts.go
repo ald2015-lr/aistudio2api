@@ -2448,6 +2448,45 @@ func (p *AccountPool) ClearCooldownIfGeneration(
 	return err
 }
 
+// ClearCooldownsMatching 清除账户上满足 match 的冷却（作用域与冷却状态，不论目录代际），返回清除的条数。
+// 认证文件更新后用它按原因清除 403 无权限的冷却：新的登录状态可能已经解决了权限问题，冷却最长要到次日零点才到期，
+// 不能让重新上传的账户一直等；额度等其他原因的冷却与登录无关，保持不变
+func (p *AccountPool) ClearCooldownsMatching(accountID string, match func(string, CooldownState) bool) (int, error) {
+	// 内存中没有符合的冷却时不读写运行态文件：重新导入一批账户时每个都会调用一次
+	p.mu.Lock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		p.mu.Unlock()
+		return 0, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	found := false
+	for scope, cooldown := range account.runtime.Cooldowns {
+		if match(scope, cooldown) {
+			found = true
+			break
+		}
+	}
+	p.mu.Unlock()
+	if !found {
+		return 0, nil
+	}
+	cleared := 0
+	_, err := p.updateRuntime(accountID, func(_ *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
+		cleared = 0
+		for scope, cooldown := range runtimeState.Cooldowns {
+			if match(scope, cooldown) {
+				delete(runtimeState.Cooldowns, scope)
+				cleared++
+			}
+		}
+		return cleared > 0, nil, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return cleared, nil
+}
+
 // BindResource 将资源 ID 固定到创建账户
 func (p *AccountPool) BindResource(resourceID string, accountID string) error {
 	return p.BindResourceKind(resourceID, accountID, "")

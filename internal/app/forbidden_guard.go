@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +30,10 @@ const (
 	// 视为号池级 403（纯 Go proof、动态头、请求形态或 WAA binding 失效等，见 docs/waa.md），不是账号没有权限：不写单模型冷却、
 	// 不升档、不登记淘汰，按一般失败处理（计入连续失败、退避），免得修复上线后号池仍按递增档位冷却到数小时后（冷却会持久化）
 	forbiddenSystemicAccounts = 5
+	// forbiddenModelReasonPrefix 与 forbiddenPauseReasonSuffix 为单模型 403 冷却与多模型连续 403 自动暂停写入的冷却原因的固定部分：
+	// 认证文件更新后按它们找出 403 无权限的冷却并清除（见 forbiddenCooldown）
+	forbiddenModelReasonPrefix = "无权限（模型）: "
+	forbiddenPauseReasonSuffix = "次返回 403 无权限，自动暂停"
 )
 
 type forbiddenEvent struct {
@@ -213,6 +218,42 @@ func (tracker *forbiddenTracker) reset(accountID string) {
 	tracker.mu.Lock()
 	delete(tracker.events, accountID)
 	tracker.mu.Unlock()
+}
+
+// deniedAccounts 返回号池内最近对该模型返回 403 的账号（号池级 403 判定窗口内的记录）
+func (tracker *forbiddenTracker) deniedAccounts(pool aistudio.PoolScope, modelID string) []string {
+	if tracker == nil {
+		return nil
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	state := tracker.scopes[forbiddenScopeKey{pool: pool, modelID: modelID}]
+	accountIDs := make([]string, 0, len(state.denied))
+	for _, denial := range state.denied {
+		accountIDs = append(accountIDs, denial.accountID)
+	}
+	return accountIDs
+}
+
+// forgetAccount 认证文件更新后清除账号的连续 403 计数与全部单模型 403 冷却档位：新的登录状态再 403 时从第一档重新计
+func (tracker *forbiddenTracker) forgetAccount(accountID string) {
+	if tracker == nil {
+		return
+	}
+	tracker.mu.Lock()
+	defer tracker.mu.Unlock()
+	delete(tracker.events, accountID)
+	for key := range tracker.models {
+		if key.accountID == accountID {
+			delete(tracker.models, key)
+		}
+	}
+}
+
+// forbiddenCooldown 判断冷却是否由 403 无权限写入：单模型 403 冷却，或多模型连续 403 的自动暂停
+func forbiddenCooldown(_ string, cooldown aistudio.CooldownState) bool {
+	return strings.HasPrefix(cooldown.Reason, forbiddenModelReasonPrefix) ||
+		strings.HasSuffix(cooldown.Reason, forbiddenPauseReasonSuffix)
 }
 
 // isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）

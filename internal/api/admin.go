@@ -28,6 +28,8 @@ type AdminService interface {
 	RuntimeConfig(context.Context) (RuntimeConfig, error)
 	UpdateRuntimeConfig(context.Context, RuntimeConfig) (RuntimeConfig, error)
 	Cooldowns(context.Context) ([]AdminCooldown, error)
+	PermissionDenied(context.Context) ([]AdminPermissionDenied, error)
+	ClearPermissionDenied(context.Context, PermissionDeniedClearInput) (int, error)
 	Requests(context.Context) ([]AdminRequest, error)
 	CancelRequest(context.Context, string) error
 	Events(context.Context) (<-chan AdminEvent, error)
@@ -329,6 +331,33 @@ type AdminCooldown struct {
 	Reason       string    `json:"reason,omitempty"`
 }
 
+// AdminPermissionDenied 表示一个返回过 HTTP 403 无权限（PERMISSION_DENIED）的账户：多半没有同意 Google 的政策，
+// 重新获取认证文件上传后清除。Models 按最近一次 403 从新到旧排列，Count 为各模型次数之和
+type AdminPermissionDenied struct {
+	ID      string                       `json:"id"`
+	Label   string                       `json:"label"`
+	Models  []AdminPermissionDeniedModel `json:"models"`
+	Count   int                          `json:"count"`
+	FirstAt time.Time                    `json:"first_at"`
+	LastAt  time.Time                    `json:"last_at"`
+}
+
+// AdminPermissionDeniedModel 表示账户在一个模型上的 403 记录；Channels 为返回过 403、之后还没有成功过的通道
+type AdminPermissionDeniedModel struct {
+	Model    string    `json:"model"`
+	Channels []string  `json:"channels"`
+	Count    int       `json:"count"`
+	FirstAt  time.Time `json:"first_at"`
+	LastAt   time.Time `json:"last_at"`
+	Message  string    `json:"message,omitempty"`
+}
+
+// PermissionDeniedClearInput 表示要清除记录的账户；All 为真时清除全部
+type PermissionDeniedClearInput struct {
+	AccountIDs []string `json:"account_ids"`
+	All        bool     `json:"all"`
+}
+
 // AdminRequest 表示活动请求摘要
 type AdminRequest struct {
 	ID           string    `json:"id"`
@@ -369,6 +398,8 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
+	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
+	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)
@@ -547,6 +578,29 @@ func (s *server) handleCooldowns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string][]AdminCooldown{"cooldowns": cooldowns})
+}
+
+func (s *server) handlePermissionDenied(w http.ResponseWriter, r *http.Request) {
+	accounts, err := s.config.Admin.PermissionDenied(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string][]AdminPermissionDenied{"accounts": accounts})
+}
+
+func (s *server) handleClearPermissionDenied(w http.ResponseWriter, r *http.Request) {
+	var input PermissionDeniedClearInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	cleared, err := s.config.Admin.ClearPermissionDenied(r.Context(), input)
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"cleared": cleared})
 }
 
 func (s *server) handleRequests(w http.ResponseWriter, r *http.Request) {

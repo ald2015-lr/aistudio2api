@@ -107,6 +107,7 @@ func newRuntime(
 	// 账户因登录失效退出调度后用合并推送更新管理页，不为单个账户立即推送全部账户状态
 	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
+	service.permissionDenied = openPermissionDeniedRegistry(store.PrimaryDirectory(), requests)
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -130,6 +131,8 @@ func newRuntime(
 		err := workers.Close()
 		transport.CloseIdleConnections()
 		headers.Close()
+		// 403 无权限账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
+		service.permissionDenied.flush()
 		return err
 	}
 	return service, admin, closeRuntime, nil
@@ -2190,6 +2193,8 @@ type trackedService struct {
 	requests  *requestRegistry
 	workers   *accountWorkerManager
 	forbidden *forbiddenTracker
+	// permissionDenied 为 403 无权限账户的登记表（见 permission_denied.go），保存在账户目录，跨重启保留；为空时不登记
+	permissionDenied *permissionDeniedRegistry
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
 	quota *quotaSharing
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
@@ -4061,6 +4066,7 @@ func (service *trackedService) generateWithRetry(
 			service.forbidden.reset(request.AccountID)
 			service.forbidden.resetModel(request.AccountID, lease.CooldownScope(modelID))
 			service.forbidden.modelSucceeded(scope, modelID, time.Now())
+			service.permissionDenied.succeeded(request.AccountID, modelID, lease.Channel())
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
 			finishAttempt = cancelAttempt
@@ -4109,7 +4115,7 @@ func (service *trackedService) generateWithRetry(
 			now := time.Now()
 			if pause, count, models := service.forbidden.record(request.AccountID, modelID, now); pause {
 				until := now.Add(forbiddenPause)
-				reason := fmt.Sprintf("%d 分钟内 %d 个模型连续 %d 次返回 403 无权限，自动暂停",
+				reason := fmt.Sprintf("%d 分钟内 %d 个模型连续 %d "+forbiddenPauseReasonSuffix,
 					int(forbiddenWindow/time.Minute), models, count)
 				stateErr := service.pool.MarkCooldownIfGeneration(
 					request.AccountID, "", lease.ModelAccessGeneration(), lease.CheckedAt(), until, reason,
@@ -4133,15 +4139,21 @@ func (service *trackedService) generateWithRetry(
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
 		if modelDenied && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
 			modelDenied = false
+			// 判定成立之前几个账号的 403 已经登记为无权限账户：一并撤销窗口内新登记的条目，免得修复后列表里留下一批正常账户
+			service.permissionDenied.dropSystemic(
+				service.forbidden.deniedAccounts(scope, modelID), modelID, time.Now().Add(-forbiddenWindow),
+			)
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 				"号池内 %d 分钟内至少 %d 个账号对模型 %s 返回 403 且没有成功，按号池级 403 处理，不冷却账号",
 				int(forbiddenWindow/time.Minute), forbiddenSystemicAccounts, modelID,
 			))
 		}
 		if modelDenied {
+			// 登记为 403 无权限账户，管理页单独列出（多半是没有同意 Google 的政策，重新获取认证文件上传后清除，见 permission_denied.go）
+			service.permissionDenied.record(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now())
 			cooldownScope := lease.CooldownScope(modelID)
 			until, level := service.forbidden.recordModel(request.AccountID, cooldownScope, time.Now())
-			reason := "无权限（模型）: " + err.Error()
+			reason := forbiddenModelReasonPrefix + err.Error()
 			if stateErr := service.pool.MarkCooldownIfGeneration(
 				request.AccountID, cooldownScope, lease.ModelAccessGeneration(), lease.CheckedAt(), until, reason,
 			); stateErr != nil {

@@ -142,6 +142,8 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 			continue
 		}
 		delete(watcher.failures, directory)
+		// 重新导入的账户目录带着新的认证文件：清除之前的 403 无权限记录与冷却（目录里旧的 runtime-state.json 可能还留着）
+		watcher.admin.service.forgetPermissionDenied(account.ID, "重新导入")
 		known[account.ID] = aistudio.AccountLoginSummary{ID: account.ID}
 		changed = true
 		message := "自动导入账户 | 账户=" + account.Config.Label
@@ -459,6 +461,8 @@ func (admin *runtimeAdmin) refreshAccountLogin(ctx context.Context, accountID st
 	if err := lease.SaveStorageState(state); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
+	// 新的认证文件可能已经解决了 403 无权限（多半是之前没有同意 Google 的政策）：释放账户之前清除记录与冷却，释放后立即重新参与调度
+	admin.service.forgetPermissionDenied(accountID, "认证文件更新")
 	return true, lease.Release()
 }
 
@@ -534,6 +538,7 @@ func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	admin.service.removeAccountModelRetry(accountID)
 	admin.onboard.forget(accountID)
 	accountDisableNotes.clear(accountID)
+	admin.service.permissionDenied.clearAccount(accountID)
 	return errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID))
 }
 
@@ -575,6 +580,8 @@ func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, account
 	}); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
+	// 同 refreshAccountLogin：新的认证文件可能已经解决了 403 无权限，释放账户之前清除记录与冷却
+	admin.service.forgetPermissionDenied(account.ID, "认证文件更新")
 	if err := lease.Release(); err != nil {
 		return false, err
 	}

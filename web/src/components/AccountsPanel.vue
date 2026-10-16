@@ -19,6 +19,7 @@ import type {
   AccountState,
   ChromeImportProfile,
   Cooldown,
+  PermissionDeniedAccount,
   UltraWorkerCounters,
   WorkerCounters,
   WorkerState,
@@ -141,6 +142,132 @@ function formatRemaining(until: number): string {
 
 function formatClock(until: number): string {
   return new Date(until).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
+}
+
+// ---------- 403 无权限账户 ----------
+
+// 列表的最短刷新间隔：账户与冷却数据在每个请求结束后都会推送，列表不随它们高频请求，最多每 15 秒一次
+const PERMISSION_DENIED_REFRESH_MS = 15000
+// 收起时显示的账户数
+const PERMISSION_DENIED_COLLAPSED = 20
+
+const permissionDenied = ref<PermissionDeniedAccount[]>([])
+const showAllPermissionDenied = ref(false)
+const permissionDeniedClearing = ref(false)
+let permissionDeniedLoadedAt = 0
+let permissionDeniedLoading = false
+let permissionDeniedTimer: number | undefined
+// permissionDeniedVersion 在清除记录后递增：清除前发出、清除后才返回的读取结果不再覆盖列表
+let permissionDeniedVersion = 0
+
+const visiblePermissionDenied = computed(() =>
+  showAllPermissionDenied.value
+    ? permissionDenied.value
+    : permissionDenied.value.slice(0, PERMISSION_DENIED_COLLAPSED),
+)
+
+// loadPermissionDenied 读取 403 无权限账户列表；失败时保留上一次的列表（旧版服务没有这个接口时不显示）
+async function loadPermissionDenied(): Promise<void> {
+  if (permissionDeniedLoading) return
+  permissionDeniedLoading = true
+  permissionDeniedLoadedAt = Date.now()
+  const version = permissionDeniedVersion
+  try {
+    const accounts = await api.permissionDenied()
+    if (version === permissionDeniedVersion) permissionDenied.value = accounts
+  } catch {
+    // 保留上一次的列表
+  } finally {
+    permissionDeniedLoading = false
+  }
+}
+
+// schedulePermissionDeniedLoad 账户或冷却数据变化后刷新列表；距上次刷新不到 15 秒时推迟到满 15 秒，期间的变化合并为一次
+function schedulePermissionDeniedLoad(): void {
+  if (permissionDeniedTimer !== undefined) return
+  const wait = Math.max(0, permissionDeniedLoadedAt + PERMISSION_DENIED_REFRESH_MS - Date.now())
+  permissionDeniedTimer = window.setTimeout(() => {
+    permissionDeniedTimer = undefined
+    void loadPermissionDenied()
+  }, wait)
+}
+
+watch([() => props.accounts, () => props.cooldowns], schedulePermissionDeniedLoad)
+onMounted(() => {
+  void loadPermissionDenied()
+})
+onBeforeUnmount(() => {
+  if (permissionDeniedTimer !== undefined) window.clearTimeout(permissionDeniedTimer)
+})
+
+// permissionDeniedModels 把账户的 403 模型格式化为"模型（通道）"，按最近一次从新到旧
+function permissionDeniedModels(account: PermissionDeniedAccount): string {
+  return account.models
+    .map((model) => {
+      const channels = model.channels.map((channel) => t(channelLabelKey(channel))).join('/')
+      return channels === '' ? model.model : `${model.model} (${channels})`
+    })
+    .join(', ')
+}
+
+// permissionDeniedDetail 为模型一栏的悬停提示：每个模型的次数与上游原文
+function permissionDeniedDetail(account: PermissionDeniedAccount): string {
+  return account.models
+    .map((model) => `${model.model} ×${model.count}${model.message ? `: ${model.message}` : ''}`)
+    .join('\n')
+}
+
+function formatDateTime(value: string): string {
+  const time = Date.parse(value)
+  if (!Number.isFinite(time)) return '—'
+  return new Date(time).toLocaleString([], {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  })
+}
+
+// downloadPermissionDenied 下载 403 无权限账户的邮箱列表（txt，每行一个，与复制的内容相同）
+function downloadPermissionDenied(): void {
+  if (permissionDenied.value.length === 0) return
+  const text = `${permissionDenied.value.map((account) => account.label).join('\n')}\n`
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
+  const now = new Date()
+  const pad = (value: number) => String(value).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `permission-denied-accounts-${stamp}.txt`
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// clearPermissionDenied 清除全部 403 无权限账户记录（只清除列表，不解除冷却）
+async function clearPermissionDenied(): Promise<void> {
+  if (
+    !(await confirmAction(
+      t('accounts.permissionDeniedClearConfirm'),
+      t('accounts.permissionDeniedClear'),
+    ))
+  )
+    return
+  permissionDeniedClearing.value = true
+  try {
+    const result = await api.clearPermissionDenied({ all: true })
+    permissionDeniedVersion += 1
+    permissionDenied.value = []
+    showAllPermissionDenied.value = false
+    emit('notice', tf('accounts.permissionDeniedCleared', { count: result.cleared }), 'success')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    permissionDeniedClearing.value = false
+  }
 }
 
 // ---------- 弹窗与单账户操作 ----------
@@ -813,6 +940,93 @@ function closeBulkPanel(): void {
 
       <p class="-mt-2 text-xs text-gray-500">{{ t('accounts.autoImportHint') }}</p>
       <OnboardingPanel :disabled-count="stateCounts.disabled" />
+
+      <!-- 403 无权限账户：多半未同意 Google 政策，重新获取认证文件上传后自动清除 -->
+      <div
+        v-if="permissionDenied.length > 0"
+        class="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span
+              v-tooltip="t('accounts.permissionDeniedHelp')"
+              class="font-bold text-red-300"
+              tabindex="0"
+            >
+              {{ t('accounts.permissionDeniedTitle') }}
+            </span>
+            <span class="text-gray-300">{{ t('accounts.permissionDeniedHint') }}</span>
+            <span class="font-mono text-red-300">
+              {{ tf('accounts.permissionDeniedCount', { count: permissionDenied.length }) }}
+            </span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm"
+              type="button"
+              @click="copyEmails(permissionDenied.map((account) => account.label))"
+            >
+              {{ t('accounts.copyAllEmails') }}
+            </button>
+            <button class="btn btn-sm" type="button" @click="downloadPermissionDenied">
+              {{ t('accounts.permissionDeniedDownload') }}
+            </button>
+            <button
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="permissionDeniedClearing"
+              :aria-busy="permissionDeniedClearing"
+              @click="clearPermissionDenied"
+            >
+              {{ t('accounts.permissionDeniedClear') }}
+            </button>
+          </div>
+        </div>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-left text-gray-500">
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedModels') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedLast') }}</th>
+                <th class="py-1 text-right font-normal">
+                  {{ t('accounts.permissionDeniedTimes') }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="account in visiblePermissionDenied"
+                :key="account.id"
+                class="border-t border-[#30363d]"
+              >
+                <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
+                <td class="max-w-md py-1 pr-3">
+                  <div class="cell-truncate text-gray-300" :title="permissionDeniedDetail(account)">
+                    {{ permissionDeniedModels(account) }}
+                  </div>
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ formatDateTime(account.last_at) }}
+                </td>
+                <td class="py-1 text-right font-mono text-red-300">{{ account.count }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <button
+          v-if="permissionDenied.length > PERMISSION_DENIED_COLLAPSED"
+          class="mt-2 text-xs text-blue-400 hover:underline"
+          type="button"
+          @click="showAllPermissionDenied = !showAllPermissionDenied"
+        >
+          {{
+            showAllPermissionDenied
+              ? t('accounts.cooldownShowLess')
+              : tf('accounts.permissionDeniedShowAll', { count: permissionDenied.length })
+          }}
+        </button>
+      </div>
 
       <!-- 模型冷却概况：按模型统计冷却中的账号与恢复倒计时 -->
       <div v-if="cooldownSummary.entries > 0" class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-sm">

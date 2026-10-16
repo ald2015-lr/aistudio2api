@@ -260,6 +260,26 @@ export interface Cooldown {
   reason?: string
 }
 
+// PermissionDeniedModel 为账户在一个模型上的 403 无权限记录；channels 为返回过 403、之后还没有成功过的通道
+export interface PermissionDeniedModel {
+  model: string
+  channels: UpstreamChannel[]
+  count: number
+  first_at: string
+  last_at: string
+  message?: string
+}
+
+// PermissionDeniedAccount 为返回过 403 无权限的账户（多半未同意 Google 政策），重新获取认证文件上传后清除
+export interface PermissionDeniedAccount {
+  id: string
+  label: string
+  models: PermissionDeniedModel[]
+  count: number
+  first_at: string
+  last_at: string
+}
+
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
 
 export interface RequestSummary {

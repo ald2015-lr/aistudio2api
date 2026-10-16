@@ -355,6 +355,8 @@ func (admin *runtimeAdmin) addAccount(
 		return api.AdminAccount{}, err
 	}
 	publishLease = nil
+	// 删除后用同一邮箱重新添加的账户不沿用之前的 403 无权限记录
+	admin.service.forgetPermissionDenied(account.ID, "新增账户")
 	admin.onboard.markManual(account.ID)
 	admin.syncAccountModelCatalog(ctx, account)
 	return admin.account(account.ID)
@@ -437,6 +439,7 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 		return accountOperationError(err)
 	}
 	admin.service.removeAccountModelRetry(accountID)
+	admin.service.permissionDenied.clearAccount(accountID)
 	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
 		return err
 	}
@@ -501,6 +504,8 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
+	// 重新登录得到新的认证文件：清除 403 无权限记录与冷却，释放后立即重新参与调度
+	admin.service.forgetPermissionDenied(account.ID, "浏览器登录")
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}

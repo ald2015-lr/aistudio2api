@@ -14,6 +14,7 @@ import type {
   PlaygroundInput,
   PlaygroundMedia,
   Cooldown,
+  PermissionDeniedAccount,
   RequestBody,
   RequestSummary,
   ServiceConfig,
@@ -44,6 +45,14 @@ interface CooldownsResponse {
 
 interface RequestsResponse {
   requests: RequestSummary[]
+}
+
+interface PermissionDeniedResponse {
+  accounts: PermissionDeniedAccount[]
+}
+
+interface PermissionDeniedClearResponse {
+  cleared: number
 }
 
 export interface EventConnection {
@@ -126,6 +135,13 @@ export const api = {
   accounts: async () => (await requestJSON<AccountsResponse>('/api/accounts')).accounts,
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
+  permissionDenied: async () =>
+    (await requestJSON<PermissionDeniedResponse>('/api/accounts/permission-denied')).accounts,
+  clearPermissionDenied: (input: { account_ids?: string[]; all?: boolean }) =>
+    requestJSON<PermissionDeniedClearResponse>('/api/accounts/permission-denied/clear', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
   requests: async () => (await requestJSON<RequestsResponse>('/api/requests')).requests,
   config: () => requestJSON<ServiceConfig>('/api/config'),
   createAccount: (input: AccountLoginInput) =>
