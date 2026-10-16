@@ -407,6 +407,15 @@ func (manager *runtimeManager) UpdateAccount(ctx context.Context, id string, inp
 	return manager.generation().admin.UpdateAccount(ctx, id, input)
 }
 
+// EnableAccounts 在当前生成服务批量启用账户
+func (manager *runtimeManager) EnableAccounts(ctx context.Context, input api.BulkEnableInput) (api.BulkEnableResult, error) {
+	admin, ok := manager.generation().admin.(bulkAccountEnabler)
+	if !ok {
+		return api.BulkEnableResult{}, fmt.Errorf("批量启用尚未就绪")
+	}
+	return admin.EnableAccounts(ctx, input)
+}
+
 // DeleteAccount 在当前生成服务删除账户
 func (manager *runtimeManager) DeleteAccount(ctx context.Context, id string) error {
 	return manager.generation().admin.DeleteAccount(ctx, id)

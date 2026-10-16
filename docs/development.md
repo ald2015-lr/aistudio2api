@@ -222,7 +222,7 @@ POST /api/control/start
 
 | 文件 | 内容 | 生命周期 |
 | --- | --- | --- |
-| `account.json` | label、enabled、proxy、locale、timezone | 创建或编辑账户时写入 |
+| `account.json` | label、enabled、proxy、locale、timezone | 创建或编辑账户时写入；缺少 `enabled` 字段按启用读取。账户默认启用：启动与目录扫描导入时，`enabled` 为 `false` 但 `.disable-reasons.json` 中没有手动停用记录的账户在加入账户池之前改为启用并原子写回（16 个并行，只写一条汇总日志）；只有管理页或管理接口停用的保持停用 |
 | `storage-state.json` | Cookie、localStorage 与可选 Chrome OAuth/DBSC 续签材料 | 合并 `Set-Cookie` 或认证续签后原子写回 |
 | `camoufox-fingerprint.json` | 账户固定的浏览器指纹、语言与时区 | 首次运行生成，空值、窗口几何、字体、语音与媒体设备按 Camoufox 官方启动器规则规范化；重新登录和 WAA runtime 继续复用 |
 | `runtime-state.json` | 权益等级、模型资格、冷却与资源账户绑定 | 权益同步、首次模型结果或资源变化后原子写回 |
@@ -278,7 +278,7 @@ Worker 同样按账户当前权益分为普通分区与 Ultra 分区（`internal
 
 `ModelAccessKey(scope, model)` 会移除 `models/` 前缀；空 scope 返回规范模型 ID，非空 scope 返回 `<scope>:<canonicalModelID>`。Bidi setup 使用 lease（账户租约）时间，会话内每个 qualifying turn（一次模型资格检查）分配严格递增的 attempt 时间，`turn_complete` 消费对应 attempt。普通流式生成在规范 `EventFinish` 到达时写 `verified`；此前的 text、reasoning、tool、usage 和首事件用于输出与性能统计，终态前断流、取消或错误保持原验证状态。
 
-模型目录刷新为全部 enabled ready/busy 账户并发执行。同步报错或返回空目录的账户进入 generation 内的 pending ID 集合；每个非空结果立即更新公共目录、账户状态并在 RUNNING 期间预热更多 Worker。初次 fan-out（同时向全部符合条件的账户发出 `ListModels`）结束后，单个 30 秒 ticker（定时器）对可用的 pending 账户再次并发刷新。冷却中的任务保留到期再试；需要登录、停用、不可用或已删除的账户退出重试，重新登录或启用后由账户更新流程重新同步。失败日志记录账户与原因，恢复成功记录模型数量。`modelRevision` 跟踪账户和配置变化，生成服务开始接收请求前会确认已应用当前 revision。
+模型目录刷新为全部 enabled ready/busy 账户并发执行。同步报错或返回空目录的账户进入 generation 内的 pending ID 集合；每个非空结果立即更新公共目录、账户状态并在 RUNNING 期间预热更多 Worker。初次 fan-out（同时向全部符合条件的账户发出 `ListModels`）结束后，单个 30 秒 ticker（定时器）对可用的 pending 账户再次并发刷新。冷却中的任务保留到期再试；需要登录、停用、不可用或已删除的账户退出重试，重新登录后重新同步；管理页单个启用或批量启用的账户没有模型目录时，在后台按 16 个并发（两者共用）补同步，一批同步完合并应用一次目录；认证文件更新后启用的账户随即同步一次。失败日志记录账户与原因，恢复成功记录模型数量。`modelRevision` 跟踪账户和配置变化，生成服务开始接收请求前会确认已应用当前 revision。
 
 认证状态包含长期凭证和设备绑定材料，保存在本机受控目录。提交、Issue、CI 和普通日志使用脱敏材料，保留字段形状并替换 Cookie、token、proof、邮箱、账户 ID、提示词、响应正文和完整原始帧。
 
@@ -303,7 +303,7 @@ Worker 同样按账户当前权益分为普通分区与 Ultra 分区（`internal
 | 能力 | 路由 |
 | --- | --- |
 | 健康与状态 | `GET /health`、`GET /api/status` |
-| 模型与账户 | `GET /api/models`、`GET/POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`PUT/DELETE /api/accounts/{id}` |
+| 模型与账户 | `GET /api/models`、`GET/POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT/DELETE /api/accounts/{id}` |
 | 登录与验证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
 | 配置 | `GET /api/config`、`PUT /api/config` |

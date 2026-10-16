@@ -15,8 +15,9 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
-// 新账户自动处理：持续上传的新账户攒够一批（或等待超过上限）后，先在停用状态下验证登录，
-// 验证通过才启用，失效的账户保持停用，不会接到任何请求。
+// 新账户自动处理：持续上传的新账户攒够一批（或等待超过上限）后验证登录；停用的账户先在停用状态下验证，
+// 验证通过才启用，失效的保持停用，不会接到任何请求。账户默认启用：启动与导入时没有手动停用记录的停用账户
+// 已经改为启用（见 account_enable.go），这里多数账户已是启用状态，验证未通过的会被标为需要登录。
 // 处理记录与设置保存在账户目录的 .onboarding.json，重启后继续有效：
 //   - 首次启用本功能时，已有账户全部记为基线，不做任何改动（不会重新启用你手动停用的账户）
 //   - 之后新增的目录（包括服务停止期间上传的）都会进入队列
@@ -39,6 +40,10 @@ const (
 	onboardingMaxBatchSize   = 200
 	onboardingMaxConcurrency = 8
 )
+
+// onboardingSaveDelay 为处理结果合并保存的间隔：账户上万时 .onboarding.json 有几 MB，原先每处理完一个账户就完整重写
+// 并同步一次文件，且全程持有队列锁。服务异常退出时最多丢失这几秒的结果，这些账户下次启动时重新进入队列
+var onboardingSaveDelay = 2 * time.Second
 
 // 处理结果
 const (
@@ -80,6 +85,8 @@ type accountOnboarder struct {
 	processing map[string]*onboardPending
 	recent     []api.OnboardingEvent
 	wake       chan struct{}
+	// savePending 为真时已有一次合并保存在等待（见 scheduleSaveLocked）
+	savePending bool
 }
 
 func defaultOnboardingPolicy() api.OnboardingPolicy {
@@ -163,8 +170,9 @@ func (onboarder *accountOnboarder) load() {
 	onboarder.saveLocked()
 }
 
-// saveLocked 原子写入处理记录；调用方持有 mu
+// saveLocked 原子写入处理记录；调用方持有 mu。等待中的合并保存随之完成
 func (onboarder *accountOnboarder) saveLocked() {
+	onboarder.savePending = false
 	content, err := json.MarshalIndent(onboardFile{
 		Version: 1, Policy: onboarder.policy, Accounts: onboarder.records,
 	}, "", "  ")
@@ -175,6 +183,27 @@ func (onboarder *accountOnboarder) saveLocked() {
 		if onboarder.admin != nil && onboarder.admin.requests != nil {
 			onboarder.admin.requests.log("service", "WARN", "新账户自动处理记录保存失败 | "+err.Error())
 		}
+	}
+}
+
+// scheduleSaveLocked 在 onboardingSaveDelay 后保存一次，期间的多次变化合并写入；调用方持有 mu
+func (onboarder *accountOnboarder) scheduleSaveLocked() {
+	if onboarder.savePending {
+		return
+	}
+	onboarder.savePending = true
+	time.AfterFunc(onboardingSaveDelay, onboarder.flush)
+}
+
+// flush 写出等待合并保存的处理结果；生成服务停止与关闭时也调用。没有待保存的变化时什么都不做
+func (onboarder *accountOnboarder) flush() {
+	if onboarder == nil {
+		return
+	}
+	onboarder.mu.Lock()
+	defer onboarder.mu.Unlock()
+	if onboarder.savePending {
+		onboarder.saveLocked()
 	}
 }
 
@@ -248,6 +277,7 @@ func (onboarder *accountOnboarder) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			onboarder.flush()
 			return
 		case <-ticker.C:
 		case <-onboarder.wake:
@@ -360,34 +390,30 @@ func (onboarder *accountOnboarder) process(
 	label := status.Label
 	verified := false
 	if policy.AutoVerify {
-		if _, err := onboarder.admin.VerifyAccount(ctx, accountID); err != nil {
+		verification, err := onboarder.admin.verifyLogin(ctx, accountID)
+		if err != nil {
 			return onboardError, strings.TrimSpace(err.Error()), true
 		}
 		if status, ok = onboarder.accountStatus(accountID); !ok {
 			return "", "", false
 		}
-		if status.State == aistudio.AccountAuthRequired {
-			reason := strings.TrimSpace(status.Message)
-			if reason == "" {
-				reason = "AI Studio 登录已失效"
+		if failed, reason := onboardVerifyFailure(verification, status); failed {
+			outcome := "验证未通过，保持停用"
+			if status.Enabled {
+				outcome = "验证未通过，账户需要重新登录"
 			}
-			onboarder.admin.requests.log(label, "WARN", "新账户自动处理 | 验证未通过，保持停用 | 原因="+reason)
+			onboarder.admin.requests.log(label, "WARN", "新账户自动处理 | "+outcome+" | 原因="+reason)
 			return onboardVerifyFailed, reason, false
 		}
 		verified = true
 	}
 	if policy.AutoEnable && !status.Enabled {
+		// 启用后还没有模型目录时（未经验证直接启用、验证时目录同步失败），UpdateAccount 会在后台补一次同步
 		dto := adminAccountDTO(status)
 		if _, err := onboarder.admin.UpdateAccount(ctx, accountID, api.AccountInput{
 			Label: dto.Label, Enabled: true, Proxy: dto.Proxy, Locale: dto.Locale, Timezone: dto.Timezone,
 		}); err != nil {
 			return onboardError, strings.TrimSpace(err.Error()), true
-		}
-		if !verified {
-			// 未经验证直接启用时补一次模型目录同步，否则账户没有目录无法预热与调度
-			if account, err := onboarder.admin.pool.Account(accountID); err == nil {
-				onboarder.admin.syncAccountModelCatalog(ctx, account)
-			}
 		}
 		onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | 已启用")
 		return onboardEnabled, "", false
@@ -396,6 +422,26 @@ func (onboarder *accountOnboarder) process(
 		return onboardVerified, "", false
 	}
 	return onboardSkipped, "账户已是启用状态", false
+}
+
+// onboardVerifyFailure 判断验证是否未通过并给出原因：浏览器验证未认证，或验证后账户被标为需要登录（启用账户的模型目录
+// 同步确认登录失效）。停用账户的对外状态始终是 disabled，原先只看状态，停用账户验证未通过也被当成通过并启用，
+// 面板上“验证未通过”一直是 0
+func onboardVerifyFailure(verification aistudio.LoginVerification, status aistudio.AccountStatus) (bool, string) {
+	if verification.Authenticated && status.State != aistudio.AccountAuthRequired {
+		return false, ""
+	}
+	reason := ""
+	if !verification.Authenticated {
+		reason = strings.TrimSpace(verification.Reason)
+	}
+	if reason == "" {
+		reason = strings.TrimSpace(status.Message)
+	}
+	if reason == "" {
+		reason = "AI Studio 登录已失效"
+	}
+	return true, reason
 }
 
 // finish 记录处理结果；出错且未超过重试次数时稍后重试。返回最终结果（仍在重试时为空）
@@ -430,9 +476,9 @@ func (onboarder *accountOnboarder) finish(accountID string, result string, detai
 	// 停用原因：验证未通过或出错的账户保持停用，在管理页显示原因；启用后清除
 	switch result {
 	case onboardVerifyFailed:
-		accountDisableNotes.set(accountID, "新账户自动处理验证未通过（"+detail+"），认证文件更新后会自动重新验证", true)
+		accountDisableNotes.set(accountID, "新账户自动处理验证未通过（"+detail+"），认证文件更新或重启后按默认启用", true)
 	case onboardError:
-		accountDisableNotes.set(accountID, "新账户自动处理验证出错（"+detail+"），认证文件更新后会自动重新验证", true)
+		accountDisableNotes.set(accountID, "新账户自动处理验证出错（"+detail+"），认证文件更新或重启后按默认启用", true)
 	case onboardEnabled:
 		accountDisableNotes.clear(accountID)
 	}
@@ -442,7 +488,7 @@ func (onboarder *accountOnboarder) finish(accountID string, result string, detai
 	if len(onboarder.recent) > onboardingRecentLimit {
 		onboarder.recent = onboarder.recent[:onboardingRecentLimit]
 	}
-	onboarder.saveLocked()
+	onboarder.scheduleSaveLocked()
 	return result
 }
 
@@ -544,33 +590,4 @@ func (onboarder *accountOnboarder) updatePolicy(policy api.OnboardingPolicy) err
 	))
 	onboarder.signal()
 	return nil
-}
-
-// requeue 认证文件更新后，把停用的账户重新加入自动处理队列（管理页手动添加的除外）；返回是否加入
-func (onboarder *accountOnboarder) requeue(accountID string) bool {
-	if onboarder == nil {
-		return false
-	}
-	onboarder.mu.Lock()
-	if !onboarder.policy.AutoVerify && !onboarder.policy.AutoEnable {
-		onboarder.mu.Unlock()
-		return false
-	}
-	if record, done := onboarder.records[accountID]; done && record.Result == onboardManual {
-		onboarder.mu.Unlock()
-		return false
-	}
-	_, queued := onboarder.pending[accountID]
-	_, active := onboarder.processing[accountID]
-	if queued || active {
-		onboarder.mu.Unlock()
-		return false
-	}
-	delete(onboarder.records, accountID)
-	// 认证刚更新，立即开始，不等攒批
-	onboarder.pending[accountID] = &onboardPending{queuedAt: time.Now().Add(-onboardingMaxWait)}
-	onboarder.saveLocked()
-	onboarder.mu.Unlock()
-	onboarder.signal()
-	return true
 }

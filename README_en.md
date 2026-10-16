@@ -532,7 +532,7 @@ Authentication files are stored in `auth/` by default:
 
 | Path | Contents |
 | --- | --- |
-| `auth/<Google email>/account.json` | Account email, proxy, locale, timezone, and enabled state |
+| `auth/<Google email>/account.json` | Account email, proxy, locale, timezone, and enabled state (a missing `enabled` field means enabled; `false` without a manual disable record is switched to enabled and written back at startup or import) |
 | `auth/<Google email>/storage-state.json` | Google cookies and authentication renewal material |
 | `auth/<Google email>/runtime-state.json` | Benefit tier, model eligibility, cooldowns, and resource ownership |
 | `auth/<Google email>/camoufox-cache/` | Web cache of that account's browser; can be deleted while the service is stopped |
@@ -542,6 +542,8 @@ Authentication files are stored in `auth/` by default:
 The lowercase Google email is the account directory, management UI identity, and log source. `.leases` coordinates account-directory access, while the runtime lease in the user cache allows one WAA Worker per email on the current computer.
 
 The Accounts page supports Chrome batch import and isolated Camoufox login. `ready` accounts can be edited, disabled, verified, and deleted; `auth_required` accounts can log in again.
+
+Accounts are enabled by default: at startup and when the directory watcher imports a folder, an account whose `account.json` says disabled (or has no `enabled` field) and that has no manual disable record is switched to enabled and written back in parallel, with a single summary log line. Only accounts disabled from the management page or API stay disabled. "Enable all" and enabling a selection call `POST /api/accounts/bulk-enable` in batches of 500 (at most 1000 per request): each account only gets its enabled flag rewritten, and the account and model snapshot is merged and pushed once per batch instead of once per account. Accounts that are verifying, logging in, or serving a request are reported as busy after 3 seconds; retry later. Enabled accounts without a model catalog sync it in the background (16 at a time) and become usable once it arrives; accounts whose login has expired then show as needing login.
 
 ## Documentation
 

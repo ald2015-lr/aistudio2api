@@ -90,6 +90,27 @@ export interface OnboardingEvent {
   at: string
 }
 
+// BulkEnableInput 为批量启用请求：account_ids 为要启用的账户，all_disabled 为 true 时启用全部停用账户
+export interface BulkEnableInput {
+  account_ids?: string[]
+  all_disabled?: boolean
+}
+
+// BulkEnableFailure 为批量启用中没有启用的账户；code 为 account_busy（正在验证、登录或处理请求）、account_not_found 等
+export interface BulkEnableFailure {
+  id: string
+  code?: string
+  message: string
+}
+
+// BulkEnableResult 为一次批量启用的结果：skipped 为原本已启用的账户数，remaining 为超过单次上限、本次没有处理的账户数
+export interface BulkEnableResult {
+  enabled: number
+  skipped: number
+  failed: BulkEnableFailure[] | null
+  remaining: number
+}
+
 // OnboardingStatus 为新账户自动处理队列状态；next_batch_seconds 为 -1 表示队列为空
 export interface OnboardingStatus {
   policy: OnboardingPolicy

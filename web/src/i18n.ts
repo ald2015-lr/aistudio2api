@@ -276,7 +276,8 @@ const zhCN = {
   'accounts.sortModels': '按模型数',
   'accounts.enableAll': '一键启用',
   'accounts.verifyAll': '一键验证',
-  'accounts.enableAllConfirm': '启用全部 {count} 个已停用账户？',
+  'accounts.enableAllConfirm':
+    '启用全部 {count} 个已停用账户？每 500 个一批提交，没有模型目录的账户启用后在后台同步，登录已失效的会显示为需要登录。',
   'accounts.noneDisabled': '没有已停用的账户',
   'accounts.noneToVerify': '没有需要验证的账户',
   'accounts.selected': '已选 {count} 个',
@@ -302,6 +303,7 @@ const zhCN = {
   'accounts.progressFailures': '失败明细（{count}）',
   'accounts.bulkBusy': '批量操作进行中，请稍候',
   'accounts.bulkFinished': '{action}完成：成功 {succeeded}，失败 {failed}',
+  'accounts.bulkEnableBusy': '账户正忙（正在验证、登录或处理请求），稍后重试',
   'accounts.state': '状态',
   'accounts.account': '账户',
   'accounts.region': '区域 / 时区',
@@ -357,8 +359,9 @@ const zhCN = {
   'onboard.nextIn': '约 {seconds} 秒后开始',
   'onboard.settings': '设置与记录',
   'onboard.collapse': '收起',
-  'onboard.autoVerify': '自动验证新账户（在停用状态下验证，通过后才启用，失效的账户保持停用）',
-  'onboard.autoEnable': '自动启用新账户（同时开启验证时，只启用验证通过的账户）',
+  'onboard.autoVerify':
+    '自动验证新账户（启动浏览器验证登录；账户默认启用，验证未通过的显示为需要登录，仍为停用的账户在停用状态下验证）',
+  'onboard.autoEnable': '自动启用仍为停用的账户（同时开启验证时，只启用验证通过的账户）',
   'onboard.batchSize': '每批数量',
   'onboard.concurrency': '验证并发',
   'onboard.hint':
@@ -900,7 +903,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.sortModels': 'By models',
   'accounts.enableAll': 'Enable all',
   'accounts.verifyAll': 'Verify all',
-  'accounts.enableAllConfirm': 'Enable all {count} disabled accounts?',
+  'accounts.enableAllConfirm':
+    'Enable all {count} disabled accounts? They are submitted 500 at a time; accounts without a model catalog sync it in the background after enabling, and accounts whose login has expired show as needing login.',
   'accounts.noneDisabled': 'No disabled accounts',
   'accounts.noneToVerify': 'No accounts to verify',
   'accounts.selected': '{count} selected',
@@ -927,6 +931,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.progressFailures': 'Failures ({count})',
   'accounts.bulkBusy': 'A bulk operation is running',
   'accounts.bulkFinished': '{action} finished: {succeeded} succeeded, {failed} failed',
+  'accounts.bulkEnableBusy':
+    'Account is busy (verifying, logging in, or serving a request); try again later',
   'accounts.state': 'State',
   'accounts.account': 'Account',
   'accounts.region': 'Locale / Time zone',
@@ -982,8 +988,10 @@ const en: Record<TranslationKey, string> = {
   'onboard.nextIn': 'starts in ~{seconds}s',
   'onboard.settings': 'Settings & history',
   'onboard.collapse': 'Collapse',
-  'onboard.autoVerify': 'Verify new accounts (while disabled; enable only if verification passes)',
-  'onboard.autoEnable': 'Enable new accounts (with verification on, only verified accounts)',
+  'onboard.autoVerify':
+    'Verify new accounts (launches a browser; accounts are enabled by default and show as needing login if verification fails, accounts still disabled are verified while disabled)',
+  'onboard.autoEnable':
+    'Enable accounts that are still disabled (with verification on, only verified accounts)',
   'onboard.batchSize': 'Batch size',
   'onboard.concurrency': 'Verify concurrency',
   'onboard.hint':

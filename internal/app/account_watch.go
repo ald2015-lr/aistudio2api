@@ -47,7 +47,7 @@ type authFileStat struct {
 //   - 新目录：自动载入并加入账户池，无需重启
 //   - 目录被删除：连续缺失两轮后移出账户池（不删除任何文件）
 //   - 认证文件被外部更新（重新登录、后台程序刷新 Cookie）：任何状态的账户都会载入新的登录状态。
-//     需要登录的账户随之恢复调度；自动停用（非手动停用）的账户重新加入新账户自动处理，验证通过后启用
+//     需要登录的账户随之恢复调度；停用但不是手动停用的账户按默认启用，并重新同步模型目录
 type accountWatcher struct {
 	admin     *runtimeAdmin
 	failures  map[string]string
@@ -110,6 +110,8 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	imported := make([]*aistudio.Account, 0)
 	importedIDs := make([]string, 0)
 	now := time.Now()
+	loaded := make([]*aistudio.Account, 0)
+	loadedDirectories := make([]string, 0)
 	for _, directory := range directories {
 		if ctx.Err() != nil {
 			return
@@ -120,25 +122,37 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 			continue
 		}
 		account, err := watcher.admin.store.LoadDirectory(directory)
-		if err == nil {
-			err = watcher.admin.registerExistingAccount(ctx, account)
-		}
 		if err != nil {
-			watcher.report(directory, fmt.Sprintf(
-				"自动导入账户失败 | 目录=%s | 错误=%s", id, strings.TrimSpace(err.Error()),
-			))
+			watcher.reportImportFailure(directory, err)
+			continue
+		}
+		loaded = append(loaded, account)
+		loadedDirectories = append(loadedDirectories, directory)
+	}
+	// 账户默认启用：account.json 为停用、没有手动停用记录的账户先改为启用（并行写回 account.json），再加入账户池，
+	// 与启动时的规则一致；一次放进几千个目录时也不逐个推送账户状态
+	enableUnmarkedAccounts(loaded, watcher.admin.requests, "导入时")
+	for index, account := range loaded {
+		if ctx.Err() != nil {
+			return
+		}
+		directory := loadedDirectories[index]
+		if err := watcher.admin.registerExistingAccount(ctx, account); err != nil {
+			watcher.reportImportFailure(directory, err)
 			continue
 		}
 		delete(watcher.failures, directory)
-		known[id] = aistudio.AccountLoginSummary{ID: account.ID}
+		known[account.ID] = aistudio.AccountLoginSummary{ID: account.ID}
 		changed = true
+		message := "自动导入账户 | 账户=" + account.Config.Label
 		if account.Config.Enabled {
 			imported = append(imported, account)
 		} else {
-			accountDisableNotes.setIfAbsent(account.ID, "导入时 account.json 为停用，等待新账户自动处理验证后启用", true)
+			// 只有手动停用过的账户（目录被移走后又放回）还是停用
+			message += " | 账户是手动停用的，保持停用"
 		}
 		importedIDs = append(importedIDs, account.ID)
-		watcher.admin.requests.log("auth", "INFO", "自动导入账户 | 账户="+account.Config.Label)
+		watcher.admin.requests.log("auth", "INFO", message)
 	}
 	// 新账户进入自动处理队列（攒够一批后验证、通过后启用）
 	watcher.admin.onboard.enqueue(importedIDs)
@@ -155,6 +169,13 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	if changed {
 		watcher.admin.syncModelCache()
 	}
+}
+
+// reportImportFailure 记录一次目录导入失败；同一目录的相同错误只记录一次
+func (watcher *accountWatcher) reportImportFailure(directory string, err error) {
+	watcher.report(directory, fmt.Sprintf(
+		"自动导入账户失败 | 目录=%s | 错误=%s", filepath.Base(directory), strings.TrimSpace(err.Error()),
+	))
 }
 
 // accountRecoverRetry 为恢复账户的模型目录同步失败后再次尝试的间隔
@@ -381,11 +402,33 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie | 账户="+summary.ID)
 	case accountDisableNotes.manual(summary.ID):
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户是手动停用的，保持停用 | 账户="+summary.ID)
-	case !accountDisableNotes.automatic(summary.ID):
-		// 没有停用原因记录（升级前停用、手工改 account.json 停用、记录丢失）：按手动停用处理，不自动启用
-		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie；账户停用原因未记录，按手动停用处理，保持停用 | 账户="+summary.ID)
-	case admin.onboard.requeue(summary.ID):
-		admin.requests.log("auth", "INFO", "检测到认证文件更新，停用账户已重新加入新账户自动处理，验证通过后启用 | 账户="+summary.ID)
+	default:
+		// 账户默认启用：自动停用（新账户自动处理验证未通过等）或没有停用记录的账户换了新的登录后直接启用并同步模型目录，
+		// 登录仍然无效的由模型目录同步标为需要登录；原先没有停用记录的按手动停用处理，与重启后默认启用的规则不一致
+		return admin.enableAfterLoginUpdate(ctx, summary.ID)
+	}
+	return true
+}
+
+// enableAfterLoginUpdate 启用认证文件刚更新的停用账户并同步它的模型目录；返回 false 表示账户正忙，下一轮再试
+func (admin *runtimeAdmin) enableAfterLoginUpdate(ctx context.Context, accountID string) bool {
+	enabled, err := admin.enableAccountConfig(ctx, accountID)
+	if err != nil {
+		if accountBusyError(err) {
+			return false
+		}
+		admin.requests.log("auth", "WARN", fmt.Sprintf(
+			"检测到认证文件更新，启用账户失败 | 账户=%s | 错误=%s", accountID, strings.TrimSpace(err.Error()),
+		))
+		return true
+	}
+	if !enabled {
+		return true
+	}
+	admin.service.markModelsChanged()
+	admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie 并启用账户（没有手动停用记录） | 账户="+accountID)
+	if account, err := admin.pool.Account(accountID); err == nil {
+		admin.syncAccountModelCatalog(ctx, account)
 	}
 	return true
 }

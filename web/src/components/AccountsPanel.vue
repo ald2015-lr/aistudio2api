@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '@/api'
-import { emptyBulkState, runBulk, type BulkAction, type BulkState } from '@/bulk'
+import {
+  emptyBulkState,
+  runBulk,
+  runChunkedBulk,
+  type BulkAction,
+  type BulkChunkResult,
+  type BulkState,
+} from '@/bulk'
 import { copyText } from '@/clipboard'
 import { confirmAction } from '@/confirm'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
@@ -621,6 +628,11 @@ async function startBulk(
   if (bulk.running || accounts.length === 0) return
   bulkPanelOpen.value = true
   await runBulk(bulk, action, accounts, concurrency, task)
+  finishBulk(action)
+}
+
+// finishBulk 批量任务结束后刷新数据并给出汇总通知
+function finishBulk(action: BulkAction): void {
   emit('refresh')
   emit(
     'notice',
@@ -633,6 +645,33 @@ async function startBulk(
   )
 }
 
+// ENABLE_CHUNK 为批量启用每次请求提交的账户数：服务端每次最多处理 1000 个，500 个一批几秒内返回，
+// 不会被反向代理的请求超时打断，两批之间也可以停止
+const ENABLE_CHUNK = 500
+
+// enableTargets 分批调用批量启用接口：原先逐个账户发请求，每启用一个服务端都要推送一次全部账户，上万个账户要几个小时。
+// 原本已启用的账户计为成功，没有启用的列出原因
+async function enableTargets(targets: readonly Account[]): Promise<void> {
+  if (bulk.running || targets.length === 0) return
+  bulkPanelOpen.value = true
+  await runChunkedBulk(bulk, 'enable', targets, ENABLE_CHUNK, enableChunk)
+  finishBulk('enable')
+}
+
+// enableChunk 一次请求启用一批账户，把服务端的失败项换成面板的失败明细
+async function enableChunk(chunk: readonly Account[]): Promise<BulkChunkResult> {
+  const result = await api.enableAccounts({ account_ids: chunk.map((account) => account.id) })
+  const labels = new Map(chunk.map((account) => [account.id, account.label]))
+  return {
+    succeeded: result.enabled + result.skipped,
+    failures: (result.failed ?? []).map((failure) => ({
+      id: failure.id,
+      label: labels.get(failure.id) ?? failure.id,
+      message: failure.code === 'account_busy' ? t('accounts.bulkEnableBusy') : failure.message,
+    })),
+  }
+}
+
 // enableAll 一键启用全部已停用账户
 async function enableAll(): Promise<void> {
   const targets = disabledAccounts.value
@@ -642,7 +681,7 @@ async function enableAll(): Promise<void> {
   }
   if (!(await confirmAction(tf('accounts.enableAllConfirm', { count: targets.length }), t('common.enable'))))
     return
-  await startBulk('enable', targets, 4, (account) => setEnabled(account, true))
+  await enableTargets(targets)
 }
 
 function openVerifyDialog(): void {
@@ -680,12 +719,7 @@ async function bulkSelected(action: 'enable' | 'disable' | 'delete'): Promise<vo
     clearSelection()
     return
   }
-  await startBulk(
-    'enable',
-    targets.filter((account) => !account.enabled),
-    4,
-    (account) => setEnabled(account, true),
-  )
+  await enableTargets(targets.filter((account) => !account.enabled))
 }
 
 // copyEmails 复制账户邮箱（每行一个），便于在本地批量重新登录

@@ -3433,7 +3433,9 @@ func readAccountConfig(filePath string) (AccountConfig, error) {
 	defer file.Close()
 	decoder := json.NewDecoder(file)
 	decoder.DisallowUnknownFields()
-	var value AccountConfig
+	// 缺少 enabled 字段时按启用（与 DefaultAccountConfig 一致）：外部程序写入的 account.json 常常不带这一项，
+	// 原先按零值读成停用，重启后这些账户全部显示停用；显式写了 false 的仍按停用读取
+	value := AccountConfig{Enabled: true}
 	if err := decoder.Decode(&value); err != nil {
 		return AccountConfig{}, fmt.Errorf("解析 %s: %w", accountConfigName, err)
 	}

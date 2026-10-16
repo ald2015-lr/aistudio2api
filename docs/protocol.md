@@ -149,7 +149,7 @@ Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secu
 
 | 文件 | 内容 |
 | --- | --- |
-| `auth/<Google 邮箱>/account.json` | 邮箱、enabled、proxy、locale、timezone |
+| `auth/<Google 邮箱>/account.json` | 邮箱、enabled（缺少该字段按启用读取）、proxy、locale、timezone |
 | `auth/<Google 邮箱>/storage-state.json` | Cookie、localStorage 和可选 Chrome 续签材料 |
 | `auth/<Google 邮箱>/camoufox-fingerprint.json` | 账户固定的 navigator、屏幕、字体、语言、地区和时区配置 |
 | `auth/<Google 邮箱>/runtime-state.json` | 账户权益、实测模型资格、冷却与 Drive/Veo 资源绑定 |
@@ -1100,7 +1100,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | --- | --- |
 | 状态与模型 | `GET /api/status`、`GET /api/models` |
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
-| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}` |
+| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}` |
 | 账户认证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
@@ -1117,6 +1117,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/accounts` | 201 | `{"account":AdminAccount}` |
 | `GET /api/accounts/import/chrome` | 200 | `{"profiles":[ChromeImportProfile,...]}` |
 | `POST /api/accounts/import/chrome` | 201 | `{"accounts":[AdminAccount,...]}` |
+| `POST /api/accounts/bulk-enable` | 200 | `BulkEnableResult` |
 | `PUT /api/accounts/{id}` | 200 | `{"account":AdminAccount}` |
 | `POST /api/accounts/{id}/login`、`verify` | 200 | `{"account":AdminAccount}` |
 | `DELETE /api/accounts/{id}` | 204 | 空 body |
@@ -1145,6 +1146,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |
 | `ChromeImportProfile` | `id`、`profile`、`display_name`、`email`、`locale` |
 | `ChromeImportInput` | `account_ids`、`proxy`、`locale`、`timezone` |
+| `BulkEnableInput` | `account_ids`、`all_disabled`（为 `true` 时启用全部停用账户，忽略 `account_ids`） |
+| `BulkEnableResult` | `enabled`（本次启用数）、`skipped`（原本已启用数）、`failed`（`{id,code,message}` 数组，`code` 为 `account_busy`、`account_not_found` 等）、`remaining`（超过单次上限 1000、本次没有处理的停用账户数） |
 | `AdminCooldown` | `account_id`、`account_label`、`model_id`、`until`、可选 `reason` |
 | `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`） |
 | `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
@@ -1156,7 +1159,9 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 
 `AccountCreateInput` 启动隔离 Camoufox 登录，邮箱由 AI Studio 页面读取。`ChromeImportInput.account_ids` 可一次选择多个账号。`AccountInput.label` 必须与不可变的 Google 邮箱 ID 一致，`locale` 与 `timezone` 必须非空，`proxy` 使用无 credentials、path、query 或 fragment 的 HTTP、HTTPS、SOCKS5 origin。新增、导入、登录和验证成功后立即刷新该账户模型目录，并发布最新账户与模型事件。
 
-`PUT /api/accounts/{id}` 的提交顺序固定为：校验不可变邮箱 ID，取得账户独占租约，创建未发布的新固定出口，关闭当前 Worker 并把新 Worker 配置标记为 `pending`（尚未发布），在模型目录写锁内原子写入 `account.json` 并更新账户池，随后发布 Worker 配置、替换固定出口、释放租约并重建模型缓存。`account.json` 写入是唯一持久提交点。提交前的出口创建、Worker 关闭或写入错误会丢弃这份待发布配置并保持旧配置；已经关闭的 Worker 由后续请求按旧配置重建。持久写入后，新配置、Worker 配置与固定出口共同成为已提交状态。租约释放错误保留该提交状态并返回原始 unlock 错误；释放成功后记录完成日志并同步模型缓存。
+`POST /api/accounts/bulk-enable` 一次请求启用一批账户：去重后只处理停用的账户，单次最多 1000 个（其余计入 `remaining`），16 个并行取得账户独占租约（最多等 3 秒，等不到记为 `account_busy`）并只把 `account.json` 的 `enabled` 改为 `true`，代理、语言、时区不变，不重建固定出口与 Worker 配置，清除停用原因；全部写完后登记一次模型变化、合并并推送一次快照，再在后台为没有模型目录的账户同步目录（与单个启用共用 16 个并发名额，整批同步完合并一次）。启用不等待目录，登录已失效的账户由目录同步标为 `auth_required`。请求体缺少 `account_ids` 且 `all_disabled` 不为 `true` 时返回 400 `invalid_account`。管理页“一键启用”与选中账户的启用按 500 个一批依次提交，两批之间可以停止。
+
+`PUT /api/accounts/{id}` 的提交顺序固定为：校验不可变邮箱 ID，取得账户独占租约，创建未发布的新固定出口，关闭当前 Worker 并把新 Worker 配置标记为 `pending`（尚未发布），在模型目录写锁内原子写入 `account.json` 并更新账户池，随后发布 Worker 配置、替换固定出口、释放租约并重建模型缓存。`account.json` 写入是唯一持久提交点。提交前的出口创建、Worker 关闭或写入错误会丢弃这份待发布配置并保持旧配置；已经关闭的 Worker 由后续请求按旧配置重建。持久写入后，新配置、Worker 配置与固定出口共同成为已提交状态。租约释放错误保留该提交状态并返回原始 unlock 错误；释放成功后记录完成日志并同步模型缓存；账户由停用改为启用且没有模型目录时，在后台补一次目录同步。
 
 `RuntimeConfig` 字段。`response-only` 表示字段由服务器填充，客户端提交的值不参与保存：
 

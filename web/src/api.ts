@@ -4,6 +4,8 @@ import type {
   AccountDraft,
   AccountLoginInput,
   AdminEvent,
+  BulkEnableInput,
+  BulkEnableResult,
   ChromeImportInput,
   ChromeImportProfile,
   Model,
@@ -142,6 +144,12 @@ export const api = {
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, {
       method: 'PUT',
       body: JSON.stringify(draft),
+    }),
+  // enableAccounts 一次请求启用一批账户（服务端每次最多 1000 个）
+  enableAccounts: (input: BulkEnableInput) =>
+    requestJSON<BulkEnableResult>('/api/accounts/bulk-enable', {
+      method: 'POST',
+      body: JSON.stringify(input),
     }),
   deleteAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),

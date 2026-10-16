@@ -34,6 +34,9 @@ type runtimeAdmin struct {
 	config     config.Config
 	// onboard 为新账户自动处理队列
 	onboard *accountOnboarder
+	// catalogSlots 为启用后在后台同步模型目录的共用并发名额（见 bulk_enable.go），首次使用时创建
+	catalogSlotsOnce sync.Once
+	catalogSlots     chan struct{}
 }
 
 // requestRegistry 保存活动请求与事件订阅
@@ -407,6 +410,10 @@ func (admin *runtimeAdmin) UpdateAccount(ctx context.Context, accountID string, 
 		return api.AdminAccount{}, err
 	}
 	admin.syncModelCache()
+	if !wasEnabled && input.Enabled {
+		// 停用账户不参与启动时的模型目录同步，启用后没有目录就不能预热、接不到请求：在后台补一次同步
+		admin.startCatalogBackfill([]string{account.ID})
+	}
 	admin.requests.log("auth", "INFO", "账户配置已更新 | 账户="+accountConfig.Label)
 	return admin.account(account.ID)
 }
@@ -434,6 +441,8 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 		return err
 	}
 	admin.onboard.forget(accountID)
+	// 同一账户重新上传后不再沿用旧的停用原因（手动停用的记录会让它保持停用）
+	accountDisableNotes.clear(accountID)
 	admin.requests.log("auth", "INFO", "账户已删除 | 账户="+account.Label)
 	return nil
 }
@@ -504,9 +513,18 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 }
 
 func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
+	if _, err := admin.verifyLogin(ctx, accountID); err != nil {
+		return api.AdminAccount{}, err
+	}
+	return admin.account(accountID)
+}
+
+// verifyLogin 启动隔离浏览器验证登录并写回账户状态，返回浏览器的验证结果。停用账户的对外状态始终是 disabled
+// （登录失效也不会显示为需要登录），调用方判断验证是否通过必须看返回的 Authenticated，不能看账户状态
+func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (aistudio.LoginVerification, error) {
 	lease, err := admin.pool.AcquireAccount(ctx, accountID)
 	if err != nil {
-		return api.AdminAccount{}, accountOperationError(err)
+		return aistudio.LoginVerification{}, accountOperationError(err)
 	}
 	account := lease.Account()
 	startedAt := time.Now()
@@ -517,7 +535,7 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 			"账户验证失败 | 耗时=%s | 错误=%s",
 			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
 		))
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
+		return aistudio.LoginVerification{}, errors.Join(err, lease.Release())
 	}
 	err = admin.service.changeModels(func() error {
 		if verification.Authenticated {
@@ -534,10 +552,10 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 		return admin.pool.MarkAuthRequired(account.ID, reason)
 	})
 	if err != nil {
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
+		return aistudio.LoginVerification{}, errors.Join(err, lease.Release())
 	}
 	if err := lease.Release(); err != nil {
-		return api.AdminAccount{}, err
+		return aistudio.LoginVerification{}, err
 	}
 	if verification.Authenticated {
 		admin.syncAccountModelCatalog(ctx, account)
@@ -548,7 +566,7 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 		"账户验证完成 | 已认证=%t | 耗时=%s",
 		verification.Authenticated, time.Since(startedAt).Round(time.Millisecond),
 	))
-	return admin.account(account.ID)
+	return verification, nil
 }
 
 // StartService 使用管理器提供的启动生命周期启动生成服务

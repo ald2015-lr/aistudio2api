@@ -78,3 +78,47 @@ export async function runBulk(
     state.running = false
   }
 }
+
+// BulkChunkResult 为一批账户的处理结果：succeeded 为成功数，failures 只列出失败的账户
+export interface BulkChunkResult {
+  succeeded: number
+  failures: BulkFailure[]
+}
+
+// runChunkedBulk 把账户按 chunkSize 分批，依次交给 task 一次处理一批（例如一次请求启用 500 个账户）；
+// cancelled 置位后不再提交下一批，已提交的一批会等待完成；task 抛出错误时这一批全部计为失败
+export async function runChunkedBulk(
+  state: BulkState,
+  action: BulkAction,
+  accounts: readonly Account[],
+  chunkSize: number,
+  task: (chunk: readonly Account[]) => Promise<BulkChunkResult>,
+): Promise<void> {
+  const queue = [...accounts]
+  Object.assign(state, emptyBulkState(), { action, running: true, total: queue.length })
+  const size = Math.max(1, Math.floor(chunkSize))
+  try {
+    for (let start = 0; start < queue.length && !state.cancelled; start += size) {
+      const chunk = queue.slice(start, start + size)
+      const first = chunk[0]
+      if (first === undefined) break
+      state.active = [chunk.length > 1 ? `${first.label} +${chunk.length - 1}` : first.label]
+      try {
+        const result = await task(chunk)
+        state.succeeded += result.succeeded
+        state.failures = [...state.failures, ...result.failures]
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        state.failures = [
+          ...state.failures,
+          ...chunk.map((account) => ({ id: account.id, label: account.label, message })),
+        ]
+      } finally {
+        state.active = []
+        state.done += chunk.length
+      }
+    }
+  } finally {
+    state.running = false
+  }
+}

@@ -45,6 +45,10 @@ func newRuntime(
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	// 账户默认启用：先载入停用原因（载入前写出上一代实例未保存的变化），再在建立账户池、固定出口与 Worker 之前
+	// 把没有手动停用记录的停用账户改为启用，后续的状态推导与模型目录同步把它们当作普通的启用账户
+	accountDisableNotes.load(store.PrimaryDirectory())
+	enableUnmarkedAccounts(accounts, requests, "启动时")
 
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")
 	pool := aistudio.NewAccountPool(accounts, cfg.PerAccountConcurrency)
@@ -111,7 +115,6 @@ func newRuntime(
 	service.setPrimaryModels(cfg.PrimaryModels, cfg.PrimaryQueueWait)
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
-	accountDisableNotes.load(store.PrimaryDirectory())
 	admin.onboard = newAccountOnboarder(admin, store.PrimaryDirectory())
 	go admin.onboard.run(lifecycle)
 	// 生成服务实例存活期间自动识别新增、删除与重新登录的账户目录
@@ -121,6 +124,9 @@ func newRuntime(
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
 	))
 	closeRuntime := func() error {
+		// 停用原因与新账户处理记录都是合并几秒后才写文件，关闭时立即写出，退出前的变化不会丢失
+		admin.onboard.flush()
+		accountDisableNotes.flush()
 		err := workers.Close()
 		transport.CloseIdleConnections()
 		headers.Close()
@@ -2938,6 +2944,14 @@ func (service *trackedService) changeModels(update func() error) error {
 	err := update()
 	service.modelRevision++
 	return err
+}
+
+// markModelsChanged 登记一次已经写入账户池的模型目录变化：批量启用逐个写入账户配置时不占用变化锁（写配置要同步到磁盘），
+// 全部写完后统一登记一次，之后的 SyncModels 会重新合并
+func (service *trackedService) markModelsChanged() {
+	service.modelChangeMu.Lock()
+	service.modelRevision++
+	service.modelChangeMu.Unlock()
 }
 
 // SyncModels 合并刷新已登记的模型目录变化
