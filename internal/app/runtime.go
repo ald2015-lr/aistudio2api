@@ -377,9 +377,12 @@ func newAccountWorkerManager(
 
 // expandInBackground 在后台为账户启动 Worker，就绪后由调度信号唤醒排队请求。
 // 它由正在排队的请求发起，冷启动名额按按需启动计（不加 withBackgroundStartup）
-func (manager *accountWorkerManager) expandInBackground(accountID string, modelID string) {
+// 返回的通道在这次扩容结束（就绪、失败或被取消）时关闭，发起扩容的选号据此只等自己这一个，不再连着扩容别的账户
+func (manager *accountWorkerManager) expandInBackground(accountID string, modelID string) <-chan struct{} {
 	ctx := manager.backgroundContext()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		_, err := manager.ensureWorker(ctx, accountID, modelID, false)
 		if err == nil || ctx.Err() != nil || errors.Is(err, errAccountWorkerOpening) ||
 			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) {
@@ -387,6 +390,7 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 		}
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 后台扩容失败 | 错误=%v", err))
 	}()
+	return done
 }
 
 // backgroundContext 返回后台扩容使用的 context，ResetAll 时取消
@@ -3255,6 +3259,10 @@ func (service *trackedService) acquireLease(
 		service.workers.dispatch.leave(waiter)
 		waiter = nil
 	}
+	// expanding 在这次选号发起的后台扩容结束时关闭：扩容还没结束时不再为同一次选号扩容别的账户，只等它。
+	// 原先每次复查（兜底计时与每次号池变化）都会再扩容一个，一个排队的请求能连着冷启动好几个浏览器，
+	// 偏好靠前的账户都在启动中时还会启动排在后面的、对主用模型已冷却的账户
+	var expanding <-chan struct{}
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -3323,8 +3331,19 @@ func (service *trackedService) acquireLease(
 		}
 		// 不等待的选号不做后台扩容再排队，直接按下面的现场启动处理：分区有空槽时现场冷启动，否则返回没有立即可用的账号
 		if len(groups.StandbyReady) > 0 && warmCandidates > 0 && !fixedAccount && !immediate {
+			if expanding != nil {
+				select {
+				case <-expanding:
+					expanding = nil
+				default:
+					if err := wait(schedulingRecheck, "Worker 正在扩容"); err != nil {
+						return nil, err
+					}
+					continue
+				}
+			}
 			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
-				service.workers.expandInBackground(accountID, selection.ModelID)
+				expanding = service.workers.expandInBackground(accountID, selection.ModelID)
 				if err := wait(schedulingRecheck, "Worker 正在扩容"); err != nil {
 					return nil, err
 				}
