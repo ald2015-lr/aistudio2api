@@ -189,8 +189,8 @@ func TestInteractionPassesStreamAndModelAlias(t *testing.T) {
 		t.Fatalf("-nothinking 应隐藏思维链并保留签名: %s", stream.Body.String())
 	}
 	created := interactionSSE(t, stream.Body.String())[0].data["interaction"].(map[string]any)
-	if created["model"] != "test-model-nothinking" {
-		t.Fatalf("交互资源应报告客户端请求的模型名: %v", created["model"])
+	if created["model"] != "test-model" {
+		t.Fatalf("交互资源应报告去掉后缀的目录模型名: %v", created["model"])
 	}
 
 	plain := postJSON(t, handler, "/v1/interactions", `{"model":"test-model-128","input":"hi"}`, nil)

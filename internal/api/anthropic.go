@@ -96,6 +96,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
+	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
+	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
 	if request.Stream {
 		// 先拿到事件流再写响应头与 message_start：降级判定（流式严格模式）要在判定之前保留返回 400 的机会；

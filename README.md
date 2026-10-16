@@ -282,6 +282,8 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 
 模型列表为每个可调节思考的文本模型列出 `-low`、`-medium`、`-128` 等别名；目录里的模型 ID 本身以等级结尾时（例如 `xxx-low`）按 ID 里的等级设置，不再强制最高思考。
 
+响应里的模型名（OpenAI、Anthropic、Responses、Interactions 的 `model`，Gemini 的 `modelVersion`）是请求的模型名去掉上述后缀：请求 `gemini-3.1-pro-preview`、`gemini-3.1-pro-preview-128`、`gemini-3.1-pro-preview-low` 都返回 `gemini-3.1-pro-preview`；目录里没有的名称按请求原样返回。不返回上游报告的实际服务模型版本，它只出现在 OpenAI 与 Responses 的 `provider_model` 字段和管理日志里。
+
 调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。
 
 以 Cherry Studio 为例：

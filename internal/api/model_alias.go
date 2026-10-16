@@ -341,6 +341,15 @@ func (s *server) applyModelAlias(ctx context.Context, request *aistudio.Generate
 	return alias.hideThought && modelThinks(model)
 }
 
+// responseModel 返回响应里报告的模型名（OpenAI、Anthropic、Responses 的 model，Gemini 的 modelVersion，Interactions 的 model），
+// 取 prepareGenerate 解析后的请求模型：带后缀的别名（-128、-low、-medium、-high、-minimal、-nothinking、-online 及其组合）
+// 报告为目录里的模型名，例如 gemini-3.1-pro-preview-low 报告为 gemini-3.1-pro-preview；不带后缀或无法解析的名称按请求原样报告
+// （去掉首尾空白）。不报告上游返回的实际服务模型版本：中转与客户端按请求的模型名对账、计费，实际服务模型另见 provider_model
+// 与管理日志的 served_model
+func responseModel(request aistudio.GenerateRequest) string {
+	return strings.TrimSpace(request.Model)
+}
+
 // resolveModelName 把带后缀的名称换成目录模型名，供计数等只需要模型名的接口使用
 func (s *server) resolveModelName(ctx context.Context, name string) string {
 	models, err := s.aliasCatalog(ctx)

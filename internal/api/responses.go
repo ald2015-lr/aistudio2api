@@ -166,6 +166,8 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		generateRequest.System = strings.Join(instructions, "\n")
 	}
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
+	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
+	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
 	events, err := s.service.Generate(r.Context(), generateRequest)
 	if err == nil && request.Stream {

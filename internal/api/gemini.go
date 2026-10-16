@@ -891,11 +891,8 @@ func buildGeminiResponse(request aistudio.GenerateRequest, result generationResu
 	}
 	response := map[string]any{
 		"candidates":   []any{candidate},
-		"modelVersion": request.Model,
+		"modelVersion": responseModel(request),
 		"responseId":   request.ID,
-	}
-	if result.providerModel != "" {
-		response["modelVersion"] = result.providerModel
 	}
 	if result.usage != nil {
 		response["usageMetadata"] = geminiUsage(result.usage)
@@ -1269,7 +1266,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	}
 	defer chunks.close()
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
-		response := map[string]any{"responseId": request.ID, "modelVersion": request.Model}
+		response := map[string]any{"responseId": request.ID, "modelVersion": responseModel(request)}
 		switch event.Kind {
 		case aistudio.EventText:
 			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))}
@@ -1343,10 +1340,8 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		}
 		return
 	}
-	model := request.Model
-	if result.providerModel != "" {
-		model = result.providerModel
-	}
+	// 最后一块同样报告请求的模型名（见 responseModel），不换成上游报告的实际服务模型版本
+	model := responseModel(request)
 	candidate := map[string]any{"index": 0}
 	setGeminiFinish(candidate, result.finishReason)
 	final := map[string]any{

@@ -1878,7 +1878,7 @@ tool group 字段：
     "groundingMetadata": {},
     "citationMetadata": {}
   }],
-  "modelVersion": "gemini-provider-id",
+  "modelVersion": "gemini-requested-model",
   "responseId": "request-id",
   "usageMetadata": {
     "promptTokenCount": 10,
@@ -1908,6 +1908,8 @@ tool group 字段：
 `groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`retrievedContext:{uri,title,text}` 或 `maps:{uri,title,text,placeId}`；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
 
 非流式响应把相邻的同类正文或思考片段合并为一个 Part，不论片段是否带签名；同一段里出现多个签名时保留最后一个（gemini-4 等模型给许多正文分片都带签名，按签名拆开时 new-api、SillyTavern 拼接多个 Part 会在句子中间断行）。工具调用、媒体与带转录元数据的 Part 保持独立；引用、搜索来源与用量不产生 Part，也不打断合并。正文或思考中途单独到达的签名挂到正在合并的 Part 上；输出开头的单个签名在合并完成后挂到随后的第一个 Part 上，该 Part 合并后已带签名时前置签名单独成 Part，不因前置签名拆开连续正文。其余无处可挂的独立签名（工具调用、媒体之后，以及流式响应中的独立签名）以 `{"text":"","thought":true,"thoughtSignature":"..."}` 承载，作为输入回传时还原为纯签名 Part。
+
+`modelVersion` 为请求的模型名去掉 `-low`、`-128`、`-nothinking` 等后缀（与 OpenAI、Anthropic、Responses、Interactions 的 `model` 一致），流式的每一帧相同，不换成上游报告的实际服务模型版本；实际服务模型记在管理日志的 `served_model`。
 
 `:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`，元素之间的空行用作心跳）。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 
