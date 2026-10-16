@@ -3439,8 +3439,19 @@ func (service *trackedService) acquireLease(
 			failures.last = promoteErr
 			continue
 		}
-		if len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
+		// 热候选取租约时被其他请求抢先（分类时还有空位，TryAcquireFor 返回空）同样按账号全部忙碌等待，不落到下面的冷却判断
+		if len(warmAvailable) > 0 || len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
 			if err := wait(schedulingRecheck, "账号全部忙碌"); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// 还有没冷却的备用账户，只是所在分区没有空槽、也没有可回收或可替换的空闲 Worker：这是容量原因，按没有空闲的 Worker 槽位排队
+		// （主用模型受排队预算限制，其余模型等到请求超时），不按全部冷却返回 429，也不按冷却等待绕过排队预算。EarliestCooldown 是
+		// 候选集里最早恢复的账户（常常是冷却中的热 Worker 或其他备用账户），不代表槽位何时空出，原先据此返回的 Retry-After 可能长达几小时。
+		// 降级判定的 Playground 优先选号除外：它全部冷却时调用方立即改为不限通道选号
+		if len(groups.StandbyReady) > 0 && !selection.PlaygroundFirst {
+			if err := wait(schedulingRecheck, waitReasonNoSlot); err != nil {
 				return nil, err
 			}
 			continue
@@ -3456,7 +3467,7 @@ func (service *trackedService) acquireLease(
 			continue
 		}
 		if candidates > 0 {
-			if err := wait(schedulingRecheck, "没有空闲的 Worker 槽位"); err != nil {
+			if err := wait(schedulingRecheck, waitReasonNoSlot); err != nil {
 				return nil, err
 			}
 			continue

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -326,7 +327,8 @@ func TestAcquireLeaseReclaimsDeadWorker(t *testing.T) {
 	t.Fatal("请求时间线应有回收死槽位的记录")
 }
 
-// TestAcquireLeaseNeverReclaimsBusyDeadWorker 死槽位的账号仍有进行中的请求时不被回收
+// TestAcquireLeaseNeverReclaimsBusyDeadWorker 死槽位的账号仍有进行中的请求时不被回收；还有没冷却的备用账号，
+// 请求按没有空闲的 Worker 槽位排队到超时，不按全部冷却返回
 func TestAcquireLeaseNeverReclaimsBusyDeadWorker(t *testing.T) {
 	manager, pool, requests := partitionTestManager(t, []string{partitionNormalA, partitionNormalB, partitionNormalC}, nil, 2, 2, 0, 1)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -348,8 +350,9 @@ func TestAcquireLeaseNeverReclaimsBusyDeadWorker(t *testing.T) {
 	if lease != nil {
 		_ = lease.Release()
 	}
-	if err == nil {
-		t.Fatal("两个死槽位都在服务请求时不应取得租约")
+	var cooling *aistudio.AllCoolingError
+	if !errors.Is(err, context.DeadlineExceeded) || errors.As(err, &cooling) {
+		t.Fatalf("两个死槽位都在服务请求时 err = %v，期望排队到超时（不是全部冷却）", err)
 	}
 	if got := sortedWarm(manager); !slices.Equal(got, []string{partitionNormalA, partitionNormalB}) {
 		t.Fatalf("正在服务请求的 Worker 不应被回收，驻留 Worker = %v", got)

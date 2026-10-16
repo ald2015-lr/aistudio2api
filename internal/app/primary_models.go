@@ -37,6 +37,8 @@ const (
 	primaryStreamStartGrace = 5 * time.Second
 	// waitReasonCooling 为候选全部冷却时的等待原因：这类等待不受排队上限限制，等待的时间延后截止时间，沿用原有的冷却排队规则
 	waitReasonCooling = "账号冷却中"
+	// waitReasonNoSlot 为有没冷却的候选、只是所在分区没有空闲 Worker 槽位时的等待原因：按容量原因计入排队上限
+	waitReasonNoSlot = "没有空闲的 Worker 槽位"
 )
 
 // primaryModelSettings 为生效的主用模型列表（按降级判定的规则整理：去空白、去 models/ 前缀、小写）与排队上限
