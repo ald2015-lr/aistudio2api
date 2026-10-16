@@ -120,6 +120,18 @@ func (queue *dispatchQueue) passOn(waiter *dispatchWaiter) {
 	}
 }
 
+// position 返回 waiter 在同条件队列中的位置（从 1 开始）与队列长度，不在队列中时位置为 0：
+// 队列内逐个查找，只在真正写排队进度时调用，不在每次等待时调用
+func (queue *dispatchQueue) position(waiter *dispatchWaiter) (int, int) {
+	if waiter == nil {
+		return 0, 0
+	}
+	queue.mu.Lock()
+	defer queue.mu.Unlock()
+	waiters := queue.queues[waiter.key]
+	return slices.Index(waiters, waiter) + 1, len(waiters)
+}
+
 // wakeHeads 在账户或 Worker 状态变化后唤醒每个队列的队首
 func (queue *dispatchQueue) wakeHeads() {
 	queue.mu.Lock()

@@ -2231,6 +2231,8 @@ type trackedService struct {
 	streamPlaygroundModels atomic.Pointer[map[string]struct{}]
 	// primaryModels 为主用模型列表与排队上限（PRIMARY_MODELS / PRIMARY_QUEUE_WAIT，可热更新，见 primary_models.go）
 	primaryModels atomic.Pointer[primaryModelSettings]
+	// queueProgress 为重复的排队进度日志全进程共用的限流（见 queue_progress.go）
+	queueProgress queueProgressLimiter
 }
 
 type modelCatalogService interface {
@@ -3253,8 +3255,19 @@ func (service *trackedService) acquireLease(
 	failedWorkers := failures.accounts
 	// 主用模型的选号带排队预算（见 primary_models.go）：容量原因的等待累计超过上限时 wait 返回 CapacityBusyError，没有预算时不限时
 	budget := leaseWaitBudgetFromContext(ctx)
+	// 生成请求的选号带排队进度（见 queue_progress.go）：排队满宽限后写明原因，请求在排队中结束时错误带上最后的原因；没有时不写
+	progress := leaseWaitProgressFromContext(ctx)
 	var waiter *dispatchWaiter
 	defer func() { service.workers.dispatch.leave(waiter) }()
+	// snapshot 为本轮复查的候选计数，detail 只在真正写排队进度时调用（含同条件队列位置，队列内逐个查找）
+	var snapshot queueSnapshot
+	detail := func(now time.Time) string {
+		text := " | 模型=" + selection.ModelID
+		if position, total := service.workers.dispatch.position(waiter); position > 0 {
+			text += fmt.Sprintf(" | 同条件队列=%d/%d", position, total)
+		}
+		return text + snapshot.text(now)
+	}
 	wait := func(delay time.Duration, reason string) error {
 		if immediate {
 			return &noImmediateLeaseError{reason: reason}
@@ -3266,7 +3279,7 @@ func (service *trackedService) acquireLease(
 			// 不让排除了刚空出槽位的账户的队首挡住后面能用它的请求
 			service.workers.dispatch.passOn(waiter)
 		}
-		return budget.wait(ctx, waiter.wake, delay, reason)
+		return service.waitQueued(ctx, progress, budget, waiter.wake, delay, reason, detail)
 	}
 	// 带排除列表的请求现场冷启动（及随后等容量）期间不看调度信号：开始前离开等待队列并把这次唤醒交给下一个请求，
 	// 否则号池变化只唤醒仍在队首的它，后面能用被它排除的账户的请求只能等兜底复查；之后还要等待时按到达序号重新排队
@@ -3284,7 +3297,7 @@ func (service *trackedService) acquireLease(
 	var expanding <-chan struct{}
 	for {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, progress.queueEnded(err)
 		}
 		warm := service.workers.ReadyWarmAccountIDs()
 		active := service.workers.WarmAccountIDs()
@@ -3306,6 +3319,11 @@ func (service *trackedService) acquireLease(
 		standbyReady, opening := service.workers.withoutOpening(groups.StandbyReady)
 		groups.StandbyReady = standbyReady
 		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
+		snapshot = queueSnapshot{
+			warmIdle: len(warmAvailable), warmBusy: len(groups.WarmBusy),
+			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy),
+			opening: opening, earliestCooldown: groups.EarliestCooldown,
+		}
 		if len(warmAvailable) > 0 {
 			// 不在主用与热门模型里的请求先用对这些模型是死槽位的热 Worker（它们本来就服务不了主用模型），
 			// 取不到再用其余热 Worker：还能服务主用模型的 Worker 的租约位留给主用模型
@@ -3340,7 +3358,8 @@ func (service *trackedService) acquireLease(
 		// 再等旧 Worker 让位；每轮最多回收一个。还有热 Worker 在忙时不在请求路径上关闭浏览器，交给后台扩容与冷却登记处理
 		if len(groups.StandbyReady) > 0 && warmCandidates == 0 && !fixedAccount && !immediate {
 			if victim, partition := capacity.reclaimDead(ctx, groups.StandbyReady); victim != "" {
-				if requestID := aistudio.TraceFromContext(ctx).RequestID(); requestID != "" {
+				// 请求 ID 先取排队进度里的（主路由也有），否则取 /trace/ 排查记录的
+				if requestID := leaseRequestID(ctx); requestID != "" {
 					service.requests.logRequestProgress(requestID, "service", "INFO", fmt.Sprintf(
 						"回收冷却占位的 %s，让备用账号启动 | 账号=%s", workerSlotName(partition), victim,
 					))
@@ -3407,7 +3426,8 @@ func (service *trackedService) acquireLease(
 				if immediate {
 					return nil, &noImmediateLeaseError{reason: "Worker 容量已满"}
 				}
-				if err := budget.wait(ctx, workersChanged, schedulingRecheck, "Worker 容量已满"); err != nil {
+				// 等 Worker 状态变化（workersChanged），不等调度队列的唤醒：此前可能已让出队列（yieldQueue）
+				if err := service.waitQueued(ctx, progress, budget, workersChanged, schedulingRecheck, "Worker 容量已满", detail); err != nil {
 					return nil, err
 				}
 				continue
@@ -3807,9 +3827,12 @@ func (service *trackedService) generateWithRetry(
 	// 主用模型（PRIMARY_MODELS）的请求带一份排队预算，整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
 	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
 	budget := service.primaryBudget(modelID, scope)
-	acquireCtx := withDispatchOrder(withLeaseWaitBudget(requestCtx, budget))
+	// 排队进度同样整个请求共用一份，带上请求 ID：主路由（没有排查记录）的排队原因与回收记录也能写进请求时间线（见 queue_progress.go）
+	progress := newLeaseWaitProgress(request.ID)
+	acquireCtx := withLeaseWaitProgress(withDispatchOrder(withLeaseWaitBudget(requestCtx, budget)), progress)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		budget.beginAttempt()
+		progress.beginAttempt()
 		request.Contents = originalContents
 		selectionAccountID := requestedAccountID
 		recoveringAccount := recoveryAccountID != ""
