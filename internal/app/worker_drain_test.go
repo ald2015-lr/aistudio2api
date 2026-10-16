@@ -369,9 +369,13 @@ func TestDrainClearedOnExit(t *testing.T) {
 		}
 		env.manager.retireMu.Lock()
 		entry := env.manager.retirements[accounts[0]]
+		var retryAt time.Time
+		if entry != nil {
+			retryAt = entry.retryAt
+		}
 		env.manager.retireMu.Unlock()
-		if entry == nil || time.Until(entry.retryAt) < 30*time.Second {
-			t.Fatalf("超时后登记应保留并推迟约 1 分钟再试: %+v", entry)
+		if entry == nil || time.Until(retryAt) < 30*time.Second {
+			t.Fatalf("超时后登记应保留并推迟约 1 分钟再试: 存在=%v 重试时间=%v", entry != nil, retryAt)
 		}
 		time.Sleep(600 * time.Millisecond)
 		if env.pool.Draining(accounts[0]) {
@@ -550,12 +554,15 @@ func TestRegisterDeadWorkers(t *testing.T) {
 	if got := env.service.registerDeadWorkers(); got != 2 {
 		t.Fatalf("应补登记 2 个死槽位，实际 %d", got)
 	}
+	// 登记的字段在持锁时读出：后台淘汰循环会在锁内改写同一条登记（推迟重试时间等）
 	env.manager.retireMu.Lock()
 	global, scoped := env.manager.retirements[accounts[0]], env.manager.retirements[accounts[1]]
 	_, other := env.manager.retirements[accounts[2]]
+	globalOK := global != nil && global.global()
+	scopedOK := scoped != nil && slices.Equal(scoped.models, []string{drainProModel})
 	env.manager.retireMu.Unlock()
-	if global == nil || !global.global() || scoped == nil || !slices.Equal(scoped.models, []string{drainProModel}) || other {
-		t.Fatalf("登记范围不对: 全局=%+v 主用=%+v 其他模型已登记=%v", global, scoped, other)
+	if !globalOK || !scopedOK || other {
+		t.Fatalf("登记范围不对: 全局=%v 主用=%v 其他模型已登记=%v", globalOK, scopedOK, other)
 	}
 	admin := &runtimeAdmin{lifecycle: env.ctx, pool: env.pool, service: env.service, requests: env.requests, workers: env.manager}
 	status, err := admin.Status(env.ctx)
