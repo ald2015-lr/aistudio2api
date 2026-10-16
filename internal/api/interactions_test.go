@@ -634,3 +634,80 @@ func TestInteractionDeferredSignatureSkipsUnsignedCall(t *testing.T) {
 		t.Fatalf("流式事件 %v，期望 %v", names, want)
 	}
 }
+
+// TestInteractionDeferredSignatureSkipsUnsignedThought 暂存的签名不并进随后不带签名的思考摘要（流式与非流式），
+// 回传时不会交给之后不带签名的函数调用
+func TestInteractionDeferredSignatureSkipsUnsignedThought(t *testing.T) {
+	call := func(id string) aistudio.Event {
+		return aistudio.Event{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: id, Name: "lookup", Arguments: json.RawMessage(`{}`)}}
+	}
+	for name, events := range map[string][]aistudio.Event{
+		"调用之后的思考": {
+			{Kind: aistudio.EventText, Text: "Now"},
+			{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "s1"},
+			{Kind: aistudio.EventText, Text: " checking"},
+			call("A"),
+			{Kind: aistudio.EventReasoning, Text: "planning"},
+			call("B"),
+			{Kind: aistudio.EventFinish, FinishReason: "stop"},
+		},
+		"正文之后的思考": {
+			{Kind: aistudio.EventText, Text: "Now"},
+			{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "s1"},
+			{Kind: aistudio.EventText, Text: " checking"},
+			{Kind: aistudio.EventReasoning, Text: "planning"},
+			call("A"),
+			{Kind: aistudio.EventFinish, FinishReason: "stop"},
+		},
+	} {
+		replayed := func(raw []byte) map[string]string {
+			t.Helper()
+			contents, err := interactionContents(raw)
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+			signatures := map[string]string{}
+			for _, content := range contents {
+				for _, part := range content.Parts {
+					if part.FunctionCall != nil {
+						signatures[part.FunctionCall.ID] = part.FunctionCall.ThoughtSignature
+					}
+				}
+			}
+			return signatures
+		}
+		steps, err := interactionSteps(generationResult{events: events}, "", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(steps)
+		for id, signature := range replayed(raw) {
+			if signature != "" {
+				t.Fatalf("%s: 非流式回传后调用 %s 带上了签名 %q: %s", name, id, signature, raw)
+			}
+		}
+		if !strings.Contains(string(raw), `"s1"`) {
+			t.Fatalf("%s: 签名丢失: %s", name, raw)
+		}
+
+		stream := postJSON(t, NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"}), "/v1beta/interactions", `{"model":"test-model","input":"hi","stream":true,"store":false}`, nil)
+		var rebuilt []map[string]any
+		for _, event := range interactionSSE(t, stream.Body.String()) {
+			switch event.name {
+			case "step.start":
+				rebuilt = append(rebuilt, event.data["step"].(map[string]any))
+			case "step.delta":
+				delta := event.data["delta"].(map[string]any)
+				if delta["type"] == "thought_signature" {
+					rebuilt[len(rebuilt)-1]["signature"] = delta["signature"]
+				}
+			}
+		}
+		raw, _ = json.Marshal(rebuilt)
+		for id, signature := range replayed(raw) {
+			if signature != "" {
+				t.Fatalf("%s: 流式回传后调用 %s 带上了签名 %q: %s", name, id, signature, raw)
+			}
+		}
+	}
+}

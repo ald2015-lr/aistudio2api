@@ -1767,7 +1767,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps` 与 `usage`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
 
-SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；随后是不带签名的函数调用时排在该调用之后，回传时不会成为该调用的签名；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
+SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；随后是不带签名的函数调用或不带签名的思考摘要时排在它们之后，回传时不会成为不带签名的调用的签名；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
 
 ### Gemini GenerateContent
 

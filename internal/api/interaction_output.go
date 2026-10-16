@@ -133,9 +133,13 @@ func signatureOnlyStep(step map[string]any) bool {
 }
 
 // flushesSignatures 判断输出该步骤前是否要先输出暂存的签名：继续当前 model_output 时不输出；不带签名的函数调用也不输出，
-// 回传时紧挨在函数调用前的 thought 签名会成为该调用的签名，暂存的签名留到调用之后的下一步或输出结束时再输出
+// 回传时紧挨在函数调用前的 thought 签名会成为该调用的签名，暂存的签名留到调用之后的下一步或输出结束时再输出；
+// 不带签名的思考摘要同样不输出：暂存的签名会并进这一步，回传时这一步的签名会交给随后不带签名的函数调用
 func flushesSignatures(event aistudio.Event, step map[string]any, activeOutput bool) bool {
 	if step["type"] == "model_output" && activeOutput {
+		return false
+	}
+	if step["type"] == "thought" && !signedThoughtStep(step) {
 		return false
 	}
 	return event.Kind != aistudio.EventToolCall || interactionCallSignature(event) != ""
