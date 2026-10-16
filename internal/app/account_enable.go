@@ -23,12 +23,18 @@ const defaultEnableConcurrency = 16
 // 写回失败的账户内存中同样启用，下次载入时按同样的规则再次启用。返回启用的账户 ID。
 //
 // 停用记录文件无法读取时（见 disableNotes.load）分不出哪些是手动停用的：没有记录的停用账户一律保持停用，
-// 并补记为手动停用（管理页显示原因，需要启用的在管理页启用）
+// 并补记为手动停用（管理页显示原因，需要启用的在管理页启用）。
+// 已是启用的账户顺带清除自动停用记录（验证未通过时账户仍是启用的也会留下），手动停用记录保留
 func enableUnmarkedAccounts(accounts []*aistudio.Account, requests *requestRegistry, stage string) []string {
 	targets := make([]*aistudio.Account, 0)
 	presumed := make([]string, 0)
+	alreadyEnabled := make([]string, 0, len(accounts))
 	for _, account := range accounts {
-		if account == nil || account.Config.Enabled {
+		if account == nil {
+			continue
+		}
+		if account.Config.Enabled {
+			alreadyEnabled = append(alreadyEnabled, account.ID)
 			continue
 		}
 		if !accountDisableNotes.keepDisabled(account.ID) {
@@ -37,6 +43,7 @@ func enableUnmarkedAccounts(accounts []*aistudio.Account, requests *requestRegis
 			presumed = append(presumed, account.ID)
 		}
 	}
+	accountDisableNotes.clearAutomaticFor(alreadyEnabled)
 	if len(presumed) > 0 {
 		accountDisableNotes.presumeManual(presumed)
 		if requests != nil {

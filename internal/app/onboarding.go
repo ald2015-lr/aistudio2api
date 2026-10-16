@@ -25,7 +25,7 @@ import (
 //   - 目录被删除后记录随之移除，同一账户重新上传会再次处理
 //   - 管理页浏览器登录、Chrome 导入创建的账户记为手动添加，不自动处理
 //   - 手动停用的账户（有手动停用记录）不自动启用：导入时直接记为跳过，排队或验证期间被手动停用的也保持停用；
-//     只有管理页“处理现有停用账户”（确认框写明手动停用的也会启用）加入的例外
+//     只有管理页“处理现有停用账户”（确认框写明手动停用的也会启用）加入的例外，重启后尚未处理完的同样例外
 const (
 	onboardingFileName = ".onboarding.json"
 	// onboardingTick 为检查队列的周期
@@ -69,6 +69,8 @@ type onboardFile struct {
 	Version  int                      `json:"version"`
 	Policy   api.OnboardingPolicy     `json:"policy"`
 	Accounts map[string]onboardRecord `json:"accounts"`
+	// Explicit 为“处理现有停用账户”加入、尚未处理完的账户及加入时间（见 onboardPending.explicitAt）
+	Explicit map[string]time.Time `json:"explicit,omitempty"`
 }
 
 type onboardPending struct {
@@ -76,7 +78,9 @@ type onboardPending struct {
 	attempts  int
 	notBefore time.Time
 	// explicitAt 非零表示由管理页“处理现有停用账户”在这一时间加入：在这之前手动停用的账户验证通过后也启用
-	// （见 disableNotes.blocksAutoEnable）。不保存到文件，重启后重新进入队列的按普通新账户处理
+	// （见 disableNotes.blocksAutoEnable）。随处理记录保存（onboardFile.Explicit）：原先只在内存中，账户上千个时
+	// 队列要处理几个小时，这期间停止服务或重启，重新排队的账户按普通新账户处理，手动停用的全部记为跳过，
+	// 管理员的要求被悄悄丢掉
 	explicitAt time.Time
 }
 
@@ -132,10 +136,12 @@ func (onboarder *accountOnboarder) load() {
 	onboarder.mu.Lock()
 	defer onboarder.mu.Unlock()
 	existing := false
+	var explicit map[string]time.Time
 	if content, err := os.ReadFile(onboarder.path); err == nil {
 		var file onboardFile
 		if err := json.Unmarshal(content, &file); err == nil {
 			existing = true
+			explicit = file.Explicit
 			if validateOnboardingPolicy(file.Policy) == nil {
 				onboarder.policy = file.Policy
 			}
@@ -150,7 +156,8 @@ func (onboarder *accountOnboarder) load() {
 	}
 	now := time.Now()
 	present := make(map[string]struct{})
-	queued := 0
+	queued, resumed := 0, 0
+	var latestExplicit time.Time
 	for _, status := range onboarder.admin.pool.Status() {
 		present[status.ID] = struct{}{}
 		if _, done := onboarder.records[status.ID]; done {
@@ -160,8 +167,19 @@ func (onboarder *accountOnboarder) load() {
 			onboarder.records[status.ID] = onboardRecord{Result: onboardBaseline, At: now}
 			continue
 		}
-		onboarder.pending[status.ID] = &onboardPending{queuedAt: now}
+		// “处理现有停用账户”加入、重启前没有处理完的账户仍按管理员当时的要求处理
+		explicitAt := explicit[status.ID]
+		onboarder.pending[status.ID] = &onboardPending{queuedAt: now, explicitAt: explicitAt}
 		queued++
+		if !explicitAt.IsZero() {
+			resumed++
+			if explicitAt.After(latestExplicit) {
+				latestExplicit = explicitAt
+			}
+		}
+	}
+	if !latestExplicit.IsZero() {
+		accountDisableNotes.noteExplicitRequest(latestExplicit)
 	}
 	// 目录已不存在的账户移除记录，重新上传时会再次处理
 	for id := range onboarder.records {
@@ -174,7 +192,13 @@ func (onboarder *accountOnboarder) load() {
 			"新账户自动处理已开启 | 现有 %d 个账户记为基线不做改动，之后新增的账户将自动验证、通过后启用", len(present),
 		))
 	} else if queued > 0 {
-		onboarder.admin.requests.log("auth", "INFO", fmt.Sprintf("新账户自动处理 | 发现服务停止期间新增的账户 %d 个，已加入队列", queued))
+		message := fmt.Sprintf("新账户自动处理 | 发现服务停止期间新增的账户 %d 个，已加入队列", queued)
+		if resumed > 0 {
+			message = fmt.Sprintf(
+				"新账户自动处理 | 重新加入队列 %d 个账户，其中 %d 个是“处理现有停用账户”加入、尚未处理完的，仍按当时的要求处理", queued, resumed,
+			)
+		}
+		onboarder.admin.requests.log("auth", "INFO", message)
 	}
 	onboarder.saveLocked()
 }
@@ -182,8 +206,16 @@ func (onboarder *accountOnboarder) load() {
 // saveLocked 原子写入处理记录；调用方持有 mu。等待中的合并保存随之完成
 func (onboarder *accountOnboarder) saveLocked() {
 	onboarder.savePending = false
+	explicit := make(map[string]time.Time)
+	for _, items := range []map[string]*onboardPending{onboarder.pending, onboarder.processing} {
+		for id, item := range items {
+			if !item.explicitAt.IsZero() {
+				explicit[id] = item.explicitAt
+			}
+		}
+	}
 	content, err := json.MarshalIndent(onboardFile{
-		Version: 1, Policy: onboarder.policy, Accounts: onboarder.records,
+		Version: 1, Policy: onboarder.policy, Accounts: onboarder.records, Explicit: explicit,
 	}, "", "  ")
 	if err != nil {
 		return
@@ -606,11 +638,13 @@ func (onboarder *accountOnboarder) status() api.OnboardingStatus {
 
 // queueDisabled 把当前停用的账户加入队列（管理页手动添加的除外），返回加入数量。
 // 用于处理功能开启前就已上传、被记为基线的停用账户；验证通过的会被启用。这是管理员的明确操作，确认框写明
-// 手动停用的账户验证通过也会启用：记下加入时间，之前的手动停用不挡住启用，之后才手动停用的仍保持停用
+// 手动停用的账户验证通过也会启用：记下加入时间（随处理记录保存，重启后继续有效），之前的手动停用不挡住启用，
+// 之后才手动停用的仍保持停用
 func (onboarder *accountOnboarder) queueDisabled() int {
 	statuses := onboarder.admin.pool.Status()
 	onboarder.mu.Lock()
 	now := time.Now()
+	accountDisableNotes.noteExplicitRequest(now)
 	added := 0
 	for _, status := range statuses {
 		if status.Enabled {

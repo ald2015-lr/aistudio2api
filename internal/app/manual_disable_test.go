@@ -270,6 +270,62 @@ func TestQueueDisabledHonorsLaterManualDisable(t *testing.T) {
 	}
 }
 
+// TestQueueDisabledSurvivesRestart “处理现有停用账户”的要求随处理记录保存：队列没处理完就重启（只留下磁盘上的停用记录与处理记录），
+// 重新排队的账户仍按管理员当时的要求处理，加入之前手动停用的验证通过后启用；加入之后再次手动停用的仍保持停用
+// （再次停用只更新记录的时间，这次的时间决定它保持停用，返回前已写入文件）。原先这个要求只在内存中，重启后手动停用的全部记为跳过
+func TestQueueDisabledSurvivesRestart(t *testing.T) {
+	notes := isolateDisableNotes(t)
+	admin, _, accounts := enableTestAdmin(t, "earlier@example.com", "later@example.com")
+	admin.login = &verifyTestLogin{verification: aistudio.LoginVerification{Authenticated: true}}
+	notesDirectory, onboardDirectory := t.TempDir(), t.TempDir()
+	notes.load(notesDirectory, admin.requests)
+	// 等待中的定时保存到时已没有变化，不会在临时目录删除后再写
+	t.Cleanup(notes.flush)
+	onboarder := newTestOnboarder(admin, onboardDirectory)
+	admin.onboard = onboarder
+	earlier, later := accounts[0].ID, accounts[1].ID
+	for _, accountID := range []string{earlier, later} {
+		if _, err := admin.UpdateAccount(context.Background(), accountID, manualDisableInput(accountID, false)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(time.Millisecond)
+	if added := onboarder.queueDisabled(); added != 2 {
+		t.Fatalf("加入 %d 个，期望 2 个", added)
+	}
+	time.Sleep(time.Millisecond)
+	if _, err := admin.UpdateAccount(context.Background(), later, manualDisableInput(later, false)); err != nil {
+		t.Fatal(err)
+	}
+
+	// 重启：停用记录与处理队列都从磁盘重新载入，内存中没写出的变化丢失
+	restartedNotes := &disableNotes{notes: make(map[string]disableNote)}
+	accountDisableNotes = restartedNotes
+	restartedNotes.load(notesDirectory, admin.requests)
+	t.Cleanup(restartedNotes.flush)
+	restarted := newAccountOnboarder(admin, onboardDirectory)
+	t.Cleanup(restarted.flush)
+	admin.onboard = restarted
+	batch, policy := restarted.takeBatch(time.Now().Add(onboardingMaxWait))
+	if len(batch) != 2 {
+		t.Fatalf("本批 = %v，期望两个账户", batch)
+	}
+	results := make(map[string]string)
+	for _, accountID := range batch {
+		result, detail, retry := restarted.process(context.Background(), accountID, policy)
+		results[accountID] = restarted.finish(accountID, result, detail, retry)
+	}
+	if results[earlier] != onboardEnabled || !testStatus(t, admin.pool, earlier).Enabled || restartedNotes.manual(earlier) {
+		t.Fatalf("加入之前手动停用的账户重启后仍应启用并清除记录：结果=%s", results[earlier])
+	}
+	if results[later] != onboardSkipped || testStatus(t, admin.pool, later).Enabled || !restartedNotes.manual(later) {
+		t.Fatalf("加入之后再次手动停用的账户重启后仍应保持停用：结果=%s", results[later])
+	}
+	if logCount(admin.requests, "其中 2 个是“处理现有停用账户”加入、尚未处理完的") != 1 {
+		t.Fatal("缺少重新加入队列的日志")
+	}
+}
+
 // TestDisableNotesManualWrittenImmediately 手动停用记录在管理接口返回前已经写入文件；原先合并 3 秒后才写，
 // 这期间进程退出就丢了记录，account.json 已是停用，重启后按默认启用
 func TestDisableNotesManualWrittenImmediately(t *testing.T) {

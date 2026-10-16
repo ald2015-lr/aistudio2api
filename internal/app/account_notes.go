@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,7 +15,7 @@ import (
 // 停用原因：账户被停用时记下原因与时间，管理页账户列表在停用账户的邮箱下方显示。
 // 保存在账户目录下的 .disable-reasons.json，不写入各账户的 account.json：
 // 旧版本程序与外部工具读取 account.json 都不受影响，回滚也不会出问题。
-// 自动停用记录合并几秒后写入；手动停用记录立即写入（见 set）：没有手动停用记录的停用账户重启后按默认启用，
+// 自动停用记录合并几秒后写入；新的手动停用记录立即写入（见 set）：没有手动停用记录的停用账户重启后按默认启用，
 // 这条记录丢了账户就会被悄悄启用。多个进程共用一个账户目录时各自整份写出自己载入的记录，不做合并
 const (
 	disableNotesFileName  = ".disable-reasons.json"
@@ -44,8 +45,12 @@ type disableNotes struct {
 	// backupPending 为真时改写文件前先把读不出来的原文件另存一份，供人工恢复
 	unreadable    bool
 	backupPending bool
+	// explicitSince 为管理员最近一次“处理现有停用账户”的时间（见 noteExplicitRequest）
+	explicitSince time.Time
 	// requests 用于记录载入与写入失败；测试中可能为空
 	requests *requestRegistry
+	// encode 把记录编码为文件内容；为空时用 json.MarshalIndent（测试替换它确认编码时不持有 mu）
+	encode func(map[string]disableNote) ([]byte, error)
 }
 
 var accountDisableNotes = &disableNotes{notes: make(map[string]disableNote)}
@@ -84,17 +89,21 @@ func (store *disableNotes) load(directory string, requests *requestRegistry) {
 	))
 }
 
-// set 记下停用原因。手动停用（auto 为假）立即写入文件再返回：原先合并 3 秒后才写，这期间进程退出（崩溃、被杀、断电）
-// 记录就丢了，account.json 已是停用，重启后按“没有手动停用记录”启用。自动停用的记录不覆盖已有的手动停用记录：
-// 排队期间被手动停用、随后验证未通过的账户原先被改记为自动停用，重启后又被启用
+// set 记下停用原因。新的手动停用记录（原先没有记录或是自动停用）立即写入文件再返回：原先合并 3 秒后才写，
+// 这期间进程退出（崩溃、被杀、断电）记录就丢了，account.json 已是停用，重启后按“没有手动停用记录”启用。
+// 已有手动停用记录的再次停用（批量停用选中了已停用的账户）只更新时间与原因，合并几秒后写入：文件里已有手动停用记录，
+// 丢了这几秒账户也保持停用；原先每次都整份重写并同步文件，记录上万条时批量停用几千个账户要多花几分钟、写几 GB。
+// 例外是记录早于最近一次“处理现有停用账户”：更新时间决定这个账户是否仍保持停用（见 blocksAutoEnable），同样立即写入。
+// 自动停用的记录不覆盖已有的手动停用记录：排队期间被手动停用、随后验证未通过的账户原先被改记为自动停用，重启后又被启用
 func (store *disableNotes) set(accountID string, reason string, auto bool) {
 	store.mu.Lock()
-	if existing, exists := store.notes[accountID]; auto && exists && !existing.Auto {
+	existing, exists := store.notes[accountID]
+	if auto && exists && !existing.Auto {
 		store.mu.Unlock()
 		return
 	}
 	store.notes[accountID] = disableNote{Reason: reason, At: time.Now(), Auto: auto}
-	if auto {
+	if auto || exists && !existing.Auto && existing.At.After(store.explicitSince) {
 		store.scheduleSaveLocked()
 		store.mu.Unlock()
 		return
@@ -102,6 +111,17 @@ func (store *disableNotes) set(accountID string, reason string, auto bool) {
 	store.markDirtyLocked()
 	store.mu.Unlock()
 	store.flush()
+}
+
+// noteExplicitRequest 记下管理员“处理现有停用账户”的时间（加入队列时，以及重启后从处理记录恢复时）：
+// 早于这个时间的手动停用记录再次停用时立即写入（见 set），否则这几秒内进程退出，重启后按文件中较早的时间判断，
+// 加入之后的再次停用被当成加入之前的，账户验证通过后被启用
+func (store *disableNotes) noteExplicitRequest(at time.Time) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if at.After(store.explicitSince) {
+		store.explicitSince = at
+	}
 }
 
 // presumeManual 给没有停用记录的账户补记手动停用（停用记录文件无法读取时，见 enableUnmarkedAccounts）并立即写入：
@@ -160,6 +180,23 @@ func (store *disableNotes) clearAutomatic(accountID string) {
 	}
 	delete(store.notes, accountID)
 	store.scheduleSaveLocked()
+}
+
+// clearAutomaticFor 清除启用账户的自动停用记录，手动停用记录保留（启动与导入时，见 enableUnmarkedAccounts）：
+// 自动停用记录只在账户停用时显示原因，也不挡住启用，启用账户留着它只会让文件越来越大，每次写入都要整份重写
+func (store *disableNotes) clearAutomaticFor(accountIDs []string) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	changed := false
+	for _, accountID := range accountIDs {
+		if note, exists := store.notes[accountID]; exists && note.Auto {
+			delete(store.notes, accountID)
+			changed = true
+		}
+	}
+	if changed {
+		store.scheduleSaveLocked()
+	}
 }
 
 // manual 判断账户是否有手动停用记录（管理页或管理接口）
@@ -231,7 +268,9 @@ func (store *disableNotes) scheduleSaveLocked() {
 
 // flush 写出尚未保存的变化：定时保存合并几秒内的多次变化，关闭生成服务时立即写出，原先关闭前 3 秒内的变化会丢失；
 // 没有待保存的变化时什么都不做。同时写入的调用排队进行，返回时调用前的变化都已写入（或写入失败并记了日志）。
-// 写入失败原先被忽略、待保存标记也被清掉；现在记一条 WARN 并保留标记，下一次保存或关闭时再写
+// 写入失败原先被忽略、待保存标记也被清掉；现在记一条 WARN 并保留标记，下一次保存或关闭时再写。
+// 持有 mu 时只复制一份记录，编码与写入在 mu 之外进行：记录上万条时编码要几十毫秒，原先全程持有 mu，
+// 管理页构建账户列表（每个停用账户查一次原因）与停用、启用都要等它；writeMu 一直持有到写完，较旧的快照不会最后落盘
 func (store *disableNotes) flush() {
 	store.writeMu.Lock()
 	defer store.writeMu.Unlock()
@@ -242,8 +281,13 @@ func (store *disableNotes) flush() {
 	}
 	store.dirty = false
 	path, backup := store.path, store.backupPending
-	data, err := json.MarshalIndent(store.notes, "", "  ")
+	snapshot := maps.Clone(store.notes)
+	encode := store.encode
 	store.mu.Unlock()
+	if encode == nil {
+		encode = func(notes map[string]disableNote) ([]byte, error) { return json.MarshalIndent(notes, "", "  ") }
+	}
+	data, err := encode(snapshot)
 	if err == nil && backup {
 		store.backupUnreadable(path)
 	}
