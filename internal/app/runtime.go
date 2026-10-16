@@ -3882,7 +3882,7 @@ func (service *trackedService) generateWithRetry(
 	hardFailures := 0
 	// deferredReset、deferredAccountID 为最近一次没等到关闭失败 Worker 就换号的账号与它的后台关闭（见 worker_reset.go）：
 	// 换号找不到可用账号、换号次数用完或到连续失败上限时回到这个账号，等关闭结束后在原账号重放；换号的选号排队时关闭结束、
-	// 可以重放就不再等其他账号，同样回到原账号重放
+	// 可以重放就不再排除这个账号，按原来的排队位置重新选号（不固定到它，见下文 errWorkerResetReady 的处理）
 	var deferredReset *workerReset
 	deferredAccountID := ""
 	// returnToDeferred 在请求不能再换号时（why 为原因，reason 为写进进度的错误）回到 deferredReset 的原账号：一直等后台关闭结束，
@@ -3961,7 +3961,7 @@ func (service *trackedService) generateWithRetry(
 		useImmediate := immediateRetry
 		immediateRetry = false
 		// 没等到关闭就换走的原账号在这次选号里仍被排除：选号排队时它的关闭结束、可以重放就提前结束（errWorkerResetReady），
-		// 回到原账号重放，不再等其他账号空出槽位（原账号关闭完成后空闲着也用不上，可能一直等到请求超时）
+		// 随后不再排除它、重新选号，不只等其他账号空出槽位（一直排除时原账号关闭完成后也用不上，可能一直等到请求超时）
 		selectCtx := withWorkerResetWake(acquireCtx, deferredReset)
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
@@ -3983,12 +3983,15 @@ func (service *trackedService) generateWithRetry(
 		}
 		if errors.Is(acquireErr, errWorkerResetReady) {
 			if requestCtx.Err() == nil {
-				// 换号的选号在排队，原账号的失败 Worker 已关闭：回到原账号重放，与换号没有可用账号时相同
+				// 换号的选号在排队，原账号的失败 Worker 已关闭：把原账号移出排除列表，按同样的条件重新选号（不占换号次数），
+				// 不固定到原账号。关闭后原账号没有 Worker，要冷启动并占一个 Worker 槽位：分区满时（号池大时常态，换号排队又正是
+				// 号池忙的时候）固定到它只能等槽位，这次排队刚为备用账号发起的扩容占着空出的槽位，扩容出来的 Worker 的空闲并发却
+				// 交给后面排队的请求，请求一直等到超时。重新选号沿用请求的到达序号，排回原来的位置，原账号与其他账号哪个先能用就用哪个。
+				// 关闭还没结束时换号没有可用账号、换号次数用完或到连续失败上限仍回到原账号等关闭结束后重放（returnToDeferred）：那时没有别的账号可用
 				accountID := deferredAccountID
 				deferredReset, deferredAccountID = nil, ""
-				trace.Note("换号排队中原账号的 Worker 已恢复，回到原账号重放")
-				service.requests.logRequestProgress(request.ID, "service", "WARN", "换号排队中原账号的 WAA Worker 已恢复，回到原账号重放")
-				recoveryAccountID = accountID
+				trace.Note("换号排队中原账号的失败 Worker 已关闭，原账号重新参与选号")
+				service.requests.logRequestProgress(request.ID, "service", "WARN", "换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号")
 				delete(attempted, accountID)
 				maxAttempts++
 				continue

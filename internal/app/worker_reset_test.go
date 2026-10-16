@@ -599,8 +599,9 @@ func TestWorkerResetFallbackWaitEndsWithRequest(t *testing.T) {
 	}
 }
 
-// TestSwitchQueueReturnsWhenDeferredResetFinishes 没等到关闭就换号、其他账号都满了而排队：原账号的关闭结束后不再等其他账号空出槽位，
-// 回到原账号重放。原先原账号在这次选号里一直被排除，关闭完成、空闲着也用不上，只能等 bob 空出槽位或请求超时
+// TestSwitchQueueReturnsWhenDeferredResetFinishes 没等到关闭就换号、其他账号都满了而排队：原账号的关闭结束后不再排除它，
+// 重新选号时在原账号冷启动新 Worker 重放（bob 一直满着）。原先原账号在这次选号里一直被排除，关闭完成后也用不上，
+// 只能等 bob 空出槽位或请求超时
 func TestSwitchQueueReturnsWhenDeferredResetFinishes(t *testing.T) {
 	upstream := newWorkerFailureService(map[string]int{resetTestAlice: 1})
 	service, closed := workerResetTestService(t, upstream, resetTestAlice, resetTestBob)
@@ -636,14 +637,161 @@ func TestSwitchQueueReturnsWhenDeferredResetFinishes(t *testing.T) {
 	if calls := upstream.called(); !slices.Equal(calls, []string{resetTestAlice, resetTestAlice}) {
 		t.Fatalf("上游调用 = %v，期望在 alice 上重放（bob 一直满着）", calls)
 	}
-	if !progressLogged(service, "换号排队中原账号的 WAA Worker 已恢复，回到原账号重放") {
-		t.Fatal("请求进度应写明换号排队中回到原账号")
+	if !progressLogged(service, "换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号") {
+		t.Fatal("请求进度应写明换号排队中原账号重新参与选号")
 	}
 	if got := closed[resetTestAlice](); got != 1 {
 		t.Fatalf("Worker 关闭 %d 次，期望 1 次", got)
 	}
 	if waiters := dispatchWaiters(service); waiters != 0 {
 		t.Fatalf("请求结束后仍有 %d 个等待者", waiters)
+	}
+}
+
+// requestRecordingService 包装 workerFailureService：按请求 ID 记下每次调用的账号；blockID 的请求在上游一直等到 release 关闭
+// （模拟同时还在输出的长请求，占着它分到的那个并发槽位）
+type requestRecordingService struct {
+	*workerFailureService
+	blockID   string
+	release   chan struct{}
+	mu        sync.Mutex
+	byRequest map[string][]string
+}
+
+func (service *requestRecordingService) Generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	service.mu.Lock()
+	service.byRequest[request.ID] = append(service.byRequest[request.ID], request.AccountID)
+	service.mu.Unlock()
+	if request.ID == service.blockID {
+		select {
+		case <-service.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return service.workerFailureService.Generate(ctx, request)
+}
+
+func (service *requestRecordingService) calledBy(requestID string) []string {
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	return slices.Clone(service.byRequest[requestID])
+}
+
+// TestSwitchQueueWakeKeepsUnpinnedSelection 换号排队中原账号关闭结束的唤醒不把请求固定到原账号。原账号关闭后没有 Worker，
+// 要冷启动并占一个 Worker 槽位：分区满（MAX_ACTIVE_WORKERS=2）时固定到它只能等槽位，而空出的槽位已被这次排队为备用账号发起的
+// 扩容占用，那个新 Worker 的空闲并发又被后面排队的请求拿走，请求一直等到超时（发现里 10 次有 5 次 4 秒后 504）。
+// 现在唤醒只是不再排除原账号，按原来的排队位置重新选号，哪个账号先能用就用哪个。
+// recheck-first 持有 resetMu，把关闭结束的通知推迟到请求按号池变化复查、发起扩容之后，固定复现发现里的先后顺序；natural 为自然顺序
+func TestSwitchQueueWakeKeepsUnpinnedSelection(t *testing.T) {
+	const (
+		// standby 为备用账号（没有 Worker），fill-first 下排在最前；failing 为热账号，有其他请求在输出时返回一次 Code 5；
+		// full 为热账号，两个并发槽位都被占满
+		standby = "wake-a@example.com"
+		failing = "wake-b@example.com"
+		full    = "wake-c@example.com"
+	)
+	for _, test := range []struct {
+		name       string
+		holdNotice bool
+	}{
+		{name: "recheck-first", holdNotice: true},
+		{name: "natural"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inner := newWorkerFailureService(map[string]int{failing: 1})
+			upstream := &requestRecordingService{
+				workerFailureService: inner, blockID: "req-wake-queued", release: make(chan struct{}),
+				byRequest: make(map[string][]string),
+			}
+			service, closed := workerResetTestService(t, upstream, standby, failing, full)
+			manager := service.workers
+			manager.maxActive.Store(2)
+			manager.warmTarget.Store(2)
+			standbyWorker := manager.accounts[standby]
+			standbyWorker.mu.Lock()
+			standbyWorker.worker = nil
+			standbyWorker.mu.Unlock()
+			standbyWorker.warm.Store(false)
+			// 冷启动 300ms：扩容的 Worker 就绪前原账号的关闭已经结束
+			launches := make(chan string, 8)
+			manager.launch = func(ctx context.Context, accountID string, _ camoufoxnative.Options) (*aistudio.NativeWorker, error) {
+				select {
+				case launches <- accountID:
+				default:
+				}
+				timer := time.NewTimer(300 * time.Millisecond)
+				defer timer.Stop()
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+				worker, _ := aistudio.NewStubWorker(accountID, 0)
+				return worker, nil
+			}
+			releaseFull := []func(){holdLease(t, service.pool, full), holdLease(t, service.pool, full)}
+			defer func() {
+				for _, release := range releaseFull {
+					release()
+				}
+			}()
+			releaseQueued := sync.OnceFunc(func() { close(upstream.release) })
+			defer releaseQueued()
+			holder := newSiblingHolder(service.pool)
+			inner.beforeFail = holder.hold
+
+			results := startResetTestRequestWithin(service.lifecycle, service, "req-wake", "", 4*time.Second)
+			sibling := holder.lease(t)
+			if !waitUntil(5*time.Second, func() bool {
+				return progressLogged(service, "后台继续关闭失败的 Worker，换号重试") && dispatchWaiters(service) == 1
+			}) {
+				t.Fatalf("换号后应排队（分区已满、full 占满），上游调用 = %v", upstream.calledBy("req-wake"))
+			}
+			// 后到的请求排在它后面：之后扩容出来的 Worker 它也能用
+			queued := startResetTestRequestWithin(service.lifecycle, service, "req-wake-queued", "", 20*time.Second)
+			if !waitUntil(5*time.Second, func() bool { return dispatchWaiters(service) == 2 }) {
+				t.Fatal("后到的请求应同队排队")
+			}
+			if test.holdNotice {
+				manager.resetMu.Lock()
+			}
+			if err := sibling.Release(); err != nil {
+				if test.holdNotice {
+					manager.resetMu.Unlock()
+				}
+				t.Fatal(err)
+			}
+			if test.holdNotice {
+				// failing 的 Worker 关闭、分区空出槽位后请求复查并为备用账号发起扩容，之后才放行关闭结束的通知（扩容还没就绪）
+				select {
+				case <-launches:
+					manager.resetMu.Unlock()
+				case <-time.After(5 * time.Second):
+					manager.resetMu.Unlock()
+					t.Fatal("failing 关闭后排队的请求应发起扩容")
+				}
+			}
+			result := awaitResetTestResult(t, results, 10*time.Second)
+			if result.err != nil || result.text != "hello" {
+				t.Fatalf("text=%q err=%v 用时=%s 上游调用=%v，期望不固定到原账号、用先就绪的 Worker 成功",
+					result.text, result.err, result.elapsed, upstream.calledBy("req-wake"))
+			}
+			if calls := upstream.calledBy("req-wake"); test.holdNotice && !slices.Equal(calls, []string{failing, standby}) {
+				t.Fatalf("上游调用 = %v，期望 failing 失败后用扩容出来的 %s", calls, standby)
+			}
+			if !progressLogged(service, "换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号") {
+				t.Fatal("请求进度应写明原账号重新参与选号")
+			}
+			releaseQueued()
+			if other := awaitResetTestResult(t, queued, 10*time.Second); other.err != nil || other.text != "hello" {
+				t.Fatalf("后到的请求 text=%q err=%v，期望成功", other.text, other.err)
+			}
+			if got := closed[failing](); got != 1 {
+				t.Fatalf("failing 的 Worker 关闭 %d 次，期望 1 次", got)
+			}
+			waitResetsSettled(t, manager)
+		})
 	}
 }
 
