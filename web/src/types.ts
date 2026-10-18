@@ -163,10 +163,13 @@ export interface UltraWorkerCounters {
   max: number
 }
 
-// PrimarySupply 为一个主用模型在普通分区的可用供给（约每 30 秒统计一次）：warm 为能服务它的常驻 Worker，
-// standby 为还能服务它的空闲备用账号，最多统计 1000 个，达到上限时 standby_capped 为 true
+// PrimarySupply 为一个主用模型的可用供给（约每 30 秒统计一次）：warm 为能服务它的常驻 Worker，
+// standby 为还能服务它的空闲备用账号，最多统计 1000 个，达到上限时 standby_capped 为 true。
+// pool 为 "ultra" 时是 Ultra 主用模型（ULTRA_PRIMARY_MODELS），只统计 Ultra 分区的 Worker 与 Ultra 号池的账号；
+// 没有该字段时是普通主用模型（PRIMARY_MODELS），只统计普通分区。旧版服务端不返回 pool
 export interface PrimarySupply {
   model: string
+  pool?: string
   warm: number
   standby: number
   standby_capped?: boolean
@@ -184,7 +187,8 @@ export interface ServiceStatus {
   // ultra_accounts 为 Ultra 号池的账户计数，ultra_workers 为 Ultra 分区的 Worker 计数
   ultra_accounts?: AccountCounters
   ultra_workers?: UltraWorkerCounters
-  // primary_supply 为每个主用模型（PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有
+  // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
+  // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
 }
 
@@ -360,9 +364,15 @@ export interface ServiceConfig {
   upstream_channels: UpstreamChannel[]
   // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段
   stream_playground_models?: string[]
-  // primary_models 为主用模型，primary_queue_wait 为它们等空闲账号或 Worker 的上限（0s 表示不排队）；旧版服务端不返回这两个字段
+  // primary_models 为主用模型，primary_queue_wait 为它们等空闲账号或 Worker 的上限（0s 表示不排队）；旧版服务端不返回这两个字段。
+  // 这份列表只作用于普通号池
   primary_models?: string[]
   primary_queue_wait?: string
+  // ultra_primary_models 为 Ultra 主用模型（空数组表示关闭），只作用于 /ultra 请求（以及 ULTRA_EXCLUSIVE 关闭时普通路径上
+  // 只有 Ultra 账户能服务的模型），这些模型没有额度时立即返回 429；ultra_primary_queue_wait 为它们的排队上限，
+  // 规则与 primary_queue_wait 相同。旧版服务端不返回这两个字段
+  ultra_primary_models?: string[]
+  ultra_primary_queue_wait?: string
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   ignore_client_seed: boolean

@@ -56,10 +56,7 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	// 交互资源的 model 报告去掉后缀的目录模型名（见 responseModel）
 	model := responseModel(generate)
 	generate.Stream = request.Stream
-	events, err := s.service.Generate(r.Context(), generate)
-	if err == nil && request.Stream {
-		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generate.Model))
-	}
+	events, err := s.generate(r.Context(), generate)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiRequestError(w, err)

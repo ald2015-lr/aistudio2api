@@ -123,8 +123,8 @@ func TestPrimaryQueueWaitBounded(t *testing.T) {
 	assertLeasesReleased(t, pool)
 }
 
-// TestPrimaryQueueWaitUltraScope /ultra 请求的排队预算只看 Ultra 号池：Ultra 账号忙碌时即使普通账号空闲也按号池繁忙返回，
-// 错误写明 Ultra 号池
+// TestPrimaryQueueWaitUltraScope /ultra 请求的排队预算按 Ultra 主用模型列表：只在普通列表里的模型在 /ultra 上不再快速失败（照常排队）；
+// 在 Ultra 列表里时只看 Ultra 号池，Ultra 账号忙碌时即使普通账号空闲也按号池繁忙返回，错误写明 Ultra 号池；普通路径不受影响
 func TestPrimaryQueueWaitUltraScope(t *testing.T) {
 	service, pool := primaryBusyService(t, nil, primaryTestA, primaryTestB)
 	if err := pool.SetCatalog(primaryTestB, aistudio.BenefitTierUltra, []aistudio.Model{{
@@ -136,10 +136,24 @@ func TestPrimaryQueueWaitUltraScope(t *testing.T) {
 	defer cancel()
 	release := holdLease(t, pool, primaryTestB)
 	defer release()
-	service.setPrimaryModels([]string{testRuntimeModel}, 0)
 	ultraCtx := aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra)
-	lease, err, _ := acquirePrimary(ultraCtx, service, aistudio.PoolScopeUltra)
+
+	// 只在普通列表里：/ultra 请求没有排队预算，照常排队到请求结束，不按号池繁忙提前返回
+	service.setPrimaryModels([]string{testRuntimeModel}, 0)
+	if budget := service.primaryBudget(testRuntimeModel, aistudio.PoolScopeUltra); budget != nil {
+		t.Fatalf("普通列表的模型在 Ultra 号池不应有排队预算: %+v", budget)
+	}
+	queueCtx, queueCancel := context.WithTimeout(ultraCtx, 600*time.Millisecond)
+	lease, err, elapsed := acquirePrimary(queueCtx, service, aistudio.PoolScopeUltra)
+	queueCancel()
 	var busy *aistudio.CapacityBusyError
+	if lease != nil || errors.As(err, &busy) || !errors.Is(err, context.DeadlineExceeded) || elapsed < 500*time.Millisecond {
+		t.Fatalf("普通列表的模型在 /ultra 上 lease=%v err=%v 用时 %s，期望照常排队到请求结束", lease, err, elapsed)
+	}
+
+	// 在 Ultra 列表里：只看 Ultra 号池，立即按号池繁忙返回
+	service.setPrimaryModelSettings(nil, 0, []string{testRuntimeModel}, 0)
+	lease, err, _ = acquirePrimary(ultraCtx, service, aistudio.PoolScopeUltra)
 	if lease != nil || !errors.As(err, &busy) || busy.Pool != aistudio.PoolScopeUltra || !strings.Contains(err.Error(), "Ultra") {
 		t.Fatalf("Ultra 账号忙碌时 lease=%v err=%v，期望写明 Ultra 号池的号池繁忙错误", lease, err)
 	}

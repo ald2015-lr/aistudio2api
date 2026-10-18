@@ -123,12 +123,21 @@ const ultraWorkers = computed(() => {
   return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0 ? workers : null
 })
 
-// primarySupply 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+
-const primarySupply = computed(() =>
+// primarySupplyRows 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+。
+// 普通条目与 Ultra 条目（pool 为 ultra）分开：同一个模型可能同时在两份列表里，Ultra 条目显示在 Ultra Worker 行下面
+const primarySupplyRows = computed(() =>
   (status.value?.primary_supply ?? []).map((supply) => ({
     ...supply,
     standbyLabel: supply.standby_capped ? `${supply.standby}+` : String(supply.standby),
   })),
+)
+const primarySupply = computed(() =>
+  primarySupplyRows.value.filter((supply) => supply.pool !== 'ultra'),
+)
+// Ultra 条目与 Ultra Worker 行一样只在有 Ultra 号池时显示：ULTRA_PRIMARY_MODELS 默认非空，没有 Ultra 账户的部署也会统计出
+// 全为 0 的条目，显示出来会被误读为备用账号已经用完
+const ultraPrimarySupply = computed(() =>
+  ultraWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'ultra') : [],
 )
 
 // navBadge 在导航项旁显示账户就绪数与活动请求数
@@ -551,6 +560,20 @@ onUnmounted(() => {
             :class="ultraWorkers.occupied >= ultraWorkers.max ? 'text-yellow-400' : 'text-fuchsia-300'"
           >
             {{ tf('app.ultraWorkers', { occupied: ultraWorkers.occupied, max: ultraWorkers.max }) }}
+          </div>
+          <div
+            v-for="supply in ultraPrimarySupply"
+            :key="`ultra:${supply.model}`"
+            v-tooltip="tf('app.ultraPrimarySupplyDetail', { model: supply.model })"
+            class="flex flex-wrap items-baseline gap-x-1"
+            :class="supply.standby === 0 ? 'text-yellow-400' : 'text-fuchsia-300'"
+          >
+            <span class="max-w-full min-w-0 truncate">
+              {{ tf('app.ultraPrimarySupplyModel', { model: supply.model }) }}
+            </span>
+            <span class="whitespace-nowrap">
+              {{ tf('app.primarySupply', { warm: supply.warm, standby: supply.standbyLabel }) }}
+            </span>
           </div>
           <template v-if="status.workers?.prewarm">
             <div v-if="status.workers.prewarm.active" class="text-cyan-300">

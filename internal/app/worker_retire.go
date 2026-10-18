@@ -50,7 +50,7 @@ func (entry retirement) global() bool {
 	return len(entry.models) == 0
 }
 
-// drainable 判断忙碌的登记能否排空：全局冷却，或登记的模型中有一个是判断死槽位用的模型（deadSlotModels，热门与主用模型）。
+// drainable 判断忙碌的登记能否排空：全局冷却，或登记的模型中有一个是判断死槽位用的模型（deadSlotModelsFor，热门模型与账号所在分区的主用模型）。
 // 模型按降级判定的规则比较（主用模型已整理为小写）
 func (entry retirement) drainable(deadModels []string) bool {
 	if entry.global() {
@@ -279,7 +279,16 @@ func (manager *accountWorkerManager) retirePass() int {
 		occupied[partition] = held
 		return held
 	}
-	deadModels := manager.deadSlotModels()
+	// 判断能否排空用账号所在分区的死槽位模型（Ultra 分区按 Ultra 主用模型），每个分区第一次需要时取一次
+	deadModels := make(map[aistudio.PoolScope][]string, len(workerPartitions))
+	deadModelsIn := func(partition aistudio.PoolScope) []string {
+		models, ok := deadModels[partition]
+		if !ok {
+			models = manager.deadSlotModelsFor(partition)
+			deadModels[partition] = models
+		}
+		return models
+	}
 	var victims []retirementCandidate
 	for _, candidate := range candidates {
 		if manager.lifecycle.Err() != nil {
@@ -327,7 +336,7 @@ func (manager *accountWorkerManager) retirePass() int {
 		} else {
 			// 只有全局冷却、或在主用模型与热门模型上冷却的死槽位才排空；只在别的模型上冷却的（少用的模型、单个账号无权限的模型）
 			// 还能服务主用与热门模型，忙碌时不排空，空闲后照常淘汰
-			if busy && !candidate.entry.drainable(deadModels) {
+			if busy && !candidate.entry.drainable(deadModelsIn(partition)) {
 				continue
 			}
 			key := candidate.spareKey()
@@ -429,20 +438,46 @@ func (service *trackedService) retireCooledWorker(accountID string, modelID stri
 	service.workers.retireWorker(accountID, scope)
 }
 
-// registerDeadWorkers 把驻留 Worker 中的死槽位补登记淘汰（keepWarm 每个周期调用）：账号全局长时间冷却，或在热门模型、主用模型上
-// 长时间不可用。原先只在本进程 applyQuotaCooldown 写入冷却、账号恰好驻留时登记，而且只在内存里：重启后、其他进程写入的冷却、
-// 冷却时账号还没驻留（随后被预热）都没有登记，这些 Worker 永远不会被排空淘汰，状态页的冷却占位也与登记数对不上。
-// 先对全部驻留 Worker 调用一次 LongCoolingSet，只对其中的死槽位再按全局与各模型分别核对范围，返回新增的登记数
+// registerDeadWorkers 把驻留 Worker 中的死槽位补登记淘汰（keepWarm 每个周期调用）：账号全局长时间冷却，或在热门模型、所在分区的
+// 主用模型上长时间不可用（Ultra 分区按 Ultra 主用模型，见 primaryModelListFor）。原先只在本进程 applyQuotaCooldown 写入冷却、
+// 账号恰好驻留时登记，而且只在内存里：重启后、其他进程写入的冷却、冷却时账号还没驻留（随后被预热）都没有登记，这些 Worker 永远
+// 不会被排空淘汰，状态页的冷却占位也与登记数对不上。每个分区先对驻留 Worker 调用一次 LongCoolingSet，只对其中的死槽位再按全局与
+// 各模型分别核对范围，返回新增的登记数
 func (service *trackedService) registerDeadWorkers() int {
 	workers := service.workers
 	if workers == nil {
 		return 0
 	}
-	models := workers.deadSlotModels()
-	warm := workers.WarmAccountIDs()
+	allWarm := workers.WarmAccountIDs()
+	ultra := service.pool.UltraAccountIDs()
+	added, deadTotal := 0, 0
+	var logged []string
+	for _, partition := range workerPartitions {
+		warm := inPartition(allWarm, ultra, partition)
+		if len(warm) == 0 {
+			continue
+		}
+		models := workers.deadSlotModelsFor(partition)
+		partitionAdded, dead := service.registerDeadWorkersIn(warm, models)
+		added += partitionAdded
+		deadTotal += dead
+		logged = mergeModelLists(logged, models)
+	}
+	if added > 0 {
+		service.requests.log("service", "INFO", fmt.Sprintf(
+			"WAA Worker 补登记淘汰 | 新增=%d | 驻留 Worker 中的死槽位=%d/%d | 模型=%s",
+			added, deadTotal, len(allWarm), strings.Join(logged, ","),
+		))
+	}
+	return added
+}
+
+// registerDeadWorkersIn 在一个分区的驻留 Worker 中补登记死槽位（models 为该分区判断死槽位用的模型），返回新增的登记数与死槽位数
+func (service *trackedService) registerDeadWorkersIn(warm []string, models []string) (int, int) {
+	workers := service.workers
 	dead := service.pool.LongCoolingSet(warm, models, rotationMinRemaining, false)
 	if len(dead) == 0 {
-		return 0
+		return 0, 0
 	}
 	accountIDs := make([]string, 0, len(dead))
 	for accountID := range dead {
@@ -470,13 +505,7 @@ func (service *trackedService) registerDeadWorkers() int {
 			}
 		}
 	}
-	if added > 0 {
-		service.requests.log("service", "INFO", fmt.Sprintf(
-			"WAA Worker 补登记淘汰 | 新增=%d | 驻留 Worker 中的死槽位=%d/%d | 模型=%s",
-			added, len(dead), len(warm), strings.Join(models, ","),
-		))
-	}
-	return added
+	return added, len(dead)
 }
 
 // victimMode 为淘汰选号的范围
@@ -605,15 +634,12 @@ func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, part
 	return victim, nil
 }
 
-// deadWarmCounts 统计各分区驻留 Worker 中的死槽位数（账号全局长时间冷却，或在预热池的热门冷却模型、主用模型上长时间不可用），
+// deadWarmCounts 统计各分区驻留 Worker 中的死槽位数（账号全局长时间冷却，或在预热池的热门冷却模型、所在分区的主用模型上长时间不可用），
 // 供状态页显示；口径与 registerDeadWorkers 的补登记一致
 func (manager *accountWorkerManager) deadWarmCounts(warm []string, ultra map[string]struct{}) (normal int, ultraDead int) {
-	for accountID := range manager.pool.LongCoolingSet(warm, manager.deadSlotModels(), rotationMinRemaining, false) {
-		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
-			ultraDead++
-		} else {
-			normal++
-		}
-	}
+	normal = len(manager.pool.LongCoolingSet(inPartition(warm, ultra, aistudio.PoolScopeNormal),
+		manager.deadSlotModelsFor(aistudio.PoolScopeNormal), rotationMinRemaining, false))
+	ultraDead = len(manager.pool.LongCoolingSet(inPartition(warm, ultra, aistudio.PoolScopeUltra),
+		manager.deadSlotModelsFor(aistudio.PoolScopeUltra), rotationMinRemaining, false))
 	return normal, ultraDead
 }

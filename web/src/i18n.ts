@@ -188,7 +188,11 @@ const zhCN = {
   'settings.primaryModels': '主用模型列表',
   'settings.primaryQueueWait': '排队上限',
   'settings.primaryHelp':
-    '列表中的模型的请求最多等这么久空闲的账号或 Worker，超过即返回 429 并带 Retry-After，让客户端稍后重试，而不是在这里排队到请求超时。同时生成数约为 峰值 Worker 上限 × 单账户请求并发，并发超过它时请求就会排队；这只是对症状的处理，长期不够用应加 Worker 或并发。逗号分隔的模型 ID；留空时所有模型照常排队（默认）。排队上限为 0 表示不排队，没有立即可用的账号就返回 429；上限整个请求共用一份，按实际经过的时间计，换号重试的尝试与退避都算在内（请求自己现场冷启动的浏览器启动时间不计），不能超过请求超时。候选全部冷却仍按原规则处理。修改后立即生效。',
+    '这份列表只作用于普通号池（不带 /ultra 前缀的请求），/ultra 请求按下方的 Ultra 主用模型列表。列表中的模型的请求最多等这么久空闲的账号或 Worker，超过即返回 429 并带 Retry-After，让客户端稍后重试，而不是在这里排队到请求超时。同时生成数约为 峰值 Worker 上限 × 单账户请求并发，并发超过它时请求就会排队；这只是对症状的处理，长期不够用应加 Worker 或并发。逗号分隔的模型 ID；留空时所有模型照常排队（默认）。排队上限为 0 表示不排队，没有立即可用的账号就返回 429；上限整个请求共用一份，按实际经过的时间计，换号重试的尝试与退避都算在内（请求自己现场冷启动的浏览器启动时间不计），不能超过请求超时。候选全部冷却仍按原规则处理。修改后立即生效。',
+  'settings.ultraPrimaryModels': 'Ultra 主用模型列表',
+  'settings.ultraPrimaryQueueWait': 'Ultra 排队上限',
+  'settings.ultraPrimaryHelp':
+    'Ultra 主用模型列表只作用于 /ultra 请求；关闭“Ultra 账户只服务 /ultra 请求”时，普通路径上不在上方普通列表里、但在这份列表里的模型（通常是只有 Ultra 账户能服务的模型）也按这里的规则。这些模型没有额度时立即返回 429 并带 Retry-After，而不是在服务里一直换号重试：候选账户全部冷却时立即返回；请求中遇到额度 429 后最多再换 2 次账户，每次额度失败后的那次换号只用已启动的 Worker，不为它现场冷启动备用账户。排队上限只限制等空闲账户或 Worker 的时间，规则与上方相同（0 表示不排队，不能超过请求超时）。逗号分隔的模型 ID，默认 gemini-4-argon；清空即关闭。修改后立即生效。',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': '通道',
@@ -360,6 +364,9 @@ const zhCN = {
   'app.primarySupply': '热 {warm} · 备用 {standby}',
   'app.primarySupplyDetail':
     '主用模型 {model}：热为能服务它的常驻 Worker，备用为还能服务它的空闲账号（最多统计 1000 个），约每 30 秒更新。备用为 0 表示没有还能服务该模型的空闲账号（当天额度可能已用完，太平洋时间零点重置）',
+  'app.ultraPrimarySupplyModel': 'Ultra 主用 {model}：',
+  'app.ultraPrimarySupplyDetail':
+    'Ultra 主用模型 {model}：热为 Ultra 分区能服务它的常驻 Worker，备用为 Ultra 号池里还能服务它的空闲账号（最多统计 1000 个），约每 30 秒更新。备用为 0 表示没有还能服务该模型的空闲 Ultra 账号（当天额度可能已用完，太平洋时间零点重置）；额度不足时该模型的请求立即返回 429，不在服务里排队重试',
   'app.prewarmActive': '预热中 · 进行 {inflight} · 本轮 {launched}',
   'app.prewarmStalled': '预热循环 {seconds}s 无进展',
   'app.prewarmIdle': '预热空闲',
@@ -448,6 +455,8 @@ const zhCN = {
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
   'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
   'settings.invalidPrimaryQueueWait': '主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
+  'settings.invalidUltraPrimaryQueueWait':
+    'Ultra 主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
   'settings.invalidListen': '监听地址格式应为 主机:端口',
   'settings.invalidMaxWorkers': '峰值 Worker 上限不能小于常驻 Worker 数',
   'settings.invalidWarmConcurrency': '启动预热并发应在 1 到常驻 Worker 数之间',
@@ -827,7 +836,11 @@ const en: Record<TranslationKey, string> = {
   'settings.primaryModels': 'Primary model list',
   'settings.primaryQueueWait': 'Queue limit',
   'settings.primaryHelp':
-    'Requests for the listed models wait at most this long for a free account or worker, then get a 429 with Retry-After so the client retries later instead of queuing here until the request timeout. Concurrent generations are roughly the active worker limit × concurrent requests per account; beyond that, requests queue. This only treats the symptom: add workers or per-account concurrency when capacity is short for long. Comma-separated model IDs; empty keeps every model queuing as usual (default). A limit of 0 never queues and returns 429 when nothing is free right away; the limit is shared by the whole request and counts wall-clock time, including retries on another account and their backoff (the browser start-up of a cold start the request runs for itself does not count), and it cannot exceed the request timeout. When every candidate is cooling down the usual rules still apply. Changes apply immediately.',
+    'This list applies to the normal pool only (requests without the /ultra prefix); /ultra requests use the Ultra primary model list below. Requests for the listed models wait at most this long for a free account or worker, then get a 429 with Retry-After so the client retries later instead of queuing here until the request timeout. Concurrent generations are roughly the active worker limit × concurrent requests per account; beyond that, requests queue. This only treats the symptom: add workers or per-account concurrency when capacity is short for long. Comma-separated model IDs; empty keeps every model queuing as usual (default). A limit of 0 never queues and returns 429 when nothing is free right away; the limit is shared by the whole request and counts wall-clock time, including retries on another account and their backoff (the browser start-up of a cold start the request runs for itself does not count), and it cannot exceed the request timeout. When every candidate is cooling down the usual rules still apply. Changes apply immediately.',
+  'settings.ultraPrimaryModels': 'Ultra primary model list',
+  'settings.ultraPrimaryQueueWait': 'Ultra queue limit',
+  'settings.ultraPrimaryHelp':
+    'The Ultra primary model list applies to /ultra requests. When "Ultra accounts only serve /ultra requests" is off, models on normal paths that are not in the normal list above but are in this list (usually models only Ultra accounts can serve) follow these rules too. When these models are out of quota the request gets a 429 with Retry-After right away instead of switching accounts inside the service over and over: it returns at once when every candidate account is cooling down, and after a quota 429 during a request it switches accounts at most 2 more times; the switch right after each quota failure uses only workers that are already running and never cold-starts a standby account for it. The queue limit only bounds the wait for a free account or worker and follows the same rules as above (0 never queues; it cannot exceed the request timeout). Comma-separated model IDs; defaults to gemini-4-argon; clear it to turn this off. Changes apply immediately.',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': 'Channel',
@@ -1006,6 +1019,9 @@ const en: Record<TranslationKey, string> = {
   'app.primarySupply': '{warm} warm · {standby} standby',
   'app.primarySupplyDetail':
     "Primary model {model}: warm is the number of resident workers that can serve it, standby the number of idle accounts that still can (counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time)",
+  'app.ultraPrimarySupplyModel': 'Ultra primary {model}:',
+  'app.ultraPrimarySupplyDetail':
+    "Ultra primary model {model}: warm is the number of resident workers in the Ultra partition that can serve it, standby the number of idle Ultra-pool accounts that still can (counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle Ultra account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time). When quota runs out, requests for this model get a 429 right away instead of queuing and retrying inside the service",
   'app.prewarmActive': 'Prewarming · {inflight} running · {launched} this round',
   'app.prewarmStalled': 'Prewarm loop stalled {seconds}s',
   'app.prewarmIdle': 'Prewarm idle',
@@ -1098,6 +1114,8 @@ const en: Record<TranslationKey, string> = {
     'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',
   'settings.invalidPrimaryQueueWait':
     'Primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
+  'settings.invalidUltraPrimaryQueueWait':
+    'Ultra primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
   'settings.invalidListen': 'Listen address must be host:port',
   'settings.invalidMaxWorkers': 'Peak worker limit cannot be lower than the resident worker count',
   'settings.invalidWarmConcurrency': 'Warm-up concurrency must be between 1 and the resident worker count',

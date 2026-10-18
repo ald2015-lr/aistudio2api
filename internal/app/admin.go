@@ -877,6 +877,19 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		// 旧版页面看不到排队上限：它把请求超时调到现值以下时按请求超时封顶，而不是报一个页面上没有的字段无效
 		primaryQueueWait = requestTimeout
 	}
+	// Ultra 主用模型与排队上限：规则与普通主用模型相同（旧版页面沿用现值，空数组表示关闭，排队上限 0 表示不排队）
+	ultraPrimaryModels := saved.UltraPrimaryModels
+	if value.UltraPrimaryModels != nil {
+		ultraPrimaryModels = config.NormalizeModelList(*value.UltraPrimaryModels)
+	}
+	ultraPrimaryQueueWait := saved.UltraPrimaryQueueWait
+	if strings.TrimSpace(value.UltraPrimaryQueueWait) != "" {
+		if ultraPrimaryQueueWait, err = time.ParseDuration(strings.TrimSpace(value.UltraPrimaryQueueWait)); err != nil {
+			return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("ULTRA_PRIMARY_QUEUE_WAIT 无效: %w", err))
+		}
+	} else if ultraPrimaryQueueWait > requestTimeout {
+		ultraPrimaryQueueWait = requestTimeout
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
 		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
@@ -889,6 +902,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		StreamPlaygroundModels: streamPlaygroundModels,
 		PrimaryModels:          primaryModels,
 		PrimaryQueueWait:       primaryQueueWait,
+		UltraPrimaryModels:     ultraPrimaryModels,
+		UltraPrimaryQueueWait:  ultraPrimaryQueueWait,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
@@ -1479,6 +1494,7 @@ func buildVersion() string {
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
+	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
@@ -1500,6 +1516,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		StreamPlaygroundModels: &streamPlaygroundModels,
 		PrimaryModels:          &primaryModels,
 		PrimaryQueueWait:       cfg.PrimaryQueueWait.String(),
+		UltraPrimaryModels:     &ultraPrimaryModels,
+		UltraPrimaryQueueWait:  cfg.UltraPrimaryQueueWait.String(),
 	}
 }
 

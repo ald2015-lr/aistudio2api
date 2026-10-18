@@ -43,33 +43,33 @@ func TestPrimarySupplyCounts(t *testing.T) {
 	// 备用：d 主用模型已冷却，e 正被占用，f 空闲
 	env.coolPro(t, accounts[3])
 	release := holdLease(t, env.pool, accounts[4])
-	entries := env.manager.computePrimarySupply([]string{drainProModel}, primarySupplyStandbyLimit)
+	entries := env.manager.computePrimarySupply(normalSupplyTargets(drainProModel), primarySupplyStandbyLimit)
 	want := api.AdminPrimarySupply{Model: drainProModel, Warm: 1, Standby: 1}
 	if len(entries) != 1 || entries[0] != want {
 		t.Fatalf("供给 = %+v，应为 %+v", entries, want)
 	}
 	// 其他模型不受主用模型冷却影响：a、c 能服务，b 排空中不计；e 被占用、f 空闲，d 能服务
-	other := env.manager.computePrimarySupply([]string{testRuntimeModel}, primarySupplyStandbyLimit)
+	other := env.manager.computePrimarySupply(normalSupplyTargets(testRuntimeModel), primarySupplyStandbyLimit)
 	if got := other[0]; got.Warm != 2 || got.Standby != 2 {
 		t.Fatalf("其他模型的供给 = %+v，应为 热 2 · 备用 2", got)
 	}
 	release()
 	// e 空闲后备用为 2：上限 1 时只数到 1 并标记 capped，上限 2 时不标记
-	if got := env.manager.computePrimarySupply([]string{drainProModel}, 1)[0]; got.Standby != 1 || !got.StandbyCapped {
+	if got := env.manager.computePrimarySupply(normalSupplyTargets(drainProModel), 1)[0]; got.Standby != 1 || !got.StandbyCapped {
 		t.Fatalf("上限 1 时供给 = %+v，应为备用 1 且 capped", got)
 	}
-	if got := env.manager.computePrimarySupply([]string{drainProModel}, 2)[0]; got.Standby != 2 || got.StandbyCapped {
+	if got := env.manager.computePrimarySupply(normalSupplyTargets(drainProModel), 2)[0]; got.Standby != 2 || got.StandbyCapped {
 		t.Fatalf("上限 2 时供给 = %+v，应为备用 2 且不 capped", got)
 	}
 	// 正在启动的账号不算空闲备用
 	env.manager.openingSet.Store(accounts[5], struct{}{})
-	got := env.manager.computePrimarySupply([]string{drainProModel}, primarySupplyStandbyLimit)[0]
+	got := env.manager.computePrimarySupply(normalSupplyTargets(drainProModel), primarySupplyStandbyLimit)[0]
 	env.manager.openingSet.Delete(accounts[5])
 	if got.Standby != 1 {
 		t.Fatalf("f 启动中时备用应为 1（只有 e），实际 %+v", got)
 	}
 	// 号池里没有的模型两项都为 0
-	if got := env.manager.computePrimarySupply([]string{"missing-model"}, primarySupplyStandbyLimit); len(got) != 1 || got[0] != (api.AdminPrimarySupply{Model: "missing-model"}) {
+	if got := env.manager.computePrimarySupply(normalSupplyTargets("missing-model"), primarySupplyStandbyLimit); len(got) != 1 || got[0] != (api.AdminPrimarySupply{Model: "missing-model"}) {
 		t.Fatalf("号池里没有的模型供给 = %+v", got)
 	}
 }
@@ -197,8 +197,12 @@ func TestStatusShowsDrainingAndRetiring(t *testing.T) {
 		}
 	}
 	release()
-	if !waitUntil(3*time.Second, func() bool { return !slices.Contains(env.manager.WarmAccountIDs(), accounts[0]) }) {
-		t.Fatalf("租约释放后排空的 Worker 应被淘汰，驻留 Worker = %v", sortedWarm(env.manager))
+	// 淘汰先关闭 Worker（随即离开驻留列表），再删除登记、清除排空（finishRetirement）：只等 Worker 离开驻留列表时，
+	// 负载高的机器上状态接口可能正好落在两步之间、仍看到 1 条登记，所以连同登记与排空一起等
+	if !waitUntil(3*time.Second, func() bool {
+		return !slices.Contains(env.manager.WarmAccountIDs(), accounts[0]) && env.manager.retirementCount() == 0 && !env.pool.Draining(accounts[0])
+	}) {
+		t.Fatalf("租约释放后排空的 Worker 应被淘汰，驻留 Worker = %v，登记 = %d", sortedWarm(env.manager), env.manager.retirementCount())
 	}
 	status, err = admin.Status(env.ctx)
 	if err != nil {

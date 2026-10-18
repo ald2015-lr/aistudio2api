@@ -112,6 +112,12 @@ func publicErrorFor(err error, model string) publicError {
 			Message: blockedPromptMessage(blocked.Reason), Kind: publicKindBlocked,
 		}
 	}
+	// Ultra 主用模型额度不足立即结束：与全部冷却一样按 429 与固定的官方文案返回，Retry-After 按 RetryAt 写入。
+	// 最后一次上游额度错误（Cause）的原文不放进对外消息：其中的 "You exceeded your current quota" 会触发 new-api 等中转自动禁用渠道
+	var quota *aistudio.PrimaryQuotaError
+	if errors.As(err, &quota) {
+		return rateLimitPublicError()
+	}
 	var rpcError *aistudio.RPCError
 	if errors.As(err, &rpcError) {
 		return upstreamPublicError(rpcError)

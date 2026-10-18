@@ -50,16 +50,18 @@ type AdminStatus struct {
 	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
 	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含两个分区）
 	UltraWorkers AdminWorkerPartition `json:"ultra_workers"`
-	// PrimarySupply 为每个主用模型（PRIMARY_MODELS）在普通分区的可用供给，keepWarm 约每 30 秒统计一次并缓存；
-	// 没有主用模型或服务还没统计过时为空
+	// PrimarySupply 为每个主用模型的可用供给：普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）
+	// 统计 Ultra 分区（Pool 为 ultra），keepWarm 约每 30 秒统计一次并缓存；没有主用模型或服务还没统计过时为空
 	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
 }
 
-// AdminPrimarySupply 表示一个主用模型在普通分区的可用供给：Warm 为能服务它的驻留 Worker（对它没有冷却、不在排空中），
-// Standby 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、对它没有冷却），最多统计 1000 个，达到上限时 StandbyCapped 为真。
+// AdminPrimarySupply 表示一个主用模型在它所在分区的可用供给：Pool 为 ultra 时是 Ultra 主用模型、统计 Ultra 分区，为空时是普通主用模型、
+// 统计普通分区。Warm 为能服务它的驻留 Worker（对它没有冷却、不在排空中），Standby 为能服务它的空闲备用账号（没有驻留 Worker、
+// 不在启动中、对它没有冷却），最多统计 1000 个，达到上限时 StandbyCapped 为真。
 // Standby 为 0 表示没有还能服务该模型的空闲账号（多半是当天额度已用完，太平洋时间零点重置）
 type AdminPrimarySupply struct {
 	Model         string `json:"model"`
+	Pool          string `json:"pool,omitempty"`
 	Warm          int    `json:"warm"`
 	Standby       int    `json:"standby"`
 	StandbyCapped bool   `json:"standby_capped,omitempty"`
@@ -303,6 +305,10 @@ type RuntimeConfig struct {
 	// （PRIMARY_QUEUE_WAIT，时长文本，0s 表示不排队）；保存时没有这些字段（旧版页面）则沿用现值
 	PrimaryModels    *[]string `json:"primary_models,omitempty"`
 	PrimaryQueueWait string    `json:"primary_queue_wait,omitempty"`
+	// UltraPrimaryModels 为 Ultra 主用模型（ULTRA_PRIMARY_MODELS，只作用于 Ultra 号池，没有额度时立即返回 429），读取时总是返回
+	// （可以为空数组）；UltraPrimaryQueueWait 为它的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，时长文本）；保存时没有这些字段（旧版页面）则沿用现值
+	UltraPrimaryModels    *[]string `json:"ultra_primary_models,omitempty"`
+	UltraPrimaryQueueWait string    `json:"ultra_primary_queue_wait,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

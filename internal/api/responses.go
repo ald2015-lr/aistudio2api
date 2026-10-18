@@ -169,10 +169,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
-	events, err := s.service.Generate(r.Context(), generateRequest)
-	if err == nil && request.Stream {
-		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generateRequest.Model))
-	}
+	events, err := s.generate(r.Context(), generateRequest)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)

@@ -504,7 +504,7 @@ func TestRequestPathStandbyAvoidsPrimaryCooled(t *testing.T) {
 	if got := capacity.promotable(groups.StandbyReady, false); got != accounts[1] {
 		t.Fatalf("现场启动应选主用模型没有冷却的 %s，实际 %q", accounts[1], got)
 	}
-	if got := env.manager.preferUncooled(groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
+	if got := env.manager.preferUncooled(aistudio.PoolScopeNormal, groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
 		t.Fatalf("预热排序应考虑主用模型: %v", got)
 	}
 	// 端到端：唯一的热 Worker 被占满，其他模型的请求扩容启动的是 s2
@@ -887,7 +887,7 @@ func TestStandbyPreferenceNeedsPrimarySupport(t *testing.T) {
 	if got := capacity.promotable(groups.StandbyReady, false); got != accounts[1] {
 		t.Fatalf("现场启动应选能服务主用模型的 %s，实际 %q", accounts[1], got)
 	}
-	if got := env.manager.preferUncooled(groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
+	if got := env.manager.preferUncooled(aistudio.PoolScopeNormal, groups.StandbyReady); !slices.Equal(got, []string{accounts[1], accounts[0]}) {
 		t.Fatalf("预热排序应把能服务主用模型的账号排在前面: %v", got)
 	}
 }

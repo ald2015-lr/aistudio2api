@@ -160,10 +160,10 @@ func TestPrimaryModelsHotReload(t *testing.T) {
 		lifecycle: ctx, configPath: path, activeManagement: cfg, requests: requests, apiKey: newAPIKeyHolder(cfg.ProxyAPIKey),
 		intent: &serviceIntent{}, current: &runtimeGeneration{service: service, admin: admin, config: cfg},
 	}
-	if _, listed := service.primaryQueueWait(testRuntimeModel); listed {
+	if _, listed := normalPrimaryWait(service, testRuntimeModel); listed {
 		t.Fatal("默认列表为空")
 	}
-	if manager.StreamStartWait(testRuntimeModel) != 0 {
+	if manager.StreamStartWait(normalPoolContext(), testRuntimeModel) != 0 {
 		t.Fatal("不在列表里的模型不延长流式首事件等待")
 	}
 
@@ -178,10 +178,10 @@ func TestPrimaryModelsHotReload(t *testing.T) {
 	if updated.ServiceRestartRequired {
 		t.Fatal("主用模型热更新后不应要求重启生成服务")
 	}
-	if wait, listed := service.primaryQueueWait("models/" + testRuntimeModel); !listed || wait != 3*time.Second {
+	if wait, listed := normalPrimaryWait(service, "models/"+testRuntimeModel); !listed || wait != 3*time.Second {
 		t.Fatalf("保存后列表应立即生效：listed=%v wait=%s", listed, wait)
 	}
-	if got := manager.StreamStartWait(testRuntimeModel); got != 3*time.Second+primaryStreamStartGrace {
+	if got := manager.StreamStartWait(normalPoolContext(), testRuntimeModel); got != 3*time.Second+primaryStreamStartGrace {
 		t.Fatalf("主用模型的流式首事件等待下限 = %s，期望排队上限加余量", got)
 	}
 	if !slices.Equal(manager.current.config.PrimaryModels, []string{"Models/Other", testRuntimeModel}) || manager.current.config.PrimaryQueueWait != 3*time.Second {
@@ -192,7 +192,7 @@ func TestPrimaryModelsHotReload(t *testing.T) {
 	if _, err := manager.UpdateRuntimeConfig(ctx, value); err != nil {
 		t.Fatal(err)
 	}
-	if wait, listed := service.primaryQueueWait(testRuntimeModel); !listed || wait != 0 {
+	if wait, listed := normalPrimaryWait(service, testRuntimeModel); !listed || wait != 0 {
 		t.Fatalf("排队上限改为 0 后应立即生效：listed=%v wait=%s", listed, wait)
 	}
 
@@ -201,7 +201,7 @@ func TestPrimaryModelsHotReload(t *testing.T) {
 	if _, err := manager.UpdateRuntimeConfig(ctx, value); err != nil {
 		t.Fatal(err)
 	}
-	if _, listed := service.primaryQueueWait(testRuntimeModel); listed {
+	if _, listed := normalPrimaryWait(service, testRuntimeModel); listed {
 		t.Fatal("清空后应立即恢复默认排队")
 	}
 }

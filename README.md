@@ -370,9 +370,9 @@ curl http://127.0.0.1:2048/ultra/v1/chat/completions \
 ```
 
 - **独占开关**：`ULTRA_EXCLUSIVE=true`（默认）时 Ultra 账户只服务 `/ultra` 请求，普通路径只用其余账户；设为 `false` 时普通路径也可以用 Ultra 账户，`/ultra` 仍只用 Ultra 账户。
-- **模型与错误**：`/ultra/v1/models`、`/ultra/v1beta/models` 只列 Ultra 账户可用的模型。没有可用的 Ultra 账户时返回 503，Ultra 账户全部冷却时返回 429 与 `Retry-After`；文件、视频等资源只能在创建它的号池内使用，跨号池引用返回 400。
+- **模型与错误**：`/ultra/v1/models`、`/ultra/v1beta/models` 只列 Ultra 账户可用的模型。没有可用的 Ultra 账户时返回 503，Ultra 账户全部冷却时返回 429 与 `Retry-After`；Ultra 主用模型（`ULTRA_PRIMARY_MODELS`，默认 `gemini-4-argon`）没有额度时立即返回 429，不在服务里一直换号重试，见[主用模型](#主用模型)；文件、视频等资源只能在创建它的号池内使用，跨号池引用返回 400。
 - **单独的 Worker 数**：Ultra 账户的 Worker 与普通号池分开计数，`ULTRA_WARM_WORKER_LIMIT`（常驻，默认 2，可以为 0 表示只按需启动）与 `ULTRA_MAX_ACTIVE_WORKERS`（峰值，默认 5）可按需设为 10、20 等；`WARM_WORKER_LIMIT`、`MAX_ACTIVE_WORKERS` 只约束普通号池，浏览器总数最多为两个峰值之和。Ultra 请求不会挤占普通号池的 Worker，反之亦然。
-- **管理页面**：“服务配置”的“Ultra 号池”可修改以上三项，保存后立即生效；“账户”页显示 Ultra 账户的就绪数与总数，可按权益筛选；侧栏显示 Ultra Worker 占用；请求日志、请求摘要与用量记录中经 `/ultra` 的请求带 Ultra 标记，用量页可按号池筛选与分组；API 试用勾选“使用 Ultra 账户”即经 `/ultra` 发送。
+- **管理页面**：“服务配置”的“Ultra 号池”可修改以上三项，“主用模型”一组可修改 Ultra 主用模型列表与 Ultra 排队上限，保存后立即生效；“账户”页显示 Ultra 账户的就绪数与总数，可按权益筛选；侧栏显示 Ultra Worker 占用；请求日志、请求摘要与用量记录中经 `/ultra` 的请求带 Ultra 标记，用量页可按号池筛选与分组；API 试用勾选“使用 Ultra 账户”即经 `/ultra` 发送。
 - `/ultra` 下其余未知路径返回 404；排查路由 `/trace/` 按普通路径的规则选号，`/trace/ultra/v1/...` 为 Ultra 号池的排查路由。
 
 ### Gemini Interactions
@@ -559,8 +559,10 @@ cp .env.example .env
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
 | `STREAM_PLAYGROUND_MODELS` | 空 | 流式请求优先走 Playground 的模型，逗号分隔。需要订阅权益的模型在 Build 通道只能一次性返回整段回复；列表中的模型的流式请求先用 Playground 逐块输出，Playground 账号都在忙时立即改用 Build，不排队等待 Playground。留空时 Playground 与 Build 照常轮询；非流式请求不受影响。管理页“服务配置”会列出目录中需要订阅权益、可经 Playground 调用的模型，保存后立即生效 |
-| `PRIMARY_MODELS` | 空 | 主用模型，逗号分隔。列表中的模型的请求最多等 `PRIMARY_QUEUE_WAIT` 空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`，由客户端稍后重试，不再排队到 `REQUEST_TIMEOUT`；留空时所有模型照常排队。候选全部冷却仍按原规则处理。管理页“服务配置”可修改，保存后立即生效 |
+| `PRIMARY_MODELS` | 空 | 普通号池的主用模型，逗号分隔，只作用于普通路径（不带 `/ultra` 前缀）。列表中的模型的请求最多等 `PRIMARY_QUEUE_WAIT` 空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`，由客户端稍后重试，不再排队到 `REQUEST_TIMEOUT`；留空时所有模型照常排队。候选全部冷却仍按原规则处理。管理页“服务配置”可修改，保存后立即生效（见[主用模型](#主用模型)） |
 | `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限，整个请求共用一份：从第一次选号起按实际经过的时间计，失败后换号重试的尝试（如 403、额度 429）与换号退避都算在内，不再每次换号重新计时；请求自己现场冷启动的浏览器启动时间不计（最多 `INIT_TIMEOUT`）；上限到了之后只接受立即可用的账号，否则返回 429；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
+| `ULTRA_PRIMARY_MODELS` | `gemini-4-argon` | Ultra 号池的主用模型，逗号分隔，作用于 `/ultra` 请求（`ULTRA_EXCLUSIVE=false` 时也作用于普通路径上不在 `PRIMARY_MODELS` 里的这些模型）。排队规则与 `PRIMARY_MODELS` 相同，另外没有额度时立即返回 429：候选全部冷却立即返回，额度 429 后最多再换 2 次账号，每次额度失败后的那次换号只用已启动的 Worker（见[主用模型](#主用模型)）。在 `.env` 写空值或在管理页清空即关闭；进程环境变量的空值不生效。保存后立即生效 |
+| `ULTRA_PRIMARY_QUEUE_WAIT` | `10s` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同：整个请求共用一份，`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
@@ -573,7 +575,30 @@ cp .env.example .env
 
 号池的同时生成数约为 `MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`（Ultra 号池为 `ULTRA_MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`）。并发请求超过它时，多出来的请求在选号时排队等空闲的账号或 Worker，首字延迟随之拉长，直到 `REQUEST_TIMEOUT` 到期返回 504；账号因每日限额冷却却仍占着 Worker 时可用容量更少。这样的冷却占位（账号全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）即使一直有其他模型的请求在用，也会被排空：不再接新的请求，替补账号先启动，进行中的请求结束后关闭；其他模型的请求优先分给冷却占位，把还能服务主用模型的 Worker 留给主用模型。`PRIMARY_MODELS` 的快速失败只是对症状的处理：列表中的模型排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429 让客户端稍后重试，不会增加容量；长期高于容量时应提高 `MAX_ACTIVE_WORKERS` 或 `PER_ACCOUNT_CONCURRENCY`，或减少并发。
 
-管理页侧栏的容量显示：“冷却占位 N · 待淘汰”为常驻 Worker 中账号长时间冷却（全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）的死槽位，其中正在排空的另显示“排空中 N”（不再接新请求，正在服务的请求结束后关闭，替补已先启动）；设置了 `PRIMARY_MODELS` 时每个主用模型一行“主用 <模型>：热 N · 备用 M”，热为能服务它的常驻 Worker 数，备用为还能服务它的空闲账号数（最多统计 1000 个，显示为 1000+），约每 30 秒更新，备用为 0 时标黄（见[故障排除](#主用模型返回-429-或首字很慢)）。`/api/status` 中对应 `workers` 与 `ultra_workers` 的 `dead`、`draining`、`retiring`（待淘汰登记数）与 `primary_supply`。
+管理页侧栏的容量显示：“冷却占位 N · 待淘汰”为常驻 Worker 中账号长时间冷却（全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）的死槽位，其中正在排空的另显示“排空中 N”（不再接新请求，正在服务的请求结束后关闭，替补已先启动）；设置了 `PRIMARY_MODELS` 时每个主用模型一行“主用 <模型>：热 N · 备用 M”，热为能服务它的常驻 Worker 数，备用为还能服务它的空闲账号数（最多统计 1000 个，显示为 1000+），约每 30 秒更新，备用为 0 时标黄（见[故障排除](#主用模型返回-429-或首字很慢)）；`ULTRA_PRIMARY_MODELS` 的每个模型在 Ultra Worker 一行下面另有一行“Ultra 主用 <模型>：热 N · 备用 M”，只统计 Ultra 分区的常驻 Worker 与 Ultra 号池的空闲账号。`/api/status` 中对应 `workers` 与 `ultra_workers` 的 `dead`、`draining`、`retiring`（待淘汰登记数）与 `primary_supply`（Ultra 主用模型的条目带 `"pool": "ultra"`）。
+
+### 主用模型
+
+主用模型有两份列表，按请求所在的号池分别生效，管理页“服务配置”的“主用模型”一组可以修改，保存后立即生效，不用重启：
+
+| 列表 | 默认 | 作用于 | 没有额度时 |
+| --- | --- | --- | --- |
+| `PRIMARY_MODELS`、`PRIMARY_QUEUE_WAIT` | 空、`10s` | 普通路径（不带 `/ultra` 前缀）的请求 | 与其他模型相同：候选全部冷却且 1 分钟内恢复时等待恢复，额度 429 后换号重试 |
+| `ULTRA_PRIMARY_MODELS`、`ULTRA_PRIMARY_QUEUE_WAIT` | `gemini-4-argon`、`10s` | `/ultra` 请求；`ULTRA_EXCLUSIVE=false` 时还有普通路径上不在 `PRIMARY_MODELS`、但在这份列表里的模型（通常是只有 Ultra 账号能服务的模型） | 立即返回 429，不在服务里一直换号重试（见下） |
+
+两份列表都限制排队：列表中的模型最多等排队上限空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`（建议间隔为排队上限，限定在 1 到 30 秒，上限为 0 时 5 秒）；上限整个请求共用一份，规则见上表的 `PRIMARY_QUEUE_WAIT`。同一个模型可以同时在两份列表里：普通路径按普通列表，`/ultra` 只看 Ultra 列表，只在普通列表里的模型在 `/ultra` 上照常排队。死槽位与替补也按分区看各自的列表：Ultra 分区的 Worker 只按 Ultra 主用模型判断，普通分区只按普通列表（`ULTRA_EXCLUSIVE=false` 时也不合并，免得普通号池的主用模型去淘汰数量少的 Ultra Worker）。
+
+Ultra 主用模型没有额度时立即返回 429：
+
+- **候选全部冷却**：立即返回 429，`Retry-After` 为距最早恢复的秒数（每日限额就是真实的恢复时间），不再原地等待 1 分钟内恢复的冷却。还有没冷却的备用账号、只是 Ultra 分区没有空闲的 Worker 槽位时属于容量不足，按排队上限处理。降级判定的 Playground 优先选号全部冷却时照旧改为不限通道选号。
+- **请求中遇到额度 429**（包括租到的账号在请求发出前刚进入冷却）：最多再换 2 次账号（一个请求最多 3 次因额度失败的尝试），换号不退避；每次额度失败后紧接着的那一次选号只用已经启动的 Worker：有空闲的就用，都在忙时在排队上限内等待，不为这个请求现场冷启动备用账号，也不等后台扩容。没有已启动的 Worker 能服务时立即返回 429，同时（所在分区还能扩容时）在后台为一个备用账号启动 Worker，留给之后的请求。换到的 Worker 再因额度以外的原因失败（例如 5xx、过载）时，下一次选号按普通规则进行，可能现场冷启动备用账号。同一账号另一通道可用时先在那里再试一次（计一次额度失败）；带文件的请求仍先把文件复制到其他账号再试。
+- **不算额度失败**：输入超过账号上限的 429（见[错误响应格式](#错误响应格式)）照旧按 400 处理。第一次尝试照常可以现场冷启动一个备用账号（这时还不知道它有没有额度）。
+- **`Retry-After`**：候选全部冷却时为距最早恢复的时间；换号次数用完或没有其他可换的账号时为 5 秒与本请求遇到的最早额度恢复时间中较早者；额度 429 后没有已启动的 Worker 时为 5 秒；都至少 1 秒。
+- **对外消息固定**：与号池全部冷却相同，为 `Resource has been exhausted (e.g. check quota).`（OpenAI `rate_limit_exceeded`、Anthropic `rate_limit_error`、Gemini `RESOURCE_EXHAUSTED`），不带上游原文；原因、额度失败次数与总耗时只写管理日志（“Ultra 主用模型额度不足，立即返回 429”，见[运行日志](docs/logging.md)）。
+
+流式请求写出响应头前等待首个事件的时间按请求的号池取对应列表的排队上限加 5 秒（至少 10 秒）。Ultra 主用模型的请求自己现场冷启动备用账号时（例如第一次尝试时没有已启动的 Worker），这段等待再按启动时长延后（启动期间不写出响应头）：冷启动的账号随后返回额度 429、请求以额度不足结束时，同样以 HTTP 429 和 `Retry-After` 返回。延后有两个上限：合计不超过 `INIT_TIMEOUT`（抵扣用完后再现场冷启动另一个账号时不再延后），且从开始等首个事件算起最多 50 秒（排队上限加 5 秒更长时按它）；到了上限照常先回 200 再推流（之后有心跳），之后的错误在流内返回。延后期间客户端收不到任何字节：前面若有反向代理或中转，读超时要大于这段等待（默认最长 50 秒；nginx 默认的 `proxy_read_timeout` 60 秒与 Cloudflare 的 100 秒都够），更短时会在冷启动期间断开，断开还会取消进行中的启动。这些 429 因此通常以 HTTP 状态返回，而不是 200 之后的流内错误。普通号池的 `PRIMARY_MODELS` 与不在列表里的模型行为不变（普通号池的主用模型在请求自己现场冷启动后排队超限时仍可能是流内错误）。
+
+> **升级提醒**：`ULTRA_PRIMARY_MODELS` 默认不为空，升级后 `/ultra` 上的 `gemini-4-argon` 自动成为 Ultra 主用模型。不需要时在 `.env` 写 `ULTRA_PRIMARY_MODELS=`（空值），或在管理页清空 Ultra 主用模型列表；进程环境变量设为空值不生效（空值按未设置处理，仍用 `.env` 里的值或默认值）。另外 `PRIMARY_MODELS` 从此只作用于普通路径，原先靠它让 `/ultra` 请求快速失败的，把这些模型加进 `ULTRA_PRIMARY_MODELS`。
 
 ### 端口配置
 
@@ -678,6 +703,30 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 - **备用 0（黄色）**：普通号池里已经没有还能服务该模型的空闲账号，多半是可用账号当天的该模型额度已经用完。冷却占位淘汰后换不上能服务它的替补，请求只能等仍能服务它的常驻 Worker 空出，排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429。额度在太平洋时间零点重置（北京时间夏令时 15:00、冬令时 16:00），之后供给自动恢复；在此之前只能加入新的账号，或减少该模型的请求。
 - **备用不为 0 但热很少**：检查 `WARM_WORKER_LIMIT`，它应不小于希望常驻的 Worker 数。低于驻留数时，淘汰或回收空出的槽位预热不补，超出的空闲 Worker 5 分钟后被回收，主用模型的请求要等现场冷启动。
 - **“冷却占位”与“排空中”长时间不下降**：在运行日志中搜索“替补跳过”（分区内没有能服务这些模型、没有冷却的备用账号）与“排空超时”（固定账户或文件绑定的请求一直在用该 Worker）。
+- **Ultra 主用模型的 429**：看 Ultra Worker 下面的“Ultra 主用 <模型>”一行，口径同上，只统计 Ultra 号池。这些模型没有额度时立即返回 429（见[主用模型](#主用模型)），运行日志里对应“Ultra 主用模型候选全部冷却，立即返回 429”或“Ultra 主用模型额度不足，立即返回 429”，后者写明原因与额度失败次数；客户端按 `Retry-After` 稍后重试即可。
+
+### Ultra 上 gemini-4-argon 首字很慢
+
+`gemini-4-argon` 需要订阅权益、只在 Build 通道提供，首字慢通常是下面几个原因叠加：
+
+- **Build 单次调用**：需要订阅权益的模型在 Build 通道经单次调用生成，整段回复生成完才一次返回，流式请求也要等到这时才收到第一个字，首字时间约等于整段的生成时间。管理页模型目录（`GET /api/models`）里 `build_unary` 为 `true` 的模型都是这样；它没有 Playground 通道，`STREAM_PLAYGROUND_MODELS` 帮不上忙。
+- **默认最高思考**：模型名不带后缀时思考强度设为最高（HIGH），只有客户端显式传了 `reasoning_effort` 等思考参数时才以客户端为准；思考越长，单次调用返回得越晚。
+- **分钟限额冷却**：按模型计的分钟限额只冷却该账号的这个模型，很快恢复，但 Ultra 账号少时容易全部冷却。作为 Ultra 主用模型（默认）时立即返回 429 与 `Retry-After`；从 `ULTRA_PRIMARY_MODELS` 去掉后，请求会原地等待 1 分钟内恢复的冷却。
+- **额度 429 换号与冷启动**：不是 Ultra 主用模型时，额度 429 后会把 Ultra 号池逐个试一遍，换到没有 Worker 的备用账号还要现场冷启动浏览器（每次 10～30 秒以上）；作为 Ultra 主用模型时最多再换 2 次，额度失败后的换号只用已启动的 Worker。
+
+排查：
+
+```bash
+./tools/slow_requests.sh 24 30 gemini-4-argon
+```
+
+从用量账本列出最近 24 小时首字最慢的 30 个该模型请求，把首字拆成排队（取得最终执行账号之前的时间：排队、换号、等 Worker 与现场冷启动）与上游（首事件减排队）两段，并列出每次尝试的账号、通道、失败原因与耗时：排队长、尝试多是额度换号与冷启动；排队短、上游长是单次调用本身的生成时间（思考加正文）。
+
+处理：
+
+- 保持 `FIRST_EVENT_TIMEOUT=0`（默认）：单次调用的第一个事件就是整段回复，开启首事件超时会把正常但较长的生成中途放弃再换号，白白消耗额度。
+- 缩短思考：用 `-low`、`-medium` 后缀（如 `gemini-4-argon-low`，后缀优先于客户端参数），或在客户端传 `reasoning_effort`（`low`、`medium`）。
+- 确认 `ULTRA_PRIMARY_MODELS` 里有它（默认就有），没有额度时让客户端按 `Retry-After` 重试，而不是在服务里换号、冷启动。
 
 ### 错误响应格式
 
@@ -689,7 +738,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 | 输入超过账号的输入上限（部分账号的 Playground 与 Build 另有上限，如 131072 token，上游文案为 `The input token count exceeds the maximum number of tokens allowed 131072`） | 400 | 与安全拦截相同：`Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)`，OpenAI 附 `code: content_policy_violation`，不向客户端暴露账号上限；上游按 429 返回时同样按 400 返回，不冷却账号，只改走 Build、改用更高权益账号各再试一次；管理日志仍记录“输入超过模型上限（提示词过长）” |
 | 输入被安全策略拦截 | 400 | 如 `Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)` |
 | 模型不存在或没有账号能提供 | 404 | `models/<模型> is not found for API version v1beta, …` |
-| 号池全部冷却、上游限流 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数） |
+| 号池全部冷却、上游限流、主用模型排队超限、Ultra 主用模型额度不足 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数），主用模型排队超限与 Ultra 主用模型额度不足时同样附 `Retry-After`（见[主用模型](#主用模型)） |
 | 号池内部的账号认证（需要重新登录）、停用、占用、权限、目录问题，号池为空，服务未就绪或重启中 | 503 | `The service is currently unavailable.` |
 | 上游过载 | 503 | `The model is overloaded. Please try again later.` |
 | 超时 | 504 | `Deadline expired before operation could complete.` |

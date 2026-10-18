@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -109,21 +110,23 @@ type streamWaitService struct {
 	wait time.Duration
 }
 
-func (s *streamWaitService) StreamStartWait(string) time.Duration { return s.wait }
+func (s *streamWaitService) StreamStartWait(context.Context, string) time.Duration { return s.wait }
+
+var _ StreamStartWaitProvider = (*streamWaitService)(nil)
 
 // TestStreamStartWaitUsesProvider 写出流式响应头前的首事件等待默认为一个心跳间隔；生成服务为主用模型要求更久时按它，
 // 要求更短或不支持时仍按心跳间隔
 func TestStreamStartWaitUsesProvider(t *testing.T) {
 	plain := &server{service: &scriptedService{}}
-	if got := plain.streamStartWait("test-model"); got != streamHeartbeatInterval {
+	if got := plain.streamStartWait(context.Background(), "test-model"); got != streamHeartbeatInterval {
 		t.Fatalf("不支持时等待 = %s，期望心跳间隔 %s", got, streamHeartbeatInterval)
 	}
 	longer := &server{service: &streamWaitService{wait: streamHeartbeatInterval + 5*time.Second}}
-	if got := longer.streamStartWait("test-model"); got != streamHeartbeatInterval+5*time.Second {
+	if got := longer.streamStartWait(context.Background(), "test-model"); got != streamHeartbeatInterval+5*time.Second {
 		t.Fatalf("要求更久时等待 = %s，期望 %s", got, streamHeartbeatInterval+5*time.Second)
 	}
 	shorter := &server{service: &streamWaitService{wait: time.Second}}
-	if got := shorter.streamStartWait("test-model"); got != streamHeartbeatInterval {
+	if got := shorter.streamStartWait(context.Background(), "test-model"); got != streamHeartbeatInterval {
 		t.Fatalf("要求更短时等待 = %s，期望仍为心跳间隔", got)
 	}
 }

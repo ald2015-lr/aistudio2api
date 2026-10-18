@@ -208,7 +208,7 @@ func TestStreamedPrimaryBusyReturnsHTTPStatus(t *testing.T) {
 	service.setPrimaryModels([]string{testRuntimeModel}, limit)
 	service.state.Store(serviceRunning)
 	service.dataContext = service.lifecycle
-	if wait := service.StreamStartWait(testRuntimeModel); wait != limit+primaryStreamStartGrace {
+	if wait := service.StreamStartWait(normalPoolContext(), testRuntimeModel); wait != limit+primaryStreamStartGrace {
 		t.Fatalf("StreamStartWait = %s", wait)
 	}
 	handler := api.NewHandler(service, api.Config{APIKey: "sk-test"})

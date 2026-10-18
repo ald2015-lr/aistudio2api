@@ -30,6 +30,10 @@ const (
 	defaultUltraMaxActiveWorkers = 5
 )
 
+// defaultUltraPrimaryModels 为 Ultra 主用模型的默认列表：Build 独有、需要订阅的模型只有 Ultra 号池能服务，
+// 默认让它在 /ultra 上没有额度时立即返回 429，不在号池里挨个换号、现场冷启动
+var defaultUltraPrimaryModels = []string{"gemini-4-argon"}
+
 var configKeys = [...]string{
 	"AISTUDIO_AUTH_STATES",
 	"LISTEN_ADDR",
@@ -50,6 +54,8 @@ var configKeys = [...]string{
 	"STREAM_PLAYGROUND_MODELS",
 	"PRIMARY_MODELS",
 	"PRIMARY_QUEUE_WAIT",
+	"ULTRA_PRIMARY_MODELS",
+	"ULTRA_PRIMARY_QUEUE_WAIT",
 	"TEMPORARY_CHAT",
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
@@ -98,14 +104,23 @@ type Config struct {
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
 	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
 	StreamPlaygroundModels []string `json:"stream_playground_models"`
-	// PrimaryModels 为主用模型 ID（PRIMARY_MODELS，逗号分隔，默认为空）：列表中的模型的生成请求等空闲账号或 Worker 最多
-	// PrimaryQueueWait，超过即按 429 返回并带 Retry-After，由客户端稍后重试，不再排队到请求超时；为空时所有模型照常排队
+	// PrimaryModels 为主用模型 ID（PRIMARY_MODELS，逗号分隔，默认为空），只作用于普通号池（以及 ULTRA_EXCLUSIVE=false 时的普通路径）：
+	// 列表中的模型的生成请求等空闲账号或 Worker 最多 PrimaryQueueWait，超过即按 429 返回并带 Retry-After，由客户端稍后重试，
+	// 不再排队到请求超时；为空时所有模型照常排队。Ultra 号池用 UltraPrimaryModels
 	PrimaryModels []string `json:"primary_models"`
 	// PrimaryQueueWait 为主用模型的排队上限（PRIMARY_QUEUE_WAIT，默认 10s，未配置时不超过 REQUEST_TIMEOUT）：只计等待时间
 	// （含等待冷启动名额），不计浏览器启动本身与锁等待；
 	// 0 表示不排队，没有立即可用的账号或 Worker 就返回 429；不能超过 RequestTimeout
 	PrimaryQueueWait time.Duration `json:"-"`
-	TemporaryChat    bool          `json:"temporary_chat"`
+	// UltraPrimaryModels 为 Ultra 主用模型 ID（ULTRA_PRIMARY_MODELS，逗号分隔，默认 gemini-4-argon）：只作用于 Ultra 号池
+	// （/ultra 请求，以及 ULTRA_EXCLUSIVE=false 时普通路径上不在 PrimaryModels 里的这些模型），排队上限为 UltraPrimaryQueueWait；
+	// 这些模型没有额度时立即返回 429（候选全部冷却立即返回，额度 429 后最多再换 2 次账号、只用已启动的 Worker），不在号池里挨个重试。
+	// 写空值表示关闭；进程环境变量的空值不生效（与其他配置项相同），关闭只能在 .env 里写空值或在管理页清空
+	UltraPrimaryModels []string `json:"ultra_primary_models"`
+	// UltraPrimaryQueueWait 为 Ultra 主用模型的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，规则与 PrimaryQueueWait 相同：默认 10s，
+	// 未配置时不超过 REQUEST_TIMEOUT，保存时写具体值）；0 表示不排队；不能超过 RequestTimeout
+	UltraPrimaryQueueWait time.Duration `json:"-"`
+	TemporaryChat         bool          `json:"temporary_chat"`
 	// IgnoreClientSeed 为真时忽略客户端传入的 seed，每次请求都使用随机种子
 	IgnoreClientSeed bool `json:"ignore_client_seed"`
 	// RepeatPromptNonce 为真时，在最后一条用户消息末尾加入不可见随机后缀（客户端指定 seed 或温度为 0 时除外）。
@@ -162,6 +177,8 @@ func Default() Config {
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       append([]string(nil), upstreamChannels...),
 		PrimaryQueueWait:       defaultPrimaryQueueWait,
+		UltraPrimaryModels:     slices.Clone(defaultUltraPrimaryModels),
+		UltraPrimaryQueueWait:  defaultPrimaryQueueWait,
 		WAABackend:             WAABackendCamoufox,
 		RepeatPromptNonce:      true,
 		MinOutputTokens:        defaultMinOutputTokens,
@@ -276,6 +293,19 @@ func Load(path string) (Config, error) {
 	} else {
 		cfg.PrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
 	}
+	// Ultra 主用模型：键存在时按写的值（空值表示关闭），键不存在时保持默认列表。进程环境变量的空值在上面已被忽略，
+	// 只能经 .env 的空值或管理页清空来关闭
+	if value, ok := values["ULTRA_PRIMARY_MODELS"]; ok {
+		cfg.UltraPrimaryModels = ParseModelList(value)
+	}
+	if value, ok := values["ULTRA_PRIMARY_QUEUE_WAIT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.UltraPrimaryQueueWait, err = parseOptionalDuration("ULTRA_PRIMARY_QUEUE_WAIT", value)
+		if err != nil {
+			return Config{}, err
+		}
+	} else {
+		cfg.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -353,6 +383,8 @@ func (c Config) Save(path string) error {
 		"STREAM_PLAYGROUND_MODELS": strings.Join(c.StreamPlaygroundModels, ","),
 		"PRIMARY_MODELS":           strings.Join(c.PrimaryModels, ","),
 		"PRIMARY_QUEUE_WAIT":       c.PrimaryQueueWait.String(),
+		"ULTRA_PRIMARY_MODELS":     strings.Join(c.UltraPrimaryModels, ","),
+		"ULTRA_PRIMARY_QUEUE_WAIT": c.UltraPrimaryQueueWait.String(),
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
@@ -441,6 +473,15 @@ func (c Config) Validate() error {
 	if c.PrimaryQueueWait > c.RequestTimeout {
 		return fmt.Errorf("PRIMARY_QUEUE_WAIT 不能超过 REQUEST_TIMEOUT")
 	}
+	if err := validateModelList("ULTRA_PRIMARY_MODELS", c.UltraPrimaryModels); err != nil {
+		return err
+	}
+	if c.UltraPrimaryQueueWait < 0 {
+		return fmt.Errorf("ULTRA_PRIMARY_QUEUE_WAIT 必须是 0 或正数时长")
+	}
+	if c.UltraPrimaryQueueWait > c.RequestTimeout {
+		return fmt.Errorf("ULTRA_PRIMARY_QUEUE_WAIT 不能超过 REQUEST_TIMEOUT")
+	}
 	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
 		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
 	}
@@ -494,6 +535,11 @@ func validateUpstreamChannels(channels []string) error {
 
 // MarshalJSON 将时长输出为 env 使用的文本格式
 func (c Config) MarshalJSON() ([]byte, error) {
+	// Ultra 主用模型为空时写空数组而不是 null：解析时 null 与缺字段一样取默认列表，清空后必须能原样往返
+	ultraPrimaryModels := c.UltraPrimaryModels
+	if ultraPrimaryModels == nil {
+		ultraPrimaryModels = []string{}
+	}
 	type payload struct {
 		AuthStates             string         `json:"auth_states"`
 		ListenAddr             string         `json:"listen_addr"`
@@ -514,6 +560,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		StreamPlaygroundModels []string       `json:"stream_playground_models"`
 		PrimaryModels          []string       `json:"primary_models"`
 		PrimaryQueueWait       string         `json:"primary_queue_wait"`
+		UltraPrimaryModels     []string       `json:"ultra_primary_models"`
+		UltraPrimaryQueueWait  string         `json:"ultra_primary_queue_wait"`
 		TemporaryChat          bool           `json:"temporary_chat"`
 		IgnoreClientSeed       bool           `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool           `json:"repeat_prompt_nonce"`
@@ -541,6 +589,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		StreamPlaygroundModels: c.StreamPlaygroundModels,
 		PrimaryModels:          c.PrimaryModels,
 		PrimaryQueueWait:       c.PrimaryQueueWait.String(),
+		UltraPrimaryModels:     ultraPrimaryModels,
+		UltraPrimaryQueueWait:  c.UltraPrimaryQueueWait.String(),
 		TemporaryChat:          c.TemporaryChat,
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
@@ -572,6 +622,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		StreamPlaygroundModels []string        `json:"stream_playground_models"`
 		PrimaryModels          []string        `json:"primary_models"`
 		PrimaryQueueWait       string          `json:"primary_queue_wait"`
+		UltraPrimaryModels     *[]string       `json:"ultra_primary_models"`
+		UltraPrimaryQueueWait  string          `json:"ultra_primary_queue_wait"`
 		TemporaryChat          bool            `json:"temporary_chat"`
 		IgnoreClientSeed       bool            `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool           `json:"repeat_prompt_nonce"`
@@ -604,6 +656,17 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	// Ultra 主用模型：旧版数据没有该字段（或为 null）时取默认列表，显式的空数组表示关闭；排队上限缺省与普通主用模型同规则
+	ultraPrimaryModels := slices.Clone(defaultUltraPrimaryModels)
+	if value.UltraPrimaryModels != nil {
+		ultraPrimaryModels = NormalizeModelList(*value.UltraPrimaryModels)
+	}
+	ultraPrimaryQueueWait := defaultPrimaryQueueWaitFor(requestTimeout)
+	if strings.TrimSpace(value.UltraPrimaryQueueWait) != "" {
+		if ultraPrimaryQueueWait, err = parseOptionalDuration("ULTRA_PRIMARY_QUEUE_WAIT", value.UltraPrimaryQueueWait); err != nil {
+			return err
+		}
+	}
 	parsed := Config{
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
@@ -624,6 +687,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		StreamPlaygroundModels: NormalizeModelList(value.StreamPlaygroundModels),
 		PrimaryModels:          NormalizeModelList(value.PrimaryModels),
 		PrimaryQueueWait:       primaryQueueWait,
+		UltraPrimaryModels:     ultraPrimaryModels,
+		UltraPrimaryQueueWait:  ultraPrimaryQueueWait,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,

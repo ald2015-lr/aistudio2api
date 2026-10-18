@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -36,6 +37,10 @@ func TestLegacyShortRequestTimeoutLoads(t *testing.T) {
 		if cfg.PrimaryQueueWait != test.wait {
 			t.Fatalf("%q：PrimaryQueueWait = %s，期望 %s", test.content, cfg.PrimaryQueueWait, test.wait)
 		}
+		// Ultra 主用模型的排队上限同规则：没有配置时同样按请求超时封顶，旧 .env 升级后照常载入
+		if want := min(10*time.Second, cfg.RequestTimeout); cfg.UltraPrimaryQueueWait != want {
+			t.Fatalf("%q：UltraPrimaryQueueWait = %s，期望 %s", test.content, cfg.UltraPrimaryQueueWait, want)
+		}
 	}
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := os.WriteFile(path, []byte("AISTUDIO_AUTH_STATES=auth\nREQUEST_TIMEOUT=8s\nPRIMARY_QUEUE_WAIT=9s\n"), 0o600); err != nil {
@@ -56,6 +61,7 @@ func TestLegacyShortRequestTimeoutLoads(t *testing.T) {
 	legacy := Default()
 	legacy.RequestTimeout = 5 * time.Second
 	legacy.PrimaryQueueWait = 5 * time.Second
+	legacy.UltraPrimaryQueueWait = 5 * time.Second
 	data, err := json.Marshal(legacy)
 	if err != nil {
 		t.Fatal(err)
@@ -66,6 +72,8 @@ func TestLegacyShortRequestTimeoutLoads(t *testing.T) {
 	}
 	delete(fields, "primary_queue_wait")
 	delete(fields, "primary_models")
+	delete(fields, "ultra_primary_queue_wait")
+	delete(fields, "ultra_primary_models")
 	legacyData, _ := json.Marshal(fields)
 	var decoded Config
 	if err := json.Unmarshal(legacyData, &decoded); err != nil {
@@ -73,5 +81,9 @@ func TestLegacyShortRequestTimeoutLoads(t *testing.T) {
 	}
 	if decoded.PrimaryQueueWait != 5*time.Second || len(decoded.PrimaryModels) != 0 {
 		t.Fatalf("旧版 JSON：PrimaryQueueWait = %s，PrimaryModels = %v，期望 5s 与空", decoded.PrimaryQueueWait, decoded.PrimaryModels)
+	}
+	// 没有 Ultra 主用模型字段的旧版 JSON：列表取默认，排队上限同样按请求超时封顶
+	if decoded.UltraPrimaryQueueWait != 5*time.Second || !slices.Equal(decoded.UltraPrimaryModels, []string{"gemini-4-argon"}) {
+		t.Fatalf("旧版 JSON：UltraPrimaryQueueWait = %s，UltraPrimaryModels = %v，期望 5s 与默认列表", decoded.UltraPrimaryQueueWait, decoded.UltraPrimaryModels)
 	}
 }

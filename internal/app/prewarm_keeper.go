@@ -166,11 +166,12 @@ func (manager *accountWorkerManager) hotModelList() []string {
 	return nil
 }
 
-// preferUncooled 把候选账户按能服务的热门与主用模型个数从多到少排列（同数保持原顺序），预热时优先启动还能服务主用模型的账户。
+// preferUncooled 把分区内的候选账户按能服务的热门与该分区主用模型个数从多到少排列（同数保持原顺序），预热时优先启动还能服务
+// 主用模型的账户；Ultra 分区按 Ultra 列表，普通分区按普通列表（见 primaryModelListFor）。
 // 能否服务按候选集成员判断（目录、权益、启用通道都支持且没有长时间冷却，见 aistudio.ServeableCounts）：只看冷却键会把目录里根本没有
 // 主用模型的账户当成“没冷却”排在前面。都服务不了时仍然保留原顺序，它们还能服务其他模型
-func (manager *accountWorkerManager) preferUncooled(accountIDs []string) []string {
-	models := manager.deadSlotModels()
+func (manager *accountWorkerManager) preferUncooled(partition aistudio.PoolScope, accountIDs []string) []string {
+	models := manager.deadSlotModelsFor(partition)
 	if len(models) == 0 || len(accountIDs) <= 1 {
 		return accountIDs
 	}

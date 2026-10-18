@@ -1090,7 +1090,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | OpenAI 转录 | `POST /v1/audio/transcriptions` |
 | 实时 WebSocket | `GET /v1/live`、`GET /v1/robotics/stream` |
 
-上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；去掉前缀时保留客户端的转义（如 ID 中的 `%2F`），与直接请求 `/v1` 时匹配到同一个路由；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 不变，没有 `/ultra/trace` 或 `/trace/ultra`。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 账户的资源同样如此）按各协议格式返回 400，消息说明资源属于哪个号池。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
+上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；去掉前缀时保留客户端的转义（如 ID 中的 `%2F`），与直接请求 `/v1` 时匹配到同一个路由；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 不变，没有 `/ultra/trace` 或 `/trace/ultra`。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；`ULTRA_PRIMARY_MODELS` 中的模型没有额度时立即返回 429 与 `Retry-After`（见下文 `PrimaryQuotaError`）；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 账户的资源同样如此）按各协议格式返回 400，消息说明资源属于哪个号池。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
 
 动态路由的注册形状为 `GET /v1/files/{file}`、`GET /v1/files/{file}/content`、`DELETE /v1/files/{file}`、`GET /v1/videos/{video}`、`GET /v1/videos/{video}/content`、`POST /v1beta/models/{action}` 与 `GET /v1beta/operations/{operation}`；端点表中的 `{id}` 表示对应资源标识。
 
@@ -1139,11 +1139,11 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 | DTO | 字段 |
 | --- | --- |
-| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，每个 `PRIMARY_MODELS` 模型一项；没有主用模型、服务未运行或还没统计过时省略） |
+| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略） |
 | `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池账户 |
-| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、主用模型上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数 |
+| `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、所在分区的主用模型（普通分区按 `PRIMARY_MODELS`，Ultra 分区按 `ULTRA_PRIMARY_MODELS`）上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数 |
 | `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`draining`、`retiring`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小，其余字段口径同 `AdminWorkerCounts` |
-| `AdminPrimarySupply` | `model`、`warm`、`standby`、可选 `standby_capped`；一个主用模型在普通分区的可用供给，由 `keepWarm` 约每 30 秒统计一次并缓存（主用模型列表变化后的下一个周期立即重新统计），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；模型在号池里找不到时两项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
+| `AdminPrimarySupply` | `model`、`warm`、`standby`、可选 `standby_capped`、可选 `pool`；一个主用模型在所属分区的可用供给：`PRIMARY_MODELS` 的条目统计普通分区，`pool` 省略；`ULTRA_PRIMARY_MODELS` 的条目 `pool` 为 `ultra`，只统计 Ultra 分区的驻留 Worker 与 Ultra 号池的账号。供给由 `keepWarm` 约每 30 秒统计一次并缓存（任一份主用模型列表变化后的下一个周期立即重新统计），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；模型在号池里找不到时两项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
 | `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`）、`message` |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |
@@ -1178,6 +1178,8 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
 | `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 账户；读取时总是返回，提交时省略则沿用现值 |
 | `ultra_warm_worker_limit`、`ultra_max_active_workers` | 保存值，保存后立即热更新：Ultra 分区的常驻数（可以为 0）与峰值数（至少 1 且不小于常驻数）；读取时总是返回，提交时省略则沿用现值 |
+| `primary_models`、`primary_queue_wait` | 保存值，保存后立即生效：普通号池的主用模型（字符串数组）与排队上限（时长文本，`0s` 为不排队，不超过 `request_timeout`）；读取时总是返回，提交时省略则沿用现值，空数组为清空 |
+| `ultra_primary_models`、`ultra_primary_queue_wait` | 保存值，保存后立即生效：Ultra 号池的主用模型（字符串数组，默认 `["gemini-4-argon"]`，关闭时为空数组）与排队上限（规则同上）；读取时总是返回，提交时省略（`null` 或空串）则沿用现值，空数组为关闭 |
 | `temporary_chat` | 保存值；下一次启动生成服务时使用 |
 | `listen_addr`、`proxy_api_key` | 保存值；下一管理进程使用 |
 | `active_listen_addr`、`active_proxy_api_key` | response-only；当前管理进程固定值 |
@@ -1288,7 +1290,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 
 按需热替换先启动 pending Worker（正在启动、尚未发布的替代 Worker），再关闭旧 Worker；旧实例成功退出后，替代 Worker 才成为当前 Worker。旧实例关闭和替代 Worker 回收同时失败时，两者都保留等待再次清理，并各占一个活动容量槽；达到容量上限后停止新建 Worker。完整生成服务 Stop/Start 的顺序为：Start 创建新生成服务实例前先重试停止旧实例，旧 PID 未退出时返回停止错误并保留原实例。
 
-管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker：失败的 Worker 在后台关闭（同一 Worker 版本只关闭一次，关闭前等同账户其他进行中的请求结束，期间该账户不接新请求）。不指定账户、也没有文件绑定的生成请求最多等 2 秒（`PRIMARY_MODELS` 中的模型最多 1 秒且不超过剩余排队预算的四分之一），关闭完成就在原账户重放一次，否则换到其他账户重试；换号时没有其他可用账户则回到原账户，等关闭完成后重放。这次失败计入连续失败上限（5 次）后就不能再换号的请求不再只等 2 秒，一直等关闭完成后在原账户重放；换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回到原账户等关闭完成后重放；换号后排队等其他账户时原账户关闭完成，即不再排除原账户，按原来的排队位置重新选号，原账户与其他账户哪个先能用就用哪个。回到原账户等待期间请求超时或被取消时按超时（504）或取消结束。指定账户、文件绑定的请求以及 Veo、Live 与转录等关闭完成后在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。`PRIMARY_MODELS` 中的模型排队超过 `PRIMARY_QUEUE_WAIT` 仍没有空闲的账号或 Worker 时同样返回 HTTP 429 与 `Retry-After`（排队上限限定在 1 到 30 秒，上限为 0 时 5 秒），不换号；排队上限整个请求共用一份、按实际经过的时间计，换号重试的尝试与退避都算在内，请求自己现场冷启动的浏览器启动时间不计；管理日志、请求列表与用量账本记录“号池繁忙：模型 X 暂时没有空闲的账号或 Worker，请稍后重试”，客户端只收到官方的限流措辞。
+管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker：失败的 Worker 在后台关闭（同一 Worker 版本只关闭一次，关闭前等同账户其他进行中的请求结束，期间该账户不接新请求）。不指定账户、也没有文件绑定的生成请求最多等 2 秒（`PRIMARY_MODELS` 中的模型最多 1 秒且不超过剩余排队预算的四分之一），关闭完成就在原账户重放一次，否则换到其他账户重试；换号时没有其他可用账户则回到原账户，等关闭完成后重放。这次失败计入连续失败上限（5 次）后就不能再换号的请求不再只等 2 秒，一直等关闭完成后在原账户重放；换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回到原账户等关闭完成后重放；换号后排队等其他账户时原账户关闭完成，即不再排除原账户，按原来的排队位置重新选号，原账户与其他账户哪个先能用就用哪个。回到原账户等待期间请求超时或被取消时按超时（504）或取消结束。指定账户、文件绑定的请求以及 Veo、Live 与转录等关闭完成后在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。`PRIMARY_MODELS` 中的模型排队超过 `PRIMARY_QUEUE_WAIT` 仍没有空闲的账号或 Worker 时同样返回 HTTP 429 与 `Retry-After`（排队上限限定在 1 到 30 秒，上限为 0 时 5 秒），不换号；排队上限整个请求共用一份、按实际经过的时间计，换号重试的尝试与退避都算在内，请求自己现场冷启动的浏览器启动时间不计；管理日志、请求列表与用量账本记录“号池繁忙：模型 X 暂时没有空闲的账号或 Worker，请稍后重试”，客户端只收到官方的限流措辞。主用模型按请求的号池查找：`/ultra` 只查 `ULTRA_PRIMARY_MODELS`（默认 `gemini-4-argon`），`ULTRA_EXCLUSIVE=true` 的普通路径只查 `PRIMARY_MODELS`，`ULTRA_EXCLUSIVE=false` 的普通路径先查 `PRIMARY_MODELS`、没有再查 `ULTRA_PRIMARY_MODELS`。按 Ultra 列表命中的请求没有额度时立即返回 HTTP 429 与 `Retry-After`，不在号池里挨个换号：候选全部冷却时立即按全部冷却返回（不再等待 1 分钟内恢复的冷却，降级判定的 Playground 优先选号仍先改为不限通道）；请求中遇到额度 429（输入超过账号上限的 429 不算）后最多再换 2 次账号，每次额度失败后紧接着的那次选号只用已启动的 Worker，不现场冷启动备用账号，额度失败达到换号上限、其余候选全部冷却、没有已启动的 Worker，或没有其他可换的账号（能服务该模型的账号都已试过、剩下的暂时不可调度，或换号次数用完）时返回 `PrimaryQuotaError`。`Retry-After`：其余候选全部冷却时为最早恢复（不设上限），达到换号上限或没有其他可换的账号时为 5 秒与本请求遇到的最早额度恢复中较早者，没有已启动的 Worker 时为 5 秒，都至少 1 秒。管理日志写明原因、额度失败次数与总耗时，客户端只收到与全部冷却相同的官方限流措辞，不含上游原文。
 
 模型目录重试的 pending 集合保存等待再次同步的账户 ID。启动期全账户 fan-out、以及新增、登录或验证后的单账户同步，遇到任意错误或成功返回空目录时加入；返回非空目录时移除；删除账户同时移除。全账户后台同步结束后启动单个 30 秒 ticker（Go 定时器），每次对排序后的待重试账户列表再次并发 fan-out，并在任务开始时复核该 ID 仍在 pending 集合中。错误或空目录继续保留；每个非空成功立即更新账户缓存与公共目录快照、发布 `accounts` 和 `models`，并在 `RUNNING` 状态触发 Worker 预热。批次结束时，`auth_required` 集合发生变化会补发当前账户与模型快照；即时单账户同步无论成功或失败都立即发布当前快照。
 
@@ -1386,7 +1388,7 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 
 Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理：以模型文字消息结尾的历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（见上文分轮修正）。以工具调用结尾的历史仍按缺少工具结果处理。
 
-流式请求在写出响应头前最多等待首个事件 10 秒（`PRIMARY_MODELS` 中的模型为 `PRIMARY_QUEUE_WAIT` 加 5 秒与 10 秒中的较大者）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回（号池繁忙的 429 以 HTTP 状态返回同样是尽力而为：排队预算整个请求共用一份，换号重试与退避都计入，通常早于这个等待；请求自己现场冷启动或候选冷却延后了截止时间而晚于这个等待时，在流内返回）。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
+流式请求在写出响应头前最多等待首个事件 10 秒（主用模型为对应列表的排队上限加 5 秒与 10 秒中的较大者，按请求的号池取：`/ultra` 上的 `ULTRA_PRIMARY_MODELS` 为 `ULTRA_PRIMARY_QUEUE_WAIT`，普通路径上的 `PRIMARY_MODELS` 为 `PRIMARY_QUEUE_WAIT`，`ULTRA_EXCLUSIVE=false` 时普通路径上只在 Ultra 列表里的模型为 `ULTRA_PRIMARY_QUEUE_WAIT`）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、Ultra 主用模型额度不足、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回（号池繁忙的 429 以 HTTP 状态返回同样是尽力而为：排队预算整个请求共用一份，换号重试与退避都计入，通常早于这个等待；Ultra 主用模型的请求自己现场冷启动时，等待按启动时长延后（启动期间不开始推流；合计不超过 `INIT_TIMEOUT`，且从开始等待算起最多 50 秒，等待本来更长时按它），冷启动后才遇到的额度不足通常同样以 HTTP 状态返回；普通号池的主用模型在请求自己现场冷启动或候选冷却延后了截止时间而晚于这个等待时，在流内返回）。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
 
 四套生成入口共享同一规范请求，输入映射如下：
 
@@ -2188,7 +2190,8 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 文件超过 512 MiB | 413 | `file_too_large` | `request_too_large` | `INTERNAL` |
 | 上游配额或限流（输入超限的 429 除外，见上） | 429 | `upstream_error` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 候选账户均在冷却且 1 分钟内不恢复 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
-| 主用模型（`PRIMARY_MODELS`）排队超过 `PRIMARY_QUEUE_WAIT` 没有空闲的账号或 Worker（号池繁忙） | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| 主用模型（`PRIMARY_MODELS`、`ULTRA_PRIMARY_MODELS`）排队超过对应的排队上限没有空闲的账号或 Worker（号池繁忙） | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| Ultra 主用模型（`ULTRA_PRIMARY_MODELS`）额度不足（`PrimaryQuotaError`：额度 429 后达到换号上限、其余候选全部冷却、没有已启动的 Worker 或没有其他可换的账号），带 `Retry-After`，消息固定为 `Resource has been exhausted (e.g. check quota).` | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 上游过载 | 529 | `upstream_error` | `overloaded_error` | `INTERNAL` |
 | 当前客户端请求被管理端取消 | 503 | `request_canceled` | `api_error` | `UNAVAILABLE` |
 | 生成服务已停止 | 503 | `service_stopped` | `api_error` | `UNAVAILABLE` |

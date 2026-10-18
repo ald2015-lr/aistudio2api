@@ -170,7 +170,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
-		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait
+		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
+		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait
 }
 
 // applyLiveConfig 读取已保存配置，把可热更新的字段直接应用到当前生成服务，不中断任何请求
@@ -204,7 +205,7 @@ func (manager *runtimeManager) applyLiveConfig() {
 	admin.service.minOutputTokens.Store(int64(saved.MinOutputTokens))
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
-	admin.service.setPrimaryModels(saved.PrimaryModels, saved.PrimaryQueueWait)
+	admin.service.setPrimaryModelSettings(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait)
 	generation.config = saved
 	manager.mu.Unlock()
 
@@ -213,7 +214,7 @@ func (manager *runtimeManager) applyLiveConfig() {
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
 		saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
-		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait),
+		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 	))
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()

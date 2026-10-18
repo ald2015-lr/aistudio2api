@@ -40,6 +40,8 @@ type EditableKey =
   | 'stream_playground_models'
   | 'primary_models'
   | 'primary_queue_wait'
+  | 'ultra_primary_models'
+  | 'ultra_primary_queue_wait'
   | 'waa_backend'
   | 'temporary_chat'
   | 'ignore_client_seed'
@@ -67,6 +69,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'stream_playground_models',
   'primary_models',
   'primary_queue_wait',
+  'ultra_primary_models',
+  'ultra_primary_queue_wait',
   'waa_backend',
   'temporary_chat',
   'ignore_client_seed',
@@ -102,6 +106,9 @@ function cloneDowngradeGuard(value: DowngradeGuardConfig | undefined): Downgrade
   // 旧版服务端不返回 reject_status，按默认 400 处理
   return { ...source, models: [...(source.models ?? [])], reject_status: source.reject_status ?? 400 }
 }
+
+// DEFAULT_ULTRA_PRIMARY_MODELS 与服务端 ULTRA_PRIMARY_MODELS 的默认值一致；旧版服务端不返回该字段时按它显示
+const DEFAULT_ULTRA_PRIMARY_MODELS: readonly string[] = ['gemini-4-argon']
 
 // parseModelList 与服务端一致：逗号或空白分隔，去掉 models/ 前缀并去重
 function parseModelList(value: string): string[] {
@@ -151,6 +158,8 @@ const form = reactive<ServiceConfig>({
   stream_playground_models: [],
   primary_models: [],
   primary_queue_wait: '10s',
+  ultra_primary_models: [...DEFAULT_ULTRA_PRIMARY_MODELS],
+  ultra_primary_queue_wait: '10s',
   waa_backend: 'camoufox',
   temporary_chat: false,
   ignore_client_seed: false,
@@ -185,6 +194,15 @@ function onPrimaryModelsInput(event: Event): void {
   const value = (event.target as HTMLInputElement).value
   primaryModelsText.value = value
   form.primary_models = parseModelList(value)
+}
+
+// Ultra 主用模型的输入框同样单独保存文字；清空即关闭 Ultra 主用模型
+const ultraPrimaryModelsText = ref((form.ultra_primary_models ?? []).join(', '))
+
+function onUltraPrimaryModelsInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value
+  ultraPrimaryModelsText.value = value
+  form.ultra_primary_models = parseModelList(value)
 }
 
 // subscriptionModels 为目录中需要订阅权益、可经 Build 调用（在 Build 通道一次性返回整段回复）且可经 Playground 流式调用的模型，
@@ -318,6 +336,11 @@ function validate(value: ServiceConfig): string {
   if (Number.isNaN(primaryWait) || primaryWait > durationMillis(value.request_timeout)) {
     return t('settings.invalidPrimaryQueueWait')
   }
+  // Ultra 主用模型的排队上限规则相同
+  const ultraPrimaryWait = durationMillis(value.ultra_primary_queue_wait ?? '0s')
+  if (Number.isNaN(ultraPrimaryWait) || ultraPrimaryWait > durationMillis(value.request_timeout)) {
+    return t('settings.invalidUltraPrimaryQueueWait')
+  }
   const numbers: [unknown, TranslationKey][] = [
     [value.warm_worker_limit, 'settings.warmWorkerLimit'],
     [value.max_active_workers, 'settings.maxActiveWorkers'],
@@ -425,13 +448,18 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
         form[key] = saved[key]
       }
     }
-    if (
-      form.primary_queue_wait !== undefined &&
-      saved.primary_queue_wait !== undefined &&
-      form.primary_queue_wait !== saved.primary_queue_wait &&
-      durationMillis(form.primary_queue_wait) === durationMillis(saved.primary_queue_wait)
-    ) {
-      form.primary_queue_wait = saved.primary_queue_wait
+    // 两个主用模型排队上限在旧版服务端可能没有返回，只在两边都有值时同步
+    for (const key of ['primary_queue_wait', 'ultra_primary_queue_wait'] as const) {
+      const local = form[key]
+      const remote = saved[key]
+      if (
+        local !== undefined &&
+        remote !== undefined &&
+        local !== remote &&
+        durationMillis(local) === durationMillis(remote)
+      ) {
+        form[key] = remote
+      }
     }
     saveError.value = ''
     emit('saved', saved)
@@ -520,11 +548,14 @@ watch(
       guardModelsText.value = form.downgrade_guard.models.join(', ')
       form.stream_playground_models = [...(config.stream_playground_models ?? [])]
       streamModelsText.value = form.stream_playground_models.join(', ')
-      // 旧版服务端不返回主用模型字段时按默认值显示；payload 保存时总会带上这两个键，旧版服务端忽略未知字段，
-      // 新版服务端读取时总是返回它们，不存在“新版服务端 + 字段缺失”的组合，不会重置服务端现值
+      // 旧版服务端不返回主用模型字段时按默认值显示；payload 保存时总会带上这几个键，旧版服务端忽略未知字段，
+      // 新版服务端读取时总是返回它们（Ultra 列表关闭时为空数组），不存在“新版服务端 + 字段缺失”的组合，不会重置服务端现值
       form.primary_models = [...(config.primary_models ?? [])]
       primaryModelsText.value = form.primary_models.join(', ')
       form.primary_queue_wait = config.primary_queue_wait ?? '10s'
+      form.ultra_primary_models = [...(config.ultra_primary_models ?? DEFAULT_ULTRA_PRIMARY_MODELS)]
+      ultraPrimaryModelsText.value = form.ultra_primary_models.join(', ')
+      form.ultra_primary_queue_wait = config.ultra_primary_queue_wait ?? '10s'
     }
     savedConfig.value = config
   },
@@ -940,6 +971,37 @@ onBeforeUnmount(() => {
           </label>
         </div>
         <span class="mt-2 block text-xs text-gray-500">{{ t('settings.primaryHelp') }}</span>
+        <div class="mt-4 border-t border-[#30363d] pt-4">
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <label class="block md:col-span-2">
+              <span class="mb-1 flex items-center gap-2 text-sm font-medium text-gray-400">
+                <span class="tag tag-ultra">{{ t('pool.ultra') }}</span>
+                {{ t('settings.ultraPrimaryModels') }}
+              </span>
+              <input
+                :value="ultraPrimaryModelsText"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                @input="onUltraPrimaryModelsInput"
+              />
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                t('settings.ultraPrimaryQueueWait')
+              }}</span>
+              <input
+                v-model.trim="form.ultra_primary_queue_wait"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                placeholder="10s"
+                required
+                autocomplete="off"
+              />
+            </label>
+          </div>
+          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.ultraPrimaryHelp') }}</span>
+        </div>
       </div>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">

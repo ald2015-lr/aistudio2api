@@ -218,29 +218,64 @@ func (manager *accountWorkerManager) drainTimeout() time.Duration {
 	return timeout + drainTimeoutGrace
 }
 
-// setPrimaryModels 记录主用模型（已按降级判定的规则整理并排序）
-func (manager *accountWorkerManager) setPrimaryModels(models []string) {
-	manager.primaryModels.Store(&models)
+// workerPrimaryModels 为 Worker 管理器使用的两份主用模型（已按降级判定的规则整理并排序）：normal 为普通号池的列表（PRIMARY_MODELS），
+// ultra 为 Ultra 号池的列表（ULTRA_PRIMARY_MODELS），整份替换
+type workerPrimaryModels struct {
+	normal []string
+	ultra  []string
 }
 
-func (manager *accountWorkerManager) primaryModelList() []string {
+// setPrimaryModels 记录两份主用模型（已按降级判定的规则整理并排序）
+func (manager *accountWorkerManager) setPrimaryModels(normal []string, ultra []string) {
+	manager.primaryModels.Store(&workerPrimaryModels{normal: normal, ultra: ultra})
+}
+
+// primaryModelLists 返回普通号池与 Ultra 号池的主用模型
+func (manager *accountWorkerManager) primaryModelLists() (normal []string, ultra []string) {
 	if models := manager.primaryModels.Load(); models != nil {
-		return *models
+		return models.normal, models.ultra
 	}
-	return nil
+	return nil, nil
 }
 
-// deadSlotModels 返回判断死槽位用的模型：预热池的热门冷却模型与主用模型，去重并排序。
+// primaryModelListFor 返回 Worker 分区判断死槽位、挑替补与统计供给用的主用模型：Ultra 分区用 Ultra 列表，其余用普通列表。
+// ULTRA_EXCLUSIVE=false 时普通路径也能用 Ultra 账号，但 Ultra 分区仍不并入普通列表：否则普通号池的主用模型冷却会把稀缺的
+// Ultra Worker 当成死槽位淘汰，而它们还能服务 Ultra 列表的模型
+func (manager *accountWorkerManager) primaryModelListFor(partition aistudio.PoolScope) []string {
+	normal, ultra := manager.primaryModelLists()
+	if partition == aistudio.PoolScopeUltra {
+		return ultra
+	}
+	return normal
+}
+
+// deadSlotModelsFor 返回判断分区内死槽位用的模型：预热池的热门冷却模型与该分区的主用模型，去重并排序。
 // 主用模型不等热门模型的 5% 阈值：重启后热门模型还没学到时同样有效
-func (manager *accountWorkerManager) deadSlotModels() []string {
-	hot, primary := manager.hotModelList(), manager.primaryModelList()
-	if len(primary) == 0 {
-		return hot
+func (manager *accountWorkerManager) deadSlotModelsFor(partition aistudio.PoolScope) []string {
+	return mergeModelLists(manager.hotModelList(), manager.primaryModelListFor(partition))
+}
+
+// deadSlotModelsForScope 返回按选号号池判断死槽位用的模型：Ultra 号池与普通号池各用自己分区的列表，不限号池（候选跨两个分区）
+// 用两者的并集
+func (manager *accountWorkerManager) deadSlotModelsForScope(scope aistudio.PoolScope) []string {
+	switch scope {
+	case aistudio.PoolScopeUltra, aistudio.PoolScopeNormal:
+		return manager.deadSlotModelsFor(scope)
+	default:
+		normal, ultra := manager.primaryModelLists()
+		return mergeModelLists(manager.hotModelList(), mergeModelLists(normal, ultra))
 	}
-	if len(hot) == 0 {
-		return primary
+}
+
+// mergeModelLists 合并两个已排序的模型列表，去重并排序；一边为空时直接返回另一边（不复制）
+func mergeModelLists(left []string, right []string) []string {
+	if len(right) == 0 {
+		return left
 	}
-	models := append(slices.Clone(hot), primary...)
+	if len(left) == 0 {
+		return right
+	}
+	models := append(slices.Clone(left), right...)
 	slices.Sort(models)
 	return slices.Compact(models)
 }
@@ -385,7 +420,7 @@ func (manager *accountWorkerManager) pickReplacement(ctx context.Context, partit
 	if len(standby) == 0 {
 		return ""
 	}
-	avoid := manager.deadSlotModels()
+	avoid := manager.deadSlotModelsFor(partition)
 	if len(models) > 0 {
 		avoid = append(slices.Clone(avoid), models...)
 		slices.Sort(avoid)
@@ -418,7 +453,7 @@ func (manager *accountWorkerManager) replacementCandidates(
 ) []string {
 	targets := models
 	if len(targets) == 0 {
-		targets = manager.primaryModelList()
+		targets = manager.primaryModelListFor(partition)
 	}
 	var standby []string
 	matched := false

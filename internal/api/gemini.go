@@ -853,10 +853,7 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, stream bool) {
 	hideThought := s.prepareGenerate(r.Context(), &request)
 	request.Stream = stream
-	events, err := s.service.Generate(r.Context(), request)
-	if err == nil && stream {
-		events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(request.Model))
-	}
+	events, err := s.generate(r.Context(), request)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiRequestError(w, err)

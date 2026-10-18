@@ -103,10 +103,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		// 先拿到事件流再写响应头与 message_start：降级判定（流式严格模式）要在判定之前保留返回 400 的机会；
 		// 生成服务在此之前失败时也和官方 API 一样直接返回 HTTP 错误
 		inputTokens := aistudio.EstimatedInputTokens(generateRequest)
-		events, err := s.service.Generate(r.Context(), generateRequest)
-		if err == nil {
-			events, err = awaitStreamStart(r.Context(), events, s.streamStartWait(generateRequest.Model))
-		}
+		events, err := s.generate(r.Context(), generateRequest)
 		if err != nil {
 			if shouldWriteRequestError(r, err) {
 				writeAnthropicRequestError(w, err)

@@ -17,6 +17,11 @@ var errUpstreamStream = errors.New("upstream stream error")
 
 const streamHeartbeatInterval = 10 * time.Second
 
+// streamStartHoldMax 为生成服务现场冷启动推迟写出流式响应头时，从开始等首个事件算起最多等多久（写出响应头前的等待本来就更长时按它）：
+// 推迟期间连接上没有任何字节，前面的反向代理与中转读不到响应头时按读超时断开（nginx 默认 60 秒，Cloudflare 100 秒），断开还会取消
+// 请求与进行中的启动，客户端重试又要从头冷启动。到时照常先回 200 再推流（之后有心跳），启动更久时其后的错误在流内返回
+const streamStartHoldMax = 50 * time.Second
+
 type generationResult struct {
 	events        []aistudio.Event
 	text          strings.Builder
@@ -103,46 +108,93 @@ func (result *generationResult) apply(event aistudio.Event) error {
 	return nil
 }
 
-// streamStartWaitProvider 由生成服务实现：返回模型在写出流式响应头前至少要等首个事件多久（主用模型为排队上限加余量），
-// 保证排队超限的 429 以 HTTP 状态返回，不是 200 之后的流内错误；返回 0 表示按默认心跳间隔
-type streamStartWaitProvider interface {
-	StreamStartWait(model string) time.Duration
+// StreamStartWaitProvider 由生成服务实现：返回模型在写出流式响应头前至少要等首个事件多久（主用模型为排队上限加余量），
+// 保证排队超限、额度不足的 429 以 HTTP 状态返回，不是 200 之后的流内错误；返回 0 表示按默认心跳间隔。
+// ctx 为请求的 context：主用模型按号池分两份列表（普通号池与 Ultra 号池），生成服务从中读取请求的号池。
+// 这里按接口类型断言，签名不一致不会编译报错、只会静默退回心跳间隔：接口导出给 app 包，实现方各有一条
+// var _ api.StreamStartWaitProvider 的编译期断言，改签名时两边一起报错
+type StreamStartWaitProvider interface {
+	StreamStartWait(ctx context.Context, model string) time.Duration
 }
 
 // streamStartWait 返回写出流式响应头前等待首个事件的时间：默认一个心跳间隔，生成服务要求更久时按它
-func (s *server) streamStartWait(model string) time.Duration {
+func (s *server) streamStartWait(ctx context.Context, model string) time.Duration {
 	wait := streamHeartbeatInterval
-	if provider, ok := s.service.(streamStartWaitProvider); ok {
-		wait = max(wait, provider.StreamStartWait(model))
+	if provider, ok := s.service.(StreamStartWaitProvider); ok {
+		wait = max(wait, provider.StreamStartWait(ctx, model))
 	}
 	return wait
 }
 
+// generate 调用生成服务。流式请求在写出响应头前等首个事件（见 awaitStreamStart）：首个事件前的错误按非流式返回 HTTP 状态，
+// 不先回 200 再在流里报错；交给生成服务的 context 带一份 aistudio.StreamStartHold，生成服务为请求现场冷启动 Worker 时用它推迟
+// 写出响应头（Ultra 主用模型，启动结束后才遇到的额度不足仍以 429 返回；最多推迟到 streamStartHoldMax）。非流式请求原样调用
+func (s *server) generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	if !request.Stream {
+		return s.service.Generate(ctx, request)
+	}
+	ctx = aistudio.WithStreamStartHold(ctx, aistudio.NewStreamStartHold())
+	events, err := s.service.Generate(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	return awaitStreamStart(ctx, events, s.streamStartWait(ctx, request.Model))
+}
+
 // awaitStreamStart 在写出流式响应头前最多等待 wait 等首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
 // HTTP 状态和错误对象（参数错误、无可用账号、全部冷却、号池繁忙、降级拒绝等不再变成 200 之后的流内错误）；
-// wait 内没有事件时照常开始推流，返回的事件流从首个事件开始重放
+// wait 内没有事件时照常开始推流，返回的事件流从首个事件开始重放。ctx 里有 aistudio.StreamStartHold 时，等待截止时间按它当前要延长的
+// 等待延后（生成服务现场冷启动进行中为这次启动最多还能延长的等待，结束后为实测时长），合计不超过 streamStartHoldMax
 func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event, wait time.Duration) (<-chan aistudio.Event, error) {
+	return awaitStreamStartWithin(ctx, events, wait, streamStartHoldMax)
+}
+
+// awaitStreamStartWithin 与 awaitStreamStart 相同，推迟写出响应头最多到开始等待后 holdMax（不早于 wait）
+func awaitStreamStartWithin(ctx context.Context, events <-chan aistudio.Event, wait time.Duration, holdMax time.Duration) (<-chan aistudio.Event, error) {
+	hold := aistudio.StreamStartHoldFromContext(ctx)
+	holdMax = max(holdMax, wait)
+	// 起点在创建计时器之前取（单调时钟）：没有延长时计时器第一次到期就判定为已到
+	startedAt := time.Now()
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
+	// expired 复查等待是否已到：截止时间为 wait 加当前要延长的等待、不超过 holdMax；没到时按它重设计时器，已到时返回 true
+	expired := func() bool {
+		remaining := min(wait+hold.Extension(), holdMax) - time.Since(startedAt)
+		if remaining <= 0 {
+			return true
+		}
+		timer.Reset(remaining)
+		return false
+	}
 	var first aistudio.Event
-	select {
-	case <-ctx.Done():
-		go drainEvents(events)
-		return nil, ctx.Err()
-	case <-timer.C:
-		return events, nil
-	case event, ok := <-events:
-		if !ok {
-			return nil, errIncompleteStream
-		}
-		if event.Kind == aistudio.EventError {
+waiting:
+	for {
+		select {
+		case <-ctx.Done():
 			go drainEvents(events)
-			if event.Err != nil {
-				return nil, event.Err
+			return nil, ctx.Err()
+		case <-timer.C:
+			if expired() {
+				return events, nil
 			}
-			return nil, errUpstreamStream
+		case <-hold.Changed():
+			if expired() {
+				return events, nil
+			}
+		case event, ok := <-events:
+			if !ok {
+				return nil, errIncompleteStream
+			}
+			if event.Kind == aistudio.EventError {
+				go drainEvents(events)
+				if event.Err != nil {
+					return nil, event.Err
+				}
+				return nil, errUpstreamStream
+			}
+			first = event
+			break waiting
 		}
-		first = event
 	}
 	replay := make(chan aistudio.Event)
 	go func() {

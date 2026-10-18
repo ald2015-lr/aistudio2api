@@ -97,7 +97,8 @@ func (e *AllCoolingError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
-// CapacityBusyError 表示主用模型（PRIMARY_MODELS）的请求在排队上限（PRIMARY_QUEUE_WAIT）内没有等到空闲的账号或 Worker 槽位：
+// CapacityBusyError 表示主用模型（PRIMARY_MODELS 或 ULTRA_PRIMARY_MODELS）的请求在排队上限（PRIMARY_QUEUE_WAIT 或
+// ULTRA_PRIMARY_QUEUE_WAIT）内没有等到空闲的账号或 Worker 槽位：
 // 号池容量（峰值 Worker 数 × 单账户并发）低于当前并发时，请求不再排队到请求超时，立即按 429 返回并带 Retry-After，
 // 由客户端稍后重试。只在等待原因是账号忙碌、没有空闲槽位、Worker 启动或扩容中时产生；候选全部冷却仍按 AllCoolingError 处理
 type CapacityBusyError struct {
@@ -157,6 +158,61 @@ func (e *CapacityBusyError) HTTPStatus() int {
 
 // ErrorCode 返回 OpenAI 兼容的限流错误代码
 func (e *CapacityBusyError) ErrorCode() string {
+	return "rate_limit_exceeded"
+}
+
+// PrimaryQuotaError 表示 Ultra 主用模型（ULTRA_PRIMARY_MODELS）的请求因额度不足立即结束：额度 429 的换号次数已达上限、
+// 其余候选全部冷却、额度 429 后号池里没有已启动的 Worker（只剩要现场冷启动的备用账号），或没有其他可换的账号。对外与全部冷却一样按 429 返回并带
+// Retry-After，由客户端稍后重试，不在号池里挨个换号、现场冷启动直到超时。
+// Cause 为最后一次上游额度错误，只写进内部日志：刻意不实现 Unwrap，否则会被当成上游 RPCError（对外原文、没有 Retry-After）
+// 或输入超限等错误处理
+type PrimaryQuotaError struct {
+	ModelID string
+	// Pool 为请求限定的号池
+	Pool PoolScope
+	// Reason 为结束的原因（额度失败已达换号上限、其余候选全部冷却、额度 429 后没有已启动的 Worker 等）
+	Reason string
+	// QuotaHits 为本请求遇到的额度失败次数，Elapsed 为请求从第一次选号起的总耗时
+	QuotaHits int
+	Elapsed   time.Duration
+	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
+	Until time.Time
+	// Cause 为最后一次上游额度错误（可为空）
+	Cause error
+}
+
+func (e *PrimaryQuotaError) Error() string {
+	pool := e.Pool.Label()
+	if pool == "" {
+		pool = "不限号池"
+	}
+	message := fmt.Sprintf("额度不足：%s的 Ultra 主用模型 %s 没有可用额度，立即返回（原因：%s，额度失败 %d 次",
+		pool, e.ModelID, e.Reason, e.QuotaHits)
+	if e.Elapsed > 0 {
+		message += fmt.Sprintf("，总耗时 %s", roundBusyDuration(e.Elapsed))
+	}
+	if !e.Until.IsZero() {
+		message += "，建议重试时间 " + e.Until.Local().Format(time.RFC3339)
+	}
+	message += "）"
+	if e.Cause != nil {
+		message += "：" + e.Cause.Error()
+	}
+	return message
+}
+
+// RetryAt 返回建议重试时间，供对外错误写 Retry-After
+func (e *PrimaryQuotaError) RetryAt() time.Time {
+	return e.Until
+}
+
+// HTTPStatus 返回额度不足对应的公开状态码：与全部冷却一样按限流 429 返回
+func (e *PrimaryQuotaError) HTTPStatus() int {
+	return http.StatusTooManyRequests
+}
+
+// ErrorCode 返回 OpenAI 兼容的限流错误代码
+func (e *PrimaryQuotaError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 

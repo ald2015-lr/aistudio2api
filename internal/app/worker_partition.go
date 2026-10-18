@@ -167,8 +167,10 @@ type standbyCapacity struct {
 	active   map[aistudio.PoolScope]int
 	cooling  map[aistudio.PoolScope]bool
 	idle     map[aistudio.PoolScope]bool
-	// serveable 为已核对过的备用账户能服务几个热门或主用模型（见 preferred），一次调度内每个账户最多核对一次
-	serveable map[string]int
+	// serveable 为已核对过的备用账户能服务几个热门或主用模型（见 preferred），一次调度内每个账户最多核对一次；
+	// deadModels 为各分区判断死槽位用的模型，一次调度内第一次需要时取一次
+	serveable  map[string]int
+	deadModels map[aistudio.PoolScope][]string
 }
 
 // standbyCapacity 按当前驻留的 Worker 创建分区容量判断
@@ -203,25 +205,42 @@ func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope 
 // preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个按能服务的热门与主用模型个数从多到少排列（同数保持原顺序），
 // 第二段为其余候选，保持原顺序且不复制（备用账户可能有上万个）。为其他模型的请求启动的备用账号也优先选还能服务主用模型的，
 // 不直接启动一个服务不了主用模型的 Worker（目录里没有、权益不够或已长时间冷却，按候选集成员判断，见 aistudio.ServeableCounts）；
-// 只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），都服务不了时仍按原顺序使用
+// 只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），都服务不了时仍按原顺序使用。
+// 主用模型按候选账户所在的分区取（Ultra 分区按 Ultra 主用模型，见 primaryModelListFor）：不限号池的选号候选跨两个分区，
+// 前段按分区分组各核对一次（每个分区最多一次加锁，分区归属在调度内已缓存），不用两个列表的并集，免得普通号池的主用模型
+// 左右 Ultra 备用账号的先后
 func (capacity *standbyCapacity) preferred(list []string) [2][]string {
-	models := capacity.manager.deadSlotModels()
-	if len(models) == 0 || len(list) <= 1 {
+	if len(list) <= 1 {
+		return [2][]string{list, nil}
+	}
+	if capacity.deadModels == nil {
+		capacity.deadModels = make(map[aistudio.PoolScope][]string, len(workerPartitions))
+		for _, partition := range workerPartitions {
+			capacity.deadModels[partition] = capacity.manager.deadSlotModelsFor(partition)
+		}
+	}
+	models := capacity.deadModels
+	if len(models[aistudio.PoolScopeNormal]) == 0 && len(models[aistudio.PoolScopeUltra]) == 0 {
 		return [2][]string{list, nil}
 	}
 	head := list[:min(standbyPreferLimit, len(list))]
-	unknown := make([]string, 0, len(head))
+	unknown := make(map[aistudio.PoolScope][]string, len(workerPartitions))
 	for _, accountID := range head {
 		if _, checked := capacity.serveable[accountID]; !checked {
-			unknown = append(unknown, accountID)
+			partition := capacity.partition(accountID)
+			unknown[partition] = append(unknown[partition], accountID)
 		}
 	}
-	if len(unknown) > 0 {
-		if capacity.serveable == nil {
-			capacity.serveable = make(map[string]int, len(unknown))
+	for _, partition := range workerPartitions {
+		accountIDs := unknown[partition]
+		if len(accountIDs) == 0 {
+			continue
 		}
-		counts := capacity.manager.pool.ServeableCounts(unknown, models, rotationMinRemaining)
-		for _, accountID := range unknown {
+		if capacity.serveable == nil {
+			capacity.serveable = make(map[string]int, len(head))
+		}
+		counts := capacity.manager.pool.ServeableCounts(accountIDs, models[partition], rotationMinRemaining)
+		for _, accountID := range accountIDs {
 			capacity.serveable[accountID] = counts[accountID]
 		}
 	}
