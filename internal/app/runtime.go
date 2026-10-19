@@ -5054,6 +5054,11 @@ func (service *trackedService) forwardEvents(
 		}
 		if event.Kind == aistudio.EventFinish {
 			api.SetAccessLogFinishReason(requestCtx, event.FinishReason)
+			if event.FinishMessage != "" {
+				// 上游对结束原因的说明（如 MALFORMED_FUNCTION_CALL 出错的调用）写进这次请求的管理日志，排查时不用再抓原始响应
+				level, message := upstreamFinishLog(event.FinishReason, event.FinishMessage)
+				service.requests.logRequestProgress(requestID, accountLabel, level, message)
+			}
 			if contentEvents > 0 {
 				replyHash := hex.EncodeToString(replyDigest.Sum(nil))[:12]
 				api.SetAccessLogReplyHash(requestCtx, replyHash)

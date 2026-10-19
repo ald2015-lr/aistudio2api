@@ -150,7 +150,7 @@ Build 独有模型计算：Playground 目录按模型 ID 与别名建立索引�
 
 并发调度优化：分配账号时不再逐个等待正在生成 WAA proof 的账户（每次 1～5 秒），调度耗时不再随并发线性增长；候选全部没有空位且有账户冷却时，从磁盘刷新运行态改为同一模型每 3 秒最多一次；没有额度信息的 429 也会让该账户的这个模型冷却 30 秒，不再被反复选中白白失败；只有 “You exceeded your current quota” 通用文案、没有其他周期信息的额度 429 按每日限额冷却到太平洋时间次日零点（北京时间夏令时 15:00、冬令时 16:00）。额度周期按 `quota_unit`、`quota_limit`、`quota_metric`、错误文案依次判定，按模型计的分钟限额只冷却该模型，不再冻结整个账号；上游给出 RetryInfo 或 Retry-After 时按它计算恢复时间（每日限额不会因此提前恢复）。
 
-参数容错：`max_tokens` 超过模型上限时按上限发送，不再报错；`reasoning_effort` 兼容 `xhigh`、`max`（视为最高）与 `auto`（使用模型默认）；只支持思考预算的模型收到思考强度时换算为预算（low 1024、medium 8192、high 24576）；不支持调节思考的模型忽略思考参数。Playground 与 Build 两个通道一致。
+参数容错：`max_tokens` 超过模型上限时按上限发送，不再报错；`reasoning_effort` 兼容 `xhigh`、`max`（视为最高）与 `auto`（使用模型默认）；只支持思考预算的模型收到思考强度时换算为预算（low 1024、medium 8192、high 24576）；不支持调节思考的模型忽略思考参数。Playground 与 Build 两个通道一致。OpenAI 与 Gemini 的 penalty、logprobs、logit_bias 上游没有对应参数，直接忽略，不再返回 400（`n` 与 `candidateCount` 仍只接受 1），其余协议兼容见下文 [API 使用](#api-使用)。
 
 优雅退出：收到停止信号（`./start.sh stop/restart`）后先停止接收新请求，等进行中的请求完成再结束运行时，最多等待 SHUTDOWN_GRACE（默认 60 秒）；管理页实时事件流会主动断开，不拖住等待。此前运行时直接跟随退出信号，每次重启都会立即截断所有进行中的回复。start.sh 强制结束前的等待相应放宽到 90 秒（STOP_TIMEOUT）。
 
@@ -284,7 +284,19 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 
 响应里的模型名（OpenAI、Anthropic、Responses、Interactions 的 `model`，Gemini 的 `modelVersion`）是请求的模型名去掉上述后缀：请求 `gemini-3.1-pro-preview`、`gemini-3.1-pro-preview-128`、`gemini-3.1-pro-preview-low` 都返回 `gemini-3.1-pro-preview`；目录里没有的名称按请求原样返回。带 `models/` 前缀的名称（如 `models/gemini-3.1-pro-preview-low`）先去掉前缀再解析，各协议一致。不返回上游报告的实际服务模型版本：它只出现在 OpenAI、Responses 与 Anthropic 非流式响应的 `provider_model` 字段里；实际服务的模型与请求的不是同一系列时，管理日志另记 `served_model`。
 
-调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。
+调用 API 必须携带 `PROXY_API_KEY`（默认 `sk-onechat-fun-fun`，可在管理页“服务配置”中修改）；使用默认密钥时，浏览器中只有本机页面可以直接调用接口，网页版客户端需要改为自定义密钥。密钥可以放在 `Authorization: Bearer`、`x-api-key`、`x-goog-api-key`、`api-key` 请求头或 `?key=` 查询参数中，任一位置与配置的密钥相同即通过：经 new-api 转发时 `?key=` 里常是下游令牌、请求头里才是本服务密钥，这种请求同样放行，不会因 401 让整个渠道被自动停用。只支持一个密钥。
+
+协议兼容（各项细节见 [Google AI Studio 协议规范](docs/protocol.md)）：
+
+- **忽略上游没有的参数**：OpenAI Chat 的 `frequency_penalty`、`presence_penalty`、`logprobs`、`logit_bias` 与 Gemini 的 `frequencyPenalty`、`presencePenalty`、`responseLogprobs`、`logprobs` 直接忽略，不再返回 400（SillyTavern、LobeChat、Open WebUI、Dify 常带非 0 的 penalty）；Chat 非流式响应的 `logprobs` 为 `null`。`n` 与 `candidateCount` 仍只接受 1。
+- **历史工具调用参数容错**：Chat `tool_calls` 与 Responses `function_call` 的 `arguments` 不是 JSON object（例如一次被截断的调用）时包成 `{"_raw":"<原文>"}` 发送，Cline、Roo、OpenCode 等客户端回放后会话不再每轮 400。
+- **Anthropic 服务端工具**：`web_search_*`、`web_fetch_*`、`code_execution_*` 按前缀识别任何日期版本；`tool_search_tool_*` 与 MCP toolset 定义直接忽略。`web_fetch` 的 `allowed_domains`、`blocked_domains` 仍返回 400。
+- **Anthropic 历史**：更换 API key、或会话从别的 Claude 渠道切过来时，web_search 历史按文本保留标题与 URL（摘要只从本服务签发的来源恢复），调用与结果缺一半、搜索失败结果，以及 web_fetch、code_execution、tool_search 等其他服务端工具的历史也都转成文本，不再返回 400；`document` 支持 `text`、`content` 与 `file`（`file_id`）来源，`image` 支持 `file` 来源。
+- **Anthropic 结构化输出**：`output_config.format` 与 beta 写法 `output_format` 的 `json_schema` 按 JSON 模式与 Schema 输出（原先被静默忽略，客户端拿到自由文本）。
+- **工具参数 Schema**：`required` 列出未定义的属性时补上 `{}`，上游不再以 `property is not defined` 拒绝整个请求（Playground、Build 与 `strict` 核对一致）；Playground 上 `"5"`、`5.0` 这类整数写法与 `TYPE_UNSPECIFIED` 不再让 Schema 降级。
+- **Gemini 小兼容**：`MODALITY_UNSPECIFIED`、`MODE_UNSPECIFIED` 按未设置处理；带 `dynamicRetrievalConfig` 的 `googleSearchRetrieval` 照常开启 Google Search；`fileData` 可以省略 `mimeType`（按 `displayName` 或 `fileUri` 的扩展名推断）。
+- **上游结束说明**：Google 给出 `finishMessage`（如 `MALFORMED_FUNCTION_CALL` 的具体问题）时，Gemini 响应的 `finishMessage` 原样带上，管理日志另记一行 `上游结束说明`；输入被拦截时的上游说明只写进管理日志，客户端收到的错误不变。
+- **流式心跳**：10 秒没有新内容时，Gemini 流写一个空行（google-genai Python SDK 会把 `: ping` 当作 JSON 解析而报错），Anthropic 发送官方 `event: ping`，OpenAI Chat、Responses 与 Interactions 仍发送 `: ping`。
 
 以 Cherry Studio 为例：
 
@@ -790,7 +802,7 @@ Gemini 的思考也算在最大输出里，客户端把最大输出设得很小�
 
 ### 排查路由 /trace/
 
-`/trace/` 前缀下的全部接口与主路由完全相同（同一个 API Key、同样的调度与转换），只是额外为每个 POST 请求在 `logs/trace/` 写一份完整记录：客户端原始请求（鉴权头已隐藏）、协议转换后与发往上游的参数（含实际使用的 seed）、真正发给 AI Studio 的请求体、每次换号尝试的账号与失败原因、上游原始响应开头、完整回复与返回给客户端的内容。只保留最近 100 个文件，主路由不受影响。
+`/trace/` 前缀下的全部接口与主路由完全相同（同一个 API Key、同样的调度与转换），只是额外为每个 POST 请求在 `logs/trace/` 写一份完整记录：客户端原始请求（`Authorization`、`x-api-key`、`x-goog-api-key`、`api-key`、Cookie 等鉴权头与 `?key=` 参数已隐藏）、协议转换后与发往上游的参数（含实际使用的 seed）、真正发给 AI Studio 的请求体、每次换号尝试的账号与失败原因、上游原始响应开头、完整回复与返回给客户端的内容。只保留最近 100 个文件，主路由不受影响。
 
 用法：在中转里新建一个测试渠道，接口地址填 `http://服务器:2048/trace`（Ultra 号池填 `http://服务器:2048/trace/ultra`，其余与正式渠道相同），用它复现问题，然后执行 `./start.sh trace`，把 `reports/` 下生成的压缩包发给开发者。记录里有提示词与回复原文，分享前请确认内容可以公开。
 

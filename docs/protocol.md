@@ -526,11 +526,13 @@ AUDIO 采用独立输出模态。JSON Schema type code 为 string=`1`、number=`
 | `$[0][frame][0]` | candidates |
 | `$[0][frame][0][0][0]` | candidate content |
 | `$[0][frame][0][0][1]` | finish reason code |
+| `$[0][frame][0][0][3]` | finish message（上游对结束原因的说明，如 `MALFORMED_FUNCTION_CALL` 的具体问题；不是字符串时忽略） |
 | `$[0][frame][0][0][6]` | citations |
 | `$[0][frame][0][0][7]` | grounding metadata |
 | `$[0][frame][2]` | usage |
 | `$[0][frame][7]` | response ID |
 | `$[0][frame][3]` 且 frame 0 为空 | interaction metadata |
+| `$[0][frame][1]` 且 frame 0 为 null | prompt feedback：`[0]` 为 block reason code，`[2]` 为拦截说明（block reason message，不是字符串时忽略） |
 
 传输正文是一个 JSON 根值，网络 chunk 提供字节；解码器在 `$[0]` 中每出现一个完整 repeated frame 时立即消费该 frame。每个内容帧包含一个 candidate，candidate content 为 `[[parts...], "model"]`。完成帧可以同时携带最后一组 Part、usage、response ID 和 finish reason，根数组解析完成后结束读取。
 
@@ -682,6 +684,8 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 
 错误响应根形状为 `[null,[code,message,...]]`。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
 
+frame 0 为 null 且带 prompt feedback 时表示上游拒绝当前输入（Build 为没有 candidate 而带 `promptFeedback.blockReason`），形成输入拦截错误。上游给出的拦截说明（Playground 的 prompt feedback `[2]`、Build 的 `promptFeedback.blockReasonMessage`）只附在内部错误与管理日志的 `request.error` 中（`AI Studio 拒绝当前输入: <reason>: <说明>`）；公开协议的错误消息仍按 block reason 统一生成官方措辞，不含这段原文。
+
 各协议的具体终态转换如下：
 
 | 上游终态 | OpenAI Chat | OpenAI Responses | Anthropic Messages | Gemini GenerateContent |
@@ -692,7 +696,7 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 | 内容拦截：`safety`、`recitation`、`blocklist`、`prohibited_content`、`spii`、`image_safety`、`image_prohibited_content`、`image_recitation` | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举 |
 | 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举或 `OTHER` |
 
-内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值；Gemini 使用 `finishMessage` 保留编号。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
+内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
 
 ## 6. 函数、Google 工具、Drive 与媒体
 
@@ -726,17 +730,18 @@ Anthropic 接受的具体 server tool type 为：
 
 | AI Studio 工具 | Anthropic type |
 | --- | --- |
-| Google Search | `web_search_20250305` |
+| Google Search | `web_search_*`（任何日期版本，如 `web_search_20250305`） |
 | Image Search | `image_search` |
-| URL Context | `web_fetch_20250910`、`url_context` |
-| Code Execution | `code_execution_20250522`、`code_execution_20250825` |
+| URL Context | `web_fetch_*`（任何日期版本，如 `web_fetch_20250910`）、`url_context` |
+| Code Execution | `code_execution_*`（任何日期版本，如 `code_execution_20250522`、`code_execution_20250825`） |
 | Google Maps | `google_maps` |
+| 无（忽略） | `tool_search_tool_*`、type 含 `toolset` 的定义 |
 
 根 field 7 按请求声明逐项编码，函数声明和各类 Google 工具按上表对应的 Tool entry 编码。模型的工具范围取自实时能力码。根 field 14 为 ToolConfig；请求同时携带函数声明与 Google 工具时，其 field 3 `include_server_side_tool_invocations` 为 `true`，由上游在同一轮内执行 Google 工具并返回函数调用。
 
 编码器将全部函数声明合并为一个 Tool entry；Google Search 与 Image Search 合并为一个 search entry 并分别占用 `searchTypes` 索引 `0/1`；Code Execution、URL Context 与 Maps 各占一个 entry。Google Maps 与 Code Execution/URL Context 构成互斥工具组，每个请求选择其中一组。
 
-Anthropic server tool 的 `name` 必须分别为 `web_search`、`image_search`、`web_fetch`、`code_execution`、`url_context` 或 `google_maps`。这些定义接受 `type` 与对应 `name`，各 type 的文档化选项见 Anthropic Messages 一节，其余选项与 custom tool 一样忽略；`description` 或 `input_schema` 返回 `400 invalid_request_error`。
+Anthropic server tool 的 `name` 必须分别为 `web_search`、`image_search`、`web_fetch`、`code_execution`、`url_context` 或 `google_maps`。这些定义接受 `type` 与对应 `name`，各 type 的文档化选项见 Anthropic Messages 一节，其余选项与 custom tool 一样忽略；`description` 或 `input_schema` 返回 `400 invalid_request_error`。被忽略的 `tool_search_tool_*` 与 toolset 定义不做这些检查。
 
 函数 JSON Struct 使用 protobuf `Struct/Value` 数组：map 为 `[[[key,value],...]]`；Value oneof 索引 `0..5` 分别表示 null、number、string、bool、Struct、ListValue。对象键排序后编码。
 
@@ -824,6 +829,9 @@ Schema 归一化规则：
 | `$schema`、`default`、`additionalProperties`、`exclusiveMinimum`、`propertyNames`、`prefixItems` | 从 wire schema 中省略 |
 | 顶层 schema 为空或 `null` | 按没有参数的 object 编码；`response_format` 等结构化输出的 `schema: null` 按未设置处理，只保留 JSON 模式 |
 | 值为显式 `null` 的字段（`const` 除外） | 按缺省处理 |
+| `minItems`、`maxItems`、`minProperties`、`maxProperties`、`minLength`、`maxLength` 的字符串写法（`"5"`，`@google/genai` 等 SDK 把 int64 序列化为字符串）或零小数写法（`5.0`） | 按整数 `5` 编码；带小数、负数、非数字或超过 2^53 的写法照旧按其他 Schema 字段降级 |
+| `type: "TYPE_UNSPECIFIED"`（Gemini 枚举零值，不区分大小写），包括 `anyOf` / `oneOf` / `allOf` 的直接分支 | 按没有声明 `type` 处理，由下面的缺少 `type` 规则推断，推断时不借用这个值 |
+| `required` 列出而 `properties` 没有定义的属性（MCP 与 agent 客户端常见） | 函数参数补上不限类型的定义 `{}`，上游不再以 `property is not defined` 拒绝；递归处理 `properties`、`$defs`、`definitions`、`items`、`additionalProperties`、`not`、`anyOf`、`oneOf`、`allOf`、`prefixItems`；`properties` 不是 object 时不补 |
 | `items: true` / `items: false` | `true` 不限制元素；`false` 编码为 `maxItems=0`，元素类型按缺省补齐 |
 | `properties` 中的 `true` / `null` / `false` | `true` 与 `null` 按开放节点处理；`false` 删除该属性并同步移出 `required` |
 | `not` 为 `null`、`false`、`true`、`""`、空对象 | 删除；`true` 本应禁止所有值，按宽松处理 |
@@ -837,7 +845,11 @@ Schema 归一化规则：
 | array 缺少 `items` | `prefixItems` 中带类型的项组成 `anyOf`；没有时为 string |
 | 其他 Schema 字段 | 降级编码：只编码层级与类型，完整 Schema 附在说明里（函数参数附在函数说明，结构化输出附在根节点说明；见下文） |
 
-函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道原样发送 `parametersJsonSchema`，不经过降级。结构化输出（`response_format` / `text.format` / `responseSchema`）在 Playground 上按同样规则降级，完整 Schema 以 `The response must follow this JSON Schema: ...` 附在根节点说明；Build 通道原样发送 `responseJsonSchema`。
+函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道发送 `parametersJsonSchema`，不经过降级，字符串整数与 `TYPE_UNSPECIFIED` 也原样发送，只补齐 `required` 中未定义的属性。
+
+`required` 补齐在 Playground 编码、Build `parametersJsonSchema` 与 `strict` 参数核对三处一致（核对用补齐后的 Schema，`additionalProperties:false` 时这些必填属性才可能满足，缺少必填属性的调用仍判为不符合）。大小与嵌套检查在前：超过 1 MiB 的 Schema 原样交给原有处理（Playground 返回 400，Build 原样发送）；已处于嵌套上限的节点不补，补齐不会让原本合规的 Schema 超过嵌套上限。不需要补齐时原样发送原始字节；补齐后重新编码，数值保留原写法，键顺序与空白可能变化。
+
+结构化输出（`response_format` / `text.format` / `responseSchema` / Anthropic `output_config.format`）在 Playground 上按同样规则编码与降级（整数与 `TYPE_UNSPECIFIED` 规则同样适用，不做 `required` 补齐），完整 Schema 以 `The response must follow this JSON Schema: ...` 附在根节点说明；Build 通道原样发送 `responseJsonSchema`。
 
 AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7 的函数声明，由模型决定是否调用；none 省略 tools。Playground 没有工具选择字段，必须调用、指定函数与单次调用以系统指令写明要求，再由生成链路核对上游实际返回的调用；Build 通道写入原生 `toolConfig.functionCallingConfig`（必须调用为 `ANY`，指定函数写入 `allowedFunctionNames`，`validated` 或任一函数 `strict` 时为 `VALIDATED`）。客户端工具选择映射如下：
 
@@ -849,7 +861,7 @@ AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7
 
 Gemini `VALIDATED` 对所有函数按 Schema 核对参数。核对规则：指定函数时只发送被选中的函数；上游调用了未选择的函数、`strict` 函数的参数不符合 Schema（JSON Schema 2020-12 校验，`pattern` 按 ECMAScript 正则、单次匹配最多 1 秒）、要求调用却没有任何工具调用（声明了 Google 搜索等内置工具且上游使用了它们时视为满足）时，事件流以错误结束，HTTP 状态 502；首个事件之前发生时按非流式返回。要求单次调用而上游返回多个调用时只保留第一个。客户端 Schema 本身无法编译（如引用了未提供的外部定义）时不阻止请求，只是不核对该函数的参数。
 
-函数调用响应 Part 为 `[name, Struct, callId?]`；上游没有给出 callId 时，代理补一个 `call_local_` 开头的本地 ID 返回给客户端，客户端带回结果时按它关联，发回上游时去掉；下一轮 function result 使用同一形状并原样带回 thought signature。tool result 显式提供函数名时保留该值；缺少名称时，先按 call ID 关联当前轮尚未返回结果的调用，未匹配且仅剩一个调用时使用其名称。每个结果对应一个调用，调用与结果之间的助手文本不影响关联，新一轮普通对话开始后重新建立关联；存在歧义或缺少调用记录时返回参数错误。函数参数和结果使用 JSON object，标量或数组结果封装为 `{"result":<VALUE>}`。
+函数调用响应 Part 为 `[name, Struct, callId?]`；上游没有给出 callId 时，代理补一个 `call_local_` 开头的本地 ID 返回给客户端，客户端带回结果时按它关联，发回上游时去掉；下一轮 function result 使用同一形状并原样带回 thought signature。tool result 显式提供函数名时保留该值；缺少名称时，先按 call ID 关联当前轮尚未返回结果的调用，未匹配且仅剩一个调用时使用其名称。每个结果对应一个调用，关联上的调用从待返回列表移除，调用与结果之间的助手文本不影响关联，新一轮普通对话开始后重新建立关联；存在歧义或缺少调用记录时返回参数错误。Build 通道按同样规则关联（同一轮两个调用时，第一个结果按 ID 关联后，第二个不带 ID 的结果关联剩下的调用；两个不带名称的结果对应同一个调用时同样返回参数错误）。函数参数和结果使用 JSON object，标量或数组结果封装为 `{"result":<VALUE>}`。
 
 ### Drive 上传与文件 Part
 
@@ -1094,7 +1106,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 动态路由的注册形状为 `GET /v1/files/{file}`、`GET /v1/files/{file}/content`、`DELETE /v1/files/{file}`、`GET /v1/videos/{video}`、`GET /v1/videos/{video}/content`、`POST /v1beta/models/{action}` 与 `GET /v1beta/operations/{operation}`；端点表中的 `{id}` 表示对应资源标识。
 
-公开 `/v1` 与 `/v1beta` 接受 `Authorization: Bearer`、`X-API-Key`、`X-Goog-API-Key` 或 `?key=`，读取优先级为 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`Authorization: Bearer`；配置为空时关闭本地 API key 校验，此时 `Origin` 为 `null` 或非 localhost、非回环地址的 http/https 页面请求返回 401，不带 `Origin` 的客户端与其他 scheme 不受限制。`/v1*` 响应允许任意 origin，允许 `GET/POST/PUT/DELETE/OPTIONS` 与 `Authorization`、`Content-Type`、`X-API-Key`、`X-Goog-API-Key`、`Anthropic-Version`、`Anthropic-Beta` headers。`/v1*` 请求体上限约为 684 MiB，可容纳 Base64 编码的 512 MiB 文件。`/api` 控制面要求来源地址为 loopback 且 `Host` 为 localhost 或回环地址，携带 Origin 时执行 same-origin 校验。全部响应携带 `X-Frame-Options: DENY`、`Content-Security-Policy: frame-ancestors 'none'`、`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。`GET /health` 返回 `{"status":"ok"}`。
+公开 `/v1` 与 `/v1beta` 从 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`api-key` 请求头与 `Authorization: Bearer` 读取 API key，任一来源与配置的密钥相同即通过，每个来源分别按常量时间比较；其他来源为空、是旧密钥或下游令牌都不影响结果（例如经 new-api 转发时 `?key=` 里是下游令牌、请求头里才是本服务密钥）。只支持配置一个密钥，不按逗号拆分。配置为空时关闭本地 API key 校验，此时 `Origin` 为 `null` 或非 localhost、非回环地址的 http/https 页面请求返回 401，不带 `Origin` 的客户端与其他 scheme 不受限制。`/v1*` 响应允许任意 origin，允许 `GET/POST/PUT/DELETE/OPTIONS` 与 `Authorization`、`Content-Type`、`X-API-Key`、`X-Goog-API-Key`、`Api-Key`、`Anthropic-Version`、`Anthropic-Beta` headers。`/v1*` 请求体上限约为 684 MiB，可容纳 Base64 编码的 512 MiB 文件。`/api` 控制面要求来源地址为 loopback 且 `Host` 为 localhost 或回环地址，携带 Origin 时执行 same-origin 校验。全部响应携带 `X-Frame-Options: DENY`、`Content-Security-Policy: frame-ancestors 'none'`、`X-Content-Type-Options: nosniff` 与 `Referrer-Policy: no-referrer`。`GET /health` 返回 `{"status":"ok"}`。
 
 | 控制能力 | 端点 |
 | --- | --- |
@@ -1397,12 +1409,12 @@ Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Stud
 | --- | --- | --- | --- | --- |
 | system | `system` / `developer` messages | `instructions` 和 system/developer message items | `system` 字符串或 text blocks | `systemInstruction` text parts |
 | text | 字符串或 text content part | 字符串、message item | 字符串或 text block | Part `text` |
-| image/document | Base64 data URL、`file_id` | `input_image`、`input_file` | base64 source 或 URL source | `inlineData`、`fileData` |
+| image/document | Base64 data URL、`file_id` | `input_image`、`input_file` | base64、URL 或 file source；document 另有 text 与 content source | `inlineData`、`fileData` |
 | audio input | `input_audio` Base64 | message content 中的 `input_audio` | base64 document source | `inlineData` |
 | YouTube | `video_url` / `input_video` | `input_video` | URL source | `fileData.fileUri` |
 | function call | assistant `tool_calls` | `function_call` item | `tool_use` block | `functionCall` Part |
 | function result | tool message | `function_call_output` item | `tool_result` block | `functionResponse` Part |
-| structured output | `response_format` | `text.format` | — | `responseMimeType` 与 response schema |
+| structured output | `response_format` | `text.format` | `output_config.format`、`output_format` | `responseMimeType` 与 response schema |
 | thinking | `reasoning_effort` 或 `reasoning.effort` | `reasoning.effort` | `thinking.budget_tokens`、`output_config.effort` | `thinkingConfig` |
 
 Gemini 附件与 `predictLongRunning` 的图片输入接受 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。同一别名对同时出现时，外层优先选择驼峰对象，内层优先选择非空驼峰值。
@@ -1426,20 +1438,21 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Gemini `safetySettings` | 映射 GenerateContent field 3；Build 发送 `safetySettings`；OpenAI Chat、Responses 与 Anthropic 没有对应字段，按默认值发送（非图片模型四类 `OFF`，图片模型不发送） |
 | OpenAI Chat `n` | 仅接受省略或 `1` |
 | OpenAI Chat `parallel_tool_calls` | `false` 时一次回复最多一个函数调用（见上文工具选择） |
-| OpenAI Chat `logprobs` / `logit_bias` | 分别接受省略或 `false`、省略或空对象 |
-| OpenAI Chat frequency / presence penalty | 仅接受 `0` |
+| OpenAI Chat `logprobs` / `top_logprobs` / `logit_bias` | 上游没有对应参数，任何取值都忽略；不返回对数概率，非流式 choice 的 `logprobs` 恒为 `null` |
+| OpenAI Chat frequency / presence penalty | 上游没有对应参数，任何取值都忽略（SillyTavern、LobeChat 等客户端常带非 0 值） |
 | OpenAI Chat function `strict` | `true` 时核对上游返回的参数（见上文工具选择） |
 | Responses `parallel_tool_calls` | 写入响应元数据；`false` 时一次回复最多一个函数调用 |
 | Responses `truncation` | 省略、`disabled` 或 `auto`；`auto` 在本地估算超过模型输入上限一半时按 CountTokens 权威计数，超出上限则从最早的完整轮次开始删除（不拆开工具调用与结果，最多计数 6 次），最新一轮本身超限时返回 400 |
 | Responses function `strict` | `true` 时核对上游返回的参数 |
 | Responses `store` | 省略或 `true` 时保存当前进程会话节点；`false` 只返回本次结果 |
-| Gemini frequency / presence penalty | 仅接受 `0` |
+| Gemini frequency / presence penalty | 上游没有对应参数，任何取值都忽略 |
 | Gemini `candidateCount` | 仅接受省略或 `1` |
-| Gemini `responseLogprobs` / `logprobs` | 分别接受省略或 `false`、省略或 `0` |
-| Gemini `googleSearchRetrieval` | 仅接受空对象；`dynamicRetrievalConfig` 返回 `400 INVALID_ARGUMENT` |
+| Gemini `responseLogprobs` / `logprobs` | 上游没有对应参数，任何取值都忽略，响应不含 `logprobsResult` |
+| Gemini `googleSearchRetrieval` | 接受任意对象，映射为 Google Search；`dynamicRetrievalConfig`（旧版动态检索阈值）没有对应参数，忽略 |
 | Anthropic `thinking` | `enabled` 携带 `budget_tokens`，支持 thinking budget 的模型直接写入预算，只支持 thinking level 的模型按 0、1024、8192 以内与更大预算分别使用 minimal、low、medium、high；`adaptive` 使用模型默认思考 |
 | Anthropic thinking capability | 模型既不支持 thinking budget 也不支持 thinking level 时形成 `invalid_request_error`；非流式返回 HTTP 400，流式返回 Anthropic error event |
 | Anthropic thinking type | `disabled` 按最低思考强度（minimal）生成，不返回思考正文（保留思考签名），优先于 `output_config.effort`；未知 type 返回 `400 invalid_request_error` |
+| Anthropic 结构化输出 | `output_config.format` 与 beta 写法 `output_format` 为 `{type:"json_schema",schema}`，两者同时出现时以 `output_config.format` 为准；映射为与 OpenAI `response_format` 相同的 JSON 模式与 response schema（Playground 无法编码的 Schema 同样降级，仍按 JSON 输出）；`schema` 为 `null` 或省略时只保留 JSON 模式；其他 `type` 返回 `400 invalid_request_error` |
 
 ### OpenAI Chat Completions
 
@@ -1456,11 +1469,11 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | `web_search_options` | 对象，开启 Google Search；`search_context_size`（low/medium/high）与 `user_location` 以系统指令提示传给上游（软约束） |
 | `temperature`、`top_p` | 可选采样值 |
 | `max_tokens`、`max_completion_tokens` | 后者优先 |
-| `frequency_penalty`、`presence_penalty` | 省略或 `0` |
+| `frequency_penalty`、`presence_penalty` | 接受任意值，忽略 |
 | `n` | 省略或 `1` |
 | `parallel_tool_calls` | `false` 时一次回复最多一个函数调用 |
-| `logprobs` | 省略或 `false` |
-| `logit_bias` | 省略、`null` 或空对象 |
+| `logprobs`、`top_logprobs` | 接受任意值，忽略；非流式 choice 的 `logprobs` 为 `null` |
+| `logit_bias` | 接受任意值，忽略 |
 | `stop` | string 或 string array；空字符串从条件中移除 |
 | `response_format` | `{type:"text"}`、`{type:"json_object"}` 或 `{type:"json_schema",json_schema:{schema}}` |
 | `reasoning_effort` | thinking effort |
@@ -1477,6 +1490,8 @@ message 字段为 `role`、`content`、可选 `name`、`tool_call_id`、`tool_ca
   "extra_content": {"google":{"thought_signature":"<SIGNATURE>"}}
 }
 ```
+
+历史 tool call 的 `arguments` 为空时按 `{}` 发送；不是 JSON object 时（被截断的 JSON、字符串、数组、`null` 等）包成 `{"_raw":"<原文>"}` 发送，不返回 400。Cline、Roo 等客户端回放一次被截断的调用后，会话照常继续。
 
 `content` 可以是 string 或 Part 数组。Part 字段：
 
@@ -1510,6 +1525,7 @@ function tool 使用 `{"type":"function","function":{"name","description","param
       "tool_calls": [],
       "annotations": []
     },
+    "logprobs": null,
     "finish_reason": "stop",
     "provider_finish_reason": "provider_19"
   }],
@@ -1522,7 +1538,7 @@ function tool 使用 `{"type":"function","function":{"name","description","param
 }
 ```
 
-`provider_model`、`provider_finish_reason`、`reasoning_content`、`tool_calls`、`annotations` 和 `usage` 仅在有对应数据时出现。annotation 形状为 `{"type":"url_citation","url_citation":{"url","title","start_index","end_index"}}`。
+`provider_model`、`provider_finish_reason`、`reasoning_content`、`tool_calls`、`annotations` 和 `usage` 仅在有对应数据时出现；`logprobs` 与官方一致始终出现且为 `null`（请求里的 `logprobs` 被忽略）。annotation 形状为 `{"type":"url_citation","url_citation":{"url","title","start_index","end_index"}}`。
 
 Chat SSE 顺序：
 
@@ -1555,7 +1571,7 @@ Chat SSE 顺序：
 | `metadata` | string-to-string object |
 | `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
 
-input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
+input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
 
 | type | 字段 |
 | --- | --- |
@@ -1672,7 +1688,8 @@ web search 发生时，search call item 排在 message 前；无 grounding query
 | `temperature`、`top_p`、`top_k` | 生成参数 |
 | `tools`、`tool_choice` | custom/server tools 与 auto/none/any/指定 tool |
 | `thinking` | `{type:"enabled",budget_tokens:<INT>}` 或 `{type:"adaptive"}` |
-| `output_config` | `{effort:"..."}` |
+| `output_config` | `{effort:"...",format:{type:"json_schema",schema}}`；`format` 为结构化输出（见上文生成参数映射） |
+| `output_format` | 结构化输出的 beta 写法 `{type:"json_schema",schema}`；与 `output_config.format` 同时出现时以后者为准 |
 
 message content 可以是 string 或 block 数组：
 
@@ -1681,26 +1698,35 @@ message content 可以是 string 或 block 数组：
 | `text` | `text` |
 | `thinking` | `thinking`、`signature` |
 | `redacted_thinking` | `data` |
-| `image`、`document` | `source:{type,media_type,data,url}` |
+| `image`、`document` | `source:{type,media_type,data,url,file_id,content}` |
 | `tool_use` | `id`、`name`、object `input` |
 | `tool_result` | `tool_use_id`、`content`、`is_error` |
-| `server_tool_use` | `id`、`name:"web_search"`、`input:{query}` |
-| `web_search_tool_result` | `tool_use_id`、`content:[{type:"web_search_result",url,title,encrypted_content,page_age}]` |
+| `server_tool_use` | `id`、`name`、`input`；web_search 为 `input:{query}` |
+| `web_search_tool_result` | `tool_use_id`、`content:[{type:"web_search_result",url,title,encrypted_content,page_age}]` 或失败对象 `{type:"web_search_tool_result_error",error_code}` |
+| `search_result` | `source`、`title`、`content`（字符串或 text、image block 数组） |
+| `web_fetch_tool_result`、`code_execution_tool_result`、`bash_code_execution_tool_result`、`text_editor_code_execution_tool_result`、`tool_search_tool_result` | `tool_use_id`、`content` |
 
-`image` / `document` 的 Base64 source 使用 `type:"base64"`、`media_type`、`data`；URL source 使用 `type:"url"` 与非空 `url`，省略 media type 时 image 默认 `image/*`、document 默认 `application/pdf`。`tool_result` 中的 Base64 图片、`document`（如 PDF）、MCP `resource` blob 与 `audio` 作为附件放在随后的用户消息中，原位置换成说明文字；`tool_result.is_error=true` 把合法 JSON content 包装为 `{"error":<CONTENT>}`；普通标量或数组结果包装为 `{"result":<CONTENT>}`。
+`image` / `document` 的 Base64 source 使用 `type:"base64"`、`media_type`、`data`；URL source 使用 `type:"url"` 与非空 `url`，省略 media type 时 image 默认 `image/*`、document 默认 `application/pdf`；file source 使用 `type:"file"` 与非空 `file_id`，按本服务 Files 接口上传的文件 ID 引用（与 OpenAI 的 `file_id` 相同），缺少 `file_id` 时返回 `invalid_request_error`。document 另外接受 text source（`type:"text"`，`data` 为纯文本文档正文，作为文本发送，空文本省略）与 content source（`type:"content"`，`content` 为字符串或 text、image 块数组）。客户端提供的 `search_result` 块以 `Search result: <title>` 加来源的文本发送，`content` 同样只接受字符串或 text、image 块。这两处嵌套内容出现其他块（如再嵌套的 `search_result`、`document` 或 `tool_use`）时返回 `invalid_request_error`，不再按普通内容块逐层递归转换：逐层递归时每层都要重新解析剩余的 JSON，几千层嵌套的请求体就会耗尽内存。
+
+其他服务端工具的历史调用与结果按文本保留上下文，不返回 400（会话从别的 Claude 渠道切过来时常带这些块）：非 web_search 的 `server_tool_use` 写成 `Server tool call <name>: <input>`；`web_fetch_tool_result` 写成 `Web fetch: <url>`，结果的 `content` 须为单个 `document` 块，按上文 document source 转换（文本、PDF 等），其他块返回 `invalid_request_error`，失败结果写成 `Web fetch failed: <error_code>`；code_execution 与 tool_search 的结果写成 `Server tool result <type>: <content>`。`container_upload` 等其他未知块仍返回 `invalid_request_error`。
+
+`tool_result` 中的 Base64 图片、`document`（如 PDF）、MCP `resource` blob 与 `audio` 作为附件放在随后的用户消息中，原位置换成说明文字；沿 `{"content": ...}` 对象向内查找附件最多 8 层，更深的部分原样按 JSON 发送（OpenAI Chat、Responses 与 Interactions 的工具结果同样如此）；`tool_result.is_error=true` 把合法 JSON content 包装为 `{"error":<CONTENT>}`；普通标量或数组结果包装为 `{"result":<CONTENT>}`。
 
 custom tool 为 `{name,description,input_schema}`，可选 `type:"custom"`；`strict:true` 时核对上游返回的参数，`cache_control`、`defer_loading` 等其他字段只影响 Anthropic 自身的缓存与加载，忽略。server tool 字段：
 
 | type | 必需 name |
 | --- | --- |
-| `web_search_20250305` | `web_search` |
+| `web_search_*`（任何日期版本，如 `web_search_20250305`） | `web_search` |
 | `image_search` | `image_search` |
-| `web_fetch_20250910` | `web_fetch` |
-| `code_execution_20250522`、`code_execution_20250825` | `code_execution` |
+| `web_fetch_*`（任何日期版本，如 `web_fetch_20250910`） | `web_fetch` |
+| `code_execution_*`（任何日期版本，如 `code_execution_20250522`、`code_execution_20250825`） | `code_execution` |
 | `url_context` | `url_context` |
 | `google_maps` | `google_maps` |
+| `tool_search_tool_*`（如 regex、bm25 两种工具搜索），以及 type 含 `toolset` 的定义（如 MCP toolset） | 忽略整个定义，不检查 name 与其他字段 |
 
-`web_search_20250305` 接受 `max_uses`，调用次数由上游决定，忽略；`allowed_domains`（`site:` 查询）、`blocked_domains`（`-site:` 查询）与 `user_location` 以系统指令提示传给上游（软约束）；`allowed_domains` 与 `blocked_domains` 同时非空时返回 `invalid_request_error`。`web_fetch_20250910` 的 `max_uses`、`citations`、`max_content_tokens` 上游没有对应参数，忽略；`allowed_domains`、`blocked_domains` 是显式的抓取范围限制，URL Context 无法遵守，非空时返回 `invalid_request_error`，不悄悄放开限制。
+server tool type 不区分大小写，`web_search_`、`web_fetch_`、`code_execution_` 按前缀识别：Anthropic 定期发布带新日期的版本，新版本无需等本服务更新。工具搜索只决定 Anthropic 侧按需加载哪些工具，MCP toolset 由 Anthropic 连接远端 MCP 服务器，上游都没有对应能力：这两类定义直接忽略，`defer_loading` 的函数照常全部声明。`bash_*`、`text_editor_*`、`memory_*` 等其他 type 仍返回 `invalid_request_error`（`unsupported tool type`）。
+
+`web_search_*` 接受 `max_uses`，调用次数由上游决定，忽略；`allowed_domains`（`site:` 查询）、`blocked_domains`（`-site:` 查询）与 `user_location` 以系统指令提示传给上游（软约束）；`allowed_domains` 与 `blocked_domains` 同时非空时返回 `invalid_request_error`。`web_fetch_*` 的 `max_uses`、`citations`、`max_content_tokens` 上游没有对应参数，忽略；`allowed_domains`、`blocked_domains` 是显式的抓取范围限制，URL Context 无法遵守，非空时返回 `invalid_request_error`，不悄悄放开限制。
 
 server tool 的 `cache_control`、`defer_loading` 等只影响 Anthropic 自身缓存与加载的字段以及未知字段忽略，与 custom tool 一致；`description` 或 `input_schema` 返回 `invalid_request_error`。tool choice 接受省略、`{"type":"auto"}`、`{"type":"none"}`、`{"type":"any"}` 与 `{"type":"tool","name"}`，以及 `disable_parallel_tool_use`。
 
@@ -1729,7 +1755,7 @@ content 输出 block 为 `text`、`thinking`、`redacted_thinking`、`tool_use`�
 
 Anthropic 响应中的媒体编码为 text block 中的 Markdown data URL，代码编码为 fenced text。Google Search 的每个去重查询生成一组 `server_tool_use` 和 `web_search_tool_result`，结果按 URL 去重，来源集合覆盖本次搜索的全部查询。`usage.server_tool_use.web_search_requests` 记录上游报告的去重查询数，`web_fetch_requests` 为 `0`。URL Context 等其余引用在末尾追加 `Sources:` Markdown 列表。
 
-搜索来源的 `encrypted_content` 由本服务生成，保存上游返回的 URL、标题与可用摘要。客户端在下一轮 assistant 消息中原样回传相互关联的两个搜索块；服务使用相同的 `PROXY_API_KEY` 恢复来源上下文。更换 API key 后，先前的搜索上下文返回 `400 invalid_request_error`。该字段用于本服务的多轮会话，和 Anthropic 服务的来源令牌分别使用。
+搜索来源的 `encrypted_content` 由本服务生成，保存上游返回的 URL、标题与可用摘要。客户端在下一轮消息中回传搜索块时，`server_tool_use` 与对应的 `web_search_tool_result` 合并为一个文本块 `Web search: <query>`，后面逐条列出结果的标题与 URL；摘要只从本服务用当前 `PROXY_API_KEY` 签发、且 URL 与结果一致的来源中恢复。以下情况都按文本保留，不返回 400：更换 API key 后或会话从别的 Claude 渠道切过来、`encrypted_content` 解不开（只保留标题与 URL）；调用与结果缺少对应的一半（只有结果时以 `Web search results:` 开头）；结果为 `error_code` 失败对象（写成 `Web search failed: <error_code>`）。`content` 既不是结果数组也不是带 `error_code` 的对象时仍返回 `invalid_request_error`。该字段用于本服务的多轮会话，和 Anthropic 服务的来源令牌分别使用。
 
 Anthropic SSE：
 
@@ -1741,13 +1767,14 @@ Anthropic SSE：
 | `content_block_stop` | `{type,index}` |
 | `message_delta` | `{type,delta:{stop_reason,stop_sequence,provider_finish_reason?},usage}` |
 | `message_stop` | `{type:"message_stop"}` |
+| `ping` | `{type:"ping"}`；10 秒没有语义事件时作为心跳发送 |
 | `error` | `{type:"error",error:{type,message}}` |
 
 delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signature_delta{signature}`、`input_json_delta{partial_json}`。thinking signature 在对应 thinking block 关闭前发送；redacted thinking 使用一个 start/stop block；tool_use 先发送空 input，再通过 `input_json_delta` 发送完整参数 JSON。搜索块在来源汇总后以完整的 start/stop block 输出，查询计数随最终 `message_delta.usage` 返回。
 
 ### Gemini Interactions
 
-`POST /v1beta/interactions` 与 `POST /v1/interactions` 接受同一创建请求，与其他公开端点一样必须携带 API key（`x-goog-api-key`、Bearer、`X-API-Key` 或 `key` 查询参数）；缺少或错误时两个入口都返回 Gemini 格式的 401 `UNAUTHENTICATED`。
+`POST /v1beta/interactions` 与 `POST /v1/interactions` 接受同一创建请求，与其他公开端点一样必须携带 API key（`x-goog-api-key`、Bearer、`X-API-Key`、`api-key` 或 `key` 查询参数，任一来源相同即通过）；缺少或错误时两个入口都返回 Gemini 格式的 401 `UNAUTHENTICATED`。
 
 ```json
 {
@@ -1806,20 +1833,22 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | --- | --- |
 | text/thought | `text`、可选 `thought`、`thoughtSignature` |
 | inline data | `inlineData:{mimeType,data}` |
-| file data | `fileData:{mimeType,fileUri,displayName}` |
+| file data | `fileData:{mimeType?,fileUri,displayName?}`；`fileUri` 必需，`mimeType` 可省略 |
 | function call | `functionCall:{id,name,args}` |
 | function response | `functionResponse:{id,name,response}` |
 | executable code | `executableCode:{language,code}` |
 | code result | `codeExecutionResult:{outcome,output,error}` |
 
+`fileData` 省略 `mimeType` 时（官方 Files API 的 `fileUri` 自带类型）按 `displayName` 的扩展名推断，推断不出再按 `fileUri` 路径（URL 取 path，不含查询参数）的扩展名推断，仍推断不出时留空；本服务上传的文件按文件 ID 发送，不依赖这里的类型，YouTube 等外部媒体 URL 按外部媒体处理。缺少 `fileUri` 时返回 400。
+
 `generationConfig` 全字段：
 
 | 类别 | 字段 |
 | --- | --- |
-| sampling | `temperature`、`topP`、`topK`、`frequencyPenalty`、`presencePenalty`、`seed` |
+| sampling | `temperature`、`topP`、`topK`、`seed`；`frequencyPenalty`、`presencePenalty` 接受任意值并忽略 |
 | media | `mediaResolution`（或 `media_resolution`）：`MEDIA_RESOLUTION_LOW`、`MEDIA_RESOLUTION_MEDIUM`、`MEDIA_RESOLUTION_HIGH`，不区分大小写；其他值在选号前返回 400 |
 | output limits | `candidateCount`、`maxOutputTokens`、`stopSequences` |
-| log probabilities | `responseLogprobs`、`logprobs` |
+| log probabilities | `responseLogprobs`、`logprobs` 接受任意值并忽略 |
 | structured output | `responseMimeType`、`responseSchema`、`responseJsonSchema` |
 | modalities | `responseModalities` |
 | image | `imageConfig:{aspectRatio,imageSize}` |
@@ -1827,7 +1856,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | transcription | `transcriptionConfig:{languageCodes,customVocabulary,wordTimestamps,speakerLabels,smartTranscription}` |
 | speech | `speechConfig` |
 
-`responseModalities` 只接受 `TEXT`、`IMAGE` 与 `AUDIO`，`AUDIO` 与其他模态互斥。图像模型省略模态或仅请求 `IMAGE` 时发送 `[IMAGE,TEXT]`；`imageConfig` 保留显式宽高比与尺寸，支持输出分辨率的模型省略图片配置时使用 `1K`。
+`responseModalities` 接受 `TEXT`、`IMAGE` 与 `AUDIO`，`AUDIO` 与其他模态互斥；枚举零值 `MODALITY_UNSPECIFIED`（SDK 序列化未赋值的枚举时会带上）忽略，只有它时与省略 `responseModalities` 相同，其他值返回 400。图像模型省略模态或仅请求 `IMAGE` 时发送 `[IMAGE,TEXT]`；`imageConfig` 保留显式宽高比与尺寸，支持输出分辨率的模型省略图片配置时使用 `1K`。
 
 `speechConfig.voiceConfig` 与 `multiSpeakerVoiceConfig` 互斥；单声音必须提供 `prebuiltVoiceConfig.voiceName`，每个多说话人条目必须提供非空 `speaker` 与 `voiceConfig.prebuiltVoiceConfig.voiceName`；`multiSpeakerVoiceConfig.mode` 可选 `VERBATIM` 或 `CONVERSATIONAL`。文本 part 的 `speechMetadata`（或 `speech_metadata`）`{speaker,style}` 写入 Part field 41。能力码 85 的模型把未带 speaker 的文本按行拆分，以配置中说话人名加冒号开头的行开始新分段，续行并入上一分段，首个说话人行之前的文本不发送；没有匹配行的文本原样发送。旧 TTS 模型把 `speechMetadata` 写回 `speaker: 台词` 前缀与 `style\n\n` 说明段落。`transcriptionConfig.smartTranscription=true` 与显式 true 的 `wordTimestamps` 或 `speakerLabels` 互斥；language code `detect` 归一为空自动检测。
 
@@ -1861,7 +1890,7 @@ tool group 字段：
 | maps | `googleMaps` |
 | image search | `imageSearch` |
 
-`googleSearch.searchTypes` 可以包含 `webSearch` 与 `imageSearch` 空对象；未提供或两项均未启用时默认 web search。`timeRangeFilter.startTime/endTime` 使用 RFC 3339 Nano。`googleSearchRetrieval` 只接受空对象。tool choice 位于 `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`，接受 `AUTO`、`NONE`、`ANY` 与 `VALIDATED`；`allowedFunctionNames` 限定可调用的函数（见上文工具选择）。
+`googleSearch.searchTypes` 可以包含 `webSearch` 与 `imageSearch` 空对象；未提供或两项均未启用时默认 web search。`timeRangeFilter.startTime/endTime` 使用 RFC 3339 Nano。`googleSearchRetrieval` 接受任意对象并映射为 Google Search，`dynamicRetrievalConfig`（旧版动态检索阈值）没有对应参数，忽略。tool choice 位于 `toolConfig.functionCallingConfig:{mode,allowedFunctionNames}`，接受 `AUTO`、`NONE`、`ANY` 与 `VALIDATED`，枚举零值 `MODE_UNSPECIFIED` 与省略相同（按 `AUTO`）；`allowedFunctionNames` 限定可调用的函数（见上文工具选择）。
 
 `:countTokens` 返回：
 
@@ -1914,7 +1943,7 @@ tool group 字段：
 
 `modelVersion` 为请求的模型名去掉 `-low`、`-128`、`-nothinking` 等后缀（与 OpenAI、Anthropic、Responses、Interactions 的 `model` 一致），流式的每一帧相同，不换成上游报告的实际服务模型版本；实际服务的模型与请求的不是同一系列时，管理日志另记 `served_model`（同一系列的版本号差异不记录）。
 
-`:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`，元素之间的空行用作心跳）。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage` 和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
+`:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`）。两种格式的心跳都是一个空行：JSON 数组元素之间的空白不影响解析，SSE 中的空行不构成事件，官方 SDK 与 new-api 都直接跳过。SSE 不使用 `: ping` 注释帧：google-genai Python SDK 把不以 `data: ` 开头的行当作分行的 JSON 错误体拼接解析，注释行会让整个流报 `UnknownApiResponseError`。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage`（与非流式相同，上游给出的结束说明优先，见第 5 节“Finish 与错误”）和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 
 ### Files、Transcribe 与媒体
 
@@ -2145,7 +2174,15 @@ setup 之后的客户端对象统一字段为 `type`、可选 `text`、`mime_typ
 | Anthropic | `message_start` | `content_block_start`、delta、`content_block_stop` | `message_delta.usage` | `message_stop` |
 | Gemini | candidate Part | `GenerateContentResponse` 增量 | 最后一帧 `usageMetadata` | 最后一帧 finish reason |
 
-上游语义事件间隔达到 10 秒时，四套流式协议发送 SSE 注释帧 `: ping` 并立即 flush。OpenAI Chat 先发送 assistant role chunk，Responses 先发送 `response.created` 与 `response.in_progress`，Anthropic 先发送 `message_start`；这些起始事件在账户调度期间即可到达客户端。Gemini 的首个帧来自上游语义事件或 `: ping`。
+上游语义事件间隔达到 10 秒时，各流式协议发送心跳并立即 flush：
+
+| 协议 | 心跳 |
+| --- | --- |
+| OpenAI Chat、OpenAI Responses、Gemini Interactions | SSE 注释帧 `: ping` |
+| Anthropic | 官方 ping 事件 `event: ping` 加 `data: {"type":"ping"}`；Anthropic SDK 识别并跳过，new-api 按官方事件转发 |
+| Gemini `:streamGenerateContent`（SSE 与 JSON 数组） | 一个空行 |
+
+OpenAI Chat 先发送 assistant role chunk，Responses 先发送 `response.created` 与 `response.in_progress`，Anthropic 先发送 `message_start`；这些起始事件在账户调度期间即可到达客户端。Gemini 的首个帧来自上游语义事件，之前只有心跳空行。
 
 Responses 的 `web_search_call` 由实际 grounding query 触发。搜索发生时，SSE 先输出 index 0 的 search call，再输出 index 1 的 message；模型未调用搜索时仅输出 message，并按正文事件逐块发送。上游在正文后失败时，已收到的正文 delta 位于 `response.failed` 之前。
 

@@ -26,8 +26,17 @@ type anthropicRequest struct {
 		BudgetTokens *int64 `json:"budget_tokens"`
 	} `json:"thinking"`
 	OutputConfig *struct {
-		Effort string `json:"effort"`
+		Effort string                 `json:"effort"`
+		Format *anthropicOutputFormat `json:"format"`
 	} `json:"output_config"`
+	// OutputFormat 为结构化输出的 beta 写法，与 output_config.format 同时出现时以后者为准
+	OutputFormat *anthropicOutputFormat `json:"output_format"`
+}
+
+// anthropicOutputFormat 为 output_config.format 与 output_format 的结构化输出格式
+type anthropicOutputFormat struct {
+	Type   string          `json:"type"`
+	Schema json.RawMessage `json:"schema"`
 }
 
 type anthropicMessage struct {
@@ -236,6 +245,9 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	if request.OutputConfig != nil && strings.TrimSpace(request.OutputConfig.Effort) != "" {
 		config.ReasoningEffort = request.OutputConfig.Effort
 	}
+	if err := applyAnthropicOutputFormat(&config, request.outputFormat()); err != nil {
+		return aistudio.GenerateRequest{}, err
+	}
 	// 关闭思考：AI Studio 的思考模型不能完全关闭（只支持思考预算的模型预算为 0 会被拒绝），
 	// 按最低强度生成，不返回思考正文（保留签名）；优先于 output_config.effort
 	if request.Thinking != nil && request.Thinking.Type == "disabled" {
@@ -246,6 +258,31 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 	return aistudio.GenerateRequest{
 		ID: id, Model: request.Model, System: system, Contents: contents, Config: config, Tools: tools,
 	}, nil
+}
+
+// outputFormat 返回请求的结构化输出格式：output_config.format 优先，其次 beta 写法 output_format
+func (request anthropicRequest) outputFormat() *anthropicOutputFormat {
+	if request.OutputConfig != nil && request.OutputConfig.Format != nil {
+		return request.OutputConfig.Format
+	}
+	return request.OutputFormat
+}
+
+// applyAnthropicOutputFormat 把 json_schema 结构化输出映射为与 OpenAI response_format、Gemini responseSchema 相同的
+// JSON 模式与 responseSchema（Schema 无法直接编码时同样降级，仍按 JSON 输出）。原先这两个字段被静默忽略，客户端拿到自由文本
+func applyAnthropicOutputFormat(config *aistudio.GenerationConfig, format *anthropicOutputFormat) error {
+	if format == nil {
+		return nil
+	}
+	if format.Type != "json_schema" {
+		return fmt.Errorf("unsupported output format type %q; expected json_schema", format.Type)
+	}
+	config.ResponseMIMEType = "application/json"
+	// schema 为 null 或省略时只保留 JSON 模式
+	if geminiRawObjectPresent(format.Schema) {
+		config.ResponseSchema = format.Schema
+	}
+	return nil
 }
 
 func anthropicSystemText(raw json.RawMessage) (string, error) {
@@ -320,12 +357,8 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 			Content   json.RawMessage `json:"content"`
 			IsError   bool            `json:"is_error"`
 			Signature string          `json:"signature"`
-			Source    *struct {
-				Type      string `json:"type"`
-				MediaType string `json:"media_type"`
-				Data      string `json:"data"`
-				URL       string `json:"url"`
-			} `json:"source"`
+			Source    json.RawMessage `json:"source"`
+			Title     string          `json:"title"`
 		}
 		if err := json.Unmarshal(rawBlock, &block); err != nil {
 			return nil, err
@@ -348,36 +381,11 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 			pendingSignature = block.Data
 		case "image", "document":
 			flushPendingSignature()
-			if block.Source == nil {
-				return nil, fmt.Errorf("%s source is required", block.Type)
+			media, err := anthropicSourceParts(block.Type, block.Source)
+			if err != nil {
+				return nil, err
 			}
-			switch block.Source.Type {
-			case "base64":
-				data, err := decodeBase64Flexible(block.Source.Data)
-				if err != nil {
-					return nil, fmt.Errorf("%s source data: %w", block.Type, err)
-				}
-				mediaType, data := normalizeImagePayload(block.Source.MediaType, data)
-				parts = append(parts, aistudio.Part{InlineData: &aistudio.Blob{MIME: mediaType, Data: data}})
-			case "url":
-				if media, ok := aistudio.ExternalMediaForURL(block.Source.URL); ok {
-					parts = append(parts, aistudio.Part{ExternalMedia: media})
-				} else {
-					mime := block.Source.MediaType
-					if mime == "" && block.Type == "image" {
-						mime = "image/*"
-					}
-					if mime == "" {
-						mime = "application/pdf"
-					}
-					if strings.TrimSpace(block.Source.URL) == "" {
-						return nil, fmt.Errorf("%s source URL is required", block.Type)
-					}
-					parts = append(parts, aistudio.Part{ExternalMedia: &aistudio.ExternalMedia{MIME: mime, URL: block.Source.URL}})
-				}
-			default:
-				return nil, fmt.Errorf("unsupported source type %q", block.Source.Type)
-			}
+			parts = append(parts, media...)
 		case "tool_use":
 			input := block.Input
 			if len(input) == 0 {
@@ -415,6 +423,27 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 				ID: block.ToolUseID, Content: content,
 			}})
 			parts = append(parts, media...)
+		case "search_result":
+			// 客户端提供的搜索结果块：来源与标题作为文本，正文按规范只含 text 与 image 块
+			flushPendingSignature()
+			var source string
+			_ = json.Unmarshal(block.Source, &source)
+			nested, err := anthropicInnerParts(block.Content)
+			if err != nil {
+				return nil, fmt.Errorf("search_result content: %w", err)
+			}
+			parts = append(parts, aistudio.Part{Text: "Search result: " + block.Title + "\n" + source})
+			parts = append(parts, nested...)
+		case "server_tool_use", "web_fetch_tool_result", "code_execution_tool_result", "bash_code_execution_tool_result",
+			"text_editor_code_execution_tool_result", "tool_search_tool_result":
+			// 其他服务端工具（web_fetch、code_execution、tool_search 等）的历史调用与结果：上游没有对应的历史格式，
+			// 转成文本保留上下文（web_search 历史已由 decodeAnthropicSearchHistory 改写）。会话从别的 Claude 渠道切过来时常带这些块
+			flushPendingSignature()
+			history, err := anthropicServerToolHistoryParts(block.Type, block.Name, block.Input, block.Content)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, history...)
 		default:
 			return nil, fmt.Errorf("unsupported content block type %q", block.Type)
 		}
@@ -423,12 +452,163 @@ func anthropicParts(raw json.RawMessage) ([]aistudio.Part, error) {
 	return parts, nil
 }
 
+// anthropicSourceParts 转换 image / document 块的 source：两种块都接受 base64、url 与 file（file_id 按已上传文件引用，
+// 与 OpenAI 的 file_id 相同）；document 另外接受 text（纯文本文档）与 content（由内容块组成的文档）
+func anthropicSourceParts(blockType string, raw json.RawMessage) ([]aistudio.Part, error) {
+	if !rawJSONConfigured(raw) {
+		return nil, fmt.Errorf("%s source is required", blockType)
+	}
+	var source struct {
+		Type      string          `json:"type"`
+		MediaType string          `json:"media_type"`
+		Data      string          `json:"data"`
+		URL       string          `json:"url"`
+		FileID    string          `json:"file_id"`
+		Content   json.RawMessage `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &source); err != nil {
+		return nil, fmt.Errorf("%s source: %w", blockType, err)
+	}
+	switch {
+	case source.Type == "base64":
+		data, err := decodeBase64Flexible(source.Data)
+		if err != nil {
+			return nil, fmt.Errorf("%s source data: %w", blockType, err)
+		}
+		mediaType, data := normalizeImagePayload(source.MediaType, data)
+		return []aistudio.Part{{InlineData: &aistudio.Blob{MIME: mediaType, Data: data}}}, nil
+	case source.Type == "url":
+		if media, ok := aistudio.ExternalMediaForURL(source.URL); ok {
+			return []aistudio.Part{{ExternalMedia: media}}, nil
+		}
+		mime := source.MediaType
+		if mime == "" && blockType == "image" {
+			mime = "image/*"
+		}
+		if mime == "" {
+			mime = "application/pdf"
+		}
+		if strings.TrimSpace(source.URL) == "" {
+			return nil, fmt.Errorf("%s source URL is required", blockType)
+		}
+		return []aistudio.Part{{ExternalMedia: &aistudio.ExternalMedia{MIME: mime, URL: source.URL}}}, nil
+	case source.Type == "file":
+		if strings.TrimSpace(source.FileID) == "" {
+			return nil, fmt.Errorf("%s source file_id is required", blockType)
+		}
+		return []aistudio.Part{{File: &aistudio.FileRef{ID: strings.TrimSpace(source.FileID), MIME: source.MediaType}}}, nil
+	case source.Type == "text" && blockType == "document":
+		if source.Data == "" {
+			return nil, nil
+		}
+		return []aistudio.Part{{Text: source.Data}}, nil
+	case source.Type == "content" && blockType == "document":
+		nested, err := anthropicInnerParts(source.Content)
+		if err != nil {
+			return nil, fmt.Errorf("document source content: %w", err)
+		}
+		return nested, nil
+	default:
+		return nil, fmt.Errorf("unsupported source type %q", source.Type)
+	}
+}
+
+// anthropicInnerParts 转换嵌在其他块里的内容（search_result 的 content、document 的 content source）：按 Anthropic 规范
+// 只含 text 与 image 块，字符串按文本处理，其他块返回错误。这里不调用 anthropicParts：嵌套块若再递归转换，
+// 每层都要重新解析并复制剩余的 JSON，几千层嵌套、约 300 KB 的请求体就要耗费数 GB 内存与数十秒；
+// image 的 source 不再含内容块，整个转换最多只解析固定的几层
+func anthropicInnerParts(raw json.RawMessage) ([]aistudio.Part, error) {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		if text == "" {
+			return nil, nil
+		}
+		return []aistudio.Part{{Text: text}}, nil
+	}
+	var blocks []struct {
+		Type   string          `json:"type"`
+		Text   string          `json:"text"`
+		Source json.RawMessage `json:"source"`
+	}
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, fmt.Errorf("content must be a string or block array")
+	}
+	parts := make([]aistudio.Part, 0, len(blocks))
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				parts = append(parts, aistudio.Part{Text: block.Text})
+			}
+		case "image":
+			media, err := anthropicSourceParts("image", block.Source)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, media...)
+		default:
+			return nil, fmt.Errorf("nested content only accepts text and image blocks, got %q", block.Type)
+		}
+	}
+	return parts, nil
+}
+
+// anthropicWebFetchDocument 转换 web_fetch 结果里的文档：按规范是单个 document 块，按 document 的 source 转换，
+// 不经 anthropicParts 递归（原因见 anthropicInnerParts）
+func anthropicWebFetchDocument(raw json.RawMessage) ([]aistudio.Part, error) {
+	var document struct {
+		Type   string          `json:"type"`
+		Source json.RawMessage `json:"source"`
+	}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		return nil, err
+	}
+	if document.Type != "document" {
+		return nil, fmt.Errorf("content must be a document block, got %q", document.Type)
+	}
+	return anthropicSourceParts("document", document.Source)
+}
+
+// anthropicServerToolHistoryParts 把服务端工具的历史调用或结果渲染为文本；web_fetch 结果里的文档照常转换（文本与 PDF 等附件），
+// 抓取失败时写明 error_code
+func anthropicServerToolHistoryParts(blockType string, name string, input json.RawMessage, content json.RawMessage) ([]aistudio.Part, error) {
+	switch blockType {
+	case "server_tool_use":
+		return []aistudio.Part{{Text: "Server tool call " + name + ": " + string(input)}}, nil
+	case "web_fetch_tool_result":
+		var result struct {
+			URL       string          `json:"url"`
+			ErrorCode string          `json:"error_code"`
+			Content   json.RawMessage `json:"content"`
+		}
+		if err := json.Unmarshal(content, &result); err != nil {
+			return nil, fmt.Errorf("web_fetch_tool_result content: %w", err)
+		}
+		if result.ErrorCode != "" {
+			return []aistudio.Part{{Text: "Web fetch failed: " + result.ErrorCode}}, nil
+		}
+		parts := []aistudio.Part{{Text: "Web fetch: " + result.URL}}
+		if rawJSONConfigured(result.Content) {
+			document, err := anthropicWebFetchDocument(result.Content)
+			if err != nil {
+				return nil, fmt.Errorf("web_fetch_tool_result content: %w", err)
+			}
+			parts = append(parts, document...)
+		}
+		return parts, nil
+	default:
+		return []aistudio.Part{{Text: "Server tool result " + blockType + ": " + string(content)}}, nil
+	}
+}
+
 func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.Tools, error) {
 	var mapped aistudio.Tools
 	for _, tool := range tools {
 		typeName := strings.ToLower(tool.Type)
+		// 服务端工具按类型前缀识别，web_search_*、web_fetch_*、code_execution_* 的任何日期版本都接受：
+		// Anthropic 会定期发布新版本（如 web_search_20260209），原先只认几个固定日期，其他版本一律返回 400
 		switch {
-		case typeName == "web_search_20250305":
+		case strings.HasPrefix(typeName, "web_search_"):
 			if err := validateAnthropicServerTool(tool, "web_search"); err != nil {
 				return aistudio.Tools{}, err
 			}
@@ -450,7 +630,7 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 				return aistudio.Tools{}, err
 			}
 			mapped.Google = appendUnique(mapped.Google, "image_search")
-		case typeName == "web_fetch_20250910":
+		case strings.HasPrefix(typeName, "web_fetch_"):
 			if err := validateAnthropicServerTool(tool, "web_fetch"); err != nil {
 				return aistudio.Tools{}, err
 			}
@@ -466,11 +646,14 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 				}
 			}
 			mapped.Google = appendUnique(mapped.Google, "url_context")
-		case typeName == "code_execution_20250522", typeName == "code_execution_20250825":
+		case strings.HasPrefix(typeName, "code_execution_"):
 			if err := validateAnthropicServerTool(tool, "code_execution"); err != nil {
 				return aistudio.Tools{}, err
 			}
 			mapped.Google = appendUnique(mapped.Google, "code_execution")
+		case strings.HasPrefix(typeName, "tool_search_tool_"), strings.Contains(typeName, "toolset"):
+			// 工具搜索（tool_search_tool_regex_* / _bm25_*）只决定 Anthropic 侧按需加载哪些工具，MCP toolset 由 Anthropic 连接
+			// 远端 MCP 服务器，上游都没有对应能力，忽略；被延迟加载的函数照常全部声明
 		case typeName == "url_context":
 			if err := validateAnthropicServerTool(tool, "url_context"); err != nil {
 				return aistudio.Tools{}, err
@@ -745,7 +928,7 @@ type anthropicStreamWriter struct {
 }
 
 func (s *server) streamAnthropic(r *http.Request, writer *anthropicStreamWriter, events <-chan aistudio.Event) {
-	result, err := consumeStreamEvents(r.Context(), events, writer.live, func() error { return writeSSEHeartbeat(writer.w) })
+	result, err := consumeStreamEvents(r.Context(), events, writer.live, writer.heartbeat)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = writer.error(err)
@@ -757,6 +940,11 @@ func (s *server) streamAnthropic(r *http.Request, writer *anthropicStreamWriter,
 
 func (writer *anthropicStreamWriter) emit(eventType string, payload any) error {
 	return writeSSE(writer.w, eventType, payload)
+}
+
+// heartbeat 按官方格式发送 ping 事件保持连接：Anthropic SDK 识别并跳过 ping，new-api 按官方事件转发
+func (writer *anthropicStreamWriter) heartbeat() error {
+	return writer.emit("ping", map[string]string{"type": "ping"})
 }
 
 func (writer *anthropicStreamWriter) start() error {

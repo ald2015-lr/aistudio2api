@@ -80,6 +80,21 @@ func requestOutcome(entry api.AccessLog) (string, string, string) {
 	return "completed", "INFO", "请求完成"
 }
 
+// upstreamFinishMessageLimit 为管理日志里上游结束说明的最大字数：MALFORMED_FUNCTION_CALL 的说明会带上整段出错的调用
+const upstreamFinishMessageLimit = 2000
+
+// upstreamFinishLog 返回上游结束说明（finishMessage）的管理日志级别与内容：正常结束为 INFO，其余为 WARN；过长的说明截断
+func upstreamFinishLog(reason string, message string) (string, string) {
+	level := "WARN"
+	if strings.EqualFold(reason, "stop") || strings.EqualFold(reason, "stop_sequence") {
+		level = "INFO"
+	}
+	if runes := []rune(message); len(runes) > upstreamFinishMessageLimit {
+		message = string(runes[:upstreamFinishMessageLimit]) + "…"
+	}
+	return level, "上游结束说明 | 结束原因=" + reason + " | 说明=" + message
+}
+
 // finishedRequestLog 投影请求结果日志，失败且没有错误信息时记录 HTTP 状态
 func finishedRequestLog(entry api.AccessLog) (*api.RequestLog, string, string) {
 	data := requestLogData(entry)

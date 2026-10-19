@@ -600,7 +600,7 @@ func setAccessLogResponseError(w http.ResponseWriter, message string) {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Goog-API-Key, Anthropic-Version, Anthropic-Beta")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Key, X-Goog-API-Key, Api-Key, Anthropic-Version, Anthropic-Beta")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -702,8 +702,7 @@ func authMiddleware(requiredKey func() string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		provided := requestAPIKey(r)
-		if subtle.ConstantTimeCompare([]byte(provided), []byte(key)) != 1 {
+		if !requestAPIKeyMatches(r, key) {
 			writeAuthError(w, r)
 			return
 		}
@@ -713,20 +712,36 @@ func authMiddleware(requiredKey func() string, next http.Handler) http.Handler {
 	})
 }
 
-func requestAPIKey(r *http.Request) string {
-	if key := strings.TrimSpace(r.URL.Query().Get("key")); key != "" {
-		return key
+// apiKeyHeaders 为直接携带本服务 API key 的请求头（Authorization 另按 Bearer 读取）。排查记录按同一份列表隐藏请求头，
+// 新增密钥来源时两处不会漏改：api-key 成为有效凭据后曾因排查记录未隐藏它而把密钥明文写进 logs/trace/
+var apiKeyHeaders = []string{"X-Goog-API-Key", "X-API-Key", "Api-Key"}
+
+// requestAPIKeyMatches 判断 ?key=、X-Goog-API-Key、X-API-Key、api-key 与 Authorization Bearer 中是否有任一与配置的密钥相同。
+// 原先只看优先级最高的一个来源：SillyTavern 经 new-api 转发时 ?key= 里是下游的旧令牌、请求头里才是正确密钥，结果返回 401，
+// 整个渠道被自动停用。每个来源都按常量时间比较
+func requestAPIKeyMatches(r *http.Request, key string) bool {
+	expected := []byte(key)
+	matched := false
+	candidates := make([]string, 0, len(apiKeyHeaders)+2)
+	candidates = append(candidates, r.URL.Query().Get("key"))
+	for _, name := range apiKeyHeaders {
+		candidates = append(candidates, r.Header.Get(name))
 	}
-	if key := strings.TrimSpace(r.Header.Get("X-Goog-API-Key")); key != "" {
-		return key
+	candidates = append(candidates, bearerToken(r.Header.Get("Authorization")))
+	for _, candidate := range candidates {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" && subtle.ConstantTimeCompare([]byte(candidate), expected) == 1 {
+			matched = true
+		}
 	}
-	if key := strings.TrimSpace(r.Header.Get("X-API-Key")); key != "" {
-		return key
-	}
-	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
-	scheme, key, ok := strings.Cut(authorization, " ")
+	return matched
+}
+
+// bearerToken 返回 Authorization: Bearer 的凭据，其他认证方式返回空
+func bearerToken(authorization string) string {
+	scheme, token, ok := strings.Cut(strings.TrimSpace(authorization), " ")
 	if ok && strings.EqualFold(scheme, "Bearer") {
-		return strings.TrimSpace(key)
+		return strings.TrimSpace(token)
 	}
 	return ""
 }

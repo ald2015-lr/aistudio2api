@@ -163,3 +163,72 @@ func TestEncodeJSONSchemaBooleanItemsRespectDepth(t *testing.T) {
 		t.Fatalf("期望嵌套层数错误，得到 %v", err)
 	}
 }
+
+// TestEncodeJSONSchemaCanonicalIntegers 整数字段的字符串写法（"5"）与零小数写法（5.0）按整数编码，
+// 不再因解析失败让整个 Schema 降级；带小数或不是数字的写法仍报错
+func TestEncodeJSONSchemaCanonicalIntegers(t *testing.T) {
+	wire, err := encodeJSONSchema(json.RawMessage(`{"type":"array","items":{"type":"string","minLength":"2","maxLength":10.0},"minItems":"1","maxItems":5.0}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire[21] != int64(1) || wire[20] != int64(5) {
+		t.Fatalf("minItems=%#v maxItems=%#v，期望 1 与 5", wire[21], wire[20])
+	}
+	items := wire[5].([]any)
+	if items[12] != int64(2) || items[13] != int64(10) {
+		t.Fatalf("items minLength=%#v maxLength=%#v，期望 2 与 10", items[12], items[13])
+	}
+	wire, err = encodeJSONSchema(json.RawMessage(`{"type":"object","properties":{"a":{"type":"string"}},"minProperties":"0","maxProperties":"3"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire[8] != int64(0) || wire[9] != int64(3) {
+		t.Fatalf("minProperties=%#v maxProperties=%#v，期望 0 与 3", wire[8], wire[9])
+	}
+	for _, raw := range []string{
+		`{"type":"string","maxLength":"5.5"}`,
+		`{"type":"string","maxLength":2.5}`,
+		`{"type":"string","maxLength":"abc"}`,
+		`{"type":"string","maxLength":"-1"}`,
+		`{"type":"string","maxLength":1e300}`,
+	} {
+		if _, err := encodeJSONSchema(json.RawMessage(raw)); err == nil {
+			t.Fatalf("%s 应返回错误", raw)
+		}
+	}
+	// 函数参数里的字符串整数不再降级编码（降级时说明里会附上完整 Schema）
+	declaration, err := encodeFunctionDeclaration(FunctionDeclaration{Name: "list", Parameters: json.RawMessage(`{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"maxItems":"3"}}}`)})
+	if err != nil || declaration[1] != nil {
+		t.Fatalf("字符串整数不应触发降级: wire=%v err=%v", declaration, err)
+	}
+}
+
+// TestEncodeJSONSchemaTypeUnspecified type 为 TYPE_UNSPECIFIED 时按没有声明 type 处理，由结构推断类型
+func TestEncodeJSONSchemaTypeUnspecified(t *testing.T) {
+	for _, test := range []struct {
+		raw  string
+		code int64
+	}{
+		{raw: `{"type":"TYPE_UNSPECIFIED","properties":{"a":{"type":"string"}}}`, code: 6},
+		{raw: `{"type":"TYPE_UNSPECIFIED","items":{"type":"STRING"}}`, code: 5},
+		{raw: `{"type":"type_unspecified"}`, code: 1},
+		{raw: `{"type":"TYPE_UNSPECIFIED","const":"x"}`, code: 1},
+		{raw: `{"anyOf":[{"type":"TYPE_UNSPECIFIED"},{"type":"integer"}]}`, code: 3},
+	} {
+		wire, err := encodeJSONSchema(json.RawMessage(test.raw))
+		if err != nil {
+			t.Fatalf("%s: %v", test.raw, err)
+		}
+		if wire[0] != test.code {
+			t.Fatalf("%s: type=%#v，期望 %d", test.raw, wire[0], test.code)
+		}
+	}
+	wire, err := encodeJSONSchema(json.RawMessage(`{"type":"object","properties":{"a":{"type":"TYPE_UNSPECIFIED"}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	property := wire[6].([]any)[0].([]any)[1].([]any)
+	if property[0] != int64(1) {
+		t.Fatalf("属性 type=%#v，期望按未声明推断为 string", property[0])
+	}
+}

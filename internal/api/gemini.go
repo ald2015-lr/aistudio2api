@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"sort"
 	"strings"
@@ -144,11 +145,7 @@ type geminiGenerationConfig struct {
 	Temperature         *float64                   `json:"temperature"`
 	TopP                *float64                   `json:"topP"`
 	TopK                *int                       `json:"topK"`
-	FrequencyPenalty    *float64                   `json:"frequencyPenalty"`
-	PresencePenalty     *float64                   `json:"presencePenalty"`
 	CandidateCount      *int64                     `json:"candidateCount"`
-	ResponseLogprobs    *bool                      `json:"responseLogprobs"`
-	Logprobs            *int64                     `json:"logprobs"`
 	MaxOutputTokens     *int64                     `json:"maxOutputTokens"`
 	StopSequences       []string                   `json:"stopSequences"`
 	ResponseMIMEType    string                     `json:"responseMimeType"`
@@ -452,21 +449,11 @@ func (config geminiGenerationConfig) mediaResolution() string {
 	return config.MediaResolutionSnake
 }
 
+// validate 只拒绝无法遵守的多候选；frequencyPenalty、presencePenalty、responseLogprobs、logprobs
+// 上游没有对应参数，忽略（与 OpenAI 协议一致，原先非 0 时整个请求返回 400）
 func (config geminiGenerationConfig) validate() error {
-	if config.FrequencyPenalty != nil && *config.FrequencyPenalty != 0 {
-		return fmt.Errorf("generationConfig.frequencyPenalty must be 0")
-	}
-	if config.PresencePenalty != nil && *config.PresencePenalty != 0 {
-		return fmt.Errorf("generationConfig.presencePenalty must be 0")
-	}
 	if config.CandidateCount != nil && *config.CandidateCount != 1 {
 		return fmt.Errorf("generationConfig.candidateCount must be 1")
-	}
-	if config.ResponseLogprobs != nil && *config.ResponseLogprobs {
-		return fmt.Errorf("generationConfig.responseLogprobs must be false")
-	}
-	if config.Logprobs != nil && *config.Logprobs != 0 {
-		return fmt.Errorf("generationConfig.logprobs must be 0")
 	}
 	return nil
 }
@@ -515,9 +502,15 @@ func mapGeminiResponseModalities(input []string) ([]aistudio.ResponseModality, e
 		switch modality {
 		case aistudio.ResponseModalityText, aistudio.ResponseModalityImage, aistudio.ResponseModalityAudio:
 			modalities = append(modalities, modality)
+		case "MODALITY_UNSPECIFIED":
+			// 枚举默认值（SDK 序列化未赋值的枚举时会带上）按未设置处理
 		default:
 			return nil, fmt.Errorf("unsupported response modality %q", raw)
 		}
+	}
+	// 只有 MODALITY_UNSPECIFIED 时与省略 responseModalities 相同，使用模型默认输出模态
+	if len(modalities) == 0 && len(input) > 0 {
+		return nil, nil
 	}
 	return modalities, nil
 }
@@ -615,9 +608,14 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			})
 		case file != nil:
 			uri := file.URI()
+			if uri == "" {
+				return nil, false, fmt.Errorf("fileData requires fileUri")
+			}
+			// mimeType 可省略（官方 Files API 的 fileUri 自带类型）：按 displayName 或 fileUri 的扩展名推断，推断不出时留空，
+			// 已上传文件按文件 ID 发送，不依赖这里的类型
 			mime := file.MIME()
-			if uri == "" || mime == "" {
-				return nil, false, fmt.Errorf("fileData requires fileUri and mimeType")
+			if mime == "" {
+				mime = mimeForFilename(file.DisplayName, mimeForFilename(geminiFileURIPath(uri), ""))
 			}
 			if media, ok := aistudio.ExternalMediaForURL(uri); ok {
 				parts = append(parts, aistudio.Part{ExternalMedia: media, ThoughtSignature: part.ThoughtSignature})
@@ -784,7 +782,7 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 				}
 			}
 		}
-		retrieval, err := geminiEmptyObjectPresent(group.GoogleSearchRetrieval, "googleSearchRetrieval")
+		retrieval, err := geminiObjectPresent(group.GoogleSearchRetrieval, "googleSearchRetrieval")
 		if err != nil {
 			return aistudio.Tools{}, err
 		}
@@ -806,7 +804,8 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 	}
 	toolConfig := aistudio.ToolConfig{AllowedFunctionNames: config.FunctionCallingConfig.AllowedFunctionNames}
 	switch strings.ToUpper(config.FunctionCallingConfig.Mode) {
-	case "", "AUTO":
+	case "", "AUTO", "MODE_UNSPECIFIED":
+		// MODE_UNSPECIFIED 是枚举默认值，与省略相同
 		toolConfig.Mode = "auto"
 	case "ANY":
 		toolConfig.Mode = "required"
@@ -821,7 +820,9 @@ func mapGeminiTools(groups []geminiToolGroup, config geminiToolConfig) (aistudio
 	return mapped, nil
 }
 
-func geminiEmptyObjectPresent(raw json.RawMessage, field string) (bool, error) {
+// geminiObjectPresent 判断字段是否为非 null 的 JSON 对象。googleSearchRetrieval 的 dynamicRetrievalConfig
+// （旧版动态检索阈值）没有对应参数，照常映射为 Google Search（原先只接受空对象，带配置时返回 400）
+func geminiObjectPresent(raw json.RawMessage, field string) (bool, error) {
 	if !geminiRawObjectPresent(raw) {
 		return false, nil
 	}
@@ -829,10 +830,15 @@ func geminiEmptyObjectPresent(raw json.RawMessage, field string) (bool, error) {
 	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
 		return false, fmt.Errorf("%s must be an object", field)
 	}
-	if len(object) != 0 {
-		return false, fmt.Errorf("%s only accepts an empty object", field)
-	}
 	return true, nil
+}
+
+// geminiFileURIPath 返回 fileUri 中用于推断类型的路径部分：URL 取 path（不含查询参数），其他写法原样返回
+func geminiFileURIPath(uri string) string {
+	if parsed, err := url.Parse(uri); err == nil && parsed.Scheme != "" && parsed.Path != "" {
+		return parsed.Path
+	}
+	return uri
 }
 
 func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest) {
@@ -880,7 +886,7 @@ func buildGeminiResponse(request aistudio.GenerateRequest, result generationResu
 		"content": map[string]any{"role": "model", "parts": geminiOutputParts(result)},
 		"index":   0,
 	}
-	setGeminiFinish(candidate, result.finishReason)
+	setGeminiFinish(candidate, result.finishReason, result.events)
 	if result.grounding != nil {
 		candidate["groundingMetadata"] = geminiGroundingMetadata(*result.grounding)
 	} else if len(result.citations) > 0 {
@@ -1176,14 +1182,28 @@ func geminiFinishReason(reason string) string {
 	}
 }
 
-func setGeminiFinish(candidate map[string]any, reason string) {
+// setGeminiFinish 写入终止原因；上游给出 finishMessage 时原样作为 finishMessage，
+// 没有时只为 missing_thought_signature 与无法映射的 provider_* 原因补一段说明
+func setGeminiFinish(candidate map[string]any, reason string, events []aistudio.Event) {
 	candidate["finishReason"] = geminiFinishReason(reason)
 	normalized := strings.ToLower(strings.TrimSpace(reason))
-	if normalized == "missing_thought_signature" {
+	if message := upstreamFinishMessage(events); message != "" {
+		candidate["finishMessage"] = message
+	} else if normalized == "missing_thought_signature" {
 		candidate["finishMessage"] = "Missing thought signature"
 	} else if strings.HasPrefix(normalized, "provider_") {
 		candidate["finishMessage"] = "AI Studio finish reason " + strings.TrimPrefix(normalized, "provider_")
 	}
+}
+
+// upstreamFinishMessage 返回最后一个终止事件携带的上游 finishMessage，没有时为空
+func upstreamFinishMessage(events []aistudio.Event) string {
+	for index := len(events) - 1; index >= 0; index-- {
+		if events[index].Kind == aistudio.EventFinish {
+			return events[index].FinishMessage
+		}
+	}
+	return ""
 }
 
 func geminiUsage(usage *aistudio.Usage) map[string]any {
@@ -1238,11 +1258,10 @@ func (writer *geminiChunkWriter) chunk(payload any) error {
 	return http.NewResponseController(writer.w).Flush()
 }
 
-// heartbeat 保持连接：JSON 数组元素之间的空白不影响解析
+// heartbeat 保持连接，两种格式都只写一个换行：JSON 数组元素之间的空白不影响解析；SSE 下空行不构成事件，
+// 官方 SDK 与 new-api 都直接跳过。SSE 注释 ": ping" 不能用：google-genai Python SDK 把不以 "data: " 开头的行
+// 当作分行的 JSON 错误体拼接解析，注释行会被当成 JSON 解码失败，整个流报 UnknownApiResponseError
 func (writer *geminiChunkWriter) heartbeat() error {
-	if writer.sse {
-		return writeSSEHeartbeat(writer.w)
-	}
 	if _, err := io.WriteString(writer.w, "\n"); err != nil {
 		return err
 	}
@@ -1340,7 +1359,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	// 最后一块同样报告请求的模型名（见 responseModel），不换成上游报告的实际服务模型版本
 	model := responseModel(request)
 	candidate := map[string]any{"index": 0}
-	setGeminiFinish(candidate, result.finishReason)
+	setGeminiFinish(candidate, result.finishReason, result.events)
 	final := map[string]any{
 		"responseId": request.ID, "modelVersion": model,
 		"candidates": []any{candidate},

@@ -173,6 +173,14 @@ ERROR  account@example.com  WAA Worker 停止失败 | PID=18240 | 耗时=10.002s
 
 `request.state` 区分 `running`、`completed`、`tool_calls`、`limited`、`blocked`、`failed` 和 `cancelled`。策略终止保留 HTTP `200` 并显示原始 `finish_reason`；达到输出上限时显示 `max_tokens`。未知终止原因保留为 `provider_<code>`。
 
+上游在终止时给出结束说明（Gemini API 的 `finishMessage`，Playground 与 Build 都会解码；例如 `MALFORMED_FUNCTION_CALL` 时写明出错的调用）时，请求时间线另写一条进度 `上游结束说明 | 结束原因=<reason> | 说明=<message>`，排查时不用再抓原始响应。结束原因为 `stop` 或 `stop_sequence` 时级别为 INFO，其余为 WARN；说明超过 2000 字时截断并以 `…` 结尾。这一行同样进入排查记录（`/trace/`）的 `timeline`；`request.finished` 的字段不变。说明另外作为 Gemini 响应的 `finishMessage` 返回，其他协议不携带（见 [protocol.md](protocol.md)）。
+
+```text
+WARN  account@example.com  上游结束说明 | 结束原因=malformed_function_call | 说明=<上游说明>
+```
+
+上游拒绝当前输入（prompt feedback）并给出拦截说明（`blockReasonMessage`）时，`request.error` 在原因后附上这段说明，例如 `AI Studio 拒绝当前输入: prohibited_content: <上游说明>`；没有说明时只有原因。客户端收到的错误消息仍按原因生成官方措辞，不含这段说明。
+
 控制台每行是一条独立 JSON 事件，请求数据与中文摘要分离：
 
 ```json
@@ -265,14 +273,24 @@ WARN  account@example.com  事件流停顿 | 模型=gemini-3.7-flash | 已等待
 INFO  account@example.com  事件流恢复 | 模型=gemini-3.7-flash | 停顿=1m31.208s | 当前事件=reasoning
 ```
 
-所有流式公开协议在连续 10 秒没有语义事件时发送 SSE 注释帧：
+流式公开协议在连续 10 秒没有语义事件时发送心跳，格式按协议不同。OpenAI Chat、OpenAI Responses 与 Gemini Interactions 发送 SSE 注释帧：
 
 ```text
 : ping
 
 ```
 
-SSE 客户端把该帧作为连接存活信号，正文、推理和 usage 继续使用各协议的 `data` 或命名事件。Anthropic 在调用生成服务前发送起始事件；OpenAI Chat 与 Responses 在取得生成事件流后发送起始事件。
+Anthropic 按官方格式发送 ping 事件（Anthropic SDK 识别并跳过，new-api 按官方事件转发）：
+
+```text
+event: ping
+data: {"type":"ping"}
+
+```
+
+Gemini `:streamGenerateContent` 在 SSE（`alt=sse`）与 JSON 数组两种格式下都只写一个空行：SSE 中的空行不构成事件，JSON 数组元素之间的空白不影响解析。google-genai Python SDK 会把 `: ping` 注释行当作 JSON 解析而报 `UnknownApiResponseError`，所以 Gemini 不用注释帧。
+
+客户端把心跳作为连接存活信号，正文、推理和 usage 继续使用各协议的 `data` 或命名事件。Anthropic 在调用生成服务前发送起始事件；OpenAI Chat 与 Responses 在取得生成事件流后发送起始事件。
 
 ## 账户事件
 

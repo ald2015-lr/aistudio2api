@@ -214,7 +214,7 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 | 只有签名 | `text: ""` |
 
 - thought signature 写入 Part 的 `thoughtSignature`；函数调用没有签名时写 `skip_thought_signature_validator`
-- function result 缺少名称时，按 call ID 关联当前轮尚未返回结果的调用，未匹配且只剩一个调用时使用其名称
+- function result 与 Playground 的关联规则相同：先按 call ID 关联当前轮尚未返回结果的调用，未匹配且只剩一个待返回调用、结果不带名称或名称与它相同时关联该调用；缺少名称时补上调用的名称，关联上的调用从待返回列表移除。同一轮两个调用时，第一个结果按 ID 关联后，第二个不带 ID 的结果关联剩下的调用；两个不带名称的结果对应同一个调用时返回参数错误
 - 函数参数与结果是 JSON 对象时原样写入，其他 JSON 值封装为 `{"result":<VALUE>}`
 - 代码执行结果的 outcome 不是 `OUTCOME_OK` 时 `output` 写错误文本
 
@@ -222,7 +222,7 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 
 | 工具 | Gemini API |
 | --- | --- |
-| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`，JSON Schema 原样发送 |
+| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`，JSON Schema 原样发送，只为 `required` 列出而 `properties` 没有定义的属性补上 `{}`（上游否则以 `property is not defined` 拒绝；超过 1 MiB 的 Schema 不补，不需要补齐时发送原始字节，规则见 [protocol.md](protocol.md) 的 Schema 归一化） |
 | Google Search、Image Search | `{"googleSearch":{...}}`；请求 Image Search 时带 `searchTypes {imageSearch, webSearch?}`；时间范围写 `timeRangeFilter {startTime, endTime}`（RFC 3339 UTC） |
 | Code Execution | `{"codeExecution":{}}` |
 | URL Context | `{"urlContext":{}}` |
@@ -248,7 +248,7 @@ thinking level 由 Playground 枚举换算：Low=`LOW`、Medium=`MEDIUM`、High=
 
 TTS 模型带 `speech_metadata` 能力时，`说话人: 台词` 文本按多说话人配置拆成带 `speechMetadata` 的分段；其他 TTS 模型把分段的说话人与风格折叠回台词文本。Build 代理请求的 `multiSpeakerVoiceConfig` 只含 `speakerVoiceConfigs`，带 `mode` 的请求走 Playground。
 
-Playground 私有字段在 Build 请求中不发送：账户时区、GenerateContent 与 generation config 的固定槽、可设置分辨率图片模型的默认工具槽。不等于 1 的 `candidateCount` 与 logprobs 由公开适配器拒绝。
+Playground 私有字段在 Build 请求中不发送：账户时区、GenerateContent 与 generation config 的固定槽、可设置分辨率图片模型的默认工具槽。不等于 1 的 `candidateCount` 由公开适配器拒绝；penalty 与 logprobs 参数由公开适配器忽略，不发送。
 
 ## 5. 响应、终止与 usage
 
@@ -266,14 +266,15 @@ Playground 私有字段在 Build 请求中不发送：账户时区、GenerateCon
 | `citationMetadata.citationSources` | citation（`uri`、`title`、`startIndex`、`endIndex`） |
 | `groundingMetadata` | grounding |
 | `usageMetadata` | usage |
-| `finishReason` | usage 与 finish |
+| `finishReason` | usage 与 finish；同一 candidate 的 `finishMessage` 作为 finish 的结束说明 |
 
 - Part 的 `thoughtSignature` 附在该 Part 产生的事件上
 - 带 `thought: true` 的 `inlineData` 是图片模型思考过程中的草图，不作为输出媒体
 - `groundingMetadata` 读取 `webSearchQueries`、`searchEntryPoint {renderedContent, sdkBlob}`、`groundingChunks` 的 `web`、`retrievedContext`、`maps`（`uri`、`title`、`text`、`placeId`）、`groundingSupports`（segment 的 `partIndex`、`startIndex`、`endIndex`、`text`，`groundingChunkIndices`，`confidenceScores`）与 `googleMapsWidgetContextToken`
 - `usageMetadata` 的 `totalTokenCount` 大于 0 时记录：`promptTokenCount` 为输入，`candidatesTokenCount` 为输出，`thoughtsTokenCount` 为思考，`toolUsePromptTokenCount` 为工具；缺少 `candidatesTokenCount` 时输出为总数减去其余三项
 - 第一次出现 `finishReason` 时先发出最近的 usage，再发出 finish；终止原因为去掉 `FINISH_REASON_` 前缀后的小写枚举名，与 Playground 的规范终止原因一致，`UNSPECIFIED` 为 `unspecified`
-- 没有 candidate 且带 `promptFeedback.blockReason` 时返回 prompt feedback 错误，原因为去掉 `BLOCK_REASON_` 前缀的小写枚举名
+- 没有 candidate 且带 `promptFeedback.blockReason` 时返回 prompt feedback 错误，原因为去掉 `BLOCK_REASON_` 前缀的小写枚举名；`promptFeedback.blockReasonMessage` 作为拦截说明附在内部错误与管理日志里，公开错误消息不含这段原文
+- candidate 的 `finishMessage`（上游对结束原因的说明）去掉首尾空白后随 finish 事件保留：写进管理日志的 `上游结束说明`，并作为 Gemini 响应的 `finishMessage` 返回
 - candidate 数量不是 1、正文不是 JSON 或 Base64 无效时返回带路径的协议错误；流结束时没有 `finishReason` 同样为协议错误
 
 ### 停止序列、usage 与终态

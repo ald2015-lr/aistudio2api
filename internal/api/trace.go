@@ -33,10 +33,15 @@ var (
 	traceIDUnsafe = regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 )
 
-// traceHiddenHeaders 为不写入排查记录的鉴权头
-var traceHiddenHeaders = map[string]bool{
-	"Authorization": true, "X-Api-Key": true, "X-Goog-Api-Key": true, "Cookie": true, "Proxy-Authorization": true,
-}
+// traceHiddenHeaders 为不写入排查记录的鉴权头（规范化写法）：除 Authorization、Cookie、Proxy-Authorization 外，
+// 鉴权读取的每个密钥请求头（apiKeyHeaders）都在其中，包括 Azure 风格客户端使用的 api-key
+var traceHiddenHeaders = func() map[string]bool {
+	hidden := map[string]bool{"Authorization": true, "Cookie": true, "Proxy-Authorization": true}
+	for _, name := range apiKeyHeaders {
+		hidden[http.CanonicalHeaderKey(name)] = true
+	}
+	return hidden
+}()
 
 // traceStore 保存排查记录文件，只保留最近 traceKeepFiles 个
 type traceStore struct {

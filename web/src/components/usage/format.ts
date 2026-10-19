@@ -47,15 +47,17 @@ export function useUsageFormat() {
       ? '—'
       : `${(value * 100).toLocaleString(locale.value, { maximumFractionDigits: digits })}%`
 
-  // duration 把毫秒显示为毫秒、秒或分钟
+  // duration 把毫秒显示为毫秒、秒或分钟。先按显示精度取整再决定单位：
+  // 原先分钟以下的秒数单独四舍五入，119.6 秒显示为 "1 min 60 s"，59.96 秒显示为 "60 s"
   const duration = (milliseconds: number): string => {
     if (milliseconds <= 0) return '—'
-    if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`
-    if (milliseconds < 60_000)
-      return `${(milliseconds / 1000).toLocaleString(locale.value, { maximumFractionDigits: 1 })} s`
-    const minutes = Math.floor(milliseconds / 60_000)
-    const seconds = Math.round((milliseconds % 60_000) / 1000)
-    return `${minutes} min ${seconds} s`
+    const rounded = Math.round(milliseconds)
+    if (rounded < 1000) return `${rounded} ms`
+    const tenths = Math.round(milliseconds / 100)
+    if (tenths < 600)
+      return `${(tenths / 10).toLocaleString(locale.value, { maximumFractionDigits: 1 })} s`
+    const totalSeconds = Math.round(milliseconds / 1000)
+    return `${Math.floor(totalSeconds / 60)} min ${totalSeconds % 60} s`
   }
 
   // dateTime 显示带月日的本地时间，seconds 为真时显示秒

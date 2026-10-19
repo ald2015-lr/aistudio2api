@@ -125,7 +125,8 @@ func encodeFunctionDeclarationHint(declaration FunctionDeclaration) ([]any, int6
 	if declaration.Name == "" {
 		return nil, 0, fmt.Errorf("function declaration 缺少名称")
 	}
-	raw := normalizeFunctionParameters(declaration.Parameters)
+	// required 列出的未定义属性补上 {}（超过大小或嵌套上限的 Schema 不补，由 encodeJSONSchema 照常拒绝）
+	raw := defineRequiredProperties(normalizeFunctionParameters(declaration.Parameters))
 	parameters, err := encodeJSONSchema(raw)
 	degraded := false
 	if err != nil {

@@ -394,6 +394,8 @@ type Event struct {
 	StopSequence        string               `json:"stop_sequence,omitempty"`
 	ProviderModel       string               `json:"provider_model,omitempty"`
 	ThoughtSignature    string               `json:"thought_signature,omitempty"`
+	// FinishMessage 为上游对结束原因的说明（Gemini API finishMessage，如 MALFORMED_FUNCTION_CALL 的具体问题），没有时为空
+	FinishMessage string `json:"finish_message,omitempty"`
 	// UpstreamOutputTokens 为上游在这一块报告的累计正文 token（Playground 正文阶段每块都有；0 表示这一块没有），只供降级判定计算出字速度
 	UpstreamOutputTokens int64 `json:"-"`
 	// UpstreamPromptTokens 为上游在这一块报告的输入 token（0 表示这一块没有），只供降级判定校准"字数 → token"的比例

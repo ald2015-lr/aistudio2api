@@ -23,7 +23,10 @@ type ProtocolEvidenceError struct {
 // PromptFeedbackError 表示上游拒绝当前输入且没有返回候选
 type PromptFeedbackError struct {
 	Reason string
-	Raw    json.RawMessage
+	// Message 为上游对拦截原因的说明（promptFeedback.blockReasonMessage），没有时为空。
+	// 只进日志与内部错误；公开协议的错误文案由 api 包按 Reason 统一生成，不含这段原文
+	Message string
+	Raw     json.RawMessage
 }
 
 // Unwrap 返回原始错误，使 errors.Is 能识别读取超时、连接断开等可重试的底层错误
@@ -39,8 +42,11 @@ func (e *ProtocolEvidenceError) Error() string {
 	return fmt.Sprintf("AI Studio %s 协议位置 %s: %s", e.Method, e.Path, e.Detail)
 }
 
-// Error 返回上游输入拒绝原因
+// Error 返回上游输入拒绝原因，上游给出说明时附在后面
 func (e *PromptFeedbackError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("AI Studio 拒绝当前输入: %s: %s", e.Reason, e.Message)
+	}
 	return fmt.Sprintf("AI Studio 拒绝当前输入: %s", e.Reason)
 }
 

@@ -332,8 +332,19 @@ func finishFiltered(reason string) bool {
 // MCP（image + data + mimeType）格式，以及 MCP 工具结果对象 {"content": [...]}。
 // 取出的图片在原位置替换为文字说明；网络地址形式的图片保持原样
 func splitFunctionResultMedia(raw json.RawMessage) (json.RawMessage, []aistudio.Part, error) {
+	return splitFunctionResultMediaDepth(raw, 0)
+}
+
+// functionResultMediaMaxDepth 为沿 {"content": ...} 向内查找附件的最大层数。真实工具结果（MCP 的 {"content":[...]}）只有一两层；
+// 每层都要重新解析并复制剩余的 JSON，不设上限时几千层嵌套的请求体会让 CPU 与内存按层数平方增长。更深的部分原样按 JSON 发送
+const functionResultMediaMaxDepth = 8
+
+func splitFunctionResultMediaDepth(raw json.RawMessage, depth int) (json.RawMessage, []aistudio.Part, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if strings.HasPrefix(trimmed, "{") {
+		if depth >= functionResultMediaMaxDepth {
+			return raw, nil, nil
+		}
 		var object map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
 			return raw, nil, nil
@@ -342,7 +353,7 @@ func splitFunctionResultMedia(raw json.RawMessage) (json.RawMessage, []aistudio.
 		if !exists {
 			return raw, nil, nil
 		}
-		cleaned, media, err := splitFunctionResultMedia(content)
+		cleaned, media, err := splitFunctionResultMediaDepth(content, depth+1)
 		if err != nil || len(media) == 0 {
 			return raw, nil, err
 		}

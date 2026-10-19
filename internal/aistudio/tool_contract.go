@@ -152,6 +152,8 @@ func compileToolSchema(parameters []byte) (*jsonschema.Schema, error) {
 	if len(raw) > maxSchemaBytes {
 		return nil, fmt.Errorf("schema 超过 %d 字节上限", maxSchemaBytes)
 	}
+	// 与发给上游的 Schema 一致：required 列出的未定义属性补上 {}，否则 additionalProperties:false 时这些必填属性永远无法满足
+	raw = defineRequiredProperties(raw)
 	document, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
 	if err != nil {
 		return nil, err

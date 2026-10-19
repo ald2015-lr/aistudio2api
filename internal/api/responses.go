@@ -347,15 +347,9 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			if item.Namespace != "" {
 				item.Name = item.Namespace + "." + item.Name
 			}
-			arguments := json.RawMessage(item.Arguments)
-			if len(arguments) == 0 {
-				arguments = json.RawMessage(`{}`)
-			}
-			if !json.Valid(arguments) {
-				return nil, nil, fmt.Errorf("function_call arguments must be JSON")
-			}
+			// 参数不是 JSON object 时包成 _raw，见 historyFunctionArguments
 			contents = append(contents, aistudio.Content{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{FunctionCall: &aistudio.FunctionCall{
-				ID: item.CallID, Name: item.Name, Arguments: arguments, ThoughtSignature: pendingSignature,
+				ID: item.CallID, Name: item.Name, Arguments: historyFunctionArguments(item.Arguments), ThoughtSignature: pendingSignature,
 			}}}})
 			pendingSignature = ""
 		case "function_call_output":

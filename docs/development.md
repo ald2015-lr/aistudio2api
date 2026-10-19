@@ -332,13 +332,17 @@ Worker 同样按账户当前所在的号池分为普通分区与 Ultra 分区（
 | 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 
-`/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。
+`/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。`authMiddleware` 经 `requestAPIKeyMatches` 逐个比较 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`Api-Key` 与 `Authorization: Bearer`（`bearerToken`），每个来源都按常量时间比较，任一相同即放行并标记访问日志已通过校验；不再只取优先级最高的一个来源。
 
 `/ultra/v1/...` 与 `/ultra/v1beta/...` 去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录，见 `internal/api/ultra.go`），并把请求标记为 Ultra 号池；其余 `/ultra/*` 路径返回 404。`/trace/ultra/v1/...` 由 `traceEntry` 同时去掉两个前缀并标记 Ultra 号池，日志与排查记录的路径保留 `/trace/ultra` 前缀；`/ultra/trace/...` 仍返回 404。普通路径由 `poolScopeMiddleware` 按 `ULTRA_EXCLUSIVE` 标记为普通号池或不限号池。别名解析的模型目录快照按号池分别缓存（进程级，30 秒过期；过期后仍先返回旧快照，同时在后台刷新，刷新只由带后缀的请求触发，见 `aliasCatalog`）：`ULTRA_INCLUDE_PRO` 切换后号池内容变了，但快照不随开关作废，带后缀的模型名（如 `gemini-4-argon-low`）要等该号池的快照过期、并由过期后的第一个带后缀请求触发的后台刷新完成，才按新目录解析。在此之前的请求（快照过期前的请求、触发刷新的那个请求，以及刷新完成前同时到达的请求）仍按切换前的目录解析，旧目录里没有的模型解析不到，原名转发后可能因找不到模型而失败。带后缀的请求稀少时，切换时快照往往已经过期，切换后第一个这样的请求无论离切换多久都按旧目录解析，所以 30 秒的过期时间并不是旧目录的使用时限。不带后缀的模型名原样转发、不受影响；这与账户目录变化后的行为相同，不为开关另设缓存代数；请求日志、活动请求与用量账本带 `pool`（`/ultra` 请求为 `ultra`），日志路径保留 `/ultra` 前缀。
 
 OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 共用当前进程内最多 256 个响应节点，用于重建下一轮完整 contents（Interactions 不保存音频输出）；进程重启后客户端应重新提交完整上下文。Drive 文件、Veo operation 和产物文件的账户绑定写入 `runtime-state.json`，重启后仍可轮询和下载。
 
 新增上游能力从 `internal/aistudio` 开始：编码真实数组槽位、解码服务器事件，再由 `internal/api` 投影到公开协议。模型方法、上下文、输出上限、工具、声音、图片规格和视频规格均来自实时 `ListModels`。
+
+函数参数 Schema 的 `required` 补齐（`defineRequiredProperties`，`internal/aistudio/schema.go`）有三个调用点：Playground 的 `encodeFunctionDeclarationHint`（`tools.go`）、Build 的 `parametersJsonSchema`（`build.go`）与 `strict` 核对的 `compileToolSchema`（`tool_contract.go`，在其大小检查之后）；改动补齐规则时三处要一起测，保证发给上游的 Schema 与核对用的 Schema 一致。整数字段规范化（`canonicalSchemaIntegers`）与 `TYPE_UNSPECIFIED` 处理只在 Playground 的 `encodeSchemaNode` 中进行，Build 与 `strict` 核对不做这两项（改动会改变发给 Google 的 Build 请求）。上游结束说明解码为 `Event.FinishMessage`（Playground 读 candidate `[3]`，Build 读 `finishMessage`），由 `internal/app` 的 `forwardEvents` 写进请求进度、由 `internal/api` 的 `setGeminiFinish` 写进 Gemini `finishMessage`；拦截说明进 `PromptFeedbackError.Message`，公开错误文案（`official_errors.go`）只按 `Reason` 生成。
+
+流式心跳由各协议的写入器提供给 `consumeStreamEvents`：OpenAI Chat、Responses 与 Interactions 用 `writeSSEHeartbeat`（`: ping`），Anthropic 用 `anthropicStreamWriter.heartbeat`（`event: ping`），Gemini 用 `geminiChunkWriter.heartbeat`（SSE 与 JSON 数组都写一个空行）。新增流式协议时按该协议官方 SDK 能跳过的格式选择心跳。
 
 `runtimeManager` 同时实现基础 `Service` 以及 Video、File、Bidi 和 Transcription 扩展接口。`internal/app` 负责资源账户绑定、跨账户文件复制、运行状态和重试流程；`internal/api` 负责 HTTP、SSE 与 WebSocket DTO，即公开协议使用的请求、响应和事件对象。完整请求字段、响应 DTO、SSE 和 WebSocket 事件见 [protocol.md](protocol.md)。
 

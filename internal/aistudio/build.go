@@ -144,14 +144,20 @@ func encodeBuildContents(contents []Content) ([]any, error) {
 			if part.FunctionCall != nil {
 				pendingCalls = append(pendingCalls, *part.FunctionCall)
 			}
-			if result := part.FunctionResult; result != nil && result.Name == "" {
+			// 与 Playground（encodeContent）相同：先按调用 ID、再按唯一待返回调用关联函数结果，缺少名称时补上调用的名称；
+			// 关联上的调用从待返回列表删除。原先不删，同一轮有两个调用时，第一个结果按 ID 关联后第二个不带 ID 的结果
+			// 仍面对两个待返回调用，无法关联而报错
+			if result := part.FunctionResult; result != nil {
 				matched := slices.IndexFunc(pendingCalls, func(call FunctionCall) bool { return result.ID != "" && call.ID == result.ID })
-				if matched < 0 && len(pendingCalls) == 1 {
+				if matched < 0 && len(pendingCalls) == 1 && (result.Name == "" || result.Name == pendingCalls[0].Name) {
 					matched = 0
 				}
 				if matched >= 0 {
-					part.FunctionResult = cloneFunctionResult(result)
-					part.FunctionResult.Name = pendingCalls[matched].Name
+					if result.Name == "" {
+						part.FunctionResult = cloneFunctionResult(result)
+						part.FunctionResult.Name = pendingCalls[matched].Name
+					}
+					pendingCalls = slices.Delete(pendingCalls, matched, matched+1)
 				}
 			}
 			encoded, err := encodeBuildPart(part)
@@ -286,7 +292,8 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 			if declaration.Description != "" {
 				encoded["description"] = declaration.Description
 			}
-			encoded["parametersJsonSchema"] = normalizeFunctionParameters(declaration.Parameters)
+			// required 列出的未定义属性补上 {}，上游不再以 property is not defined 拒绝（超过大小上限的 Schema 原样发送）
+			encoded["parametersJsonSchema"] = defineRequiredProperties(normalizeFunctionParameters(declaration.Parameters))
 			declarations = append(declarations, encoded)
 		}
 		wire = append(wire, map[string]any{"functionDeclarations": declarations})
@@ -440,9 +447,13 @@ type buildResponse struct {
 			} `json:"citationSources"`
 		} `json:"citationMetadata"`
 		GroundingMetadata *buildGrounding `json:"groundingMetadata"`
+		// FinishMessage 为上游对结束原因的说明
+		FinishMessage string `json:"finishMessage"`
 	} `json:"candidates"`
 	PromptFeedback *struct {
 		BlockReason string `json:"blockReason"`
+		// BlockReasonMessage 为上游对拦截原因的说明
+		BlockReasonMessage string `json:"blockReasonMessage"`
 	} `json:"promptFeedback"`
 	UsageMetadata *struct {
 		PromptTokenCount        int64  `json:"promptTokenCount"`
@@ -544,7 +555,10 @@ func (d *BuildStreamDecoder) decodeChunk(raw []byte) ([]Event, error) {
 	}
 	if len(response.Candidates) == 0 {
 		if response.PromptFeedback != nil && response.PromptFeedback.BlockReason != "" {
-			return nil, &PromptFeedbackError{Reason: buildEnumName(response.PromptFeedback.BlockReason, "BLOCK_REASON_"), Raw: cloneRaw(raw)}
+			return nil, &PromptFeedbackError{
+				Reason:  buildEnumName(response.PromptFeedback.BlockReason, "BLOCK_REASON_"),
+				Message: strings.TrimSpace(response.PromptFeedback.BlockReasonMessage), Raw: cloneRaw(raw),
+			}
 		}
 		return nil, nil
 	}
@@ -588,7 +602,10 @@ func (d *BuildStreamDecoder) decodeChunk(raw []byte) ([]Event, error) {
 			usage := *d.usage
 			events = append(events, Event{Kind: EventUsage, Usage: &usage})
 		}
-		events = append(events, Event{Kind: EventFinish, FinishReason: buildEnumName(candidate.FinishReason, "FINISH_REASON_")})
+		events = append(events, Event{
+			Kind: EventFinish, FinishReason: buildEnumName(candidate.FinishReason, "FINISH_REASON_"),
+			FinishMessage: strings.TrimSpace(candidate.FinishMessage),
+		})
 		d.finished = true
 	}
 	return events, nil

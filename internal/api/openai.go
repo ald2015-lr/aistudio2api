@@ -25,12 +25,8 @@ type chatRequest struct {
 	TopP                *float64          `json:"top_p"`
 	MaxTokens           *int64            `json:"max_tokens"`
 	MaxCompletionTokens *int64            `json:"max_completion_tokens"`
-	FrequencyPenalty    *float64          `json:"frequency_penalty"`
-	PresencePenalty     *float64          `json:"presence_penalty"`
 	N                   *int64            `json:"n"`
 	ParallelToolCalls   *bool             `json:"parallel_tool_calls"`
-	Logprobs            *bool             `json:"logprobs"`
-	LogitBias           json.RawMessage   `json:"logit_bias"`
 	Stop                json.RawMessage   `json:"stop"`
 	ResponseFormat      json.RawMessage   `json:"response_format"`
 	ReasoningEffort     string            `json:"reasoning_effort"`
@@ -293,21 +289,28 @@ func chatMessageContent(message chatMessage) (aistudio.Content, error) {
 		if call.Type != "" && call.Type != "function" {
 			return aistudio.Content{}, fmt.Errorf("unsupported tool call type %q", call.Type)
 		}
-		arguments := json.RawMessage(call.Function.Arguments)
-		if len(arguments) == 0 {
-			arguments = json.RawMessage(`{}`)
-		}
-		if !json.Valid(arguments) {
-			return aistudio.Content{}, fmt.Errorf("tool call %q arguments must be JSON", call.Function.Name)
-		}
 		parts = append(parts, aistudio.Part{FunctionCall: &aistudio.FunctionCall{
 			ID:               call.ID,
 			Name:             call.Function.Name,
-			Arguments:        arguments,
+			Arguments:        historyFunctionArguments(call.Function.Arguments),
 			ThoughtSignature: call.ExtraContent.Google.ThoughtSignature,
 		}})
 	}
 	return aistudio.Content{Role: role, Parts: parts}, nil
+}
+
+// historyFunctionArguments 返回历史工具调用的参数：空串为 {}；不是 JSON object 的原文（被截断的 JSON、字符串、数组等）
+// 包成 {"_raw":"<原文>"}。Cline、Roo 等客户端回放一次被截断的调用后，原先这个会话之后每一轮都返回 400
+func historyFunctionArguments(arguments string) json.RawMessage {
+	if strings.TrimSpace(arguments) == "" {
+		return json.RawMessage(`{}`)
+	}
+	var object map[string]json.RawMessage
+	if json.Unmarshal([]byte(arguments), &object) == nil && object != nil {
+		return json.RawMessage(arguments)
+	}
+	encoded, _ := json.Marshal(map[string]string{"_raw": arguments})
+	return encoded
 }
 
 func openAIAssistantContentParts(raw json.RawMessage, fallback []aistudio.Part) ([]aistudio.Part, error) {
@@ -653,27 +656,12 @@ func appendUnique(values []string, value string) []string {
 }
 
 func (request chatRequest) generationConfig() (aistudio.GenerationConfig, error) {
+	// 只接受单个候选：多候选会把一个请求扇出为多次生成
 	if request.N != nil && *request.N != 1 {
 		return aistudio.GenerationConfig{}, fmt.Errorf("n must be 1")
 	}
-	if request.Logprobs != nil && *request.Logprobs {
-		return aistudio.GenerationConfig{}, fmt.Errorf("logprobs must be false")
-	}
-	if rawJSONConfigured(request.LogitBias) {
-		var biases map[string]json.RawMessage
-		if err := json.Unmarshal(request.LogitBias, &biases); err != nil || biases == nil {
-			return aistudio.GenerationConfig{}, fmt.Errorf("logit_bias must be an empty object")
-		}
-		if len(biases) != 0 {
-			return aistudio.GenerationConfig{}, fmt.Errorf("logit_bias must be empty")
-		}
-	}
-	if request.FrequencyPenalty != nil && *request.FrequencyPenalty != 0 {
-		return aistudio.GenerationConfig{}, fmt.Errorf("frequency_penalty must be 0")
-	}
-	if request.PresencePenalty != nil && *request.PresencePenalty != 0 {
-		return aistudio.GenerationConfig{}, fmt.Errorf("presence_penalty must be 0")
-	}
+	// frequency_penalty、presence_penalty、logprobs、top_logprobs、logit_bias 上游没有对应参数，忽略：
+	// SillyTavern、LobeChat 等客户端常带非 0 的 penalty，经 new-api 原样转发，原先整个请求返回 400
 	config := aistudio.GenerationConfig{
 		Temperature:     request.Temperature,
 		TopP:            request.TopP,
@@ -770,9 +758,11 @@ func buildChatCompletion(id string, created int64, model string, result generati
 	if len(result.citations) > 0 {
 		message["annotations"] = openAICitations(result.citations)
 	}
+	// logprobs 与官方一致恒为 null：请求里的 logprobs 被忽略，不返回对数概率
 	choice := map[string]any{
 		"index":         0,
 		"message":       message,
+		"logprobs":      nil,
 		"finish_reason": openAIFinishReason(result.finishReason, len(result.toolCalls) > 0),
 	}
 	if providerReason := providerFinishReason(result.finishReason); providerReason != "" {

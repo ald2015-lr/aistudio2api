@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,6 +59,7 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		return nil, fmt.Errorf("schema 必须是 JSON object")
 	}
 	cleanNullFields(schema)
+	canonicalSchemaIntegers(schema)
 	if err := normalizeNot(schema); err != nil {
 		return nil, err
 	}
@@ -133,6 +135,7 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		}
 		wire = setWireField(wire, 5, items)
 	}
+	// 整数字段已由 canonicalSchemaIntegers 规范为整数字面量
 	for _, field := range []struct {
 		name  string
 		index int
@@ -379,11 +382,16 @@ func normalizeConstAndMetadata(schema map[string]json.RawMessage) error {
 	return nil
 }
 
-// normalizeSchemaConst 删除说明字段，并把字符串 const 转换为单值 enum
+// normalizeSchemaConst 删除说明字段与 TYPE_UNSPECIFIED 类型，并把字符串 const 转换为单值 enum
 func normalizeSchemaConst(schema map[string]json.RawMessage) error {
 	delete(schema, "title")
 	delete(schema, "$id")
 	delete(schema, "$comment")
+	// Gemini SDK 把未设置的 type 写成枚举零值 TYPE_UNSPECIFIED（原先报"未知 schema.type"，工具参数被降级编码）：
+	// 按没有声明 type 处理，由 normalizeImplicitType 推断。组合子节点在这里一并去掉，推断时不会借用这个值
+	if isUnspecifiedSchemaType(schema["type"]) {
+		delete(schema, "type")
+	}
 	raw, ok := schema["const"]
 	if !ok {
 		return nil
@@ -492,6 +500,43 @@ func schemaType(schema map[string]json.RawMessage) (string, error) {
 	return "", fmt.Errorf("schema.type 必须是字符串")
 }
 
+// schemaIntegerFields 为取值必须是非负整数的 Schema 字段
+var schemaIntegerFields = []string{"minItems", "maxItems", "minProperties", "maxProperties", "minLength", "maxLength"}
+
+// canonicalSchemaIntegers 把整数字段的字符串写法（"5"）与零小数写法（5.0）改写为整数字面量。
+// @google/genai 等 SDK 把 int64 字段序列化为字符串，原先 schemaInteger 解析失败，整个 Schema 被降级编码
+func canonicalSchemaIntegers(schema map[string]json.RawMessage) {
+	for _, name := range schemaIntegerFields {
+		if value, ok := schema[name]; ok {
+			schema[name] = canonicalSchemaInteger(value)
+		}
+	}
+}
+
+// canonicalSchemaInteger 返回整数的规范字面量；不是整数（含有小数、超过 2^53 的浮点写法、非数字字符串）时原样返回，
+// 由 schemaInteger 照常报错
+func canonicalSchemaInteger(raw json.RawMessage) json.RawMessage {
+	value := string(bytes.TrimSpace(raw))
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		value = strings.TrimSpace(text)
+	}
+	if integer, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return json.RawMessage(strconv.FormatInt(integer, 10))
+	}
+	number, err := strconv.ParseFloat(value, 64)
+	if err != nil || number != math.Trunc(number) || math.Abs(number) > 1<<53 {
+		return raw
+	}
+	return json.RawMessage(strconv.FormatInt(int64(number), 10))
+}
+
+// isUnspecifiedSchemaType 判断 type 是否为 Gemini 枚举零值 TYPE_UNSPECIFIED（不区分大小写）
+func isUnspecifiedSchemaType(raw json.RawMessage) bool {
+	var typeName string
+	return len(raw) > 0 && json.Unmarshal(raw, &typeName) == nil && strings.EqualFold(strings.TrimSpace(typeName), "TYPE_UNSPECIFIED")
+}
+
 func schemaInteger(raw json.RawMessage, name string) (int64, error) {
 	value, err := strconv.ParseInt(string(raw), 10, 64)
 	if err != nil || value < 0 {
@@ -568,6 +613,83 @@ func normalizeFunctionParameters(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(emptyFunctionParameters)
 	}
 	return json.RawMessage(trimmed)
+}
+
+// defineRequiredProperties 为 required 列出而 properties 没有定义的属性补上不限类型的定义 {}。
+// MCP 与 agent 客户端常有这种写法，原样发出时上游以 property is not defined 拒绝整个请求；
+// Playground、Build 与 strict 参数核对都用补齐后的 Schema，三处一致。
+//
+// 大小与嵌套检查在前：超过 maxSchemaBytes 的 Schema 原样返回，交给调用方按原有方式处理（Playground 拒绝、Build 原样发送）；
+// 只处理 maxSchemaDepth 层以内的节点，更深的节点由编码时的嵌套检查拒绝。不需要补齐时返回原值，不重新编码
+func defineRequiredProperties(raw json.RawMessage) json.RawMessage {
+	if len(raw) > maxSchemaBytes || !bytes.Contains(raw, []byte(`"required"`)) {
+		return raw
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	// 保留数值原文，重新编码时不改变 minimum、maximum 等取值的写法
+	decoder.UseNumber()
+	var schema any
+	if decoder.Decode(&schema) != nil || decoder.More() {
+		return raw
+	}
+	if !defineRequiredNode(schema, 0) {
+		return raw
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
+// defineRequiredNode 补齐一个节点及其子节点 required 中未定义的属性，返回是否修改；depth 为当前嵌套层数。
+// 补上的定义比当前节点深一层，位于最大层数的节点不补，补齐不会让原本合规的 Schema 超过嵌套上限
+func defineRequiredNode(value any, depth int) bool {
+	schema, ok := value.(map[string]any)
+	if !ok || depth >= maxSchemaDepth {
+		return false
+	}
+	changed := false
+	if required, ok := schema["required"].([]any); ok {
+		properties, isObject := schema["properties"].(map[string]any)
+		// properties 不是 object（写法错误）时不补，交给编码时报错；显式 null 按没有 properties 处理
+		if isObject || schema["properties"] == nil {
+			for _, item := range required {
+				name, ok := item.(string)
+				if !ok {
+					continue
+				}
+				if _, defined := properties[name]; defined {
+					continue
+				}
+				if properties == nil {
+					properties = map[string]any{}
+					schema["properties"] = properties
+				}
+				properties[name] = map[string]any{}
+				changed = true
+			}
+		}
+	}
+	for key, child := range schema {
+		switch key {
+		case "properties", "$defs", "definitions":
+			if children, ok := child.(map[string]any); ok {
+				for _, nested := range children {
+					changed = defineRequiredNode(nested, depth+1) || changed
+				}
+			}
+		case "items", "additionalProperties", "not":
+			changed = defineRequiredNode(child, depth+1) || changed
+		case "anyOf", "oneOf", "allOf", "prefixItems":
+			if children, ok := child.([]any); ok {
+				for _, nested := range children {
+					changed = defineRequiredNode(nested, depth+1) || changed
+				}
+			}
+		}
+	}
+	return changed
 }
 
 // cleanNullFields 删除值为显式 null 的字段（const 除外）。SDK 生成的 schema 常把未设置的可选字段写成 null，
