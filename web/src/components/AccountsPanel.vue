@@ -559,12 +559,19 @@ const workerDotClass: Record<WorkerState, string> = {
   none: 'bg-gray-700',
 }
 
-// accountTier 返回账户的权益：Ultra 号池的账户为 Ultra；权益尚未读取时为 unknown（服务端暂按 Free 显示，计入普通号池）
+// accountTier 返回账户的真实权益，不随号池变化：开启 ULTRA_INCLUDE_PRO 后 Pro 账户属于 Ultra 号池，仍显示为 Pro，
+// 也仍能用“权益：Pro”筛出来。权益尚未读取时为 unknown（服务端暂按 Free 显示，计入普通号池）；
+// 已经属于 Ultra 号池的账户不按 unknown 显示，这样有权益但还没有目录指纹的已入池账户仍显示它的权益
 function accountTier(account: Account): AccountTier {
-  if (account.pool === 'ultra') return 'Ultra'
-  if (account.benefit_tier_known === false) return 'unknown'
+  if (account.benefit_tier_known === false && account.pool !== 'ultra') return 'unknown'
   const tier = account.benefit_tier
   return tier === 'Ultra' || tier === 'Pro' || tier === 'Plus' ? tier : 'Free'
+}
+
+// inUltraPool 判断账户是否属于 Ultra 号池（成员关系，不是权益）：经 /ultra 前缀的请求只用这些账户，
+// 开启 ULTRA_INCLUDE_PRO 时其中含权益为 Pro 的账户，所以号池计数不能按权益统计
+function inUltraPool(account: Account): boolean {
+  return account.pool === 'ultra'
 }
 
 // workerState 账户 Worker 的实时状态：运行中、启动中或未启动
@@ -594,7 +601,8 @@ const stateCounts = computed(() => {
   return counts
 })
 
-// tierCounts 按权益统计账户数，ultraReady 为 Ultra 号池中就绪的账户数
+// tierCounts 按真实权益统计账户数，供权益筛选显示数量；ultraPoolCount 与 ultraReady 按号池成员关系统计
+// Ultra 号池的账户数与其中就绪的账户数，开启 ULTRA_INCLUDE_PRO 时含 Pro 账户
 const tierCounts = computed(() => {
   const counts: Record<TierFilter, number> = {
     all: props.accounts.length,
@@ -607,10 +615,15 @@ const tierCounts = computed(() => {
   for (const account of props.accounts) counts[accountTier(account)] += 1
   return counts
 })
+const ultraPoolCount = computed(() => props.accounts.filter(inUltraPool).length)
+// poolTagShown 表示有账户要在权益旁另加 Ultra 号池标记（权益不是 Ultra 却属于 Ultra 号池）。原来的权益列放不下
+// “权益 + 标记”，只在这时加宽权益列并同样加大表格最小宽度，账户列不被挤窄；开关关闭时表格布局与原来一致
+const poolTagShown = computed(() =>
+  props.accounts.some((account) => inUltraPool(account) && accountTier(account) !== 'Ultra'),
+)
 const ultraReady = computed(
   () =>
-    props.accounts.filter((account) => accountTier(account) === 'Ultra' && account.state === 'ready')
-      .length,
+    props.accounts.filter((account) => inUltraPool(account) && account.state === 'ready').length,
 )
 
 const filtered = computed(() => {
@@ -891,10 +904,10 @@ function closeBulkPanel(): void {
             class="tag tag-ultra"
             tabindex="0"
           >
-            {{ tf('accounts.ultraCount', { ready: ultraReady, total: tierCounts.Ultra }) }}
+            {{ tf('accounts.ultraCount', { ready: ultraReady, total: ultraPoolCount }) }}
           </span>
           <span
-            v-if="ultraWorkerCounts && tierCounts.Ultra > 0"
+            v-if="ultraWorkerCounts && ultraPoolCount > 0"
             class="font-mono text-xs text-fuchsia-300"
           >
             {{
@@ -1274,13 +1287,13 @@ function closeBulkPanel(): void {
       </div>
       <div v-else class="panel">
         <div class="overflow-x-auto">
-          <table class="data-table min-w-[1060px]">
+          <table class="data-table" :class="poolTagShown ? 'min-w-[1108px]' : 'min-w-[1060px]'">
             <colgroup>
               <col class="w-10" />
               <col class="w-28" />
               <col class="w-24" />
               <col />
-              <col class="w-20" />
+              <col :class="poolTagShown ? 'w-32' : 'w-20'" />
               <col class="w-16" />
               <col class="w-44" />
               <col class="w-44" />
@@ -1363,7 +1376,17 @@ function closeBulkPanel(): void {
                     class="text-gray-500"
                     >{{ t('accounts.tierUnknown') }}</span
                   >
-                  <template v-else>{{ accountTier(account) }}</template>
+                  <template v-else>
+                    {{ accountTier(account) }}
+                    <!-- 权益不是 Ultra 却属于 Ultra 号池（开启 ULTRA_INCLUDE_PRO 的 Pro 账户）：权益照常显示，另加号池标记 -->
+                    <span
+                      v-if="inUltraPool(account)"
+                      v-tooltip="t('accounts.proInUltraHelp')"
+                      class="tag tag-ultra"
+                      tabindex="0"
+                      >{{ t('accounts.poolUltraTag') }}</span
+                    >
+                  </template>
                 </td>
                 <td class="font-mono text-xs text-gray-300">
                   {{ account.models.length === 0 ? '—' : account.models.length }}

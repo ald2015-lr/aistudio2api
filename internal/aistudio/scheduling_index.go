@@ -357,7 +357,7 @@ func (p *AccountPool) rebuildCandidateSetLocked(set *candidateSet, now time.Time
 // 冷却按每个支持通道取全局与通道作用域中较晚的期限，账户的恢复时间为各通道中最早的（见 accountChannelsCooldown），
 // 期限只在冷却表变化时改变，是否已到期由调度时的时刻决定
 func (p *AccountPool) candidateStateLocked(set *candidateSet, account *Account) int64 {
-	if account == nil || !account.Config.Enabled || account.State != AccountReady || !set.key.pool.allows(account) {
+	if account == nil || !account.Config.Enabled || account.State != AccountReady || !p.inPoolLocked(set.key.pool, account) {
 		return 0
 	}
 	var supportedBuffer [4]Channel
@@ -422,16 +422,22 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 	p.accountChangedLocked(account)
 }
 
-// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集、Ultra 账户集合与缓存的状态列表；调用方持有 p.mu。
+// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集、Ultra 号池成员集合与缓存的状态列表；调用方持有 p.mu。
 // 每条修改这些字段的路径都必须调用，否则候选集要等下次全量重建才能反映变化，Status() 要等缓存过期才与 StatusOf 一致
 func (p *AccountPool) accountChangedLocked(account *Account) {
 	if account == nil {
 		return
 	}
-	if account.BenefitTier == BenefitTierUltra && p.byID[account.ID] == account {
-		p.ultraAccounts[account.ID] = struct{}{}
-	} else {
-		delete(p.ultraAccounts, account.ID)
+	// 只在成员实际变化时修改集合并作废 UltraAccountIDs 的快照：这里每秒被冷却、状态与运行态变化调用很多次，
+	// 每次都作废等于没有写时复制
+	want := ultraPoolTier(account.BenefitTier, p.ultraIncludePro) && p.byID[account.ID] == account
+	if _, has := p.ultraAccounts[account.ID]; has != want {
+		if want {
+			p.ultraAccounts[account.ID] = struct{}{}
+		} else {
+			delete(p.ultraAccounts, account.ID)
+		}
+		p.ultraSnapshot = nil
 	}
 	if p.sched != nil {
 		if p.sched.positionValid(p, account) {

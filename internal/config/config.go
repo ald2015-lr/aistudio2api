@@ -45,6 +45,7 @@ var configKeys = [...]string{
 	"WARM_WORKER_LIMIT",
 	"MAX_ACTIVE_WORKERS",
 	"ULTRA_EXCLUSIVE",
+	"ULTRA_INCLUDE_PRO",
 	"ULTRA_WARM_WORKER_LIMIT",
 	"ULTRA_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
@@ -131,9 +132,12 @@ type Config struct {
 	// FirstEventTimeout 为每次尝试等待首个上游事件的上限：超时只取消这一次尝试并按超时换号重试；0 表示关闭（默认），
 	// 思考很长的模型可能很久才有第一个事件
 	FirstEventTimeout time.Duration `json:"-"`
-	// UltraExclusive 为真（默认）时 Ultra 账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 账户
+	// UltraExclusive 为真（默认）时 Ultra 号池的账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 号池的账户
 	UltraExclusive bool `json:"ultra_exclusive"`
-	// UltraWarmWorkerLimit 与 UltraMaxActiveWorkers 为 Ultra 分区（权益为 Ultra 的账户）的常驻与峰值 Worker 数，
+	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
+	// 账户权益本身不变（权益请求头、输入上限、模型资格、更高权益重试仍按 Pro）。默认 false，保存后立即生效
+	UltraIncludePro bool `json:"ultra_include_pro"`
+	// UltraWarmWorkerLimit 与 UltraMaxActiveWorkers 为 Ultra 分区（Ultra 号池的账户）的常驻与峰值 Worker 数，
 	// 与普通分区分开计算（WarmWorkerLimit、MaxActiveWorkers 只约束普通分区），浏览器总数最多为两个分区峰值之和；
 	// 常驻数可以为 0（只按需启动）
 	UltraWarmWorkerLimit  int `json:"ultra_warm_worker_limit"`
@@ -170,6 +174,7 @@ func Default() Config {
 		WarmWorkerLimit:        defaultWarmWorkerLimit,
 		MaxActiveWorkers:       defaultMaxActiveWorkers,
 		UltraExclusive:         true,
+		UltraIncludePro:        false,
 		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
@@ -247,6 +252,12 @@ func Load(path string) (Config, error) {
 		cfg.UltraExclusive, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
 			return Config{}, fmt.Errorf("ULTRA_EXCLUSIVE 必须是 true 或 false")
+		}
+	}
+	if value, ok := values["ULTRA_INCLUDE_PRO"]; ok && strings.TrimSpace(value) != "" {
+		cfg.UltraIncludePro, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("ULTRA_INCLUDE_PRO 必须是 true 或 false")
 		}
 	}
 	if value, ok := values["ULTRA_WARM_WORKER_LIMIT"]; ok && strings.TrimSpace(value) != "" {
@@ -374,6 +385,7 @@ func (c Config) Save(path string) error {
 		"WARM_WORKER_LIMIT":        strconv.Itoa(c.WarmWorkerLimit),
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
 		"ULTRA_EXCLUSIVE":          strconv.FormatBool(c.UltraExclusive),
+		"ULTRA_INCLUDE_PRO":        strconv.FormatBool(c.UltraIncludePro),
 		"ULTRA_WARM_WORKER_LIMIT":  strconv.Itoa(c.UltraWarmWorkerLimit),
 		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
@@ -551,6 +563,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmWorkerLimit        int            `json:"warm_worker_limit"`
 		MaxActiveWorkers       int            `json:"max_active_workers"`
 		UltraExclusive         bool           `json:"ultra_exclusive"`
+		UltraIncludePro        bool           `json:"ultra_include_pro"`
 		UltraWarmWorkerLimit   int            `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
@@ -580,6 +593,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmWorkerLimit:        c.WarmWorkerLimit,
 		MaxActiveWorkers:       c.MaxActiveWorkers,
 		UltraExclusive:         c.UltraExclusive,
+		UltraIncludePro:        c.UltraIncludePro,
 		UltraWarmWorkerLimit:   c.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
@@ -613,6 +627,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmWorkerLimit        int             `json:"warm_worker_limit"`
 		MaxActiveWorkers       int             `json:"max_active_workers"`
 		UltraExclusive         *bool           `json:"ultra_exclusive"`
+		UltraIncludePro        *bool           `json:"ultra_include_pro"`
 		UltraWarmWorkerLimit   *int            `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  *int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
@@ -643,7 +658,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理；没有主用模型排队上限时按默认 10s 处理
+	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -678,6 +693,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmWorkerLimit:        value.WarmWorkerLimit,
 		MaxActiveWorkers:       value.MaxActiveWorkers,
 		UltraExclusive:         value.UltraExclusive == nil || *value.UltraExclusive,
+		UltraIncludePro:        value.UltraIncludePro != nil && *value.UltraIncludePro,
 		UltraWarmWorkerLimit:   intOrDefault(value.UltraWarmWorkerLimit, defaultUltraWarmWorkerLimit),
 		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,

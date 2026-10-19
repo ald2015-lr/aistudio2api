@@ -93,10 +93,18 @@ func (manager *accountWorkerManager) drainLimit(partition aistudio.PoolScope) in
 }
 
 // startDrain 在分区排空数低于上限时把账号标记排空并返回排空状态；已在排空、达到上限、账号已没有驻留 Worker、
-// 已被其他路径选中淘汰或已不在账户池时返回 nil
+// 已被其他路径选中淘汰、已不在账户池，或账号已不在 partition 时返回 nil。partition 为调用方（retirePass）在一轮开始时按成员快照
+// 算出的分区，调用方按它核对了能否排空与可接替账户，排空开始后还要在它里面启动替补。ULTRA_INCLUDE_PRO 恰好在取快照与这里之间
+// 切换时，这些判断都是对旧分区做的：照常写入的话，排空记在新分区（poolRuleChanged 会改标），替补却在旧分区启动，新分区少一个
+// Worker 却多记一份让出额度。所以在 drainMu 内按当前成员重算，与 partition 不一致就不排空，登记留到下一轮按新的成员快照重新判断
+// （poolRuleChanged 同样在 drainMu 内改标，写入的排空总记在当前分区）
 func (manager *accountWorkerManager) startDrain(accountID string, partition aistudio.PoolScope) *drainState {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
+	// 锁顺序 drainMu 再到账户池锁，与下面的 SetDraining 相同；成员快照写时复制，这里只是一次加锁
+	if partitionOf(accountID, manager.pool.UltraAccountIDs()) != partition {
+		return nil
+	}
 	if manager.drains[accountID] != nil || manager.drainCountLocked(partition) >= manager.drainLimit(partition) {
 		return nil
 	}
@@ -145,6 +153,13 @@ func (manager *accountWorkerManager) drainOf(accountID string) *drainState {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	return manager.drains[accountID]
+}
+
+// drainPartition 返回排空当前记在的分区；poolRuleChanged 在 drainMu 内改标，这里同样在 drainMu 内读取
+func (manager *accountWorkerManager) drainPartition(drain *drainState) aistudio.PoolScope {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	return drain.partition
 }
 
 // drainCount 返回分区内排空中的账号数
@@ -363,6 +378,11 @@ func (manager *accountWorkerManager) startReplacement(partition aistudio.PoolSco
 	}
 	models = slices.Clone(models)
 	go func() {
+		if drain != nil {
+			// 排空开始之后、挑替补之前 ULTRA_INCLUDE_PRO 可能又切换了：poolRuleChanged 已把排空改记到新分区，
+			// 替补跟着排空走，让出额度与替补总在同一个分区
+			partition = manager.drainPartition(drain)
+		}
 		drain.finishReplacement(manager.runReplacement(ctx, partition, models, reason))
 	}()
 }

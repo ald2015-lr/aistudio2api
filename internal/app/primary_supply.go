@@ -23,11 +23,13 @@ const (
 	primarySupplyStandbyLimit = 1000
 )
 
-// primarySupplySnapshot 为一次统计的结果：models、ultraModels 为统计时的普通与 Ultra 主用模型列表，at 为统计时间
+// primarySupplySnapshot 为一次统计的结果：models、ultraModels 为统计时的普通与 Ultra 主用模型列表，at 为统计时间，
+// ruleVersion 为统计前读到的号池规则版本（见 AccountPool.PoolRuleVersion）
 type primarySupplySnapshot struct {
 	models      []string
 	ultraModels []string
 	at          time.Time
+	ruleVersion uint64
 	entries     []api.AdminPrimarySupply
 }
 
@@ -57,10 +59,13 @@ func supplyPoolLabel(pool aistudio.PoolScope) string {
 	return ""
 }
 
-// refreshPrimarySupply 在缓存过期（超过 primarySupplyInterval）或任一份主用模型列表变化时重新统计（keepWarm 每个周期调用），
-// 返回这次是否重新统计；两份列表都为空时清空缓存
+// refreshPrimarySupply 在缓存过期（超过 primarySupplyInterval）、任一份主用模型列表变化或号池规则版本变化时重新统计
+// （keepWarm 每个周期调用），返回这次是否重新统计；两份列表都为空时清空缓存。供给按分区统计，ULTRA_INCLUDE_PRO 切换后
+// Pro 账户换了分区，版本不同就在下一个 keepWarm 周期重算，不等满 30 秒。先读版本再统计：统计期间发生的切换让快照带上旧版本，
+// 下一个周期照样重算
 func (manager *accountWorkerManager) refreshPrimarySupply(now time.Time) bool {
 	normal, ultra := manager.primaryModelLists()
+	version := manager.pool.PoolRuleVersion()
 	snapshot := manager.primarySupply.Load()
 	if len(normal) == 0 && len(ultra) == 0 {
 		if snapshot != nil {
@@ -69,11 +74,11 @@ func (manager *accountWorkerManager) refreshPrimarySupply(now time.Time) bool {
 		return false
 	}
 	if snapshot != nil && slices.Equal(snapshot.models, normal) && slices.Equal(snapshot.ultraModels, ultra) &&
-		now.Sub(snapshot.at) < primarySupplyInterval {
+		now.Sub(snapshot.at) < primarySupplyInterval && snapshot.ruleVersion == version {
 		return false
 	}
 	manager.primarySupply.Store(&primarySupplySnapshot{
-		models: slices.Clone(normal), ultraModels: slices.Clone(ultra), at: now,
+		models: slices.Clone(normal), ultraModels: slices.Clone(ultra), at: now, ruleVersion: version,
 		entries: manager.computePrimarySupply(primarySupplyTargets(normal, ultra), primarySupplyStandbyLimit),
 	})
 	return true

@@ -115,7 +115,8 @@ const workerSets = computed(() => ({
   starting: new Set(status.value?.workers?.starting_ids ?? []),
 }))
 
-// ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；没有 Ultra 账户也没有 Ultra Worker 时不显示
+// ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
+// 也没有 Ultra Worker 时不显示
 const ultraWorkers = computed(() => {
   const workers = status.value?.ultra_workers
   if (workers === undefined) return null
@@ -134,7 +135,7 @@ const primarySupplyRows = computed(() =>
 const primarySupply = computed(() =>
   primarySupplyRows.value.filter((supply) => supply.pool !== 'ultra'),
 )
-// Ultra 条目与 Ultra Worker 行一样只在有 Ultra 号池时显示：ULTRA_PRIMARY_MODELS 默认非空，没有 Ultra 账户的部署也会统计出
+// Ultra 条目与 Ultra Worker 行一样只在有 Ultra 号池时显示：ULTRA_PRIMARY_MODELS 默认非空，Ultra 号池没有账户的部署也会统计出
 // 全为 0 的条目，显示出来会被误读为备用账号已经用完
 const ultraPrimarySupply = computed(() =>
   ultraWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'ultra') : [],

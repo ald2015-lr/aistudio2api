@@ -21,11 +21,13 @@ export interface Account {
   locale: string
   timezone: string
   models: string[]
+  // benefit_tier 始终是账户的真实权益：Pro 账户并入 Ultra 号池后仍为 Pro，号池成员关系看 pool
   benefit_tier: string
   message: string
   // benefit_tier_known 为 false 表示权益尚未从官网读取：benefit_tier 按 Free 显示，账户属于普通号池
   benefit_tier_known: boolean
-  // pool 为账户当前所属的号池：权益为 Ultra 的账户属于 ultra，其余属于 normal
+  // pool 为账户当前所属的号池，表示成员关系而不是权益：权益为 Ultra 的账户属于 ultra；
+  // 开启 ULTRA_INCLUDE_PRO 时权益为 Pro 的账户也属于 ultra；其余属于 normal
   pool: AccountPool
 }
 
@@ -184,7 +186,7 @@ export interface ServiceStatus {
   accounts: AccountCounters
   // workers 的数量与上限只含普通分区，warm_ids、starting_ids 包含两个分区
   workers?: WorkerCounters
-  // ultra_accounts 为 Ultra 号池的账户计数，ultra_workers 为 Ultra 分区的 Worker 计数
+  // ultra_accounts 为 Ultra 号池的账户计数（开启 ULTRA_INCLUDE_PRO 时含并入的 Pro 账户），ultra_workers 为 Ultra 分区的 Worker 计数
   ultra_accounts?: AccountCounters
   ultra_workers?: UltraWorkerCounters
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
@@ -353,9 +355,12 @@ export interface ServiceConfig {
   // warm_worker_limit 与 max_active_workers 只约束普通分区的 Worker
   warm_worker_limit: number
   max_active_workers: number
-  // ultra_exclusive 为真时 Ultra 账户只服务 /ultra 请求；ultra_warm_worker_limit 可以为 0（只按需启动），
+  // ultra_exclusive 为真时 Ultra 号池的账户只服务 /ultra 请求；ultra_warm_worker_limit 可以为 0（只按需启动），
   // ultra_max_active_workers 至少为 1 且不小于 Ultra 常驻数
   ultra_exclusive: boolean
+  // ultra_include_pro 为真时权益为 Pro 的账户并入 Ultra 号池，按 Ultra 号池的全部设置调度，账户的真实权益不变。
+  // 服务端总是返回该字段，因此这里不是可选字段：缺了它，设置页的快照对比会一直显示未保存
+  ultra_include_pro: boolean
   ultra_warm_worker_limit: number
   ultra_max_active_workers: number
   warm_startup_concurrency: number
@@ -369,7 +374,7 @@ export interface ServiceConfig {
   primary_models?: string[]
   primary_queue_wait?: string
   // ultra_primary_models 为 Ultra 主用模型（空数组表示关闭），只作用于 /ultra 请求（以及 ULTRA_EXCLUSIVE 关闭时普通路径上
-  // 只有 Ultra 账户能服务的模型），这些模型没有额度时立即返回 429；ultra_primary_queue_wait 为它们的排队上限，
+  // 只有 Ultra 号池的账户能服务的模型），这些模型没有额度时立即返回 429；ultra_primary_queue_wait 为它们的排队上限，
   // 规则与 primary_queue_wait 相同。旧版服务端不返回这两个字段
   ultra_primary_models?: string[]
   ultra_primary_queue_wait?: string

@@ -178,7 +178,7 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		// 与 Status 共用状态推导（按候选索引的紧凑数组）：需要登录的账户即使还有未结束的租约也不计入可预热
 		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {
 			summary.Available++
-			if account.BenefitTier == BenefitTierUltra {
+			if ultraPoolTier(account.BenefitTier, p.ultraIncludePro) {
 				summary.UltraAvailable++
 			}
 		}
@@ -271,7 +271,7 @@ func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts)
 		}
 		state := index.derivedStateAt(position, nowNanos)
 		counts.add(state)
-		if index.tier[position] == BenefitTierUltra {
+		if ultraPoolTier(index.tier[position], p.ultraIncludePro) {
 			ultra.add(state)
 		}
 	}
@@ -504,7 +504,7 @@ func (p *AccountPool) spareAccountsAtLocked(
 		if limit > 0 && spare >= limit {
 			break
 		}
-		if account == nil || !index.enabled[position] || index.state[position] != AccountReady || !scope.allowsTier(index.tier[position]) {
+		if account == nil || !index.enabled[position] || index.state[position] != AccountReady || !p.tierInPoolLocked(scope, index.tier[position]) {
 			continue
 		}
 		if global := index.globalUntil[position]; global > nowNanos && global-nowNanos >= minNanos {
@@ -555,10 +555,9 @@ func (p *AccountPool) ServeableCounts(accountIDs []string, modelIDs []string, mi
 			counts[account.ID] = 0
 			continue
 		}
-		scope := PoolScopeNormal
-		if index.tier[position] == BenefitTierUltra {
-			scope = PoolScopeUltra
-		}
+		// 索引只存真实权益，号池由权益加 ULTRA_INCLUDE_PRO 推导：并入的 Pro 按 Ultra 号池的候选集计分，
+		// 否则独占模式下它在普通候选集里得 0 分，永远不会为 Ultra 主用模型预热
+		scope := p.poolOfTierLocked(index.tier[position])
 		scoped, built := sets[scope]
 		if !built {
 			scoped = p.spareSetsLocked(scope, modelIDs, now)

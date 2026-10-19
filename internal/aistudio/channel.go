@@ -329,7 +329,7 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string, scope P
 		return false
 	}
 	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
+		if account == nil || !p.inPoolLocked(scope, account) {
 			continue
 		}
 		for _, model := range account.buildModels {
@@ -356,7 +356,7 @@ func (p *AccountPool) modelChannelsInLocked(model Model, scope PoolScope) []stri
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {
 		for _, account := range p.accounts {
-			if account != nil && account.Config.Enabled && scope.allows(account) && p.channelSupportsLocked(account, channel, selection) {
+			if account != nil && account.Config.Enabled && p.inPoolLocked(scope, account) && p.channelSupportsLocked(account, channel, selection) {
 				channels = append(channels, string(channel))
 				break
 			}

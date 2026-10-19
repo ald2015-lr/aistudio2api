@@ -849,8 +849,12 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	// Ultra 号池设置：旧版页面保存时不带这些字段，沿用现值（Ultra 常驻数可以为 0，不能用零值判断是否缺省）
 	ultraExclusive, ultraWarm, ultraMax := saved.UltraExclusive, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers
+	ultraIncludePro := saved.UltraIncludePro
 	if value.UltraExclusive != nil {
 		ultraExclusive = *value.UltraExclusive
+	}
+	if value.UltraIncludePro != nil {
+		ultraIncludePro = *value.UltraIncludePro
 	}
 	if value.UltraWarmWorkerLimit != nil {
 		ultraWarm = *value.UltraWarmWorkerLimit
@@ -894,7 +898,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
 		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
-		UltraExclusive: ultraExclusive, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
+		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		RoutingStrategy:        value.RoutingStrategy,
@@ -1511,6 +1515,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		WAABackend:             cfg.WAABackend,
 		DowngradeGuard:         downgradeGuardToAPI(cfg.DowngradeGuard),
 		UltraExclusive:         &cfg.UltraExclusive,
+		UltraIncludePro:        &cfg.UltraIncludePro,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
 		StreamPlaygroundModels: &streamPlaygroundModels,

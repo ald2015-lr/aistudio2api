@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -9,12 +10,14 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
-// Worker 分区：每个 Worker 计入其账户当前权益所属的分区（aistudio.PoolScopeNormal 或 aistudio.PoolScopeUltra）。
+// Worker 分区：每个 Worker 计入其账户当前所在号池对应的分区（aistudio.PoolScopeNormal 或 aistudio.PoolScopeUltra），
+// 号池由账户权益与 ULTRA_INCLUDE_PRO 共同决定（见 aistudio.AccountPool.UltraAccountIDs）。
 // WARM_WORKER_LIMIT、MAX_ACTIVE_WORKERS（warmTarget、maxActive）只约束普通分区，ULTRA_WARM_WORKER_LIMIT、
 // ULTRA_MAX_ACTIVE_WORKERS（ultraWarmTarget、ultraMaxActive）约束 Ultra 分区，浏览器总数最多为两个分区峰值之和。
 // 预热补齐、空闲回收、容量判断、淘汰选号（idleWarmVictimFor 与冷却轮换的 tryReserveVictim）都只在一个分区内进行：
 // Ultra 请求不会淘汰普通 Worker，反之亦然。冷启动名额（WARM_STARTUP_CONCURRENCY）与单账户并发仍是全局共用的。
-// 账户权益在持有 Worker 期间变化时，该 Worker 从此按新分区计数，不强制重启
+// 账户权益在持有 Worker 期间变化、或 ULTRA_INCLUDE_PRO 切换时，该 Worker 从此按新分区计数，不强制重启：
+// 分区判断每次调用都重新读取成员，超出峰值的空闲 Worker 由空闲回收逐步收敛（见 poolRuleChanged）
 
 // workerPartitions 为全部 Worker 分区，普通分区在前
 var workerPartitions = [...]aistudio.PoolScope{aistudio.PoolScopeNormal, aistudio.PoolScopeUltra}
@@ -115,6 +118,59 @@ func (manager *accountWorkerManager) shortPartition() (aistudio.PoolScope, bool)
 	return aistudio.PoolScopeAll, false
 }
 
+// partitionLabel 返回分区的中文名称，用于运行日志
+func partitionLabel(partition aistudio.PoolScope) string {
+	if partition == aistudio.PoolScopeUltra {
+		return "Ultra 分区"
+	}
+	return "普通分区"
+}
+
+// poolRuleChanged 在 ULTRA_INCLUDE_PRO 实际切换之后调用：Pro 账户换了号池，它们的 Worker 从此计入另一个分区。
+// 分区计数、预热目标与容量判断每次调用都重新读取成员，不需要迁移；这里只处理按分区固定下来的状态并唤醒等待者：
+//  1. 排空状态在排空开始时记下了分区，按当前成员改标，否则排空中的 Pro Worker 会在最长 REQUEST_TIMEOUT+30 秒内
+//     继续给旧分区记让出额度；
+//  2. 唤醒等待容量的请求，按新成员重新判断（账户池的变化通知已唤醒等待账户的请求与调度队首）；
+//  3. 记录生效日志，分区超过峰值时提示空闲 Worker 将逐步回收。
+//
+// 所有输入都读当前状态，可以重复执行；exclusive 为调用时生效的 ULTRA_EXCLUSIVE
+func (manager *accountWorkerManager) poolRuleChanged(exclusive bool) {
+	manager.drainMu.Lock()
+	// 在 drainMu 内取成员快照（锁顺序 drainMu 再到账户池锁，与 SetDraining 相同）：startDrain 同样在 drainMu 内按当前成员算分区，
+	// 两边不会用不同时刻的成员覆盖对方
+	ultra := manager.pool.UltraAccountIDs()
+	for accountID, drain := range manager.drains {
+		drain.partition = partitionOf(accountID, ultra)
+	}
+	manager.drainMu.Unlock()
+	manager.notifyScheduling()
+
+	ultra = manager.pool.UltraAccountIDs()
+	warm, opening := manager.WarmAccountIDs(), manager.OpeningAccountIDs()
+	current := make(map[aistudio.PoolScope]int, len(workerPartitions))
+	for _, partition := range workerPartitions {
+		current[partition] = len(inPartition(warm, ultra, partition)) + len(inPartition(opening, ultra, partition))
+	}
+	includePro := manager.pool.UltraIncludePro()
+	manager.requests.log("service", "INFO", fmt.Sprintf(
+		"Pro 账户并入 Ultra 号池设置已更新并立即生效 | 并入=%t | Ultra 号池账户=%d | Ultra 分区 Worker=%d/%d | 普通分区 Worker=%d/%d",
+		includePro, len(ultra),
+		current[aistudio.PoolScopeUltra], manager.maxActiveFor(aistudio.PoolScopeUltra),
+		current[aistudio.PoolScopeNormal], manager.maxActiveFor(aistudio.PoolScopeNormal),
+	))
+	for _, partition := range workerPartitions {
+		if peak := manager.maxActiveFor(partition); current[partition] > peak {
+			manager.requests.log("service", "WARN", fmt.Sprintf(
+				"%s Worker 超过峰值 | 当前=%d | 峰值=%d | 空闲 Worker 将逐步回收，可调大对应峰值",
+				partitionLabel(partition), current[partition], peak,
+			))
+		}
+	}
+	if includePro && exclusive {
+		manager.requests.log("service", "WARN", "ULTRA_EXCLUSIVE=true 时 Pro 账户不再服务普通路径；Pro 账户上的文件与视频改从 /ultra 引用")
+	}
+}
+
 // workerLogName 返回分区在运行日志里的 Worker 名称：普通分区沿用原有写法，Ultra 分区加前缀
 func workerLogName(partition aistudio.PoolScope) string {
 	if partition == aistudio.PoolScopeUltra {
@@ -132,8 +188,9 @@ func workerSlotName(partition aistudio.PoolScope) string {
 }
 
 // fillTargetFor 返回预热循环中分区要补齐到的常驻数：普通分区按 WARM_WORKER_LIMIT；Ultra 分区按 ULTRA_WARM_WORKER_LIMIT，
-// 没有可预热的 Ultra 账户时为 0，没有 Ultra 账户的部署不会为空分区反复分类候选。
-// 可预热的账户都是 Ultra 时普通分区同样为 0：只有 Ultra 账户（或普通账户都不可用）的部署按 Ultra 分区完成预热，
+// 没有可预热的 Ultra 号池账户时为 0，没有 Ultra 号池账户的部署不会为空分区反复分类候选（UltraAvailable 按号池成员计数，
+// ULTRA_INCLUDE_PRO=true 时含 Pro，只有 Pro 账户的部署同样会预热 Ultra 分区）。
+// 可预热的账户都属于 Ultra 号池时普通分区同样为 0：只有 Ultra 号池账户（或普通账户都不可用）的部署按 Ultra 分区完成预热，
 // Ultra 常驻数为 0 时直接完成首轮预热、Ultra Worker 按需启动；没有可预热账户时仍按原来的方式报错
 func (manager *accountWorkerManager) fillTargetFor(partition aistudio.PoolScope, summary aistudio.BootstrapSummary) int {
 	if partition == aistudio.PoolScopeUltra && summary.UltraAvailable == 0 {

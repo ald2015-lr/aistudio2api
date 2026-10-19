@@ -52,8 +52,7 @@ func newRuntime(
 
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")
 	pool := aistudio.NewAccountPool(accounts, cfg.PerAccountConcurrency)
-	pool.SetRoutingStrategy(cfg.RoutingStrategy)
-	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
+	configurePool(pool, cfg)
 	headers, err := newAccountHeaderProvider(accounts, cfg.Proxy)
 	if err != nil {
 		return nil, nil, nil, err
@@ -142,18 +141,27 @@ func newRuntime(
 	return service, admin, closeRuntime, nil
 }
 
+// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道与 ULTRA_INCLUDE_PRO。
+// 必须在创建 Worker 管理器、同步目录与预热之前调用，第一次 Worker 分区与预热目标就按正确的号池成员计算
+func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
+	pool.SetRoutingStrategy(cfg.RoutingStrategy)
+	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
+	pool.SetUltraIncludePro(cfg.UltraIncludePro)
+}
+
 // accountWorkerManager 管理每账户的长驻 WAA worker
 type accountWorkerManager struct {
-	// bootstrapCache 为预热概况的短时缓存（见 bootstrapSummary）
-	bootstrapMu    sync.Mutex
-	bootstrapCache aistudio.BootstrapSummary
-	bootstrapAt    time.Time
-	mu             sync.RWMutex
-	fillMu         sync.Mutex
-	rebalanceMu    sync.Mutex
-	pool           *aistudio.AccountPool
-	accounts       map[string]*accountWorker
-	openings       map[string]chan struct{}
+	// bootstrapCache 为预热概况的短时缓存（见 bootstrapSummary）；bootstrapVersion 为计算前读到的号池规则版本
+	bootstrapMu      sync.Mutex
+	bootstrapCache   aistudio.BootstrapSummary
+	bootstrapAt      time.Time
+	bootstrapVersion uint64
+	mu               sync.RWMutex
+	fillMu           sync.Mutex
+	rebalanceMu      sync.Mutex
+	pool             *aistudio.AccountPool
+	accounts         map[string]*accountWorker
+	openings         map[string]chan struct{}
 	// openingSet 是 openings 的无锁镜像，供状态接口读取正在启动的账户
 	openingSet sync.Map
 	// warmFailures 记录预热失败的账户与时间，冷却期内不再反复尝试
@@ -1433,7 +1441,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return preparer, nil
 		}
-		// 容量只计账户所在分区：Worker 按账户当前权益计入普通或 Ultra 分区
+		// 容量只计账户所在分区：Worker 按账户当前所在号池（权益与 ULTRA_INCLUDE_PRO 共同决定）计入普通或 Ultra 分区
 		ultra := manager.pool.UltraAccountIDs()
 		partition := partitionOf(accountID, ultra)
 		occupancy := manager.occupiedWorkersIn(partition, ultra)
@@ -4625,8 +4633,9 @@ func (service *trackedService) applyQuotaCooldown(
 	if cooldown.Global || cooldown.Kind != dailyQuotaKind {
 		return cooldown, true, nil
 	}
-	// 通道共用额度的判定按账户所在号池分开学习
-	other, coolOther := service.quota.dailyLimitHit(accountID, modelID, service.pool.PoolOf(accountID), lease.Channel(), lease.CheckedAt(), time.Now())
+	// 通道共用额度的判定按账户真实权益分开学习（Ultra 权益单独一组），不随 ULTRA_INCLUDE_PRO 变化：
+	// 并入 Ultra 号池的 Pro 账户额度与 Ultra 不同，证据混进 Ultra 的判定后关掉开关也不会消失
+	other, coolOther := service.quota.dailyLimitHit(accountID, modelID, service.pool.TierPoolOf(accountID), lease.Channel(), lease.CheckedAt(), time.Now())
 	if !coolOther {
 		return cooldown, true, nil
 	}
@@ -5116,17 +5125,21 @@ const (
 )
 
 // bootstrapSummary 返回预热概况；账户多时缓存几秒。统计要在账户池锁内扫描全部账户的模型（账户多时几百毫秒），
-// 预热循环与状态接口频繁调用，诊断中占了约两成的账户池锁时间；预热目标本身按分钟变化，不需要实时
+// 预热循环与状态接口频繁调用，诊断中占了约两成的账户池锁时间；预热目标本身按分钟变化，不需要实时。
+// 缓存同时记下计算前读到的号池规则版本，ULTRA_INCLUDE_PRO 切换后版本不同即重算：UltraAvailable 按号池成员计数，
+// 沿用旧值会让 Ultra 分区的预热目标在缓存期内仍按旧成员计算。先读版本再计算，切换前开始、切换后才写回的旧结果
+// 带的是旧版本，下一次调用照样重算，不会再被用满一个缓存期
 func (manager *accountWorkerManager) bootstrapSummary() aistudio.BootstrapSummary {
+	version := manager.pool.PoolRuleVersion()
 	manager.bootstrapMu.Lock()
-	cached, at := manager.bootstrapCache, manager.bootstrapAt
+	cached, at, cachedVersion := manager.bootstrapCache, manager.bootstrapAt, manager.bootstrapVersion
 	manager.bootstrapMu.Unlock()
-	if !at.IsZero() && cached.Available > bootstrapCacheMinAccounts && time.Since(at) < bootstrapSummaryTTL {
+	if !at.IsZero() && cached.Available > bootstrapCacheMinAccounts && time.Since(at) < bootstrapSummaryTTL && cachedVersion == version {
 		return cached
 	}
 	summary := manager.pool.BootstrapSummary()
 	manager.bootstrapMu.Lock()
-	manager.bootstrapCache, manager.bootstrapAt = summary, time.Now()
+	manager.bootstrapCache, manager.bootstrapAt, manager.bootstrapVersion = summary, time.Now(), version
 	manager.bootstrapMu.Unlock()
 	return summary
 }

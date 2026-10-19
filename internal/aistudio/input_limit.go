@@ -45,7 +45,8 @@ func benefitTierRank(tier BenefitTier) int {
 }
 
 // EnabledAccountsAboveTierOf 返回号池内启用、权益高于 accountID 所属账号权益的账户 ID（按候选索引顺序）。
-// 输入 token 超过账号上限时用它找一次更高权益的账号再试；accountID 不存在或没有更高权益的账号时返回 nil
+// 输入 token 超过账号上限时用它找一次更高权益的账号再试；accountID 不存在或没有更高权益的账号时返回 nil。
+// 号池按成员关系（含 ULTRA_INCLUDE_PRO）过滤，权益高低仍按真实权益比较：输入上限由真实权益决定
 func (p *AccountPool) EnabledAccountsAboveTierOf(scope PoolScope, accountID string) []string {
 	if p == nil {
 		return nil
@@ -60,7 +61,7 @@ func (p *AccountPool) EnabledAccountsAboveTierOf(scope PoolScope, accountID stri
 	index := p.schedulingLocked()
 	var ids []string
 	for position := range index.ids {
-		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) || benefitTierRank(index.tier[position]) <= rank {
+		if !index.enabled[position] || !p.tierInPoolLocked(scope, index.tier[position]) || benefitTierRank(index.tier[position]) <= rank {
 			continue
 		}
 		ids = append(ids, index.ids[position])

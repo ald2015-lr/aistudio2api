@@ -46,7 +46,8 @@ type AdminStatus struct {
 	ActiveRequests int                `json:"active_requests"`
 	Accounts       AdminAccountCounts `json:"accounts"`
 	Workers        AdminWorkerCounts  `json:"workers"`
-	// UltraAccounts 为 Ultra 号池（权益为 Ultra 的账户）的状态计数，Accounts 包含全部账户
+	// UltraAccounts 为 Ultra 号池成员（权益为 Ultra 的账户，ULTRA_INCLUDE_PRO=true 时也含权益为 Pro 的账户）的状态计数，
+	// Accounts 包含全部账户
 	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
 	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含两个分区）
 	UltraWorkers AdminWorkerPartition `json:"ultra_workers"`
@@ -230,7 +231,8 @@ type AdminAccount struct {
 	Message     string   `json:"message"`
 	// BenefitTierKnown 表示权益已经从官网读取过；为 false 时 benefit_tier 按 Free 显示，账户属于普通号池
 	BenefitTierKnown bool `json:"benefit_tier_known"`
-	// Pool 为账户当前所属的号池：ultra（权益为 Ultra）或 normal
+	// Pool 为账户当前所属的号池（成员关系）：ultra（权益为 Ultra，ULTRA_INCLUDE_PRO=true 时也含 Pro）或 normal；
+	// benefit_tier 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍显示 Pro
 	Pool string `json:"pool"`
 }
 
@@ -293,9 +295,10 @@ type RuntimeConfig struct {
 	WAABackend                string   `json:"waa_backend"`
 	// DowngradeGuard 为降级判定设置；保存时没有该字段（旧版页面）则沿用现值
 	DowngradeGuard *DowngradeGuardConfig `json:"downgrade_guard,omitempty"`
-	// UltraExclusive、UltraWarmWorkerLimit、UltraMaxActiveWorkers 为 Ultra 号池设置（ULTRA_EXCLUSIVE、ULTRA_WARM_WORKER_LIMIT、
-	// ULTRA_MAX_ACTIVE_WORKERS），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值
+	// UltraExclusive、UltraIncludePro、UltraWarmWorkerLimit、UltraMaxActiveWorkers 为 Ultra 号池设置（ULTRA_EXCLUSIVE、
+	// ULTRA_INCLUDE_PRO、ULTRA_WARM_WORKER_LIMIT、ULTRA_MAX_ACTIVE_WORKERS），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值
 	UltraExclusive        *bool `json:"ultra_exclusive,omitempty"`
+	UltraIncludePro       *bool `json:"ultra_include_pro,omitempty"`
 	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
 	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS），读取时总是返回（可以为空数组）；

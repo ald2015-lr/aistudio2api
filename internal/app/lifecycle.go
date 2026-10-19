@@ -74,9 +74,12 @@ type runtimeManager struct {
 	startCancel      context.CancelFunc
 	apiKey           *apiKeyHolder
 	intent           *serviceIntent
-	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 账户，保存配置后立即生效，
+	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 号池的账户，保存配置后立即生效，
 	// 启动生成服务时按新读取的配置同步
 	ultraExclusive atomic.Bool
+	// liveConfigMu 让配置热更新逐次进行：applyLiveConfig 在锁外读取 .env，两次保存并发时，先读到旧文件的一次可能最后应用，
+	// 账户池里的 ULTRA_INCLUDE_PRO、current.config 与 .env 就会不一致。逐次进行后，最后一次应用读到的一定是最后写入的文件
+	liveConfigMu sync.Mutex
 	// shuttingDown 在进程退出时置为 true（由 mu 保护），之后不再启动生成服务
 	shuttingDown bool
 	// ledger 为用量账本，在开始接收请求之前设置、之后不再改变；打开失败时为 nil（方法对 nil 安全）
@@ -571,7 +574,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		RoutingStrategy: value.RoutingStrategy, UpstreamChannels: value.UpstreamChannels,
 		WAABackend:     value.WAABackend,
 		DowngradeGuard: active.DowngradeGuard,
-		UltraExclusive: active.UltraExclusive, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
+		UltraExclusive: active.UltraExclusive, UltraIncludePro: active.UltraIncludePro, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
@@ -581,6 +584,9 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	}
 	if value.UltraExclusive != nil {
 		saved.UltraExclusive = *value.UltraExclusive
+	}
+	if value.UltraIncludePro != nil {
+		saved.UltraIncludePro = *value.UltraIncludePro
 	}
 	if value.UltraWarmWorkerLimit != nil {
 		saved.UltraWarmWorkerLimit = *value.UltraWarmWorkerLimit
@@ -602,7 +608,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
 		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
-		saved.UltraExclusive == active.UltraExclusive && saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
+		saved.UltraExclusive == active.UltraExclusive && saved.UltraIncludePro == active.UltraIncludePro &&
+		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.TemporaryChat == active.TemporaryChat &&

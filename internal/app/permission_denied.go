@@ -239,8 +239,8 @@ func (registry *permissionDeniedRegistry) channelIndexLocked(accountID string, m
 
 // dropSystemic 号池级 403 判定成立后撤销号池 scope 里该模型首次登记不早于 since 的全部条目，返回撤销的账户数：这些 403 是号池一侧的
 // 问题，不是账户没有权限。原先只撤销号池级判定记着的最多 5 个账户：故障紧接着成功开始时，判定要等号池 forbiddenWindow 内没有成功
-// 才成立，这之前每个 403 都按账户级登记，判定成立后列表里仍留下大批正常账户。更早就登记过的保留；账户是否属于号池按当前权益判断
-// （一次取得 Ultra 账户集合，只在需要扫描时取）
+// 才成立，这之前每个 403 都按账户级登记，判定成立后列表里仍留下大批正常账户。更早就登记过的保留；账户是否属于号池按当前成员判断
+// （权益与 ULTRA_INCLUDE_PRO 共同决定；一次取得 Ultra 号池成员的只读快照，只在需要扫描时取）
 func (registry *permissionDeniedRegistry) dropSystemic(
 	pool *aistudio.AccountPool, scope aistudio.PoolScope, modelID string, since time.Time,
 ) int {

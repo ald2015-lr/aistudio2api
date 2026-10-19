@@ -9,10 +9,12 @@ import (
 	"time"
 )
 
-// PoolScope 表示一次请求可以使用的账户号池。号池按账户当前权益划分：权益为 Ultra 的账户组成 Ultra 号池，
-// 其余账户（含权益尚未识别的账户）组成普通号池。/ultra 前缀的请求只用 Ultra 号池；ULTRA_EXCLUSIVE=true（默认）时
-// 普通路径只用普通号池，为 false 时普通路径不限号池。预热、轮换、登录检查等不和请求关联的后台任务不限号池。
-// Worker 分区同样按账户当前权益划分（普通分区与 Ultra 分区），用 PoolScopeNormal 与 PoolScopeUltra 表示
+// PoolScope 表示一次请求可以使用的账户号池。号池按账户当前权益与 ULTRA_INCLUDE_PRO 划分（唯一的判定见 ultraPoolTier）：
+// 权益为 Ultra 的账户，以及 ULTRA_INCLUDE_PRO=true 时权益为 Pro 的账户，组成 Ultra 号池（付费号池）；其余账户（含权益尚未识别的账户）
+// 组成普通号池。号池只决定账户服务哪条路径，账户权益本身不变：权益请求头、模型资格与输入上限仍按真实权益。
+// /ultra 前缀的请求只用 Ultra 号池；ULTRA_EXCLUSIVE=true（默认）时普通路径只用普通号池，为 false 时普通路径不限号池。
+// 预热、轮换、登录检查等不和请求关联的后台任务不限号池。Worker 分区与号池一致（普通分区与 Ultra 分区），
+// 用 PoolScopeNormal 与 PoolScopeUltra 表示
 type PoolScope uint8
 
 const (
@@ -48,29 +50,100 @@ func (scope PoolScope) Label() string {
 	}
 }
 
-// allowsTier 判断当前权益为 tier 的账户是否属于号池
-func (scope PoolScope) allowsTier(tier BenefitTier) bool {
+// ultraPoolTier 判断权益为 tier 的账户是否属于 Ultra 号池：Ultra 总是属于，includePro（ULTRA_INCLUDE_PRO）为真时 Pro 也属于。
+// 号池成员只由这里决定，权益本身不变。不叫 paid：Model.Paid 是模型属性，同名会把两者混淆
+func ultraPoolTier(tier BenefitTier, includePro bool) bool {
+	return tier == BenefitTierUltra || includePro && tier == BenefitTierPro
+}
+
+// poolOfTier 返回权益为 tier 的账户所属的号池（Worker 分区）：属于 Ultra 号池的为 PoolScopeUltra，其余（含尚未识别）为 PoolScopeNormal
+func poolOfTier(tier BenefitTier, includePro bool) PoolScope {
+	if ultraPoolTier(tier, includePro) {
+		return PoolScopeUltra
+	}
+	return PoolScopeNormal
+}
+
+// allowsTier 判断权益为 tier 的账户在开关 includePro 下是否属于号池
+func (scope PoolScope) allowsTier(tier BenefitTier, includePro bool) bool {
 	switch scope {
 	case PoolScopeUltra:
-		return tier == BenefitTierUltra
+		return ultraPoolTier(tier, includePro)
 	case PoolScopeNormal:
-		return tier != BenefitTierUltra
+		return !ultraPoolTier(tier, includePro)
 	default:
 		return true
 	}
 }
 
-// allows 判断账户当前是否属于号池；调用方持有账户池 mu
-func (scope PoolScope) allows(account *Account) bool {
-	return account != nil && scope.allowsTier(account.BenefitTier)
+// allows 判断账户在开关 includePro 下是否属于号池
+func (scope PoolScope) allows(account *Account, includePro bool) bool {
+	return account != nil && scope.allowsTier(account.BenefitTier, includePro)
 }
 
-// PoolOfTier 返回权益所属的号池：Ultra 权益属于 Ultra 号池，其余（含尚未识别）属于普通号池
-func PoolOfTier(tier BenefitTier) PoolScope {
-	if tier == BenefitTierUltra {
-		return PoolScopeUltra
+// inPoolLocked 判断账户当前是否属于号池；调用方持有 p.mu。账户池内的号池判断都经过这里或 tierInPoolLocked，
+// 开关与它派生的成员集合、候选集在同一把锁下变化
+func (p *AccountPool) inPoolLocked(scope PoolScope, account *Account) bool {
+	return scope.allows(account, p.ultraIncludePro)
+}
+
+// tierInPoolLocked 判断权益为 tier 的账户当前是否属于号池；调用方持有 p.mu。候选索引按位置只存真实权益，号池在读取时推导
+func (p *AccountPool) tierInPoolLocked(scope PoolScope, tier BenefitTier) bool {
+	return scope.allowsTier(tier, p.ultraIncludePro)
+}
+
+// poolOfTierLocked 返回权益为 tier 的账户当前所属的号池；调用方持有 p.mu
+func (p *AccountPool) poolOfTierLocked(tier BenefitTier) PoolScope {
+	return poolOfTier(tier, p.ultraIncludePro)
+}
+
+// SetUltraIncludePro 切换 ULTRA_INCLUDE_PRO，返回是否发生变化。号池成员规则变化与账户权益变化同类（见 syncAccountRuntimeLocked）：
+// 递增 eligibilityVersion 让按号池缓存的目录汇总、别名解析与模型通道重建；候选集成员按号池判断，整个候选索引作废，
+// 下次调度时重建（与 Remove、SetUpstreamChannels 相同）。进行中的租约不受影响，按旧成员选中、尚未确认的租约由
+// refreshAndValidateLease 放弃并重新选号。最后关闭 changed，让等待账户的请求和后台循环立即按新成员重查
+func (p *AccountPool) SetUltraIncludePro(on bool) bool {
+	if p == nil {
+		return false
 	}
-	return PoolScopeNormal
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.ultraIncludePro == on {
+		return false
+	}
+	p.ultraIncludePro = on
+	// 成员集合按新规则整体重算：一次 O(N) 扫描，比逐个账户走 accountChangedLocked 少维护一遍候选集（候选索引随后整体作废）
+	clear(p.ultraAccounts)
+	for _, account := range p.accounts {
+		if account != nil && p.byID[account.ID] == account && ultraPoolTier(account.BenefitTier, on) {
+			p.ultraAccounts[account.ID] = struct{}{}
+		}
+	}
+	p.ultraSnapshot = nil
+	p.eligibilityVersion++
+	p.invalidateSchedulingLocked()
+	p.invalidateStatusLocked()
+	p.poolRuleVersion.Add(1)
+	p.notifyLocked()
+	return true
+}
+
+// UltraIncludePro 返回当前是否把权益为 Pro 的账户并入 Ultra 号池（ULTRA_INCLUDE_PRO）
+func (p *AccountPool) UltraIncludePro() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ultraIncludePro
+}
+
+// PoolRuleVersion 返回号池划分规则的版本：ULTRA_INCLUDE_PRO 每次实际切换时加一，无锁读取。
+// app 层按号池成员计算、又在锁外缓存的派生结果（预热概况、主用模型供给）计算前读取并一同保存，版本不同即作废
+func (p *AccountPool) PoolRuleVersion() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.poolRuleVersion.Load()
 }
 
 type poolScopeContextKey struct{}
@@ -104,7 +177,9 @@ func ScopedSelection(ctx context.Context, selection AccountSelection) AccountSel
 }
 
 // ResourcePoolMismatchError 表示请求引用的文件或视频绑定在请求号池之外的账户上：/ultra 请求不能使用普通号池账户的资源，
-// 独占模式下普通路径也不能使用 Ultra 账户的资源。属于请求本身的原因，对外按 400 返回，不会改用池外账户。
+// 独占模式下普通路径也不能使用 Ultra 号池账户（含 ULTRA_INCLUDE_PRO=true 时并入的 Pro）的资源。资源不随开关迁移，按所属账户当前的
+// 号池判断：开启后独占模式下经普通路径、关闭后经 /ultra 引用 Pro 账户上已有的资源，同样按这个错误返回。
+// 属于请求本身的原因，对外按 400 返回，不会改用池外账户。
 // 消息是英文：会原样返回给客户端，告诉调用方改用哪个入口
 type ResourcePoolMismatchError struct {
 	ResourceID string
@@ -140,13 +215,13 @@ func (p *AccountPool) resourcePoolErrorLocked(scope PoolScope, resourceID string
 		return nil
 	}
 	owner := p.byID[ownerID]
-	if owner == nil || scope.allows(owner) {
+	if owner == nil || p.inPoolLocked(scope, owner) {
 		return nil
 	}
-	return &ResourcePoolMismatchError{ResourceID: resourceID, Owner: PoolOfTier(owner.BenefitTier)}
+	return &ResourcePoolMismatchError{ResourceID: resourceID, Owner: p.poolOfTierLocked(owner.BenefitTier)}
 }
 
-// PoolOf 返回账户当前所属的号池（Worker 分区）；账户不存在时按普通号池
+// PoolOf 返回账户当前所属的号池（Worker 分区），随 ULTRA_INCLUDE_PRO 变化；账户不存在时按普通号池
 func (p *AccountPool) PoolOf(accountID string) PoolScope {
 	if p == nil {
 		return PoolScopeNormal
@@ -157,18 +232,38 @@ func (p *AccountPool) PoolOf(accountID string) PoolScope {
 	if account == nil {
 		return PoolScopeNormal
 	}
-	return PoolOfTier(account.BenefitTier)
+	return p.poolOfTierLocked(account.BenefitTier)
 }
 
-// UltraAccountIDs 一次加锁返回当前属于 Ultra 号池的账户，供 Worker 分区计数
+// TierPoolOf 返回账户按真实权益的号池：Ultra 权益为 PoolScopeUltra，其余为 PoolScopeNormal，不随 ULTRA_INCLUDE_PRO 变化。
+// 供额度共享学习分组：Ultra 账户的额度与其他权益不同，并入 Ultra 号池的 Pro 证据混进 Ultra 的判定后，关掉开关也不会消失。
+// 账户不存在时按普通号池
+func (p *AccountPool) TierPoolOf(accountID string) PoolScope {
+	if p == nil {
+		return PoolScopeNormal
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	if account == nil {
+		return PoolScopeNormal
+	}
+	return poolOfTier(account.BenefitTier, false)
+}
+
+// UltraAccountIDs 一次加锁返回当前属于 Ultra 号池的账户，供 Worker 分区计数。返回值是共享的只读快照，调用方不得修改：
+// 快照只在成员实际变化时重建（见 accountChangedLocked、Remove、SetUltraIncludePro），Pro 并入后成员可达数千，
+// 每次调用都克隆会在账户池锁内的热路径上花去近一毫秒
 func (p *AccountPool) UltraAccountIDs() map[string]struct{} {
 	if p == nil {
 		return make(map[string]struct{})
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	// 账户池随权益变化维护 Ultra 账户集合（见 accountChangedLocked），每次请求的分区判断不再扫描全部账户
-	return maps.Clone(p.ultraAccounts)
+	if p.ultraSnapshot == nil {
+		p.ultraSnapshot = maps.Clone(p.ultraAccounts)
+	}
+	return p.ultraSnapshot
 }
 
 // CanonicalModelIDIn 与 CanonicalModelID 相同，但只在号池内的账户目录中解析别名
@@ -213,7 +308,7 @@ func (p *AccountPool) EnabledAccountsIn(scope PoolScope) ([]string, int) {
 	ids := make([]string, 0, len(index.ids))
 	schedulable := 0
 	for position := range index.ids {
-		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {
+		if !index.enabled[position] || !p.tierInPoolLocked(scope, index.tier[position]) {
 			continue
 		}
 		ids = append(ids, index.ids[position])
@@ -234,7 +329,7 @@ func (p *AccountPool) attemptCandidatesIn(scope PoolScope) int {
 	nowNanos := now.UnixNano()
 	eligible := 0
 	for position := range index.ids {
-		if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {
+		if !index.enabled[position] || !p.tierInPoolLocked(scope, index.tier[position]) {
 			continue
 		}
 		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {

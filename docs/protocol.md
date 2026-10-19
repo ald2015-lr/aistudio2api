@@ -177,9 +177,9 @@ Google 邮箱的小写形式同时作为账户目录、管理页面标识和日�
 | 2 | Ultra | `X-AIStudio-G1-Tier: TIER2` |
 | 3 | Plus | `X-AIStudio-G1-Tier: TIER0` |
 
-官网为 `GenerateContent`、`CountTokens`、Interaction、Code Assistant 与 Veo RPC 注入该 header。模型 field 83 描述访问方式：`1` 为付费 API key，`3` 为 Pro/Ultra 订阅，`4` 为 Ultra 订阅。公开模型目录合并全部账户的实时 `ListModels` 记录；账户调度使用 AccessModes、BenefitTier 与成功调用历史选择具体账户。
+官网为 `GenerateContent`、`CountTokens`、Interaction、Code Assistant 与 Veo RPC 注入该 header。模型 field 83 描述访问方式：`1` 为付费 API key，`3` 为 Pro/Ultra 订阅，`4` 为 Ultra 订阅。公开模型目录合并全部账户的实时 `ListModels` 记录；账户调度使用 AccessModes、BenefitTier 与成功调用历史选择具体账户。号池划分（见下段）不改变权益：`ULTRA_INCLUDE_PRO=true` 时并入 Ultra 号池的 Pro 账户仍发 `X-AIStudio-G1-Tier: TIER1`，access mode `3` 的模型 Pro 与 Ultra 账户都可服务，只有 access mode `4`（Ultra 订阅）可用的模型仍只由 Ultra 账户服务。
 
-账户按当前权益分为两个号池：权益为 Ultra 的账户组成 Ultra 号池，其余账户（含尚未读取权益的账户，`benefit_tier_known=false`）组成普通号池。`/ultra` 前缀的请求只在 Ultra 号池内选号；`ULTRA_EXCLUSIVE=true`（默认）时普通路径只在普通号池内选号，为 `false` 时普通路径不限号池。号池限定作用于全部选号、模型存在性校验、公开模型目录与别名解析、换号、通道回退、文件复制与上传候选；不和请求关联的预热、轮换、登录检查不限号池。权益在目录同步或运行状态刷新后变化时，账户立即按新权益归入号池。Worker 按同样的划分计入普通分区或 Ultra 分区，两个分区分别受 `WARM_WORKER_LIMIT`/`MAX_ACTIVE_WORKERS` 与 `ULTRA_WARM_WORKER_LIMIT`/`ULTRA_MAX_ACTIVE_WORKERS` 约束，淘汰与轮换不跨分区。
+账户按当前权益与 `ULTRA_INCLUDE_PRO` 分为两个号池：权益为 Ultra 的账户，以及 `ULTRA_INCLUDE_PRO=true` 时权益为 Pro 的账户，组成 Ultra 号池（付费号池），其余账户（含尚未读取权益的账户，`benefit_tier_known=false`）组成普通号池。`/ultra` 前缀的请求只在 Ultra 号池内选号；`ULTRA_EXCLUSIVE=true`（默认）时普通路径只在普通号池内选号，为 `false` 时普通路径不限号池。号池限定作用于全部选号、模型存在性校验、公开模型目录与别名解析、换号、通道回退、文件复制与上传候选；不和请求关联的预热、轮换、登录检查不限号池。权益在目录同步或运行状态刷新后变化、或 `ULTRA_INCLUDE_PRO` 保存后切换时，账户立即按新的划分归入号池（开关不需要重启生成服务）。`ULTRA_EXCLUSIVE=true` 且 `ULTRA_INCLUDE_PRO=true` 时普通路径不再使用 Pro 账户：只有 Pro、Ultra 账户能服务的模型（access mode `3`、`4`；只在 Build 通道提供的模型如 `gemini-4-argon` 不按权益判断，只看哪些账户的 Build 目录列出它，普通号池里没有这样的账户时同样如此）不再出现在普通路径的公开模型目录里，普通路径上输入超限后的更高权益重试也不会再选到 Pro 账户。Worker 按同样的划分计入普通分区或 Ultra 分区，两个分区分别受 `WARM_WORKER_LIMIT`/`MAX_ACTIVE_WORKERS` 与 `ULTRA_WARM_WORKER_LIMIT`/`ULTRA_MAX_ACTIVE_WORKERS` 约束，淘汰与轮换不跨分区。
 
 ## 3. WAA challenge、官方 VM 与 fresh proof
 
@@ -1090,7 +1090,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | OpenAI 转录 | `POST /v1/audio/transcriptions` |
 | 实时 WebSocket | `GET /v1/live`、`GET /v1/robotics/stream` |
 
-上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；去掉前缀时保留客户端的转义（如 ID 中的 `%2F`），与直接请求 `/v1` 时匹配到同一个路由；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 不变，没有 `/ultra/trace` 或 `/trace/ultra`。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；`ULTRA_PRIMARY_MODELS` 中的模型没有额度时立即返回 429 与 `Retry-After`（见下文 `PrimaryQuotaError`）；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 账户的资源同样如此）按各协议格式返回 400，消息说明资源属于哪个号池。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
+上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；去掉前缀时保留客户端的转义（如 ID 中的 `%2F`），与直接请求 `/v1` 时匹配到同一个路由；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 按普通路径的规则选号，`/trace/ultra/v1/...` 去掉两个前缀并只用 Ultra 号池，`/ultra/trace/...` 返回 404。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；`ULTRA_PRIMARY_MODELS` 中的模型没有额度时立即返回 429 与 `Retry-After`（见下文 `PrimaryQuotaError`）；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 号池账户的资源同样如此，含 `ULTRA_INCLUDE_PRO=true` 时 Pro 账户上的资源）按各协议格式返回 400，消息说明资源属于哪个号池。资源不随 `ULTRA_INCLUDE_PRO` 切换迁移，是否放行按资源所属账户当前的号池判断：开启后，`ULTRA_EXCLUSIVE=true` 时经普通路径引用 Pro 账户上已有的资源返回 400（消息说明资源属于 Ultra 号池，要改用 `/ultra`），`ULTRA_EXCLUSIVE=false` 时普通路径不检查号池，开启不会产生 400；关闭后经 `/ultra` 引用 Pro 账户上的资源返回 400（消息说明资源属于普通号池，要改用普通路径）。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
 
 动态路由的注册形状为 `GET /v1/files/{file}`、`GET /v1/files/{file}/content`、`DELETE /v1/files/{file}`、`GET /v1/videos/{video}`、`GET /v1/videos/{video}/content`、`POST /v1beta/models/{action}` 与 `GET /v1beta/operations/{operation}`；端点表中的 `{id}` 表示对应资源标识。
 
@@ -1140,11 +1140,11 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | DTO | 字段 |
 | --- | --- |
 | `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略） |
-| `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池账户 |
+| `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池成员（`ULTRA_INCLUDE_PRO=true` 时含权益为 Pro 的账户） |
 | `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、所在分区的主用模型（普通分区按 `PRIMARY_MODELS`，Ultra 分区按 `ULTRA_PRIMARY_MODELS`）上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数 |
 | `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`draining`、`retiring`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小，其余字段口径同 `AdminWorkerCounts` |
-| `AdminPrimarySupply` | `model`、`warm`、`standby`、可选 `standby_capped`、可选 `pool`；一个主用模型在所属分区的可用供给：`PRIMARY_MODELS` 的条目统计普通分区，`pool` 省略；`ULTRA_PRIMARY_MODELS` 的条目 `pool` 为 `ultra`，只统计 Ultra 分区的驻留 Worker 与 Ultra 号池的账号。供给由 `keepWarm` 约每 30 秒统计一次并缓存（任一份主用模型列表变化后的下一个周期立即重新统计），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；模型在号池里找不到时两项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
-| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`）、`message` |
+| `AdminPrimarySupply` | `model`、`warm`、`standby`、可选 `standby_capped`、可选 `pool`；一个主用模型在所属分区的可用供给：`PRIMARY_MODELS` 的条目统计普通分区，`pool` 省略；`ULTRA_PRIMARY_MODELS` 的条目 `pool` 为 `ultra`，只统计 Ultra 分区的驻留 Worker 与 Ultra 号池的账号（`ULTRA_INCLUDE_PRO=true` 时含 Pro 账户）。供给由 `keepWarm` 约每 30 秒统计一次并缓存（任一份主用模型列表变化或 `ULTRA_INCLUDE_PRO` 切换后的下一个周期立即重新统计，约 5 秒内），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；模型在号池里找不到时两项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
+| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`，账户当前所属的号池，即成员关系：`ULTRA_INCLUDE_PRO=true` 时 Pro 账户为 `ultra`）、`message`；`benefit_tier` 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍为 `Pro` |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |
 | `ChromeImportProfile` | `id`、`profile`、`display_name`、`email`、`locale` |
@@ -1176,7 +1176,8 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
-| `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 账户；读取时总是返回，提交时省略则沿用现值 |
+| `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 号池的账户；读取时总是返回，提交时省略则沿用现值 |
+| `ultra_include_pro` | 保存值，保存后立即热更新（不重启生成服务与 Worker）：`true` 时权益为 Pro 的账户并入 Ultra 号池与 Ultra 分区，按全部 Ultra 号池设置调度，账户权益不变；读取时总是返回，提交时省略（旧版页面）则沿用现值；默认 `false`。进程环境变量设置了 `ULTRA_INCLUDE_PRO` 时以环境变量为准 |
 | `ultra_warm_worker_limit`、`ultra_max_active_workers` | 保存值，保存后立即热更新：Ultra 分区的常驻数（可以为 0）与峰值数（至少 1 且不小于常驻数）；读取时总是返回，提交时省略则沿用现值 |
 | `primary_models`、`primary_queue_wait` | 保存值，保存后立即生效：普通号池的主用模型（字符串数组）与排队上限（时长文本，`0s` 为不排队，不超过 `request_timeout`）；读取时总是返回，提交时省略则沿用现值，空数组为清空 |
 | `ultra_primary_models`、`ultra_primary_queue_wait` | 保存值，保存后立即生效：Ultra 号池的主用模型（字符串数组，默认 `["gemini-4-argon"]`，关闭时为空数组）与排队上限（规则同上）；读取时总是返回，提交时省略（`null` 或空串）则沿用现值，空数组为关闭 |

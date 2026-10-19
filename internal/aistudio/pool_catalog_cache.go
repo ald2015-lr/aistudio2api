@@ -97,7 +97,7 @@ func (p *AccountPool) catalogSummaryLocked(scope PoolScope) *catalogSummary {
 	summary = &catalogSummary{version: p.eligibilityVersion, models: make(map[string]*catalogModelSummary)}
 	seen := make(map[uint64]struct{})
 	for _, account := range p.accounts {
-		if account == nil || len(account.Models) == 0 || !scope.allows(account) {
+		if account == nil || len(account.Models) == 0 || !p.inPoolLocked(scope, account) {
 			continue
 		}
 		summary.accounts++
@@ -151,7 +151,7 @@ func (p *AccountPool) canonicalIndexLocked(scope PoolScope) *canonicalIndex {
 	index = &canonicalIndex{version: p.eligibilityVersion, primary: make(map[string]struct{}), alias: make(map[string]string)}
 	seen := make(map[uint64]struct{})
 	for _, account := range p.accounts {
-		if account == nil || len(account.Models) == 0 || !scope.allows(account) {
+		if account == nil || len(account.Models) == 0 || !p.inPoolLocked(scope, account) {
 			continue
 		}
 		key := accountCatalogKeyLocked(account)

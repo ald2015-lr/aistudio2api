@@ -221,7 +221,7 @@ func TestUltraExclusiveFollowsEffectiveConfig(t *testing.T) {
 
 func clearAppConfigEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{"ULTRA_EXCLUSIVE", "ULTRA_WARM_WORKER_LIMIT", "ULTRA_MAX_ACTIVE_WORKERS", "WARM_WORKER_LIMIT", "MAX_ACTIVE_WORKERS"} {
+	for _, key := range []string{"ULTRA_EXCLUSIVE", "ULTRA_INCLUDE_PRO", "ULTRA_WARM_WORKER_LIMIT", "ULTRA_MAX_ACTIVE_WORKERS", "WARM_WORKER_LIMIT", "MAX_ACTIVE_WORKERS"} {
 		t.Setenv(key, "")
 		os.Unsetenv(key)
 	}

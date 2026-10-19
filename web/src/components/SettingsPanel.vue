@@ -31,6 +31,7 @@ type EditableKey =
   | 'warm_worker_limit'
   | 'max_active_workers'
   | 'ultra_exclusive'
+  | 'ultra_include_pro'
   | 'ultra_warm_worker_limit'
   | 'ultra_max_active_workers'
   | 'warm_startup_concurrency'
@@ -60,6 +61,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'warm_worker_limit',
   'max_active_workers',
   'ultra_exclusive',
+  'ultra_include_pro',
   'ultra_warm_worker_limit',
   'ultra_max_active_workers',
   'warm_startup_concurrency',
@@ -149,6 +151,7 @@ const form = reactive<ServiceConfig>({
   warm_worker_limit: 5,
   max_active_workers: 10,
   ultra_exclusive: true,
+  ultra_include_pro: false,
   ultra_warm_worker_limit: 2,
   ultra_max_active_workers: 5,
   warm_startup_concurrency: 2,
@@ -823,6 +826,29 @@ onBeforeUnmount(() => {
             <span class="mt-1 block text-xs text-gray-500">{{ t('settings.ultraExclusiveHelp') }}</span>
           </span>
         </label>
+        <label class="mt-3 flex items-start gap-3">
+          <input
+            v-model="form.ultra_include_pro"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.ultraIncludePro')
+            }}</span>
+            <span class="mt-1 block text-xs text-gray-500">{{
+              t('settings.ultraIncludeProHelp')
+            }}</span>
+          </span>
+        </label>
+        <!-- 并入开关开启而独占关闭时，普通路径仍会用到 Pro，用户想要的“Pro 不服务普通路径”没有达成，这里明确提示 -->
+        <p
+          v-if="form.ultra_include_pro && !form.ultra_exclusive"
+          class="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
+          role="note"
+        >
+          {{ t('settings.ultraIncludeProSharedHint') }}
+        </p>
         <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
           <label class="block">
             <span class="mb-1 block text-sm font-medium text-gray-400">{{

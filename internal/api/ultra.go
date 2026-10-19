@@ -9,7 +9,8 @@ import (
 )
 
 // Ultra 路由：/ultra 前缀下的全部接口与主路由完全相同（同一个 API Key、同样的处理链与协议转换），
-// 只是请求只使用 Ultra 号池（权益为 Ultra 的账户）。客户端把接口地址改成
+// 只是请求只使用 Ultra 号池（权益为 Ultra 的账户，ULTRA_INCLUDE_PRO=true 时也含权益为 Pro 的账户；号池成员由账户池判定，
+// 这里只标记请求的号池）。客户端把接口地址改成
 // http://服务器:端口/ultra/v1（OpenAI）或 http://服务器:端口/ultra（Anthropic、Gemini）即可。
 // ULTRA_EXCLUSIVE=true（默认）时普通路径只使用普通号池，为 false 时普通路径不限号池
 const ultraPrefix = "/ultra"
@@ -60,7 +61,7 @@ func poolScopeMiddleware(exclusive func() bool, next http.Handler) http.Handler 
 	})
 }
 
-// ultraExclusive 返回当前是否独占 Ultra 账户；没有配置读取函数时按默认独占
+// ultraExclusive 返回当前是否独占 Ultra 号池的账户；没有配置读取函数时按默认独占
 func (config Config) ultraExclusive() bool {
 	if config.UltraExclusive == nil {
 		return true

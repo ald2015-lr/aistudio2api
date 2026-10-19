@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	appconfig "github.com/Mag1cFall/AIStudio2API/internal/config"
@@ -280,6 +281,11 @@ const (
 	emptyUltraPoolReason = "没有权益为 Ultra 的账户"
 	// emptyNormalPoolReason 为账户都是 Ultra 账户、独占模式下普通路径没有可用账户时的原因
 	emptyNormalPoolReason = "账户都是 Ultra 账户，ULTRA_EXCLUSIVE=true 时只服务 /ultra 前缀的请求"
+	// emptyUltraPoolWithProReason 为 ULTRA_INCLUDE_PRO=true 时 Ultra 号池中没有任何账户的原因：开关关闭时仍用 emptyUltraPoolReason，
+	// 现有客户端与测试可能按原文判断
+	emptyUltraPoolWithProReason = "没有权益为 Ultra 或 Pro 的账户"
+	// emptyNormalPoolWithProReason 为 ULTRA_INCLUDE_PRO=true 时账户都属于 Ultra 号池、独占模式下普通路径没有可用账户的原因
+	emptyNormalPoolWithProReason = "账户都属于 Ultra 号池（权益为 Ultra，或 ULTRA_INCLUDE_PRO=true 时的 Pro），ULTRA_EXCLUSIVE=true 时只服务 /ultra 前缀的请求"
 )
 
 // accountStateLabels 为不可调度账户状态的中文说明
@@ -406,7 +412,7 @@ type AccountStatus struct {
 	BenefitTier string       `json:"benefit_tier"`
 	// BenefitTierKnown 表示账户权益已经从官网读取过（运行态里有目录指纹）；尚未读取的账户按 Free 显示，属于普通号池
 	BenefitTierKnown bool `json:"benefit_tier_known"`
-	// Pool 为账户当前所属的号池：ultra 或 normal
+	// Pool 为账户当前所属的号池（成员关系，随 ULTRA_INCLUDE_PRO 变化）：ultra 或 normal；BenefitTier 始终是真实权益
 	Pool      string                   `json:"pool"`
 	Cooldowns map[string]CooldownState `json:"-"`
 	LastUsed  *time.Time               `json:"last_used,omitempty"`
@@ -500,8 +506,8 @@ type AccountPool struct {
 	sortedIndices        []int
 	sortedIndicesVersion uint64
 	// sched 为候选索引（见 scheduling_index.go），nil 表示下次调度时重建；eligibilityVersion 在影响"号池内哪些账户
-	// 支持哪些模型"的变化时递增（账户增删、目录或权益变化、启用状态、Build 目录、上游通道），按版本缓存的目录汇总、
-	// 别名解析与模型通道（见 pool_catalog_cache.go）在版本变化后重建；ultraAccounts 为当前权益为 Ultra 的账户。
+	// 支持哪些模型"的变化时递增（账户增删、目录或权益变化、启用状态、Build 目录、上游通道、号池划分规则），按版本缓存的目录汇总、
+	// 别名解析与模型通道（见 pool_catalog_cache.go）在版本变化后重建；ultraAccounts 为当前属于 Ultra 号池的账户（见 ultraPoolTier）。
 	// statusCache 为账户多时缓存的状态列表
 	sched              *schedulingIndex
 	eligibilityVersion uint64
@@ -509,8 +515,14 @@ type AccountPool struct {
 	canonicalIndexes   map[PoolScope]*canonicalIndex
 	modelChannelsMemos map[PoolScope]*modelChannelsMemo
 	ultraAccounts      map[string]struct{}
-	statusCache        []AccountStatus
-	statusCacheAt      time.Time
+	// ultraIncludePro 为 ULTRA_INCLUDE_PRO：为真时权益为 Pro 的账户也属于 Ultra 号池（Worker 分区）；受 mu 保护
+	ultraIncludePro bool
+	// ultraSnapshot 为 UltraAccountIDs 返回的只读副本，nil 表示成员变化后尚未重建；受 mu 保护
+	ultraSnapshot map[string]struct{}
+	// poolRuleVersion 在号池划分规则每次实际切换时加一，无锁读取，供 app 层按版本作废派生缓存
+	poolRuleVersion atomic.Uint64
+	statusCache     []AccountStatus
+	statusCacheAt   time.Time
 	// background 记录后台运行态写入（见 pool_background.go），WaitBackground 等待它们结束
 	background backgroundWrites
 }
@@ -1002,7 +1014,8 @@ func NewAccountPool(accounts []*Account, perAccountConcurrency int) *AccountPool
 			continue
 		}
 		account.position = position
-		if account.BenefitTier == BenefitTierUltra {
+		// 构造时开关为 false；ULTRA_INCLUDE_PRO=true 由随后的 SetUltraIncludePro 重算成员（见 app 的 configurePool）
+		if ultraPoolTier(account.BenefitTier, false) {
 			p.ultraAccounts[account.ID] = struct{}{}
 		}
 		if account.runtime.Cooldowns == nil {
@@ -1194,6 +1207,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 	}
 	delete(p.byID, accountID)
 	delete(p.ultraAccounts, accountID)
+	p.ultraSnapshot = nil
 	// 移出号池的账户不再排空：调用方另建同 ID 账户时从未排空开始
 	account.draining = false
 	for index, candidate := range p.accounts {
@@ -1517,8 +1531,8 @@ func (p *AccountPool) refreshAndValidateLease(
 		if err := p.resourcePoolErrorLocked(selection.Pool, resourceID, account.ID); err != nil {
 			return false, err
 		}
-	} else if !selection.Pool.allows(account) {
-		// 刷新运行态期间账户权益变化、已不属于请求的号池：放弃这个账户重新选号
+	} else if !p.inPoolLocked(selection.Pool, account) {
+		// 刷新运行态期间账户权益或 ULTRA_INCLUDE_PRO 变化、已不属于请求的号池：放弃这个账户重新选号
 		return false, nil
 	}
 	if selection.ModelID != "" && !p.channelSupportsLocked(account, lease.Channel(), selection) {
@@ -1547,7 +1561,7 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	var reasons []string
 	for _, account := range p.accounts {
-		if account == nil || account.Config.Enabled && account.State == AccountReady || !selection.Pool.allows(account) {
+		if account == nil || account.Config.Enabled && account.State == AccountReady || !p.inPoolLocked(selection.Pool, account) {
 			continue
 		}
 		if selection.ModelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
@@ -1575,13 +1589,18 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	return ErrNoEligibleAccount
 }
 
-// emptyPoolErrorLocked 返回号池中没有任何账户时的号池暂时不可调度错误：Ultra 号池为空说明没有权益为 Ultra 的账户；
-// 普通号池为空而账户池不为空，说明账户都是 Ultra 账户、独占模式下普通路径不能使用。调用方持有 p.mu
+// emptyPoolErrorLocked 返回号池中没有任何账户时的号池暂时不可调度错误：Ultra 号池为空说明没有属于 Ultra 号池的账户；
+// 普通号池为空而账户池不为空，说明账户都属于 Ultra 号池、独占模式下普通路径不能使用。ULTRA_INCLUDE_PRO=true 时原因写明
+// Pro 也属于 Ultra 号池，关闭时保持原文。调用方持有 p.mu
 func (p *AccountPool) emptyPoolErrorLocked(scope PoolScope) *AccountsNotReadyError {
 	reason := emptyPoolReason
 	switch {
+	case scope == PoolScopeUltra && p.ultraIncludePro:
+		reason = emptyUltraPoolWithProReason
 	case scope == PoolScopeUltra:
 		reason = emptyUltraPoolReason
+	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll) && p.ultraIncludePro:
+		reason = emptyNormalPoolWithProReason
 	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll):
 		reason = emptyNormalPoolReason
 	}
@@ -1598,7 +1617,7 @@ func (p *AccountPool) NoCandidateError(selection AccountSelection, groups Accoun
 
 func (p *AccountPool) hasAccountLocked(scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account != nil && scope.allows(account) {
+		if account != nil && p.inPoolLocked(scope, account) {
 			return true
 		}
 	}
@@ -2905,7 +2924,7 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 		BenefitTier: account.BenefitTier.String(),
 		// 权益来自目录同步：保存过目录指纹才算已经读取
 		BenefitTierKnown: account.runtime.CatalogFingerprint != "",
-		Pool:             PoolOfTier(account.BenefitTier).String(),
+		Pool:             p.poolOfTierLocked(account.BenefitTier).String(),
 		Cooldowns:        cloneCooldowns(account.runtime.Cooldowns),
 		Message:          account.stateMessage,
 	}
@@ -3343,7 +3362,7 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		if _, exists := excluded[accountID]; exists {
 			return nil, ErrNoEligibleAccount
 		}
-		if !selection.Pool.allows(account) {
+		if !p.inPoolLocked(selection.Pool, account) {
 			return nil, ErrNoEligibleAccount
 		}
 		p.schedulingLocked()
@@ -3356,7 +3375,7 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		indices = make([]int, 0, len(allowed))
 		for accountID := range allowed {
 			account := p.byID[accountID]
-			if account == nil || !selection.Pool.allows(account) {
+			if account == nil || !p.inPoolLocked(selection.Pool, account) {
 				continue
 			}
 			if _, exists := excluded[accountID]; exists {
@@ -3371,7 +3390,7 @@ func (p *AccountPool) selectionIndicesLocked(selection AccountSelection) ([]int,
 		indices = make([]int, 0, len(sorted))
 		for _, index := range sorted {
 			account := p.accounts[index]
-			if account == nil || !selection.Pool.allows(account) {
+			if account == nil || !p.inPoolLocked(selection.Pool, account) {
 				continue
 			}
 			if allowed != nil {
@@ -3421,7 +3440,7 @@ func (p *AccountPool) selectionIndicesBruteLocked(selection AccountSelection) ([
 	indices := make([]int, 0, len(sorted))
 	for _, index := range sorted {
 		account := p.accounts[index]
-		if account == nil || !selection.Pool.allows(account) {
+		if account == nil || !p.inPoolLocked(selection.Pool, account) {
 			continue
 		}
 		if _, exists := allowed[account.ID]; allowed != nil && !exists {
@@ -4017,7 +4036,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 	requestedAccountID := strings.TrimSpace(selection.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	supports := func(account *Account) bool {
-		if account == nil || !account.Config.Enabled || account.State != AccountReady || !selection.Pool.allows(account) {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || !p.inPoolLocked(selection.Pool, account) {
 			return false
 		}
 		if modelID == "" {

@@ -3,6 +3,7 @@ package aistudio
 import (
 	"context"
 	"fmt"
+	"maps"
 	"math/rand"
 	"reflect"
 	"slices"
@@ -90,7 +91,7 @@ func sameError(left error, right error) bool {
 
 func bruteHasModel(p *AccountPool, modelID string, method string, capability string, scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
+		if account == nil || !scope.allows(account, p.ultraIncludePro) {
 			continue
 		}
 		for _, model := range account.Models {
@@ -113,7 +114,7 @@ func bruteCanonical(p *AccountPool, scope PoolScope, modelID string) string {
 	trimmed := strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
 	canonical := ""
 	for _, account := range p.accounts {
-		if account == nil || !scope.allows(account) {
+		if account == nil || !scope.allows(account, p.ultraIncludePro) {
 			continue
 		}
 		for _, model := range account.Models {
@@ -139,7 +140,7 @@ func bruteModelChannels(p *AccountPool, model Model, scope PoolScope) []string {
 	var channels []string
 	for _, channel := range p.selectionChannelsLocked(selection) {
 		for _, account := range p.accounts {
-			if account != nil && account.Config.Enabled && scope.allows(account) && p.channelSupportsLocked(account, channel, selection) {
+			if account != nil && account.Config.Enabled && scope.allows(account, p.ultraIncludePro) && p.channelSupportsLocked(account, channel, selection) {
 				channels = append(channels, string(channel))
 				break
 			}
@@ -156,7 +157,7 @@ func bruteStateCounts(p *AccountPool, now time.Time) (AccountStateCounts, Accoun
 		}
 		state := p.accountStateLocked(account, now)
 		counts.add(state)
-		if account.BenefitTier == BenefitTierUltra {
+		if ultraPoolTier(account.BenefitTier, p.ultraIncludePro) {
 			ultra.add(state)
 		}
 	}
@@ -167,7 +168,7 @@ func bruteEnabledAccountsIn(p *AccountPool, scope PoolScope, now time.Time) ([]s
 	ids := make([]string, 0, len(p.accounts))
 	schedulable := 0
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || !scope.allows(account) {
+		if account == nil || !account.Config.Enabled || !scope.allows(account, p.ultraIncludePro) {
 			continue
 		}
 		ids = append(ids, account.ID)
@@ -182,7 +183,7 @@ func bruteEnabledAccountsIn(p *AccountPool, scope PoolScope, now time.Time) ([]s
 func bruteAttemptCandidates(p *AccountPool, scope PoolScope, now time.Time) int {
 	eligible := 0
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || !scope.allows(account) {
+		if account == nil || !account.Config.Enabled || !scope.allows(account, p.ultraIncludePro) {
 			continue
 		}
 		if state := p.accountStateLocked(account, now); state == AccountReady || state == AccountBusy {
@@ -290,7 +291,7 @@ func (p *AccountPool) syncDerivedLocked(now time.Time) {
 func (fuzzer *indexFuzzer) mutate() {
 	pool, random := fuzzer.pool, fuzzer.random
 	now := time.Now()
-	switch random.Intn(17) {
+	switch random.Intn(18) {
 	case 0, 1, 2:
 		accountID := fuzzer.randomID()
 		until := now.Add(time.Duration(5+random.Intn(60)) * time.Millisecond)
@@ -416,6 +417,26 @@ func (fuzzer *indexFuzzer) mutate() {
 		changed := pool.SetDraining(accountID, on)
 		if changed != (before != on) || pool.Draining(accountID) != on {
 			fuzzer.t.Fatalf("SetDraining(%s, %v) = %v，之前 %v，之后 %v", accountID, on, changed, before, pool.Draining(accountID))
+		}
+	case 17:
+		// ULTRA_INCLUDE_PRO 热切换：Pro 账户在两个号池之间整体移动，候选索引作废后按新成员重建；
+		// 先取一次快照，核对切换后快照被作废
+		if random.Intn(3) == 0 {
+			pool.UltraAccountIDs()
+			on := random.Intn(2) == 0
+			before := pool.UltraIncludePro()
+			version := pool.PoolRuleVersion()
+			changed := pool.SetUltraIncludePro(on)
+			if changed != (before != on) || pool.UltraIncludePro() != on {
+				fuzzer.t.Fatalf("SetUltraIncludePro(%v) = %v，之前 %v", on, changed, before)
+			}
+			wantVersion := version
+			if changed {
+				wantVersion++
+			}
+			if pool.PoolRuleVersion() != wantVersion {
+				fuzzer.t.Fatalf("SetUltraIncludePro(%v) 后号池规则版本 %d，期望 %d", on, pool.PoolRuleVersion(), wantVersion)
+			}
 		}
 	}
 }
@@ -571,7 +592,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 		ids, schedulable := make([]string, 0), 0
 		eligible := 0
 		for position := range index.ids {
-			if !index.enabled[position] || !scope.allowsTier(index.tier[position]) {
+			if !index.enabled[position] || !scope.allowsTier(index.tier[position], pool.ultraIncludePro) {
 				continue
 			}
 			ids = append(ids, index.ids[position])
@@ -598,7 +619,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 		}
 		state := index.derivedStateAt(position, now.UnixNano())
 		counts.add(state)
-		if index.tier[position] == BenefitTierUltra {
+		if ultraPoolTier(index.tier[position], pool.ultraIncludePro) {
 			ultra.add(state)
 		}
 	}
@@ -612,13 +633,20 @@ func (fuzzer *indexFuzzer) check(round int) {
 	sort.Strings(ultraIDs)
 	wantUltraIDs := make([]string, 0)
 	for _, account := range pool.accounts {
-		if account != nil && account.BenefitTier == BenefitTierUltra {
+		if account != nil && ultraPoolTier(account.BenefitTier, pool.ultraIncludePro) {
 			wantUltraIDs = append(wantUltraIDs, account.ID)
 		}
 	}
 	sort.Strings(wantUltraIDs)
 	if !slices.Equal(ultraIDs, wantUltraIDs) {
-		t.Fatalf("第 %d 轮：Ultra 账户集合 %v，期望 %v", round, ultraIDs, wantUltraIDs)
+		t.Fatalf("第 %d 轮：Ultra 号池成员集合 %v，期望 %v（ULTRA_INCLUDE_PRO=%v）", round, ultraIDs, wantUltraIDs, pool.ultraIncludePro)
+	}
+	// 写时复制的快照已建好时必须与成员集合一致：成员变化的每条路径都要作废它
+	if snapshot := pool.ultraSnapshot; snapshot != nil {
+		snapshotIDs := slices.Sorted(maps.Keys(snapshot))
+		if !slices.Equal(snapshotIDs, wantUltraIDs) {
+			t.Fatalf("第 %d 轮：UltraAccountIDs 快照 %v，期望 %v", round, snapshotIDs, wantUltraIDs)
+		}
 	}
 	for _, account := range pool.accounts {
 		if got, want := accountBootstrapModelsLocked(account), bruteBootstrapModels(account); !slices.Equal(got, want) {
@@ -635,7 +663,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 func bruteSpareAccounts(p *AccountPool, scope PoolScope, exclude map[string]struct{}, modelIDs []string, minRemaining time.Duration, now time.Time) int {
 	spare := 0
 	for _, account := range p.accounts {
-		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account) {
+		if account == nil || !account.Config.Enabled || account.State != AccountReady || !scope.allows(account, p.ultraIncludePro) {
 			continue
 		}
 		if _, excluded := exclude[account.ID]; excluded || len(bruteBootstrapModels(account)) == 0 {
@@ -671,7 +699,7 @@ func bruteSpareAccounts(p *AccountPool, scope PoolScope, exclude map[string]stru
 
 func bruteHasCatalog(p *AccountPool, scope PoolScope) bool {
 	for _, account := range p.accounts {
-		if account != nil && len(account.Models) > 0 && scope.allows(account) {
+		if account != nil && len(account.Models) > 0 && scope.allows(account, p.ultraIncludePro) {
 			return true
 		}
 	}

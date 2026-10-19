@@ -46,7 +46,7 @@ func (manager *runtimeManager) activeAPIKey() string {
 	return manager.apiKey.get()
 }
 
-// activeUltraExclusive 返回当前是否独占 Ultra 账户：为真时普通路径的请求不使用 Ultra 账户
+// activeUltraExclusive 返回当前是否独占 Ultra 号池的账户：为真时普通路径的请求不使用 Ultra 号池的账户
 func (manager *runtimeManager) activeUltraExclusive() bool {
 	return manager.ultraExclusive.Load()
 }
@@ -162,7 +162,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 	return saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
 		saved.FirstEventTimeout == active.FirstEventTimeout &&
 		saved.WarmWorkerLimit == active.WarmWorkerLimit && saved.MaxActiveWorkers == active.MaxActiveWorkers &&
-		saved.UltraExclusive == active.UltraExclusive && saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
+		saved.UltraExclusive == active.UltraExclusive && saved.UltraIncludePro == active.UltraIncludePro &&
+		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
@@ -176,9 +177,30 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 
 // applyLiveConfig 读取已保存配置，把可热更新的字段直接应用到当前生成服务，不中断任何请求
 func (manager *runtimeManager) applyLiveConfig() {
+	admin, saved, applied := manager.applyLiveFields()
+	if !applied {
+		return
+	}
+	manager.requests.log("service", "INFO", fmt.Sprintf(
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s",
+		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
+		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
+		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
+		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
+	))
+	admin.service.prewarmIfRunning()
+	admin.syncModelCache()
+}
+
+// applyLiveFields 在 liveConfigMu 内读取 .env 并应用可热更新的字段，返回应用到的生成服务与配置；没有需要热更新的变化
+// （或需要重建生成服务）时 applied 为 false。读取、应用与号池成员切换后的处理逐次进行（见 runtimeManager.liveConfigMu）；
+// 日志、预热补齐与模型目录同步在锁外进行，同步较慢时不挡住下一次保存
+func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved config.Config, applied bool) {
+	manager.liveConfigMu.Lock()
+	defer manager.liveConfigMu.Unlock()
 	saved, err := config.Load(manager.configPath)
 	if err != nil {
-		return
+		return nil, saved, false
 	}
 	manager.overrides.Apply(&saved)
 	// 独占设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
@@ -188,16 +210,20 @@ func (manager *runtimeManager) applyLiveConfig() {
 	generation := manager.current
 	if generation == nil || requiresRebuild(saved, generation.config) || liveFieldsEqual(saved, generation.config) {
 		manager.mu.Unlock()
-		return
+		return nil, saved, false
 	}
 	admin, ok := generation.admin.(*runtimeAdmin)
 	if !ok {
 		manager.mu.Unlock()
-		return
+		return nil, saved, false
 	}
 	admin.pool.SetPerAccountConcurrency(saved.PerAccountConcurrency)
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
+	// 先更新两个分区的容量再改号池成员：同一次保存调大 ULTRA_* 峰值时，并入的 Pro Worker 按新上限计数
 	admin.workers.applyLiveSettings(saved)
+	// ULTRA_INCLUDE_PRO 热切换：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同。只在账户池里改成员规则，
+	// 不重启 Worker；Pro Worker 改到新分区计数，候选索引与按号池的缓存在账户池内作废重建
+	membershipChanged := admin.pool.SetUltraIncludePro(saved.UltraIncludePro)
 	admin.service.setRequestTimeout(saved.RequestTimeout)
 	admin.service.firstEventTimeout.Store(int64(saved.FirstEventTimeout))
 	admin.service.ignoreSeed.Store(saved.IgnoreClientSeed)
@@ -209,13 +235,9 @@ func (manager *runtimeManager) applyLiveConfig() {
 	generation.config = saved
 	manager.mu.Unlock()
 
-	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s",
-		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
-		saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
-		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
-		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
-	))
-	admin.service.prewarmIfRunning()
-	admin.syncModelCache()
+	if membershipChanged {
+		// 解锁后的步骤都从当前状态重新推导（成员、开关、独占设置），不依赖上面捕获的 saved
+		admin.workers.poolRuleChanged(manager.activeUltraExclusive())
+	}
+	return admin, saved, true
 }

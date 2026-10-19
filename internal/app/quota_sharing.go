@@ -19,7 +19,9 @@ import (
 // 证据足够判定为共用后，一个通道达到每日限额就同时冷却另一个通道，
 // 不再让请求去另一个通道白白失败一次、再换号重试。
 // 学到的结论保存在账户目录的 .quota-sharing.json，重启后继续有效。
-// 结论按号池分开学习：Ultra 账户的额度与其他权益不同，键为 模型|ultra；普通号池的键仍为模型 ID，已保存的记录继续有效
+// 结论按账户真实权益分组学习：Ultra 账户的额度与其他权益不同，键为 模型|ultra；其余权益（含 ULTRA_INCLUDE_PRO=true 时
+// 并入 Ultra 号池的 Pro 账户）的键仍为模型 ID，已保存的记录继续有效。分组不随 ULTRA_INCLUDE_PRO 变化：
+// Pro 的证据若记进 模型|ultra，关掉开关后也不会消失
 const (
 	quotaSharingFileName = ".quota-sharing.json"
 	// quotaSharedMinEvidence 至少这么多次"另一通道随后也达到每日限额"才判定为共用
@@ -46,19 +48,19 @@ type quotaSharing struct {
 	path     string
 	requests *requestRegistry
 	models   map[string]*quotaSharingStats
-	// pending 为等待验证的观察：键为 账户|模型|通道，值为另一个通道达到每日限额的时间与账户当时的号池
+	// pending 为等待验证的观察：键为 账户|模型|通道，值为另一个通道达到每日限额的时间与账户当时的权益分组
 	pending map[string]quotaPending
-	// sinceRevisit 为判定共用后各模型（按号池分开）距上次复核的每日限额次数（只在内存中）
+	// sinceRevisit 为判定共用后各模型（按权益分组分开）距上次复核的每日限额次数（只在内存中）
 	sinceRevisit map[string]int
 }
 
-// quotaPending 为一次等待验证的观察：证据记入账户当时所在号池的判定
+// quotaPending 为一次等待验证的观察：证据记入账户当时权益分组的判定（pool 为 TierPoolOf 的结果，不是号池成员关系）
 type quotaPending struct {
 	since time.Time
 	pool  aistudio.PoolScope
 }
 
-// quotaStatsKey 返回模型在号池内的判定键：Ultra 号池为 模型|ultra，普通号池沿用模型 ID
+// quotaStatsKey 返回模型在权益分组内的判定键：Ultra 权益为 模型|ultra，其余权益沿用模型 ID
 func quotaStatsKey(modelID string, pool aistudio.PoolScope) string {
 	if pool == aistudio.PoolScopeUltra {
 		return modelID + "|" + pool.String()
@@ -151,7 +153,7 @@ func (sharing *quotaSharing) verdictLocked(statsKey string) string {
 	}
 }
 
-// recordLocked 记录模型在号池内的一次证据并保存、写日志；调用方持有 mu
+// recordLocked 记录模型在权益分组内的一次证据并保存、写日志；调用方持有 mu
 func (sharing *quotaSharing) recordLocked(modelID string, pool aistudio.PoolScope, shared bool) {
 	statsKey := quotaStatsKey(modelID, pool)
 	stats := sharing.models[statsKey]
@@ -173,7 +175,7 @@ func (sharing *quotaSharing) recordLocked(modelID string, pool aistudio.PoolScop
 		}
 		poolField := ""
 		if pool == aistudio.PoolScopeUltra {
-			poolField = " | 号池=Ultra"
+			poolField = " | 权益=Ultra"
 		}
 		sharing.requests.log("service", level, fmt.Sprintf(
 			"每日额度通道判定 | 模型=%s%s | 另一通道也达到限额=%d | 另一通道仍可用=%d | 结论=%s",
@@ -191,9 +193,9 @@ func (sharing *quotaSharing) pruneLocked(now time.Time) {
 	}
 }
 
-// dailyLimitHit 在账户的某个通道达到模型每日限额时调用，pool 为账户当前所在的号池。
+// dailyLimitHit 在账户的某个通道达到模型每日限额时调用，pool 为账户按真实权益的分组（TierPoolOf，不随 ULTRA_INCLUDE_PRO 变化）。
 // 若这是另一个通道达到限额后该通道的首次尝试，记为"共用"证据；
-// 返回是否应同时冷却另一个通道（模型在该号池内已判定为共用额度时）
+// 返回是否应同时冷却另一个通道（模型在该权益分组内已判定为共用额度时）
 func (sharing *quotaSharing) dailyLimitHit(
 	accountID string,
 	modelID string,

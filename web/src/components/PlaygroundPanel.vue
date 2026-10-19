@@ -75,7 +75,8 @@ const submittedPrompt = ref('')
 const submittedModel = ref('')
 let controller: AbortController | undefined
 
-// ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 账户时模型列表只显示这些模型，还没有读到时显示全部模型
+// ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 号池时模型列表只显示这些模型，还没有读到时显示全部模型。
+// 账户的 models 只含 Playground 目录，只在 Build 通道提供的模型（如 gemini-4-argon）不会出现在这里，过滤时要放过它们
 const ultraModelIDs = computed(
   () =>
     new Set(
@@ -86,7 +87,16 @@ const ultraModelIDs = computed(
 )
 const availableModels = computed(() =>
   props.models.filter((model) => {
-    if (form.ultra && ultraModelIDs.value.size > 0 && !ultraModelIDs.value.has(model.id)) {
+    // 只在 Build 通道提供的模型无法按账户的 Playground 目录判断 Ultra 号池能否服务，照常列出，由服务端按号池选号；
+    // 否则勾选“使用 Ultra 号池”后这类模型会被滤掉，没法在这里验证 Ultra 号池（含并入的 Pro 账户）能否使用它们
+    const channels = model.channels ?? []
+    const buildOnly = channels.includes('build') && !channels.includes('playground')
+    if (
+      form.ultra &&
+      ultraModelIDs.value.size > 0 &&
+      !buildOnly &&
+      !ultraModelIDs.value.has(model.id)
+    ) {
       return false
     }
     const capabilities = model.capabilities ?? {}

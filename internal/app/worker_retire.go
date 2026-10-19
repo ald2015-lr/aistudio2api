@@ -350,6 +350,8 @@ func (manager *accountWorkerManager) retirePass() int {
 			}
 			// 账号正在服务请求：不取独占租约，先排空（不固定账户的请求不再分给它），等进行中的请求释放租约后被再次唤醒
 			if busy {
+				// 账号在取成员快照之后换了分区（ULTRA_INCLUDE_PRO 切换）时 startDrain 同样返回 nil：上面的可接替账户与能否排空
+				// 都是按旧分区判断的，不写入排空，登记没有推迟，下一轮按新的成员快照重新判断
 				drain := manager.startDrain(accountID, partition)
 				if drain == nil {
 					continue
@@ -405,6 +407,9 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 		// 取独占租约时账号又有了请求（或其他进程持有文件锁），等下一次唤醒；排空中的账号继续排空
 	default:
 		manager.dropRetirement(accountID)
+		// 替补补在 Worker 关闭时所在的分区：victim.partition 是选中时的成员快照，ULTRA_INCLUDE_PRO 在选中之后切换时
+		// 关闭的 Pro Worker 空出的是新分区的槽位（排空中的已由 poolRuleChanged 改记到新分区），按当前成员重算
+		victim.partition = partitionOf(accountID, manager.pool.UltraAccountIDs())
 		plan := manager.replacementsFor([]evictedWorker{{partition: victim.partition, models: victim.entry.models, drain: victim.drain}})
 		drained := ""
 		if victim.drain != nil {

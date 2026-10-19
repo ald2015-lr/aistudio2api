@@ -158,14 +158,19 @@ const zhCN = {
     '常驻 Worker 数与峰值 Worker 上限只约束普通号池；Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为两个峰值之和。启动预热并发与单账户请求并发两个号池共用。',
   'settings.ultraTitle': 'Ultra 号池',
   'settings.ultraHelp':
-    '权益为 Ultra 的账户组成 Ultra 号池。客户端把 Base URL 换成 /ultra 前缀（OpenAI 用 http://主机:端口/ultra/v1，Anthropic 与 Gemini 用 http://主机:端口/ultra）即只用 Ultra 账户处理请求。修改后立即生效，不需要重启服务。',
-  'settings.ultraExclusive': 'Ultra 账户只服务 /ultra 请求',
+    '权益为 Ultra 的账户组成 Ultra 号池（付费号池）；开启下方“Pro 账户并入 Ultra 号池”后，权益为 Pro 的账户也属于它。客户端把 Base URL 换成 /ultra 前缀（OpenAI 用 http://主机:端口/ultra/v1，Anthropic 与 Gemini 用 http://主机:端口/ultra）即只用 Ultra 号池的账户处理请求。修改后立即生效，不需要重启服务。',
+  'settings.ultraExclusive': 'Ultra 号池的账户只服务 /ultra 请求',
   'settings.ultraExclusiveHelp':
-    '开启（默认）时普通路径只用其余账户，Ultra 账户留给 /ultra；关闭时普通路径也可以用 Ultra 账户，/ultra 仍只用 Ultra 账户。',
+    '开启（默认）时普通路径只用其余账户，Ultra 号池的账户留给 /ultra；关闭时普通路径也可以用 Ultra 号池的账户，/ultra 仍只用 Ultra 号池的账户。',
+  'settings.ultraIncludePro': 'Pro 账户并入 Ultra 号池（付费号池）',
+  'settings.ultraIncludeProHelp':
+    '开启后权益为 Pro 的账户与 Ultra 账户同属 Ultra 号池，按 Ultra 号池的全部设置调度：经 /ultra 前缀服务并列入 /ultra 的模型列表，受上方“Ultra 号池的账户只服务 /ultra 请求”约束，Worker 计入下方 Ultra 常驻数与峰值上限，适用 Ultra 主用模型列表，也计入侧栏与账户页的 Ultra 号池计数。账户的真实权益不变：账户页仍显示 Pro（另加 Ultra 号池标记），模型资格、输入上限与额度共享仍按 Pro 计。上方设置开启时普通路径不再使用 Pro 账户，普通号池容量随之变小，gemini-4-argon 与需要订阅权益的模型会从普通路径的模型列表（/v1/models）消失，客户端要改用 /ultra 前缀。Pro 与 Ultra 共用下方两个 Worker 上限，默认值偏小，建议调大；Ultra 常驻 Worker 数为 1（ULTRA_WARM_WORKER_LIMIT=1）时常驻的可能是 Pro 账户而不是 Ultra 账户，建议不小于 2。资源不迁移，Pro 账户上已有的文件与视频任务切换后可能要换入口引用：开启本项后，上方设置开启时经普通路径引用会返回 400，要改用 /ultra 前缀（上方设置关闭时不受影响）；关闭本项后经 /ultra 引用会返回 400，要改用普通路径。建议在没有进行中的视频任务时切换。默认关闭；修改后立即生效，不需要重启服务，已运行的 Worker 改按新的分区计数，不会重启。',
+  'settings.ultraIncludeProSharedHint':
+    '上方“Ultra 号池的账户只服务 /ultra 请求”（ULTRA_EXCLUSIVE）已关闭：普通路径仍会使用 Pro 与 Ultra 账户，并入 Ultra 号池的 Pro 账户照常服务普通路径的请求。要让 Pro 账户只服务 /ultra 请求，请同时开启上方设置。',
   'settings.ultraWarmWorkerLimit': 'Ultra 常驻 Worker 数',
   'settings.ultraMaxActiveWorkers': 'Ultra 峰值 Worker 上限',
   'settings.ultraWorkersHelp':
-    'Ultra 账户的 Worker 与普通号池分开计数：预热、空闲回收与淘汰都只在 Ultra 分区内进行，不会挤占普通号池的 Worker。常驻数可以为 0（只在有请求时启动），峰值至少为 1 且不小于常驻数。',
+    'Ultra 号池账户的 Worker 与普通号池分开计数：预热、空闲回收与淘汰都只在 Ultra 分区内进行，不会挤占普通号池的 Worker；开启“Pro 账户并入 Ultra 号池”后，Pro 账户的 Worker 也计入这里。常驻数可以为 0（只在有请求时启动），峰值至少为 1 且不小于常驻数。',
   'settings.routingStrategy': '账户选择策略',
   'settings.routingRoundRobin': '轮询',
   'settings.routingFillFirst': '账号粘性优先',
@@ -192,7 +197,7 @@ const zhCN = {
   'settings.ultraPrimaryModels': 'Ultra 主用模型列表',
   'settings.ultraPrimaryQueueWait': 'Ultra 排队上限',
   'settings.ultraPrimaryHelp':
-    'Ultra 主用模型列表只作用于 /ultra 请求；关闭“Ultra 账户只服务 /ultra 请求”时，普通路径上不在上方普通列表里、但在这份列表里的模型（通常是只有 Ultra 账户能服务的模型）也按这里的规则。这些模型没有额度时立即返回 429 并带 Retry-After，而不是在服务里一直换号重试：候选账户全部冷却时立即返回；请求中遇到额度 429 后最多再换 2 次账户，每次额度失败后的那次换号只用已启动的 Worker，不为它现场冷启动备用账户。排队上限只限制等空闲账户或 Worker 的时间，规则与上方相同（0 表示不排队，不能超过请求超时）。逗号分隔的模型 ID，默认 gemini-4-argon；清空即关闭。修改后立即生效。',
+    'Ultra 主用模型列表只作用于 /ultra 请求；关闭“Ultra 号池的账户只服务 /ultra 请求”时，普通路径上不在上方普通列表里、但在这份列表里的模型（通常是只有 Ultra 号池的账户能服务的模型）也按这里的规则。这些模型没有额度时立即返回 429 并带 Retry-After，而不是在服务里一直换号重试：候选账户全部冷却时立即返回；请求中遇到额度 429 后最多再换 2 次账户，每次额度失败后的那次换号只用已启动的 Worker，不为它现场冷启动备用账户。排队上限只限制等空闲账户或 Worker 的时间，规则与上方相同（0 表示不排队，不能超过请求超时）。逗号分隔的模型 ID，默认 gemini-4-argon；清空即关闭。修改后立即生效。',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': '通道',
@@ -230,9 +235,9 @@ const zhCN = {
   'playground.system': '系统指令',
   'playground.prompt': '用户消息',
   'playground.stream': '流式响应',
-  'playground.ultra': '使用 Ultra 账户',
+  'playground.ultra': '使用 Ultra 号池',
   'playground.ultraHelp': '请求经 /ultra 前缀发送，只由 Ultra 号池的账户处理',
-  'playground.ultraNoModels': '还没有读到 Ultra 账户的模型，列表显示全部模型',
+  'playground.ultraNoModels': '还没有读到 Ultra 号池账户的模型，列表显示全部模型',
   'playground.reasoning': '思考强度',
   'playground.reasoningOff': '默认',
   'playground.reasoningLow': '低',
@@ -366,7 +371,7 @@ const zhCN = {
     '主用模型 {model}：热为能服务它的常驻 Worker，备用为还能服务它的空闲账号（最多统计 1000 个），约每 30 秒更新。备用为 0 表示没有还能服务该模型的空闲账号（当天额度可能已用完，太平洋时间零点重置）',
   'app.ultraPrimarySupplyModel': 'Ultra 主用 {model}：',
   'app.ultraPrimarySupplyDetail':
-    'Ultra 主用模型 {model}：热为 Ultra 分区能服务它的常驻 Worker，备用为 Ultra 号池里还能服务它的空闲账号（最多统计 1000 个），约每 30 秒更新。备用为 0 表示没有还能服务该模型的空闲 Ultra 账号（当天额度可能已用完，太平洋时间零点重置）；额度不足时该模型的请求立即返回 429，不在服务里排队重试',
+    'Ultra 主用模型 {model}：热为 Ultra 分区能服务它的常驻 Worker，备用为 Ultra 号池里还能服务它的空闲账号（开启“Pro 账户并入 Ultra 号池”时含 Pro 账户，最多统计 1000 个），约每 30 秒更新。备用为 0 表示 Ultra 号池里没有还能服务该模型的空闲账号（当天额度可能已用完，太平洋时间零点重置）；额度不足时该模型的请求立即返回 429，不在服务里排队重试',
   'app.prewarmActive': '预热中 · 进行 {inflight} · 本轮 {launched}',
   'app.prewarmStalled': '预热循环 {seconds}s 无进展',
   'app.prewarmIdle': '预热空闲',
@@ -414,9 +419,13 @@ const zhCN = {
   'accounts.workerFilterStarting': 'Worker：启动中',
   'accounts.workerFilterNone': 'Worker：未启动',
   'accounts.sortWorker': '按 Worker',
-  'accounts.ultraCount': 'Ultra 就绪 {ready} / {total}',
-  'accounts.ultraCountHelp': 'Ultra 号池的账户数：经 /ultra 前缀的请求只用这些账户',
+  'accounts.ultraCount': 'Ultra 号池就绪 {ready} / {total}',
+  'accounts.ultraCountHelp':
+    'Ultra 号池的账户数（开启“Pro 账户并入 Ultra 号池”时含 Pro 账户）：经 /ultra 前缀的请求只用这些账户',
   'accounts.ultraWorkers': 'Ultra Worker {warm} / {target}',
+  'accounts.poolUltraTag': 'Ultra 号池',
+  'accounts.proInUltraHelp':
+    '已开启“Pro 账户并入 Ultra 号池”：这个账户的权益仍是 Pro，但属于 Ultra 号池，按 Ultra 号池的设置调度，经 /ultra 前缀的请求会用它；服务配置里的“Ultra 号池的账户只服务 /ultra 请求”开启时，它不再服务普通路径的请求',
   'accounts.tierFilterAll': '权益：全部',
   'accounts.tierFilterUltra': '权益：Ultra',
   'accounts.tierFilterPro': '权益：Pro',
@@ -806,14 +815,19 @@ const en: Record<TranslationKey, string> = {
     'Resident workers and the active worker limit apply to the normal pool only. Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of both limits. Startup prewarm concurrency and per-account concurrency are shared by both pools.',
   'settings.ultraTitle': 'Ultra pool',
   'settings.ultraHelp':
-    'Accounts with the Ultra tier form the Ultra pool. Point a client at the /ultra prefix (OpenAI: http://host:port/ultra/v1; Anthropic and Gemini: http://host:port/ultra) to have its requests served only by Ultra accounts. Changes apply immediately without a service restart.',
-  'settings.ultraExclusive': 'Ultra accounts only serve /ultra requests',
+    'Accounts with the Ultra tier form the Ultra pool (the paid pool); with "Put Pro accounts in the Ultra pool" below turned on, accounts with the Pro tier belong to it too. Point a client at the /ultra prefix (OpenAI: http://host:port/ultra/v1; Anthropic and Gemini: http://host:port/ultra) to have its requests served only by Ultra-pool accounts. Changes apply immediately without a service restart.',
+  'settings.ultraExclusive': 'Ultra-pool accounts only serve /ultra requests',
   'settings.ultraExclusiveHelp':
-    'When on (default), normal paths only use the other accounts and Ultra accounts are kept for /ultra. When off, normal paths may also use Ultra accounts; /ultra still uses Ultra accounts only.',
+    'When on (default), normal paths only use the other accounts and Ultra-pool accounts are kept for /ultra. When off, normal paths may also use Ultra-pool accounts; /ultra still uses Ultra-pool accounts only.',
+  'settings.ultraIncludePro': 'Put Pro accounts in the Ultra pool (paid pool)',
+  'settings.ultraIncludeProHelp':
+    'When on, accounts with the Pro tier join Ultra accounts in the Ultra pool and are scheduled by every Ultra-pool setting: they serve the /ultra prefix and appear in its model list, follow "Ultra-pool accounts only serve /ultra requests" above, count toward the Ultra resident and active worker limits below, follow the Ultra primary model list, and count toward the Ultra-pool figures in the sidebar and on the accounts page. Their real tier does not change: the accounts page still shows Pro (with an Ultra pool tag), and model eligibility, input limits and quota sharing still follow Pro. While the setting above is on, normal paths no longer use Pro accounts, the normal pool shrinks accordingly, and gemini-4-argon and the models that need a subscription disappear from the normal-path model list (/v1/models), so clients have to switch to the /ultra prefix. Pro and Ultra share the two worker limits below, whose defaults are small, so raise them; with 1 Ultra resident worker (ULTRA_WARM_WORKER_LIMIT=1) the resident one may be a Pro account rather than an Ultra account, so keep it at 2 or more. Resources do not move, so files and video jobs that already live on a Pro account may need a different entry point after a switch: after turning this on, referencing them through normal paths returns 400 while the setting above is on, so use the /ultra prefix instead (nothing changes while it is off); after turning this off, referencing them through /ultra returns 400, so use normal paths instead. Switch while no video job is in progress. Off by default; changes apply immediately without a service restart, and running workers are recounted in their new partition instead of being restarted.',
+  'settings.ultraIncludeProSharedHint':
+    '"Ultra-pool accounts only serve /ultra requests" (ULTRA_EXCLUSIVE) above is off, so normal paths still use Pro and Ultra accounts, and Pro accounts in the Ultra pool keep serving normal-path requests. Turn that setting on as well to keep Pro accounts for /ultra requests only.',
   'settings.ultraWarmWorkerLimit': 'Ultra resident workers',
   'settings.ultraMaxActiveWorkers': 'Ultra active worker limit',
   'settings.ultraWorkersHelp':
-    'Workers of Ultra accounts are counted separately from the normal pool: prewarming, idle reaping and eviction stay inside the Ultra partition and never take workers from the normal pool. The resident count may be 0 (start on demand only); the limit must be at least 1 and not lower than the resident count.',
+    'Workers of Ultra-pool accounts are counted separately from the normal pool: prewarming, idle reaping and eviction stay inside the Ultra partition and never take workers from the normal pool. With "Put Pro accounts in the Ultra pool" on, workers of Pro accounts count here too. The resident count may be 0 (start on demand only); the limit must be at least 1 and not lower than the resident count.',
   'settings.routingStrategy': 'Account selection strategy',
   'settings.routingRoundRobin': 'Round robin',
   'settings.routingFillFirst': 'Fill first',
@@ -840,7 +854,7 @@ const en: Record<TranslationKey, string> = {
   'settings.ultraPrimaryModels': 'Ultra primary model list',
   'settings.ultraPrimaryQueueWait': 'Ultra queue limit',
   'settings.ultraPrimaryHelp':
-    'The Ultra primary model list applies to /ultra requests. When "Ultra accounts only serve /ultra requests" is off, models on normal paths that are not in the normal list above but are in this list (usually models only Ultra accounts can serve) follow these rules too. When these models are out of quota the request gets a 429 with Retry-After right away instead of switching accounts inside the service over and over: it returns at once when every candidate account is cooling down, and after a quota 429 during a request it switches accounts at most 2 more times; the switch right after each quota failure uses only workers that are already running and never cold-starts a standby account for it. The queue limit only bounds the wait for a free account or worker and follows the same rules as above (0 never queues; it cannot exceed the request timeout). Comma-separated model IDs; defaults to gemini-4-argon; clear it to turn this off. Changes apply immediately.',
+    'The Ultra primary model list applies to /ultra requests. When "Ultra-pool accounts only serve /ultra requests" is off, models on normal paths that are not in the normal list above but are in this list (usually models only Ultra-pool accounts can serve) follow these rules too. When these models are out of quota the request gets a 429 with Retry-After right away instead of switching accounts inside the service over and over: it returns at once when every candidate account is cooling down, and after a quota 429 during a request it switches accounts at most 2 more times; the switch right after each quota failure uses only workers that are already running and never cold-starts a standby account for it. The queue limit only bounds the wait for a free account or worker and follows the same rules as above (0 never queues; it cannot exceed the request timeout). Comma-separated model IDs; defaults to gemini-4-argon; clear it to turn this off. Changes apply immediately.',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': 'Channel',
@@ -882,9 +896,9 @@ const en: Record<TranslationKey, string> = {
   'playground.system': 'System instruction',
   'playground.prompt': 'User message',
   'playground.stream': 'Stream response',
-  'playground.ultra': 'Use Ultra accounts',
+  'playground.ultra': 'Use the Ultra pool',
   'playground.ultraHelp': 'Requests go through the /ultra prefix and are served only by Ultra-pool accounts',
-  'playground.ultraNoModels': 'No models known for Ultra accounts yet; showing all models',
+  'playground.ultraNoModels': 'No models known for Ultra-pool accounts yet; showing all models',
   'playground.reasoning': 'Reasoning effort',
   'playground.reasoningOff': 'Default',
   'playground.reasoningLow': 'Low',
@@ -1021,7 +1035,7 @@ const en: Record<TranslationKey, string> = {
     "Primary model {model}: warm is the number of resident workers that can serve it, standby the number of idle accounts that still can (counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time)",
   'app.ultraPrimarySupplyModel': 'Ultra primary {model}:',
   'app.ultraPrimarySupplyDetail':
-    "Ultra primary model {model}: warm is the number of resident workers in the Ultra partition that can serve it, standby the number of idle Ultra-pool accounts that still can (counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle Ultra account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time). When quota runs out, requests for this model get a 429 right away instead of queuing and retrying inside the service",
+    "Ultra primary model {model}: warm is the number of resident workers in the Ultra partition that can serve it, standby the number of idle Ultra-pool accounts that still can (including Pro accounts when they are put in the Ultra pool; counted up to 1000), refreshed about every 30 seconds. Standby 0 means no idle Ultra-pool account can serve this model any more (the day's quota is probably used up; it resets at midnight Pacific time). When quota runs out, requests for this model get a 429 right away instead of queuing and retrying inside the service",
   'app.prewarmActive': 'Prewarming · {inflight} running · {launched} this round',
   'app.prewarmStalled': 'Prewarm loop stalled {seconds}s',
   'app.prewarmIdle': 'Prewarm idle',
@@ -1070,9 +1084,13 @@ const en: Record<TranslationKey, string> = {
   'accounts.workerFilterStarting': 'Worker: starting',
   'accounts.workerFilterNone': 'Worker: not started',
   'accounts.sortWorker': 'By worker',
-  'accounts.ultraCount': 'Ultra ready {ready} / {total}',
-  'accounts.ultraCountHelp': 'Accounts in the Ultra pool: requests under the /ultra prefix only use these accounts',
+  'accounts.ultraCount': 'Ultra pool ready {ready} / {total}',
+  'accounts.ultraCountHelp':
+    'Accounts in the Ultra pool (including Pro accounts when "Put Pro accounts in the Ultra pool" is on): requests under the /ultra prefix only use these accounts',
   'accounts.ultraWorkers': 'Ultra workers {warm} / {target}',
+  'accounts.poolUltraTag': 'Ultra pool',
+  'accounts.proInUltraHelp':
+    '"Put Pro accounts in the Ultra pool" is on: this account keeps its Pro tier but belongs to the Ultra pool, is scheduled by the Ultra-pool settings and serves requests under the /ultra prefix. While "Ultra-pool accounts only serve /ultra requests" is on in Service config, it no longer serves normal-path requests',
   'accounts.tierFilterAll': 'Tier: all',
   'accounts.tierFilterUltra': 'Tier: Ultra',
   'accounts.tierFilterPro': 'Tier: Pro',
