@@ -107,17 +107,10 @@ func newRuntime(
 	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.permissionDenied = openPermissionDeniedRegistry(store.PrimaryDirectory(), requests)
-	// 确定失效账户的持久表（见 startup_failures_store.go），同一账户目录共用一个实例
-	workers.startupFailures = openStartupFailureRegistry(store.PrimaryDirectory(), requests)
-	// 续签换掉登录签名 Cookie 时在提交处更新两张表记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
-	refresher.renewed = func(accountID string, identity string) {
-		service.permissionDenied.setIdentity(accountID, identity)
-		workers.startupFailures.setIdentity(accountID, identity)
-	}
+	// 续签换掉登录签名 Cookie 时在提交处更新登记记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
+	refresher.renewed = service.permissionDenied.setIdentity
 	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
 	service.reconcilePermissionDenied()
-	// 需要重新登录的状态不持久化，重启后按 Cookie 推导为就绪：按失效账户记录重新标记反复确认登录失效的账户，并清除过时的记录
-	workers.reconcileStartupFailures()
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -141,9 +134,8 @@ func newRuntime(
 		err := workers.Close()
 		transport.CloseIdleConnections()
 		headers.Close()
-		// 403 无权限账户的登记与失效账户记录平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
+		// 403 无权限账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
 		service.permissionDenied.flush()
-		workers.startupFailures.flush()
 		return err
 	}
 	return service, admin, closeRuntime, nil
@@ -238,18 +230,6 @@ type accountWorkerManager struct {
 	startupSlots startupSlots
 	// refresher 在 Worker 启动阶段确认登录失效时恢复认证；为空时只把账户标为需要登录
 	refresher *authRuntimeRefresher
-	// lastStartupSuccess 为最近一次 Worker 启动成功的时间（UnixNano，0 为还没有），lastProbe 为最近一次保底试探放行的时间；
-	// envFailures 为近期环境类启动失败的时间点（由 envFailMu 保护）；startupFailures 为确定失效账户的持久表（由生成服务装配时设置，
-	// 为空时不持久化）。见 startup_failures.go。startupHealth 为确认页面受阻失效时判断号池是否健康用的近期启动记录
-	// （其他账户最近的启动成功、近 30 分钟尝试启动与页面受阻的账户），见 startup_page_blocked.go
-	lastStartupSuccess atomic.Int64
-	lastProbe          atomic.Int64
-	envFailMu          sync.Mutex
-	envFailures        []time.Time
-	startupFailures    *startupFailureRegistry
-	startupHealth      startupHealthTracker
-	// warmGrace 为单个预热或替补任务在初始化超时之外额外允许的时间（纳秒，0 为 warmTaskGrace），测试调低
-	warmGrace atomic.Int64
 	// launch 启动单个账户的 WAA Worker，为空时使用 newWAAWorker（测试替换为不启动浏览器的实现）
 	launch func(context.Context, string, camoufoxnative.Options) (*aistudio.NativeWorker, error)
 }
@@ -277,22 +257,6 @@ type accountWorker struct {
 	// cleanupRetryAt 与 cleanupBackoff 为清理失败后下一次后台重试的时间与间隔（由 account.mu 保护）
 	cleanupRetryAt time.Time
 	cleanupBackoff time.Duration
-	// 启动失败记忆（见 startup_failures.go）：startFailUntil（UnixNano，0 为没有）为原因不确定、指纹文件损坏或页面受阻的启动失败后暂停调度的期限，
-	// startFailErr 为最近一次的错误，startFailGen 为记录时的认证代际（代际变化后记录视为无）。调度时对上万个备用账户读一遍，用原子值读取、
-	// 不取账户锁；写入在账户锁内，顺序同 busyUntil（先写原因与代际再写期限）。startFailKind 为这段连续失败的类别，startFailCount 为计入
-	// 退避的连续失败次数，startFailTotal 为连续失败总次数（含按系统性问题不计次数的），startFailEvidence 为页面受阻时计入失效确认的
-	// 连续次数（每次失败时号池都健康的，见 startup_page_blocked.go），startFailStage、startFailFirst、startFailLast 供列表展示，
-	// 都由 account.mu 保护
-	startFailUntil    atomic.Int64
-	startFailErr      atomic.Pointer[error]
-	startFailGen      atomic.Uint64
-	startFailKind     startupFailureKind
-	startFailCount    int
-	startFailTotal    int
-	startFailEvidence int
-	startFailStage    int
-	startFailFirst    time.Time
-	startFailLast     time.Time
 }
 
 type accountWorkerPreparer struct {
@@ -303,9 +267,7 @@ type accountWorkerPreparer struct {
 	runtimeLease   *aistudio.AccountRuntimeLease
 	ownsLease      bool
 	startedAt      time.Time
-	// launchStartedAt 为取得冷启动名额、开始启动浏览器的时间：就绪日志的 排队 = launchStartedAt − startedAt，启动 = 自 launchStartedAt 起
-	launchStartedAt time.Time
-	pending         bool
+	pending        bool
 }
 
 type accountWorkerUpdate struct {
@@ -393,11 +355,6 @@ type accountWorkerInitError struct {
 	err error
 	// authHandled 表示启动阶段已经处理过登录失效（已恢复一次或已标为需要登录），上层不再恢复第二次
 	authHandled bool
-	// stage 为失败时的启动阶段（1–7，见 workerStartupProgress），取得 runtime 租约失败时为 0 且 leaseFailed 为真（见 classifyStartupFailure）；
-	// initExpired 表示失败时整个启动的期限（INIT_TIMEOUT）已经到了（调用方的 ctx 没有结束），页面受阻的文本此时只说明页面加载得太慢
-	stage       int
-	leaseFailed bool
-	initExpired bool
 }
 
 func (err *accountWorkerInitError) Error() string {
@@ -458,10 +415,8 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 	go func() {
 		defer close(done)
 		_, err := manager.ensureWorker(ctx, accountID, modelID, false)
-		// 启动错误已由 startReservedWorker 写过 ERROR（带阶段与类别），这里只写其他错误，不重复
-		var initErr *accountWorkerInitError
 		if err == nil || ctx.Err() != nil || errors.Is(err, errAccountWorkerOpening) ||
-			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) || errors.As(err, &initErr) {
+			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) {
 			return
 		}
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 后台扩容失败 | 错误=%v", err))
@@ -1213,18 +1168,14 @@ func (manager *accountWorkerManager) startReservedWorker(
 		if err != nil {
 			account.startupMu.Unlock()
 			manager.requests.log(label, "ERROR", fmt.Sprintf(
-				"WAA Worker 启动失败 | 取得 runtime 租约 | 类别=%s | 耗时=%s | 错误=%s",
-				startupFailureEnvironment.label(), time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
+				"WAA Worker 启动失败 | 耗时=%s | 错误=%s",
+				time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
 			))
-			return nil, &accountWorkerInitError{err: err, leaseFailed: true}
+			return nil, &accountWorkerInitError{err: err}
 		}
 		ownsLease = true
 		manager.clearRuntimeBusy(account)
 	}
-	initTimeout := time.Duration(manager.initTimeout.Load())
-	deadline, hasDeadline := ctx.Deadline()
-	// enoughBefore 为等名额之前剩余期限还够一次完整启动（INIT_TIMEOUT）
-	enoughBefore := hasDeadline && time.Until(deadline) >= initTimeout
 	releaseSlot, err := manager.acquireStartupSlot(ctx, label, options.ExecutablePath)
 	if err != nil {
 		if ownsLease {
@@ -1233,27 +1184,12 @@ func (manager *accountWorkerManager) startReservedWorker(
 		account.startupMu.Unlock()
 		return nil, err
 	}
-	initTimeout = time.Duration(manager.initTimeout.Load())
-	// 后台启动（预热、补齐、替补）的期限包含等名额的时间：名额被按需启动占满、等到名额时剩余期限已不够一次完整启动，
-	// 放回名额与租约、按容量已满返回（稍后重试），不启动注定被掐断的浏览器，也不记为预热失败。
-	// 只在等名额把原本够用的期限耗到不够时放弃：期限本来就短于 INIT_TIMEOUT 的调用方照常启动
-	if enoughBefore && backgroundStartup(ctx) && time.Until(deadline) < initTimeout {
-		releaseSlot()
-		if ownsLease {
-			_ = runtimeLease.Release()
-		}
-		account.startupMu.Unlock()
-		return nil, errStartupSlotsLate
-	}
 	manager.requests.log(label, "INFO", "WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型="+bootstrapModel)
+	initTimeout := time.Duration(manager.initTimeout.Load())
 	initCtx, cancel := context.WithTimeout(ctx, initTimeout)
 	options.Model = bootstrapModel
-	// stage 为当前启动阶段，失败时据此分类（见 classifyStartupFailure）；Camoufox 在读取 storage state 之后才报告第 2 阶段
-	var stage atomic.Int32
-	stage.Store(1)
-	options.StartupProgress = func(startupStage camoufoxnative.StartupStage) {
-		step, message := workerStartupProgress(startupStage)
-		stage.Store(int32(step))
+	options.StartupProgress = func(stage camoufoxnative.StartupStage) {
+		step, message := workerStartupProgress(stage)
 		manager.requests.log(label, "INFO", fmt.Sprintf("WAA Worker 启动 | %d/7 | %s", step, message))
 	}
 	launch := manager.launch
@@ -1268,15 +1204,8 @@ func (manager *accountWorkerManager) startReservedWorker(
 		budget = leaseWaitBudgetFromContext(ctx)
 	}
 	launchStartedAt := time.Now()
-	// 近 30 分钟尝试启动的账户（页面受阻的大面积爆发按它判断，见 startup_page_blocked.go）。已确认为页面受阻失效的账户不计入，
-	// 与页面受阻的账户数口径一致；只按账户 ID 查（不取号池锁算登录签名：认证文件更新时记录已随之清除）
-	if !manager.startupFailures.pageBlocked(account.id, "") {
-		manager.startupHealth.noteAttempt(account.id, launchStartedAt)
-	}
 	budget.beginColdStart(initTimeout)
 	worker, initErr := launch(initCtx, account.id, options)
-	// 在 cancel 之前读取：调用方的 ctx 没有结束、initCtx 已结束，说明整个启动的期限（INIT_TIMEOUT）到了
-	initExpired := initCtx.Err() != nil
 	cancel()
 	// 名额只覆盖浏览器启动本身，发布、替换与淘汰旧 Worker 不再占用
 	releaseSlot()
@@ -1286,40 +1215,19 @@ func (manager *accountWorkerManager) startReservedWorker(
 			_ = runtimeLease.Release()
 		}
 		account.startupMu.Unlock()
-		failedStage := int(stage.Load())
-		queued, launching := launchStartedAt.Sub(startedAt), time.Since(launchStartedAt)
 		if err := ctx.Err(); err != nil {
-			manager.requests.log(label, "INFO", fmt.Sprintf(
-				"WAA Worker 启动取消 | 原因=%s | 阶段=%s | 排队=%s | 启动=%s",
-				manager.startupCancelReason(ctx), startupStepText(failedStage),
-				queued.Round(time.Millisecond), launching.Round(time.Millisecond),
-			))
 			return nil, err
 		}
-		failure := &accountWorkerInitError{err: initErr, stage: failedStage, initExpired: initExpired}
 		manager.requests.log(label, "ERROR", fmt.Sprintf(
-			"WAA Worker 启动失败 | 页面模型=%s | 阶段=%s | 类别=%s | 排队=%s | 启动=%s | 耗时=%s | 错误=%s",
-			bootstrapModel, startupStepText(failedStage), classifyStartupFailure(failure, failedStage).label(),
-			queued.Round(time.Millisecond), launching.Round(time.Millisecond),
-			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()),
+			"WAA Worker 启动失败 | 页面模型=%s | 耗时=%s | 错误=%s",
+			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()),
 		))
-		return nil, failure
+		return nil, &accountWorkerInitError{err: initErr}
 	}
 	return &accountWorkerPreparer{
 		account: account, worker: worker, bootstrapModel: bootstrapModel, manager: manager,
-		runtimeLease: runtimeLease, ownsLease: ownsLease, startedAt: startedAt, launchStartedAt: launchStartedAt, pending: true,
+		runtimeLease: runtimeLease, ownsLease: ownsLease, startedAt: startedAt, pending: true,
 	}, nil
-}
-
-// startupCancelReason 返回启动被取消的原因：生成服务停止、期限已到或调用方取消
-func (manager *accountWorkerManager) startupCancelReason(ctx context.Context) string {
-	switch {
-	case manager.lifecycle.Err() != nil:
-		return "生成服务停止"
-	case errors.Is(context.Cause(ctx), context.DeadlineExceeded):
-		return "期限已到"
-	}
-	return "已取消"
 }
 
 // activateAccountWorker 将已启动 Worker 发布到热池
@@ -1356,25 +1264,13 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 		preparer.account.generation.Add(1)
 	}
 	preparer.account.warm.Store(true)
-	now := time.Now()
-	preparer.account.readyAt.Store(now.UnixNano())
-	// 启动成功：清除启动失败记忆（见 startup_failures.go），并记下最近一次成功的时间（原因不确定的失败据此判断是否为系统性问题）
-	clearStartupFailureLocked(preparer.account)
-	preparer.manager.lastStartupSuccess.Store(now.UnixNano())
+	preparer.account.readyAt.Store(time.Now().UnixNano())
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
-	// 其他账户判断页面受阻时号池是否健康用（见 startup_page_blocked.go）
-	preparer.manager.startupHealth.noteSuccess(preparer.account.id, now)
-	// 能启动 Worker 说明登录有效：确定失效记录（如续签恢复之前记下的登录页跳转、页面受阻）随之清除
-	if preparer.manager.startupFailures.remove(preparer.account.id) {
-		preparer.manager.requests.log(label, "INFO", "WAA Worker 启动成功，清除失效账户记录")
-	}
 	preparer.manager.notifyScheduling()
 	preparer.manager.requests.log(label, "INFO", fmt.Sprintf(
-		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 排队=%s | 启动=%s | 耗时=%s",
-		preparer.bootstrapModel, preparer.worker.State().PID,
-		preparer.launchStartedAt.Sub(preparer.startedAt).Round(time.Millisecond),
-		now.Sub(preparer.launchStartedAt).Round(time.Millisecond), now.Sub(preparer.startedAt).Round(time.Millisecond),
+		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s",
+		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond),
 	))
 	preparer.pending = false
 	preparer.account.startupMu.Unlock()
@@ -1683,59 +1579,35 @@ func (manager *accountWorkerManager) ensureWorker(
 // 在请求租约内恢复一次认证并重新启动；仍失败时账户标为需要登录，错误带 authHandled，上层不再恢复第二次。
 // 预热与后台扩容没有租约，也不为此另取普通租约（会更新 LastUsed、把账户显示为忙碌，干扰 idleWarmVictimFor
 // 与预热轮换选号）：账户保存了续签材料时留给带租约的按需启动恢复，没有续签材料时按启动前的认证代际标为需要登录
-// 启动失败在返回前计入账户一次（noteStartupFailure，见 startup_failures.go），返回的错误不变
 func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Context, accountID string, model string) (*accountWorkerPreparer, error) {
 	generation := manager.pool.AuthGeneration(accountID)
 	startedAt := time.Now()
-	worker, err := manager.startAuthenticated(ctx, accountID, model, &generation, startedAt)
-	if err != nil {
-		manager.noteStartupFailure(ctx, accountID, generation, startedAt, err)
-	}
-	return worker, err
-}
-
-// startAuthenticated 为 startAuthenticatedWorker 的实现。带租约恢复认证成功后把 generation 改为恢复后的认证代际：
-// 之后的启动用的是新认证，它的失败按新认证记录。包装启动错误时保留失败时的启动阶段
-func (manager *accountWorkerManager) startAuthenticated(
-	ctx context.Context, accountID string, model string, generation *uint64, startedAt time.Time,
-) (*accountWorkerPreparer, error) {
 	worker, err := manager.startReservedWorker(ctx, accountID, model)
 	if err == nil || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(err) {
 		return worker, err
 	}
-	stage := startupStageOf(err)
 	lease, leased := aistudio.AccountLeaseFromContext(ctx)
 	if !leased || lease.Account().ID != accountID {
-		marked, markErr := manager.markStartupAuthRequired(accountID, *generation, startedAt, err)
+		marked, markErr := manager.markStartupAuthRequired(accountID, generation, startedAt, err)
 		if !marked && markErr == nil {
 			return nil, err
 		}
-		return nil, &accountWorkerInitError{err: errors.Join(err, markErr), authHandled: true, stage: stage}
+		return nil, &accountWorkerInitError{err: errors.Join(err, markErr), authHandled: true}
 	}
 	if manager.refresher == nil {
-		return nil, &accountWorkerInitError{err: errors.Join(err, lease.MarkAuthenticationRequired(err.Error())), authHandled: true, stage: stage}
+		return nil, &accountWorkerInitError{err: errors.Join(err, lease.MarkAuthenticationRequired(err.Error())), authHandled: true}
 	}
 	if recoverErr := manager.refresher.Recover(ctx, err); recoverErr != nil {
-		return nil, &accountWorkerInitError{err: recoverErr, authHandled: true, stage: stage}
+		return nil, &accountWorkerInitError{err: recoverErr, authHandled: true}
 	}
-	*generation = manager.pool.AuthGeneration(accountID)
 	worker, err = manager.startReservedWorker(ctx, accountID, model)
 	if err == nil {
 		return worker, nil
 	}
-	stage = startupStageOf(err)
-	failure := &accountWorkerInitError{stage: stage, authHandled: true}
-	var inner *accountWorkerInitError
-	if errors.As(err, &inner) {
-		// 保留第二次启动失败的原因标记：classifyStartupFailure 用 errors.As 只看最外层这个包装，丢了 initExpired 时
-		// 用满 INIT_TIMEOUT（页面只是加载得太慢）的页面受阻文本会被当成页面受阻计入失效确认
-		failure.leaseFailed, failure.initExpired = inner.leaseFailed, inner.initExpired
-	}
 	if aistudio.DefinitiveAuthenticationFailure(err) {
 		err = manager.refresher.markAuthenticationRequired(ctx, err)
 	}
-	failure.err = err
-	return nil, failure
+	return nil, &accountWorkerInitError{err: err, authHandled: true}
 }
 
 // markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录
@@ -1829,11 +1701,8 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 	inflight := make(map[string]aistudio.PoolScope)
 	results := make(chan warmResult, warmResultBuffer)
 	launched := 0
-	// capacityFull 为 Worker 槽位已满的分区：该分区本轮不再启动新的；slotsLate 为其中因冷启动名额被按需启动占满、
-	// 等到名额时剩余期限不足而放弃启动的分区（errStartupSlotsLate），slotsFull 为真正槽位已满的分区，等待原因据此区分
+	// capacityFull 为 Worker 槽位已满的分区：该分区本轮不再启动新的
 	capacityFull := make(map[aistudio.PoolScope]bool, len(workerPartitions))
-	slotsLate := make(map[aistudio.PoolScope]bool, len(workerPartitions))
-	slotsFull := make(map[aistudio.PoolScope]bool, len(workerPartitions))
 	// openingElsewhere 记录已由其他路径（如请求按需扩容）在启动的账户，本轮不再重复尝试，避免空转
 	openingElsewhere := make(map[string]struct{})
 	var busySince time.Time
@@ -1859,11 +1728,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		// 槽位已满或该账户已在启动：不算失败，该分区本轮不再启动新的，交给 keepWarm 稍后重试
 		if errors.Is(result.err, errAccountWorkerCapacity) {
 			capacityFull[partition] = true
-			if errors.Is(result.err, errStartupSlotsLate) {
-				slotsLate[partition] = true
-			} else {
-				slotsFull[partition] = true
-			}
 			return
 		}
 		if errors.Is(result.err, errAccountWorkerOpening) {
@@ -1953,9 +1817,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			ready, readyBusyErr = manager.runtimeAvailable(ready)
 			busy, standbyBusyErr = manager.runtimeAvailable(busy)
 			runtimeBusyErr = errors.Join(runtimeBusyErr, readyBusyErr, standbyBusyErr)
-			// 启动失败暂停中的账户不预热（warmFailures 保持不动）；分区里还没有任何热 Worker、也没有在启动的时保底试探每分钟放行一个
-			busy = manager.startupBackoffAvailable(busy, false)
-			ready = manager.startupBackoffAvailable(ready, warmCounts[partition] == 0 && inflightCounts[partition] == 0 && len(busy) == 0)
 			pendingBusy = pendingBusy || len(busy) > 0
 			ready = manager.preferUncooled(partition, ready)
 			readyCount += len(ready)
@@ -1966,7 +1827,9 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				go func(accountID string) {
 					// 不等待 Worker 槽位：槽位满时立即返回；冷启动名额按后台启动排队，让给按需启动（见 startupSlots）。
 					// 单个任务限时，避免个别账户拖住整轮预热
-					taskCtx, taskCancel := context.WithTimeout(withBackgroundStartup(ctx), manager.warmTaskTimeout())
+					taskCtx, taskCancel := context.WithTimeout(
+						withBackgroundStartup(ctx), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
+					)
 					_, err := manager.ensureWorker(taskCtx, accountID, "", false)
 					taskCancel()
 					results <- warmResult{accountID: accountID, err: err}
@@ -1997,16 +1860,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			warm = manager.WarmAccountIDs()
 			if len(warm) > 0 {
 				// 本轮暂时无法继续：记录原因后结束，由 keepWarm 定期再补
-				reason := fmt.Sprintf("暂无可启动的账户（预热失败冷却中 %d 个，启动失败暂停中 %d 个）",
-					len(manager.recentWarmFailures(time.Now())), manager.pausedStartupCount(time.Now()))
+				reason := fmt.Sprintf("暂无可启动的账户（预热失败冷却中 %d 个）", len(manager.recentWarmFailures(time.Now())))
 				level := "INFO"
 				full, anyFull := fullPartition(capacityFull)
 				switch {
-				case anyFull && slotsLate[full] && !slotsFull[full]:
-					launching, onDemand, _ := manager.startupSlots.usage()
-					reason = fmt.Sprintf("冷启动名额被按需启动占满（启动中 %d / 上限 %d，按需排队 %d）",
-						launching, max(manager.warmConcurrencyValue(), 1)+1, onDemand)
-					level = "WARN"
 				case anyFull:
 					occupancy := manager.occupiedWorkersIn(full, manager.pool.UltraAccountIDs())
 					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.effectiveSlots(), manager.maxActiveFor(full))
@@ -2079,15 +1936,6 @@ const (
 type warmResult struct {
 	accountID string
 	err       error
-}
-
-// warmTaskTimeout 返回单个预热或替补任务的期限：初始化超时加 warmTaskGrace（测试可用 warmGrace 调低）。期限包含等冷启动名额的时间
-func (manager *accountWorkerManager) warmTaskTimeout() time.Duration {
-	grace := time.Duration(manager.warmGrace.Load())
-	if grace <= 0 {
-		grace = warmTaskGrace
-	}
-	return time.Duration(manager.initTimeout.Load()) + grace
 }
 
 func excludeAccountIDs(accountIDs []string, excluded map[string]struct{}) []string {
@@ -3533,22 +3381,12 @@ func (service *trackedService) acquireLease(
 		runtimeBusyErr := errors.Join(readyBusyErr, standbyBusyErr)
 		candidates := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) +
 			len(groups.StandbyReady) + len(groups.StandbyBusy)
-		// 启动失败暂停中的备用账户（原因不确定的启动失败，见 startup_failures.go）暂时不作为候选：原先同一个排队的请求会反复挑同一个失败的号
-		// 启动，排在后面的健康账户一次都轮不到。没有热候选时保底试探每分钟放行一个；固定账户（指定账户或文件绑定）不受影响
-		pausedStandby := 0
-		if !fixedAccount {
-			before := len(groups.StandbyReady) + len(groups.StandbyBusy)
-			warmCount := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy)
-			groups.StandbyBusy = service.workers.startupBackoffAvailable(groups.StandbyBusy, false)
-			groups.StandbyReady = service.workers.startupBackoffAvailable(groups.StandbyReady, warmCount == 0 && len(groups.StandbyBusy) == 0)
-			pausedStandby = max(before-len(groups.StandbyReady)-len(groups.StandbyBusy), 0)
-		}
 		standbyReady, opening := service.workers.withoutOpening(groups.StandbyReady)
 		groups.StandbyReady = standbyReady
 		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
 		snapshot = queueSnapshot{
 			warmIdle: len(warmAvailable), warmBusy: len(groups.WarmBusy),
-			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy), startupPaused: pausedStandby,
+			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy),
 			opening: opening, earliestCooldown: groups.EarliestCooldown,
 		}
 		if len(warmAvailable) > 0 {
@@ -3574,7 +3412,7 @@ func (service *trackedService) acquireLease(
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)
-		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening || pausedStandby > 0) {
+		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening) {
 			// 额度 429 之后没有已启动的 Worker，只剩要冷启动的备用账号（或正在启动的）：不现场冷启动（10–30s 以上，冷启动出来的账号
 			// 也不一定有额度），为其中一个发起后台扩容（所在分区能扩容时），不等它，立即返回；调用方按额度不足返回 429，
 			// 客户端稍后重试时扩容出来的 Worker 多半已经就绪。候选全部冷却仍走下面的全部冷却
@@ -3685,14 +3523,6 @@ func (service *trackedService) acquireLease(
 		// 热候选取租约时被其他请求抢先（分类时还有空位，TryAcquireFor 返回空）同样按账号全部忙碌等待，不落到下面的冷却判断
 		if len(warmAvailable) > 0 || len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
 			if err := wait(schedulingRecheck, "账号全部忙碌"); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		// 备用账户都在启动失败暂停中：等暂停到期（到期时唤醒调度）或保底试探，按容量原因排队（主用模型受排队预算限制），
-		// 不按全部冷却返回 429，也不按没有账户返回 503。Playground 优先选号同下
-		if pausedStandby > 0 && len(groups.StandbyReady) == 0 && !selection.PlaygroundFirst {
-			if err := wait(schedulingRecheck, waitReasonStartupPaused); err != nil {
 				return nil, err
 			}
 			continue

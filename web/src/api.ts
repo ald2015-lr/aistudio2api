@@ -20,7 +20,6 @@ import type {
   RequestSummary,
   ServiceConfig,
   ServiceStatus,
-  StartupFailureAccount,
   UsageRecordPage,
   UsageReport,
 } from '@/types'
@@ -54,14 +53,6 @@ interface PermissionDeniedResponse {
 }
 
 interface PermissionDeniedClearResponse {
-  cleared: number
-}
-
-interface StartupFailuresResponse {
-  accounts: StartupFailureAccount[] | null
-}
-
-interface StartupFailuresClearResponse {
   cleared: number
 }
 
@@ -149,15 +140,6 @@ export const api = {
     (await requestJSON<PermissionDeniedResponse>('/api/accounts/permission-denied')).accounts,
   clearPermissionDenied: (input: { account_ids?: string[]; all?: boolean }) =>
     requestJSON<PermissionDeniedClearResponse>('/api/accounts/permission-denied/clear', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
-  // startupFailures 读取启动 Worker 失败的账户：confirmed 为 true 的确定失效，其余只是暂停调度
-  startupFailures: async () =>
-    (await requestJSON<StartupFailuresResponse>('/api/accounts/startup-failures')).accounts ?? [],
-  // clearStartupFailures 清除指定账户（或 all 为 true 时全部）的启动失败记录与暂停，账户本身不变
-  clearStartupFailures: (input: { account_ids: string[]; all: boolean }) =>
-    requestJSON<StartupFailuresClearResponse>('/api/accounts/startup-failures/clear', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

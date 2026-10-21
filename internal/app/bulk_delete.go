@@ -161,7 +161,6 @@ func (admin *runtimeAdmin) DeleteAccounts(ctx context.Context, input api.BulkDel
 		// 不能用不区分大小写的 permissionDeniedRegistry.clear，否则只差大小写的 ID 会按不存在处理，却清掉号池里那个账户的记录
 		for _, accountID := range missing {
 			admin.service.permissionDenied.clearAccount(accountID)
-			admin.workers.startupFailures.remove(accountID)
 		}
 	}
 	result.Deleted = len(deleted)

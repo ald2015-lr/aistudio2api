@@ -193,24 +193,6 @@ export interface PrimarySupply {
   standby_capped?: boolean
 }
 
-// StartupStatus 为 Worker 冷启动的实时状态（普通与 Ultra 号池共用冷启动名额）：launching 为正在启动浏览器的数量
-// （占用的冷启动名额），limit 为同时启动的上限（WARM_STARTUP_CONCURRENCY 至少按 1 计，另加 1 个请求现场名额），
-// queued_on_demand 与 queued_background 为在名额队列里等待的按需启动（请求现场）与后台启动（预热、扩容、替补）数；
-// paused 为启动失败暂停中的账户数，dead 为确定失效的账户数（含确认为页面受阻的），last_success 为最近一次 Worker 启动成功的时间
-// （还没有成功过时为空），env_failures_10m 为近 10 分钟环境类启动失败数（浏览器没能启动或连接，多半是机器资源不够，不计入账户）；
-// page_blocked_burst 为真时大量账户同时页面受阻（可能是官网页面改版），暂不把新的页面受阻确认为失效，旧版服务端不返回
-export interface StartupStatus {
-  launching: number
-  limit: number
-  queued_on_demand: number
-  queued_background: number
-  paused: number
-  dead: number
-  last_success?: string
-  env_failures_10m: number
-  page_blocked_burst?: boolean
-}
-
 export interface ServiceStatus {
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
@@ -226,8 +208,6 @@ export interface ServiceStatus {
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
   // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
-  // startup 为冷启动名额与启动失败的统计；旧版服务端不返回
-  startup?: StartupStatus
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'
@@ -320,31 +300,6 @@ export interface PermissionDeniedAccount {
   count: number
   first_at: string
   last_at: string
-}
-
-// StartupFailureKind 为启动 Worker 失败的类别：auth 为登录失效（启动时被跳转到 Google 登录页，或账户处于需要重新登录），
-// files 为认证文件无法用于启动浏览器，fingerprint 为账户 Camoufox 指纹文件损坏（与登录无关，重新上传认证文件修不好），
-// page_blocked 为页面受阻（页面打开后填不进 bootstrap 提示词或 Run 按钮一直不可用，多半是官网有需要账户处理的提示），
-// ambiguous 为启动反复失败、原因不确定（页面未就绪、WAA 失败、超时，机器负载高或网络慢时健康账户也会这样）
-export type StartupFailureKind = 'auth' | 'files' | 'fingerprint' | 'page_blocked' | 'ambiguous'
-
-// StartupFailureAccount 为启动 Worker 失败的账户。confirmed 为 true 时确定失效（kind 为 auth、files，或号池健康时连续受阻确认的
-// page_blocked：账户状态仍是就绪，按 30 分钟暂停重试，可能带 until），可以删除；为 false 时只是暂停调度到 until（kind 为 fingerprint、
-// page_blocked 或 ambiguous），不改变账户状态，不能据此删除。stage 为失败时的启动阶段 1–7
-// （未知为 0），url 为登录跳转的地址（只用于展示），reason 为原因摘要，message 为错误原文（截断）
-export interface StartupFailureAccount {
-  id: string
-  label: string
-  kind: StartupFailureKind
-  confirmed: boolean
-  reason?: string
-  message?: string
-  stage?: number
-  url?: string
-  count: number
-  first_at?: string
-  last_at?: string
-  until?: string
 }
 
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'

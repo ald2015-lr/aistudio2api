@@ -350,57 +350,6 @@ const zhCN = {
   'accounts.permissionDeniedDeleteSkipped':
     '；{count} 个在确认后已不在列表里（例如重新上传了认证文件），没有删除',
   'accounts.permissionDeniedShowAll': '展开全部 {count} 个',
-  'accounts.startupDeadTitle': '失效账户',
-  'accounts.startupDeadHint':
-    '（启动 Worker 时登录已失效、认证文件无法使用，或页面打开后反复受阻；前两种重新上传认证文件或重新登录即可）',
-  'accounts.startupDeadCount': '{count} 个',
-  'accounts.startupDeadHelp':
-    '确定失效的账户：当前处于“需要重新登录”状态的账户，以及确认为“页面受阻”的账户。前者中启动 Worker 时被跳转到 Google 登录页（登录失效）或认证文件无法用于启动浏览器而被标记的会写明原因与阶段，其余是验证未通过等其他原因标记的；“页面受阻”为同一份认证文件下连续 3 次在页面打开后填不进提示词或 Run 按钮一直不可用、且每次失败时其他账户都能正常启动的账户，账户状态仍是就绪，每 30 分钟重试一次，问题消失、启动成功后自动移出。认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录）、验证通过、Worker 启动成功或删除账户后自动清除。有续签材料、留给请求续签恢复的账户，重启后等待重试确认的记录，原因不确定的启动失败（页面未就绪、WAA 失败、超时）、还没确认的页面受阻以及指纹文件损坏（与登录无关）都不列在这里，见下方“启动反复失败（未确认）”。',
-  'accounts.startupFailureEmail': '邮箱',
-  'accounts.startupFailureReason': '原因',
-  'accounts.startupFailureStage': '阶段',
-  'accounts.startupFailureStageHelp':
-    '失败时的启动阶段：1 读取认证文件 · 2 读取指纹与浏览器缓存 · 3 启动浏览器 · 4 连接浏览器 · 5 载入 AI Studio 页面 · 6–7 WAA 初始化；— 为未知',
-  'accounts.startupFailureTimes': '次数',
-  'accounts.startupFailureLast': '最近一次',
-  'accounts.startupFailureUntil': '暂停至',
-  'accounts.startupFailureFirst': '首次：{time}',
-  'accounts.startupFailureURL': '跳转地址：{url}',
-  'accounts.startupFailureKindAuth': '登录失效',
-  'accounts.startupFailureKindFiles': '认证文件无法使用',
-  'accounts.startupFailureKindFingerprint': '指纹文件损坏',
-  'accounts.startupFailureKindPageBlocked': '页面受阻',
-  'accounts.startupFailureKindAmbiguous': '启动反复失败',
-  'accounts.startupFailureShowAll': '展开全部 {count} 个',
-  'accounts.startupDeadDownload': '下载列表',
-  'accounts.startupDeadClear': '清除记录',
-  'accounts.startupDeadClearConfirm':
-    '清除列表中 {count} 个账户的失效记录？只清除记录，不删除账户，也不改变账户状态：仍处于“需要重新登录”状态的账户会继续列出，再次启动失败时也会重新列出；“页面受阻”的账户立即重新参与调度，再次受阻时从头计数。',
-  'accounts.startupDeadCleared': '已清除 {count} 个账户的记录',
-  'accounts.startupDeadDelete': '一键删除',
-  'accounts.startupDeadDeleteHelp':
-    '从号池删除列表中的全部失效账户（包括折叠未显示的）并删除它们的认证目录，与账户列表里的“删除”相同，不能恢复。下方“启动反复失败（未确认）”的账户不会被删除。“页面受阻”的账户登录可能仍然正常，很多账户同时出现时可能是官网改版，不要批量删除。',
-  'accounts.startupDeadDeleteConfirm':
-    '删除列表中的全部 {count} 个失效账户及其认证文件（账户目录会被移除）？删除后不能恢复，要重新上传认证文件才能再用；正在处理请求的账户会等它空闲后删除。确认后会重新读取列表，只删除仍确定失效的账户。',
-  'accounts.startupDeadDeleteSkipped':
-    '；{count} 个在确认后已不再列为失效（例如重新上传了认证文件或验证通过），没有删除',
-  'accounts.startupDeadDeletePageBlocked':
-    '其中 {count} 个为“页面受阻”：账户状态仍是就绪，登录可能正常，建议先在浏览器里登录检查是否有需要处理的提示。',
-  'accounts.startupDeadDeleteBurst':
-    '注意：目前大量账户同时页面受阻，可能是官网页面改版，列表中的“页面受阻”账户未必失效，不建议批量删除。',
-  'accounts.startupPageBlockedHelp':
-    '其中 {count} 个为“页面受阻”：页面打开后填不进提示词或 Run 按钮一直不可用，多半是账户在官网有需要处理的提示（例如未同意的条款或通知挡住了输入框）。可以在浏览器里登录该账户打开 AI Studio 检查，处理后等下次重试（最多 30 分钟）自动恢复；确认无用后再删除。如果很多账户同时出现，可能是官网改版，不要批量删除。',
-  'accounts.startupPageBlockedBurst':
-    '大量账户同时页面受阻，可能是官网页面改版或灰度，不一定是账户本身的问题：暂不把新的页面受阻确认为失效（已列出的不变）。不要据此批量删除，先在浏览器里登录其中一两个账户检查。',
-  'accounts.startupDeadReadFailed': '重新读取失效账户列表失败，没有删除任何账户：{error}',
-  'accounts.startupPausedTitle': '启动反复失败（未确认）',
-  'accounts.startupPausedCount': '{count} 个',
-  'accounts.startupPausedHint':
-    '这类失败（页面未就绪、WAA 失败、超时）也可能是机器负载高、网络或代理慢导致，健康账户同样会出现，所以只暂停调度一段时间（启动成功后清零），不改变账户状态，也不提供删除。“页面受阻”（页面打开后填不进提示词或 Run 按钮一直不可用，多半是账户在官网有需要处理的提示）同样先只暂停：同一份认证文件下连续 3 次、每次失败时其他账户都能正常启动，才移到上方“失效账户”；很多账户同时出现时可能是官网改版，不确认。这里也列出之前记下失效、但账户当前不是“需要重新登录”状态的记录（如重启后让账户重试一次的），下次启动再失败才列为失效。可以逐个点“验证”确认；验证会另开浏览器，服务刚启动或负载高时不要批量验证。“指纹文件损坏”的账户与登录无关：账户目录里的 camoufox-fingerprint.json 内容坏了（如写入时磁盘满或进程被杀），重新上传认证文件、验证与重新登录都修不好（都要先读这个文件），不能验证；按原因里的路径从备份恢复该文件，或删除它（下次启动按当前版本重新生成指纹），再点“清除暂停”。',
-  'accounts.startupPausedExpired': '已到期',
-  'accounts.startupPausedClear': '清除暂停',
-  'accounts.startupPausedCleared': '已清除 {label} 的启动失败暂停',
-  'accounts.workerStartPaused': '启动失败×{count}（暂停至 {time}）',
   'models.allChannels': '全部通道',
   'models.pricingAll': '免费与付费',
   'models.pricingFree': '仅免费',
@@ -422,17 +371,7 @@ const zhCN = {
   'cooldowns.reason': '原因',
   'app.workers': 'Worker {warm} / {target}',
   'app.workersStarting': '启动中 {count}',
-  'app.coldStart': '冷启动 {launching} / {limit} · 排队 {queued}',
-  'app.coldStartShared': '冷启动 {launching} / {limit} · 排队 {queued}（两池共用）',
-  'app.coldStartDetail':
-    '冷启动名额：同时真正在启动浏览器的最多 {limit} 个（请求的冷启动另保留 1 个），普通与 Ultra 号池共用，这一行是两个号池合计：当前占用 {launching} 个，在名额队列里等待的按需 {onDemand} · 后台 {background} 个；名额占满且有排队时显示为黄色。上面的“启动中”只统计普通分区，包含在等名额的。启动失败暂停中的账户 {paused} 个；近 10 分钟环境类启动失败 {env} 次；最近一次启动成功：{last}',
-  'app.startupNever': '暂无',
   'app.workerCapacity': '槽位 {occupied} / 峰值 {max}',
-  'app.workerCapacityDetail':
-    '槽位不含启动中的 Worker，调度判断容量时含：槽位加启动中达到峰值时显示为黄色，新的 Worker 只能等待',
-  'app.startupDead': '失效账户 {count}',
-  'app.startupDeadDetail':
-    '确定失效的账户（登录已失效、认证文件无法使用或页面反复受阻）；点击到账户页查看、复制或删除',
   'app.workersDead': '冷却占位 {count} · 待淘汰',
   'app.workersDeadDetail':
     '账号已长时间冷却（如每日限额，或主用、热门模型的当天额度已用完）的常驻 Worker：占着名额却服务不了这些请求。空闲时立即关闭，忙碌时先排空再关闭，并换上没有冷却的账号',
@@ -1090,58 +1029,6 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedDeleteSkipped':
     '; {count} were no longer listed after confirming (for example, the auth file was uploaded again) and were not deleted',
   'accounts.permissionDeniedShowAll': 'Show all {count}',
-  'accounts.startupDeadTitle': 'Dead accounts',
-  'accounts.startupDeadHint':
-    '(sign-in expired, the auth file is unusable, or the page stays blocked after it opens when starting a worker; for the first two, upload a new auth file or log in again)',
-  'accounts.startupDeadCount': '{count}',
-  'accounts.startupDeadHelp':
-    'Accounts confirmed dead: accounts that currently need to log in again, and accounts confirmed as "Page blocked". Among the former, those marked because starting a worker was redirected to the Google sign-in page (sign-in expired) or the auth file could not be used to start the browser show the reason and stage, and the others were marked for other reasons, such as a failed verification. "Page blocked" means that with the same auth file, the prompt could not be filled in or the Run button stayed disabled after the page opened 3 times in a row, while other accounts started normally each time; the account stays ready, is retried every 30 minutes, and leaves the list once the problem is gone and it starts. An entry is cleared automatically when the auth file is updated (a new storage-state.json is uploaded, a browser login, or the directory is imported again), when verification passes, when a worker starts, or when the account is deleted. Accounts with renewal material left for a request to renew, records waiting for another try after a restart, startup failures with an uncertain cause (page not ready, WAA failure, timeout), page blocks not yet confirmed and corrupted fingerprint files (unrelated to sign-in) are not listed here; see "Repeated startup failures (unconfirmed)" below.',
-  'accounts.startupFailureEmail': 'Email',
-  'accounts.startupFailureReason': 'Reason',
-  'accounts.startupFailureStage': 'Stage',
-  'accounts.startupFailureStageHelp':
-    'Startup stage at failure: 1 read auth file · 2 read fingerprint and browser cache · 3 launch browser · 4 connect to browser · 5 load the AI Studio page · 6–7 WAA setup; — means unknown',
-  'accounts.startupFailureTimes': 'Times',
-  'accounts.startupFailureLast': 'Last seen',
-  'accounts.startupFailureUntil': 'Paused until',
-  'accounts.startupFailureFirst': 'First: {time}',
-  'accounts.startupFailureURL': 'Redirected to: {url}',
-  'accounts.startupFailureKindAuth': 'Sign-in expired',
-  'accounts.startupFailureKindFiles': 'Auth file unusable',
-  'accounts.startupFailureKindFingerprint': 'Fingerprint file corrupted',
-  'accounts.startupFailureKindPageBlocked': 'Page blocked',
-  'accounts.startupFailureKindAmbiguous': 'Repeated startup failure',
-  'accounts.startupFailureShowAll': 'Show all {count}',
-  'accounts.startupDeadDownload': 'Download list',
-  'accounts.startupDeadClear': 'Clear records',
-  'accounts.startupDeadClearConfirm':
-    'Clear the dead records of the {count} listed accounts? Only the records are cleared; the accounts are not deleted and their state does not change: accounts that still need to log in again stay listed, and an account that fails to start again is listed again. "Page blocked" accounts are scheduled again at once, and counting starts over if they are blocked again.',
-  'accounts.startupDeadCleared': 'Cleared records of {count} accounts',
-  'accounts.startupDeadDelete': 'Delete all',
-  'accounts.startupDeadDeleteHelp':
-    'Removes every listed dead account (including collapsed ones) from the pool and deletes its auth directory, the same as "Delete" in the account list. This cannot be undone. Accounts under "Repeated startup failures (unconfirmed)" are never deleted. "Page blocked" accounts may still be signed in; when many accounts show it at once, the site may have changed, so do not delete them in bulk.',
-  'accounts.startupDeadDeleteConfirm':
-    'Delete all {count} listed dead accounts and their auth files (the account directories are removed)? This cannot be undone; an account can be used again only after its auth file is uploaded again. Accounts serving a request are deleted once they become idle. The list is read again after you confirm, and only accounts still confirmed dead are deleted.',
-  'accounts.startupDeadDeleteSkipped':
-    '; {count} were no longer listed as dead after confirming (for example, the auth file was uploaded again or verification passed) and were not deleted',
-  'accounts.startupDeadDeletePageBlocked':
-    ' {count} of them are "Page blocked": the account is still ready and may still be signed in; log in to it in a browser first to check for a notice it has to handle.',
-  'accounts.startupDeadDeleteBurst':
-    ' Note: many accounts are page blocked at the same time right now, so the site may have changed; the "Page blocked" accounts in the list may not be dead, and deleting them in bulk is not recommended.',
-  'accounts.startupPageBlockedHelp':
-    '{count} of them are "Page blocked": the prompt cannot be filled in or the Run button stays disabled after the page opens, usually because the site shows a notice the account has to handle (for example, terms that were not accepted or a notice covering the input box). Log in to the account in a browser and open AI Studio to check; once handled, it recovers by itself at the next retry (within 30 minutes). Delete it only after you confirm it is unusable. If many accounts show this at once, the site may have changed; do not delete them in bulk.',
-  'accounts.startupPageBlockedBurst':
-    'Many accounts are page blocked at the same time, so the site may have changed or be rolling out a change, and the accounts themselves may be fine: new page blocks are not confirmed as dead for now (entries already listed stay). Do not delete in bulk because of this; log in to one or two of the accounts in a browser to check first.',
-  'accounts.startupDeadReadFailed':
-    'Could not read the dead account list again, nothing was deleted: {error}',
-  'accounts.startupPausedTitle': 'Repeated startup failures (unconfirmed)',
-  'accounts.startupPausedCount': '{count}',
-  'accounts.startupPausedHint':
-    'These failures (page not ready, WAA failure, timeout) can also be caused by a heavily loaded machine or a slow network or proxy, and healthy accounts show them too, so the account is only paused from scheduling for a while (reset after a successful start); its state does not change and it cannot be deleted from here. "Page blocked" (the prompt cannot be filled in or the Run button stays disabled after the page opens, usually because the site shows a notice the account has to handle) is also only paused at first: it moves to "Dead accounts" above after 3 times in a row with the same auth file, each while other accounts started normally; when many accounts show it at once, the site may have changed, and it is not confirmed. Records of accounts found dead earlier that do not currently need to log in again (such as one given another try after a restart) are listed here too; they become dead only if the next start fails. Use "Verify" on an account to check it; verification opens a separate browser, so do not verify in bulk right after a start or while the machine is busy. "Fingerprint file corrupted" is unrelated to sign-in: the camoufox-fingerprint.json file in the account directory is broken (for example, the disk filled up or the process was killed while it was written). Uploading the auth file again, verification and logging in again cannot fix it (they all read this file first), so it cannot be verified; restore the file at the path shown in the reason from a backup, or delete it (the next start generates a new fingerprint for the current version), then click "Clear pause".',
-  'accounts.startupPausedExpired': 'Expired',
-  'accounts.startupPausedClear': 'Clear pause',
-  'accounts.startupPausedCleared': 'Cleared the startup pause of {label}',
-  'accounts.workerStartPaused': 'Start failed ×{count} (paused until {time})',
   'models.allChannels': 'All channels',
   'models.pricingAll': 'Free & paid',
   'models.pricingFree': 'Free only',
@@ -1163,17 +1050,7 @@ const en: Record<TranslationKey, string> = {
   'cooldowns.reason': 'Reason',
   'app.workers': 'Workers {warm} / {target}',
   'app.workersStarting': '{count} starting',
-  'app.coldStart': 'Cold starts {launching} / {limit} · {queued} queued',
-  'app.coldStartShared': 'Cold starts {launching} / {limit} · {queued} queued (both pools)',
-  'app.coldStartDetail':
-    'Cold-start slots: at most {limit} browsers are actually launched at the same time (cold starts for requests keep one extra slot), shared by the normal and Ultra pools, and this line counts both pools together: {launching} slots are in use and {onDemand} on-demand · {background} background starts wait in the slot queue; shown in yellow when every slot is in use and starts are queued. "Starting" above counts the normal partition only and includes starts waiting for a slot. Accounts paused after startup failures: {paused}; environment startup failures in the last 10 minutes: {env}; last successful start: {last}',
-  'app.startupNever': 'none yet',
   'app.workerCapacity': 'Slots {occupied} / peak {max}',
-  'app.workerCapacityDetail':
-    'Slots exclude starting workers, but the scheduler counts them when checking capacity: shown in yellow when slots plus starting workers reach the peak, and new workers have to wait',
-  'app.startupDead': 'Dead accounts {count}',
-  'app.startupDeadDetail':
-    'Accounts confirmed dead (sign-in expired, auth file unusable, or page repeatedly blocked); click to view, copy, or delete them on the Accounts page',
   'app.workersDead': '{count} dead slots · retiring',
   'app.workersDeadDetail':
     "Warm workers whose account is in a long cooldown (e.g. daily quota, or the day's quota of a primary or hot model is used up): they hold a slot but cannot serve those requests. Closed at once when idle, drained first when busy, and replaced with an uncooled account",

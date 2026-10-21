@@ -175,52 +175,6 @@ func TestLoginSummaryReportsMissingFiles(t *testing.T) {
 	}
 }
 
-// TestMarkFilesMissing 启动 Worker 读认证文件时报不存在：文件确实不在时把就绪账户标为不可用（与取得租约时发现文件缺失相同，
-// 目录监视据此在文件恢复后重新同步）；文件存在、或账户不是就绪状态（需要重新登录）时不改变
-func TestMarkFilesMissing(t *testing.T) {
-	pool := testPoolWithAccount(t, "alice@example.com")
-	account, err := pool.Account("alice@example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if pool.MarkFilesMissing("alice@example.com") {
-		t.Fatal("文件存在时不应标记")
-	}
-	if pool.MarkFilesMissing("nobody@example.com") {
-		t.Fatal("账户不存在时不应标记")
-	}
-	if err := pool.MarkAuthRequired("alice@example.com", "登录失效"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Remove(account.StoragePath); err != nil {
-		t.Fatal(err)
-	}
-	if pool.MarkFilesMissing("alice@example.com") {
-		t.Fatal("需要重新登录的账户不应改标为不可用")
-	}
-	if err := pool.MarkReady("alice@example.com"); err != nil {
-		t.Fatal(err)
-	}
-	if !pool.MarkFilesMissing("alice@example.com") {
-		t.Fatal("文件不存在的就绪账户应标为不可用")
-	}
-	if summaries := pool.LoginSummaries(); len(summaries) != 1 || !summaries[0].FilesMissing || summaries[0].State != AccountUnavailable {
-		t.Fatalf("summaries=%+v", summaries)
-	}
-}
-
-// TestAuthGenerations 一次加锁返回一批账户的认证代际，与逐个读取相同，不存在的账户不返回
-func TestAuthGenerations(t *testing.T) {
-	pool := testPoolWithAccount(t, "alice@example.com")
-	generations := pool.AuthGenerations([]string{"alice@example.com", "nobody@example.com"})
-	if len(generations) != 1 || generations["alice@example.com"] != pool.AuthGeneration("alice@example.com") {
-		t.Fatalf("generations=%v", generations)
-	}
-	if generations := pool.AuthGenerations(nil); len(generations) != 0 {
-		t.Fatalf("空列表 generations=%v", generations)
-	}
-}
-
 // TestStaleLeaseDoesNotOverwriteSavedLogin 保存新登录状态之后，之前开始的租约写回旧 Cookie 被丢弃
 func TestStaleLeaseDoesNotOverwriteSavedLogin(t *testing.T) {
 	pool := testPoolWithAccount(t, "alice@example.com")
