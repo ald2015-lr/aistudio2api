@@ -113,6 +113,22 @@ export interface BulkEnableResult {
   remaining: number
 }
 
+// BulkDeleteFailure 为批量删除中没有删掉的账户；code 为 account_busy（账户一直在处理请求，等不到空闲）等错误码
+export interface BulkDeleteFailure {
+  id: string
+  code?: string
+  message: string
+}
+
+// BulkDeleteResult 为一次批量删除的结果：deleted 为本次删除的账户数，missing 为号池里已经没有的账户数
+// （同时清除它的 403 记录，不算失败，不占单次上限），remaining 为号池里还有、超过单次上限本次没有处理的账户数
+export interface BulkDeleteResult {
+  deleted: number
+  missing: number
+  failed: BulkDeleteFailure[] | null
+  remaining: number
+}
+
 // OnboardingStatus 为新账户自动处理队列状态；next_batch_seconds 为 -1 表示队列为空
 export interface OnboardingStatus {
   policy: OnboardingPolicy

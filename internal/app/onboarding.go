@@ -327,12 +327,20 @@ func (onboarder *accountOnboarder) markManual(accountID string) {
 
 // forget 账户被删除或目录消失时移除记录，重新上传后会再次处理
 func (onboarder *accountOnboarder) forget(accountID string) {
-	if onboarder == nil {
+	onboarder.forgetMany([]string{accountID})
+}
+
+// forgetMany 一次移除多个账户的记录，只写一次文件：账户上万时 .onboarding.json 有几 MB，批量删除几百个账户时
+// 逐个 forget 每次都要完整重写并同步一次文件
+func (onboarder *accountOnboarder) forgetMany(accountIDs []string) {
+	if onboarder == nil || len(accountIDs) == 0 {
 		return
 	}
 	onboarder.mu.Lock()
-	delete(onboarder.records, accountID)
-	delete(onboarder.pending, accountID)
+	for _, accountID := range accountIDs {
+		delete(onboarder.records, accountID)
+		delete(onboarder.pending, accountID)
+	}
 	onboarder.saveLocked()
 	onboarder.mu.Unlock()
 }

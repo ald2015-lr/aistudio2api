@@ -336,6 +336,19 @@ const zhCN = {
   'accounts.permissionDeniedClearConfirm':
     '清除全部 403 无权限账户记录？只清除这个列表，不解除冷却；账户再次返回 403 时会重新列出。',
   'accounts.permissionDeniedCleared': '已清除 {count} 个账户的记录',
+  'accounts.permissionDeniedDelete': '一键删除',
+  'accounts.permissionDeniedDeleteHelp':
+    '从号池删除列表中的全部账户（包括折叠未显示的）并删除它们的认证目录，与账户列表里的“删除”相同，不能恢复。',
+  'accounts.permissionDeniedDeleteConfirm':
+    '删除列表中的全部 {count} 个账户及其认证文件（账户目录会被移除）？删除后不能恢复，要重新上传认证文件才能再用；正在处理请求的账户会等它空闲后删除。',
+  'accounts.permissionDeniedDeleteResult':
+    '已删除 {deleted} 个，不存在 {missing} 个，失败 {failed} 个',
+  'accounts.permissionDeniedDeleteFailures': '；失败：{list}',
+  'accounts.permissionDeniedDeleteMore': '等 {count} 个，完整列表见“失败明细”',
+  'accounts.permissionDeniedDeleteRemaining': '；另有 {count} 个本次没有处理，再点一次继续',
+  'accounts.permissionDeniedDeleteBusy': '账户一直在处理请求，等不到空闲，稍后再点一次',
+  'accounts.permissionDeniedDeleteSkipped':
+    '；{count} 个在确认后已不在列表里（例如重新上传了认证文件），没有删除',
   'accounts.permissionDeniedShowAll': '展开全部 {count} 个',
   'models.allChannels': '全部通道',
   'models.pricingAll': '免费与付费',
@@ -1000,6 +1013,21 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedClearConfirm':
     'Clear all 403 permission denied records? Only this list is cleared, cooldowns stay; an account that returns 403 again is listed again.',
   'accounts.permissionDeniedCleared': 'Cleared records of {count} accounts',
+  'accounts.permissionDeniedDelete': 'Delete all',
+  'accounts.permissionDeniedDeleteHelp':
+    'Removes every listed account (including collapsed ones) from the pool and deletes its auth directory, the same as "Delete" in the account list. This cannot be undone.',
+  'accounts.permissionDeniedDeleteConfirm':
+    'Delete all {count} listed accounts and their auth files (the account directories are removed)? This cannot be undone; an account can be used again only after its auth file is uploaded again. Accounts serving a request are deleted once they become idle.',
+  'accounts.permissionDeniedDeleteResult':
+    'Deleted {deleted}, {missing} no longer existed, {failed} failed',
+  'accounts.permissionDeniedDeleteFailures': '; failed: {list}',
+  'accounts.permissionDeniedDeleteMore': 'and {count} more, see "Failures" for the full list',
+  'accounts.permissionDeniedDeleteRemaining':
+    '; {count} were not processed this time, click again to continue',
+  'accounts.permissionDeniedDeleteBusy':
+    'Account kept serving requests and never became idle; click again later',
+  'accounts.permissionDeniedDeleteSkipped':
+    '; {count} were no longer listed after confirming (for example, the auth file was uploaded again) and were not deleted',
   'accounts.permissionDeniedShowAll': 'Show all {count}',
   'models.allChannels': 'All channels',
   'models.pricingAll': 'Free & paid',

@@ -1112,7 +1112,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | --- | --- |
 | 状态与模型 | `GET /api/status`、`GET /api/models` |
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
-| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}` |
+| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}`、`POST /api/accounts/bulk-delete` |
 | 账户认证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
@@ -1134,6 +1134,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `PUT /api/accounts/{id}` | 200 | `{"account":AdminAccount}` |
 | `POST /api/accounts/{id}/login`、`verify` | 200 | `{"account":AdminAccount}` |
 | `DELETE /api/accounts/{id}` | 204 | 空 body |
+| `POST /api/accounts/bulk-delete` | 200 | `BulkDeleteResult` |
 | `POST /api/control/start`、`stop` | 200 | `AdminStatus` |
 | `GET /api/config`、`PUT /api/config` | 200 | `RuntimeConfig` |
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
@@ -1163,6 +1164,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `ChromeImportInput` | `account_ids`、`proxy`、`locale`、`timezone` |
 | `BulkEnableInput` | `account_ids`、`all_disabled`（为 `true` 时启用全部停用账户，忽略 `account_ids`） |
 | `BulkEnableResult` | `enabled`（本次启用数）、`skipped`（原本已启用数）、`failed`（`{id,code,message}` 数组，`code` 为 `account_busy`、`account_not_found` 等）、`remaining`（超过单次上限 1000、本次没有处理的停用账户数） |
+| `BulkDeleteInput` | `account_ids`（必填；去掉首尾空白、去重，没有账户时返回 400） |
+| `BulkDeleteResult` | `deleted`（本次删除数）、`missing`（号池里已经没有的账户数，已删除或从未载入，同时清除它的 403 记录，不算失败）、`failed`（`{id,code,message}` 数组，`code` 为 `account_busy`（等不到账户空闲）或其他错误码）、`remaining`（号池里还有、超过单次上限 500 本次没有处理的账户数；已经没有的账户计入 `missing`，不计入这里） |
 | `AdminCooldown` | `account_id`、`account_label`、`model_id`、`until`、可选 `reason` |
 | `AdminPermissionDenied` | `id`、`label`、`models`、`count`（各模型次数之和）、`first_at`、`last_at`；`models` 每项为 `model`、`channels`（返回过 403、之后还没有成功过的通道）、`count`、`first_at`、`last_at`、可选 `message`（上游原文，最多 300 字符） |
 | `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`） |
@@ -1176,6 +1179,8 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 `AccountCreateInput` 启动隔离 Camoufox 登录，邮箱由 AI Studio 页面读取。`ChromeImportInput.account_ids` 可一次选择多个账号。`AccountInput.label` 必须与不可变的 Google 邮箱 ID 一致，`locale` 与 `timezone` 必须非空，`proxy` 使用无 credentials、path、query 或 fragment 的 HTTP、HTTPS、SOCKS5 origin。新增、导入、登录和验证成功后立即刷新该账户模型目录，并发布最新账户与模型事件。
 
 `POST /api/accounts/bulk-enable` 一次请求启用一批账户：去重后只处理停用的账户，单次最多 1000 个（其余计入 `remaining`），16 个并行取得账户独占租约（最多等 3 秒，等不到记为 `account_busy`）并只把 `account.json` 的 `enabled` 改为 `true`，代理、语言、时区不变，不重建固定出口与 Worker 配置，清除停用原因；全部写完后登记一次模型变化、合并并推送一次快照，再在后台为没有模型目录的账户同步目录（与单个启用共用 16 个并发名额，整批同步完合并一次）。启用不等待目录，登录已失效的账户由目录同步标为 `auth_required`。请求体缺少 `account_ids` 且 `all_disabled` 不为 `true` 时返回 400 `invalid_account`。管理页“一键启用”与选中账户的启用按 500 个一批依次提交，两批之间可以停止。
+
+`POST /api/accounts/bulk-delete` 一次请求删除一批账户，每个账户的效果与 `DELETE /api/accounts/{id}` 相同：从账户池移除并删除账户目录，清除它的 403 无权限记录、停用原因与新账户自动处理记录，关闭它的 Worker；每个账户仍写一条“账户已删除”，整批结束后只合并、推送一次账户与模型快照，并写一条汇总日志（见 [logging.md](logging.md)）。`account_ids` 去掉首尾空白、去重后按顺序处理：号池里已经没有的账户（已删除或从未载入）计入 `missing` 并清除它的 403 记录，不占单次名额；号池里还有的账户单次最多删除 500 个，其余计入 `remaining`。例如 600 个 ID 中前 100 个已经删除时返回 `deleted` 500、`missing` 100、`remaining` 0。原样再次提交同一列表即可继续：已经删掉的按 `missing` 处理，不占名额。同一账户被并发删除时同样按 `missing` 处理。账户 ID 按原样精确匹配（区分大小写，与 `DELETE /api/accounts/{id}` 相同），只差大小写的 ID 按 `missing` 处理，也只清除这个 ID 原样对应的 403 记录。正在处理请求的账户不在请求进行中删除：先不再接新请求，在整批共用的等待上限（约 10 秒）内等它空闲后删除；等不到的记为 `account_busy` 并撤销为删除做的准备，账户恢复正常调度。请求体没有账户时返回 400。管理页 403 无权限账户列表的“一键删除”按 500 个一批依次提交整个列表（包括折叠未显示的），两批之间可以停止；确认后先重新读取一次列表，每批提交前再对照，只提交确认时列出、提交时仍在列表里的账户（确认期间重新上传认证文件、已移出列表的账户不提交）。
 
 `GET /api/accounts/permission-denied` 列出的账户在认证文件更新时移出，同时解除它的 403 冷却与暂停：账户目录扫描发现登录签名 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`）变了，或者列出的账户磁盘上的 `storage-state.json` 与本进程内存中的登录状态不同（同一登录会话里重新导出时登录签名不变）；内容比较不计 Google 定期轮换的 `__Secure-1PSIDTS`、`__Secure-3PSIDTS`、`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`，只有这些不同的重新导出不算更新。本服务自己写回认证文件（回写 Cookie、续签）时同时更新内存，续签提交时还更新登记时记下的登录签名，都不算更新；服务停止期间换上的认证文件在启动时按登录签名对照。这套判断假定只有本进程写这个账户目录：多个进程共用一个 auth 目录时，另一个进程回写轮换 Cookie 不算更新，但它写进认证文件的其他变化（轮换 Cookie 之外的 Cookie、本地存储）在本进程看来与内存不同，仍按重新上传清除本进程的记录与 403 冷却；`.permission-denied.json` 也由各进程整份写出，不做合并。
 

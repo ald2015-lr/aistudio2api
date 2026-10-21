@@ -7,7 +7,9 @@ import {
   runChunkedBulk,
   type BulkAction,
   type BulkChunkResult,
+  type BulkFailure,
   type BulkState,
+  type BulkTarget,
 } from '@/bulk'
 import { copyText } from '@/clipboard'
 import { confirmAction } from '@/confirm'
@@ -157,7 +159,7 @@ const permissionDeniedClearing = ref(false)
 let permissionDeniedLoadedAt = 0
 let permissionDeniedLoading = false
 let permissionDeniedTimer: number | undefined
-// permissionDeniedVersion 在清除记录后递增：清除前发出、清除后才返回的读取结果不再覆盖列表
+// permissionDeniedVersion 在清除记录或一键删除后递增：之前发出、之后才返回的读取结果不再覆盖列表
 let permissionDeniedVersion = 0
 
 const visiblePermissionDenied = computed(() =>
@@ -824,6 +826,132 @@ async function enableAll(): Promise<void> {
   await enableTargets(targets)
 }
 
+// PERMISSION_DENIED_DELETE_CHUNK 为 403 无权限账户一键删除每次请求提交的账户数（服务端每次最多 500 个），两批之间可以停止
+const PERMISSION_DENIED_DELETE_CHUNK = 500
+// 一键删除的结果提示最多列出的失败账户数，其余见批量进度面板的失败明细
+const PERMISSION_DENIED_DELETE_FAILURES_SHOWN = 3
+
+const permissionDeniedDeleting = ref(false)
+
+// readPermissionDeniedNow 立即重新读取 403 无权限账户列表（不受 15 秒刷新间隔限制）；读取失败时保留当前列表
+async function readPermissionDeniedNow(): Promise<void> {
+  try {
+    const accounts = await api.permissionDenied()
+    // 之前发出、之后才返回的读取结果不再覆盖这次读取
+    permissionDeniedVersion += 1
+    permissionDenied.value = accounts
+    permissionDeniedLoadedAt = Date.now()
+  } catch {
+    // 保留当前列表
+  }
+}
+
+// stillPermissionDenied 返回仍在当前 403 无权限账户列表里的账户（账户 ID 按原样对照，与服务端一致）
+function stillPermissionDenied<T extends BulkTarget>(accounts: readonly T[]): T[] {
+  const listed = new Set(permissionDenied.value.map((account) => account.id))
+  return accounts.filter((account) => listed.has(account.id))
+}
+
+// deletePermissionDenied 一键删除 403 无权限账户：删除完整列表（包括折叠未显示的）中的账户及其认证目录，
+// 与单个“删除”效果相同，服务端同时清除它们的 403 记录。按 500 个一批调用批量删除接口，进度与失败明细显示在
+// 批量进度面板；正在处理请求的账户由服务端等它空闲后删除，等不到的列为失败。完成后刷新 403 列表与账户列表。
+// 确认框打开期间列表可能已经变化：重新上传了认证文件的账户会被服务端移出列表，这时再删除就会连同新的认证文件一起删掉。
+// 所以确认后先重新读取一次列表，每批提交前再与当前列表对照，只删除确认时列出、提交时仍在列表里的账户；
+// 确认后才列出的账户没有经过确认，也不删除
+async function deletePermissionDenied(): Promise<void> {
+  const confirmed = permissionDenied.value.map(({ id, label }) => ({ id, label }))
+  if (busy.value || permissionDeniedDeleting.value || confirmed.length === 0) return
+  if (
+    !(await confirmAction(
+      tf('accounts.permissionDeniedDeleteConfirm', { count: confirmed.length }),
+      t('accounts.permissionDeniedDelete'),
+    ))
+  )
+    return
+  if (busy.value || permissionDeniedDeleting.value) return
+  permissionDeniedDeleting.value = true
+  // skipped 为确认后已移出列表、没有删除的账户数
+  const totals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
+  // removed 为已删除或号池里已经没有的账户，服务端已清除它们的 403 记录
+  const removed = new Set<string>()
+  let failures: BulkFailure[] = []
+  try {
+    await readPermissionDeniedNow()
+    const targets = stillPermissionDenied(confirmed)
+    totals.skipped = confirmed.length - targets.length
+    if (targets.length > 0) {
+      bulkPanelOpen.value = true
+      await runChunkedBulk(bulk, 'delete', targets, PERMISSION_DENIED_DELETE_CHUNK, async (chunk) => {
+        // 前面几批删除期间列表可能又刷新过
+        const listed = stillPermissionDenied(chunk)
+        totals.skipped += chunk.length - listed.length
+        if (listed.length === 0) return { succeeded: 0, failures: [] }
+        const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
+        const failed = result.failed ?? []
+        totals.deleted += result.deleted
+        totals.missing += result.missing
+        totals.remaining += result.remaining
+        // 有本次没有处理的账户时不知道是哪几个，这一批只靠重新读取列表；账户 ID 按不区分大小写对照
+        if (result.remaining === 0) {
+          const failedIDs = new Set(failed.map((failure) => failure.id.toLowerCase()))
+          for (const account of listed) {
+            if (!failedIDs.has(account.id.toLowerCase())) removed.add(account.id)
+          }
+        }
+        const labels = new Map(listed.map((account) => [account.id.toLowerCase(), account.label]))
+        return {
+          succeeded: result.deleted + result.missing,
+          failures: failed.map((failure) => ({
+            id: failure.id,
+            label: labels.get(failure.id.toLowerCase()) ?? failure.id,
+            message:
+              failure.code === 'account_busy'
+                ? t('accounts.permissionDeniedDeleteBusy')
+                : failure.message,
+          })),
+        }
+      })
+      failures = bulk.failures
+    }
+  } finally {
+    permissionDeniedDeleting.value = false
+  }
+  // 删除前发出、删除后才返回的读取结果不再覆盖列表；先移除已删除的账户，再重新读取
+  permissionDeniedVersion += 1
+  permissionDenied.value = permissionDenied.value.filter((account) => !removed.has(account.id))
+  if (permissionDenied.value.length <= PERMISSION_DENIED_COLLAPSED) {
+    showAllPermissionDenied.value = false
+  }
+  void loadPermissionDenied()
+  emit('refresh')
+
+  let message = tf('accounts.permissionDeniedDeleteResult', {
+    deleted: totals.deleted,
+    missing: totals.missing,
+    failed: failures.length,
+  })
+  if (failures.length > 0) {
+    const shown = failures
+      .slice(0, PERMISSION_DENIED_DELETE_FAILURES_SHOWN)
+      .map((failure) => `${failure.label}: ${failure.message}`)
+    if (failures.length > PERMISSION_DENIED_DELETE_FAILURES_SHOWN) {
+      shown.push(
+        tf('accounts.permissionDeniedDeleteMore', {
+          count: failures.length - PERMISSION_DENIED_DELETE_FAILURES_SHOWN,
+        }),
+      )
+    }
+    message += tf('accounts.permissionDeniedDeleteFailures', { list: shown.join('; ') })
+  }
+  if (totals.remaining > 0) {
+    message += tf('accounts.permissionDeniedDeleteRemaining', { count: totals.remaining })
+  }
+  if (totals.skipped > 0) {
+    message += tf('accounts.permissionDeniedDeleteSkipped', { count: totals.skipped })
+  }
+  emit('notice', message, failures.length === 0 && totals.remaining === 0 ? 'success' : 'error')
+}
+
 function openVerifyDialog(): void {
   verifyScope.value = selected.value.size > 0 ? 'selection' : problemAccounts.value.length > 0 ? 'problem' : 'enabled'
   showVerifyDialog.value = true
@@ -987,11 +1115,34 @@ function closeBulkPanel(): void {
             <button
               class="btn btn-sm btn-danger"
               type="button"
-              :disabled="permissionDeniedClearing"
+              :disabled="permissionDeniedClearing || permissionDeniedDeleting"
               :aria-busy="permissionDeniedClearing"
               @click="clearPermissionDenied"
             >
               {{ t('accounts.permissionDeniedClear') }}
+            </button>
+            <button
+              v-tooltip="t('accounts.permissionDeniedDeleteHelp')"
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="
+                busy ||
+                permissionDeniedDeleting ||
+                permissionDeniedClearing ||
+                permissionDenied.length === 0
+              "
+              :aria-busy="permissionDeniedDeleting"
+              @click="deletePermissionDenied"
+            >
+              {{
+                permissionDeniedDeleting
+                  ? tf('accounts.progress', {
+                      action: t('common.delete'),
+                      done: bulk.done,
+                      total: bulk.total,
+                    })
+                  : t('accounts.permissionDeniedDelete')
+              }}
             </button>
           </div>
         </div>

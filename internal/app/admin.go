@@ -455,33 +455,60 @@ func (admin *runtimeAdmin) updateAccount(
 }
 
 func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) error {
-	account, err := admin.account(accountID)
-	if err != nil {
+	if _, err := admin.account(accountID); err != nil {
 		return err
 	}
 	defer admin.syncModelCache()
-	err = admin.service.changeModels(func() error {
-		_, removeErr := admin.pool.Remove(accountID, func(account *aistudio.Account) error {
-			if workerErr := admin.workers.Reset(account.ID); workerErr != nil {
-				return workerErr
-			}
-			return admin.store.Delete(account)
+	removed, err := admin.removeAccount(func(deleteDirectory func(*aistudio.Account) error) (*aistudio.Account, error) {
+		var removed *aistudio.Account
+		err := admin.service.changeModels(func() error {
+			var removeErr error
+			removed, removeErr = admin.pool.Remove(accountID, deleteDirectory)
+			return removeErr
 		})
-		return removeErr
+		return removed, err
 	})
-	if err != nil {
+	if removed == nil {
 		return accountOperationError(err)
 	}
+	if err != nil {
+		return err
+	}
+	admin.onboard.forget(removed.ID)
+	return nil
+}
+
+// accountRemover 把账户移出号池：调用 deleteDirectory 删除认证目录，成功后返回移出的账户
+type accountRemover func(deleteDirectory func(*aistudio.Account) error) (*aistudio.Account, error)
+
+// removeAccount 删除账户，单个删除（DeleteAccount）与批量删除（DeleteAccounts）共用：remove 移出号池时关闭账户的 Worker 并删除
+// 认证目录，之后清除模型目录重试、403 无权限记录、Worker 与固定出口、停用原因，写“账户已删除”日志。
+// 不刷新、不推送模型快照，也不移除新账户自动处理记录，由调用方处理（批量删除整批只做一次）。
+// 移出号池失败时返回的账户为 nil、错误为 remove 的原始错误；移出后清理失败时返回账户与错误，不清除停用原因、不写日志（与原先一致）
+func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Account, error) {
+	removed, err := remove(func(account *aistudio.Account) error {
+		if workerErr := admin.workers.Reset(account.ID); workerErr != nil {
+			return workerErr
+		}
+		return admin.store.Delete(account)
+	})
+	if err != nil {
+		return nil, err
+	}
+	accountID := removed.ID
 	admin.service.removeAccountModelRetry(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
 	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
-		return err
+		return removed, err
 	}
-	admin.onboard.forget(accountID)
 	// 同一账户重新上传后不再沿用旧的停用原因（手动停用的记录会让它保持停用）
 	accountDisableNotes.clear(accountID)
-	admin.requests.log("auth", "INFO", "账户已删除 | 账户="+account.Label)
-	return nil
+	label := strings.TrimSpace(removed.Config.Label)
+	if label == "" {
+		label = accountID
+	}
+	admin.requests.log("auth", "INFO", "账户已删除 | 账户="+label)
+	return removed, nil
 }
 
 func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {

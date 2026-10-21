@@ -1152,16 +1152,28 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 	p.mu.Unlock()
 	leaseLock, _, err := acquireAccountFileLease(account.StoragePath)
 	if err != nil {
-		p.mu.Lock()
-		account.exclusive = false
-		p.busyChangedLocked(account)
-		p.notifyLocked()
-		p.mu.Unlock()
+		p.clearRemoveExclusive(account)
 		if errors.Is(err, errAccountLeaseBusy) {
 			return nil, fmt.Errorf("%w: %s", ErrAccountLeased, accountID)
 		}
 		return nil, err
 	}
+	return p.removeExclusive(account, leaseLock, deleteDirectory)
+}
+
+// clearRemoveExclusive 删除没有完成时撤销删除置上的独占，账户照常调度
+func (p *AccountPool) clearRemoveExclusive(account *Account) {
+	p.mu.Lock()
+	account.exclusive = false
+	p.busyChangedLocked(account)
+	p.notifyLocked()
+	p.mu.Unlock()
+}
+
+// removeExclusive 删除已经置为独占、持有账户文件锁（leaseLock，可为 nil）的账户：锁定运行状态后删除持久目录，
+// 成功后移出调度池；失败时撤销独占，账户照常调度。返回前释放 leaseLock。Remove 与 AccountReservation.Remove 共用
+func (p *AccountPool) removeExclusive(account *Account, leaseLock *flock.Flock, deleteDirectory func(*Account) error) (*Account, error) {
+	accountID := account.ID
 	account.runtimeMu.Lock()
 	runtimeLock, err := lockRuntimeState(context.Background(), account)
 	if err != nil {
@@ -1169,11 +1181,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		if leaseLock != nil {
 			_ = leaseLock.Unlock()
 		}
-		p.mu.Lock()
-		account.exclusive = false
-		p.busyChangedLocked(account)
-		p.notifyLocked()
-		p.mu.Unlock()
+		p.clearRemoveExclusive(account)
 		return nil, err
 	}
 	account.storageMu.Lock()
@@ -1192,11 +1200,7 @@ func (p *AccountPool) Remove(accountID string, deleteDirectory func(*Account) er
 		releaseErr = errors.Join(releaseErr, leaseLock.Unlock())
 	}
 	if deleteErr != nil {
-		p.mu.Lock()
-		account.exclusive = false
-		p.busyChangedLocked(account)
-		p.notifyLocked()
-		p.mu.Unlock()
+		p.clearRemoveExclusive(account)
 		return nil, errors.Join(deleteErr, releaseErr)
 	}
 	p.mu.Lock()
@@ -1339,6 +1343,63 @@ func (r *AccountReservation) Wait(ctx context.Context) (*AccountLease, error) {
 		}
 		changed := p.changed
 		p.mu.Unlock()
+
+		timer := time.NewTimer(externalLeasePoll)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, ctx.Err()
+		case <-changed:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+// Remove 等账户上进行中的租约、独占操作与认证刷新都结束后删除持久目录并移出调度池（删除步骤与 AccountPool.Remove 相同），
+// 返回时撤销登记。登记期间账户不再发出新租约，进行中的请求照常结束；空闲时在同一次加锁内转为独占删除，与 Wait 一样没有空档：
+// AccountPool.Remove 遇到进行中的请求直接返回 ErrAccountLeased，先 Wait 取得租约、释放后再 Remove 时，释放唤醒的排队请求
+// 又可能在两者之间取得账户。账户已经空闲时立即删除、不看 ctx；需要等待时 ctx 结束即返回它的错误，登记随之撤销，账户恢复原状。
+// 登记的账户已被移出号池（或换成了同 ID 的新账户）时返回 ErrAccountNotFound，不删除新账户
+func (r *AccountReservation) Remove(ctx context.Context, deleteDirectory func(*Account) error) (*Account, error) {
+	if r == nil {
+		return nil, fmt.Errorf("账户独占等待未初始化")
+	}
+	defer r.Cancel()
+	if deleteDirectory == nil {
+		return nil, fmt.Errorf("账户目录删除函数为空")
+	}
+	p := r.pool
+	account := r.account
+	for {
+		p.mu.Lock()
+		if p.byID[account.ID] != account {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: %s", ErrAccountNotFound, account.ID)
+		}
+		if !account.exclusive && account.authRefreshers == 0 && account.active == 0 {
+			leaseLock, _, err := acquireAccountFileLease(account.StoragePath)
+			if err == nil {
+				account.exclusive = true
+				p.busyChangedLocked(account)
+				p.notifyLocked()
+				p.mu.Unlock()
+				return p.removeExclusive(account, leaseLock, deleteDirectory)
+			}
+			if !errors.Is(err, errAccountLeaseBusy) {
+				p.mu.Unlock()
+				return nil, err
+			}
+		}
+		changed := p.changed
+		p.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 
 		timer := time.NewTimer(externalLeasePoll)
 		select {

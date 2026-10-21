@@ -4,6 +4,7 @@ import type {
   AccountDraft,
   AccountLoginInput,
   AdminEvent,
+  BulkDeleteResult,
   BulkEnableInput,
   BulkEnableResult,
   ChromeImportInput,
@@ -169,6 +170,12 @@ export const api = {
     }),
   deleteAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // bulkDeleteAccounts 一次请求删除一批账户及其认证目录（服务端每次最多 500 个）
+  bulkDeleteAccounts: (ids: string[]) =>
+    requestJSON<BulkDeleteResult>('/api/accounts/bulk-delete', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
+    }),
   loginAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' }),
   verifyAccount: (id: string) =>

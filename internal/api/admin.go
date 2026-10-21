@@ -394,6 +394,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/bulk-enable", s.handleBulkEnableAccounts)
 	mux.HandleFunc("PUT /api/accounts/{id}", s.handleUpdateAccount)
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.handleDeleteAccount)
+	mux.HandleFunc("POST /api/accounts/bulk-delete", s.handleBulkDeleteAccounts)
 	mux.HandleFunc("POST /api/accounts/{id}/login", s.handleLoginAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/verify", s.handleVerifyAccount)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)

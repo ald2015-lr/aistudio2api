@@ -85,14 +85,17 @@ export interface BulkChunkResult {
   failures: BulkFailure[]
 }
 
+// BulkTarget 为分批操作需要的账户字段：账户列表与 403 无权限账户列表的条目都满足
+export type BulkTarget = Pick<Account, 'id' | 'label'>
+
 // runChunkedBulk 把账户按 chunkSize 分批，依次交给 task 一次处理一批（例如一次请求启用 500 个账户）；
 // cancelled 置位后不再提交下一批，已提交的一批会等待完成；task 抛出错误时这一批全部计为失败
-export async function runChunkedBulk(
+export async function runChunkedBulk<T extends BulkTarget>(
   state: BulkState,
   action: BulkAction,
-  accounts: readonly Account[],
+  accounts: readonly T[],
   chunkSize: number,
-  task: (chunk: readonly Account[]) => Promise<BulkChunkResult>,
+  task: (chunk: readonly T[]) => Promise<BulkChunkResult>,
 ): Promise<void> {
   const queue = [...accounts]
   Object.assign(state, emptyBulkState(), { action, running: true, total: queue.length })

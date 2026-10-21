@@ -425,6 +425,15 @@ func (manager *runtimeManager) EnableAccounts(ctx context.Context, input api.Bul
 	return admin.EnableAccounts(ctx, input)
 }
 
+// DeleteAccounts 在当前生成服务批量删除账户；生成服务停止时管理端照常删除（与单个删除、批量启用一致）
+func (manager *runtimeManager) DeleteAccounts(ctx context.Context, input api.BulkDeleteInput) (api.BulkDeleteResult, error) {
+	admin, ok := manager.generation().admin.(bulkAccountDeleter)
+	if !ok {
+		return api.BulkDeleteResult{}, fmt.Errorf("批量删除尚未就绪")
+	}
+	return admin.DeleteAccounts(ctx, input)
+}
+
 // DeleteAccount 在当前生成服务删除账户
 func (manager *runtimeManager) DeleteAccount(ctx context.Context, id string) error {
 	return manager.generation().admin.DeleteAccount(ctx, id)
