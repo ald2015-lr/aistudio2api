@@ -407,9 +407,7 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 	if len(models) > 0 {
 		bootstrapModel = models[0]
 	}
-	taskCtx, cancel := context.WithTimeout(
-		withReplacementStartup(withBackgroundStartup(ctx)), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
-	)
+	taskCtx, cancel := context.WithTimeout(withReplacementStartup(withBackgroundStartup(ctx)), manager.warmTaskTimeout())
 	defer cancel()
 	_, err := manager.ensureWorker(taskCtx, accountID, bootstrapModel, false)
 	switch {
@@ -433,7 +431,7 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 }
 
 // pickReplacement 在分区内挑一个替补账号：能服务 models 的空闲备用账号（按调度索引分类，见 replacementCandidates），
-// 去掉预热失败冷却中、正在启动、被其他进程占用与已有 Worker 的账号，并且对热门与主用模型（以及 models）都没有长时间冷却；
+// 去掉预热失败冷却中、正在启动、被其他进程占用、启动失败暂停中与已有 Worker 的账号，并且对热门与主用模型（以及 models）都没有长时间冷却；
 // 按批核对，最多 replacementScanLimit 个，没有合适的返回空
 func (manager *accountWorkerManager) pickReplacement(ctx context.Context, partition aistudio.PoolScope, models []string, warm []string) string {
 	standby := manager.replacementCandidates(ctx, partition, models, warm)
@@ -451,6 +449,8 @@ func (manager *accountWorkerManager) pickReplacement(ctx context.Context, partit
 		batch := excludeAccountIDs(standby[start:min(start+replacementScanBatch, len(standby))], failures)
 		batch, _ = manager.withoutOpening(batch)
 		batch, _ = manager.runtimeAvailable(batch)
+		// 启动失败暂停中的账号不做替补（见 startup_failures.go）
+		batch = manager.startupBackoffAvailable(batch, false)
 		batch = manager.coldAccounts(batch)
 		if len(batch) == 0 {
 			continue

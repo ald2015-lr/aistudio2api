@@ -193,6 +193,22 @@ export interface PrimarySupply {
   standby_capped?: boolean
 }
 
+// StartupStatus 为 Worker 冷启动的实时状态（普通与 Ultra 号池共用冷启动名额）：launching 为正在启动浏览器的数量
+// （占用的冷启动名额），limit 为同时启动的上限（WARM_STARTUP_CONCURRENCY 至少按 1 计，另加 1 个请求现场名额），
+// queued_on_demand 与 queued_background 为在名额队列里等待的按需启动（请求现场）与后台启动（预热、扩容、替补）数；
+// paused 为启动失败暂停中的账户数，dead 为确定失效的账户数，last_success 为最近一次 Worker 启动成功的时间（还没有成功过时为空），
+// env_failures_10m 为近 10 分钟环境类启动失败数（浏览器没能启动或连接，多半是机器资源不够，不计入账户）
+export interface StartupStatus {
+  launching: number
+  limit: number
+  queued_on_demand: number
+  queued_background: number
+  paused: number
+  dead: number
+  last_success?: string
+  env_failures_10m: number
+}
+
 export interface ServiceStatus {
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
@@ -208,6 +224,8 @@ export interface ServiceStatus {
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
   // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
+  // startup 为冷启动名额与启动失败的统计；旧版服务端不返回
+  startup?: StartupStatus
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'
@@ -300,6 +318,29 @@ export interface PermissionDeniedAccount {
   count: number
   first_at: string
   last_at: string
+}
+
+// StartupFailureKind 为启动 Worker 失败的类别：auth 为登录失效（启动时被跳转到 Google 登录页，或账户处于需要重新登录），
+// files 为认证文件无法用于启动浏览器，fingerprint 为账户 Camoufox 指纹文件损坏（与登录无关，重新上传认证文件修不好），
+// ambiguous 为启动反复失败、原因不确定（页面未就绪、WAA 失败、超时，机器负载高或网络慢时健康账户也会这样）
+export type StartupFailureKind = 'auth' | 'files' | 'fingerprint' | 'ambiguous'
+
+// StartupFailureAccount 为启动 Worker 失败的账户。confirmed 为 true 时确定失效（kind 为 auth 或 files），可以删除；
+// 为 false 时只是暂停调度到 until（kind 为 fingerprint 或 ambiguous），不改变账户状态，不能据此删除。stage 为失败时的启动阶段 1–7
+// （未知为 0），url 为登录跳转的地址（只用于展示），reason 为原因摘要，message 为错误原文（截断）
+export interface StartupFailureAccount {
+  id: string
+  label: string
+  kind: StartupFailureKind
+  confirmed: boolean
+  reason?: string
+  message?: string
+  stage?: number
+  url?: string
+  count: number
+  first_at?: string
+  last_at?: string
+  until?: string
 }
 
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'

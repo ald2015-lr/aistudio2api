@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
@@ -31,7 +33,7 @@ func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnati
 	}
 	runtime, err := camoufoxnative.Start(ctx, options)
 	if err != nil {
-		return nil, err
+		return nil, classifyNativeStartError(err)
 	}
 	runtimeState := runtime.State()
 	return &NativeWorker{
@@ -45,6 +47,45 @@ func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnati
 			PageURL:   runtimeState.PageURL,
 		},
 	}, nil
+}
+
+// nativeLoginRedirectMarker 为 Camoufox 启动时载入 AI Studio 被跳转到 Google 登录页的错误文本（camoufoxnative.Worker.bootstrap），
+// 后面紧跟页面地址
+const nativeLoginRedirectMarker = "隔离登录态失效 url="
+
+// classifyNativeStartError 把 Camoufox 启动时的登录页跳转识别为登录失效：错误文本里的跳转地址主机名是 accounts.google.com 时
+// 包装成 ErrAuthenticationRequired（保留原错误），后续按登录失效处理（无租约且没有续签材料时标为需要重新登录，带租约时恢复一次）；
+// 原先只是普通的启动失败，账户一直显示就绪，被反复拿来启动。只看主机名，不按地址路径判断；其他错误原样返回
+func classifyNativeStartError(err error) error {
+	if err == nil || errors.Is(err, ErrAuthenticationRequired) {
+		return err
+	}
+	if NativeLoginRedirectURL(err) == "" {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrAuthenticationRequired, err)
+}
+
+// NativeLoginRedirectURL 返回 Camoufox 启动错误里登录页跳转的地址（主机名为 accounts.google.com 时），没有时为空。
+// 地址取到第一个空白为止（与清理错误 errors.Join 在一起时以换行分隔），只用于识别与展示
+func NativeLoginRedirectURL(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	index := strings.Index(text, nativeLoginRedirectMarker)
+	if index < 0 {
+		return ""
+	}
+	raw := text[index+len(nativeLoginRedirectMarker):]
+	if end := strings.IndexFunc(raw, func(r rune) bool { return r == ' ' || r == '\n' || r == '\r' || r == '\t' }); end >= 0 {
+		raw = raw[:end]
+	}
+	parsed, parseErr := url.Parse(raw)
+	if parseErr != nil || !strings.EqualFold(parsed.Hostname(), "accounts.google.com") {
+		return ""
+	}
+	return raw
 }
 
 // errWorkerClosed 表示 runtime 已开始关闭，不再生成 proof

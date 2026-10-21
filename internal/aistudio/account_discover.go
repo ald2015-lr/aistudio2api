@@ -323,6 +323,63 @@ func (p *AccountPool) Labels(accountIDs []string) map[string]string {
 	return labels
 }
 
+// States 一次加锁返回这些账户的对外状态（与 Status 的 State 相同），不存在的账户不返回。只用于少量账户（如失效账户列表），
+// 不为每个账户构建一次完整状态
+func (p *AccountPool) States(accountIDs []string) map[string]AccountState {
+	states := make(map[string]AccountState, len(accountIDs))
+	if p == nil {
+		return states
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for _, accountID := range accountIDs {
+		if account := p.byID[accountID]; account != nil {
+			states[accountID] = p.accountStateLocked(account, now)
+		}
+	}
+	return states
+}
+
+// AuthGenerations 一次加锁返回这些账户的认证代际（同 AuthGeneration），不存在的账户不返回。
+// 选号与状态接口核对一批账户时用它，不为每个账户各取一次号池锁
+func (p *AccountPool) AuthGenerations(accountIDs []string) map[string]uint64 {
+	generations := make(map[string]uint64, len(accountIDs))
+	if p == nil || len(accountIDs) == 0 {
+		return generations
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, accountID := range accountIDs {
+		if account := p.byID[accountID]; account != nil {
+			generations[accountID] = account.authGeneration
+		}
+	}
+	return generations
+}
+
+// MarkFilesMissing 在账户的持久文件（配置与 storage state）确实不存在时把就绪账户标为不可用，与取得租约时发现文件缺失相同
+// （markStaleAccountUnavailable）：整体替换账户目录期间被启动的账户退出调度，文件恢复后由账户目录监视重新同步恢复
+// （AccountLoginSummary.FilesMissing）。文件存在、账户不存在或不是就绪状态（需要重新登录、已停用等）时不改变，返回是否标记
+func (p *AccountPool) MarkFilesMissing(accountID string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	p.mu.Unlock()
+	if account == nil || !errors.Is(validatePersistentAccountFiles(account), ErrAccountNotFound) {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.byID[account.ID] != account || !account.Config.Enabled || account.State != AccountReady {
+		return false
+	}
+	p.markStaleAccountUnavailableLocked(account)
+	return true
+}
+
 // longCoolingLocked 判断账户在该模型上是否长时间不可用：全局冷却，或所有启用通道都在冷却，
 // 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu。
 // 这是 Worker 淘汰与轮换的口径（针对指定模型、不看通道是否支持该模型、有剩余时间门槛）；状态页与状态摘要的 cooldown

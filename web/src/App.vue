@@ -141,6 +141,45 @@ const ultraPrimarySupply = computed(() =>
   ultraWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'ultra') : [],
 )
 
+// startupQueued 为在冷启动名额队列里等待的启动数（按需与后台）。冷启动名额由普通与 Ultra 号池共用，startup 的计数是两个号池合计，
+// 而“启动中”只统计普通分区，所以名额的占用与排队单独成行（coldStartActive 为有启动或排队时显示），不嵌在“启动中”里；
+// 旧版服务端没有 startup 字段，这时不显示这一行。startupDetail 为这一行的悬停说明
+const startupQueued = computed(() => {
+  const startup = status.value?.startup
+  return startup === undefined ? 0 : startup.queued_on_demand + startup.queued_background
+})
+const coldStartActive = computed(() => {
+  const startup = status.value?.startup
+  return startup !== undefined && startup.launching + startupQueued.value > 0
+})
+// coldStartSaturated 表示冷启动名额已占满且还有启动在排队
+const coldStartSaturated = computed(() => {
+  const startup = status.value?.startup
+  return startup !== undefined && startupQueued.value > 0 && startup.launching >= startup.limit
+})
+const startupDetail = computed(() => {
+  const startup = status.value?.startup
+  if (startup === undefined) return ''
+  const last = Date.parse(startup.last_success ?? '')
+  return tf('app.coldStartDetail', {
+    limit: startup.limit,
+    launching: startup.launching,
+    onDemand: startup.queued_on_demand,
+    background: startup.queued_background,
+    paused: startup.paused,
+    env: startup.env_failures_10m,
+    last: Number.isFinite(last)
+      ? new Date(last).toLocaleTimeString([], { hour12: false })
+      : t('app.startupNever'),
+  })
+})
+// capacityFull 表示槽位加启动中已达到峰值：侧栏的槽位不含启动中的 Worker，调度判断容量时含，达到峰值后新的 Worker 只能等待
+const capacityFull = computed(() => {
+  const workers = status.value?.workers
+  if (workers === undefined) return false
+  return (workers.occupied ?? 0) + workers.starting >= workers.max
+})
+
 // navBadge 在导航项旁显示账户就绪数与活动请求数
 function navBadge(id: TabID): string {
   if (status.value === null) return ''
@@ -504,7 +543,8 @@ onUnmounted(() => {
           </div>
           <div
             v-if="status.workers"
-            :class="(status.workers.occupied ?? 0) >= status.workers.max ? 'text-yellow-400' : ''"
+            v-tooltip="t('app.workerCapacityDetail')"
+            :class="capacityFull ? 'text-yellow-400' : ''"
           >
             {{
               tf('app.workerCapacity', {
@@ -513,6 +553,31 @@ onUnmounted(() => {
               })
             }}
           </div>
+          <!-- 冷启动名额（普通与 Ultra 号池共用）：正在启动浏览器的与在名额队列里等待的，两个号池合计，与上面只算普通分区的“启动中”分开 -->
+          <div
+            v-if="status.startup && coldStartActive"
+            v-tooltip="startupDetail"
+            :class="coldStartSaturated ? 'text-yellow-400' : 'text-cyan-300'"
+            tabindex="0"
+          >
+            {{
+              tf(ultraWorkers ? 'app.coldStartShared' : 'app.coldStart', {
+                launching: status.startup.launching,
+                limit: status.startup.limit,
+                queued: startupQueued,
+              })
+            }}
+          </div>
+          <!-- 确定失效的账户：点击跳到账户页的失效账户列表 -->
+          <button
+            v-if="(status.startup?.dead ?? 0) > 0"
+            v-tooltip="t('app.startupDeadDetail')"
+            class="block text-left text-red-400 hover:underline"
+            type="button"
+            @click="currentTab = 'accounts'"
+          >
+            {{ tf('app.startupDead', { count: status.startup?.dead ?? 0 }) }}
+          </button>
           <div
             v-if="
               status.workers &&
@@ -656,6 +721,7 @@ onUnmounted(() => {
         :worker-counts="status?.workers ?? null"
         :ultra-worker-counts="status?.ultra_workers ?? null"
         :cooldowns="cooldowns"
+        :startup="status?.startup ?? null"
         @refresh="loadAccountData"
         @notice="showNotice"
       />

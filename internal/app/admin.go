@@ -163,6 +163,8 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		},
 		UltraWorkers:  ultraWorkers,
 		PrimarySupply: primarySupply,
+		// 冷启动名额与启动失败统计（见 startup_failures.go）：确定失效数与失效账户列表一致
+		Startup: admin.workers.startupStatus(counts.AuthRequired),
 	}, nil
 }
 
@@ -355,8 +357,8 @@ func (admin *runtimeAdmin) addAccount(
 		return api.AdminAccount{}, err
 	}
 	publishLease = nil
-	// 删除后用同一邮箱重新添加的账户不沿用之前的 403 无权限记录
-	admin.service.forgetPermissionDenied(account.ID, "新增账户")
+	// 删除后用同一邮箱重新添加的账户不沿用之前的 403 无权限记录与失效账户记录
+	admin.service.authFilesUpdated(account.ID, "新增账户")
 	admin.onboard.markManual(account.ID)
 	admin.syncAccountModelCatalog(ctx, account)
 	return admin.account(account.ID)
@@ -498,6 +500,8 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 	accountID := removed.ID
 	admin.service.removeAccountModelRetry(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
+	// 失效账户记录按精确 ID 清除；内存里的启动失败暂停随 Worker 配置一起移除
+	admin.workers.startupFailures.remove(accountID)
 	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
 		return removed, err
 	}
@@ -565,8 +569,8 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
-	// 重新登录得到新的认证文件：清除 403 无权限记录与冷却，释放后立即重新参与调度
-	admin.service.forgetPermissionDenied(account.ID, "浏览器登录")
+	// 重新登录得到新的认证文件：清除 403 无权限记录与冷却、失效账户记录，释放后立即重新参与调度
+	admin.service.authFilesUpdated(account.ID, "浏览器登录")
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -624,6 +628,8 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 		return aistudio.LoginVerification{}, err
 	}
 	if verification.Authenticated {
+		// 验证通过：清除失效账户记录与启动失败暂停，账户立即重新参与调度
+		admin.service.forgetStartupFailure(account.ID, "验证通过")
 		admin.syncAccountModelCatalog(ctx, account)
 	} else {
 		admin.service.publishModelAccess()

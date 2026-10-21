@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -155,7 +156,7 @@ func immediateStartup(ctx context.Context) bool {
 }
 
 // acquireStartupSlot 为一次浏览器冷启动取得名额。纯 Go 后端不启动浏览器，只受活动 Worker 上限约束，不占名额。
-// 后台启动等待名额时到期按槽位已满返回（预热本轮不再启动新的，稍后重试），不记为账户预热失败
+// 后台启动等待名额时到期按冷启动名额不足返回（errStartupSlotsLate，仍是容量已满：预热本轮不再启动新的，稍后重试），不记为账户预热失败
 func (manager *accountWorkerManager) acquireStartupSlot(ctx context.Context, label string, executablePath string) (func(), error) {
 	if executablePath == "" {
 		return func() {}, nil
@@ -203,6 +204,11 @@ func (manager *accountWorkerManager) acquireStartupSlot(ctx context.Context, lab
 		return nil, fmt.Errorf("%w: 等待冷启动名额 %s 后排队预算已用尽", errAccountWorkerCapacity, time.Since(startedAt).Round(time.Millisecond))
 	}
 	if err != nil && background {
+		if errors.Is(err, context.DeadlineExceeded) {
+			// 等名额一直等到期限：名额被占满（按需启动排队时后台启动一律让行），与取得名额时剩余期限不足同类，按 errStartupSlotsLate
+			// 返回（仍是容量已满），预热的等待原因据此写“冷启动名额被按需启动占满”，不误报为 Worker 槽位已满
+			return nil, fmt.Errorf("%w: 等待冷启动名额: %w", errStartupSlotsLate, err)
+		}
 		return nil, fmt.Errorf("%w: 等待冷启动名额: %w", errAccountWorkerCapacity, err)
 	}
 	return release, err

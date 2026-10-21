@@ -22,6 +22,9 @@ import type {
   ChromeImportProfile,
   Cooldown,
   PermissionDeniedAccount,
+  StartupFailureAccount,
+  StartupFailureKind,
+  StartupStatus,
   UltraWorkerCounters,
   WorkerCounters,
   WorkerState,
@@ -38,6 +41,8 @@ const props = defineProps<{
   workerCounts: WorkerCounters | null
   ultraWorkerCounts: UltraWorkerCounters | null
   cooldowns: Cooldown[]
+  // startup 为状态接口的冷启动统计，暂停中与失效账户数变化时重新读取启动失败列表；旧版服务端没有
+  startup: StartupStatus | null
 }>()
 
 const emit = defineEmits<{
@@ -232,21 +237,29 @@ function formatDateTime(value: string): string {
   })
 }
 
-// downloadPermissionDenied 下载 403 无权限账户的邮箱列表（txt，每行一个，与复制的内容相同）
-function downloadPermissionDenied(): void {
-  if (permissionDenied.value.length === 0) return
-  const text = `${permissionDenied.value.map((account) => account.label).join('\n')}\n`
+// downloadEmails 下载账户邮箱列表（txt，每行一个，与复制的内容相同），文件名为“前缀-年月日-时分.txt”
+function downloadEmails(labels: readonly string[], prefix: string): void {
+  if (labels.length === 0) return
+  const text = `${labels.join('\n')}\n`
   const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
   const now = new Date()
   const pad = (value: number) => String(value).padStart(2, '0')
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
   const link = document.createElement('a')
   link.href = url
-  link.download = `permission-denied-accounts-${stamp}.txt`
+  link.download = `${prefix}-${stamp}.txt`
   document.body.appendChild(link)
   link.click()
   link.remove()
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+// downloadPermissionDenied 下载 403 无权限账户的邮箱列表
+function downloadPermissionDenied(): void {
+  downloadEmails(
+    permissionDenied.value.map((account) => account.label),
+    'permission-denied-accounts',
+  )
 }
 
 // clearPermissionDenied 清除全部 403 无权限账户记录（只清除列表，不解除冷却）
@@ -270,6 +283,231 @@ async function clearPermissionDenied(): Promise<void> {
   } finally {
     permissionDeniedClearing.value = false
   }
+}
+
+// ---------- 启动失败账户 ----------
+
+// 列表的最短刷新间隔与 403 列表相同：账户或启动统计变化时最多每 15 秒读取一次
+const STARTUP_FAILURES_REFRESH_MS = 15000
+// 收起时显示的账户数
+const STARTUP_FAILURES_COLLAPSED = 20
+
+const startupFailures = ref<StartupFailureAccount[]>([])
+const showAllStartupDead = ref(false)
+const showAllStartupPaused = ref(false)
+const startupDeadClearing = ref(false)
+// startupPauseClearing 为正在清除暂停的账户 ID
+const startupPauseClearing = ref('')
+let startupFailuresLoadedAt = 0
+let startupFailuresLoading = false
+let startupFailuresTimer: number | undefined
+// startupFailuresVersion 在清除记录、清除暂停或一键删除后递增：之前发出、之后才返回的读取结果不再覆盖列表
+let startupFailuresVersion = 0
+
+// startupDead 为确定失效的账户（登录失效或认证文件无法使用），可以一键删除；
+// startupPaused 为启动反复失败、原因不确定或指纹文件损坏的账户，只暂停调度，只读，不提供删除
+const startupDead = computed(() => startupFailures.value.filter((account) => account.confirmed))
+const startupPaused = computed(() => startupFailures.value.filter((account) => !account.confirmed))
+const visibleStartupDead = computed(() =>
+  showAllStartupDead.value
+    ? startupDead.value
+    : startupDead.value.slice(0, STARTUP_FAILURES_COLLAPSED),
+)
+const visibleStartupPaused = computed(() =>
+  showAllStartupPaused.value
+    ? startupPaused.value
+    : startupPaused.value.slice(0, STARTUP_FAILURES_COLLAPSED),
+)
+const accountsByID = computed(() => new Map(props.accounts.map((account) => [account.id, account])))
+
+// pauseClock 为判断暂停是否到期用的时钟，每 10 秒变化一次：账户表不随每秒的倒计时重新渲染
+const pauseClock = computed(() => Math.floor(clock.value / 10000) * 10000)
+
+// startupPauses 为仍在暂停中的启动失败（账户 ID → 记录与到期时间），供账户表 Worker 列显示；已到期的不再显示
+const startupPauses = computed(() => {
+  const now = pauseClock.value
+  const pauses = new Map<string, { entry: StartupFailureAccount; until: number }>()
+  for (const entry of startupPaused.value) {
+    const until = Date.parse(entry.until ?? '')
+    if (Number.isFinite(until) && until > now) pauses.set(entry.id, { entry, until })
+  }
+  return pauses
+})
+
+// loadStartupFailures 读取启动失败账户列表；失败时保留上一次的列表（旧版服务没有这个接口时不显示）
+async function loadStartupFailures(): Promise<void> {
+  if (startupFailuresLoading) return
+  startupFailuresLoading = true
+  startupFailuresLoadedAt = Date.now()
+  const version = startupFailuresVersion
+  try {
+    const accounts = await api.startupFailures()
+    if (version === startupFailuresVersion) startupFailures.value = accounts
+  } catch {
+    // 保留上一次的列表
+  } finally {
+    startupFailuresLoading = false
+  }
+}
+
+// readStartupFailuresNow 立即重新读取启动失败账户列表（不受 15 秒刷新间隔限制）；读取失败时保留当前列表并抛出错误
+async function readStartupFailuresNow(): Promise<void> {
+  const accounts = await api.startupFailures()
+  // 之前发出、之后才返回的读取结果不再覆盖这次读取
+  startupFailuresVersion += 1
+  startupFailures.value = accounts
+  startupFailuresLoadedAt = Date.now()
+}
+
+// refreshStartupFailures 在清除或验证之后立即刷新列表；读取失败时保留当前列表，等下一次定时刷新
+function refreshStartupFailures(): void {
+  readStartupFailuresNow().catch(() => {})
+}
+
+// scheduleStartupFailuresLoad 账户或启动统计变化后刷新列表；距上次刷新不到 15 秒时推迟到满 15 秒，期间的变化合并为一次
+function scheduleStartupFailuresLoad(): void {
+  if (startupFailuresTimer !== undefined) return
+  const wait = Math.max(0, startupFailuresLoadedAt + STARTUP_FAILURES_REFRESH_MS - Date.now())
+  startupFailuresTimer = window.setTimeout(() => {
+    startupFailuresTimer = undefined
+    void loadStartupFailures()
+  }, wait)
+}
+
+// 原因不确定的启动失败不改变账户状态，不会推送账户事件，所以也跟随状态接口的暂停中与失效账户数刷新
+watch(
+  [() => props.accounts, () => props.startup?.paused, () => props.startup?.dead],
+  scheduleStartupFailuresLoad,
+)
+onMounted(() => {
+  void loadStartupFailures()
+})
+onBeforeUnmount(() => {
+  if (startupFailuresTimer !== undefined) window.clearTimeout(startupFailuresTimer)
+})
+
+const startupKindKeys: Record<StartupFailureKind, TranslationKey> = {
+  auth: 'accounts.startupFailureKindAuth',
+  files: 'accounts.startupFailureKindFiles',
+  fingerprint: 'accounts.startupFailureKindFingerprint',
+  ambiguous: 'accounts.startupFailureKindAmbiguous',
+}
+
+// startupKindLabel 返回启动失败类别的名称；旧版或更新的服务端返回未知类别时原样显示
+function startupKindLabel(entry: StartupFailureAccount): string {
+  const key = startupKindKeys[entry.kind] as TranslationKey | undefined
+  return key === undefined ? entry.kind : t(key)
+}
+
+// startupFailureReason 为原因一栏：类别名加原因摘要（没有摘要时用错误原文），过长时截断，完整内容见悬停提示
+function startupFailureReason(entry: StartupFailureAccount): string {
+  const reason = (entry.reason ?? '').trim() || (entry.message ?? '').trim()
+  const kind = startupKindLabel(entry)
+  return reason === '' ? kind : `${kind} · ${reason}`
+}
+
+// startupFailureDetail 为原因一栏的悬停提示：类别、原因、错误原文、登录跳转地址与首次失败时间
+function startupFailureDetail(entry: StartupFailureAccount): string {
+  const lines = [startupKindLabel(entry)]
+  const reason = (entry.reason ?? '').trim()
+  const message = (entry.message ?? '').trim()
+  if (reason !== '') lines.push(reason)
+  if (message !== '' && message !== reason) lines.push(message)
+  if (entry.url) lines.push(tf('accounts.startupFailureURL', { url: entry.url }))
+  if (entry.first_at) {
+    lines.push(tf('accounts.startupFailureFirst', { time: formatDateTime(entry.first_at) }))
+  }
+  return lines.join('\n')
+}
+
+// startupStage 把失败时的启动阶段格式化为“n/7”，未知时为“—”
+function startupStage(entry: StartupFailureAccount): string {
+  const stage = entry.stage ?? 0
+  return stage > 0 ? `${stage}/7` : '—'
+}
+
+// startupPausedUntil 为未确认列表的暂停到期时间；已到期的显示“已到期”（下次启动失败前不再暂停）
+function startupPausedUntil(entry: StartupFailureAccount): string {
+  const until = Date.parse(entry.until ?? '')
+  if (!Number.isFinite(until)) return '—'
+  if (until <= pauseClock.value) return t('accounts.startupPausedExpired')
+  return formatClock(until)
+}
+
+function formatHourMinute(until: number): string {
+  return new Date(until).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  })
+}
+
+// startupPauseText 为账户表 Worker 列的“启动失败×N（暂停至 hh:mm）”；账户不在暂停中时为空
+function startupPauseText(account: Account): string {
+  const pause = startupPauses.value.get(account.id)
+  if (pause === undefined) return ''
+  return tf('accounts.workerStartPaused', {
+    count: pause.entry.count,
+    time: formatHourMinute(pause.until),
+  })
+}
+
+function startupPauseDetail(account: Account): string {
+  const pause = startupPauses.value.get(account.id)
+  return pause === undefined ? '' : startupFailureDetail(pause.entry)
+}
+
+// clearStartupDead 清除列表中全部失效账户的记录：只清除记录，不删除账户，也不改变账户状态，
+// 仍处于需要重新登录状态的账户会继续列出。只提交确认时列出的确定失效账户，不用 all：all 会同时清除下方未确认账户的暂停
+async function clearStartupDead(): Promise<void> {
+  const ids = startupDead.value.map((account) => account.id)
+  if (ids.length === 0) return
+  if (
+    !(await confirmAction(
+      tf('accounts.startupDeadClearConfirm', { count: ids.length }),
+      t('accounts.startupDeadClear'),
+    ))
+  )
+    return
+  startupDeadClearing.value = true
+  try {
+    const result = await api.clearStartupFailures({ account_ids: ids, all: false })
+    const cleared = new Set(ids)
+    startupFailuresVersion += 1
+    startupFailures.value = startupFailures.value.filter((account) => !cleared.has(account.id))
+    showAllStartupDead.value = false
+    emit('notice', tf('accounts.startupDeadCleared', { count: result.cleared }), 'success')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    startupDeadClearing.value = false
+  }
+  refreshStartupFailures()
+}
+
+// clearStartupPause 清除一个账户的启动失败暂停：服务端同时唤醒调度，账户立即重新参与调度，再次启动失败时重新计数
+async function clearStartupPause(entry: StartupFailureAccount): Promise<void> {
+  if (startupPauseClearing.value !== '') return
+  startupPauseClearing.value = entry.id
+  try {
+    await api.clearStartupFailures({ account_ids: [entry.id], all: false })
+    startupFailuresVersion += 1
+    startupFailures.value = startupFailures.value.filter((account) => account.id !== entry.id)
+    emit('notice', tf('accounts.startupPausedCleared', { label: entry.label }), 'success')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    startupPauseClearing.value = ''
+  }
+  refreshStartupFailures()
+}
+
+// verifyStartupPaused 验证一个启动反复失败的账户，与账户列表里的“验证”相同：验证会另开浏览器，通过时服务端清除它的暂停
+async function verifyStartupPaused(entry: StartupFailureAccount): Promise<void> {
+  const account = accountsByID.value.get(entry.id)
+  if (account === undefined) return
+  await runAccountAction(account, 'verify')
+  refreshStartupFailures()
 }
 
 // ---------- 弹窗与单账户操作 ----------
@@ -627,6 +865,13 @@ const ultraReady = computed(
   () =>
     props.accounts.filter((account) => inUltraPool(account) && account.state === 'ready').length,
 )
+// startupPauseShown 表示有账户在 Worker 列显示“启动失败×N（暂停至 hh:mm）”：原来的 Worker 列放不下，
+// 只在这时加宽 Worker 列并同样加大表格最小宽度；没有暂停中的账户时表格布局与原来一致
+const startupPauseShown = computed(() => startupPauses.value.size > 0)
+const tableMinWidth = computed(() => {
+  if (poolTagShown.value) return startupPauseShown.value ? 'min-w-[1188px]' : 'min-w-[1108px]'
+  return startupPauseShown.value ? 'min-w-[1140px]' : 'min-w-[1060px]'
+})
 
 const filtered = computed(() => {
   const term = query.value.trim().toLowerCase()
@@ -826,12 +1071,89 @@ async function enableAll(): Promise<void> {
   await enableTargets(targets)
 }
 
-// PERMISSION_DENIED_DELETE_CHUNK 为 403 无权限账户一键删除每次请求提交的账户数（服务端每次最多 500 个），两批之间可以停止
+// PERMISSION_DENIED_DELETE_CHUNK 为 403 无权限账户与失效账户一键删除每次请求提交的账户数（服务端每次最多 500 个），两批之间可以停止
 const PERMISSION_DENIED_DELETE_CHUNK = 500
 // 一键删除的结果提示最多列出的失败账户数，其余见批量进度面板的失败明细
 const PERMISSION_DENIED_DELETE_FAILURES_SHOWN = 3
 
 const permissionDeniedDeleting = ref(false)
+const startupDeadDeleting = ref(false)
+// oneClickDeleting 为 403 无权限账户或失效账户的一键删除正在进行（含确认后重新读取列表、尚未开始分批的阶段）：两者共用批量进度面板，不能同时进行
+const oneClickDeleting = computed(() => permissionDeniedDeleting.value || startupDeadDeleting.value)
+
+// OneClickDeleteTotals 为一键删除的累计结果；skipped 为确认后已移出列表、没有删除的账户数
+interface OneClickDeleteTotals {
+  deleted: number
+  missing: number
+  remaining: number
+  skipped: number
+}
+
+// bulkDeleteChunk 用批量删除接口删除一批账户：累计结果，把已删除或号池里已经没有的账户记入 removed（服务端已清除它们的记录），
+// 并把服务端的失败项换成面板的失败明细，account_busy 单独提示
+async function bulkDeleteChunk(
+  listed: readonly BulkTarget[],
+  totals: OneClickDeleteTotals,
+  removed: Set<string>,
+): Promise<BulkChunkResult> {
+  const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
+  const failed = result.failed ?? []
+  totals.deleted += result.deleted
+  totals.missing += result.missing
+  totals.remaining += result.remaining
+  // 有本次没有处理的账户时不知道是哪几个，这一批只靠重新读取列表；账户 ID 按不区分大小写对照
+  if (result.remaining === 0) {
+    const failedIDs = new Set(failed.map((failure) => failure.id.toLowerCase()))
+    for (const account of listed) {
+      if (!failedIDs.has(account.id.toLowerCase())) removed.add(account.id)
+    }
+  }
+  const labels = new Map(listed.map((account) => [account.id.toLowerCase(), account.label]))
+  return {
+    succeeded: result.deleted + result.missing,
+    failures: failed.map((failure) => ({
+      id: failure.id,
+      label: labels.get(failure.id.toLowerCase()) ?? failure.id,
+      message:
+        failure.code === 'account_busy'
+          ? t('accounts.permissionDeniedDeleteBusy')
+          : failure.message,
+    })),
+  }
+}
+
+// notifyOneClickDelete 给出一键删除的结果提示：已删除、不存在、失败（最多列出 3 个）、本次没有处理与确认后跳过的账户数
+function notifyOneClickDelete(
+  totals: OneClickDeleteTotals,
+  failures: readonly BulkFailure[],
+  skippedKey: TranslationKey,
+): void {
+  let message = tf('accounts.permissionDeniedDeleteResult', {
+    deleted: totals.deleted,
+    missing: totals.missing,
+    failed: failures.length,
+  })
+  if (failures.length > 0) {
+    const shown = failures
+      .slice(0, PERMISSION_DENIED_DELETE_FAILURES_SHOWN)
+      .map((failure) => `${failure.label}: ${failure.message}`)
+    if (failures.length > PERMISSION_DENIED_DELETE_FAILURES_SHOWN) {
+      shown.push(
+        tf('accounts.permissionDeniedDeleteMore', {
+          count: failures.length - PERMISSION_DENIED_DELETE_FAILURES_SHOWN,
+        }),
+      )
+    }
+    message += tf('accounts.permissionDeniedDeleteFailures', { list: shown.join('; ') })
+  }
+  if (totals.remaining > 0) {
+    message += tf('accounts.permissionDeniedDeleteRemaining', { count: totals.remaining })
+  }
+  if (totals.skipped > 0) {
+    message += tf(skippedKey, { count: totals.skipped })
+  }
+  emit('notice', message, failures.length === 0 && totals.remaining === 0 ? 'success' : 'error')
+}
 
 // readPermissionDeniedNow 立即重新读取 403 无权限账户列表（不受 15 秒刷新间隔限制）；读取失败时保留当前列表
 async function readPermissionDeniedNow(): Promise<void> {
@@ -860,7 +1182,7 @@ function stillPermissionDenied<T extends BulkTarget>(accounts: readonly T[]): T[
 // 确认后才列出的账户没有经过确认，也不删除
 async function deletePermissionDenied(): Promise<void> {
   const confirmed = permissionDenied.value.map(({ id, label }) => ({ id, label }))
-  if (busy.value || permissionDeniedDeleting.value || confirmed.length === 0) return
+  if (busy.value || oneClickDeleting.value || confirmed.length === 0) return
   if (
     !(await confirmAction(
       tf('accounts.permissionDeniedDeleteConfirm', { count: confirmed.length }),
@@ -868,10 +1190,9 @@ async function deletePermissionDenied(): Promise<void> {
     ))
   )
     return
-  if (busy.value || permissionDeniedDeleting.value) return
+  if (busy.value || oneClickDeleting.value) return
   permissionDeniedDeleting.value = true
-  // skipped 为确认后已移出列表、没有删除的账户数
-  const totals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
+  const totals: OneClickDeleteTotals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
   // removed 为已删除或号池里已经没有的账户，服务端已清除它们的 403 记录
   const removed = new Set<string>()
   let failures: BulkFailure[] = []
@@ -886,30 +1207,7 @@ async function deletePermissionDenied(): Promise<void> {
         const listed = stillPermissionDenied(chunk)
         totals.skipped += chunk.length - listed.length
         if (listed.length === 0) return { succeeded: 0, failures: [] }
-        const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
-        const failed = result.failed ?? []
-        totals.deleted += result.deleted
-        totals.missing += result.missing
-        totals.remaining += result.remaining
-        // 有本次没有处理的账户时不知道是哪几个，这一批只靠重新读取列表；账户 ID 按不区分大小写对照
-        if (result.remaining === 0) {
-          const failedIDs = new Set(failed.map((failure) => failure.id.toLowerCase()))
-          for (const account of listed) {
-            if (!failedIDs.has(account.id.toLowerCase())) removed.add(account.id)
-          }
-        }
-        const labels = new Map(listed.map((account) => [account.id.toLowerCase(), account.label]))
-        return {
-          succeeded: result.deleted + result.missing,
-          failures: failed.map((failure) => ({
-            id: failure.id,
-            label: labels.get(failure.id.toLowerCase()) ?? failure.id,
-            message:
-              failure.code === 'account_busy'
-                ? t('accounts.permissionDeniedDeleteBusy')
-                : failure.message,
-          })),
-        }
+        return bulkDeleteChunk(listed, totals, removed)
       })
       failures = bulk.failures
     }
@@ -924,32 +1222,76 @@ async function deletePermissionDenied(): Promise<void> {
   }
   void loadPermissionDenied()
   emit('refresh')
+  notifyOneClickDelete(totals, failures, 'accounts.permissionDeniedDeleteSkipped')
+}
 
-  let message = tf('accounts.permissionDeniedDeleteResult', {
-    deleted: totals.deleted,
-    missing: totals.missing,
-    failed: failures.length,
-  })
-  if (failures.length > 0) {
-    const shown = failures
-      .slice(0, PERMISSION_DENIED_DELETE_FAILURES_SHOWN)
-      .map((failure) => `${failure.label}: ${failure.message}`)
-    if (failures.length > PERMISSION_DENIED_DELETE_FAILURES_SHOWN) {
-      shown.push(
-        tf('accounts.permissionDeniedDeleteMore', {
-          count: failures.length - PERMISSION_DENIED_DELETE_FAILURES_SHOWN,
-        }),
-      )
+// stillStartupDead 返回仍在当前启动失败列表里、且仍确定失效的账户（账户 ID 按原样对照，与服务端一致）
+function stillStartupDead<T extends BulkTarget>(accounts: readonly T[]): T[] {
+  const listed = new Set(startupDead.value.map((account) => account.id))
+  return accounts.filter((account) => listed.has(account.id))
+}
+
+// deleteStartupDead 一键删除失效账户：做法与 403 无权限账户的一键删除相同，删除完整列表（包括折叠未显示的）中的账户及其认证目录，
+// 按 500 个一批调用批量删除接口，服务端同时清除它们的记录；完成后刷新列表与账户列表。只删除确定失效（confirmed）的账户：
+// 原因不确定、只暂停调度的账户永远不删除，机器负载高或网络慢时健康账户也会这样启动失败。
+// 确认框打开期间列表可能已经变化：重新上传了认证文件或验证通过的账户会被服务端移出列表，这时再删除就会连同新的认证文件一起删掉。
+// 所以确认后先重新读取一次列表（读取失败时不删除），每批提交前再与当前列表对照，只删除确认时列出、提交时仍确定失效的账户；
+// 确认后才列出的账户没有经过确认，也不删除
+async function deleteStartupDead(): Promise<void> {
+  const confirmed = startupDead.value.map(({ id, label }) => ({ id, label }))
+  if (busy.value || oneClickDeleting.value || confirmed.length === 0) return
+  if (
+    !(await confirmAction(
+      tf('accounts.startupDeadDeleteConfirm', { count: confirmed.length }),
+      t('accounts.startupDeadDelete'),
+    ))
+  )
+    return
+  if (busy.value || oneClickDeleting.value) return
+  startupDeadDeleting.value = true
+  const totals: OneClickDeleteTotals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
+  // removed 为已删除或号池里已经没有的账户，服务端已清除它们的记录
+  const removed = new Set<string>()
+  let failures: BulkFailure[] = []
+  try {
+    try {
+      await readStartupFailuresNow()
+    } catch (error) {
+      // 读不到当前列表就无法确认账户仍然失效，不删除
+      emit('notice', tf('accounts.startupDeadReadFailed', { error: messageOf(error) }), 'error')
+      return
     }
-    message += tf('accounts.permissionDeniedDeleteFailures', { list: shown.join('; ') })
+    const targets = stillStartupDead(confirmed)
+    totals.skipped = confirmed.length - targets.length
+    if (targets.length > 0) {
+      bulkPanelOpen.value = true
+      await runChunkedBulk(
+        bulk,
+        'delete',
+        targets,
+        PERMISSION_DENIED_DELETE_CHUNK,
+        async (chunk) => {
+          // 前面几批删除期间列表可能又刷新过
+          const listed = stillStartupDead(chunk)
+          totals.skipped += chunk.length - listed.length
+          if (listed.length === 0) return { succeeded: 0, failures: [] }
+          return bulkDeleteChunk(listed, totals, removed)
+        },
+      )
+      failures = bulk.failures
+    }
+  } finally {
+    startupDeadDeleting.value = false
   }
-  if (totals.remaining > 0) {
-    message += tf('accounts.permissionDeniedDeleteRemaining', { count: totals.remaining })
+  // 删除前发出、删除后才返回的读取结果不再覆盖列表；先移除已删除的账户，再重新读取
+  startupFailuresVersion += 1
+  startupFailures.value = startupFailures.value.filter((account) => !removed.has(account.id))
+  if (startupDead.value.length <= STARTUP_FAILURES_COLLAPSED) {
+    showAllStartupDead.value = false
   }
-  if (totals.skipped > 0) {
-    message += tf('accounts.permissionDeniedDeleteSkipped', { count: totals.skipped })
-  }
-  emit('notice', message, failures.length === 0 && totals.remaining === 0 ? 'success' : 'error')
+  void loadStartupFailures()
+  emit('refresh')
+  notifyOneClickDelete(totals, failures, 'accounts.startupDeadDeleteSkipped')
 }
 
 function openVerifyDialog(): void {
@@ -1127,7 +1469,7 @@ function closeBulkPanel(): void {
               type="button"
               :disabled="
                 busy ||
-                permissionDeniedDeleting ||
+                oneClickDeleting ||
                 permissionDeniedClearing ||
                 permissionDenied.length === 0
               "
@@ -1191,6 +1533,227 @@ function closeBulkPanel(): void {
           }}
         </button>
       </div>
+
+      <!-- 失效账户：启动 Worker 时登录已失效或认证文件无法使用（确定失效），可以一键删除 -->
+      <div
+        v-if="startupDead.length > 0"
+        class="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span
+              v-tooltip="t('accounts.startupDeadHelp')"
+              class="font-bold text-red-300"
+              tabindex="0"
+            >
+              {{ t('accounts.startupDeadTitle') }}
+            </span>
+            <span class="text-gray-300">{{ t('accounts.startupDeadHint') }}</span>
+            <span class="font-mono text-red-300">
+              {{ tf('accounts.startupDeadCount', { count: startupDead.length }) }}
+            </span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm"
+              type="button"
+              @click="copyEmails(startupDead.map((account) => account.label))"
+            >
+              {{ t('accounts.copyAllEmails') }}
+            </button>
+            <button
+              class="btn btn-sm"
+              type="button"
+              @click="
+                downloadEmails(
+                  startupDead.map((account) => account.label),
+                  'startup-dead-accounts',
+                )
+              "
+            >
+              {{ t('accounts.startupDeadDownload') }}
+            </button>
+            <button
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="startupDeadClearing || startupDeadDeleting"
+              :aria-busy="startupDeadClearing"
+              @click="clearStartupDead"
+            >
+              {{ t('accounts.startupDeadClear') }}
+            </button>
+            <button
+              v-tooltip="t('accounts.startupDeadDeleteHelp')"
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="
+                busy || oneClickDeleting || startupDeadClearing || startupDead.length === 0
+              "
+              :aria-busy="startupDeadDeleting"
+              @click="deleteStartupDead"
+            >
+              {{
+                startupDeadDeleting
+                  ? tf('accounts.progress', {
+                      action: t('common.delete'),
+                      done: bulk.done,
+                      total: bulk.total,
+                    })
+                  : t('accounts.startupDeadDelete')
+              }}
+            </button>
+          </div>
+        </div>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-left text-gray-500">
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureReason') }}</th>
+                <th class="py-1 pr-3 font-normal">
+                  <span v-tooltip="t('accounts.startupFailureStageHelp')" tabindex="0">
+                    {{ t('accounts.startupFailureStage') }}
+                  </span>
+                </th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureLast') }}</th>
+                <th class="py-1 text-right font-normal">
+                  {{ t('accounts.startupFailureTimes') }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="account in visibleStartupDead"
+                :key="account.id"
+                class="border-t border-[#30363d]"
+              >
+                <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
+                <td class="max-w-md py-1 pr-3">
+                  <div class="cell-truncate text-gray-300" :title="startupFailureDetail(account)">
+                    {{ startupFailureReason(account) }}
+                  </div>
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ startupStage(account) }}
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ formatDateTime(account.last_at ?? '') }}
+                </td>
+                <td class="py-1 text-right font-mono text-red-300">{{ account.count }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <button
+          v-if="startupDead.length > STARTUP_FAILURES_COLLAPSED"
+          class="mt-2 text-xs text-blue-400 hover:underline"
+          type="button"
+          @click="showAllStartupDead = !showAllStartupDead"
+        >
+          {{
+            showAllStartupDead
+              ? t('accounts.cooldownShowLess')
+              : tf('accounts.startupFailureShowAll', { count: startupDead.length })
+          }}
+        </button>
+      </div>
+
+      <!-- 启动反复失败（未确认）：原因不确定，机器负载高或网络慢时健康账户也会这样，只暂停调度，只能验证或清除暂停，不能删除 -->
+      <details
+        v-if="startupPaused.length > 0"
+        class="rounded-lg border border-yellow-500/20 bg-yellow-500/5 p-3 text-sm"
+      >
+        <summary class="cursor-pointer">
+          <span class="font-bold text-yellow-300">{{ t('accounts.startupPausedTitle') }}</span>
+          <span class="ml-2 font-mono text-yellow-300">
+            {{ tf('accounts.startupPausedCount', { count: startupPaused.length }) }}
+          </span>
+        </summary>
+        <p class="mt-2 text-xs leading-5 text-gray-400">{{ t('accounts.startupPausedHint') }}</p>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-left text-gray-500">
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureReason') }}</th>
+                <th class="py-1 pr-3 font-normal">
+                  <span v-tooltip="t('accounts.startupFailureStageHelp')" tabindex="0">
+                    {{ t('accounts.startupFailureStage') }}
+                  </span>
+                </th>
+                <th class="py-1 pr-3 text-right font-normal">
+                  {{ t('accounts.startupFailureTimes') }}
+                </th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureLast') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.startupFailureUntil') }}</th>
+                <th class="py-1 text-right font-normal">{{ t('accounts.actions') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="account in visibleStartupPaused"
+                :key="account.id"
+                class="border-t border-[#30363d]"
+              >
+                <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
+                <td class="max-w-md py-1 pr-3">
+                  <div class="cell-truncate text-gray-300" :title="startupFailureDetail(account)">
+                    {{ startupFailureReason(account) }}
+                  </div>
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ startupStage(account) }}
+                </td>
+                <td class="py-1 pr-3 text-right font-mono text-yellow-300">{{ account.count }}</td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ formatDateTime(account.last_at ?? '') }}
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ startupPausedUntil(account) }}
+                </td>
+                <td class="py-1">
+                  <div class="flex justify-end gap-1">
+                    <button
+                      class="btn btn-sm"
+                      type="button"
+                      :disabled="
+                        busy ||
+                        account.kind === 'fingerprint' ||
+                        accountsByID.get(account.id)?.enabled !== true
+                      "
+                      :aria-busy="pendingAction === `verify:${account.id}`"
+                      @click="verifyStartupPaused(account)"
+                    >
+                      {{ t('common.verify') }}
+                    </button>
+                    <button
+                      class="btn btn-sm"
+                      type="button"
+                      :disabled="startupPauseClearing !== ''"
+                      :aria-busy="startupPauseClearing === account.id"
+                      @click="clearStartupPause(account)"
+                    >
+                      {{ t('accounts.startupPausedClear') }}
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <button
+          v-if="startupPaused.length > STARTUP_FAILURES_COLLAPSED"
+          class="mt-2 text-xs text-blue-400 hover:underline"
+          type="button"
+          @click="showAllStartupPaused = !showAllStartupPaused"
+        >
+          {{
+            showAllStartupPaused
+              ? t('accounts.cooldownShowLess')
+              : tf('accounts.startupFailureShowAll', { count: startupPaused.length })
+          }}
+        </button>
+      </details>
 
       <!-- 模型冷却概况：按模型统计冷却中的账号与恢复倒计时 -->
       <div v-if="cooldownSummary.entries > 0" class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-sm">
@@ -1438,11 +2001,11 @@ function closeBulkPanel(): void {
       </div>
       <div v-else class="panel">
         <div class="overflow-x-auto">
-          <table class="data-table" :class="poolTagShown ? 'min-w-[1108px]' : 'min-w-[1060px]'">
+          <table class="data-table" :class="tableMinWidth">
             <colgroup>
               <col class="w-10" />
               <col class="w-28" />
-              <col class="w-24" />
+              <col :class="startupPauseShown ? 'w-44' : 'w-24'" />
               <col />
               <col :class="poolTagShown ? 'w-32' : 'w-20'" />
               <col class="w-16" />
@@ -1501,6 +2064,14 @@ function closeBulkPanel(): void {
                     <span class="dot" :class="workerDotClass[workerState(account)]"></span>
                     {{ t(workerLabelKeys[workerState(account)]) }}
                   </span>
+                  <!-- 启动反复失败、暂停调度中的账户 -->
+                  <div
+                    v-if="startupPauses.has(account.id)"
+                    class="mt-0.5 text-[11px] leading-4 text-yellow-400"
+                    :title="startupPauseDetail(account)"
+                  >
+                    {{ startupPauseText(account) }}
+                  </div>
                 </td>
                 <td>
                   <div v-tooltip="account.label" class="cell-truncate font-mono text-gray-200">

@@ -54,6 +54,25 @@ type AdminStatus struct {
 	// PrimarySupply 为每个主用模型的可用供给：普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）
 	// 统计 Ultra 分区（Pool 为 ultra），keepWarm 约每 30 秒统计一次并缓存；没有主用模型或服务还没统计过时为空
 	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
+	// Startup 为冷启动名额与启动失败的统计（两个分区合计）
+	Startup AdminStartupStatus `json:"startup"`
+}
+
+// AdminStartupStatus 表示冷启动名额与启动失败的实时统计。Launching 为正在启动浏览器的数量（占用的冷启动名额），
+// Limit 为同时启动上限 max(WARM_STARTUP_CONCURRENCY,1)+1（按需启动另保留 1 个，普通与 Ultra 共用）；QueuedOnDemand 与 QueuedBackground
+// 为在名额队列里等待的按需与后台（预热、补齐）启动数；侧栏“启动中”包含排队，真正在启动的只有 Launching 个。
+// Paused 为处于启动失败暂停中的账户数（原因不确定，只暂停调度、不改变账户状态），Dead 为确定失效的账户数（与失效账户列表的 confirmed 一致）；
+// LastSuccess 为最近一次 Worker 启动成功的时间（RFC3339，没有时为空），EnvFailures10m 为近 10 分钟环境类启动失败数（浏览器没能启动起来，
+// 多半是机器资源或部署问题，不计入账户）
+type AdminStartupStatus struct {
+	Launching        int    `json:"launching"`
+	Limit            int    `json:"limit"`
+	QueuedOnDemand   int    `json:"queued_on_demand"`
+	QueuedBackground int    `json:"queued_background"`
+	Paused           int    `json:"paused"`
+	Dead             int    `json:"dead"`
+	LastSuccess      string `json:"last_success,omitempty"`
+	EnvFailures10m   int    `json:"env_failures_10m"`
 }
 
 // AdminPrimarySupply 表示一个主用模型在它所在分区的可用供给：Pool 为 ultra 时是 Ultra 主用模型、统计 Ultra 分区，为空时是普通主用模型、
@@ -410,6 +429,8 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
 	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)
+	mux.HandleFunc("GET /api/accounts/startup-failures", s.handleStartupFailures)
+	mux.HandleFunc("POST /api/accounts/startup-failures/clear", s.handleClearStartupFailures)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)

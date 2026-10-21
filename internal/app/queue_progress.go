@@ -221,13 +221,18 @@ func (limiter *queueProgressLimiter) allow(now time.Time) (bool, int) {
 // queueSnapshot 为一次复查时的候选计数，写进排队进度
 type queueSnapshot struct {
 	warmIdle, warmBusy, standby, standbyBusy int
-	opening                                  bool
-	earliestCooldown                         time.Time
+	// startupPaused 为启动失败暂停中、本轮不作为候选的备用账户数（见 startup_failures.go）
+	startupPaused    int
+	opening          bool
+	earliestCooldown time.Time
 }
 
 func (snapshot queueSnapshot) text(now time.Time) string {
 	text := fmt.Sprintf(" | 热空闲=%d | 热忙碌=%d | 备用=%d | 备用忙碌=%d",
 		snapshot.warmIdle, snapshot.warmBusy, snapshot.standby, snapshot.standbyBusy)
+	if snapshot.startupPaused > 0 {
+		text += fmt.Sprintf(" | 启动失败暂停=%d", snapshot.startupPaused)
+	}
 	if snapshot.opening {
 		text += " | 启动中=是"
 	}

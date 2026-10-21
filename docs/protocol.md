@@ -1117,6 +1117,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
 | 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
+| 失效账户 | `GET /api/accounts/startup-failures`、`POST /api/accounts/startup-failures/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 | 用量账本 | `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv`、`GET /api/requests/{id}/body`（账本打开失败时不注册） |
 
@@ -1140,6 +1141,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
 | `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...]}`，按最近一次 403 从新到旧 |
 | `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400；账户 ID 只去掉首尾空白，匹配不区分大小写）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
+| `GET /api/accounts/startup-failures` | 200 | `{"accounts":[AdminStartupFailure,...]}`：先列确定失效的账户（当前处于 `auth_required` 的账户：有持久记录的按最近一次从新到旧，其后是没有持久记录的，按 ID），再列原因不确定的暂停（按暂停到期从早到晚），最后是账户当前不是 `auth_required` 的持久记录（未确认）；同一账户只列一次 |
+| `POST /api/accounts/startup-failures/clear` | 200 | 请求体 `StartupFailureClearInput`（`account_ids` 没有非空 ID 且 `all` 不为 `true` 时 400 `invalid_request`）；返回 `{"cleared":<清除的账户数>}`，同时清除持久记录与内存里的启动失败暂停并唤醒调度，不改变账户状态 |
 | `GET /api/requests` | 200 | `{"requests":[AdminRequest,...]}` |
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |
@@ -1152,7 +1155,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 | DTO | 字段 |
 | --- | --- |
-| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略） |
+| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、`startup`（`AdminStartupStatus`）、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略） |
 | `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池成员（`ULTRA_INCLUDE_PRO=true` 时含权益为 Pro 的账户） |
 | `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、所在分区的主用模型（普通分区按 `PRIMARY_MODELS`，Ultra 分区按 `ULTRA_PRIMARY_MODELS`）上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数 |
 | `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`draining`、`retiring`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小，其余字段口径同 `AdminWorkerCounts` |
@@ -1168,6 +1171,9 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `BulkDeleteResult` | `deleted`（本次删除数）、`missing`（号池里已经没有的账户数，已删除或从未载入，同时清除它的 403 记录，不算失败）、`failed`（`{id,code,message}` 数组，`code` 为 `account_busy`（等不到账户空闲）或其他错误码）、`remaining`（号池里还有、超过单次上限 500 本次没有处理的账户数；已经没有的账户计入 `missing`，不计入这里） |
 | `AdminCooldown` | `account_id`、`account_label`、`model_id`、`until`、可选 `reason` |
 | `AdminPermissionDenied` | `id`、`label`、`models`、`count`（各模型次数之和）、`first_at`、`last_at`；`models` 每项为 `model`、`channels`（返回过 403、之后还没有成功过的通道）、`count`、`first_at`、`last_at`、可选 `message`（上游原文，最多 300 字符） |
+| `AdminStartupStatus` | `launching`、`limit`、`queued_on_demand`、`queued_background`、`paused`、`dead`、`env_failures_10m`、可选 `last_success`；冷启动名额与启动失败的实时统计，普通与 Ultra 两个号池合计：`launching` 为正在启动浏览器（占用冷启动名额）的数量，`limit` 为同时启动上限 `max(WARM_STARTUP_CONCURRENCY,1)+1`（按需启动另保留 1 个），`queued_on_demand` 与 `queued_background` 为在名额队列里等待的按需启动（请求现场启动、请求排队时的后台扩容）与后台启动（预热、补齐、替补）数；`workers.starting` 包含这些排队的启动（只计普通分区），真正在启动的只有 `launching` 个。`paused` 为处于启动失败暂停中的账户数（原因不确定或指纹文件损坏，认证代际已变化的不算），`dead` 为确定失效的账户数（与 `GET /api/accounts/startup-failures` 中 `confirmed` 为 `true` 的条目一致，即当前处于 `auth_required` 的账户数），`last_success` 为本次生成服务最近一次 Worker 启动成功的时间（RFC 3339 UTC，还没有时省略），`env_failures_10m` 为近 10 分钟环境类启动失败数（不计入账户） |
+| `AdminStartupFailure` | `id`、`label`、`kind`、`confirmed`、`stage`、`count`、可选 `reason`、`message`、`url`、`first_at`、`last_at`、`until`；`kind` 为 `auth`（登录失效）、`files`（认证文件无法用于启动浏览器）、`fingerprint`（账户 Camoufox 指纹文件损坏，与登录无关）或 `ambiguous`（启动反复失败、原因不确定）。`confirmed` 为 `true` 时确定失效：账户当前处于 `auth_required`，有持久记录（`auth`、`files`）时带上记录的原因、阶段与次数，没有时 `kind` 为 `auth`、`stage` 与 `count` 为 0；为 `false` 时只读，不能据此删除账户：内存里的启动失败暂停（`fingerprint` 或 `ambiguous`，带 `until`；`fingerprint` 的 `reason` 写明指纹文件路径），或账户当前不是 `auth_required` 的持久记录（`auth`、`files`，如重启后让账户重试一次的，`reason` 注明下次启动再失败才确认）。`reason` 为中文原因说明，`message` 为错误原文（最多 300 字符），`stage` 为失败时的启动阶段 1–7（0 为未知），`url` 为错误里的页面地址（登录跳转地址优先，只用于展示），`count` 为连续失败次数；`first_at`、`last_at`、`until`（暂停到期，只有内存里的暂停有）为 RFC 3339 UTC，为空时省略 |
+| `StartupFailureClearInput` | `account_ids`（去掉首尾空白，先精确匹配，匹配不到的按不区分大小写匹配）、`all`（为 `true` 时清除全部持久记录与全部暂停） |
 | `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`） |
 | `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
 | `AdminEvent` | `type`、`data` |
@@ -1184,13 +1190,16 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 
 `GET /api/accounts/permission-denied` 列出的账户在认证文件更新时移出，同时解除它的 403 冷却与暂停：账户目录扫描发现登录签名 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`）变了，或者列出的账户磁盘上的 `storage-state.json` 与本进程内存中的登录状态不同（同一登录会话里重新导出时登录签名不变）；内容比较不计 Google 定期轮换的 `__Secure-1PSIDTS`、`__Secure-3PSIDTS`、`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`，只有这些不同的重新导出不算更新。本服务自己写回认证文件（回写 Cookie、续签）时同时更新内存，续签提交时还更新登记时记下的登录签名，都不算更新；服务停止期间换上的认证文件在启动时按登录签名对照。这套判断假定只有本进程写这个账户目录：多个进程共用一个 auth 目录时，另一个进程回写轮换 Cookie 不算更新，但它写进认证文件的其他变化（轮换 Cookie 之外的 Cookie、本地存储）在本进程看来与内存不同，仍按重新上传清除本进程的记录与 403 冷却；`.permission-denied.json` 也由各进程整份写出，不做合并。
 
+`GET /api/accounts/startup-failures` 列出启动 Worker 失败的账户（管理页“失效账户”卡片与其下的“启动反复失败（未确认）”）。每次启动失败按失败时的启动阶段与错误归类：登录失效（`auth`：`DefinitiveAuthenticationFailure`，包括 Camoufox 载入页面时被跳转到主机名为 `accounts.google.com` 的登录页）；认证文件无法用于启动浏览器（`files`：阶段 1–2 storage state 的内容无法使用，文件系统错误除外）；账户 Camoufox 指纹文件损坏（`fingerprint`：阶段 1–2 `camoufox-fingerprint.json` 解析失败或为空，文件系统错误除外。指纹不是登录凭据，重新上传认证文件、验证与浏览器登录都修不好，所以不改变账户状态、不写持久记录、不列为 `confirmed`，与 `ambiguous` 一样只在内存里暂停，但每次都计次数）；环境问题（阶段 1–4 的其余失败、读写文件的系统错误与取得 runtime 租约失败，只计入 `AdminStartupStatus.env_failures_10m`，不列出；其中阶段 1–2 文件不存在、账户的配置或 storage state 确实不在时把账户标为 `unavailable`，与取得租约时发现文件缺失相同，文件恢复后由账户目录监视重新同步恢复）；其余（阶段 5–7 的页面未就绪、WAA 失败、超时）为原因不确定（`ambiguous`）。容量已满、正在启动、被其他进程占用、清理未完成与启动期间请求取消或到期的不计入；启动排队或进行中认证文件被替换、续签提交了新认证（认证代际变化）时这次失败也不计入。`auth` 与 `files` 按启动阶段原有的规则处理（`files` 按启动前的认证代际把账户标为 `auth_required`，`auth` 沿用启动阶段原有的登录失效处理：有续签材料、没有请求租约时账户状态不变），只有账户因此处于 `auth_required` 时才写入账户目录下的 `.startup-failures.json`、列为 `confirmed`；`ambiguous` 只在内存里暂停该账户的调度（2 分钟、10 分钟、30 分钟封顶；近 5 分钟没有任何 Worker 启动成功时只暂停 1 分钟、不计次数），永不改变账户状态，列为 `confirmed=false`；`fingerprint` 的暂停时长相同，不按系统性问题处理。机器过载、代理或网络慢时健康账户同样报 `ambiguous` 那几类错误（`AI Studio 输入框未就绪 url=: context deadline exceeded` 读不到页面地址），所以它们不进入持久记录、不计入 `dead`，管理页也不提供删除；删除只针对 `confirmed`，复用 `POST /api/accounts/bulk-delete`。持久记录在账户的认证文件更新（新增、浏览器登录、重新导入、外部替换 `storage-state.json`）、验证通过、删除（单个与批量删除，号池里已经没有的 `missing` 账户同样按原样 ID 清除）、账户目录被移走以及之后 Worker 启动成功时清除；本服务续签换掉登录签名时只更新记下的登录签名。启动生成服务时对照持久记录：账户已不在池里或登录签名与记录时不同的删除记录；`auth` 记录在同一登录签名下 `count` 达到 2、账户没有续签材料、当前不是 `auth_required` 或 `disabled` 时重新标为 `auth_required`；其余只保留展示（`confirmed=false`）。`POST /api/accounts/startup-failures/clear` 的 `account_ids` 先精确匹配，匹配不到的再不区分大小写（同 `permission-denied/clear`）；清除后仍处于 `auth_required` 的账户继续列为 `confirmed`。两个接口都要求管理令牌；管理端不支持时返回 501 `startup_failures_unsupported`。
+
 `PUT /api/accounts/{id}` 的提交顺序固定为：校验不可变邮箱 ID，取得账户独占租约，创建未发布的新固定出口，关闭当前 Worker 并把新 Worker 配置标记为 `pending`（尚未发布），在模型目录写锁内原子写入 `account.json` 并更新账户池，随后发布 Worker 配置、替换固定出口、释放租约并重建模型缓存。`account.json` 写入是唯一持久提交点。提交前的出口创建、Worker 关闭或写入错误会丢弃这份待发布配置并保持旧配置；已经关闭的 Worker 由后续请求按旧配置重建。持久写入后，新配置、Worker 配置与固定出口共同成为已提交状态。租约释放错误保留该提交状态并返回原始 unlock 错误；释放成功后记录完成日志并同步模型缓存；账户由停用改为启用且没有模型目录时，在后台补一次目录同步。
 
 `RuntimeConfig` 字段。`response-only` 表示字段由服务器填充，客户端提交的值不参与保存：
 
 | 字段 | 读写与生效时机 |
 | --- | --- |
-| `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
+| `auth_states`、`proxy` | 保存值；下一次启动生成服务时使用 |
+| `init_timeout`、`request_timeout` | 保存值，保存后立即热更新：`init_timeout` 作用于之后开始的 Worker 启动，`request_timeout` 作用于之后进入的请求 |
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
 | `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 号池的账户；读取时总是返回，提交时省略则沿用现值 |

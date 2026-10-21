@@ -1702,6 +1702,11 @@ func (p *AccountPool) catalogMissingErrorLocked(scope PoolScope) error {
 func (p *AccountPool) markStaleAccountUnavailable(account *Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.markStaleAccountUnavailableLocked(account)
+}
+
+// markStaleAccountUnavailableLocked 为 markStaleAccountUnavailable 的实现；调用方持有 p.mu
+func (p *AccountPool) markStaleAccountUnavailableLocked(account *Account) {
 	if account != nil && p.byID[account.ID] == account {
 		account.State = AccountUnavailable
 		account.stateMessage = ErrAccountNotFound.Error()
