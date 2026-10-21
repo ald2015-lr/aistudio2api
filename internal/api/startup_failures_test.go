@@ -105,7 +105,7 @@ func TestHandleStartupFailures(t *testing.T) {
 	}
 }
 
-// TestAdminStatusStartupFields 状态接口的 startup 对象带约定的字段，没有最近一次成功时省略 last_success
+// TestAdminStatusStartupFields 状态接口的 startup 对象带约定的字段（page_blocked_burst 为假时也输出），没有最近一次成功时省略 last_success
 func TestAdminStatusStartupFields(t *testing.T) {
 	data, err := json.Marshal(AdminStatus{Startup: AdminStartupStatus{Launching: 3, Limit: 17, QueuedOnDemand: 2, QueuedBackground: 120, Paused: 4, Dead: 5, EnvFailures10m: 6}})
 	if err != nil {
@@ -117,12 +117,20 @@ func TestAdminStatusStartupFields(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	for _, key := range []string{"launching", "limit", "queued_on_demand", "queued_background", "paused", "dead", "env_failures_10m"} {
+	for _, key := range []string{"launching", "limit", "queued_on_demand", "queued_background", "paused", "dead", "env_failures_10m",
+		"page_blocked_burst"} {
 		if _, ok := decoded.Startup[key]; !ok {
 			t.Fatalf("startup 缺少 %s：%s", key, data)
 		}
 	}
 	if _, ok := decoded.Startup["last_success"]; ok {
 		t.Fatalf("没有成功时间时应省略 last_success：%s", data)
+	}
+	if string(decoded.Startup["page_blocked_burst"]) != "false" {
+		t.Fatalf("page_blocked_burst = %s", decoded.Startup["page_blocked_burst"])
+	}
+	data, err = json.Marshal(AdminStartupStatus{PageBlockedBurst: true})
+	if err != nil || !strings.Contains(string(data), `"page_blocked_burst":true`) {
+		t.Fatalf("爆发时 startup = %s %v", data, err)
 	}
 }

@@ -240,12 +240,14 @@ type accountWorkerManager struct {
 	refresher *authRuntimeRefresher
 	// lastStartupSuccess 为最近一次 Worker 启动成功的时间（UnixNano，0 为还没有），lastProbe 为最近一次保底试探放行的时间；
 	// envFailures 为近期环境类启动失败的时间点（由 envFailMu 保护）；startupFailures 为确定失效账户的持久表（由生成服务装配时设置，
-	// 为空时不持久化）。见 startup_failures.go
+	// 为空时不持久化）。见 startup_failures.go。startupHealth 为确认页面受阻失效时判断号池是否健康用的近期启动记录
+	// （其他账户最近的启动成功、近 30 分钟尝试启动与页面受阻的账户），见 startup_page_blocked.go
 	lastStartupSuccess atomic.Int64
 	lastProbe          atomic.Int64
 	envFailMu          sync.Mutex
 	envFailures        []time.Time
 	startupFailures    *startupFailureRegistry
+	startupHealth      startupHealthTracker
 	// warmGrace 为单个预热或替补任务在初始化超时之外额外允许的时间（纳秒，0 为 warmTaskGrace），测试调低
 	warmGrace atomic.Int64
 	// launch 启动单个账户的 WAA Worker，为空时使用 newWAAWorker（测试替换为不启动浏览器的实现）
@@ -275,20 +277,22 @@ type accountWorker struct {
 	// cleanupRetryAt 与 cleanupBackoff 为清理失败后下一次后台重试的时间与间隔（由 account.mu 保护）
 	cleanupRetryAt time.Time
 	cleanupBackoff time.Duration
-	// 启动失败记忆（见 startup_failures.go）：startFailUntil（UnixNano，0 为没有）为原因不确定或指纹文件损坏的启动失败后暂停调度的期限，
+	// 启动失败记忆（见 startup_failures.go）：startFailUntil（UnixNano，0 为没有）为原因不确定、指纹文件损坏或页面受阻的启动失败后暂停调度的期限，
 	// startFailErr 为最近一次的错误，startFailGen 为记录时的认证代际（代际变化后记录视为无）。调度时对上万个备用账户读一遍，用原子值读取、
 	// 不取账户锁；写入在账户锁内，顺序同 busyUntil（先写原因与代际再写期限）。startFailKind 为这段连续失败的类别，startFailCount 为计入
-	// 退避的连续失败次数，startFailTotal 为连续失败总次数（含按系统性问题不计次数的），startFailStage、startFailFirst、startFailLast
-	// 供列表展示，都由 account.mu 保护
-	startFailUntil atomic.Int64
-	startFailErr   atomic.Pointer[error]
-	startFailGen   atomic.Uint64
-	startFailKind  startupFailureKind
-	startFailCount int
-	startFailTotal int
-	startFailStage int
-	startFailFirst time.Time
-	startFailLast  time.Time
+	// 退避的连续失败次数，startFailTotal 为连续失败总次数（含按系统性问题不计次数的），startFailEvidence 为页面受阻时计入失效确认的
+	// 连续次数（每次失败时号池都健康的，见 startup_page_blocked.go），startFailStage、startFailFirst、startFailLast 供列表展示，
+	// 都由 account.mu 保护
+	startFailUntil    atomic.Int64
+	startFailErr      atomic.Pointer[error]
+	startFailGen      atomic.Uint64
+	startFailKind     startupFailureKind
+	startFailCount    int
+	startFailTotal    int
+	startFailEvidence int
+	startFailStage    int
+	startFailFirst    time.Time
+	startFailLast     time.Time
 }
 
 type accountWorkerPreparer struct {
@@ -389,9 +393,11 @@ type accountWorkerInitError struct {
 	err error
 	// authHandled 表示启动阶段已经处理过登录失效（已恢复一次或已标为需要登录），上层不再恢复第二次
 	authHandled bool
-	// stage 为失败时的启动阶段（1–7，见 workerStartupProgress），取得 runtime 租约失败时为 0 且 leaseFailed 为真（见 classifyStartupFailure）
+	// stage 为失败时的启动阶段（1–7，见 workerStartupProgress），取得 runtime 租约失败时为 0 且 leaseFailed 为真（见 classifyStartupFailure）；
+	// initExpired 表示失败时整个启动的期限（INIT_TIMEOUT）已经到了（调用方的 ctx 没有结束），页面受阻的文本此时只说明页面加载得太慢
 	stage       int
 	leaseFailed bool
+	initExpired bool
 }
 
 func (err *accountWorkerInitError) Error() string {
@@ -1262,8 +1268,15 @@ func (manager *accountWorkerManager) startReservedWorker(
 		budget = leaseWaitBudgetFromContext(ctx)
 	}
 	launchStartedAt := time.Now()
+	// 近 30 分钟尝试启动的账户（页面受阻的大面积爆发按它判断，见 startup_page_blocked.go）。已确认为页面受阻失效的账户不计入，
+	// 与页面受阻的账户数口径一致；只按账户 ID 查（不取号池锁算登录签名：认证文件更新时记录已随之清除）
+	if !manager.startupFailures.pageBlocked(account.id, "") {
+		manager.startupHealth.noteAttempt(account.id, launchStartedAt)
+	}
 	budget.beginColdStart(initTimeout)
 	worker, initErr := launch(initCtx, account.id, options)
+	// 在 cancel 之前读取：调用方的 ctx 没有结束、initCtx 已结束，说明整个启动的期限（INIT_TIMEOUT）到了
+	initExpired := initCtx.Err() != nil
 	cancel()
 	// 名额只覆盖浏览器启动本身，发布、替换与淘汰旧 Worker 不再占用
 	releaseSlot()
@@ -1283,7 +1296,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 			))
 			return nil, err
 		}
-		failure := &accountWorkerInitError{err: initErr, stage: failedStage}
+		failure := &accountWorkerInitError{err: initErr, stage: failedStage, initExpired: initExpired}
 		manager.requests.log(label, "ERROR", fmt.Sprintf(
 			"WAA Worker 启动失败 | 页面模型=%s | 阶段=%s | 类别=%s | 排队=%s | 启动=%s | 耗时=%s | 错误=%s",
 			bootstrapModel, startupStepText(failedStage), classifyStartupFailure(failure, failedStage).label(),
@@ -1350,7 +1363,9 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 	preparer.manager.lastStartupSuccess.Store(now.UnixNano())
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
-	// 能启动 Worker 说明登录有效：确定失效记录（如续签恢复之前记下的登录页跳转）随之清除
+	// 其他账户判断页面受阻时号池是否健康用（见 startup_page_blocked.go）
+	preparer.manager.startupHealth.noteSuccess(preparer.account.id, now)
+	// 能启动 Worker 说明登录有效：确定失效记录（如续签恢复之前记下的登录页跳转、页面受阻）随之清除
 	if preparer.manager.startupFailures.remove(preparer.account.id) {
 		preparer.manager.requests.log(label, "INFO", "WAA Worker 启动成功，清除失效账户记录")
 	}
@@ -1709,10 +1724,18 @@ func (manager *accountWorkerManager) startAuthenticated(
 		return worker, nil
 	}
 	stage = startupStageOf(err)
+	failure := &accountWorkerInitError{stage: stage, authHandled: true}
+	var inner *accountWorkerInitError
+	if errors.As(err, &inner) {
+		// 保留第二次启动失败的原因标记：classifyStartupFailure 用 errors.As 只看最外层这个包装，丢了 initExpired 时
+		// 用满 INIT_TIMEOUT（页面只是加载得太慢）的页面受阻文本会被当成页面受阻计入失效确认
+		failure.leaseFailed, failure.initExpired = inner.leaseFailed, inner.initExpired
+	}
 	if aistudio.DefinitiveAuthenticationFailure(err) {
 		err = manager.refresher.markAuthenticationRequired(ctx, err)
 	}
-	return nil, &accountWorkerInitError{err: err, authHandled: true, stage: stage}
+	failure.err = err
+	return nil, failure
 }
 
 // markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录

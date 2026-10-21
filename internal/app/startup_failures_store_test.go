@@ -110,18 +110,32 @@ func TestReconcileStartupFailures(t *testing.T) {
 	}
 }
 
-// startupHookAdmin 返回带内存中失效账户持久表的管理端，账户都有一条登录失效记录与一次原因不确定的暂停
-func startupHookAdmin(t *testing.T, accountIDs ...string) (*runtimeAdmin, *startupFailureRegistry) {
+// startupHookAdmin 返回带内存中失效账户持久表的管理端。kind 为登录失效时账户都有一条登录失效记录与一次原因不确定的暂停；
+// 为页面受阻时都有一条确认的页面受阻记录与一次页面受阻的暂停
+func startupHookAdmin(t *testing.T, kind startupFailureKind, accountIDs ...string) (*runtimeAdmin, *startupFailureRegistry) {
 	t.Helper()
 	admin, _, _ := deleteTestAdmin(t, accountIDs...)
 	registry := newStartupFailureRegistry("", admin.requests)
 	admin.workers.startupFailures = registry
 	admin.workers.lastStartupSuccess.Store(time.Now().UnixNano())
 	for _, accountID := range accountIDs {
-		registry.record(accountID, startupFailureAuth, "https://accounts.google.com/x", "跳转", 5, "", time.Now())
-		admin.workers.notePausedFailure(workerOf(t, admin.workers, accountID), startupFailureAmbiguous, admin.pool.AuthGeneration(accountID), 5, pageNotReadyError(), time.Now())
+		recordHookFailure(registry, kind, accountID)
+		pausedKind, stage, err := startupFailureAmbiguous, 5, pageNotReadyError()
+		if kind == startupFailurePageBlocked {
+			pausedKind, stage, err = startupFailurePageBlocked, 7, pageBlockedFillError("")
+		}
+		admin.workers.notePausedFailure(workerOf(t, admin.workers, accountID), pausedKind, admin.pool.AuthGeneration(accountID), stage, err, time.Now())
 	}
 	return admin, registry
+}
+
+// recordHookFailure 写入一条 kind 类别的失效账户记录（登录失效或确认的页面受阻）
+func recordHookFailure(registry *startupFailureRegistry, kind startupFailureKind, accountID string) {
+	if kind == startupFailurePageBlocked {
+		registry.recordPageBlocked(accountID, startupPageBlockedConfirmCount, "", pageBlockedFillError("").Error(), 7, "", time.Now(), time.Now())
+		return
+	}
+	registry.record(accountID, startupFailureAuth, "https://accounts.google.com/x", "跳转", 5, "", time.Now())
 }
 
 func workerOf(t *testing.T, manager *accountWorkerManager, accountID string) *accountWorker {
@@ -144,15 +158,27 @@ func recorded(registry *startupFailureRegistry, accountID string) bool {
 	return false
 }
 
-// TestStartupFailureClearHooks 失效账户记录按精确 ID 在这些地方清除：删除账户（单个与批量，含号池里已经没有的）、账户目录被移走、
-// 认证文件更新、验证通过；启动成功同样清除。内存里的暂停随认证文件更新与验证通过一起清除
+// TestStartupFailureClearHooks 失效账户记录（登录失效与页面受阻共用一张表与同一组清除钩子）按精确 ID 在这些地方清除：删除账户
+// （单个与批量，含号池里已经没有的）、账户目录被移走、认证文件更新、验证通过、清除接口；启动成功同样清除。内存里的暂停（含页面受阻
+// 失效确认的连续次数）随认证文件更新、验证通过与清除接口一起清除
 func TestStartupFailureClearHooks(t *testing.T) {
+	for _, kind := range []startupFailureKind{startupFailureAuth, startupFailurePageBlocked} {
+		t.Run(string(kind), func(t *testing.T) { testStartupFailureClearHooks(t, kind) })
+	}
+}
+
+func testStartupFailureClearHooks(t *testing.T, kind startupFailureKind) {
 	isolateDisableNotes(t)
-	const deleted, detached, updated, verified, started, kept = "del@example.com", "detach@example.com", "update@example.com",
-		"verify@example.com", "start@example.com", "keep@example.com"
-	admin, registry := startupHookAdmin(t, deleted, detached, updated, verified, started, kept)
-	registry.record("ghost@example.com", startupFailureAuth, "", "跳转", 5, "", time.Now())
-	registry.record("Ghost2@Example.com", startupFailureAuth, "", "跳转", 5, "", time.Now())
+	const deleted, detached, updated, verified, started, cleared, kept = "del@example.com", "detach@example.com", "update@example.com",
+		"verify@example.com", "start@example.com", "clear@example.com", "keep@example.com"
+	admin, registry := startupHookAdmin(t, kind, deleted, detached, updated, verified, started, cleared, kept)
+	recordHookFailure(registry, kind, "ghost@example.com")
+	recordHookFailure(registry, kind, "Ghost2@Example.com")
+	if kind == startupFailurePageBlocked {
+		if dead := admin.workers.startupStatus(0).Dead; dead != 7 {
+			t.Fatalf("确认的页面受阻账户应计入确定失效数（不在池里的不计），实际 %d", dead)
+		}
+	}
 
 	if err := admin.DeleteAccount(context.Background(), deleted); err != nil {
 		t.Fatal(err)
@@ -191,8 +217,20 @@ func TestStartupFailureClearHooks(t *testing.T) {
 	if until, _ := startupPauseOf(t, admin.workers, started); recorded(registry, started) || !until.IsZero() {
 		t.Fatal("启动成功应清除记录与暂停")
 	}
+	if count, err := admin.ClearStartupFailures(context.Background(), api.StartupFailureClearInput{AccountIDs: []string{cleared}}); err != nil || count != 1 {
+		t.Fatalf("清除接口 = %d %v", count, err)
+	}
+	if until, _ := startupPauseOf(t, admin.workers, cleared); recorded(registry, cleared) || !until.IsZero() ||
+		workerOf(t, admin.workers, cleared).startFailEvidence != 0 {
+		t.Fatal("清除接口应清除记录、暂停与失效确认的连续次数")
+	}
 	if until, _ := startupPauseOf(t, admin.workers, kept); !recorded(registry, kept) || until.IsZero() {
 		t.Fatal("其他账户的记录与暂停不应受影响")
+	}
+	if kind == startupFailurePageBlocked {
+		if dead := admin.workers.startupStatus(0).Dead; dead != 1 {
+			t.Fatalf("清除后确定失效数 = %d，期望 1", dead)
+		}
 	}
 }
 

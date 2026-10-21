@@ -28,6 +28,10 @@ import (
 //   - 环境问题（environment）：浏览器没能启动起来（启动 Camoufox、连接 BiDi、取得 runtime 租约、读写文件的系统错误等），多半是机器资源
 //     或部署问题，不是号的问题，只计入近 10 分钟的环境类失败数，不写账户记录；其中认证文件不存在的（整体替换账户目录的中途）
 //     按文件缺失标为不可用，文件恢复后自动恢复（noteFilesMissing）；
+//   - 页面受阻（page_blocked）：页面已经打开、输入框也在，但 bootstrap 提示词填不进去，或填好后官网 Run 按钮一直不可点（阶段 7）。
+//     多半是账户本身的问题（例如官网弹出需要同意的条款或通知，挡住了输入框）。暂停与原因不确定相同；同一认证代际下连续
+//     startupPageBlockedConfirmCount 次、每次失败时号池都健康（见 startup_page_blocked.go）时确认为失效：账户状态不变（仍是就绪，
+//     问题消失时会自己恢复），之后每次失败都暂停 30 分钟，记入确定失效的持久表（kind=page_blocked），列为确定失效、可一键删除；
 //   - 原因不确定（ambiguous）：页面未就绪、WAA 失败、超时。机器过载或代理慢时健康账号报的是同一串错误，只在内存里短暂暂停调度
 //     （2m、10m、30m 封顶；近 5 分钟没有任何 Worker 启动成功时按系统性问题只暂停 1m、不计次数），永不改变账户状态，不能据此删号。
 //
@@ -41,6 +45,7 @@ const (
 	startupFailureFiles       startupFailureKind = "files"
 	startupFailureFingerprint startupFailureKind = "fingerprint"
 	startupFailureEnvironment startupFailureKind = "environment"
+	startupFailurePageBlocked startupFailureKind = "page_blocked"
 	startupFailureAmbiguous   startupFailureKind = "ambiguous"
 )
 
@@ -55,6 +60,8 @@ func (kind startupFailureKind) label() string {
 		return "指纹文件损坏"
 	case startupFailureEnvironment:
 		return "环境问题"
+	case startupFailurePageBlocked:
+		return "页面受阻"
 	case startupFailureAmbiguous:
 		return "原因不确定"
 	}
@@ -78,8 +85,22 @@ const (
 	waitReasonStartupPaused = "候选账户启动失败暂停中"
 )
 
-// startupAmbiguousPauses 为原因不确定（以及指纹文件损坏）的连续失败第 1、2、3 次起的暂停时长
+// startupAmbiguousPauses 为原因不确定（以及指纹文件损坏、页面受阻）的连续失败第 1、2、3 次起的暂停时长
 var startupAmbiguousPauses = [...]time.Duration{2 * time.Minute, 10 * time.Minute, 30 * time.Minute}
+
+// startupMaxPause 为启动失败暂停的上限，确认为页面受阻失效的账户之后每次失败都暂停这么久
+var startupMaxPause = startupAmbiguousPauses[len(startupAmbiguousPauses)-1]
+
+// startupPageBlockedTexts 为阶段 7 页面受阻的错误文本：Camoufox 填写 bootstrap 提示词失败（“填写 bootstrap 提示词失败 value=%q err=%v”）、
+// 等待官网 Run 按钮启用超时（“等待官网 Run 按钮启用: %w”），以及纯 Go 后端填写 bootstrap 提示词失败（“填写 bootstrap 提示词失败: %w”）
+var startupPageBlockedTexts = []string{"填写 bootstrap 提示词失败", "等待官网 Run 按钮启用"}
+
+// startupBrowserBrokenTexts 为错误链里浏览器或运行时已经断开、退出的迹象：同时出现时页面受阻的文本只是连接断开的结果，
+// 不是账户的问题，仍按原因不确定处理
+var startupBrowserBrokenTexts = []string{
+	"BiDi 连接已断开", "websocket: close", "use of closed network connection", "connection reset by peer", "broken pipe",
+	"WAA runtime 已关闭",
+}
 
 // errStartupSlotsLate 表示后台启动取得冷启动名额时剩余期限已不够一次完整启动（INIT_TIMEOUT），或等名额一直等到期限：名额被
 // 按需启动占满，后台启动等了太久。按容量已满返回（预热本轮不再启动新的，稍后重试），不记为预热失败、也不计入账户
@@ -99,7 +120,9 @@ func ambiguousStartupPause(count int) time.Duration {
 //  3. 指纹文件损坏：阶段 ≤2 且错误文本含 Camoufox 指纹（解析失败、内容为空）；
 //  4. 认证文件损坏：阶段 ≤2 且错误文本含 storage state（3、4 两条里读写文件的系统错误都不算，如文件不存在、打开文件过多、磁盘满，按环境问题）；
 //  5. 环境问题：阶段 ≤4，或取得 runtime 租约失败；
-//  6. 其余（阶段 ≥5 的页面未就绪、WAA 失败、超时）都是原因不确定
+//  6. 页面受阻：阶段 7，错误文本含 startupPageBlockedTexts，且错误链里没有浏览器断开、退出的迹象（startupBrowserBrokenTexts），
+//     整个启动的期限（INIT_TIMEOUT）也没有到（期限到了说明页面加载得太慢，提示词与 Run 按钮只是没来得及）；
+//  7. 其余（阶段 ≥5 的页面未就绪、WAA 失败、超时）都是原因不确定
 func classifyStartupFailure(err error, stage int) startupFailureKind {
 	var initErr *accountWorkerInitError
 	if err == nil || !errors.As(err, &initErr) {
@@ -124,7 +147,21 @@ func classifyStartupFailure(err error, stage int) startupFailureKind {
 	if stage <= 4 || initErr.leaseFailed {
 		return startupFailureEnvironment
 	}
+	if text := err.Error(); stage == 7 && !initErr.initExpired && containsAny(text, startupPageBlockedTexts) &&
+		!containsAny(text, startupBrowserBrokenTexts) {
+		return startupFailurePageBlocked
+	}
 	return startupFailureAmbiguous
+}
+
+// containsAny 判断 text 是否包含 parts 中的任意一个
+func containsAny(text string, parts []string) bool {
+	for _, part := range parts {
+		if strings.Contains(text, part) {
+			return true
+		}
+	}
+	return false
 }
 
 // fileSystemError 判断错误是否来自读写文件的系统错误（文件不存在、打开文件过多、权限、磁盘等）：这些不说明认证文件的内容坏了。
@@ -268,22 +305,38 @@ func (manager *accountWorkerManager) noteStartupFailure(
 			"WAA Worker 启动失败计入账户 | 类别=%s | 阶段=%s | 连续失败=%d | 暂停调度=否 | 已标为需要重新登录",
 			kind.label(), startupStepText(stage), max(count, 1),
 		))
-	case startupFailureAmbiguous, startupFailureFingerprint:
+	case startupFailureAmbiguous, startupFailureFingerprint, startupFailurePageBlocked:
 		manager.notePausedFailure(account, kind, generation, stage, err, now)
 	}
 }
 
-// notePausedFailure 记下一次原因不确定或指纹文件损坏的启动失败并暂停调度，不改变账户状态。写入顺序同 markRuntimeBusy：
-// 先写原因与代际再写期限，读到期限未到的一方总能拿到原因与代际。只有原因不确定的失败按系统性问题处理：指纹文件损坏与机器负载无关，
-// 每次都计次数
+// notePausedFailure 记下一次原因不确定、指纹文件损坏或页面受阻的启动失败并暂停调度，不改变账户状态。写入顺序同 markRuntimeBusy：
+// 先写原因与代际再写期限，读到期限未到的一方总能拿到原因与代际。原因不确定与页面受阻的失败按系统性问题处理：指纹文件损坏与机器负载无关，
+// 每次都计次数。页面受阻另按号池是否健康累计失效确认的连续次数，达到 startupPageBlockedConfirmCount 时记入确定失效的持久表
+// （见 startup_page_blocked.go），已确认的之后每次失败都暂停 startupMaxPause（按系统性问题处理时也是，只是不计次数），
+// 也不再计入页面受阻的爆发统计
 func (manager *accountWorkerManager) notePausedFailure(
 	account *accountWorker, kind startupFailureKind, generation uint64, stage int, err error, now time.Time,
 ) {
-	systemic := kind == startupFailureAmbiguous && now.Sub(time.Unix(0, manager.lastStartupSuccess.Load())) >= startupSystemicWindow
+	systemic := (kind == startupFailureAmbiguous || kind == startupFailurePageBlocked) &&
+		now.Sub(time.Unix(0, manager.lastStartupSuccess.Load())) >= startupSystemicWindow
+	var verdict pageBlockedVerdict
+	identity, confirmedBefore := "", false
+	if kind == startupFailurePageBlocked {
+		identity, _ = manager.pool.LoginIdentity(account.id)
+		confirmedBefore = manager.startupFailures.pageBlocked(account.id, identity)
+		verdict = manager.startupHealth.notePageBlocked(account.id, !confirmedBefore, now)
+		if verdict.warnBurst {
+			manager.requests.log("service", "WARN", fmt.Sprintf(
+				"大量账户页面受阻，可能是官网页面改版，暂不确认为失效 | 账户数=%d | 启动尝试账户数=%d",
+				verdict.blockedAccounts, verdict.attemptedAccounts,
+			))
+		}
+	}
 	account.mu.Lock()
 	if account.startFailGen.Load() != generation || account.startFailKind != kind {
 		// 上一段连续失败属于旧认证或另一类原因，从头计
-		account.startFailCount, account.startFailTotal = 0, 0
+		account.startFailCount, account.startFailTotal, account.startFailEvidence = 0, 0, 0
 	}
 	if account.startFailTotal == 0 {
 		account.startFailFirst = now
@@ -293,6 +346,19 @@ func (manager *accountWorkerManager) notePausedFailure(
 	if !systemic {
 		account.startFailCount++
 		delay = ambiguousStartupPause(account.startFailCount)
+		if kind == startupFailurePageBlocked {
+			// 号池不健康的那次失败只计入暂停，失效确认的连续次数不增加、也不清零
+			if verdict.healthy() {
+				account.startFailEvidence++
+			}
+			if confirmedBefore || account.startFailEvidence >= startupPageBlockedConfirmCount {
+				delay = startupMaxPause
+			}
+		}
+	} else if confirmedBefore {
+		// 已确认的账户按系统性问题处理时同样不计次数，但仍暂停 startupMaxPause（确认后每 30 分钟重试一次）：服务刚启动还没有任何
+		// Worker 启动成功、或整个号池都启动不了时，不每分钟重新启动它一次、占用冷启动名额
+		delay = startupMaxPause
 	}
 	account.startFailKind = kind
 	account.startFailStage = stage
@@ -302,24 +368,53 @@ func (manager *accountWorkerManager) notePausedFailure(
 	account.startFailGen.Store(generation)
 	account.startFailUntil.Store(now.Add(delay).UnixNano())
 	count := account.startFailCount
+	evidence := account.startFailEvidence
+	firstAt := account.startFailFirst
 	label := account.label
 	fingerprintPath := accountFingerprintPath(account.config.StorageStatePath)
 	account.mu.Unlock()
-	note := ""
-	if systemic {
-		note = " | 近 5 分钟没有任何 Worker 启动成功，按系统性问题处理，不计次数"
+	confirmed, created, recordCount := confirmedBefore, false, 0
+	if kind == startupFailurePageBlocked && !systemic && verdict.healthy() &&
+		(confirmedBefore || evidence >= startupPageBlockedConfirmCount) &&
+		manager.pool.AuthGeneration(account.id) == generation {
+		// 记录前再核对一次认证代际：途中替换了认证文件的，旧凭据的失败不记到新凭据头上
+		recordCount, created = manager.startupFailures.recordPageBlocked(
+			account.id, evidence, startupFailureURL(err), startupFailureMessage(err), stage, identity, firstAt, now,
+		)
+		confirmed = confirmed || created
 	}
-	if kind == startupFailureFingerprint {
+	note := ""
+	switch {
+	case kind == startupFailurePageBlocked && confirmed:
+		// 在系统性问题之前判断：已确认的账户按系统性问题处理时同样暂停 30 分钟（只是不计次数、不更新记录）
+		note = " | 已确认为失效账户（账户状态不变，每 30 分钟重试一次）"
+	case systemic:
+		note = " | 近 5 分钟没有任何 Worker 启动成功，按系统性问题处理，不计次数"
+	case kind == startupFailureFingerprint:
 		note = fmt.Sprintf(
 			" | 指纹文件=%s | 与登录无关，账户状态不变、不计入失效账户（重新上传认证文件、验证与浏览器登录都修不好）："+
 				"从备份恢复该文件，或删除它（下次启动按当前版本重新生成指纹）后清除暂停",
 			fingerprintPath,
 		)
+	case kind == startupFailurePageBlocked && verdict.burst:
+		note = fmt.Sprintf(" | 大量账户页面受阻（可能是官网页面改版），不计入失效确认 | 失效确认=%d/%d",
+			evidence, startupPageBlockedConfirmCount)
+	case kind == startupFailurePageBlocked && !verdict.otherSuccess:
+		note = fmt.Sprintf(" | 近 10 分钟没有其他账户启动成功，不计入失效确认 | 失效确认=%d/%d",
+			evidence, startupPageBlockedConfirmCount)
+	case kind == startupFailurePageBlocked:
+		note = fmt.Sprintf(" | 失效确认=%d/%d", evidence, startupPageBlockedConfirmCount)
 	}
 	manager.requests.log(label, "WARN", fmt.Sprintf(
 		"WAA Worker 启动失败计入账户 | 类别=%s | 阶段=%s | 连续失败=%d | 暂停调度=%s%s",
 		kind.label(), startupStepText(stage), count, delay, note,
 	))
+	if created {
+		manager.requests.log(label, "WARN", fmt.Sprintf(
+			"WAA Worker 页面受阻已确认为失效账户 | 连续失败=%d | 最近错误=%s | 可在账户页删除，或到官网登录检查是否有需要处理的提示",
+			recordCount, startupFailureMessage(err),
+		))
+	}
 	time.AfterFunc(delay, manager.notifyScheduling)
 }
 
@@ -330,7 +425,7 @@ func clearStartupFailureLocked(account *accountWorker) bool {
 	account.startFailErr.Store(nil)
 	account.startFailGen.Store(0)
 	account.startFailKind = startupFailureNone
-	account.startFailCount, account.startFailTotal, account.startFailStage = 0, 0, 0
+	account.startFailCount, account.startFailTotal, account.startFailEvidence, account.startFailStage = 0, 0, 0, 0
 	account.startFailFirst, account.startFailLast = time.Time{}, time.Time{}
 	return had
 }
@@ -500,6 +595,8 @@ type startupPause struct {
 	err       error
 	// fingerprintPath 为账户 Camoufox 指纹文件的路径（指纹文件损坏时列表提示用）
 	fingerprintPath string
+	// evidence 为页面受阻时计入失效确认的连续次数
+	evidence int
 }
 
 // startupPauses 返回启动失败暂停中的账户（认证代际已变化的不算），按暂停到期时间从早到晚排列
@@ -525,7 +622,7 @@ func (manager *accountWorkerManager) startupPauses(now time.Time) []startupPause
 		pause := startupPause{
 			accountID: account.id, label: account.label, kind: account.startFailKind, until: time.Unix(0, until),
 			total: account.startFailTotal, stage: account.startFailStage, firstAt: account.startFailFirst, lastAt: account.startFailLast,
-			fingerprintPath: accountFingerprintPath(account.config.StorageStatePath),
+			fingerprintPath: accountFingerprintPath(account.config.StorageStatePath), evidence: account.startFailEvidence,
 		}
 		if stored := account.startFailErr.Load(); stored != nil {
 			pause.err = *stored
@@ -588,22 +685,39 @@ func startupFailureTime(value time.Time) string {
 	return value.UTC().Format(time.RFC3339)
 }
 
-// startupStatus 返回状态接口的 startup 字段：authRequired 为当前处于需要重新登录状态的账户数，也就是确定失效的账户数
-// （失效账户列表的 confirmed 只列当前处于需要重新登录状态的账户，持久表里其余账户的记录列为未确认，见 StartupFailures）
+// startupStatus 返回状态接口的 startup 字段：authRequired 为当前处于需要重新登录状态的账户数。确定失效的账户数与失效账户列表的
+// confirmed 一致：需要重新登录的账户，加上持久表里确认为页面受阻、账户还在池里且不是需要重新登录状态的账户（见 StartupFailures）。
+// PageBlockedBurst 为此刻处于页面受阻的大面积爆发（见 startup_page_blocked.go）
 func (manager *accountWorkerManager) startupStatus(authRequired int) api.AdminStartupStatus {
 	now := time.Now()
 	launching, queued, deferred := manager.startupSlots.usage()
 	status := api.AdminStartupStatus{
 		Launching: launching, Limit: max(manager.warmConcurrencyValue(), 1) + 1,
 		QueuedOnDemand: queued, QueuedBackground: deferred,
-		Paused:         manager.pausedStartupCount(now),
-		Dead:           authRequired,
-		EnvFailures10m: manager.environmentFailures(now),
+		Paused:           manager.pausedStartupCount(now),
+		Dead:             authRequired + manager.pageBlockedDead(),
+		EnvFailures10m:   manager.environmentFailures(now),
+		PageBlockedBurst: manager.startupHealth.burst(now),
 	}
 	if last := manager.lastStartupSuccess.Load(); last != 0 {
 		status.LastSuccess = startupFailureTime(time.Unix(0, last))
 	}
 	return status
+}
+
+// pageBlockedDead 返回持久表里确认为页面受阻、账户还在池里且不是需要重新登录状态的账户数（需要重新登录的已计入 authRequired）
+func (manager *accountWorkerManager) pageBlockedDead() int {
+	accountIDs := manager.startupFailures.pageBlockedIDs()
+	if len(accountIDs) == 0 {
+		return 0
+	}
+	count := 0
+	for _, state := range manager.pool.States(accountIDs) {
+		if state != aistudio.AccountAuthRequired {
+			count++
+		}
+	}
+	return count
 }
 
 // startupFailureAdmin 为管理接口 GET /api/accounts/startup-failures 与 POST /api/accounts/startup-failures/clear 需要的能力；
@@ -618,13 +732,19 @@ var (
 	_ startupFailureAdmin = (*runtimeAdmin)(nil)
 )
 
-// StartupFailures 返回启动失败的账户。确定失效（confirmed，可一键删除）只列当前处于需要重新登录状态的账户：先列其中有持久记录的
-// （登录失效与认证文件损坏，带原因、阶段与次数，按最近一次从新到旧），再列其余需要重新登录的账户。未确认的只读：内存里原因不确定或指纹文件损坏的
-// 暂停（按暂停到期从早到晚），以及持久表里账户当前不是需要重新登录状态的记录（重启后重试一次、验证通过或续签之前留下的，账户仍可调度、
-// 可能恢复，不能据此删号；下次启动再失败、标为需要重新登录时才列为确定失效）。同一账户只列一次
+// StartupFailures 返回启动失败的账户。确定失效（confirmed，可一键删除）：先列有持久记录的（登录失效与认证文件损坏只列当前处于需要重新登录
+// 状态的账户，页面受阻列账户还在池里的，带原因、阶段与次数，按最近一次从新到旧；页面受阻的账户状态不变，带暂停到期时间），再列其余需要重新登录
+// 的账户。未确认的只读：内存里原因不确定、指纹文件损坏或尚未确认的页面受阻的暂停（按暂停到期从早到晚），以及持久表里登录失效与认证文件损坏
+// 的账户当前不是需要重新登录状态的记录（重启后重试一次、验证通过或续签之前留下的，账户仍可调度、可能恢复，不能据此删号；下次启动再失败、
+// 标为需要重新登录时才列为确定失效）。同一账户只列一次
 func (admin *runtimeAdmin) StartupFailures(context.Context) ([]api.AdminStartupFailure, error) {
 	workers := admin.workers
 	records := workers.startupFailures.list()
+	pauses := workers.startupPauses(time.Now())
+	pauseUntil := make(map[string]time.Time, len(pauses))
+	for _, pause := range pauses {
+		pauseUntil[pause.accountID] = pause.until
+	}
 	listed := make(map[string]struct{}, len(records))
 	recordIDs := make([]string, 0, len(records))
 	for _, entry := range records {
@@ -640,20 +760,35 @@ func (admin *runtimeAdmin) StartupFailures(context.Context) ([]api.AdminStartupF
 			label = value
 		}
 		kind := startupFailureKind(entry.record.Kind)
+		state, exists := states[entry.accountID]
+		confirmed := state == aistudio.AccountAuthRequired
 		reason := "认证文件无法用于启动浏览器"
-		if kind == startupFailureAuth {
+		switch kind {
+		case startupFailureAuth:
 			reason = "启动 Worker 时确认登录失效"
 			if entry.record.URL != "" {
 				reason = "启动 Worker 时被跳转到 Google 登录页"
 			}
+		case startupFailurePageBlocked:
+			// 页面受阻不改变账户状态：账户还在池里就是确定失效
+			confirmed = exists
+			reason = "页面打开后填不进提示词或 Run 按钮一直不可用，多半是账户在官网有需要处理的提示（例如未同意条款）；" +
+				"账户状态不变，每 30 分钟重试一次"
 		}
 		item := api.AdminStartupFailure{
-			ID: entry.accountID, Label: label, Kind: string(kind), Confirmed: states[entry.accountID] == aistudio.AccountAuthRequired,
+			ID: entry.accountID, Label: label, Kind: string(kind), Confirmed: confirmed,
 			Reason: reason, Message: entry.record.Message, Stage: entry.record.Stage, URL: entry.record.URL, Count: entry.record.Count,
 			FirstAt: startupFailureTime(entry.record.FirstAt), LastAt: startupFailureTime(entry.record.LastAt),
 		}
+		if until, paused := pauseUntil[entry.accountID]; paused && kind == startupFailurePageBlocked {
+			item.Until = startupFailureTime(until)
+		}
 		if !item.Confirmed {
-			item.Reason += "（账户当前不是需要重新登录状态，下次启动再失败才确认）"
+			if kind == startupFailurePageBlocked {
+				item.Reason += "（账户已不在账户池中）"
+			} else {
+				item.Reason += "（账户当前不是需要重新登录状态，下次启动再失败才确认）"
+			}
 			pending = append(pending, item)
 			continue
 		}
@@ -677,18 +812,25 @@ func (admin *runtimeAdmin) StartupFailures(context.Context) ([]api.AdminStartupF
 	sort.Slice(authRequired, func(left int, right int) bool { return authRequired[left].ID < authRequired[right].ID })
 	result = append(result, authRequired...)
 	// 暂停先于未确认的持久记录列出：同一账户两者都有时暂停是当前的情况（账户表 Worker 列按它显示暂停到期时间）
-	for _, pause := range workers.startupPauses(time.Now()) {
+	for _, pause := range pauses {
 		if _, exists := listed[pause.accountID]; exists {
 			continue
 		}
 		listed[pause.accountID] = struct{}{}
 		kind, reason := startupFailureAmbiguous, "启动反复失败，原因不确定（机器负载高或网络慢时健康账户也会这样）"
-		if pause.kind == startupFailureFingerprint {
+		switch pause.kind {
+		case startupFailureFingerprint:
 			kind = startupFailureFingerprint
 			reason = fmt.Sprintf(
 				"账户 Camoufox 指纹文件损坏，与登录无关（重新上传认证文件、验证与浏览器登录都修不好）：从备份恢复 %s，"+
 					"或删除它（下次启动按当前版本重新生成指纹）后清除暂停",
 				pause.fingerprintPath,
+			)
+		case startupFailurePageBlocked:
+			kind = startupFailurePageBlocked
+			reason = fmt.Sprintf(
+				"页面打开后填不进提示词或 Run 按钮一直不可用，尚未确认为失效（号池健康时连续 %d 次才确认，当前 %d/%d）",
+				startupPageBlockedConfirmCount, pause.evidence, startupPageBlockedConfirmCount,
 			)
 		}
 		entry := api.AdminStartupFailure{

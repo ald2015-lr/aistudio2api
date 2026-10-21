@@ -805,7 +805,8 @@ func TestClassifyStartupFailure(t *testing.T) {
 		{"启动 Camoufox", &accountWorkerInitError{err: errors.New("等待 Camoufox BiDi 端点超时"), stage: 3}, 3, startupFailureEnvironment},
 		{"runtime 租约", &accountWorkerInitError{err: errors.New("lock: permission denied"), leaseFailed: true}, 0, startupFailureEnvironment},
 		{"输入框未就绪", pageNotReadyFailure(), 5, startupFailureAmbiguous},
-		{"WAA 失败", &accountWorkerInitError{err: errors.New("填写 bootstrap 提示词失败"), stage: 7}, 7, startupFailureAmbiguous},
+		{"WAA 失败", &accountWorkerInitError{err: errors.New("官网 WAA service 未暴露: context deadline exceeded"), stage: 7}, 7, startupFailureAmbiguous},
+		{"填写提示词失败", &accountWorkerInitError{err: errors.New("填写 bootstrap 提示词失败"), stage: 7}, 7, startupFailurePageBlocked},
 	} {
 		if got := classifyStartupFailure(test.err, test.stage); got != test.want {
 			t.Errorf("%s：分类 = %q，期望 %q", test.name, got, test.want)

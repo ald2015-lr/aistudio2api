@@ -16,11 +16,13 @@ import (
 )
 
 // 确定失效账户的持久表：启动 Worker 时确认登录失效（auth）或认证文件无法用于启动浏览器（files）、并因此处于需要重新登录状态的账户
-// （有续签材料留给带租约的请求恢复、标记被认证代际拒绝的不记），按账户记下类别、登录跳转地址、错误原文（截断）、阶段、次数、
-// 首次与最近一次的时间，以及记录时的登录签名指纹（aistudio.LoginIdentity）。原因不确定的失败不持久化。
+// （有续签材料留给带租约的请求恢复、标记被认证代际拒绝的不记），以及确认为页面受阻失效（page_blocked，号池健康时连续
+// startupPageBlockedConfirmCount 次，见 startup_page_blocked.go；账户状态不变）的账户，按账户记下类别、登录跳转地址、错误原文（截断）、
+// 阶段、次数、首次与最近一次的时间，以及记录时的登录签名指纹（aistudio.LoginIdentity）。原因不确定、尚未确认的页面受阻不持久化。
 // 需要重新登录的状态不会持久化（runtime-state 没有认证字段，重启后按 Cookie 推导为就绪），重启时对照这张表（reconcileStartupFailures）：
 // 同一登录签名下连续两次以上确认登录失效、没有续签材料的重新标为需要重新登录；只有一次的保留展示，让账户重试一次（一次登录页跳转可能是偶发）。
-// 列表只把当前处于需要重新登录状态的账户列为确定失效，其余记录（重启后待重试的等）列为未确认、不能一键删除（见 StartupFailures）。
+// 页面受阻的记录按登录签名保留，最近一次失败后 30 分钟的暂停还没到期的恢复暂停。
+// 列表把当前处于需要重新登录状态的账户与页面受阻的记录列为确定失效，其余记录（重启后待重试的等）列为未确认、不能一键删除（见 StartupFailures）。
 // 认证文件更新、验证通过、删除或移走账户、启动成功时清除；续签换掉登录签名时更新记下的指纹（不当作重新上传）。
 // 保存在账户目录下的 .startup-failures.json，变化在几秒内合并后原子写入一次，生成服务关闭时立即写入（flush）
 const (
@@ -110,7 +112,7 @@ func (registry *startupFailureRegistry) load() error {
 		if record == nil || record.Count < 1 {
 			continue
 		}
-		if kind := startupFailureKind(record.Kind); kind != startupFailureAuth && kind != startupFailureFiles {
+		if kind := startupFailureKind(record.Kind); kind != startupFailureAuth && kind != startupFailureFiles && kind != startupFailurePageBlocked {
 			continue
 		}
 		registry.accounts[accountID] = record
@@ -142,6 +144,78 @@ func (registry *startupFailureRegistry) record(
 	record.LastAt = now
 	registry.scheduleSaveLocked()
 	return record.Count
+}
+
+// recordPageBlocked 记下一次号池健康时的页面受阻（见 notePausedFailure），返回记录的连续次数与这次是否新确认：
+//   - 账户已有同一登录签名下的页面受阻记录（已确认）：次数加一，更新错误原文、阶段与最近一次的时间；
+//   - 没有时，evidence（内存里计入失效确认的连续次数）达到 startupPageBlockedConfirmCount 才新建记录（替换其他类别的旧记录），
+//     次数为 evidence，首次时间为这段连续失败的开始 firstAt；不到时什么都不做、返回 0。
+//
+// identity 为空时不比较登录签名
+func (registry *startupFailureRegistry) recordPageBlocked(
+	accountID string, evidence int, url string, message string, stage int, identity string, firstAt time.Time, now time.Time,
+) (int, bool) {
+	if registry == nil || accountID == "" {
+		return 0, false
+	}
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	if record := registry.accounts[accountID]; record.samePageBlocked(identity) {
+		if identity != "" {
+			record.Identity = identity
+		}
+		record.URL = url
+		record.Message = message
+		record.Stage = stage
+		record.Count++
+		record.LastAt = now
+		registry.scheduleSaveLocked()
+		return record.Count, false
+	}
+	if evidence < startupPageBlockedConfirmCount {
+		return 0, false
+	}
+	if firstAt.IsZero() || firstAt.After(now) {
+		firstAt = now
+	}
+	registry.accounts[accountID] = &startupFailureRecord{
+		Kind: string(startupFailurePageBlocked), URL: url, Message: message, Stage: stage, Count: evidence,
+		FirstAt: firstAt, LastAt: now, Identity: identity,
+	}
+	registry.scheduleSaveLocked()
+	return evidence, true
+}
+
+// samePageBlocked 判断记录是否为同一登录签名下的页面受阻记录（identity 或记下的签名为空时不比较）
+func (record *startupFailureRecord) samePageBlocked(identity string) bool {
+	return record != nil && record.Kind == string(startupFailurePageBlocked) &&
+		(identity == "" || record.Identity == "" || record.Identity == identity)
+}
+
+// pageBlocked 返回账户是否已确认为页面受阻失效（同一登录签名下有页面受阻记录）
+func (registry *startupFailureRegistry) pageBlocked(accountID string, identity string) bool {
+	if registry == nil {
+		return false
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	return registry.accounts[accountID].samePageBlocked(identity)
+}
+
+// pageBlockedIDs 返回有页面受阻记录的账户（状态接口统计确定失效数用）
+func (registry *startupFailureRegistry) pageBlockedIDs() []string {
+	if registry == nil {
+		return nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	accountIDs := make([]string, 0)
+	for accountID, record := range registry.accounts {
+		if record.Kind == string(startupFailurePageBlocked) {
+			accountIDs = append(accountIDs, accountID)
+		}
+	}
+	return accountIDs
 }
 
 // remove 按精确 ID 清除账户的记录，返回是否有记录
@@ -299,6 +373,7 @@ func (registry *startupFailureRegistry) flush() {
 //   - 账户已不在池里（服务停止期间删除了目录）：删除记录；
 //   - 登录签名与记录时不同（服务停止期间重新上传了认证文件）：删除记录；
 //   - 登录失效记录、同一登录签名下连续 startupFailureConfirmCount 次以上、没有续签材料、当前不是需要重新登录：重新标为需要重新登录；
+//   - 页面受阻记录：保留（仍列为确定失效），最近一次失败后 startupMaxPause 还没到的恢复暂停（restorePageBlockedPause），到了的让账户重试；
 //   - 只有一次的只保留展示，让账户重试一次
 func (manager *accountWorkerManager) reconcileStartupFailures() {
 	registry := manager.startupFailures
@@ -311,7 +386,8 @@ func (manager *accountWorkerManager) reconcileStartupFailures() {
 		accountIDs = append(accountIDs, entry.accountID)
 	}
 	states := manager.pool.States(accountIDs)
-	missing, replaced, marked := 0, 0, 0
+	now := time.Now()
+	missing, replaced, marked, restored := 0, 0, 0, 0
 	for _, entry := range entries {
 		current, exists := manager.pool.LoginIdentity(entry.accountID)
 		switch {
@@ -322,6 +398,10 @@ func (manager *accountWorkerManager) reconcileStartupFailures() {
 		case entry.record.Identity != "" && current != entry.record.Identity:
 			if registry.remove(entry.accountID) {
 				replaced++
+			}
+		case entry.record.Kind == string(startupFailurePageBlocked):
+			if manager.restorePageBlockedPause(entry.accountID, entry.record, now) {
+				restored++
 			}
 		case entry.record.Kind == string(startupFailureAuth) && entry.record.Count >= startupFailureConfirmCount:
 			if state := states[entry.accountID]; state == aistudio.AccountAuthRequired || state == aistudio.AccountDisabled {
@@ -338,9 +418,53 @@ func (manager *accountWorkerManager) reconcileStartupFailures() {
 			marked++
 		}
 	}
-	if missing+replaced+marked > 0 {
+	if missing+replaced+marked+restored > 0 {
 		manager.requests.log("service", "INFO", fmt.Sprintf(
-			"失效账户记录对账 | 重新标为需要重新登录=%d | 清除已不在账户池中=%d | 清除认证文件已更新=%d", marked, missing, replaced,
+			"失效账户记录对账 | 重新标为需要重新登录=%d | 恢复页面受阻暂停=%d | 清除已不在账户池中=%d | 清除认证文件已更新=%d",
+			marked, restored, missing, replaced,
 		))
 	}
+}
+
+// restorePageBlockedPause 为重启前确认为页面受阻失效的账户恢复暂停：暂停到最近一次失败后 startupMaxPause，已经到了的不恢复
+// （让账户重试，问题消失时自己恢复）。账户已有启动失败记忆时不覆盖。恢复后连续次数按已确认计，之后每次失败都暂停 startupMaxPause
+func (manager *accountWorkerManager) restorePageBlockedPause(accountID string, record startupFailureRecord, now time.Time) bool {
+	until := record.LastAt.Add(startupMaxPause)
+	if !until.After(now) {
+		return false
+	}
+	// 暂停不超过 startupMaxPause：记下的时间在未来（时钟回拨）时也只暂停这么久
+	until = minTime(until, now.Add(startupMaxPause))
+	manager.mu.RLock()
+	account := manager.accounts[accountID]
+	manager.mu.RUnlock()
+	if account == nil {
+		return false
+	}
+	generation := manager.pool.AuthGeneration(accountID)
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	if account.startFailTotal > 0 || account.startFailUntil.Load() != 0 {
+		return false
+	}
+	account.startFailKind = startupFailurePageBlocked
+	account.startFailCount = len(startupAmbiguousPauses)
+	account.startFailTotal = max(record.Count, 1)
+	account.startFailEvidence = max(record.Count, startupPageBlockedConfirmCount)
+	account.startFailStage = record.Stage
+	account.startFailFirst, account.startFailLast = record.FirstAt, record.LastAt
+	stored := errors.New(record.Message)
+	account.startFailErr.Store(&stored)
+	account.startFailGen.Store(generation)
+	account.startFailUntil.Store(until.UnixNano())
+	time.AfterFunc(until.Sub(now), manager.notifyScheduling)
+	return true
+}
+
+// minTime 返回较早的时间
+func minTime(left time.Time, right time.Time) time.Time {
+	if right.Before(left) {
+		return right
+	}
+	return left
 }

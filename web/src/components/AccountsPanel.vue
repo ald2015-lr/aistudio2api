@@ -304,10 +304,17 @@ let startupFailuresTimer: number | undefined
 // startupFailuresVersion 在清除记录、清除暂停或一键删除后递增：之前发出、之后才返回的读取结果不再覆盖列表
 let startupFailuresVersion = 0
 
-// startupDead 为确定失效的账户（登录失效或认证文件无法使用），可以一键删除；
-// startupPaused 为启动反复失败、原因不确定或指纹文件损坏的账户，只暂停调度，只读，不提供删除
+// startupDead 为确定失效的账户（登录失效、认证文件无法使用，或号池健康时连续页面受阻），可以一键删除；
+// startupPaused 为启动反复失败、原因不确定、指纹文件损坏或页面受阻还没确认的账户，只暂停调度，只读，不提供删除
 const startupDead = computed(() => startupFailures.value.filter((account) => account.confirmed))
 const startupPaused = computed(() => startupFailures.value.filter((account) => !account.confirmed))
+// startupDeadPageBlocked 为确认为页面受阻的失效账户数：账户状态仍是就绪，卡片另给检查与删除的建议
+const startupDeadPageBlocked = computed(
+  () => startupDead.value.filter((account) => account.kind === 'page_blocked').length,
+)
+// startupPageBlockedBurst 为大量账户同时页面受阻（可能是官网页面改版）：服务端暂不确认新的页面受阻失效，
+// 卡片顶部显示黄色提示，一键删除的确认框另加警告；旧版服务端没有这个字段
+const startupPageBlockedBurst = computed(() => props.startup?.page_blocked_burst === true)
 const visibleStartupDead = computed(() =>
   showAllStartupDead.value
     ? startupDead.value
@@ -323,11 +330,12 @@ const accountsByID = computed(() => new Map(props.accounts.map((account) => [acc
 // pauseClock 为判断暂停是否到期用的时钟，每 10 秒变化一次：账户表不随每秒的倒计时重新渲染
 const pauseClock = computed(() => Math.floor(clock.value / 10000) * 10000)
 
-// startupPauses 为仍在暂停中的启动失败（账户 ID → 记录与到期时间），供账户表 Worker 列显示；已到期的不再显示
+// startupPauses 为仍在暂停中的启动失败（账户 ID → 记录与到期时间），供账户表 Worker 列显示；已到期的不再显示。
+// 确认为页面受阻的账户状态仍是就绪、继续按 30 分钟暂停重试，带 until 时同样显示；登录失效等持久记录没有 until，不显示
 const startupPauses = computed(() => {
   const now = pauseClock.value
   const pauses = new Map<string, { entry: StartupFailureAccount; until: number }>()
-  for (const entry of startupPaused.value) {
+  for (const entry of startupFailures.value) {
     const until = Date.parse(entry.until ?? '')
     if (Number.isFinite(until) && until > now) pauses.set(entry.id, { entry, until })
   }
@@ -374,9 +382,14 @@ function scheduleStartupFailuresLoad(): void {
   }, wait)
 }
 
-// 原因不确定的启动失败不改变账户状态，不会推送账户事件，所以也跟随状态接口的暂停中与失效账户数刷新
+// 原因不确定与页面受阻的启动失败不改变账户状态，不会推送账户事件，所以也跟随状态接口的暂停中、失效账户数与页面受阻爆发刷新
 watch(
-  [() => props.accounts, () => props.startup?.paused, () => props.startup?.dead],
+  [
+    () => props.accounts,
+    () => props.startup?.paused,
+    () => props.startup?.dead,
+    () => props.startup?.page_blocked_burst,
+  ],
   scheduleStartupFailuresLoad,
 )
 onMounted(() => {
@@ -390,6 +403,7 @@ const startupKindKeys: Record<StartupFailureKind, TranslationKey> = {
   auth: 'accounts.startupFailureKindAuth',
   files: 'accounts.startupFailureKindFiles',
   fingerprint: 'accounts.startupFailureKindFingerprint',
+  page_blocked: 'accounts.startupFailureKindPageBlocked',
   ambiguous: 'accounts.startupFailureKindAmbiguous',
 }
 
@@ -399,9 +413,16 @@ function startupKindLabel(entry: StartupFailureAccount): string {
   return key === undefined ? entry.kind : t(key)
 }
 
-// startupFailureReason 为原因一栏：类别名加原因摘要（没有摘要时用错误原文），过长时截断，完整内容见悬停提示
+// startupFailureReason 为原因一栏：类别名加原因摘要（没有摘要时用错误原文），过长时截断，完整内容见悬停提示。
+// 确认为页面受阻的原因说明各账户相同（卡片另有说明），改为优先显示错误摘要（填不进提示词还是 Run 按钮不可用）；
+// 未确认的页面受阻仍先显示原因（带失效确认的进度）
 function startupFailureReason(entry: StartupFailureAccount): string {
-  const reason = (entry.reason ?? '').trim() || (entry.message ?? '').trim()
+  const reasonText = (entry.reason ?? '').trim()
+  const messageText = (entry.message ?? '').trim()
+  const reason =
+    entry.kind === 'page_blocked' && entry.confirmed
+      ? messageText || reasonText
+      : reasonText || messageText
   const kind = startupKindLabel(entry)
   return reason === '' ? kind : `${kind} · ${reason}`
 }
@@ -1240,13 +1261,14 @@ function stillStartupDead<T extends BulkTarget>(accounts: readonly T[]): T[] {
 async function deleteStartupDead(): Promise<void> {
   const confirmed = startupDead.value.map(({ id, label }) => ({ id, label }))
   if (busy.value || oneClickDeleting.value || confirmed.length === 0) return
-  if (
-    !(await confirmAction(
-      tf('accounts.startupDeadDeleteConfirm', { count: confirmed.length }),
-      t('accounts.startupDeadDelete'),
-    ))
-  )
-    return
+  // 页面受阻确认的账户状态仍是就绪、登录可能正常，确认框写明个数；大量账户同时页面受阻时另加警告，不建议批量删除
+  let message = tf('accounts.startupDeadDeleteConfirm', { count: confirmed.length })
+  const pageBlocked = startupDeadPageBlocked.value
+  if (pageBlocked > 0) {
+    message += tf('accounts.startupDeadDeletePageBlocked', { count: pageBlocked })
+  }
+  if (startupPageBlockedBurst.value) message += t('accounts.startupDeadDeleteBurst')
+  if (!(await confirmAction(message, t('accounts.startupDeadDelete')))) return
   if (busy.value || oneClickDeleting.value) return
   startupDeadDeleting.value = true
   const totals: OneClickDeleteTotals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
@@ -1534,11 +1556,19 @@ function closeBulkPanel(): void {
         </button>
       </div>
 
-      <!-- 失效账户：启动 Worker 时登录已失效或认证文件无法使用（确定失效），可以一键删除 -->
+      <!-- 失效账户：启动 Worker 时登录已失效、认证文件无法使用或号池健康时连续页面受阻（确定失效），可以一键删除 -->
       <div
         v-if="startupDead.length > 0"
         class="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm"
       >
+        <!-- 大量账户同时页面受阻：可能是官网页面改版，服务端暂不确认新的页面受阻失效 -->
+        <p
+          v-if="startupPageBlockedBurst"
+          class="mb-2 rounded border border-yellow-500/40 bg-yellow-500/10 px-2 py-1 text-xs leading-5 text-yellow-300"
+          role="status"
+        >
+          {{ t('accounts.startupPageBlockedBurst') }}
+        </p>
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
             <span
@@ -1604,6 +1634,10 @@ function closeBulkPanel(): void {
             </button>
           </div>
         </div>
+        <!-- 页面受阻确认的账户：账户状态仍是就绪，说明怎么检查、什么时候不要批量删除 -->
+        <p v-if="startupDeadPageBlocked > 0" class="mt-2 text-xs leading-5 text-gray-400">
+          {{ tf('accounts.startupPageBlockedHelp', { count: startupDeadPageBlocked }) }}
+        </p>
         <div class="mt-2 overflow-x-auto">
           <table class="w-full text-xs">
             <thead>
@@ -1657,6 +1691,15 @@ function closeBulkPanel(): void {
           }}
         </button>
       </div>
+
+      <!-- 没有失效账户时，页面受阻爆发的提示单独显示（这时服务端不确认新的页面受阻失效，账户在下方未确认列表里） -->
+      <p
+        v-if="startupDead.length === 0 && startupPageBlockedBurst"
+        class="rounded-lg border border-yellow-500/40 bg-yellow-500/10 p-3 text-xs leading-5 text-yellow-300"
+        role="status"
+      >
+        {{ t('accounts.startupPageBlockedBurst') }}
+      </p>
 
       <!-- 启动反复失败（未确认）：原因不确定，机器负载高或网络慢时健康账户也会这样，只暂停调度，只能验证或清除暂停，不能删除 -->
       <details
