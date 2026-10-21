@@ -136,8 +136,10 @@ func (t *WorkerProtectedTransport) doBrowserPrepared(
 	}
 	headers := rpc.Header.Clone()
 	headers.Set("Authorization", authorization)
-	if lease.CoolingDown(selection.ModelID) {
-		return nil, ErrAccountCoolingDown
+	// 发出前一次加锁：租约账户已进入冷却时不发送（返回带恢复时间的 AccountCoolingDownError），否则记一次发送计入每分钟上限。
+	// 401 续签后的重放会再进入这里，再检查一次冷却、再记一次发送
+	if err := lease.beginGenerationSend(selection.ModelID); err != nil {
+		return nil, err
 	}
 	reportRequestPhase(ctx, RequestPhaseSendingUpstream)
 	response, err := worker.SendProtected(ctx, ProtectedRequest{

@@ -134,6 +134,33 @@ func TestWorkerPartitionCaps(t *testing.T) {
 	}
 }
 
+// TestExpandableSkipsShortCoolingVictim 分区已满时后台扩容只替换冷却剩余不少于 ShortCooldownMax 的空闲 Worker：
+// 驻留的 A 只是短冷却（分钟限额，一分钟内恢复）时不为备用账户 B 替换它，冷却 3 分钟时可以
+func TestExpandableSkipsShortCoolingVictim(t *testing.T) {
+	manager, pool, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB}, nil, 1, 1, 0, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := manager.promote(ctx, partitionNormalA, testRuntimeModel); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.MarkCooldownIfGeneration(partitionNormalA, "", pool.ModelAccessGeneration(partitionNormalA),
+		time.Now(), time.Now().Add(30*time.Second), aistudio.MinuteQuotaKind+": 每分钟 12 次"); err != nil {
+		t.Fatal(err)
+	}
+	capacity := manager.standbyCapacity(manager.WarmAccountIDs(), testRuntimeModel)
+	if got := capacity.expandable([]string{partitionNormalB}); got != "" {
+		t.Fatalf("A 只是短冷却时不应为 B 扩容替换它，实际 %q", got)
+	}
+	if err := pool.MarkCooldownIfGeneration(partitionNormalA, "", pool.ModelAccessGeneration(partitionNormalA),
+		time.Now(), time.Now().Add(3*time.Minute), aistudio.MinuteQuotaKind+": 每分钟 12 次"); err != nil {
+		t.Fatal(err)
+	}
+	capacity = manager.standbyCapacity(manager.WarmAccountIDs(), testRuntimeModel)
+	if got := capacity.expandable([]string{partitionNormalB}); got != partitionNormalB {
+		t.Fatalf("A 冷却 3 分钟时应可为 B 扩容替换它，实际 %q", got)
+	}
+}
+
 // TestPrewarmTargetsPerPartition 预热把每个分区从自己的账户补齐到自己的常驻数；Ultra 常驻数为 0 时只按需启动
 func TestPrewarmTargetsPerPartition(t *testing.T) {
 	for _, test := range []struct {

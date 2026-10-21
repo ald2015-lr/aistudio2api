@@ -517,9 +517,10 @@ func (service *trackedService) registerDeadWorkersIn(warm []string, models []str
 type victimMode int
 
 const (
-	// victimAny 任意空闲 Worker：死槽位优先，其次冷却中的，再次最久未用
+	// victimAny 任意空闲 Worker：死槽位优先，其次冷却中的，再次最久未用；剩余不到 aistudio.ShortCooldownMax 的短冷却
+	// （分钟限额、限流）不算冷却中，与健康的空闲 Worker 同档按最久未用排序
 	victimAny victimMode = iota
-	// victimCooling 只选冷却中的（不论剩余多久），死槽位优先
+	// victimCooling 只选冷却中的（剩余不少于 ShortCooldownMax，见 WarmWorkerStates），死槽位优先
 	victimCooling
 	// victimDead 只选死槽位（账号长时间冷却）
 	victimDead

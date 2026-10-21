@@ -154,6 +154,9 @@ type schedulingIndex struct {
 	blocked     []bool
 	active      []int32
 	draining    []bool
+	// rateUntil 为账户每分钟窗口已满的截止时刻（rateUntilOf，UnixNano；0 未满，rateUntilPending 为只因预占而满），
+	// 由 rateChangedLocked 更新；分类时满窗的候选按忙碌处理
+	rateUntil []int64
 	// coolVersion 为上次按目录版本核对 coolUntil 时的 eligibilityVersion，coolSyncedAt 为核对时刻：Build 通道是否可用于某模型
 	// 还取决于其他账户的 Playground 目录（见 buildSupportsModelLocked），这个跨账户依赖按节流全量重算（见 refreshCoolingLocked）
 	coolVersion  uint64
@@ -174,7 +177,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			ids: make([]string, size), enabled: make([]bool, size), state: make([]AccountState, size),
 			tier: make([]BenefitTier, size), globalUntil: make([]int64, size), coolUntil: make([]int64, size),
 			blocked: make([]bool, size), active: make([]int32, size), draining: make([]bool, size), warmStamp: make([]uint32, size),
-			coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
+			rateUntil: make([]int64, size), coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
 		}
 		for position, account := range p.accounts {
 			if account == nil {
@@ -186,6 +189,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			index.blocked[position] = accountBlocked(account)
 			index.active[position] = int32(account.active)
 			index.draining[position] = account.draining
+			index.rateUntil[position] = rateUntilOf(account)
 		}
 		p.sched = index
 	}
@@ -411,6 +415,7 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 		index.blocked = append(index.blocked, accountBlocked(account))
 		index.active = append(index.active, int32(account.active))
 		index.draining = append(index.draining, account.draining)
+		index.rateUntil = append(index.rateUntil, rateUntilOf(account))
 		index.warmStamp = append(index.warmStamp, 0)
 		// 新账户可能已在热账户列表里，下次分类重新标记
 		index.lastWarm = nil
@@ -654,26 +659,36 @@ func (p *AccountPool) classifyIndexedLocked(
 	available := set.available
 	start := set.rotationStartLocked(p)
 	limit := int32(p.perAccountConcurrency)
+	gate := p.rateGateLocked(set.selection, now)
 	// 备用账户通常占候选的绝大多数，一次分配够
 	groups.StandbyReady = make([]string, 0, len(available))
 	for _, position := range available[start:] {
 		if !exclusion.has(position) {
-			classifyIndexedCandidate(&groups, index, position, generation, limit)
+			classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
 		}
 	}
 	for _, position := range available[:start] {
 		if !exclusion.has(position) {
-			classifyIndexedCandidate(&groups, index, position, generation, limit)
+			classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
 		}
 	}
 	return groups
 }
 
 // classifyIndexedCandidate 按忙闲数组与热账户代数把候选分进对应分组；只用于不固定账户的选择，
-// 排空中的账户（见 SetDraining）按忙碌处理：热账户分进 WarmBusy，备用账户分进 StandbyBusy
-func classifyIndexedCandidate(groups *AccountCandidateGroups, index *schedulingIndex, position int, generation uint32, limit int32) {
+// 排空中的账户（见 SetDraining）与每分钟请求已满的账户（gate 打开时）按忙碌处理：热账户分进 WarmBusy，备用账户分进 StandbyBusy
+func classifyIndexedCandidate(
+	groups *AccountCandidateGroups, index *schedulingIndex, position int, generation uint32, limit int32, gate rateGate,
+) {
 	isWarm := index.warmStamp[position] == generation
 	blocked := index.blocked[position] || index.draining[position]
+	if gate.full(index.rateUntil[position]) {
+		groups.RateLimited++
+		if isWarm {
+			groups.WarmRateLimited++
+		}
+		blocked = true
+	}
 	active := index.active[position]
 	accountID := index.ids[position]
 	switch {
@@ -712,6 +727,7 @@ func (p *AccountPool) classifyAllowedLocked(
 	}
 	generation := index.stampWarmLocked(p, warmAccountIDs)
 	limit := int32(p.perAccountConcurrency)
+	gate := p.rateGateLocked(set.selection, now)
 	groups := AccountCandidateGroups{}
 	for offset := range positions {
 		position := positions[(start+offset)%len(positions)]
@@ -722,16 +738,26 @@ func (p *AccountPool) classifyAllowedLocked(
 			}
 			continue
 		}
-		classifyIndexedCandidate(&groups, index, position, generation, limit)
+		classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
 	}
 	return groups
 }
 
 // classifyCandidate 按账户字段的忙闲与是否为热账户把候选分进对应分组（逐个账户判断的路径使用）；
-// shared 为不固定账户的选择，这时排空中的账户按忙碌处理，指定账户或文件绑定的选择不看排空
-func classifyCandidate(groups *AccountCandidateGroups, account *Account, warm map[string]struct{}, perAccountConcurrency int, shared bool) {
+// shared 为不固定账户的选择，这时排空中的账户按忙碌处理，指定账户或文件绑定的选择不看排空；
+// 每分钟请求已满的账户（gate 打开时）同样按忙碌处理
+func classifyCandidate(
+	groups *AccountCandidateGroups, account *Account, warm map[string]struct{}, perAccountConcurrency int, shared bool, gate rateGate,
+) {
 	_, isWarm := warm[account.ID]
 	blocked := accountBlocked(account) || shared && account.draining
+	if gate.full(rateUntilOf(account)) {
+		groups.RateLimited++
+		if isWarm {
+			groups.WarmRateLimited++
+		}
+		blocked = true
+	}
 	switch {
 	case isWarm && !blocked && account.active == 0:
 		groups.WarmReady = append(groups.WarmReady, account.ID)
@@ -767,7 +793,7 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 		return fmt.Errorf("候选索引账户版本 %d 与账户池 %d 不符", index.accountsVersion, p.accountsVersion)
 	}
 	if len(index.ids) != len(p.accounts) || len(index.blocked) != len(p.accounts) || len(index.active) != len(p.accounts) ||
-		len(index.draining) != len(p.accounts) {
+		len(index.draining) != len(p.accounts) || len(index.rateUntil) != len(p.accounts) {
 		return fmt.Errorf("候选索引数组长度与账户数 %d 不符", len(p.accounts))
 	}
 	for position, account := range p.accounts {
@@ -796,6 +822,27 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 		}
 	}
 	nowNanos := time.Now().UnixNano()
+	// 每分钟窗口：数组与账户缓存一致；缓存与按当前时刻现算的结果对“是否满窗”判断相同，都满时截止时刻相同
+	// （没有事件时随时间修剪只移动窗口起点，不改变截止时刻）
+	for position, account := range p.accounts {
+		if account == nil {
+			continue
+		}
+		cached := rateUntilOf(account)
+		if index.rateUntil[position] != cached {
+			return fmt.Errorf("账户 %s 的每分钟窗口数组 %d 与账户缓存 %d 不符", account.ID, index.rateUntil[position], cached)
+		}
+		if account.rate == nil {
+			continue
+		}
+		fresh := p.computeRateUntilLocked(account.rate, nowNanos)
+		if (fresh > nowNanos) != (cached > nowNanos) || fresh > nowNanos && fresh != cached {
+			return fmt.Errorf("账户 %s 的每分钟窗口缓存 %d 与现算结果 %d 不符（当前 %d）", account.ID, cached, fresh, nowNanos)
+		}
+		if account.rate.pending < 0 {
+			return fmt.Errorf("账户 %s 的每分钟预占数 %d 为负", account.ID, account.rate.pending)
+		}
+	}
 	for key, set := range index.sets {
 		if len(set.until) != len(p.accounts) {
 			return fmt.Errorf("候选集 %+v 的下标数 %d 与账户数 %d 不符", key, len(set.until), len(p.accounts))

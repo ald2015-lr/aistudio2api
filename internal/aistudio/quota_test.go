@@ -6,9 +6,19 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+// userMinuteQuotaPayload 为用户遇到的真实 429 状态（AI Studio 网页后端每账号每分钟 12 次的生成限额）：只有 ErrorInfo 与 Help，
+// 没有 RetryInfo
+const userMinuteQuotaPayload = `[8,"Quota exceeded for quota metric 'Generate requests' and limit 'Generate requests per minute per user' of service 'alkalimakersuite-pa.googleapis.com' for consumer 'project_number:823511539352'.",` +
+	`[["type.googleapis.com/google.rpc.ErrorInfo",["RATE_LIMIT_EXCEEDED","googleapis.com",[` +
+	`["quota_limit_value","12"],["quota_unit","1/min/{project}/{user}"],["window_start_time","1792587739"],` +
+	`["consumer","projects/823511539352"],["quota_metric","alkalimakersuite-pa.googleapis.com/generate_requests_global"],` +
+	`["service","alkalimakersuite-pa.googleapis.com"],["quota_limit","GeneratePerMinutePerProjectPerUser"],["quota_location","global"]]]],` +
+	`["type.googleapis.com/google.rpc.Help",[[["Request a higher quota limit.","https://cloud.google.com/docs/quotas/help/request_increase"]]]]]]`
 
 func quotaError(message string, metadata map[string]string, retry time.Duration) *RPCError {
 	return &RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: message, Metadata: metadata, RetryDelay: retry}
@@ -103,6 +113,31 @@ func TestQuotaCooldownClassification(t *testing.T) {
 			}, 0),
 			kind: "分钟限额", until: now.Add(50 * time.Second),
 		},
+		{
+			// AI Studio 网页后端每账号每分钟的限额：quota_unit 给出周期，_global 指标冻结整个账号
+			name: "只有 quota_unit 与全局指标时按全局分钟限额",
+			err: quotaError("quota", map[string]string{
+				"quota_unit":   "1/min/{project}/{user}",
+				"quota_metric": "alkalimakersuite-pa.googleapis.com/generate_requests_global",
+			}, 0),
+			kind: MinuteQuotaKind, global: true, until: now.Add(time.Minute),
+		},
+		{
+			name: "只有全局指标、没有周期证据时按全局限流",
+			err: quotaError("quota", map[string]string{
+				"quota_metric": "alkalimakersuite-pa.googleapis.com/generate_requests_global",
+			}, 0),
+			kind: RateLimitKind, global: true, until: now.Add(unknownRateLimitCooldown),
+		},
+		{
+			// quota_unit 排在 quota_limit 之前：单位是每分钟时，即使限额名带 PerDay 也按分钟限额
+			name: "quota_unit 为每分钟时优先于 quota_limit 的 PerDay",
+			err: quotaError("quota", map[string]string{
+				"quota_unit":  "1/min/{project}/{user}",
+				"quota_limit": "GenerateRequestsPerDayPerProjectPerUser",
+			}, 0),
+			kind: MinuteQuotaKind, global: true, until: now.Add(time.Minute),
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			cooldown, ok := QuotaCooldownForError(test.err, now)
@@ -116,6 +151,67 @@ func TestQuotaCooldownClassification(t *testing.T) {
 	}
 	if _, ok := QuotaCooldownForError(&RPCError{StatusCode: http.StatusBadRequest}, now); ok {
 		t.Fatal("非 429 不应冷却")
+	}
+}
+
+// TestQuotaCooldownUserMinuteSample 用户样本按全局分钟限额冷却到窗口结束（window_start_time+60s），窗口已过、恰好结束或远在未来时
+// 冷却一分钟；独立错误与 Build 流尾两条解码路径结果相同，冷却带上游给出的限额值与去掉服务名前缀的指标
+func TestQuotaCooldownUserMinuteSample(t *testing.T) {
+	start := time.Unix(1792587739, 0)
+	decoded := map[string]*RPCError{
+		"独立错误": DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(userMinuteQuotaPayload)),
+	}
+	var trailer *RPCError
+	if err := buildTrailerError(json.RawMessage(userMinuteQuotaPayload)); !errors.As(err, &trailer) {
+		t.Fatalf("Build 流尾错误=%v", err)
+	}
+	decoded["Build 流尾"] = trailer
+	for name, rpcError := range decoded {
+		if rpcError.StatusCode != http.StatusTooManyRequests || rpcError.RetryDelay != 0 || rpcError.Metadata["quota_limit_value"] != "12" {
+			t.Fatalf("%s: RPC error=%+v", name, rpcError)
+		}
+		for _, test := range []struct {
+			offset time.Duration
+			want   func(now time.Time) time.Time
+		}{
+			{0, func(time.Time) time.Time { return start.Add(time.Minute) }},
+			{20 * time.Second, func(time.Time) time.Time { return start.Add(time.Minute) }},
+			{59 * time.Second, func(time.Time) time.Time { return start.Add(time.Minute) }},
+			{60 * time.Second, func(now time.Time) time.Time { return now.Add(time.Minute) }},
+			{90 * time.Second, func(now time.Time) time.Time { return now.Add(time.Minute) }},
+			{-5 * time.Second, func(now time.Time) time.Time { return now.Add(time.Minute) }},
+		} {
+			now := start.Add(test.offset)
+			cooldown, ok := QuotaCooldownForError(rpcError, now)
+			if !ok {
+				t.Fatalf("%s 偏移 %s：429 没有产生冷却", name, test.offset)
+			}
+			if want := test.want(now); !cooldown.Until.Equal(want) {
+				t.Fatalf("%s 偏移 %s：Until=%s，期望 %s", name, test.offset, cooldown.Until, want)
+			}
+			if cooldown.Kind != MinuteQuotaKind || !cooldown.Global || cooldown.LimitValue != "12" ||
+				cooldown.Metric != "generate_requests_global" || !strings.HasPrefix(cooldown.Reason, MinuteQuotaKind+": ") {
+				t.Fatalf("%s 偏移 %s：cooldown=%+v", name, test.offset, cooldown)
+			}
+		}
+	}
+}
+
+// TestQuotaMetricName 冷却日志里的指标去掉服务名前缀，没有前缀时原样返回
+func TestQuotaMetricName(t *testing.T) {
+	for metric, want := range map[string]string{
+		"alkalimakersuite-pa.googleapis.com/generate_requests_global": "generate_requests_global",
+		" generate_requests_global ":                                  "generate_requests_global",
+		"":                                                            "",
+	} {
+		if got := quotaMetricName(metric); got != want {
+			t.Fatalf("quotaMetricName(%q)=%q，期望 %q", metric, got, want)
+		}
+	}
+	// 没有 quota_metric 与 quota_limit_value 时两个字段为空
+	cooldown, ok := QuotaCooldownForError(quotaError("quota", map[string]string{"quota_limit": "GenerateRequestsPerMinutePerProjectPerModel"}, 0), time.Now())
+	if !ok || cooldown.Metric != "" || cooldown.LimitValue != "" {
+		t.Fatalf("cooldown=%+v，期望没有指标与限额值", cooldown)
 	}
 }
 

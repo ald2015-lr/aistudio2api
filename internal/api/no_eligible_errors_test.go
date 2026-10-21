@@ -49,7 +49,7 @@ func TestNoEligibleAccountPublicStatus(t *testing.T) {
 	}
 }
 
-// TestRequestErrorRetryAfter 全部冷却且已知最早恢复时间时，三种协议的错误响应都带 Retry-After；其他错误不带
+// TestRequestErrorRetryAfter 全部冷却且已知最早恢复时间时，三种协议的错误响应都带 Retry-After（较长的间隔带随机抖动）；其他错误不带
 func TestRequestErrorRetryAfter(t *testing.T) {
 	cooling := &aistudio.AllCoolingError{ModelID: "test-model", Until: time.Now().Add(90 * time.Second)}
 	for name, write := range map[string]func(http.ResponseWriter, error){
@@ -60,9 +60,10 @@ func TestRequestErrorRetryAfter(t *testing.T) {
 		if recorder.Code != http.StatusTooManyRequests {
 			t.Fatalf("%s 状态码 = %d，期望 429", name, recorder.Code)
 		}
+		// 90 秒的建议间隔另加 0–3 秒的随机抖动（见 retryAfterSeconds）
 		seconds, err := strconv.Atoi(recorder.Header().Get("Retry-After"))
-		if err != nil || seconds < 89 || seconds > 91 {
-			t.Fatalf("%s Retry-After = %q，期望约 90 秒", name, recorder.Header().Get("Retry-After"))
+		if err != nil || seconds < 89 || seconds > 94 {
+			t.Fatalf("%s Retry-After = %q，期望约 90 秒（含 0–3 秒抖动）", name, recorder.Header().Get("Retry-After"))
 		}
 		unavailable := httptest.NewRecorder()
 		write(unavailable, &aistudio.AccountsNotReadyError{Reasons: []string{"a 需要重新登录"}})

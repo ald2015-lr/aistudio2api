@@ -402,7 +402,7 @@ func TestReclaimDeadWorkerStaysInPartition(t *testing.T) {
 	}
 }
 
-// TestIdleVictimPrefersDeadWorker 淘汰选号：死槽位优先于短暂冷却的账号，再优先于最久未用的账号；
+// TestIdleVictimPrefersDeadWorker 淘汰选号：死槽位优先于冷却剩余不少于 ShortCooldownMax 的账号，再优先于最久未用的账号；
 // 账户池只加锁一次，结果与原先逐个查询一致
 func TestIdleVictimPrefersDeadWorker(t *testing.T) {
 	manager, pool, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB, partitionNormalC}, nil, 3, 3, 0, 1)
@@ -426,9 +426,9 @@ func TestIdleVictimPrefersDeadWorker(t *testing.T) {
 	if got := manager.idleWarmVictimFor("", testRuntimeModel, true, aistudio.PoolScopeNormal); got != "" {
 		t.Fatalf("没有冷却时只选冷却账号应为空，实际 %q", got)
 	}
-	// B 分钟限额（短暂冷却），A 全局长时间冷却
+	// B 冷却剩余不少于 ShortCooldownMax（剩余不到它的短冷却不算冷却中），A 全局长时间冷却
 	if err := pool.MarkCooldownIfGeneration(partitionNormalB, testRuntimeModel, pool.ModelAccessGeneration(partitionNormalB),
-		time.Now(), time.Now().Add(30*time.Second), "分钟限额"); err != nil {
+		time.Now(), time.Now().Add(3*time.Minute), "分钟限额"); err != nil {
 		t.Fatal(err)
 	}
 	if got := manager.idleWarmVictimFor("", testRuntimeModel, false, aistudio.PoolScopeNormal); got != partitionNormalB {
@@ -436,7 +436,7 @@ func TestIdleVictimPrefersDeadWorker(t *testing.T) {
 	}
 	coolGlobally(t, pool, partitionNormalA)
 	if got := manager.idleWarmVictimFor("", testRuntimeModel, false, aistudio.PoolScopeNormal); got != partitionNormalA {
-		t.Fatalf("长时间冷却的死槽位 A 应优先于短暂冷却的 B，实际 %q", got)
+		t.Fatalf("长时间冷却的死槽位 A 应优先于冷却中的 B，实际 %q", got)
 	}
 	if got := manager.pickIdleVictim("", testRuntimeModel, victimDead, aistudio.PoolScopeNormal); got != partitionNormalA {
 		t.Fatalf("只选死槽位应为 A，实际 %q", got)
@@ -448,6 +448,48 @@ func TestIdleVictimPrefersDeadWorker(t *testing.T) {
 	}
 	if got := manager.idleWarmVictimFor("", testRuntimeModel, false, aistudio.PoolScopeNormal); got != partitionNormalB {
 		t.Fatalf("死槽位忙碌时应选冷却中的 B，实际 %q", got)
+	}
+}
+
+// TestIdleVictimIgnoresShortCooling 淘汰选号：剩余不到 ShortCooldownMax 的短冷却（分钟限额）不算冷却中，与健康的空闲 Worker 同档
+// 按最久未用排序，只选冷却账号时不选它；冷却剩余不少于 ShortCooldownMax 时照常算冷却中
+func TestIdleVictimIgnoresShortCooling(t *testing.T) {
+	manager, pool, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB, partitionNormalC}, nil, 3, 3, 0, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	// 先启动 C 再启动 B、A，让 C 最久未用
+	for _, accountID := range []string{partitionNormalC, partitionNormalB, partitionNormalA} {
+		if _, err := manager.promote(ctx, accountID, testRuntimeModel); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := pool.AcquireFor(ctx, aistudio.AccountSelection{AccountID: accountID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = lease.Release()
+		time.Sleep(2 * time.Millisecond)
+	}
+	// B 全局分钟限额，30 秒后恢复
+	if err := pool.MarkCooldownIfGeneration(partitionNormalB, "", pool.ModelAccessGeneration(partitionNormalB),
+		time.Now(), time.Now().Add(30*time.Second), aistudio.MinuteQuotaKind+": 每分钟 12 次"); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.idleWarmVictimFor("", testRuntimeModel, false, aistudio.PoolScopeNormal); got != partitionNormalC {
+		t.Fatalf("短冷却的 B 不应优先，应选最久未用的 C，实际 %q", got)
+	}
+	if got := manager.idleWarmVictimFor("", testRuntimeModel, true, aistudio.PoolScopeNormal); got != "" {
+		t.Fatalf("只选冷却账号时短冷却的 B 不算，应为空，实际 %q", got)
+	}
+	if got := manager.idleWarmVictimFor("", "", false, aistudio.PoolScopeNormal); got != partitionNormalC {
+		t.Fatalf("不针对模型时同样应选最久未用的 C，实际 %q", got)
+	}
+	// 改为 3 分钟后恢复：剩余不少于 ShortCooldownMax，算冷却中
+	if err := pool.MarkCooldownIfGeneration(partitionNormalB, "", pool.ModelAccessGeneration(partitionNormalB),
+		time.Now(), time.Now().Add(3*time.Minute), aistudio.MinuteQuotaKind+": 每分钟 12 次"); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.idleWarmVictimFor("", testRuntimeModel, true, aistudio.PoolScopeNormal); got != partitionNormalB {
+		t.Fatalf("冷却剩余 3 分钟的 B 应算冷却中，实际 %q", got)
 	}
 }
 

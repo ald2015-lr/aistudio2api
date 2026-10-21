@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"math/rand/v2"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -124,6 +125,10 @@ func publicErrorFor(err error, model string) publicError {
 	}
 	var cooling *aistudio.AllCoolingError
 	if errors.As(err, &cooling) {
+		return rateLimitPublicError()
+	}
+	// 租约账号在请求发出前进入冷却、又不能再换号：与全部冷却一样按 429 返回，带类型时 RetryAt 写进 Retry-After；原先落到兜底的 502/500
+	if errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return rateLimitPublicError()
 	}
 	// 主用模型排队超过上限（号池繁忙）：与全部冷却一样按 429 返回，Retry-After 由 setRetryAfter 按 RetryAt 写入
@@ -459,8 +464,27 @@ type retryAtProvider interface {
 	RetryAt() time.Time
 }
 
-// setRetryAfter 在 429、503 且已知最早恢复时间时写入 Retry-After（整秒，向上取整，至少 1 秒），
-// 客户端与中转据此退避，不必盲目重试
+const (
+	// Retry-After 在建议重试时间上随机往后加 0 到 min(建议间隔/5s, 3) 秒（不到 5 秒不加）：冷却一到期，
+	// 拿到同一个恢复时间的请求不会在同一秒一起涌上来。只往后加，不早于真实恢复时间
+	retryAfterJitterStep = 5 * time.Second
+	retryAfterJitterMax  = 3
+)
+
+// retryAfterSeconds 返回写进 Retry-After 的整秒数：建议间隔向上取整、至少 1 秒，再按 retryAfterJitterStep 加随机抖动。
+// 内部的恢复时间（RetryAt、进度里的“建议重试=”）不受影响
+func retryAfterSeconds(until time.Time, now time.Time) int64 {
+	wait := until.Sub(now)
+	seconds := max(int64(math.Ceil(wait.Seconds())), 1)
+	if spread := min(int64(wait/retryAfterJitterStep), retryAfterJitterMax); spread > 0 {
+		// math/rand/v2 的顶层函数并发安全
+		seconds += rand.Int64N(spread + 1)
+	}
+	return seconds
+}
+
+// setRetryAfter 在 429、503 且已知最早恢复时间时写入 Retry-After（整秒，向上取整，至少 1 秒，较长的间隔另加随机抖动，
+// 见 retryAfterSeconds），客户端与中转据此退避，不必盲目重试
 func setRetryAfter(w http.ResponseWriter, err error, status int) {
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
 		return
@@ -473,8 +497,7 @@ func setRetryAfter(w http.ResponseWriter, err error, status int) {
 	if until.IsZero() {
 		return
 	}
-	seconds := max(int64(math.Ceil(time.Until(until).Seconds())), 1)
-	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(until, time.Now()), 10))
 }
 
 // writeOpenAIRequestError 以 OpenAI 官方格式返回请求错误

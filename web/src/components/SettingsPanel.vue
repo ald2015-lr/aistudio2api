@@ -36,6 +36,7 @@ type EditableKey =
   | 'ultra_max_active_workers'
   | 'warm_startup_concurrency'
   | 'per_account_concurrency'
+  | 'account_rpm_limit'
   | 'routing_strategy'
   | 'upstream_channels'
   | 'stream_playground_models'
@@ -66,6 +67,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'ultra_max_active_workers',
   'warm_startup_concurrency',
   'per_account_concurrency',
+  'account_rpm_limit',
   'routing_strategy',
   'upstream_channels',
   'stream_playground_models',
@@ -156,6 +158,7 @@ const form = reactive<ServiceConfig>({
   ultra_max_active_workers: 5,
   warm_startup_concurrency: 2,
   per_account_concurrency: 2,
+  account_rpm_limit: 10,
   routing_strategy: 'round-robin',
   upstream_channels: ['playground', 'build'],
   stream_playground_models: [],
@@ -352,6 +355,11 @@ function validate(value: ServiceConfig): string {
   ]
   for (const [number, key] of numbers) {
     if (!isPositiveInteger(number)) return tf('settings.invalidNumber', { field: label(key) })
+  }
+  // 单账号每分钟上限可以为 0（关闭），最大 1000
+  const rpm = value.account_rpm_limit
+  if (typeof rpm !== 'number' || !Number.isInteger(rpm) || rpm < 0 || rpm > 1000) {
+    return t('settings.invalidAccountRpmLimit')
   }
   const floor = value.min_output_tokens
   if (typeof floor !== 'number' || !Number.isInteger(floor) || floor < 0) {
@@ -811,6 +819,19 @@ onBeforeUnmount(() => {
         </label>
       </div>
       <p class="-mt-4 text-xs leading-5 text-gray-500">{{ t('settings.workerPartitionHelp') }}</p>
+
+      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.accountRpmLimit') }}</span>
+        <input
+          v-model.number="form.account_rpm_limit"
+          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          type="number"
+          min="0"
+          max="1000"
+          required
+        />
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.accountRpmLimitHelp') }}</span>
+      </label>
 
       <fieldset class="block rounded-lg border border-fuchsia-500/30 bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.ultraTitle') }}</legend>

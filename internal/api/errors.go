@@ -118,6 +118,10 @@ func statusFromError(err error) int {
 	if errors.Is(err, aistudio.ErrModelNotFound) {
 		return http.StatusNotFound
 	}
+	// 租约账号在请求发出前进入冷却（请求没有发到上游）：与全部冷却一样按限流 429 返回，覆盖测试替身的裸哨兵与 errors.Join 包装过的错误
+	if errors.Is(err, aistudio.ErrAccountCoolingDown) {
+		return http.StatusTooManyRequests
+	}
 	var contract *aistudio.ToolContractError
 	if errors.As(err, &contract) {
 		return http.StatusBadGateway

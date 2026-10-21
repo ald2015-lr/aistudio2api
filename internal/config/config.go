@@ -28,6 +28,10 @@ const (
 	// defaultUltraWarmWorkerLimit 与 defaultUltraMaxActiveWorkers 为 Ultra 分区的常驻与峰值 Worker 数
 	defaultUltraWarmWorkerLimit  = 2
 	defaultUltraMaxActiveWorkers = 5
+	// defaultAccountRPMLimit 为单账号每分钟生成请求上限的默认值：上游每账号每分钟 12 次（所有模型、两个通道共用），留出余量；
+	// maxAccountRPMLimit 为允许配置的最大值
+	defaultAccountRPMLimit = 10
+	maxAccountRPMLimit     = 1000
 )
 
 // defaultUltraPrimaryModels 为 Ultra 主用模型的默认列表：Build 独有、需要订阅的模型只有 Ultra 号池能服务，
@@ -50,6 +54,7 @@ var configKeys = [...]string{
 	"ULTRA_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
+	"ACCOUNT_RPM_LIMIT",
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
 	"STREAM_PLAYGROUND_MODELS",
@@ -100,8 +105,11 @@ type Config struct {
 	MaxActiveWorkers       int           `json:"max_active_workers"`
 	WarmStartupConcurrency int           `json:"warm_startup_concurrency"`
 	PerAccountConcurrency  int           `json:"per_account_concurrency"`
-	RoutingStrategy        string        `json:"routing_strategy"`
-	UpstreamChannels       []string      `json:"upstream_channels"`
+	// AccountRPMLimit 为单账号最近 60 秒最多发出的生成请求数（ACCOUNT_RPM_LIMIT，默认 10，0 到 1000）：满了就算忙碌，
+	// 请求换到其他账号，热 Worker 都满时启动新的 Worker；只统计本进程，429 冷却仍兜底；0 表示关闭；保存后立即生效
+	AccountRPMLimit  int      `json:"account_rpm_limit"`
+	RoutingStrategy  string   `json:"routing_strategy"`
+	UpstreamChannels []string `json:"upstream_channels"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
 	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
 	StreamPlaygroundModels []string `json:"stream_playground_models"`
@@ -115,7 +123,8 @@ type Config struct {
 	PrimaryQueueWait time.Duration `json:"-"`
 	// UltraPrimaryModels 为 Ultra 主用模型 ID（ULTRA_PRIMARY_MODELS，逗号分隔，默认 gemini-4-argon）：只作用于 Ultra 号池
 	// （/ultra 请求，以及 ULTRA_EXCLUSIVE=false 时普通路径上不在 PrimaryModels 里的这些模型），排队上限为 UltraPrimaryQueueWait；
-	// 这些模型没有额度时立即返回 429（候选全部冷却立即返回，额度 429 后最多再换 2 次账号、只用已启动的 Worker），不在号池里挨个重试。
+	// 这些模型没有额度时立即返回 429（候选全部冷却立即返回；额度 429 后只用已启动的 Worker，每日额度用完最多再换 2 次账号，
+	// 分钟限额与限流最多再换 5 次），不在号池里挨个重试。
 	// 写空值表示关闭；进程环境变量的空值不生效（与其他配置项相同），关闭只能在 .env 里写空值或在管理页清空
 	UltraPrimaryModels []string `json:"ultra_primary_models"`
 	// UltraPrimaryQueueWait 为 Ultra 主用模型的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，规则与 PrimaryQueueWait 相同：默认 10s，
@@ -179,6 +188,7 @@ func Default() Config {
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
+		AccountRPMLimit:        defaultAccountRPMLimit,
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       append([]string(nil), upstreamChannels...),
 		PrimaryQueueWait:       defaultPrimaryQueueWait,
@@ -280,6 +290,13 @@ func Load(path string) (Config, error) {
 	}
 	if value, ok := values["PER_ACCOUNT_CONCURRENCY"]; ok {
 		cfg.PerAccountConcurrency, err = parsePositiveInt("PER_ACCOUNT_CONCURRENCY", value)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	// 空值沿用默认值，关闭必须写 0
+	if value, ok := values["ACCOUNT_RPM_LIMIT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.AccountRPMLimit, err = parseNonNegativeInt("ACCOUNT_RPM_LIMIT", value)
 		if err != nil {
 			return Config{}, err
 		}
@@ -390,6 +407,7 @@ func (c Config) Save(path string) error {
 		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
+		"ACCOUNT_RPM_LIMIT":        strconv.Itoa(c.AccountRPMLimit),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"STREAM_PLAYGROUND_MODELS": strings.Join(c.StreamPlaygroundModels, ","),
@@ -463,6 +481,9 @@ func (c Config) Validate() error {
 	}
 	if c.PerAccountConcurrency <= 0 {
 		return fmt.Errorf("PER_ACCOUNT_CONCURRENCY 必须是正整数")
+	}
+	if c.AccountRPMLimit < 0 || c.AccountRPMLimit > maxAccountRPMLimit {
+		return fmt.Errorf("ACCOUNT_RPM_LIMIT 必须是 0 到 %d 的整数", maxAccountRPMLimit)
 	}
 	if c.MinOutputTokens < 0 {
 		return fmt.Errorf("MIN_OUTPUT_TOKENS 必须是 0 或正整数")
@@ -568,6 +589,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		UltraMaxActiveWorkers  int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int            `json:"per_account_concurrency"`
+		AccountRPMLimit        int            `json:"account_rpm_limit"`
 		RoutingStrategy        string         `json:"routing_strategy"`
 		UpstreamChannels       []string       `json:"upstream_channels"`
 		StreamPlaygroundModels []string       `json:"stream_playground_models"`
@@ -598,6 +620,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
+		AccountRPMLimit:        c.AccountRPMLimit,
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
 		StreamPlaygroundModels: c.StreamPlaygroundModels,
@@ -632,6 +655,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		UltraMaxActiveWorkers  *int            `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int             `json:"per_account_concurrency"`
+		AccountRPMLimit        *int            `json:"account_rpm_limit"`
 		RoutingStrategy        string          `json:"routing_strategy"`
 		UpstreamChannels       []string        `json:"upstream_channels"`
 		StreamPlaygroundModels []string        `json:"stream_playground_models"`
@@ -658,7 +682,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理
+	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理；
+	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -698,6 +723,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
+		AccountRPMLimit:        intOrDefault(value.AccountRPMLimit, defaultAccountRPMLimit),
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: NormalizeModelList(value.StreamPlaygroundModels),

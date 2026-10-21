@@ -90,19 +90,47 @@ func runPrimaryRequestWith(t *testing.T, service *trackedService, clientCtx cont
 	return text, err, time.Since(startedAt)
 }
 
-// ultraPrimaryUpstream 是 Ultra 主用模型测试的上游：quota 中的账号返回每日限额 429，inputLimit 中的返回以 429 写的输入超限，
-// coolingDown 中的返回租约账号已进入冷却，runtimeFailures 中账号的前几次调用先执行 beforeRuntimeFailure、再返回协议 Code 5
-// （要重建 Worker），其余正常返回；记录调用的账号与复制文件的目标账号
+// ultraPrimaryUpstream 是 Ultra 主用模型测试的上游：quota 中的账号返回额度 429（quotaErr 非 nil 时返回它给出的错误，否则为每日限额），
+// inputLimit 中的返回以 429 写的输入超限，coolingDown 中的先执行 beforeCoolingDown、再返回租约账号已进入冷却的裸哨兵，
+// runtimeFailures 中账号的前几次调用先执行 beforeRuntimeFailure、再返回协议 Code 5（要重建 Worker），其余正常返回；
+// 记录调用的账号与复制文件的目标账号
 type ultraPrimaryUpstream struct {
 	mu                   sync.Mutex
 	quota                map[string]bool
+	quotaErr             func(accountID string) error
 	inputLimit           map[string]bool
 	coolingDown          map[string]bool
+	beforeCoolingDown    func(accountID string)
 	runtimeFailures      map[string]int
 	beforeRuntimeFailure func(accountID string)
 	allQuota             bool
 	calls                []string
 	copies               []string
+}
+
+// ultraDailyQuotaError 构造按模型的每日限额 429（另给 2 小时的重试建议）
+func ultraDailyQuotaError() *aistudio.RPCError {
+	return &aistudio.RPCError{
+		Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8,
+		Message: "You exceeded your current quota", RetryDelay: 2 * time.Hour,
+		Metadata: map[string]string{"quota_limit": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"},
+	}
+}
+
+// globalMinuteQuotaError 构造用户遇到的真实分钟限额 429（AI Studio 网页后端每账号每分钟 12 次，冷却整个账号）：
+// 只有 ErrorInfo，没有 RetryInfo，冷却到 windowStart 所在窗口结束
+func globalMinuteQuotaError(windowStart time.Time) *aistudio.RPCError {
+	return &aistudio.RPCError{
+		Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8,
+		Message: "Quota exceeded for quota metric 'Generate requests' and limit 'Generate requests per minute per user' of service " +
+			"'alkalimakersuite-pa.googleapis.com' for consumer 'project_number:823511539352'.",
+		Metadata: map[string]string{
+			"quota_limit_value": "12", "quota_unit": "1/min/{project}/{user}",
+			"window_start_time": strconv.FormatInt(windowStart.Unix(), 10), "consumer": "projects/823511539352",
+			"quota_metric": "alkalimakersuite-pa.googleapis.com/generate_requests_global", "service": "alkalimakersuite-pa.googleapis.com",
+			"quota_limit": "GeneratePerMinutePerProjectPerUser", "quota_location": "global",
+		},
+	}
 }
 
 func (upstream *ultraPrimaryUpstream) Models(context.Context) ([]aistudio.Model, error) {
@@ -134,21 +162,23 @@ func (upstream *ultraPrimaryUpstream) Generate(_ context.Context, request aistud
 	if runtimeFailure {
 		upstream.runtimeFailures[request.AccountID]--
 	}
-	hook := upstream.beforeRuntimeFailure
+	hook, quotaErr, coolingHook := upstream.beforeRuntimeFailure, upstream.quotaErr, upstream.beforeCoolingDown
 	upstream.mu.Unlock()
 	switch {
 	case quota:
-		return nil, &aistudio.RPCError{
-			Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8,
-			Message: "You exceeded your current quota", RetryDelay: 2 * time.Hour,
-			Metadata: map[string]string{"quota_limit": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"},
+		if quotaErr != nil {
+			return nil, quotaErr(request.AccountID)
 		}
+		return nil, ultraDailyQuotaError()
 	case inputLimit:
 		return nil, &aistudio.RPCError{
 			Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8,
 			Message: "The input token count (2000000) exceeds the maximum number of tokens allowed (1048576).",
 		}
 	case coolingDown:
+		if coolingHook != nil {
+			coolingHook(request.AccountID)
+		}
 		return nil, aistudio.ErrAccountCoolingDown
 	case runtimeFailure:
 		if hook != nil {
@@ -892,13 +922,16 @@ func TestUltraPrimaryQuotaRemainingNotReady(t *testing.T) {
 	assertNoBusyAccounts(t, pool)
 }
 
-// ultraColdStartService 返回浏览器后端的生成服务：两个 Ultra 账号，A 已有驻留 Worker，B 是没冷却的备用账号；
-// 每次冷启动耗时 launchDelay，launched 收到每次冷启动的账号
-func ultraColdStartService(t *testing.T, upstream aistudio.Service, launchDelay time.Duration) (*trackedService, <-chan string) {
+// ultraColdStartService 返回浏览器后端的生成服务：两个 Ultra 账号，A 已有驻留 Worker，B 是没冷却的备用账号，extra 为排在 B 之后的
+// 其余备用账号（Ultra 分区峰值为默认的 5，B 与它们可以同时启动）；每次冷启动耗时 launchDelay，launched 收到每次冷启动的账号
+func ultraColdStartService(
+	t *testing.T, upstream aistudio.Service, launchDelay time.Duration, extra ...string,
+) (*trackedService, <-chan string) {
 	t.Helper()
-	service := coldStartTestService(t, launchDelay, nil, primaryTestA, primaryTestB)
+	accounts := append([]string{primaryTestA, primaryTestB}, extra...)
+	service := coldStartTestService(t, launchDelay, nil, accounts...)
 	service.service = upstream
-	markUltra(t, service.pool, primaryTestA, primaryTestB)
+	markUltra(t, service.pool, accounts...)
 	ctx, cancel := context.WithTimeout(service.lifecycle, 10*time.Second)
 	defer cancel()
 	if _, err := service.workers.promote(ctx, primaryTestA, testRuntimeModel); err != nil {
@@ -1294,41 +1327,207 @@ func TestUltraPrimaryFileBoundCopiesFiles(t *testing.T) {
 	}
 }
 
-// TestUltraPrimaryAccountCoolingDownCounts 租约账号在发出前进入冷却（ErrAccountCoolingDown）对 Ultra 主用模型记一次额度失败：
-// 不退避，3 次后按额度不足结束；其他模型仍按一般失败计入连续失败上限并退避
+// TestUltraPrimaryAccountCoolingDownCounts 租约账号在发出前进入冷却（ErrAccountCoolingDown，请求没有发到上游）：
+// 任何模型都按已冷却处理，不计入连续失败上限、不退避；Ultra 主用模型只在拦下它的冷却剩余不少于 rotationMinRemaining 时记一次每日类额度失败
 func TestUltraPrimaryAccountCoolingDownCounts(t *testing.T) {
-	accounts := ultraTestIDs(4)
-	cooling := make(map[string]bool, len(accounts))
-	for _, accountID := range accounts {
-		cooling[accountID] = true
+	// coolingUpstream 让每个账号都返回裸哨兵
+	coolingUpstream := func(accounts []string) *ultraPrimaryUpstream {
+		cooling := make(map[string]bool, len(accounts))
+		for _, accountID := range accounts {
+			cooling[accountID] = true
+		}
+		return &ultraPrimaryUpstream{coolingDown: cooling}
 	}
-	upstream := &ultraPrimaryUpstream{coolingDown: cooling}
+	// coolBeforeBlocked 让账号返回裸哨兵前先写入 cooldown 时长的全局冷却（模拟同账号别的请求刚遇到额度 429）
+	coolBeforeBlocked := func(upstream *ultraPrimaryUpstream, pool *aistudio.AccountPool, cooldown time.Duration) {
+		upstream.beforeCoolingDown = func(accountID string) {
+			_ = pool.MarkCooldownIfGeneration(accountID, "", pool.ModelAccessGeneration(accountID), time.Now(), time.Now().Add(cooldown), "每日限额")
+		}
+	}
+	t.Run("Ultra 主用模型长冷却计数", func(t *testing.T) {
+		accounts := ultraTestIDs(4)
+		upstream := coolingUpstream(accounts)
+		service, pool := primaryBusyService(t, upstream, accounts...)
+		coolBeforeBlocked(upstream, pool, 2*time.Hour)
+		markUltra(t, pool, accounts...)
+		setUltraPrimaryModels(service, []string{testRuntimeModel}, 10*time.Second)
+		_, err, elapsed := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-ultra-cooling-long", "")
+		var quota *aistudio.PrimaryQuotaError
+		if !errors.As(err, &quota) || quota.Reason != primaryQuotaReasonLimit || quota.QuotaHits != 3 || quota.RateHits != 0 ||
+			!errors.Is(quota.Cause, aistudio.ErrAccountCoolingDown) {
+			t.Fatalf("err=%v，期望每日类额度失败达到换号上限", err)
+		}
+		if got := upstream.called(); len(got) != primaryQuotaSwitchLimit+1 {
+			t.Fatalf("上游调用 = %v，期望 3 次", got)
+		}
+		// 裸哨兵没有恢复时间：建议重试取 5s
+		if retry := time.Until(quota.RetryAt()); retry < 4*time.Second || retry > 6*time.Second {
+			t.Fatalf("建议重试间隔 = %s，期望约 5s", retry)
+		}
+		// 一般失败的退避为 200ms + 400ms：不退避时远小于它
+		if elapsed > 400*time.Millisecond {
+			t.Fatalf("用时 %s，期望不退避", elapsed)
+		}
+		if !progressLogged(service, "额度 429，换号重试（只用已启动的 Worker）| 额度失败=1/2 | 类型=发出前已冷却") {
+			t.Fatal("请求进度应写明发出前已冷却记一次每日类额度失败")
+		}
+		assertNoBusyAccounts(t, pool)
+	})
+	t.Run("Ultra 主用模型短冷却不计数", func(t *testing.T) {
+		accounts := ultraTestIDs(4)
+		upstream := coolingUpstream(accounts)
+		service, pool := primaryBusyService(t, upstream, accounts...)
+		coolBeforeBlocked(upstream, pool, 30*time.Second)
+		markUltra(t, pool, accounts...)
+		setUltraPrimaryModels(service, []string{testRuntimeModel}, 10*time.Second)
+		_, err, elapsed := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-ultra-cooling-short", "")
+		var quota *aistudio.PrimaryQuotaError
+		if errors.As(err, &quota) || !errors.Is(err, aistudio.ErrAccountCoolingDown) {
+			t.Fatalf("err=%v，期望换号次数用完后以账户已进入冷却结束、不按额度不足结束", err)
+		}
+		if got := upstream.called(); len(got) != len(accounts) {
+			t.Fatalf("上游调用 = %v，期望 4 个账号都试一遍", got)
+		}
+		if elapsed > 400*time.Millisecond {
+			t.Fatalf("用时 %s，期望不退避", elapsed)
+		}
+		if progressLogged(service, "额度 429") || progressLogged(service, "限流 429") {
+			t.Fatal("短冷却的连带拦截不应记额度失败")
+		}
+		assertNoBusyAccounts(t, pool)
+	})
+	t.Run("非主用模型不计入连续失败上限", func(t *testing.T) {
+		accounts := ultraTestIDs(6)
+		upstream := coolingUpstream(accounts)
+		service, pool := primaryBusyService(t, upstream, accounts...)
+		markUltra(t, pool, accounts...)
+		_, err, elapsed := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-other-cooling-down", "")
+		var quota *aistudio.PrimaryQuotaError
+		if errors.As(err, &quota) || !errors.Is(err, aistudio.ErrAccountCoolingDown) {
+			t.Fatalf("非主用模型 err=%v，期望以账户已进入冷却结束", err)
+		}
+		// 6 次超过连续失败上限 generateFailureLimit=5：发出前已冷却不计入
+		if got := upstream.called(); len(got) != len(accounts) {
+			t.Fatalf("上游调用 = %v，期望 6 个账号都试一遍", got)
+		}
+		if elapsed > 400*time.Millisecond {
+			t.Fatalf("用时 %s，期望不退避", elapsed)
+		}
+		if progressLogged(service, "已连续 5 次失败，不再换号") {
+			t.Fatal("发出前已冷却不应计入连续失败上限")
+		}
+		assertNoBusyAccounts(t, pool)
+	})
+}
+
+// TestPrimaryQuotaClassOf 额度 429 的类别：每日限额与剩余不少于 rotationMinRemaining 的冷却按每日类，分钟限额与限流按限流类
+func TestPrimaryQuotaClassOf(t *testing.T) {
+	now := time.Now()
+	for _, test := range []struct {
+		name     string
+		cooldown aistudio.QuotaCooldown
+		want     primaryQuotaClass
+	}{
+		{name: "每日限额", cooldown: aistudio.QuotaCooldown{Kind: aistudio.DailyQuotaKind, Until: now.Add(time.Hour)}, want: primaryQuotaDaily},
+		{name: "分钟限额剩余 50s", cooldown: aistudio.QuotaCooldown{Kind: aistudio.MinuteQuotaKind, Until: now.Add(50 * time.Second)}, want: primaryQuotaRate},
+		{name: "限流剩余 30s", cooldown: aistudio.QuotaCooldown{Kind: aistudio.RateLimitKind, Until: now.Add(30 * time.Second)}, want: primaryQuotaRate},
+		{name: "分钟限额剩余 20m", cooldown: aistudio.QuotaCooldown{Kind: aistudio.MinuteQuotaKind, Until: now.Add(20 * time.Minute)}, want: primaryQuotaDaily},
+	} {
+		if got := primaryQuotaClassOf(test.cooldown, now); got != test.want {
+			t.Fatalf("%s：类别 = %d，期望 %d", test.name, got, test.want)
+		}
+	}
+	// 用户样本：窗口开始于 10 秒前，冷却到窗口结束，按限流类
+	cooldown, ok := aistudio.QuotaCooldownForError(globalMinuteQuotaError(now.Add(-10*time.Second)), now)
+	if !ok || cooldown.Kind != aistudio.MinuteQuotaKind || !cooldown.Global {
+		t.Fatalf("用户样本的冷却 = %+v ok=%t", cooldown, ok)
+	}
+	if got := primaryQuotaClassOf(cooldown, now); got != primaryQuotaRate {
+		t.Fatalf("用户样本的类别 = %d，期望限流类", got)
+	}
+}
+
+// TestUltraPrimaryMinuteQuotaWiderLimit 8 个热账号都返回分钟限额 429：限流类另有更宽的换号上限，6 次后按限流失败已达换号上限结束
+// （Retry-After 为本请求遇到的限流冷却中最早的恢复，约 50s），每个试过的账号整个冷却，不退避
+func TestUltraPrimaryMinuteQuotaWiderLimit(t *testing.T) {
+	accounts := ultraTestIDs(8)
+	windowStart := time.Now().Add(-10 * time.Second)
+	upstream := &ultraPrimaryUpstream{
+		allQuota: true, quotaErr: func(string) error { return globalMinuteQuotaError(windowStart) },
+	}
 	service, pool := primaryBusyService(t, upstream, accounts...)
 	markUltra(t, pool, accounts...)
 	setUltraPrimaryModels(service, []string{testRuntimeModel}, 10*time.Second)
-	_, err, elapsed := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-ultra-cooling-down", "")
+	_, err, elapsed := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-ultra-minute", "")
 	var quota *aistudio.PrimaryQuotaError
-	if !errors.As(err, &quota) || quota.Reason != primaryQuotaReasonLimit || !errors.Is(quota.Cause, aistudio.ErrAccountCoolingDown) {
-		t.Fatalf("err=%v，期望额度失败达到换号上限", err)
+	if !errors.As(err, &quota) || quota.Reason != primaryQuotaReasonRateLimit || quota.RateHits != primaryRateLimitSwitchLimit+1 || quota.QuotaHits != 0 {
+		t.Fatalf("err=%v，期望限流失败已达换号上限", err)
 	}
-	if got := upstream.called(); len(got) != primaryQuotaSwitchLimit+1 {
-		t.Fatalf("上游调用 = %v，期望 3 次", got)
+	calls := upstream.called()
+	if len(calls) != primaryRateLimitSwitchLimit+1 {
+		t.Fatalf("上游调用 = %v，期望 %d 次", calls, primaryRateLimitSwitchLimit+1)
 	}
-	// 一般失败的退避为 200ms + 400ms：不退避时远小于它
-	if elapsed > 400*time.Millisecond {
+	// window_start_time 只到秒：窗口结束为取整后的窗口开始加 1 分钟，距现在 49 到 50 秒之间（减去请求用时），按它精确比较
+	if want := time.Unix(windowStart.Unix(), 0).Add(time.Minute); !quota.RetryAt().Equal(want) {
+		t.Fatalf("建议重试时间 = %s（%s 后），期望分钟窗口结束 %s", quota.RetryAt(), time.Until(quota.RetryAt()), want)
+	}
+	// 一般失败的退避为 200ms + 400ms + 800ms + …：不退避时远小于它
+	if elapsed > time.Second {
 		t.Fatalf("用时 %s，期望不退避", elapsed)
 	}
+	for _, fragment := range []string{
+		"限流 429，换号重试（只用已启动的 Worker）| 限流失败=1/5 | 类型=分钟限额",
+		"限流失败=5/5",
+		"Ultra 主用模型额度不足，立即返回 429 | 原因=限流失败已达换号上限 | 额度失败=0 | 限流失败=6 | 总耗时=",
+	} {
+		if !progressLogged(service, fragment) {
+			t.Fatalf("请求进度应写明 %q", fragment)
+		}
+	}
+	for _, accountID := range calls {
+		if !pool.AccountCoolingDown(accountID, "") {
+			t.Fatalf("试过的账号 %s 应整个冷却", accountID)
+		}
+	}
+	if !strings.Contains(quota.Error(), "限流失败 6 次") {
+		t.Fatalf("错误文案 %q 应写明限流失败次数", quota.Error())
+	}
+	assertNoBusyAccounts(t, pool)
+}
 
-	other := &ultraPrimaryUpstream{coolingDown: cooling}
-	service, pool = primaryBusyService(t, other, accounts...)
+// TestUltraPrimaryMixedQuotaClasses 两类额度失败分开计数：前 3 次分钟限额（不到限流类上限）、后 3 次每日限额，
+// 第 6 次尝试时每日类超过换号上限，按额度失败已达换号上限结束
+func TestUltraPrimaryMixedQuotaClasses(t *testing.T) {
+	accounts := ultraTestIDs(6)
+	windowStart := time.Now().Add(-10 * time.Second)
+	var calls atomic.Int64
+	upstream := &ultraPrimaryUpstream{allQuota: true, quotaErr: func(string) error {
+		if calls.Add(1) <= 3 {
+			return globalMinuteQuotaError(windowStart)
+		}
+		return ultraDailyQuotaError()
+	}}
+	service, pool := primaryBusyService(t, upstream, accounts...)
 	markUltra(t, pool, accounts...)
-	_, err, elapsed = runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-other-cooling-down", "")
-	if errors.As(err, &quota) || !errors.Is(err, aistudio.ErrAccountCoolingDown) {
-		t.Fatalf("非主用模型 err=%v，期望照旧以账户已进入冷却结束", err)
+	setUltraPrimaryModels(service, []string{testRuntimeModel}, 10*time.Second)
+	_, err, _ := runScopedPrimaryRequest(t, service, aistudio.PoolScopeUltra, "req-ultra-mixed", "")
+	var quota *aistudio.PrimaryQuotaError
+	if !errors.As(err, &quota) || quota.Reason != primaryQuotaReasonLimit || quota.QuotaHits != 3 || quota.RateHits != 3 {
+		t.Fatalf("err=%v，期望每日类达到换号上限（额度失败 3、限流失败 3）", err)
 	}
-	if got := other.called(); len(got) != len(accounts) || elapsed < 600*time.Millisecond {
-		t.Fatalf("非主用模型上游调用 = %v 用时 %s，期望 4 次且有退避", got, elapsed)
+	if got := upstream.called(); len(got) != 6 {
+		t.Fatalf("上游调用 = %v，期望 6 次", got)
 	}
+	for _, fragment := range []string{
+		"限流 429，换号重试（只用已启动的 Worker）| 限流失败=3/5 | 类型=分钟限额 | 额度失败=0/2",
+		"额度 429，换号重试（只用已启动的 Worker）| 额度失败=2/2 | 类型=每日限额",
+		"原因=额度失败已达换号上限 | 额度失败=3 | 限流失败=3",
+	} {
+		if !progressLogged(service, fragment) {
+			t.Fatalf("请求进度应写明 %q", fragment)
+		}
+	}
+	assertNoBusyAccounts(t, pool)
 }
 
 // TestUltraPrimaryConcurrentQuota 多个 Ultra 主用请求同时遇到额度耗尽：都按 429（额度不足或全部冷却，带 Retry-After）结束，
@@ -1404,22 +1603,178 @@ func TestPrimaryQuotaRetryAt(t *testing.T) {
 		{name: "换号上限", reason: primaryQuotaReasonLimit, quota: far, want: now.Add(primaryRetryFallback)},
 		{name: "换号上限时本请求的冷却更早", reason: primaryQuotaReasonLimit, quota: now.Add(2 * time.Second), want: now.Add(2 * time.Second)},
 		{name: "没有其他可换的账号", reason: primaryQuotaReasonNoOther, want: now.Add(primaryRetryFallback)},
+		{name: "限流上限取限流冷却的恢复", reason: primaryQuotaReasonRateLimit, quota: now.Add(40 * time.Second), want: now.Add(40 * time.Second)},
+		{name: "限流上限没有时间时按 5s", reason: primaryQuotaReasonRateLimit, want: now.Add(primaryRetryFallback)},
+		{name: "限流上限不超过一分钟", reason: primaryQuotaReasonRateLimit, quota: now.Add(90 * time.Second), want: now.Add(cooldownQueueLimit)},
+		{name: "限流上限不早于 1s", reason: primaryQuotaReasonRateLimit, quota: now.Add(100 * time.Millisecond), want: now.Add(primaryRetryMin)},
 	} {
 		if got := primaryQuotaRetryAt(test.reason, test.quota, test.cooling, now); !got.Equal(test.want) {
 			t.Fatalf("%s：建议重试 = %s，期望 %s", test.name, got.Sub(now), test.want.Sub(now))
 		}
 	}
 	quota := &aistudio.PrimaryQuotaError{
-		ModelID: testRuntimeModel, Pool: aistudio.PoolScopeUltra, Reason: primaryQuotaReasonLimit, QuotaHits: 3,
+		ModelID: testRuntimeModel, Pool: aistudio.PoolScopeUltra, Reason: primaryQuotaReasonLimit, QuotaHits: 3, RateHits: 2,
 		Elapsed: 1500 * time.Millisecond, Until: now.Add(5 * time.Second), Cause: errors.New("上游原文"),
 	}
 	message := quota.Error()
-	for _, fragment := range []string{"Ultra 号池", testRuntimeModel, primaryQuotaReasonLimit, "额度失败 3 次", "总耗时 1.5s", "建议重试时间", "上游原文"} {
+	for _, fragment := range []string{"Ultra 号池", testRuntimeModel, primaryQuotaReasonLimit, "额度失败 3 次", "限流失败 2 次", "总耗时 1.5s", "建议重试时间", "上游原文"} {
 		if !strings.Contains(message, fragment) {
 			t.Fatalf("错误文案 %q 缺少 %q", message, fragment)
 		}
 	}
 	if !quota.RetryAt().Equal(quota.Until) || errors.Unwrap(quota) != nil {
 		t.Fatal("RetryAt 应返回 Until，且不实现 Unwrap")
+	}
+}
+
+// TestUltraPrimaryWarmOnlyRateLimitedExpands 只用已启动 Worker 的选号：热 Worker A 每分钟请求已满（最长一分钟才释放）、B、C 是没冷却的
+// 备用账号且分区有空槽时，照常按账号全部忙碌排队到预算用完返回号池繁忙，同时只为 B 发起一次后台扩容（不等它）；A 只是并发忙碌时不扩容。
+// 预算长于兜底复查（schedulingRecheck）、短于冷启动：选号期间至少复查一次，复查时 B 还在启动、C 仍是能扩容的备用账号，不再扩容 C
+func TestUltraPrimaryWarmOnlyRateLimitedExpands(t *testing.T) {
+	const primaryTestC = "primary-c@example.com"
+	const launch = 3 * time.Second
+	const budget = 1500 * time.Millisecond
+	if budget <= schedulingRecheck || budget >= launch {
+		t.Fatalf("预算 %s 应长于兜底复查 %s、短于冷启动 %s", budget, schedulingRecheck, launch)
+	}
+	service, launched := ultraColdStartService(t, &ultraPrimaryUpstream{}, launch, primaryTestC)
+	setUltraPrimaryModels(service, []string{testRuntimeModel}, budget)
+	ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(service.lifecycle, aistudio.PoolScopeUltra), 10*time.Second)
+	defer cancel()
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeUltra}
+	warmOnlyCtx := func() context.Context {
+		return withoutColdStart(withLeaseWaitBudget(ctx, service.primaryBudget(testRuntimeModel, aistudio.PoolScopeUltra)))
+	}
+	// A 并发忙碌：排队到预算用完（期间至少复查一次），不扩容。后台扩容是异步的，等一段时间再看有没有启动
+	release := holdLease(t, service.pool, primaryTestA)
+	lease, err := service.acquireWarmLease(warmOnlyCtx(), selection)
+	var busy *aistudio.CapacityBusyError
+	if lease != nil || !errors.As(err, &busy) || busy.Reason != "账号全部忙碌" {
+		t.Fatalf("A 并发忙碌时 lease=%v err=%v，期望按账号全部忙碌返回号池繁忙", lease, err)
+	}
+	select {
+	case accountID := <-launched:
+		t.Fatalf("A 只是并发忙碌时不应扩容，实际启动了 %s", accountID)
+	case <-time.After(200 * time.Millisecond):
+	}
+	release()
+	// 第二阶段只看自己发起的启动：排空 launched，前面晚到的启动记录不会被当成 B 的扩容
+	for drained := false; !drained; {
+		select {
+		case accountID := <-launched:
+			t.Fatalf("A 只是并发忙碌时不应扩容，实际启动了 %s", accountID)
+		default:
+			drained = true
+		}
+	}
+
+	// A 每分钟请求已满
+	service.pool.SetAccountRateLimit(1)
+	fillRateWindow(t, service.pool, primaryTestA, 1)
+	startedAt := time.Now()
+	lease, err = service.acquireWarmLease(warmOnlyCtx(), selection)
+	elapsed := time.Since(startedAt)
+	if lease != nil || !errors.As(err, &busy) || busy.Reason != "账号全部忙碌" || elapsed < budget {
+		t.Fatalf("A 每分钟已满时 lease=%v err=%v 用时 %s，期望按账号全部忙碌排队约 %s 后返回号池繁忙", lease, err, elapsed, budget)
+	}
+	if elapsed >= launch {
+		t.Fatalf("用时 %s，不应等 B 冷启动完成", elapsed)
+	}
+	select {
+	case accountID := <-launched:
+		if accountID != primaryTestB {
+			t.Fatalf("后台扩容启动了 %s，期望 B", accountID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("热 Worker 每分钟已满时应为备用账号 B 发起后台扩容")
+	}
+	select {
+	case accountID := <-launched:
+		t.Fatalf("一次选号只应扩容一次，又启动了 %s", accountID)
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestUltraPrimaryWarmOnlyOpeningKeepsBusyReason 只用已启动 Worker 的选号满窗时为唯一的备用账号 B 发起扩容后，B 进入启动中、
+// 没有别的备用账号：之后的复查不按 Worker 正在启动等待（它不排队等后台扩容），仍按账号全部忙碌排队到预算用完。
+// 预算长于兜底复查，选号期间一定复查过；原先复查后最后的等待原因变成 Worker 正在启动
+func TestUltraPrimaryWarmOnlyOpeningKeepsBusyReason(t *testing.T) {
+	const launch = 3 * time.Second
+	const budget = 1500 * time.Millisecond
+	service, launched := ultraColdStartService(t, &ultraPrimaryUpstream{}, launch)
+	setUltraPrimaryModels(service, []string{testRuntimeModel}, budget)
+	ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(service.lifecycle, aistudio.PoolScopeUltra), 10*time.Second)
+	defer cancel()
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeUltra}
+	service.pool.SetAccountRateLimit(1)
+	fillRateWindow(t, service.pool, primaryTestA, 1)
+	startedAt := time.Now()
+	lease, err := service.acquireWarmLease(
+		withoutColdStart(withLeaseWaitBudget(ctx, service.primaryBudget(testRuntimeModel, aistudio.PoolScopeUltra))), selection)
+	elapsed := time.Since(startedAt)
+	var busy *aistudio.CapacityBusyError
+	if lease != nil || !errors.As(err, &busy) || busy.Reason != "账号全部忙碌" || elapsed < budget || elapsed >= launch {
+		t.Fatalf("lease=%v err=%v 用时 %s，期望按账号全部忙碌排队约 %s 后返回号池繁忙", lease, err, elapsed, budget)
+	}
+	select {
+	case accountID := <-launched:
+		if accountID != primaryTestB {
+			t.Fatalf("后台扩容启动了 %s，期望 B", accountID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("热 Worker 每分钟已满时应为备用账号 B 发起后台扩容")
+	}
+}
+
+// TestUltraPrimaryWarmOnlyNoWarmExpandsOnce 只用已启动 Worker 的选号满窗时为 B 发起扩容、排队期间 A 被写入冷却（例如同账号
+// 别的请求刚遇到额度 429）：复查时没有热候选，B 还在启动、C 是能扩容的备用账号，立即返回额度 429 后没有已启动的 Worker，
+// 不再为 C 扩容（原先同一次选号会冷启动 B、C 两个浏览器）
+func TestUltraPrimaryWarmOnlyNoWarmExpandsOnce(t *testing.T) {
+	const primaryTestC = "primary-c@example.com"
+	const launch = 3 * time.Second
+	service, launched := ultraColdStartService(t, &ultraPrimaryUpstream{}, launch, primaryTestC)
+	setUltraPrimaryModels(service, []string{testRuntimeModel}, 5*time.Second)
+	ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(service.lifecycle, aistudio.PoolScopeUltra), 10*time.Second)
+	defer cancel()
+	selection := aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent", Pool: aistudio.PoolScopeUltra}
+	service.pool.SetAccountRateLimit(1)
+	fillRateWindow(t, service.pool, primaryTestA, 1)
+	type result struct {
+		lease *aistudio.AccountLease
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		lease, err := service.acquireWarmLease(
+			withoutColdStart(withLeaseWaitBudget(ctx, service.primaryBudget(testRuntimeModel, aistudio.PoolScopeUltra))), selection)
+		done <- result{lease, err}
+	}()
+	select {
+	case accountID := <-launched:
+		if accountID != primaryTestB {
+			t.Fatalf("后台扩容启动了 %s，期望 B", accountID)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("热 Worker 每分钟已满时应为备用账号 B 发起后台扩容")
+	}
+	now := time.Now()
+	if err := service.pool.MarkCooldownIfGeneration(primaryTestA, "", service.pool.ModelAccessGeneration(primaryTestA),
+		now, now.Add(time.Hour), "每日限额"); err != nil {
+		t.Fatal(err)
+	}
+	// 写入冷却后的复查最晚在兜底复查（1s）时发生，B 的冷启动（3s）还没结束
+	select {
+	case got := <-done:
+		var noWarm *noImmediateLeaseError
+		if got.lease != nil || !errors.As(got.err, &noWarm) || noWarm.reason != primaryQuotaReasonNoWarm {
+			t.Fatalf("A 冷却后 lease=%v err=%v，期望额度 429 后没有已启动的 Worker", got.lease, got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("A 冷却后选号应立即返回没有已启动的 Worker")
+	}
+	select {
+	case accountID := <-launched:
+		t.Fatalf("B 还在启动时同一次选号不应再扩容，又启动了 %s", accountID)
+	case <-time.After(300 * time.Millisecond):
 	}
 }

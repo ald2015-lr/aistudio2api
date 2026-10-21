@@ -152,6 +152,7 @@ func (service *trackedService) prewarmIfRunning() {
 
 // requiresRebuild 判断配置差异是否只能通过重建生成服务生效：
 // 账户目录、默认代理、WAA 后端与上游通道决定了运行时的装配方式，其余字段都可热更新
+// （包括单账户每分钟上限 ACCOUNT_RPM_LIMIT：applyLiveFields 经 SetAccountRateLimit 立即生效，不在这里比较）
 func requiresRebuild(saved config.Config, active config.Config) bool {
 	return saved.AuthStates != active.AuthStates || saved.Proxy != active.Proxy ||
 		saved.WAABackend != active.WAABackend || !slices.Equal(saved.UpstreamChannels, active.UpstreamChannels)
@@ -166,7 +167,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
-		saved.PerAccountConcurrency == active.PerAccountConcurrency &&
+		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.RoutingStrategy == active.RoutingStrategy && saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
@@ -182,14 +183,23 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
-		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
+		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
+		saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 	))
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()
+}
+
+// rpmLimitSummary 为热更新日志里的单账户每分钟上限：0 为关闭
+func rpmLimitSummary(limit int) string {
+	if limit <= 0 {
+		return "关闭"
+	}
+	return fmt.Sprintf("%d 次", limit)
 }
 
 // applyLiveFields 在 liveConfigMu 内读取 .env 并应用可热更新的字段，返回应用到的生成服务与配置；没有需要热更新的变化
@@ -218,6 +228,8 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		return nil, saved, false
 	}
 	admin.pool.SetPerAccountConcurrency(saved.PerAccountConcurrency)
+	// 单账户每分钟上限：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同；调大或关闭时唤醒排队的请求
+	admin.pool.SetAccountRateLimit(saved.AccountRPMLimit)
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
 	// 先更新两个分区的容量再改号池成员：同一次保存调大 ULTRA_* 峰值时，并入的 Pro Worker 按新上限计数
 	admin.workers.applyLiveSettings(saved)

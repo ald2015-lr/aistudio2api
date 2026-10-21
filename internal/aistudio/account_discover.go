@@ -371,8 +371,8 @@ type WarmWorkerState struct {
 	// Busy 为账户有进行中的请求、独占操作或认证续签，LastUsed 为最近使用时间
 	Busy     bool
 	LastUsed time.Time
-	// Cooling 为账户在该模型上（或全局）冷却中，不论剩余多久；Dead 为长时间不可用（全局冷却或该模型所有启用通道都冷却），
-	// 这样的 Worker 对该模型是死槽位
+	// Cooling 为账户在该模型上（或全局）冷却中、且剩余不少于 ShortCooldownMax（分钟限额、限流这类一分钟内就恢复的短冷却不算）；
+	// Dead 为长时间不可用（全局冷却或该模型所有启用通道都冷却），这样的 Worker 对该模型是死槽位
 	Cooling bool
 	Dead    bool
 }
@@ -393,12 +393,13 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		if account == nil {
 			continue
 		}
-		_, cooling := accountCooldown(account, modelID, now)
+		cooldown, cooling := accountCooldown(account, modelID, now)
 		states[accountID] = WarmWorkerState{
 			Busy:     account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0,
 			LastUsed: account.LastUsed,
-			Cooling:  cooling,
-			Dead:     p.longCoolingLocked(account, modelID, now, minRemaining),
+			// 剩余不到 ShortCooldownMax 的冷却（分钟限额、限流）不算冷却中：一分钟内就恢复，关掉它换一个要冷启动 10–30 秒的账号得不偿失
+			Cooling: cooling && cooldown.Until.Sub(now) >= ShortCooldownMax,
+			Dead:    p.longCoolingLocked(account, modelID, now, minRemaining),
 		}
 	}
 	return states

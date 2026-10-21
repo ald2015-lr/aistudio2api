@@ -219,3 +219,19 @@ func TestLostWarmRaceNeverReportsAllCooling(t *testing.T) {
 		t.Fatalf("还有未冷却的热 Worker 时误报了 %d 次全部冷却（共 %d 个租约）", got, leases.Load())
 	}
 }
+
+// TestCoolingRecheckDelay 候选全部冷却时的复查等待：最早恢复不少于一次兜底复查间隔时按兜底间隔；不到时等到恢复再随机延后
+// 不到 cooldownWakeJitter（已过时从 0 起算），排队请求不在同一时刻一起复查
+func TestCoolingRecheckDelay(t *testing.T) {
+	for range 200 {
+		if got := coolingRecheckDelay(5 * time.Second); got != schedulingRecheck {
+			t.Fatalf("剩余 5s 时复查等待 = %s，期望 %s", got, schedulingRecheck)
+		}
+		if got := coolingRecheckDelay(300 * time.Millisecond); got < 300*time.Millisecond || got >= 300*time.Millisecond+cooldownWakeJitter {
+			t.Fatalf("剩余 300ms 时复查等待 = %s，期望 [300ms, 800ms)", got)
+		}
+		if got := coolingRecheckDelay(-time.Second); got < 0 || got >= cooldownWakeJitter {
+			t.Fatalf("已恢复时复查等待 = %s，期望 [0, 500ms)", got)
+		}
+	}
+}

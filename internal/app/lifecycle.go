@@ -577,7 +577,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
-		PerAccountConcurrency:  value.PerAccountConcurrency, TemporaryChat: value.TemporaryChat,
+		PerAccountConcurrency:  value.PerAccountConcurrency, AccountRPMLimit: active.AccountRPMLimit, TemporaryChat: value.TemporaryChat,
 		IgnoreClientSeed: value.IgnoreClientSeed, RepeatPromptNonce: value.RepeatPromptNonce,
 		MinOutputTokens: value.MinOutputTokens,
 		RoutingStrategy: value.RoutingStrategy, UpstreamChannels: value.UpstreamChannels,
@@ -612,6 +612,10 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.UltraPrimaryModels != nil {
 		saved.UltraPrimaryModels = config.NormalizeModelList(*value.UltraPrimaryModels)
 	}
+	// 单账户每分钟上限：提交时省略（旧版页面）按生效值比较
+	if value.AccountRPMLimit != nil {
+		saved.AccountRPMLimit = *value.AccountRPMLimit
+	}
 	overrides.Apply(&saved)
 	return saved.AuthStates == active.AuthStates && saved.Proxy == active.Proxy &&
 		saved.InitTimeout == active.InitTimeout && saved.RequestTimeout == active.RequestTimeout &&
@@ -621,7 +625,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
-		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.TemporaryChat == active.TemporaryChat &&
+		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
+		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens &&
 		saved.RoutingStrategy == active.RoutingStrategy &&

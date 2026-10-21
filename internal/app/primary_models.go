@@ -14,7 +14,8 @@ import (
 
 // 主用模型快速失败（PRIMARY_MODELS / PRIMARY_QUEUE_WAIT 与 ULTRA_PRIMARY_MODELS / ULTRA_PRIMARY_QUEUE_WAIT）。
 //
-// 号池的同时生成数约为 峰值 Worker 数 × 单账户并发（MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY，Ultra 分区另算）。并发超过它时
+// 号池的同时生成数约为 峰值 Worker 数 × 单账户并发（MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY，Ultra 分区另算），每个账号每分钟的
+// 生成次数另受 ACCOUNT_RPM_LIMIT 约束（满了按忙碌换号，见 aistudio/rate_limit.go）。并发超过它时
 // 请求在 acquireLease 里排队等空闲的账号或 Worker，原先一直等到请求超时（REQUEST_TIMEOUT，默认 5 分钟）：客户端看到的是几分钟的
 // 首字延迟与随后的 504，排队的请求越积越多。列表中的模型的生成请求改为最多排队到排队上限，超过后按 CapacityBusyError
 // 结束（对外 429 + Retry-After），由客户端稍后重试，不换号、不冷却、不记降级记忆、不退避。
@@ -29,8 +30,12 @@ import (
 // 换号上限是号池的可调度账号数（Ultra 约 20），一个请求会把 Ultra 号池挨个试一遍，换到备用账号还要现场冷启动（10–30s 以上），
 // 最后对外还是不带 Retry-After 的上游 429。现在：
 //   - 选号时候选全部冷却立即返回 AllCoolingError（Retry-After 为最早恢复），不原地等一分钟；
-//   - 额度 429 后最多再换 primaryQuotaSwitchLimit 次账号，每次额度失败后紧接着的那次选号只用已启动的 Worker（withoutColdStart）：
-//     不现场冷启动备用账号，只有备用账号时为其中一个发起后台扩容后立即返回；额度失败单独计数，不计入连续失败上限，也不退避；
+//   - 额度失败分两类计数，各有换号上限（见 primaryQuotaClassOf）：每日类（每日限额，以及剩余不少于 rotationMinRemaining 的长冷却）
+//     最多再换 primaryQuotaSwitchLimit 次账号；限流类（分钟限额、没有额度信息的限流）按账号计、一个账号用满不代表其他账号也满，
+//     最多再换 primaryRateLimitSwitchLimit 次。租约账号在发出前被同账号别的 429 连带拦下（ErrAccountCoolingDown，请求没有发到上游）
+//     只在拦下它的冷却剩余不少于 rotationMinRemaining 时记一次每日类，短冷却不计数；
+//   - 每次额度失败后紧接着的那次选号只用已启动的 Worker（withoutColdStart）：不现场冷启动备用账号，只有备用账号时为其中一个发起
+//     后台扩容后立即返回；额度失败单独计数，不计入连续失败上限，也不退避；
 //   - 结束时按 PrimaryQuotaError 返回（对外 429 + Retry-After，规则见 primaryQuotaRetryAt）；
 //   - 流式请求在请求自己现场冷启动期间推迟写出响应头（最多推迟排队预算能抵扣的启动时长，且不超过开始等首个事件后 50 秒），
 //     启动后才遇到的额度不足通常同样以 HTTP 429 返回（见 holdStreamStart）。
@@ -43,7 +48,8 @@ import (
 // 按实测时长延后截止时间（请求在等自己的 Worker，不是在排队；合计不超过 INIT_TIMEOUT），候选全部冷却的等待同样不计入。
 // 截止时间已过后容量原因的等待立即返回 CapacityBusyError：失败后的下一次尝试只接受立即可用的账号，否则按 429 结束。
 // 预算不用 context 超时，不会取消进行中的启动；不等待的选号（acquireWarmLeaseNow）本来就不排队。
-// 这只是对症状的处理：根本上要让容量跟上并发（更多 Worker、更高的单账户并发），或让冷却的账号及时让出 Worker。
+// 这只是对症状的处理：根本上要让容量跟上并发（更多 Worker；单账号并发受每分钟次数上限约束（ACCOUNT_RPM_LIMIT），不宜调高），
+// 或让冷却的账号及时让出 Worker。
 
 const (
 	// primaryRetryFallback 为排队上限为 0（不排队）时 Retry-After 的建议间隔，也是 Ultra 主用模型额度不足而号池里可能还有额度时的建议间隔
@@ -54,9 +60,14 @@ const (
 	// primaryStreamStartGrace 为流式请求写出响应头前，在排队上限之外再多等首个事件的余量：截止时间到后还要复查一次候选、
 	// 经过账户池锁才返回错误，留出余量让 429 以 HTTP 状态返回而不是 200 之后的流内错误
 	primaryStreamStartGrace = 5 * time.Second
-	// primaryQuotaSwitchLimit 为 Ultra 主用模型遇到额度失败后最多再换的账号数：一个请求最多 primaryQuotaSwitchLimit+1 次额度失败的尝试。
-	// 每日限额多半是号池里一批账号一起用完，挨个换下去只是把请求拖到超时；换两次还不行就让客户端稍后重试
+	// primaryQuotaSwitchLimit 为 Ultra 主用模型遇到每日类额度失败（每日限额，以及剩余不少于 rotationMinRemaining 的长冷却）后
+	// 最多再换的账号数：每日类额度失败超过 2 次就结束。每日限额多半是号池里一批账号一起用完，挨个换下去只是把请求拖到超时；
+	// 换两次还不行就让客户端稍后重试
 	primaryQuotaSwitchLimit = 2
+	// primaryRateLimitSwitchLimit 为限流类额度失败（分钟限额、没有额度信息的 30 秒限流）后最多再换的账号数，与每日类分开计：
+	// 分钟窗口按账号计（每账号每分钟 12 次，所有模型、两个通道共用），一个账号用满不代表其他账号也满。
+	// 取 5，与 Ultra 分区默认峰值 ULTRA_MAX_ACTIVE_WORKERS=5 对齐
+	primaryRateLimitSwitchLimit = 5
 	// waitReasonCooling 为候选全部冷却时的等待原因：这类等待不受排队上限限制，等待的时间延后截止时间，沿用原有的冷却排队规则
 	waitReasonCooling = "账号冷却中"
 	// waitReasonNoSlot 为有没冷却的候选、只是所在分区没有空闲 Worker 槽位时的等待原因：按容量原因计入排队上限
@@ -65,8 +76,10 @@ const (
 
 // Ultra 主用模型额度不足时 PrimaryQuotaError 的原因
 const (
-	// primaryQuotaReasonLimit 为额度失败的次数超过换号上限
+	// primaryQuotaReasonLimit 为每日类额度失败的次数超过换号上限（primaryQuotaSwitchLimit）
 	primaryQuotaReasonLimit = "额度失败已达换号上限"
+	// primaryQuotaReasonRateLimit 为限流类额度失败（分钟限额、限流）的次数超过换号上限（primaryRateLimitSwitchLimit）
+	primaryQuotaReasonRateLimit = "限流失败已达换号上限"
 	// primaryQuotaReasonCooling 为额度 429 后换号时其余候选全部冷却
 	primaryQuotaReasonCooling = "其余候选全部冷却"
 	// primaryQuotaReasonNoWarm 为额度 429 后号池里没有已启动的 Worker（只剩要现场冷启动的备用账号），也是那次选号的 noImmediateLeaseError 原因
@@ -393,26 +406,61 @@ func coldStartBlocked(ctx context.Context) bool {
 	return blocked
 }
 
-// primaryQuotaTracker 记录一个 Ultra 主用模型请求遇到的额度失败：hits 为次数（上游额度 429，以及租约账号在发出前进入冷却），
-// until 为其中最早的冷却恢复时间（不知道时为零值），lastErr 为最后一次额度错误。与连续失败上限分开计数；只在请求 goroutine 内使用
+// primaryQuotaClass 为 Ultra 主用模型额度失败的类别，各有自己的换号上限
+type primaryQuotaClass uint8
+
+const (
+	// primaryQuotaDaily 为每日类：换号上限 primaryQuotaSwitchLimit
+	primaryQuotaDaily primaryQuotaClass = iota + 1
+	// primaryQuotaRate 为限流类（分钟限额、限流）：换号上限 primaryRateLimitSwitchLimit
+	primaryQuotaRate
+)
+
+// primaryQuotaClassOf 返回一次额度 429 的类别：每日限额，或剩余不少于 rotationMinRemaining 的冷却（RetryInfo 很长的分钟限额、限流）
+// 按每日类，其余按限流类
+func primaryQuotaClassOf(cooldown aistudio.QuotaCooldown, now time.Time) primaryQuotaClass {
+	if cooldown.Kind == aistudio.DailyQuotaKind || cooldown.Until.Sub(now) >= rotationMinRemaining {
+		return primaryQuotaDaily
+	}
+	return primaryQuotaRate
+}
+
+// primaryQuotaTracker 记录一个 Ultra 主用模型请求遇到的额度失败：daily、rate 为两类的次数（上游额度 429，以及租约账号在发出前
+// 被长冷却拦下，见 coolingDownLong）；until 为全部额度失败中最早的冷却恢复时间，rateUntil 为限流类中最早的（不知道时为零值）；
+// last 为最近一次的类别，lastErr 为最后一次额度错误。与连续失败上限分开计数；只在请求 goroutine 内使用，不加锁
 type primaryQuotaTracker struct {
-	hits    int
-	until   time.Time
-	lastErr error
+	daily, rate      int
+	until, rateUntil time.Time
+	last             primaryQuotaClass
+	lastErr          error
+}
+
+// hits 返回两类额度失败的总次数
+func (tracker *primaryQuotaTracker) hits() int {
+	return tracker.daily + tracker.rate
 }
 
 // record 记一次额度失败；until 为这次写入的冷却恢复时间，零值表示不知道
-func (tracker *primaryQuotaTracker) record(err error, until time.Time) {
-	tracker.hits++
-	tracker.lastErr = err
-	if !until.IsZero() && (tracker.until.IsZero() || until.Before(tracker.until)) {
-		tracker.until = until
+func (tracker *primaryQuotaTracker) record(class primaryQuotaClass, err error, until time.Time) {
+	tracker.last, tracker.lastErr = class, err
+	tracker.until = earlierTime(tracker.until, until)
+	if class == primaryQuotaRate {
+		tracker.rate++
+		tracker.rateUntil = earlierTime(tracker.rateUntil, until)
+		return
 	}
+	tracker.daily++
 }
 
-// exhausted 判断额度失败的次数是否已超过换号上限
-func (tracker *primaryQuotaTracker) exhausted() bool {
-	return tracker.hits > primaryQuotaSwitchLimit
+// exhaustedReason 判断最近一次额度失败所在类别的次数是否已超过它的换号上限，返回结束原因
+func (tracker *primaryQuotaTracker) exhaustedReason() (string, bool) {
+	switch {
+	case tracker.last == primaryQuotaDaily && tracker.daily > primaryQuotaSwitchLimit:
+		return primaryQuotaReasonLimit, true
+	case tracker.last == primaryQuotaRate && tracker.rate > primaryRateLimitSwitchLimit:
+		return primaryQuotaReasonRateLimit, true
+	}
+	return "", false
 }
 
 // failure 构造额度不足的 429：cooling 为“其余候选全部冷却”时选号返回的全部冷却错误，cause 为写进内部日志的最后一次错误
@@ -421,9 +469,14 @@ func (tracker *primaryQuotaTracker) failure(budget *leaseWaitBudget, reason stri
 	if cause == nil {
 		cause = tracker.lastErr
 	}
+	// 限流失败达到换号上限时只看限流类的恢复：每日类的长冷却不代表已启动的 Worker 何时能再用
+	quotaUntil := tracker.until
+	if reason == primaryQuotaReasonRateLimit {
+		quotaUntil = tracker.rateUntil
+	}
 	return &aistudio.PrimaryQuotaError{
-		ModelID: budget.modelID, Pool: budget.pool, Reason: reason, QuotaHits: tracker.hits,
-		Elapsed: now.Sub(budget.startedAt), Until: primaryQuotaRetryAt(reason, tracker.until, cooling, now), Cause: cause,
+		ModelID: budget.modelID, Pool: budget.pool, Reason: reason, QuotaHits: tracker.daily, RateHits: tracker.rate,
+		Elapsed: now.Sub(budget.startedAt), Until: primaryQuotaRetryAt(reason, quotaUntil, cooling, now), Cause: cause,
 	}
 }
 
@@ -431,7 +484,9 @@ func (tracker *primaryQuotaTracker) failure(budget *leaseWaitBudget, reason stri
 //   - 其余候选全部冷却：号池里能服务它的账号都在冷却，取选号给出的最早恢复与本请求遇到的额度冷却中较早者，不设上限
 //     （与 AllCoolingError 一致，每日限额就写真实的恢复时间）；
 //   - 额度 429 后没有已启动的 Worker：5 秒后（限定在 1 到 30 秒），这次选号已为备用账号发起后台扩容，届时多半已经启动；
-//   - 换号上限、没有其他可换的账号：号池里可能还有没冷却的账号，判断要在账户池锁内分类全部候选、成本高，
+//   - 限流失败已达换号上限：已启动的 Worker 多半刚用满这一分钟，取本请求遇到的限流冷却中最早的恢复，不超过 cooldownQueueLimit
+//     （分钟窗口），不知道时 5 秒；
+//   - 每日类的换号上限、没有其他可换的账号：号池里可能还有没冷却的账号，判断要在账户池锁内分类全部候选、成本高，
 //     取 5 秒后与本请求遇到的额度冷却中较早者
 func primaryQuotaRetryAt(reason string, quotaUntil time.Time, cooling *aistudio.AllCoolingError, now time.Time) time.Time {
 	floor := now.Add(primaryRetryMin)
@@ -448,6 +503,13 @@ func primaryQuotaRetryAt(reason string, quotaUntil time.Time, cooling *aistudio.
 		if until.IsZero() {
 			until = fallback
 		}
+	case primaryQuotaReasonRateLimit:
+		// 已启动的 Worker 多半刚用满这一分钟：取本请求遇到的限流冷却中最早的恢复，不超过 cooldownQueueLimit；不知道时 5 秒
+		until = quotaUntil
+		if until.IsZero() {
+			until = fallback
+		}
+		until = earlierTime(until, now.Add(cooldownQueueLimit))
 	default:
 		until = earlierTime(fallback, quotaUntil)
 	}
@@ -469,16 +531,25 @@ func earlierTime(left time.Time, right time.Time) time.Time {
 	}
 }
 
-// primaryQuotaMessage 为 Ultra 主用模型额度不足立即返回时写进请求进度的一句话
+// primaryQuotaMessage 为 Ultra 主用模型额度不足立即返回时写进请求进度的一句话：额度失败为每日类的次数，有限流类失败时另写限流失败
 func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError) string {
-	return fmt.Sprintf("Ultra 主用模型额度不足，立即返回 429 | 原因=%s | 额度失败=%d | 总耗时=%s | 建议重试=%s",
-		quota.Reason, quota.QuotaHits, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
+	hits := fmt.Sprintf("额度失败=%d", quota.QuotaHits)
+	if quota.RateHits > 0 {
+		hits += fmt.Sprintf(" | 限流失败=%d", quota.RateHits)
+	}
+	return fmt.Sprintf("Ultra 主用模型额度不足，立即返回 429 | 原因=%s | %s | 总耗时=%s | 建议重试=%s",
+		quota.Reason, hits, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
 }
 
-// primaryQuotaSwitchMessage 为 Ultra 主用模型额度失败后换号时写进请求进度的一句话：额度失败按 次数/换号上限 写，
-// 第 N 次额度失败后是第 N 次换号，超过换号上限的那次额度失败不再换号、按额度不足结束
-func primaryQuotaSwitchMessage(hits int, cause error) string {
-	return fmt.Sprintf("额度 429，换号重试（只用已启动的 Worker）| 额度失败=%d/%d | 原因=%s", hits, primaryQuotaSwitchLimit, progressReason(cause))
+// primaryQuotaSwitchMessage 为 Ultra 主用模型额度失败后换号时写进请求进度的一句话：按最近一次额度失败的类别写，两类各按 次数/换号上限，
+// 第 N 次某类失败后是这一类的第 N 次换号，超过该类换号上限的那次失败不再换号、按额度不足结束；kind 为冷却类型
+func primaryQuotaSwitchMessage(tracker *primaryQuotaTracker, kind string, cause error) string {
+	if tracker.last == primaryQuotaRate {
+		return fmt.Sprintf("限流 429，换号重试（只用已启动的 Worker）| 限流失败=%d/%d | 类型=%s | 额度失败=%d/%d | 原因=%s",
+			tracker.rate, primaryRateLimitSwitchLimit, kind, tracker.daily, primaryQuotaSwitchLimit, progressReason(cause))
+	}
+	return fmt.Sprintf("额度 429，换号重试（只用已启动的 Worker）| 额度失败=%d/%d | 类型=%s | 原因=%s",
+		tracker.daily, primaryQuotaSwitchLimit, kind, progressReason(cause))
 }
 
 // primaryAllCoolingMessage 为 Ultra 主用模型还没遇到额度 429 时选号就遇到候选全部冷却、立即返回时写进请求进度的一句话：

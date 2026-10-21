@@ -312,7 +312,8 @@ func (capacity *standbyCapacity) room(partition aistudio.PoolScope) bool {
 	return capacity.active[partition] < capacity.manager.maxActiveFor(partition)
 }
 
-// coolingVictim 判断已满的分区内是否有在该模型上冷却的空闲 Worker 可以替换
+// coolingVictim 判断已满的分区内是否有在该模型上冷却的空闲 Worker 可以替换；剩余不到 aistudio.ShortCooldownMax 的短冷却
+// （分钟限额、限流）不算：一分钟内就恢复，为扩容替换它得不偿失
 func (capacity *standbyCapacity) coolingVictim(partition aistudio.PoolScope) bool {
 	if capacity.room(partition) {
 		return false
@@ -335,8 +336,8 @@ func (capacity *standbyCapacity) idleVictim(partition aistudio.PoolScope) bool {
 	return found
 }
 
-// expandable 返回可以在后台扩容的备用账户：所在分区未满，或分区已满但有冷却中的空闲 Worker 可以替换；优先没有 Worker 的账户，
-// 其次优先没有在热门或主用模型上长时间冷却的账户（见 preferred）
+// expandable 返回可以在后台扩容的备用账户：所在分区未满，或分区已满但有冷却中（剩余不少于 ShortCooldownMax）的空闲 Worker 可以替换；
+// 优先没有 Worker 的账户，其次优先没有在热门或主用模型上长时间冷却的账户（见 preferred）
 func (capacity *standbyCapacity) expandable(standby []string) string {
 	for _, candidates := range [][]string{capacity.manager.coldAccounts(standby), standby} {
 		for _, segment := range capacity.preferred(candidates) {

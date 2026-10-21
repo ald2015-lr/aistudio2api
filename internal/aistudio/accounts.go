@@ -73,6 +73,45 @@ var (
 	errAccountLeaseBusy = ErrAccountLeased
 )
 
+// AccountCoolingDownError 表示租约账户在请求发出前进入冷却（多半是同账号别的请求刚遇到额度 429）：这次请求没有发到上游。
+// errors.Is(err, ErrAccountCoolingDown) 成立；对外与全部冷却一样按 429 返回，Retry-After 为拦下它的冷却的恢复时间
+type AccountCoolingDownError struct {
+	AccountID string
+	ModelID   string
+	// Until 与 Reason 为拦下请求的冷却（全局 * 与该通道该模型中恢复较晚的一个，见 accountCooldown）
+	Until  time.Time
+	Reason string
+}
+
+func (e *AccountCoolingDownError) Error() string {
+	// 冷却原因形如“分钟限额: <上游原文>”，文案只写冷却类型
+	kind, _, _ := strings.Cut(e.Reason, ":")
+	if kind = strings.TrimSpace(kind); kind != "" {
+		kind += "，"
+	}
+	return fmt.Sprintf("%s（%s恢复时间 %s，请求没有发到上游）", ErrAccountCoolingDown.Error(), kind, e.Until.Local().Format(time.RFC3339))
+}
+
+// Is 让 errors.Is(err, ErrAccountCoolingDown) 成立：调用方按哨兵判断“发出前已冷却”
+func (e *AccountCoolingDownError) Is(target error) bool {
+	return target == ErrAccountCoolingDown
+}
+
+// RetryAt 返回拦下请求的冷却的恢复时间，供对外错误写 Retry-After
+func (e *AccountCoolingDownError) RetryAt() time.Time {
+	return e.Until
+}
+
+// HTTPStatus 返回发出前已冷却对应的公开状态码：与全部冷却一样按限流 429 返回
+func (e *AccountCoolingDownError) HTTPStatus() int {
+	return http.StatusTooManyRequests
+}
+
+// ErrorCode 返回 OpenAI 兼容的限流错误代码
+func (e *AccountCoolingDownError) ErrorCode() string {
+	return "rate_limit_exceeded"
+}
+
 // AllCoolingError 表示请求的全部候选账户都在冷却且不会很快恢复
 type AllCoolingError struct {
 	ModelID string
@@ -162,9 +201,9 @@ func (e *CapacityBusyError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
-// PrimaryQuotaError 表示 Ultra 主用模型（ULTRA_PRIMARY_MODELS）的请求因额度不足立即结束：额度 429 的换号次数已达上限、
-// 其余候选全部冷却、额度 429 后号池里没有已启动的 Worker（只剩要现场冷启动的备用账号），或没有其他可换的账号。对外与全部冷却一样按 429 返回并带
-// Retry-After，由客户端稍后重试，不在号池里挨个换号、现场冷启动直到超时。
+// PrimaryQuotaError 表示 Ultra 主用模型（ULTRA_PRIMARY_MODELS）的请求因额度不足立即结束：额度 429 的换号次数已达上限
+// （每日类与限流类各有上限，见 QuotaHits、RateHits）、其余候选全部冷却、额度 429 后号池里没有已启动的 Worker（只剩要现场冷启动的备用账号），
+// 或没有其他可换的账号。对外与全部冷却一样按 429 返回并带 Retry-After，由客户端稍后重试，不在号池里挨个换号、现场冷启动直到超时。
 // Cause 为最后一次上游额度错误，只写进内部日志：刻意不实现 Unwrap，否则会被当成上游 RPCError（对外原文、没有 Retry-After）
 // 或输入超限等错误处理
 type PrimaryQuotaError struct {
@@ -173,8 +212,10 @@ type PrimaryQuotaError struct {
 	Pool PoolScope
 	// Reason 为结束的原因（额度失败已达换号上限、其余候选全部冷却、额度 429 后没有已启动的 Worker 等）
 	Reason string
-	// QuotaHits 为本请求遇到的额度失败次数，Elapsed 为请求从第一次选号起的总耗时
+	// QuotaHits 为本请求遇到的每日类额度失败的次数，RateHits 为限流类额度失败（分钟限额、限流）的次数，
+	// Elapsed 为请求从第一次选号起的总耗时
 	QuotaHits int
+	RateHits  int
 	Elapsed   time.Duration
 	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
 	Until time.Time
@@ -189,6 +230,9 @@ func (e *PrimaryQuotaError) Error() string {
 	}
 	message := fmt.Sprintf("额度不足：%s的 Ultra 主用模型 %s 没有可用额度，立即返回（原因：%s，额度失败 %d 次",
 		pool, e.ModelID, e.Reason, e.QuotaHits)
+	if e.RateHits > 0 {
+		message += fmt.Sprintf("，限流失败 %d 次", e.RateHits)
+	}
 	if e.Elapsed > 0 {
 		message += fmt.Sprintf("，总耗时 %s", roundBusyDuration(e.Elapsed))
 	}
@@ -397,6 +441,8 @@ type Account struct {
 	// draining 为排空中（见 SetDraining）：不固定账户的选号不再给它新租约，分类时按忙碌处理；
 	// 指定账户与文件绑定的请求照常使用。只影响调度，不改变对外状态、Activity 与预热概况。受账户池 mu 保护
 	draining bool
+	// rate 为最近一个窗口的生成请求记录（每账号每分钟限速，见 rate_limit.go），第一次取得生成租约时创建；受账户池 mu 保护
+	rate *accountRate
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -466,6 +512,9 @@ type AccountCandidateGroups struct {
 	StandbyBusy      []string
 	EarliestCooldown time.Time
 	Eligible         bool
+	// RateLimited 为因每分钟请求已满（ACCOUNT_RPM_LIMIT）而按忙碌分组的候选数，冷却中与被排除的不算；WarmRateLimited 为其中的热账户数
+	RateLimited     int
+	WarmRateLimited int
 }
 
 // AccountCandidateState 表示账户候选的实时调度指标
@@ -525,6 +574,14 @@ type AccountPool struct {
 	statusCacheAt   time.Time
 	// background 记录后台运行态写入（见 pool_background.go），WaitBackground 等待它们结束
 	background backgroundWrites
+	// accountRateLimit 为单账户每分钟生成请求上限（ACCOUNT_RPM_LIMIT，0 关闭，构造时为 0，由 app 层 SetAccountRateLimit 设置）；
+	// rateWindow 为滑动窗口，只给测试改小，为 0 时取 accountRateWindow。rateFull 为截止时刻为有限值的满窗账户，rateWake 为指向
+	// 其中最早窗口释放时刻的计时器，rateWakeAt 为它的触发时刻（UnixNano，0 为没有设），见 rate_limit.go。均受 mu 保护
+	accountRateLimit int
+	rateWindow       time.Duration
+	rateFull         map[*Account]struct{}
+	rateWake         *time.Timer
+	rateWakeAt       int64
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -541,6 +598,10 @@ type AccountLease struct {
 	released              bool
 	once                  sync.Once
 	err                   error
+	// ratePending 为本租约预占的每分钟名额还没被发送或释放抵掉，受账户池 mu 保护；rateFilled 为取得租约时账户的窗口被它占满
+	// （是否写“已满”日志见 ClaimRateWindowNote），只在创建时写入
+	ratePending bool
+	rateFilled  bool
 }
 
 // AccountRuntimeLease 保证同一邮箱只有一个 WAA runtime
@@ -2302,6 +2363,8 @@ func (l *AccountLease) releaseLocked() {
 		l.account.leaseLock = nil
 		l.account.leasePath = ""
 	}
+	// 没有发出的生成租约退还每分钟名额的预占（独占租约没有预占）
+	l.releaseRateLocked()
 	l.pool.notifyLocked()
 }
 
@@ -2424,9 +2487,11 @@ func (p *AccountPool) markModelAccessVerified(
 	current := account.runtime.ModelAccess[canonicalModelID]
 	_, cooling := account.runtime.Cooldowns[canonicalModelID]
 	globalAccess := account.runtime.ModelAccess[globalCooldownKey]
-	_, globalCooling := account.runtime.Cooldowns[globalCooldownKey]
+	// 账号全局 * 上短的分钟限额或限流冷却不会被这次成功清除，不算要写回的变化（见 shortCooldownActive）
+	globalCooldown, globalCooling := account.runtime.Cooldowns[globalCooldownKey]
+	globalBlocks := globalCooling && !shortCooldownActive(globalCooldown, time.Now())
 	unchanged := generation == account.modelAccessGeneration && current.State == ModelAccessVerified &&
-		!cooling && !current.CheckedAt.Before(checkedAt) && !globalCooling &&
+		!cooling && !current.CheckedAt.Before(checkedAt) && !globalBlocks &&
 		!globalAccess.CheckedAt.Before(checkedAt)
 	p.mu.Unlock()
 	if unchanged {
@@ -2458,12 +2523,13 @@ func (p *AccountPool) markModelAccessVerified(
 			if globalAccess.CheckedAt.Before(checkedAt) {
 				runtimeChanged = true
 			}
-			if _, exists := runtimeState.Cooldowns[globalCooldownKey]; exists {
+			// 全局短冷却只推进 CheckedAt、等它自行到期：取得租约更晚的请求先成功，证明不了这一分钟的额度已经恢复
+			if cooldown, exists := runtimeState.Cooldowns[globalCooldownKey]; exists && !shortCooldownActive(cooldown, time.Now()) {
 				runtimeChanged = true
+				delete(runtimeState.Cooldowns, globalCooldownKey)
 			}
 			globalAccess.CheckedAt = checkedAt.UTC()
 			runtimeState.ModelAccess[globalCooldownKey] = globalAccess
-			delete(runtimeState.Cooldowns, globalCooldownKey)
 		}
 		return runtimeChanged, nil, nil
 	})
@@ -2567,6 +2633,32 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 	return result
 }
 
+// CooldownWrite 为写入冷却的结果（见 TryMarkCooldownIfGeneration）
+type CooldownWrite uint8
+
+const (
+	// CooldownWritten 表示已写入
+	CooldownWritten CooldownWrite = iota + 1
+	// CooldownSkippedGeneration 表示模型目录代际已变化，旧租约的结果不再写回
+	CooldownSkippedGeneration
+	// CooldownSkippedStale 表示该作用域已有不早于本次租约的记录（同账号取得租约更晚的请求已写回）
+	CooldownSkippedStale
+)
+
+// String 返回写入结果的中文说明，供冷却日志的“原因”字段使用
+func (w CooldownWrite) String() string {
+	switch w {
+	case CooldownWritten:
+		return "已写入"
+	case CooldownSkippedGeneration:
+		return "模型目录已更新，旧租约的结果不再写回"
+	case CooldownSkippedStale:
+		return "同账号取得租约更晚的请求已写回结果"
+	default:
+		return "未知"
+	}
+}
+
 // MarkCooldownIfGeneration 保存当前目录代际中的作用域冷却
 func (p *AccountPool) MarkCooldownIfGeneration(
 	accountID string,
@@ -2576,33 +2668,54 @@ func (p *AccountPool) MarkCooldownIfGeneration(
 	until time.Time,
 	reason string,
 ) error {
+	_, err := p.TryMarkCooldownIfGeneration(accountID, modelAccessScope, generation, checkedAt, until, reason)
+	return err
+}
+
+// TryMarkCooldownIfGeneration 与 MarkCooldownIfGeneration 相同，另外返回冷却是否真正写入：
+// 目录代际已变化、或该作用域已有不早于 checkedAt 的记录时不写，调用方据此如实记录日志、不登记淘汰
+func (p *AccountPool) TryMarkCooldownIfGeneration(
+	accountID string,
+	modelAccessScope string,
+	generation uint64,
+	checkedAt time.Time,
+	until time.Time,
+	reason string,
+) (CooldownWrite, error) {
 	if !until.After(time.Now()) {
-		return fmt.Errorf("冷却期限必须在未来")
+		return 0, fmt.Errorf("冷却期限必须在未来")
 	}
 	checkedAt = checkedAt.UTC()
 	if checkedAt.IsZero() {
-		return fmt.Errorf("冷却检查时间不能为空")
+		return 0, fmt.Errorf("冷却检查时间不能为空")
 	}
 	modelAccessScope = strings.TrimSpace(modelAccessScope)
 	if modelAccessScope == "" {
 		modelAccessScope = globalCooldownKey
 	}
+	var write CooldownWrite
 	_, err := p.updateRuntime(accountID, func(account *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
 		if generation != account.modelAccessGeneration {
+			write = CooldownSkippedGeneration
 			return false, nil, nil
 		}
 		modelAccessScope = canonicalAccountModelID(account, modelAccessScope)
 		currentAccess := runtimeState.ModelAccess[modelAccessScope]
 		if !currentAccess.CheckedAt.Before(checkedAt) {
+			write = CooldownSkippedStale
 			return false, nil, nil
 		}
 		next := CooldownState{Until: until.UTC(), Reason: reason}
 		currentAccess.CheckedAt = checkedAt
 		runtimeState.ModelAccess[modelAccessScope] = currentAccess
 		runtimeState.Cooldowns[modelAccessScope] = next
+		write = CooldownWritten
 		return true, nil, nil
 	})
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return write, nil
 }
 
 // ClearCooldownIfGeneration 清除当前目录代际中的作用域冷却
@@ -2625,28 +2738,29 @@ func (p *AccountPool) ClearCooldownIfGeneration(
 			return false, nil, nil
 		}
 		modelAccessScope = canonicalAccountModelID(account, modelAccessScope)
-		currentAccess := runtimeState.ModelAccess[modelAccessScope]
 		changed := false
-		if !currentAccess.CheckedAt.After(checkedAt) {
-			_, cooling := runtimeState.Cooldowns[modelAccessScope]
-			if currentAccess.CheckedAt.Before(checkedAt) || cooling {
-				changed = true
-				currentAccess.CheckedAt = checkedAt
-				runtimeState.ModelAccess[modelAccessScope] = currentAccess
-				delete(runtimeState.Cooldowns, modelAccessScope)
+		now := time.Now()
+		// clearScope 推进作用域的 CheckedAt 并清除它的冷却；账号全局 * 上的短的分钟限额或限流冷却只推进 CheckedAt、等它自行到期（见 shortCooldownActive）
+		clearScope := func(scope string) {
+			access := runtimeState.ModelAccess[scope]
+			if access.CheckedAt.After(checkedAt) {
+				return
+			}
+			cooldown, cooling := runtimeState.Cooldowns[scope]
+			keep := scope == globalCooldownKey && shortCooldownActive(cooldown, now)
+			if !access.CheckedAt.Before(checkedAt) && (!cooling || keep) {
+				return
+			}
+			changed = true
+			access.CheckedAt = checkedAt
+			runtimeState.ModelAccess[scope] = access
+			if !keep {
+				delete(runtimeState.Cooldowns, scope)
 			}
 		}
+		clearScope(modelAccessScope)
 		if modelAccessScope != globalCooldownKey {
-			globalAccess := runtimeState.ModelAccess[globalCooldownKey]
-			if !globalAccess.CheckedAt.After(checkedAt) {
-				_, cooling := runtimeState.Cooldowns[globalCooldownKey]
-				if globalAccess.CheckedAt.Before(checkedAt) || cooling {
-					changed = true
-					globalAccess.CheckedAt = checkedAt
-					runtimeState.ModelAccess[globalCooldownKey] = globalAccess
-					delete(runtimeState.Cooldowns, globalCooldownKey)
-				}
-			}
+			clearScope(globalCooldownKey)
 		}
 		return changed, nil, nil
 	})
@@ -3157,7 +3271,7 @@ func (p *AccountPool) classifyAccountBruteLocked(
 		}
 		return
 	}
-	classifyCandidate(groups, account, warm, p.perAccountConcurrency, sharedSelection(selection))
+	classifyCandidate(groups, account, warm, p.perAccountConcurrency, sharedSelection(selection), p.rateGateLocked(selection, now))
 }
 
 // sharedSelection 判断选择不固定账户：既没有指定账户，也没有绑定文件资源。排空标记只对这类选择生效
@@ -3192,9 +3306,9 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	return nil, earliest, waitable, nil
 }
 
-// leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却或文件租约被其他进程占用时
-// 返回 nil 并把冷却恢复或轮询时间并入 earliest；排空中的账户不给不固定账户的选择新租约（排空结束时唤醒等待方）。
-// 调用方持有 p.mu
+// leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却、每分钟请求已满或文件租约被其他进程占用时
+// 返回 nil 并把冷却恢复、窗口释放或轮询时间并入 earliest；排空中的账户不给不固定账户的选择新租约（排空结束时唤醒等待方）。
+// 生成选择取得的租约预占一个每分钟名额（见 rate_limit.go）。调用方持有 p.mu
 func (p *AccountPool) leaseCandidateLocked(
 	account *Account, channel Channel, selection AccountSelection, now time.Time, earliest *time.Time,
 ) (*AccountLease, error) {
@@ -3211,6 +3325,17 @@ func (p *AccountPool) leaseCandidateLocked(
 			}
 			return nil, nil
 		}
+	}
+	// 每分钟请求已满：按忙碌处理，窗口释放时刻并入 earliest 由 AcquireFor 定时复查（窗口释放计时器另发调度信号）；
+	// 只因预占而满时等租约发出或释放的唤醒（见 rateChangedLocked）
+	gated := generationSelection(selection)
+	if until := rateUntilOf(account); p.rateGateLocked(selection, now).full(until) {
+		if until != rateUntilPending {
+			if at := time.Unix(0, until).UTC(); earliest.IsZero() || at.Before(*earliest) {
+				*earliest = at
+			}
+		}
+		return nil, nil
 	}
 	refreshRuntime := false
 	if account.active == 0 {
@@ -3234,11 +3359,16 @@ func (p *AccountPool) leaseCandidateLocked(
 	account.LastUsed = now
 	p.lastPicked[selectionAccessScope(selection)] = account.ID
 	p.lastPickedChannel[selectionAccessScope(selection)] = channel
-	return &AccountLease{
+	lease := &AccountLease{
 		pool: p, account: account, authGeneration: account.authGeneration,
 		modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
 		channel: channel,
-	}, nil
+	}
+	// 上限为 0 或文件绑定时不拦但照常预占，重新打开限速时窗口仍然准确
+	if gated {
+		p.reserveRateLocked(account, lease, now)
+	}
+	return lease, nil
 }
 
 // tryAcquireIndexedLocked 为不限账户的选择在候选集中取租约：只遍历未冷却的候选，账户与通道顺序和
@@ -4207,6 +4337,13 @@ func accountCooldown(account *Account, modelID string, now time.Time) (CooldownS
 		}
 	}
 	return selected, !selected.Until.IsZero()
+}
+
+// shortCooldownActive 判断冷却是仍生效、剩余不到 ShortCooldownMax 的分钟限额或限流冷却（rateCooldownReason）：账号全局 * 上的
+// 这类冷却只等到期，同账号其他请求或非生成操作的成功不提前清除（取得租约更晚的请求先到上游并成功，证明不了这一分钟的额度已经恢复）。
+// 其他原因的冷却（转录上传等暂时故障的 30 秒冷却、长冷却的最后一段）照旧被成功清除
+func shortCooldownActive(cooldown CooldownState, now time.Time) bool {
+	return cooldown.Active(now) && cooldown.Until.Sub(now) < ShortCooldownMax && rateCooldownReason(cooldown.Reason)
 }
 
 func selectionAccessScope(selection AccountSelection) string {

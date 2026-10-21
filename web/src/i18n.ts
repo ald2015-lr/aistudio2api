@@ -156,6 +156,9 @@ const zhCN = {
   'settings.perAccountConcurrency': '单账户请求并发',
   'settings.workerPartitionHelp':
     '常驻 Worker 数与峰值 Worker 上限只约束普通号池；Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为两个峰值之和。启动预热并发与单账户请求并发两个号池共用。',
+  'settings.accountRpmLimit': '单账号每分钟请求上限',
+  'settings.accountRpmLimitHelp':
+    '每个账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型、两个通道共用）；满了就算忙碌，请求换到其他账号，热 Worker 都满时启动新的 Worker；只统计本服务，上游的 429 冷却仍然兜底；默认 10，比 12 留出余量；0 表示关闭；修改后立即生效。',
   'settings.ultraTitle': 'Ultra 号池',
   'settings.ultraHelp':
     '权益为 Ultra 的账户组成 Ultra 号池（付费号池）；开启下方“Pro 账户并入 Ultra 号池”后，权益为 Pro 的账户也属于它。客户端把 Base URL 换成 /ultra 前缀（OpenAI 用 http://主机:端口/ultra/v1，Anthropic 与 Gemini 用 http://主机:端口/ultra）即只用 Ultra 号池的账户处理请求。修改后立即生效，不需要重启服务。',
@@ -193,11 +196,11 @@ const zhCN = {
   'settings.primaryModels': '主用模型列表',
   'settings.primaryQueueWait': '排队上限',
   'settings.primaryHelp':
-    '这份列表只作用于普通号池（不带 /ultra 前缀的请求），/ultra 请求按下方的 Ultra 主用模型列表。列表中的模型的请求最多等这么久空闲的账号或 Worker，超过即返回 429 并带 Retry-After，让客户端稍后重试，而不是在这里排队到请求超时。同时生成数约为 峰值 Worker 上限 × 单账户请求并发，并发超过它时请求就会排队；这只是对症状的处理，长期不够用应加 Worker 或并发。逗号分隔的模型 ID；留空时所有模型照常排队（默认）。排队上限为 0 表示不排队，没有立即可用的账号就返回 429；上限整个请求共用一份，按实际经过的时间计，换号重试的尝试与退避都算在内（请求自己现场冷启动的浏览器启动时间不计），不能超过请求超时。候选全部冷却仍按原规则处理。修改后立即生效。',
+    '这份列表只作用于普通号池（不带 /ultra 前缀的请求），/ultra 请求按下方的 Ultra 主用模型列表。列表中的模型的请求最多等这么久空闲的账号或 Worker，超过即返回 429 并带 Retry-After，让客户端稍后重试，而不是在这里排队到请求超时。同时生成数约为 峰值 Worker 上限 × 单账户请求并发，并发超过它时请求就会排队，每分钟生成次数也不超过 Worker 数 × 单账号每分钟请求上限；这只是对症状的处理，长期不够用应增加 Worker 数；单账号并发受每分钟次数上限约束，不宜调高。逗号分隔的模型 ID；留空时所有模型照常排队（默认）。排队上限为 0 表示不排队，没有立即可用的账号就返回 429；上限整个请求共用一份，按实际经过的时间计，换号重试的尝试与退避都算在内（请求自己现场冷启动的浏览器启动时间不计），不能超过请求超时。候选全部冷却仍按原规则处理。修改后立即生效。',
   'settings.ultraPrimaryModels': 'Ultra 主用模型列表',
   'settings.ultraPrimaryQueueWait': 'Ultra 排队上限',
   'settings.ultraPrimaryHelp':
-    'Ultra 主用模型列表只作用于 /ultra 请求；关闭“Ultra 号池的账户只服务 /ultra 请求”时，普通路径上不在上方普通列表里、但在这份列表里的模型（通常是只有 Ultra 号池的账户能服务的模型）也按这里的规则。这些模型没有额度时立即返回 429 并带 Retry-After，而不是在服务里一直换号重试：候选账户全部冷却时立即返回；请求中遇到额度 429 后最多再换 2 次账户，每次额度失败后的那次换号只用已启动的 Worker，不为它现场冷启动备用账户。排队上限只限制等空闲账户或 Worker 的时间，规则与上方相同（0 表示不排队，不能超过请求超时）。逗号分隔的模型 ID，默认 gemini-4-argon；清空即关闭。修改后立即生效。',
+    'Ultra 主用模型列表只作用于 /ultra 请求；关闭“Ultra 号池的账户只服务 /ultra 请求”时，普通路径上不在上方普通列表里、但在这份列表里的模型（通常是只有 Ultra 号池的账户能服务的模型）也按这里的规则。这些模型没有额度时立即返回 429 并带 Retry-After，而不是在服务里一直换号重试：候选账户全部冷却时立即返回；请求中遇到额度 429 后，每日额度用完时最多再换 2 次账户，分钟限额与限流最多再换 5 次，每次额度失败后的那次换号只用已启动的 Worker，不为它现场冷启动备用账户。排队上限只限制等空闲账户或 Worker 的时间，规则与上方相同（0 表示不排队，不能超过请求超时）。逗号分隔的模型 ID，默认 gemini-4-argon；清空即关闭。修改后立即生效。',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': '通道',
@@ -448,7 +451,7 @@ const zhCN = {
   'accounts.tierUnknown': '未读取',
   'accounts.tierUnknownHelp': '尚未从官网读取权益，暂按 Free 计入普通号池',
   'settings.liveHint':
-    'Worker 数、并发、账户选择策略、超时、临时对话保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
+    'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、临时对话保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
   'logs.categoryAll': '全部',
   'logs.categoryRequest': '请求',
   'logs.categoryAccount': '账户',
@@ -474,6 +477,7 @@ const zhCN = {
     '调用 API 必须携带此密钥；留空保存即使用默认密钥 {key}。默认密钥随源码公开，对外监听时请改为自定义密钥',
   'settings.invalidRequired': '{field}不能为空',
   'settings.invalidNumber': '{field}必须是正整数',
+  'settings.invalidAccountRpmLimit': '单账号每分钟请求上限应为 0（关闭）到 1000 的整数',
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
   'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
   'settings.invalidPrimaryQueueWait': '主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
@@ -826,6 +830,9 @@ const en: Record<TranslationKey, string> = {
   'settings.perAccountConcurrency': 'Concurrent requests per account',
   'settings.workerPartitionHelp':
     'Resident workers and the active worker limit apply to the normal pool only. Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of both limits. Startup prewarm concurrency and per-account concurrency are shared by both pools.',
+  'settings.accountRpmLimit': 'Requests per minute per account',
+  'settings.accountRpmLimitHelp':
+    'The most generation requests each account sends in the last 60 seconds (upstream allows 12 per account per minute, shared by all models and both channels). An account that reaches it counts as busy and requests go to other accounts; when every running worker is full a new worker starts. Only requests from this service are counted, and upstream 429 cooldowns still act as the fallback. Defaults to 10, which leaves headroom below 12; 0 turns it off. Changes apply immediately.',
   'settings.ultraTitle': 'Ultra pool',
   'settings.ultraHelp':
     'Accounts with the Ultra tier form the Ultra pool (the paid pool); with "Put Pro accounts in the Ultra pool" below turned on, accounts with the Pro tier belong to it too. Point a client at the /ultra prefix (OpenAI: http://host:port/ultra/v1; Anthropic and Gemini: http://host:port/ultra) to have its requests served only by Ultra-pool accounts. Changes apply immediately without a service restart.',
@@ -863,11 +870,11 @@ const en: Record<TranslationKey, string> = {
   'settings.primaryModels': 'Primary model list',
   'settings.primaryQueueWait': 'Queue limit',
   'settings.primaryHelp':
-    'This list applies to the normal pool only (requests without the /ultra prefix); /ultra requests use the Ultra primary model list below. Requests for the listed models wait at most this long for a free account or worker, then get a 429 with Retry-After so the client retries later instead of queuing here until the request timeout. Concurrent generations are roughly the active worker limit × concurrent requests per account; beyond that, requests queue. This only treats the symptom: add workers or per-account concurrency when capacity is short for long. Comma-separated model IDs; empty keeps every model queuing as usual (default). A limit of 0 never queues and returns 429 when nothing is free right away; the limit is shared by the whole request and counts wall-clock time, including retries on another account and their backoff (the browser start-up of a cold start the request runs for itself does not count), and it cannot exceed the request timeout. When every candidate is cooling down the usual rules still apply. Changes apply immediately.',
+    'This list applies to the normal pool only (requests without the /ultra prefix); /ultra requests use the Ultra primary model list below. Requests for the listed models wait at most this long for a free account or worker, then get a 429 with Retry-After so the client retries later instead of queuing here until the request timeout. Concurrent generations are roughly the active worker limit × concurrent requests per account; beyond that, requests queue, and generations per minute never exceed the number of workers × requests per minute per account. This only treats the symptom: when capacity is short for long, add workers; per-account concurrency is bound by the per-minute request limit of each account, so do not raise it. Comma-separated model IDs; empty keeps every model queuing as usual (default). A limit of 0 never queues and returns 429 when nothing is free right away; the limit is shared by the whole request and counts wall-clock time, including retries on another account and their backoff (the browser start-up of a cold start the request runs for itself does not count), and it cannot exceed the request timeout. When every candidate is cooling down the usual rules still apply. Changes apply immediately.',
   'settings.ultraPrimaryModels': 'Ultra primary model list',
   'settings.ultraPrimaryQueueWait': 'Ultra queue limit',
   'settings.ultraPrimaryHelp':
-    'The Ultra primary model list applies to /ultra requests. When "Ultra-pool accounts only serve /ultra requests" is off, models on normal paths that are not in the normal list above but are in this list (usually models only Ultra-pool accounts can serve) follow these rules too. When these models are out of quota the request gets a 429 with Retry-After right away instead of switching accounts inside the service over and over: it returns at once when every candidate account is cooling down, and after a quota 429 during a request it switches accounts at most 2 more times; the switch right after each quota failure uses only workers that are already running and never cold-starts a standby account for it. The queue limit only bounds the wait for a free account or worker and follows the same rules as above (0 never queues; it cannot exceed the request timeout). Comma-separated model IDs; defaults to gemini-4-argon; clear it to turn this off. Changes apply immediately.',
+    'The Ultra primary model list applies to /ultra requests. When "Ultra-pool accounts only serve /ultra requests" is off, models on normal paths that are not in the normal list above but are in this list (usually models only Ultra-pool accounts can serve) follow these rules too. When these models are out of quota the request gets a 429 with Retry-After right away instead of switching accounts inside the service over and over: it returns at once when every candidate account is cooling down, and after a quota 429 during a request it switches accounts at most 2 more times when the daily quota is used up and at most 5 more times for per-minute limits and rate limits; the switch right after each quota failure uses only workers that are already running and never cold-starts a standby account for it. The queue limit only bounds the wait for a free account or worker and follows the same rules as above (0 never queues; it cannot exceed the request timeout). Comma-separated model IDs; defaults to gemini-4-argon; clear it to turn this off. Changes apply immediately.',
   'channel.playground': 'Playground',
   'channel.build': 'Build',
   'logs.channel': 'Channel',
@@ -1128,7 +1135,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.tierUnknown': 'Not read',
   'accounts.tierUnknownHelp': 'The tier has not been read from AI Studio yet; the account counts as Free in the normal pool for now',
   'settings.liveHint':
-    'Worker counts, concurrency, routing strategy, timeouts and temporary chat apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
+    'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts and temporary chat apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
   'logs.categoryAll': 'All',
   'logs.categoryRequest': 'Requests',
   'logs.categoryAccount': 'Accounts',
@@ -1155,6 +1162,8 @@ const en: Record<TranslationKey, string> = {
     'Every API call must send this key; saving it empty uses the default key {key}. The default key is public in the source code, so set your own key before listening on a public address',
   'settings.invalidRequired': '{field} is required',
   'settings.invalidNumber': '{field} must be a positive integer',
+  'settings.invalidAccountRpmLimit':
+    'Requests per minute per account must be an integer from 0 (off) to 1000',
   'settings.invalidDuration': '{field} must be a duration such as 30s, 2m or 1h30m',
   'settings.invalidFirstEventTimeout':
     'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',

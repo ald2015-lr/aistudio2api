@@ -293,6 +293,9 @@ type RuntimeConfig struct {
 	RepeatPromptNonce         bool     `json:"repeat_prompt_nonce"`
 	MinOutputTokens           int      `json:"min_output_tokens"`
 	WAABackend                string   `json:"waa_backend"`
+	// AccountRPMLimit 为单账户每分钟生成请求上限（ACCOUNT_RPM_LIMIT，0 表示关闭），读取时总是返回；保存时没有该字段（旧版页面）
+	// 则沿用现值。用指针是因为 0 表示关闭，不能用零值判断是否缺省
+	AccountRPMLimit *int `json:"account_rpm_limit,omitempty"`
 	// DowngradeGuard 为降级判定设置；保存时没有该字段（旧版页面）则沿用现值
 	DowngradeGuard *DowngradeGuardConfig `json:"downgrade_guard,omitempty"`
 	// UltraExclusive、UltraIncludePro、UltraWarmWorkerLimit、UltraMaxActiveWorkers 为 Ultra 号池设置（ULTRA_EXCLUSIVE、

@@ -381,6 +381,8 @@ export interface ServiceConfig {
   ultra_max_active_workers: number
   warm_startup_concurrency: number
   per_account_concurrency: number
+  // account_rpm_limit 为单账号最近 60 秒最多发出的生成请求数，0 表示关闭。服务端总是返回该字段，因此这里不是可选字段
+  account_rpm_limit: number
   routing_strategy: 'round-robin' | 'fill-first'
   upstream_channels: UpstreamChannel[]
   // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段

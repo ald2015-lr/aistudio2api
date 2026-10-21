@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"sort"
 	"strings"
@@ -141,12 +142,14 @@ func newRuntime(
 	return service, admin, closeRuntime, nil
 }
 
-// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道与 ULTRA_INCLUDE_PRO。
+// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、ULTRA_INCLUDE_PRO 与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
 // 必须在创建 Worker 管理器、同步目录与预热之前调用，第一次 Worker 分区与预热目标就按正确的号池成员计算
 func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
 	pool.SetUltraIncludePro(cfg.UltraIncludePro)
+	// 账户池构造时不限速（0），这里按配置打开；运行中由 applyLiveFields 热更新
+	pool.SetAccountRateLimit(cfg.AccountRPMLimit)
 }
 
 // accountWorkerManager 管理每账户的长驻 WAA worker
@@ -1355,7 +1358,8 @@ func (manager *accountWorkerManager) victimReserved(accountID string) bool {
 }
 
 // idleWarmVictimFor 在分区内选择空闲热 Worker：账号长时间冷却的死槽位优先，其次冷却中的账户，再次最久未用；
-// coolingOnly 时只返回冷却中的账户。只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然。
+// coolingOnly 时只返回冷却中的账户。冷却中只算剩余不少于 aistudio.ShortCooldownMax 的冷却：分钟限额、限流这类短冷却一分钟内就恢复，
+// 与健康的空闲 Worker 同档按最久未用排序，不为它优先关掉。只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然。
 // 候选的活动与冷却状态由账户池一次加锁给出（见 pickIdleVictim）
 func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID string, coolingOnly bool, partition aistudio.PoolScope) string {
 	mode := victimAny
@@ -1493,7 +1497,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return nil, errAccountWorkerCapacity
 		}
-		// 同分区有 Worker 正在启动时只淘汰冷却中的空闲 Worker
+		// 同分区有 Worker 正在启动时只淘汰冷却中的空闲 Worker（剩余不到 ShortCooldownMax 的短冷却不算）
 		victim := manager.idleWarmVictimFor(accountID, modelID, manager.openingIn(partition, ultra), partition)
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
 		if victim != "" && !manager.tryReserveVictim(victim) {
@@ -3314,7 +3318,8 @@ func (service *trackedService) acquireLease(
 	// 主用模型的选号带排队预算（见 primary_models.go）：容量原因的等待累计超过上限时 wait 返回 CapacityBusyError，没有预算时不限时
 	budget := leaseWaitBudgetFromContext(ctx)
 	// warmOnly：Ultra 主用模型每次额度失败后紧接着的那次选号只用已启动的 Worker（见 withoutColdStart）：不回收、不替换、不现场冷启动，
-	// 也不排队等后台扩容；热 Worker 都忙时照常排队（受排队预算限制），没有热候选、只剩备用账号时发起一次后台扩容后立即返回
+	// 也不排队等后台扩容；热 Worker 都忙时照常排队（受排队预算限制，其中有每分钟请求已满的另发起一次后台扩容、不等它），
+	// 没有热候选、只剩备用账号时发起一次后台扩容后立即返回（本次选号已发起、还没结束的扩容时不再发起）
 	warmOnly := coldStartBlocked(ctx)
 	// 生成请求的选号带排队进度（见 queue_progress.go）：排队满宽限后写明原因，请求在排队中结束时错误带上最后的原因；没有时不写
 	progress := leaseWaitProgressFromContext(ctx)
@@ -3387,7 +3392,7 @@ func (service *trackedService) acquireLease(
 		snapshot = queueSnapshot{
 			warmIdle: len(warmAvailable), warmBusy: len(groups.WarmBusy),
 			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy),
-			opening: opening, earliestCooldown: groups.EarliestCooldown,
+			opening: opening, earliestCooldown: groups.EarliestCooldown, rateLimited: groups.RateLimited,
 		}
 		if len(warmAvailable) > 0 {
 			// 不在主用与热门模型里的请求先用对这些模型是死槽位的热 Worker（它们本来就服务不了主用模型），
@@ -3415,15 +3420,26 @@ func (service *trackedService) acquireLease(
 		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening) {
 			// 额度 429 之后没有已启动的 Worker，只剩要冷启动的备用账号（或正在启动的）：不现场冷启动（10–30s 以上，冷启动出来的账号
 			// 也不一定有额度），为其中一个发起后台扩容（所在分区能扩容时），不等它，立即返回；调用方按额度不足返回 429，
-			// 客户端稍后重试时扩容出来的 Worker 多半已经就绪。候选全部冷却仍走下面的全部冷却
-			if len(groups.StandbyReady) > 0 && !fixedAccount {
+			// 客户端稍后重试时扩容出来的 Worker 多半已经就绪。候选全部冷却仍走下面的全部冷却。
+			// 本次选号已由下面的满窗扩容发起过、还没结束的扩容时不再扩容别的账户（例如扩容后热 Worker 被写入冷却、复查落到这里），
+			// 一次选号最多冷启动一个；扩容已结束（成功或失败）时照常再扩容一个。其他请求发起的启动不在此列，各请求仍各扩容一个
+			if expanding != nil {
+				select {
+				case <-expanding:
+					expanding = nil
+				default:
+				}
+			}
+			if len(groups.StandbyReady) > 0 && !fixedAccount && expanding == nil {
 				if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
 					service.workers.expandInBackground(accountID, selection.ModelID)
 				}
 			}
 			return nil, &noImmediateLeaseError{reason: primaryQuotaReasonNoWarm}
 		}
-		if len(groups.StandbyReady) == 0 && opening {
+		// 只用已启动 Worker 的选号有启动中的 Worker 时，走到这里一定还有热候选（没有热候选的已在上面返回）：不按 Worker 正在启动等待，
+		// 它不排队等后台扩容（包括下面满窗时自己发起的那次），照常按下面的账号全部忙碌在排队预算内等待
+		if len(groups.StandbyReady) == 0 && opening && !(warmOnly && warmCandidates > 0) {
 			if err := wait(schedulingRecheck, "Worker 正在启动"); err != nil {
 				return nil, err
 			}
@@ -3463,6 +3479,16 @@ func (service *trackedService) acquireLease(
 					return nil, err
 				}
 				continue
+			}
+		}
+		// 只用已启动 Worker 的选号：热 Worker 都忙、其中有每分钟请求已满的（最长要等一分钟才释放，不像并发忙碌很快空出），
+		// 又有没冷却的备用账号且所在分区能扩容时，为其中一个发起一次后台扩容，不等它，照常按下面的账号全部忙碌在排队预算内等待，
+		// 客户端重试时扩容出来的 Worker 多半已经就绪；只是并发忙碌时仍不扩容。每次选号最多发起一次：扩容的账户进入启动中后，
+		// 复查不按 Worker 正在启动等待（见上），热 Worker 随后被写入冷却、落到上面没有热候选的分支时也不在扩容结束前再扩容别的账户
+		if warmOnly && !fixedAccount && !immediate && expanding == nil && len(warmAvailable) == 0 && len(groups.WarmBusy) > 0 &&
+			groups.WarmRateLimited > 0 && len(groups.StandbyReady) > 0 {
+			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
+				expanding = service.workers.expandInBackground(accountID, selection.ModelID)
 			}
 		}
 		// 替换空闲 Worker 要等旧 Worker 让出，不等待的选号只在分区有空槽时现场启动；只用已启动 Worker 的选号从不现场启动
@@ -3544,7 +3570,7 @@ func (service *trackedService) acquireLease(
 			if remaining > cooldownQueueLimit || budget.failFastOnQuota() {
 				return nil, &aistudio.AllCoolingError{ModelID: selection.ModelID, Until: groups.EarliestCooldown}
 			}
-			if err := wait(min(remaining, schedulingRecheck), waitReasonCooling); err != nil {
+			if err := wait(coolingRecheckDelay(remaining), waitReasonCooling); err != nil {
 				return nil, err
 			}
 			continue
@@ -3604,6 +3630,19 @@ func (service *trackedService) deadSlotWorkers(selection aistudio.AccountSelecti
 
 // schedulingRecheck 为等待调度信号时的兜底复查间隔
 const schedulingRecheck = time.Second
+
+// cooldownWakeJitter 为候选全部冷却、最早恢复不到一次兜底复查间隔时的随机延后上限：冷却到期不发调度信号，排队请求各按自己的计时器复查，
+// 加抖动免得同一时刻一起在账户池锁上分类候选
+const cooldownWakeJitter = 500 * time.Millisecond
+
+// coolingRecheckDelay 返回候选全部冷却时下一次复查的等待：最早恢复不少于一次兜底复查间隔时按兜底间隔；不到时等到恢复，
+// 再随机延后不到 cooldownWakeJitter（只在最后一次不足 1 秒的等待上加）
+func coolingRecheckDelay(remaining time.Duration) time.Duration {
+	if remaining >= schedulingRecheck {
+		return schedulingRecheck
+	}
+	return max(remaining, 0) + rand.N(cooldownWakeJitter)
+}
 
 // cooldownQueueLimit 为全部候选账户冷却时请求排队等待恢复的上限，覆盖分钟限额窗口
 const cooldownQueueLimit = time.Minute
@@ -3917,7 +3956,8 @@ func (service *trackedService) generateWithRetry(
 	immediateRetry, tierRetried := false, false
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
 	// 单模型 403 写入冷却后同样计入，但不退避；没等到同账号关闭失败的 Worker 就换号时同样计入，已经等过，不再退避）。
-	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避
+	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避。租约账号在发出前已进入冷却（ErrAccountCoolingDown，
+	// 请求没有发到上游）不计入
 	hardFailures := 0
 	// deferredReset、deferredAccountID 为最近一次没等到关闭失败 Worker 就换号的账号与它的后台关闭（见 worker_reset.go）：
 	// 换号找不到可用账号、换号次数用完或到连续失败上限时回到这个账号，等关闭结束后在原账号重放；换号的选号排队时关闭结束、
@@ -3954,8 +3994,9 @@ func (service *trackedService) generateWithRetry(
 	// 整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
 	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
 	budget := service.primaryBudget(modelID, scope)
-	// Ultra 主用模型（ULTRA_PRIMARY_MODELS）没有额度时立即按 429 结束（见 primary_models.go）：额度失败（上游额度 429、租约账号在发出前
-	// 进入冷却）单独计数，不计入连续失败上限、不退避；额度失败超过 primaryQuotaSwitchLimit 次，或额度失败后换号没有已启动的 Worker、
+	// Ultra 主用模型（ULTRA_PRIMARY_MODELS）没有额度时立即按 429 结束（见 primary_models.go）：额度失败分两类计数（每日类、限流类，
+	// 见 primaryQuotaClassOf），两类都不计入连续失败上限、不退避；租约账号在发出前只是短暂冷却时不算额度失败（见 coolingDownLong）。
+	// 某类额度失败超过它的换号上限（primaryQuotaSwitchLimit、primaryRateLimitSwitchLimit），或额度失败后换号没有已启动的 Worker、
 	// 其余候选全部冷却、没有其他可换的账号时按 PrimaryQuotaError 结束。普通号池的主用模型与其他模型 failFast 为假，行为不变
 	failFast := budget.failFastOnQuota()
 	// 流式请求：自己现场冷启动时推迟写出响应头，启动结束后才遇到的额度不足仍以 429 返回（见 holdStreamStart）
@@ -4075,7 +4116,7 @@ func (service *trackedService) generateWithRetry(
 				(errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling))
 			// replayUnavailable：不固定账号的请求在 Worker 重建后固定到原账号的重放选号失败，下面只排除这个账号、照常换号
 			replayUnavailable := recoveringAccount && unbound
-			if failFast && quota.hits > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil {
+			if failFast && quota.hits() > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil {
 				// Ultra 主用模型额度失败后的换号没有可用的已启动 Worker、其余候选全部冷却或没有其他可换的账号：按额度不足立即返回 429，
 				// 不回到没等到关闭的原账号等待（returnToDeferred）。文件所属账号不可用时先照常复制文件到其他账号再试；
 				// Worker 重建后的重放选号只看了原账号一个（例如它在重建期间被其他请求的额度 429 冷却），不代表其余候选，
@@ -4138,6 +4179,12 @@ func (service *trackedService) generateWithRetry(
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
 		attempted[request.AccountID] = struct{}{}
 		accountLabel := lease.Account().Config.Label
+		if lease.ClaimRateWindowNote() {
+			// 这个租约刚好占满账号的每分钟窗口（同一账号 10 分钟最多一条，名额在这里写日志时才占用，转写等不写日志的路径不占用）
+			service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+				"账号每分钟请求已满 | 上限=%d 次/60 秒 | 窗口释放前新请求换到其他账号，热 Worker 都满且分区有空槽时扩容",
+				service.pool.AccountRateLimit()))
+		}
 		trace.StartAttempt(accountLabel, string(lease.Channel()))
 		attemptStartedAt := time.Now()
 		api.SetAccessLogChannel(requestCtx, string(lease.Channel()))
@@ -4329,13 +4376,13 @@ func (service *trackedService) generateWithRetry(
 		// modelForbidden：本次尝试的单模型 403 已写入冷却。换号不退避，但仍计入连续失败上限：模型对整个号池都返回 403 时
 		// （号池里没有付费账号、纯 Go proof 稳定 403 等）不会一个请求把账号逐个试完，逐个冷却、登记淘汰并现场冷启动
 		modelForbidden := false
-		// quotaFailure：本次尝试是 Ultra 主用模型的额度失败（只在 failFast 时计数，见上文 quota）
-		quotaFailure := false
+		// quotaFailure：本次尝试是计入换号上限的 Ultra 主用模型额度失败（只在 failFast 时计数，见上文 quota）；quotaKind 为写进进度的类型
+		quotaFailure, quotaKind := false, ""
 		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, err, ""); ok {
 			cooled = true
 			if failFast {
-				quota.record(err, cooldown.Until)
-				quotaFailure = true
+				quota.record(primaryQuotaClassOf(cooldown, time.Now()), err, cooldown.Until)
+				quotaFailure, quotaKind = true, cooldown.Kind
 			}
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
@@ -4345,12 +4392,22 @@ func (service *trackedService) generateWithRetry(
 				maxAttempts++
 			}
 		}
-		// 租约账号在请求发出前进入冷却（多半是其他请求刚遇到额度 429）：Ultra 主用模型同样记一次额度失败，不计入连续失败上限、不退避
-		if failFast && !quotaFailure && errors.Is(err, aistudio.ErrAccountCoolingDown) {
-			quota.record(err, time.Time{})
-			quotaFailure = true
+		// 租约账号在请求发出前进入冷却（多半是同账号别的请求刚遇到额度 429，请求没有发到上游）：任何模型都按已冷却处理，
+		// 不计入连续失败上限、不退避，照常换号。Ultra 主用模型只在拦下它的冷却剩余不少于 rotationMinRemaining（多半是每日限额）时
+		// 记一次每日类额度失败，短冷却的连带拦截不计数
+		coolingDown := errors.Is(err, aistudio.ErrAccountCoolingDown)
+		if coolingDown {
+			cooled = true
+			if failFast {
+				if until, long := coolingDownLong(service.pool, err, request.AccountID, modelID, time.Now()); long {
+					quota.record(primaryQuotaDaily, err, until)
+					quotaFailure, quotaKind = true, "发出前已冷却"
+				}
+			}
 		}
-		if quotaFailure {
+		// 额度失败后下一次选号只用已启动的 Worker；短冷却的连带拦截不计数，此前已有额度失败时同样保持
+		// （否则选号失败时按额度不足结束的判断会漏掉）
+		if quotaFailure || failFast && coolingDown && quota.hits() > 0 {
 			warmOnlyNext = true
 		}
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度
@@ -4453,8 +4510,9 @@ func (service *trackedService) generateWithRetry(
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
 		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure
-		// Ultra 主用模型额度失败超过换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
-		quotaExhausted := quotaFailure && quota.exhausted()
+		// Ultra 主用模型最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
+		exhaustReason, exhausted := quota.exhaustedReason()
+		quotaExhausted := quotaFailure && exhausted
 		if quotaExhausted {
 			retryable = false
 		}
@@ -4483,7 +4541,7 @@ func (service *trackedService) generateWithRetry(
 		}
 		if !retryable {
 			if quotaExhausted {
-				failure := quota.failure(budget, primaryQuotaReasonLimit, nil, err)
+				failure := quota.failure(budget, exhaustReason, nil, err)
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", primaryQuotaMessage(failure))
 				err = failure
 			}
@@ -4556,7 +4614,7 @@ func (service *trackedService) generateWithRetry(
 		service.requests.log(accountLabel, "WARN", switchMessage)
 		// 换号原因同时写进请求时间线：请求详情里能直接看到每一次失败的原因
 		if quotaFailure {
-			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", primaryQuotaSwitchMessage(quota.hits, err))
+			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", primaryQuotaSwitchMessage(&quota, quotaKind, err))
 		} else {
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
 		}
@@ -4598,7 +4656,8 @@ func channelFallback(selection aistudio.AccountSelection) aistudio.AccountSelect
 
 // applyQuotaCooldown 在上游返回额度 429 时冷却该账号的模型（或整个账号），并记录日志；
 // 每日限额且该模型已判定两个通道共用额度时，同时冷却另一个通道，避免请求再去另一个通道失败一次。
-// ok 表示 err 是额度错误；stateErr 为写入冷却状态失败的原因
+// ok 表示 err 是额度错误；stateErr 为写入冷却状态失败的原因。冷却没有写入（模型目录已更新，或同账号取得租约更晚的请求已写回结果）时
+// 如实记一行 INFO，不登记淘汰、不做通道共用额度的学习，ok 仍为真：调用方照常按已冷却换号
 func (service *trackedService) applyQuotaCooldown(
 	lease *aistudio.AccountLease, accountLabel string, modelID string, err error, note string,
 ) (cooldown aistudio.QuotaCooldown, ok bool, stateErr error) {
@@ -4613,22 +4672,30 @@ func (service *trackedService) applyQuotaCooldown(
 		modelAccessScope = ""
 		scopeLabel = "全局"
 	}
-	if stateErr = service.pool.MarkCooldownIfGeneration(
+	write, stateErr := service.pool.TryMarkCooldownIfGeneration(
 		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
 		cooldown.Until, cooldown.Reason,
-	); stateErr != nil {
+	)
+	if stateErr != nil {
 		return cooldown, true, stateErr
 	}
-	// 账号进入长时间冷却后它的驻留 Worker 成了死槽位：空闲时立即淘汰，忙碌时等请求释放租约后淘汰（见 worker_retire.go）；
-	// 放在函数结束时判断，按模型的冷却要等另一通道同步冷却后才知道是否所有启用通道都已冷却
-	defer service.retireCooledWorker(accountID, modelID, cooldown)
 	suffix := ""
 	if note != "" {
 		suffix = " | " + note
 	}
+	if write != aistudio.CooldownWritten {
+		service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+			"账号冷却未写入 | 类型=%s | 范围=%s | 恢复=%s%s | 原因=%s%s",
+			cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), quotaCooldownFields(cooldown), write.String(), suffix,
+		))
+		return cooldown, true, nil
+	}
+	// 账号进入长时间冷却后它的驻留 Worker 成了死槽位：空闲时立即淘汰，忙碌时等请求释放租约后淘汰（见 worker_retire.go）；
+	// 放在函数结束时判断，按模型的冷却要等另一通道同步冷却后才知道是否所有启用通道都已冷却
+	defer service.retireCooledWorker(accountID, modelID, cooldown)
 	service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s",
-		cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), suffix,
+		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s",
+		cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), quotaCooldownFields(cooldown), suffix,
 	))
 	if cooldown.Global || cooldown.Kind != dailyQuotaKind {
 		return cooldown, true, nil
@@ -4640,16 +4707,38 @@ func (service *trackedService) applyQuotaCooldown(
 		return cooldown, true, nil
 	}
 	otherScope := aistudio.ChannelCooldownScope(other, modelID)
-	if otherErr := service.pool.MarkCooldownIfGeneration(
+	if otherWrite, otherErr := service.pool.TryMarkCooldownIfGeneration(
 		accountID, otherScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
 		cooldown.Until, "每日限额（与另一通道共用额度，同步冷却）: "+strings.TrimPrefix(cooldown.Reason, dailyQuotaKind+": "),
-	); otherErr == nil {
+	); otherErr == nil && otherWrite == aistudio.CooldownWritten {
 		service.requests.log(accountLabel, "WARN", fmt.Sprintf(
 			"账号冷却 | 类型=%s | 范围=%s | 恢复=%s | 与另一通道共用额度，同步冷却",
 			cooldown.Kind, otherScope, cooldown.Until.Format(time.RFC3339),
 		))
 	}
 	return cooldown, true, nil
+}
+
+// quotaCooldownFields 为冷却日志补记上游给出的限额值与指标（核实各档位的真实上限）；没有时为空
+func quotaCooldownFields(cooldown aistudio.QuotaCooldown) string {
+	fields := ""
+	if cooldown.LimitValue != "" {
+		fields += " | 上限=" + cooldown.LimitValue
+	}
+	if cooldown.Metric != "" {
+		fields += " | 指标=" + cooldown.Metric
+	}
+	return fields
+}
+
+// coolingDownLong 判断租约账号在发出前被拦下的冷却是否为长时间冷却（剩余不少于 rotationMinRemaining），并返回它的恢复时间：
+// AccountCoolingDownError 按其恢复时间；不带恢复时间的裸哨兵（测试替身）按 AccountLongCooling 判断，恢复时间为零值
+func coolingDownLong(pool *aistudio.AccountPool, err error, accountID string, modelID string, now time.Time) (time.Time, bool) {
+	var blocked *aistudio.AccountCoolingDownError
+	if errors.As(err, &blocked) && !blocked.Until.IsZero() {
+		return blocked.Until, blocked.Until.Sub(now) >= rotationMinRemaining
+	}
+	return time.Time{}, pool.AccountLongCooling(accountID, modelID, rotationMinRemaining)
 }
 
 // generateFailureLimit 为单个请求非额度类失败的换号上限

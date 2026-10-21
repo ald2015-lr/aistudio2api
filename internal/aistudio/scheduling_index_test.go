@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// 候选索引的差分测试：在随机变更（冷却、状态、启用、目录、权益、通道、增删、租约、排空）之后，
+// 候选索引的差分测试：在随机变更（冷却、状态、启用、目录、权益、通道、增删、租约、排空、每分钟限速）之后，
 // 用索引分类的结果必须与逐个账户判断的参考实现（classifyCandidatesBruteLocked）完全一致，
 // 目录派生缓存与状态统计也要与按原实现逐个扫描的结果一致
 
@@ -240,6 +240,8 @@ type indexFuzzer struct {
 	leases  []*AccountLease
 	ends    []func()
 	nextID  int
+	// rateLimited 累计分类中因每分钟请求已满按忙碌处理的候选数，只写进测试日志，确认随机变更覆盖到满窗
+	rateLimited int
 }
 
 func (fuzzer *indexFuzzer) randomID() string {
@@ -291,7 +293,7 @@ func (p *AccountPool) syncDerivedLocked(now time.Time) {
 func (fuzzer *indexFuzzer) mutate() {
 	pool, random := fuzzer.pool, fuzzer.random
 	now := time.Now()
-	switch random.Intn(18) {
+	switch random.Intn(22) {
 	case 0, 1, 2:
 		accountID := fuzzer.randomID()
 		until := now.Add(time.Duration(5+random.Intn(60)) * time.Millisecond)
@@ -438,6 +440,31 @@ func (fuzzer *indexFuzzer) mutate() {
 				fuzzer.t.Fatalf("SetUltraIncludePro(%v) 后号池规则版本 %d，期望 %d", on, pool.PoolRuleVersion(), wantVersion)
 			}
 		}
+	case 18:
+		// 以随机账户取生成租约：预占每分钟名额，满窗时取不到
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		lease, err := pool.AcquireFor(ctx, AccountSelection{
+			ModelID: []string{indexTestModel, indexTestFlash}[random.Intn(2)], Method: "generateContent", AccountID: fuzzer.randomID(),
+		})
+		cancel()
+		if err == nil {
+			fuzzer.leases = append(fuzzer.leases, lease)
+		}
+	case 19:
+		// 对随机租约记一次发送（含独占租约与已移除账户的租约）
+		if len(fuzzer.leases) > 0 {
+			fuzzer.leases[random.Intn(len(fuzzer.leases))].RecordGenerationSent()
+		}
+	case 20:
+		if len(fuzzer.leases) > 0 {
+			at := random.Intn(len(fuzzer.leases))
+			if err := fuzzer.leases[at].Release(); err != nil {
+				fuzzer.t.Fatalf("Release: %v", err)
+			}
+			fuzzer.leases = slices.Delete(fuzzer.leases, at, at+1)
+		}
+	case 21:
+		pool.SetAccountRateLimit(random.Intn(4))
 	}
 }
 
@@ -529,6 +556,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 		if !sameGroups(indexed, brute) {
 			t.Fatalf("第 %d 轮：选择 %+v 的分类不一致\n索引=%+v\n参考=%+v", round, selection, normalizeGroups(indexed), normalizeGroups(brute))
 		}
+		fuzzer.rateLimited += indexed.RateLimited
 	}
 	now := time.Now()
 	for attempt := 0; attempt < 4; attempt++ {
@@ -730,6 +758,11 @@ func TestSchedulingIndexMatchesBruteForce(t *testing.T) {
 	}
 	fuzzer.pool = NewAccountPool(initial, 2)
 	fuzzer.pool.SetUpstreamChannels([]Channel{ChannelPlayground, ChannelBuild})
+	// 每分钟窗口调短，让满窗与窗口释放在随机变更中来回发生（窗口只在开始时设置一次：中途修改会让缓存的截止时刻失效）
+	fuzzer.pool.mu.Lock()
+	fuzzer.pool.rateWindow = time.Duration(20+random.Intn(40)) * time.Millisecond
+	fuzzer.pool.mu.Unlock()
+	fuzzer.pool.SetAccountRateLimit(random.Intn(4))
 	for _, id := range fuzzer.ids[:accounts/2] {
 		if err := fuzzer.pool.SetBuildCatalog(id, fuzzer.randomModels()); err != nil {
 			t.Fatal(err)
@@ -750,6 +783,7 @@ func TestSchedulingIndexMatchesBruteForce(t *testing.T) {
 		}
 		fuzzer.check(round)
 	}
+	t.Logf("分类中因每分钟请求已满按忙碌处理的候选累计 %d 个", fuzzer.rateLimited)
 }
 
 // TestSchedulingIndexCooldownExpiry 冷却到期后候选自动回到可用列表，最早恢复时间来自冷却堆
@@ -958,6 +992,18 @@ func TestSchedulingIndexAddRemove(t *testing.T) {
 	pool.mu.Unlock()
 	if err != nil {
 		t.Fatalf("增删后索引不一致: %v", err)
+	}
+	// 增加账户后每分钟窗口数组随账户数增长
+	if err := pool.Add(indexTestAccount("c@example.com", BenefitTierFree, catalog)); err != nil {
+		t.Fatal(err)
+	}
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+	if index := pool.schedulingLocked(); len(index.rateUntil) != len(pool.accounts) {
+		t.Fatalf("每分钟窗口数组长度 %d，期望 %d", len(index.rateUntil), len(pool.accounts))
+	}
+	if err := pool.verifySchedulingIndexLocked(); err != nil {
+		t.Fatalf("再次增加账户后索引不一致: %v", err)
 	}
 }
 

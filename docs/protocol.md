@@ -1193,6 +1193,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
+| `account_rpm_limit` | 保存值，保存后立即热更新：单账号最近 60 秒最多发出的生成请求数（整数 `0..1000`，默认 `10`，`0` 为关闭），满窗的账号按忙碌处理、请求换到其他账号；读取时总是返回，提交时省略（旧版页面）则沿用现值；超出范围时返回 400 `invalid_config` |
 | `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 号池的账户；读取时总是返回，提交时省略则沿用现值 |
 | `ultra_include_pro` | 保存值，保存后立即热更新（不重启生成服务与 Worker）：`true` 时权益为 Pro 的账户并入 Ultra 号池与 Ultra 分区，按全部 Ultra 号池设置调度，账户权益不变；读取时总是返回，提交时省略（旧版页面）则沿用现值；默认 `false`。进程环境变量设置了 `ULTRA_INCLUDE_PRO` 时以环境变量为准 |
 | `ultra_warm_worker_limit`、`ultra_max_active_workers` | 保存值，保存后立即热更新：Ultra 分区的常驻数（可以为 0）与峰值数（至少 1 且不小于常驻数）；读取时总是返回，提交时省略则沿用现值 |
@@ -1255,7 +1256,9 @@ POST /api/control/start
 request
   -> resolve model and endpoint capability
   -> acquire one PER_ACCOUNT_CONCURRENCY slot
+  -> reserve one ACCOUNT_RPM_LIMIT slot (generateContent only)
   -> prepare WAA proof
+  -> record generation send (60s window)
   -> send MakerSuite RPC
   -> stream frames
   -> release slot
@@ -1277,13 +1280,13 @@ POST /api/control/stop
 | 状态 | 调度语义 |
 | --- | --- |
 | `ready` | 认证有效且存在可用槽位 |
-| `busy` | 就绪账户存在独占操作、认证刷新或活动请求；调度仍按 `PER_ACCOUNT_CONCURRENCY` 判断剩余槽位。需要登录或不可用的账户有活动请求时仍显示原状态 |
+| `busy` | 就绪账户存在独占操作、认证刷新或活动请求；调度仍按 `PER_ACCOUNT_CONCURRENCY` 判断剩余槽位。需要登录或不可用的账户有活动请求时仍显示原状态。每分钟请求已满（`ACCOUNT_RPM_LIMIT`）只让调度把账户当作忙碌，不改变账户状态 |
 | `cooldown` | 账户的全局 `*` 冷却仍有效，或至少有一个模型在账户可用的每个启用通道上都在冷却（Playground 键为模型 ID，Build 键为 `build:<模型>`；只有一个通道冷却、另一个通道还能用时仍为 `ready`）；忙碌优先于冷却。状态摘要 `accounts.cooldown` 按同一口径计数；单个模型 scope 的冷却只影响对应请求的候选分类 |
 | `auth_required` | 账户级认证失败 |
 | `unavailable` | 当前运行时不可用 |
 | `disabled` | 配置已停用 |
 
-认证状态写回携带 `authGeneration` 与 `checkedAt`，仅应用账户对象、`authGeneration` 值与时间均匹配当前状态的结果；相同时间以 `ready` 为最终状态。模型访问和冷却写回携带 `modelAccessGeneration` 与 `checked_at`，仅应用 `modelAccessGeneration` 值匹配且时间不早于当前状态的结果；相同时间以 `verified` 为最终状态。`verified` 表示该账户已经成功调用对应模型或能力。
+认证状态写回携带 `authGeneration` 与 `checkedAt`，仅应用账户对象、`authGeneration` 值与时间均匹配当前状态的结果；相同时间以 `ready` 为最终状态。模型访问和冷却写回携带 `modelAccessGeneration` 与 `checked_at`，仅应用 `modelAccessGeneration` 值匹配且时间不早于当前状态的结果；相同时间以 `verified` 为最终状态。账号全局 `*` 上剩余不到 2 分钟的分钟限额或限流冷却，成功写回（包括非生成操作的成功清除）只推进 `*` 的 `checked_at`，不清除这条冷却，等它自行到期；其他冷却照旧被成功清除，包括剩余不少于 2 分钟的冷却与转录上传失败等暂时故障写的 30 秒全局冷却。`verified` 表示该账户已经成功调用对应模型或能力。
 
 `ModelAccessKey(scope, model)` 先移除 `models/` 前缀；空 scope 返回 canonical model ID（规范化模型 ID），非空 scope 返回 `<scope>:<canonicalModelID>`。各能力使用以下值：
 
@@ -1308,7 +1311,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 
 按需热替换先启动 pending Worker（正在启动、尚未发布的替代 Worker），再关闭旧 Worker；旧实例成功退出后，替代 Worker 才成为当前 Worker。旧实例关闭和替代 Worker 回收同时失败时，两者都保留等待再次清理，并各占一个活动容量槽；达到容量上限后停止新建 Worker。完整生成服务 Stop/Start 的顺序为：Start 创建新生成服务实例前先重试停止旧实例，旧 PID 未退出时返回停止错误并保留原实例。
 
-管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker：失败的 Worker 在后台关闭（同一 Worker 版本只关闭一次，关闭前等同账户其他进行中的请求结束，期间该账户不接新请求）。不指定账户、也没有文件绑定的生成请求最多等 2 秒（`PRIMARY_MODELS` 中的模型最多 1 秒且不超过剩余排队预算的四分之一），关闭完成就在原账户重放一次，否则换到其他账户重试；换号时没有其他可用账户则回到原账户，等关闭完成后重放。这次失败计入连续失败上限（5 次）后就不能再换号的请求不再只等 2 秒，一直等关闭完成后在原账户重放；换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回到原账户等关闭完成后重放；换号后排队等其他账户时原账户关闭完成，即不再排除原账户，按原来的排队位置重新选号，原账户与其他账户哪个先能用就用哪个。回到原账户等待期间请求超时或被取消时按超时（504）或取消结束。指定账户、文件绑定的请求以及 Veo、Live 与转录等关闭完成后在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。`PRIMARY_MODELS` 中的模型排队超过 `PRIMARY_QUEUE_WAIT` 仍没有空闲的账号或 Worker 时同样返回 HTTP 429 与 `Retry-After`（排队上限限定在 1 到 30 秒，上限为 0 时 5 秒），不换号；排队上限整个请求共用一份、按实际经过的时间计，换号重试的尝试与退避都算在内，请求自己现场冷启动的浏览器启动时间不计；管理日志、请求列表与用量账本记录“号池繁忙：模型 X 暂时没有空闲的账号或 Worker，请稍后重试”，客户端只收到官方的限流措辞。主用模型按请求的号池查找：`/ultra` 只查 `ULTRA_PRIMARY_MODELS`（默认 `gemini-4-argon`），`ULTRA_EXCLUSIVE=true` 的普通路径只查 `PRIMARY_MODELS`，`ULTRA_EXCLUSIVE=false` 的普通路径先查 `PRIMARY_MODELS`、没有再查 `ULTRA_PRIMARY_MODELS`。按 Ultra 列表命中的请求没有额度时立即返回 HTTP 429 与 `Retry-After`，不在号池里挨个换号：候选全部冷却时立即按全部冷却返回（不再等待 1 分钟内恢复的冷却，降级判定的 Playground 优先选号仍先改为不限通道）；请求中遇到额度 429（输入超过账号上限的 429 不算）后最多再换 2 次账号，每次额度失败后紧接着的那次选号只用已启动的 Worker，不现场冷启动备用账号，额度失败达到换号上限、其余候选全部冷却、没有已启动的 Worker，或没有其他可换的账号（能服务该模型的账号都已试过、剩下的暂时不可调度，或换号次数用完）时返回 `PrimaryQuotaError`。`Retry-After`：其余候选全部冷却时为最早恢复（不设上限），达到换号上限或没有其他可换的账号时为 5 秒与本请求遇到的最早额度恢复中较早者，没有已启动的 Worker 时为 5 秒，都至少 1 秒。管理日志写明原因、额度失败次数与总耗时，客户端只收到与全部冷却相同的官方限流措辞，不含上游原文。
+管理状态使用 `STOPPED`。该状态下生成与计数端点返回 `503 service_stopped`。Code 7 不清除账户或 operation scope 的成功状态。Worker 进程故障、Worker 被替换与协议 Code 5 会重建当前账户 Worker：失败的 Worker 在后台关闭（同一 Worker 版本只关闭一次，关闭前等同账户其他进行中的请求结束，期间该账户不接新请求）。不指定账户、也没有文件绑定的生成请求最多等 2 秒（`PRIMARY_MODELS` 中的模型最多 1 秒且不超过剩余排队预算的四分之一），关闭完成就在原账户重放一次，否则换到其他账户重试；换号时没有其他可用账户则回到原账户，等关闭完成后重放。这次失败计入连续失败上限（5 次）后就不能再换号的请求不再只等 2 秒，一直等关闭完成后在原账户重放；换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回到原账户等关闭完成后重放；换号后排队等其他账户时原账户关闭完成，即不再排除原账户，按原来的排队位置重新选号，原账户与其他账户哪个先能用就用哪个。回到原账户等待期间请求超时或被取消时按超时（504）或取消结束。指定账户、文件绑定的请求以及 Veo、Live 与转录等关闭完成后在原账户重放一次。号池中没有任何账户符合请求的模型、方法、能力、通道与权益时按请求本身的原因返回：请求指明模型时为 HTTP 404 模型不存在，否则为 HTTP 400（Gemini status 为 `INVALID_ARGUMENT`）。号池一侧的暂时性原因返回 HTTP 503（OpenAI type 为 `server_error`，Anthropic type 为 `api_error`，Gemini status 为 `UNAVAILABLE`）：支持请求的账户都处于需要重新登录、不可用或已停用状态，候选账户的 runtime 被其他进程占用，号池为空或模型目录尚未加载；管理日志里的错误逐个列出账户、状态与原因，客户端只收到官方措辞。候选全部冷却时返回 HTTP 429，并在 `Retry-After` 中给出距最早恢复时间的秒数。`PRIMARY_MODELS` 中的模型排队超过 `PRIMARY_QUEUE_WAIT` 仍没有空闲的账号或 Worker 时同样返回 HTTP 429 与 `Retry-After`（排队上限限定在 1 到 30 秒，上限为 0 时 5 秒），不换号；排队上限整个请求共用一份、按实际经过的时间计，换号重试的尝试与退避都算在内，请求自己现场冷启动的浏览器启动时间不计；管理日志、请求列表与用量账本记录“号池繁忙：模型 X 暂时没有空闲的账号或 Worker，请稍后重试”，客户端只收到官方的限流措辞。主用模型按请求的号池查找：`/ultra` 只查 `ULTRA_PRIMARY_MODELS`（默认 `gemini-4-argon`），`ULTRA_EXCLUSIVE=true` 的普通路径只查 `PRIMARY_MODELS`，`ULTRA_EXCLUSIVE=false` 的普通路径先查 `PRIMARY_MODELS`、没有再查 `ULTRA_PRIMARY_MODELS`。按 Ultra 列表命中的请求没有额度时立即返回 HTTP 429 与 `Retry-After`，不在号池里挨个换号：候选全部冷却时立即按全部冷却返回（不再等待 1 分钟内恢复的冷却，降级判定的 Playground 优先选号仍先改为不限通道）；请求中遇到额度 429（输入超过账号上限的 429 不算）后，额度失败分两类计数：每日类（每日限额，以及剩余不少于 15 分钟的冷却）最多再换 2 次账号，限流类（分钟限额、没有额度信息的 30 秒限流）最多再换 5 次；租约账号在请求发出前进入冷却时，只有拦下它的冷却剩余不少于 15 分钟才记一次每日类，短冷却照常换号、不计数。每次额度失败后紧接着的那次选号只用已启动的 Worker，不现场冷启动备用账号，某一类额度失败达到它的换号上限（原因分别为“额度失败已达换号上限”“限流失败已达换号上限”）、其余候选全部冷却、没有已启动的 Worker，或没有其他可换的账号（能服务该模型的账号都已试过、剩下的暂时不可调度，或换号次数用完）时返回 `PrimaryQuotaError`。`Retry-After`：其余候选全部冷却时为最早恢复（不设上限），每日类达到换号上限或没有其他可换的账号时为 5 秒与本请求遇到的最早额度恢复中较早者，限流类达到换号上限时为本请求遇到的限流冷却中最早的恢复（不超过 1 分钟，不知道时 5 秒），没有已启动的 Worker 时为 5 秒，都至少 1 秒。管理日志写明原因、额度失败与限流失败次数、总耗时，客户端只收到与全部冷却相同的官方限流措辞，不含上游原文。租约账号在请求发出前进入冷却（`AccountCoolingDownError`，请求没有发到上游，多半是同账号别的请求刚遇到额度 429）时，任何模型都按已冷却换号，不计入连续失败上限、不退避；普通模型（以及 Ultra 主用模型被剩余不到 15 分钟的冷却拦下、此前也没有额度失败时）不能再换号时返回 HTTP 429，`Retry-After` 为拦下它的冷却的恢复时间；Ultra 主用模型被剩余不少于 15 分钟的冷却拦下时按上文记一次每日类额度失败，以额度不足结束时 `Retry-After` 按上文每日类的规则。所有带 `Retry-After` 的 429 在建议间隔上随机往后加 0 到 min(建议间隔 ÷ 5 秒, 3) 秒（建议间隔不到 5 秒不加），免得冷却一到期所有客户端同时重试。
 
 模型目录重试的 pending 集合保存等待再次同步的账户 ID。启动期全账户 fan-out、以及新增、登录或验证后的单账户同步，遇到任意错误或成功返回空目录时加入；返回非空目录时移除；删除账户同时移除。全账户后台同步结束后启动单个 30 秒 ticker（Go 定时器），每次对排序后的待重试账户列表再次并发 fan-out，并在任务开始时复核该 ID 仍在 pending 集合中。错误或空目录继续保留；每个非空成功立即更新账户缓存与公共目录快照、发布 `accounts` 和 `models`，并在 `RUNNING` 状态触发 Worker 预热。批次结束时，`auth_required` 集合发生变化会补发当前账户与模型快照；即时单账户同步无论成功或失败都立即发布当前快照。
 
@@ -2234,12 +2237,15 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 | 上游配额或限流（输入超限的 429 除外，见上） | 429 | `upstream_error` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 候选账户均在冷却且 1 分钟内不恢复 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 主用模型（`PRIMARY_MODELS`、`ULTRA_PRIMARY_MODELS`）排队超过对应的排队上限没有空闲的账号或 Worker（号池繁忙） | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
-| Ultra 主用模型（`ULTRA_PRIMARY_MODELS`）额度不足（`PrimaryQuotaError`：额度 429 后达到换号上限、其余候选全部冷却、没有已启动的 Worker 或没有其他可换的账号），带 `Retry-After`，消息固定为 `Resource has been exhausted (e.g. check quota).` | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| Ultra 主用模型（`ULTRA_PRIMARY_MODELS`）额度不足（`PrimaryQuotaError`：额度 429 后达到每日类或限流类的换号上限、其余候选全部冷却、没有已启动的 Worker 或没有其他可换的账号），带 `Retry-After`，消息固定为 `Resource has been exhausted (e.g. check quota).` | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
+| 租约账号在请求发出前进入冷却、又不能再换号（`AccountCoolingDownError`，`errors.Is(err, ErrAccountCoolingDown)` 成立；请求没有发到上游），带类型时附 `Retry-After`（拦下它的冷却的恢复时间），消息固定为 `Resource has been exhausted (e.g. check quota).`；原先落到兜底的 502/500 | 429 | `rate_limit_exceeded` | `rate_limit_error` | `RESOURCE_EXHAUSTED` |
 | 上游过载 | 529 | `upstream_error` | `overloaded_error` | `INTERNAL` |
 | 当前客户端请求被管理端取消 | 503 | `request_canceled` | `api_error` | `UNAVAILABLE` |
 | 生成服务已停止 | 503 | `service_stopped` | `api_error` | `UNAVAILABLE` |
 | 请求期限到期 | 504 | `upstream_error` | `api_error` | `DEADLINE_EXCEEDED` |
 | 传输、Content-Type、解码或缺失终态 | 502 | `upstream_error` | `api_error` | `INTERNAL` |
+
+带 `Retry-After` 的 429（`AllCoolingError`、`CapacityBusyError`、`PrimaryQuotaError`、`AccountCoolingDownError`）在 HTTP 边界写入整秒数：建议间隔向上取整、至少 1 秒，再随机往后加 0 到 min(建议间隔 ÷ 5 秒, 3) 秒（建议间隔不到 5 秒或已过时不加），只往后加、不早于真实恢复时间，免得冷却一到期所有客户端同时重试；管理日志与请求进度里的恢复时间不含这部分。
 
 上游 RPC 的 HTTP 404 表示传输或上游失败，默认映射为 502；公开 404 对应本地模型目录或本地资源查找失败。客户端自身断开时，访问日志记录 499 并结束响应写入。
 

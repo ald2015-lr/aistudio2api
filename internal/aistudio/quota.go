@@ -28,6 +28,10 @@ type QuotaCooldown struct {
 	Global bool
 	Kind   string
 	Reason string
+	// LimitValue 为上游给出的限额值（ErrorInfo 的 quota_limit_value，如 12），Metric 为限额指标（quota_metric 去掉服务名前缀，
+	// 如 generate_requests_global）：只写进冷却日志，用来核实各档位的真实上限；上游没给时为空
+	LimitValue string
+	Metric     string
 }
 
 // QuotaCooldownForError 解析上游分钟或每日额度限制。
@@ -62,7 +66,7 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 		!strings.Contains(metadata, "{model}")
 	// 没有可识别额度信息的 429（上游限流、资源暂时耗尽等）：该账户的这个模型短暂冷却。
 	// 不冷却的话调度会反复选中它，每次都白白失败一轮再切号，高并发时拖慢所有请求
-	until, kind := now.Add(unknownRateLimitCooldown), "限流"
+	until, kind := now.Add(unknownRateLimitCooldown), RateLimitKind
 	for _, evidence := range []string{
 		rpcError.Metadata["quota_unit"], rpcError.Metadata["quota_limit"], rpcError.Metadata["quota_id"],
 		rpcError.Metadata["quota_metric"], rpcError.Message,
@@ -73,11 +77,11 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 			break
 		}
 		if minuteQuotaEvidence(evidence) {
-			until, kind = minuteQuotaReset(rpcError.Metadata["window_start_time"], now), "分钟限额"
+			until, kind = minuteQuotaReset(rpcError.Metadata["window_start_time"], now), MinuteQuotaKind
 			break
 		}
 	}
-	if kind == "限流" && strings.Contains(strings.ToLower(rpcError.Message), "you exceeded your current quota") {
+	if kind == RateLimitKind && strings.Contains(strings.ToLower(rpcError.Message), "you exceeded your current quota") {
 		until, kind = nextQuotaDay(now), DailyQuotaKind
 	}
 	if delay := rpcError.RetryDelay; delay > 0 {
@@ -86,14 +90,45 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 			until = retryAt
 		}
 	}
-	return QuotaCooldown{Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error()}, true
+	return QuotaCooldown{
+		Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error(),
+		LimitValue: strings.TrimSpace(rpcError.Metadata["quota_limit_value"]),
+		Metric:     quotaMetricName(rpcError.Metadata["quota_metric"]),
+	}, true
+}
+
+// quotaMetricName 去掉 quota_metric 的服务名前缀（alkalimakersuite-pa.googleapis.com/generate_requests_global → generate_requests_global）
+func quotaMetricName(metric string) string {
+	metric = strings.TrimSpace(metric)
+	if index := strings.LastIndexByte(metric, '/'); index >= 0 {
+		return metric[index+1:]
+	}
+	return metric
 }
 
 // DailyQuotaKind 为每日限额的冷却类型，app 层的通道共用额度学习按这个值识别
 const DailyQuotaKind = "每日限额"
 
+// MinuteQuotaKind 为分钟限额的冷却类型（quota_unit、quota_limit 等带每分钟周期，如 AI Studio 每账号每分钟 12 次的 GeneratePerMinutePerProjectPerUser）
+const MinuteQuotaKind = "分钟限额"
+
+// RateLimitKind 为没有额度周期信息的 429 的冷却类型（冷却 unknownRateLimitCooldown；上游给出 RetryInfo 时以它为准）
+const RateLimitKind = "限流"
+
 // unknownRateLimitCooldown 为没有额度信息的 429 的冷却时长
 const unknownRateLimitCooldown = 30 * time.Second
+
+// ShortCooldownMax 为“短冷却”的上限：剩余不到它的冷却（分钟限额最长一分钟、没有额度信息的限流 30 秒，或长冷却的最后一段）
+// 很快自行恢复。淘汰选号不把这样的空闲 Worker 当作冷却中（WarmWorkerStates，不看冷却原因）；账号全局 * 上剩余不到它的
+// 额度类冷却（分钟限额、限流，见 rateCooldownReason）只等到期，同账号其他请求或非生成操作的成功不提前清除
+// （markModelAccessVerified、ClearCooldownIfGeneration）
+const ShortCooldownMax = 2 * time.Minute
+
+// rateCooldownReason 判断冷却原因来自分钟限额或限流的 429（QuotaCooldownForError 写的原因为“类型: 原文”，落盘后前缀照样保留）。
+// 转录上传等暂时故障写的 30 秒全局冷却、每日限额与 403 暂停都不是
+func rateCooldownReason(reason string) bool {
+	return strings.HasPrefix(reason, MinuteQuotaKind+": ") || strings.HasPrefix(reason, RateLimitKind+": ")
+}
 
 func minuteQuotaEvidence(value string) bool {
 	return strings.Contains(value, "/min/") || strings.Contains(value, "perminute") ||

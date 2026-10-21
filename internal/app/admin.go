@@ -889,6 +889,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.UltraMaxActiveWorkers != nil {
 		ultraMax = *value.UltraMaxActiveWorkers
 	}
+	// 单账户每分钟上限：旧版页面保存时不带该字段，沿用现值（0 表示关闭，不能用零值判断是否缺省）
+	accountRPMLimit := saved.AccountRPMLimit
+	if value.AccountRPMLimit != nil {
+		accountRPMLimit = *value.AccountRPMLimit
+	}
 	// 流式优先 Playground 的模型：旧版页面保存时不带该字段，沿用现值；空数组表示清空
 	streamPlaygroundModels := saved.StreamPlaygroundModels
 	if value.StreamPlaygroundModels != nil {
@@ -928,6 +933,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
+		AccountRPMLimit:        accountRPMLimit,
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: streamPlaygroundModels,
@@ -1533,6 +1539,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		FirstEventTimeout: cfg.FirstEventTimeout.String(), WarmWorkerLimit: cfg.WarmWorkerLimit, MaxActiveWorkers: cfg.MaxActiveWorkers,
 		WarmStartupConcurrency: cfg.WarmStartupConcurrency,
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
+		AccountRPMLimit:        &cfg.AccountRPMLimit,
 		RoutingStrategy:        cfg.RoutingStrategy,
 		UpstreamChannels:       cfg.UpstreamChannels,
 		TemporaryChat:          cfg.TemporaryChat,

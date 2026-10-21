@@ -218,9 +218,11 @@ func (limiter *queueProgressLimiter) allow(now time.Time) (bool, int) {
 	return true, suppressed
 }
 
-// queueSnapshot 为一次复查时的候选计数，写进排队进度
+// queueSnapshot 为一次复查时的候选计数，写进排队进度；rateLimited 为其中因每分钟请求已满（ACCOUNT_RPM_LIMIT）按忙碌分组的候选数，
+// 在排除本请求已失败的 Worker 之前取，只作提示
 type queueSnapshot struct {
 	warmIdle, warmBusy, standby, standbyBusy int
+	rateLimited                              int
 	opening                                  bool
 	earliestCooldown                         time.Time
 }
@@ -228,6 +230,9 @@ type queueSnapshot struct {
 func (snapshot queueSnapshot) text(now time.Time) string {
 	text := fmt.Sprintf(" | 热空闲=%d | 热忙碌=%d | 备用=%d | 备用忙碌=%d",
 		snapshot.warmIdle, snapshot.warmBusy, snapshot.standby, snapshot.standbyBusy)
+	if snapshot.rateLimited > 0 {
+		text += fmt.Sprintf(" | 每分钟已满=%d", snapshot.rateLimited)
+	}
 	if snapshot.opening {
 		text += " | 启动中=是"
 	}
