@@ -14,7 +14,7 @@ import (
 // 排队进度日志：选号排队时写明在等什么。
 //
 // 原先只有主用模型在排队超限返回 429 时写一句原因（primaryQueueExceededMessage）；其他模型排队时原因只交给等待函数，
-// 一直等到 REQUEST_TIMEOUT 以 504 结束，管理日志只看得到 context deadline exceeded。generateWithRetry 把请求 ID 与一份排队进度
+// 一直等到首事件前期限（REQUEST_TIMEOUT）以 504 结束，管理日志只看得到 context deadline exceeded。generateWithRetry 把请求 ID 与一份排队进度
 // 放进选号上下文（与排队预算、到达序号的做法相同，acquireLease 的签名不变），acquireLease 的每次等待都经 waitQueued：
 //   - 一次尝试排队满 queueProgressFirstDelay 仍没有取得账号时写一条 INFO "排队等待"（原因、已等待、尝试、模型、同条件队列位置、
 //     候选计数）；很快取得租约的请求（加入队列时作为队首被立即唤醒、扩容中的短暂等待）不写，不增加正常请求的日志量；

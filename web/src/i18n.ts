@@ -147,6 +147,8 @@ const zhCN = {
   'settings.proxy': '默认代理',
   'settings.initTimeout': '初始化超时',
   'settings.requestTimeout': '请求超时',
+  'settings.requestTimeoutHelp':
+    '生成请求在首个上游事件之前的总期限：排队、冷启动、WAA proof、附件上传、等首字与首事件前的换号都计入，到时返回 504。开始输出后改为空闲上限：上游连续这么久既没有事件也没有网络字节才以 504 结束，持续出字的长回复不会被切断；整条生成请求最长 1 小时（本项更长时按本项）。计数、视频与转写等其他请求整段受它限制。修改后立即生效，只影响新请求。',
   'settings.firstEventTimeout': '首事件超时',
   'settings.firstEventTimeoutHelp':
     '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
@@ -393,7 +395,7 @@ const zhCN = {
     '账号已长时间冷却（如每日限额，或主用、热门模型的当天额度已用完）的常驻 Worker：占着名额却服务不了这些请求。空闲时立即关闭，忙碌时先排空再关闭，并换上没有冷却的账号',
   'app.workersDraining': '排空中 {count}',
   'app.workersDrainingDetail':
-    '冷却占位的 Worker 不再接新请求，正在服务的请求结束后关闭，替补已先启动',
+    '冷却占位的 Worker 不再接新请求，正在服务的请求结束后关闭（开始输出的长流会让排空保持到流结束）；有空槽时替补已先启动，否则旧 Worker 关闭后补上',
   'app.primarySupplyModel': '主用 {model}：',
   'app.primarySupply': '热 {warm} · 冷却 {cooling} · 备用 {standby}',
   'app.primarySupplyDetail':
@@ -834,6 +836,8 @@ const en: Record<TranslationKey, string> = {
   'settings.proxy': 'Default proxy',
   'settings.initTimeout': 'Init timeout',
   'settings.requestTimeout': 'Request timeout',
+  'settings.requestTimeoutHelp':
+    'Deadline before the first upstream event of a generation request: queuing, cold starts, WAA proof, attachment uploads, waiting for the first token and account switches before it all count, and a 504 is returned when it expires. Once output starts it becomes an idle limit: the request ends with 504 only when upstream sends no event and no bytes for this long, so a long reply that keeps streaming is not cut off; a whole generation request is capped at 1 hour (or this value if longer). Token counting, video and transcription requests are limited by it as a whole. Changes apply immediately to new requests only.',
   'settings.firstEventTimeout': 'First event timeout',
   'settings.firstEventTimeoutHelp':
     'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
@@ -1089,7 +1093,7 @@ const en: Record<TranslationKey, string> = {
     "Warm workers whose account is in a long cooldown (e.g. daily quota, or the day's quota of a primary or hot model is used up): they hold a slot but cannot serve those requests. Closed at once when idle, drained first when busy, and replaced with an uncooled account",
   'app.workersDraining': '{count} draining',
   'app.workersDrainingDetail':
-    'These dead-slot workers take no new requests and close once their in-flight requests finish; their replacements have already been started',
+    'These dead-slot workers take no new requests and close once their in-flight requests finish (a long stream that has started output keeps the drain going until it ends); their replacements have already been started when a slot was free, otherwise they start once the old worker closes',
   'app.primarySupplyModel': 'Primary {model}:',
   'app.primarySupply': '{warm} warm · {cooling} cooling · {standby} standby',
   'app.primarySupplyDetail':

@@ -368,7 +368,8 @@ func (p *AccountPool) AccountLongCooling(accountID string, modelID string, minRe
 
 // WarmWorkerState 为淘汰选号用的一个驻留 Worker 账户的调度状态
 type WarmWorkerState struct {
-	// Busy 为账户有进行中的请求、独占操作或认证续签，LastUsed 为最近使用时间
+	// Busy 为账户有进行中的请求、独占操作或认证续签，LastUsed 为最近活动时间：最近一次取得租约与最近一次请求结束（普通租约全部释放）
+	// 中较晚的一个，刚结束长流的账户不算空闲了整条流的时长
 	Busy     bool
 	LastUsed time.Time
 	// Cooling 为账户冷却中、且剩余不少于 ShortCooldownMax（分钟限额、限流第一档这类一分钟内就恢复的短冷却不算）：全局冷却，
@@ -410,7 +411,7 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		}
 		states[accountID] = WarmWorkerState{
 			Busy:     account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0,
-			LastUsed: account.LastUsed,
+			LastUsed: account.lastActivityLocked(),
 			// 剩余不到 ShortCooldownMax 的冷却（分钟限额、限流第一档）不算冷却中：一分钟内就恢复，关掉它换一个要冷启动 10–30 秒的账号得不偿失
 			Cooling: longCooldownActive(account, globalCooldownKey, now, ShortCooldownMax) ||
 				cooling && until.Sub(now) >= ShortCooldownMax,

@@ -752,6 +752,7 @@ onBeforeUnmount(() => {
             required
             autocomplete="off"
           />
+          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.requestTimeoutHelp') }}</span>
         </label>
       </div>
 

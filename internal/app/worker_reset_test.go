@@ -1301,7 +1301,8 @@ func (service *bidiRecoveryService) OpenBidi(ctx context.Context, request aistud
 	return nil, errors.New("测试会话不建立")
 }
 
-// TestBidiRecoveryWaitsForWorkerReset Live 会话的 Worker 恢复保持原来的语义：一直等同账号其他请求结束、关闭完成后返回可以重放；
+// TestBidiRecoveryWaitsForWorkerReset 固定账号的 Live 会话的 Worker 恢复：等同账号其他请求结束（最多 REQUEST_TIMEOUT，见 TestBidiPinnedRecoveryBounded）、
+// 关闭完成后返回可以重放；
 // 等待中取消时返回取消错误，后台关闭照常继续
 func TestBidiRecoveryWaitsForWorkerReset(t *testing.T) {
 	for _, cancelEarly := range []bool{false, true} {
@@ -1353,5 +1354,283 @@ func TestBidiRecoveryWaitsForWorkerReset(t *testing.T) {
 				t.Fatalf("Worker 关闭 %d 次，期望 1 次", got)
 			}
 		})
+	}
+}
+
+// bidiSwitchService 是 Live 换号测试的上游：按 order 依次尝试候选里的账号（固定账号时只有它），failing 中的账号报告 Worker 版本后
+// 按协议 Code 5 失败并调用 RecoverWAARuntime，未恢复时换下一个账号；result 收到最终使用的账号、各次恢复的结果与用时。
+// pool 不为空时每次尝试先像 aistudio 层的 resolveAccountLease 一样取得这个账号的租约（随即释放），取租约没有期限
+type bidiSwitchService struct {
+	workerFailureService
+	order       []string
+	failing     map[string]bool
+	generations map[string]uint64
+	result      chan bidiSwitchResult
+	pool        *aistudio.AccountPool
+}
+
+type bidiSwitchResult struct {
+	accountID  string
+	recoveries []bidiRecoveryResult
+	elapsed    time.Duration
+	// acquiring 为进入了取租约的账号（pool 不为空时）
+	acquiring []string
+}
+
+func (service *bidiSwitchService) OpenBidi(ctx context.Context, request aistudio.BidiRequest) (*aistudio.BidiSession, error) {
+	startedAt := time.Now()
+	result := bidiSwitchResult{}
+	defer func() {
+		result.elapsed = time.Since(startedAt)
+		service.result <- result
+	}()
+	for _, accountID := range service.order {
+		if request.AccountID != "" && accountID != request.AccountID ||
+			request.AccountID == "" && !slices.Contains(request.AllowedAccountIDs, accountID) {
+			continue
+		}
+		if service.pool != nil {
+			result.acquiring = append(result.acquiring, accountID)
+			lease, err := service.pool.AcquireFor(ctx, aistudio.AccountSelection{AccountID: accountID})
+			if err != nil {
+				return nil, err
+			}
+			_ = lease.Release()
+		}
+		if !service.failing[accountID] {
+			result.accountID = accountID
+			return nil, errors.New("测试会话不建立")
+		}
+		request.ObserveWAARuntime(accountID, service.generations[accountID])
+		recovered, err := request.RecoverWAARuntime(ctx, accountID, waaRuntimeFailure("BidiGenerateContent"))
+		result.recoveries = append(result.recoveries, bidiRecoveryResult{recovered: recovered, err: err})
+		if err != nil {
+			return nil, err
+		}
+		if recovered {
+			result.accountID = accountID
+			return nil, errors.New("测试会话不建立")
+		}
+	}
+	return nil, errors.New("候选都失败")
+}
+
+// newBidiSwitchTest 返回 alice 遇到 Code 5、同账号有一直持有的租约（开始输出的长流）的 Live 测试环境，accountIDs 依次尝试
+func newBidiSwitchTest(t *testing.T, accountIDs ...string) (*bidiSwitchService, *trackedService, map[string]func() int, func()) {
+	t.Helper()
+	upstream := &bidiSwitchService{
+		order: accountIDs, failing: map[string]bool{resetTestAlice: true}, result: make(chan bidiSwitchResult, 1),
+	}
+	service, closed := workerResetTestService(t, upstream, accountIDs...)
+	service.state.Store(serviceRunning)
+	service.dataContext = service.lifecycle
+	upstream.generations = map[string]uint64{resetTestAlice: service.workers.WorkerGeneration(resetTestAlice)}
+	release := holdLease(t, service.pool, resetTestAlice)
+	return upstream, service, closed, release
+}
+
+// TestBidiRecoverySwitchesAccount 不固定账号的 Live 会话遇到 Code 5、同账号有长流一直占着租约时，只等不固定账号的等待上限（这里 50ms），
+// 等不到返回未恢复、换到另一个账号，不挂到长流结束；长流结束后后台关闭照常完成
+func TestBidiRecoverySwitchesAccount(t *testing.T) {
+	upstream, service, closed, release := newBidiSwitchTest(t, resetTestAlice, resetTestBob)
+	defer release()
+	go func() { _, _ = service.OpenBidi(service.lifecycle, aistudio.BidiRequest{Model: testRuntimeModel}) }()
+	var result bidiSwitchResult
+	select {
+	case result = <-upstream.result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("同账号有长流时 Live 会话建立一直在等关闭，没有换号")
+	}
+	if result.accountID != resetTestBob || len(result.recoveries) != 1 || result.recoveries[0].recovered || result.recoveries[0].err != nil {
+		t.Fatalf("结果 = %+v，期望 alice 未恢复后换到 bob", result)
+	}
+	if result.elapsed > time.Second {
+		t.Fatalf("用时 %s，期望在不固定账号的等待上限附近换号", result.elapsed)
+	}
+	release()
+	waitResetsSettled(t, service.workers)
+	if got := closed[resetTestAlice](); got != 1 {
+		t.Fatalf("alice 的 Worker 关闭 %d 次，期望长流结束后关闭 1 次", got)
+	}
+}
+
+// TestBidiPinnedRecoveryBounded 固定账号（或只剩这个账号）的 Live 会话不能换号：最多等 REQUEST_TIMEOUT，到期按号池暂时不可用（503）结束，
+// 不因为 Live 没有期限而一直挂到同账号的长流结束；后台关闭照常继续
+func TestBidiPinnedRecoveryBounded(t *testing.T) {
+	for _, pinned := range []bool{true, false} {
+		name := map[bool]string{true: "固定账号", false: "只剩这个账号"}[pinned]
+		t.Run(name, func(t *testing.T) {
+			upstream, service, closed, release := newBidiSwitchTest(t, resetTestAlice)
+			defer release()
+			const limit = 300 * time.Millisecond
+			service.timeout.Store(int64(limit))
+			request := aistudio.BidiRequest{Model: testRuntimeModel}
+			if pinned {
+				request.AccountID = resetTestAlice
+			}
+			go func() { _, _ = service.OpenBidi(service.lifecycle, request) }()
+			var result bidiSwitchResult
+			select {
+			case result = <-upstream.result:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Live 会话建立一直在等关闭")
+			}
+			var notReady *aistudio.AccountsNotReadyError
+			if len(result.recoveries) != 1 || result.recoveries[0].recovered || !errors.As(result.recoveries[0].err, &notReady) {
+				t.Fatalf("结果 = %+v，期望等满上限后返回号池暂时不可用", result)
+			}
+			if result.elapsed < limit-50*time.Millisecond || result.elapsed > limit+time.Second {
+				t.Fatalf("用时 %s，期望约 REQUEST_TIMEOUT %s", result.elapsed, limit)
+			}
+			release()
+			waitResetsSettled(t, service.workers)
+			if got := closed[resetTestAlice](); got != 1 {
+				t.Fatalf("alice 的 Worker 关闭 %d 次，期望 1 次", got)
+			}
+		})
+	}
+}
+
+// TestBidiPinnedRetryBounded 固定账号（指定账户、会话绑定，或只剩这个账号）的 Live 会话等满 REQUEST_TIMEOUT 得到 503 后，
+// 客户端按同一账号重试：后台关闭仍登记着独占等待（同账号的长流还在输出），重试同样最多等 REQUEST_TIMEOUT 后以 503 结束，
+// 不进入没有期限的取租约、挂到长流结束；长流结束、关闭完成后重试照常进入上游
+func TestBidiPinnedRetryBounded(t *testing.T) {
+	const sessionToken = "bidi-session-reset-test"
+	for _, mode := range []string{"指定账户", "会话绑定", "只剩这个账号"} {
+		t.Run(mode, func(t *testing.T) {
+			accountIDs := []string{resetTestAlice}
+			if mode == "会话绑定" {
+				accountIDs = append(accountIDs, resetTestBob)
+			}
+			upstream, service, closed, release := newBidiSwitchTest(t, accountIDs...)
+			defer release()
+			upstream.pool = service.pool
+			const limit = 300 * time.Millisecond
+			service.timeout.Store(int64(limit))
+			request := aistudio.BidiRequest{Model: testRuntimeModel}
+			switch mode {
+			case "指定账户":
+				request.AccountID = resetTestAlice
+			case "会话绑定":
+				// 会话绑定在 alice 上：候选有 bob，但只能用 alice
+				lease, err := service.pool.AcquireFor(context.Background(), aistudio.AccountSelection{AccountID: resetTestAlice})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := lease.BindResource(sessionToken, "bidi-session"); err != nil {
+					t.Fatal(err)
+				}
+				_ = lease.Release()
+				request.SessionToken = sessionToken
+			}
+			var notReady *aistudio.AccountsNotReadyError
+			go func() { _, _ = service.OpenBidi(service.lifecycle, request) }()
+			select {
+			case result := <-upstream.result:
+				if len(result.recoveries) != 1 || !errors.As(result.recoveries[0].err, &notReady) {
+					t.Fatalf("第一次结果 = %+v，期望等满上限后返回号池暂时不可用", result)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("第一次 Live 会话建立一直在等关闭")
+			}
+			ctx, cancel := context.WithTimeout(service.lifecycle, 3*time.Second)
+			defer cancel()
+			startedAt := time.Now()
+			_, err := service.OpenBidi(ctx, request)
+			elapsed := time.Since(startedAt)
+			if !errors.As(err, &notReady) || ctx.Err() != nil {
+				t.Fatalf("重试 %s 后 err=%v，期望在 REQUEST_TIMEOUT 内以号池暂时不可用（503）结束", elapsed, err)
+			}
+			if elapsed < limit-50*time.Millisecond || elapsed > limit+time.Second {
+				t.Fatalf("重试用时 %s，期望约 REQUEST_TIMEOUT %s", elapsed, limit)
+			}
+			select {
+			case result := <-upstream.result:
+				t.Fatalf("关闭没有结束时重试不应进入上游取租约: %+v", result)
+			default:
+			}
+			release()
+			waitResetsSettled(t, service.workers)
+			if got := closed[resetTestAlice](); got != 1 {
+				t.Fatalf("alice 的 Worker 关闭 %d 次，期望 1 次", got)
+			}
+			go func() { _, _ = service.OpenBidi(service.lifecycle, request) }()
+			select {
+			case result := <-upstream.result:
+				if len(result.recoveries) != 1 || !result.recoveries[0].recovered || result.recoveries[0].err != nil {
+					t.Fatalf("关闭完成后的重试结果 = %+v，期望 Worker 已重建、可以重放", result)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("关闭完成后的重试没有进入上游")
+			}
+		})
+	}
+}
+
+// TestBidiPinnedRecoveryReasons 固定账号的 Live 会话不能换号时，503 的原因按后台关闭的结果区分：ResetAll 期间不登记关闭（放弃）时
+// 立即返回、写“后台关闭已放弃”，不说“在 … 内没有关闭重建”；关闭出错时写关闭出错并带上它的错误；关闭还没结束时才写等满上限
+func TestBidiPinnedRecoveryReasons(t *testing.T) {
+	upstream, service, _, release := newBidiSwitchTest(t, resetTestAlice)
+	defer release()
+	resume := service.workers.pauseWorkerResets()
+	go func() {
+		_, _ = service.OpenBidi(service.lifecycle, aistudio.BidiRequest{Model: testRuntimeModel, AccountID: resetTestAlice})
+	}()
+	var result bidiSwitchResult
+	select {
+	case result = <-upstream.result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Live 会话建立没有返回")
+	}
+	resume()
+	var notReady *aistudio.AccountsNotReadyError
+	if len(result.recoveries) != 1 || !errors.As(result.recoveries[0].err, &notReady) {
+		t.Fatalf("结果 = %+v，期望号池暂时不可用", result)
+	}
+	if text := result.recoveries[0].err.Error(); !strings.Contains(text, "后台关闭已放弃") || strings.Contains(text, "内没有关闭重建") {
+		t.Fatalf("ResetAll 期间的错误 = %q，期望写后台关闭已放弃", text)
+	}
+	if result.elapsed > time.Second {
+		t.Fatalf("用时 %s，后台关闭已放弃时不应等待", result.elapsed)
+	}
+	closeErr := errors.New("浏览器关不掉")
+	failed := liveResetExpired(service.lifecycle, finishedWorkerReset(false, false, closeErr), time.Minute)
+	if !errors.As(failed, &notReady) || !errors.Is(failed, closeErr) || !strings.Contains(failed.Error(), "关闭账号的失败 Worker 出错") ||
+		strings.Contains(failed.Error(), "内没有关闭重建") {
+		t.Fatalf("关闭出错时的错误 = %v，期望写关闭出错并带上它的错误", failed)
+	}
+	running := &workerReset{done: make(chan struct{})}
+	if text := liveResetExpired(service.lifecycle, running, time.Minute).Error(); !strings.Contains(text, "在 1m0s 内没有关闭重建") {
+		t.Fatalf("关闭还没结束时的错误 = %q，期望写等满上限", text)
+	}
+}
+
+// TestDataResetSwitchWait 转写与 Live 的恢复只在确实能换号时不等关闭完成：不固定账号、除已尝试的账号外还有能服务这次请求的候选
+// （以转写的选号条件为例）时返回不固定账号的等待上限；固定账号、候选只剩已尝试的账号、其余候选都冷却时不能换号，照旧等关闭完成
+func TestDataResetSwitchWait(t *testing.T) {
+	service, _ := workerResetTestService(t, newWorkerFailureService(nil), resetTestAlice, resetTestBob)
+	transcription := aistudio.AccountSelection{
+		ModelID: testRuntimeModel, ModelAccessScope: testRuntimeModel, Method: "generateContent", Capability: "transcription_output",
+		AllowedAccountIDs: []string{resetTestAlice, resetTestBob},
+	}
+	tried := map[string]uint64{resetTestAlice: 1}
+	ctx := context.Background()
+	if wait, ok := service.dataResetSwitchWait(ctx, false, transcription, tried, resetTestAlice); !ok || wait != 50*time.Millisecond {
+		t.Fatalf("还有 bob 可换时 wait=%s ok=%v，期望不固定账号的等待上限 50ms", wait, ok)
+	}
+	if _, ok := service.dataResetSwitchWait(ctx, true, transcription, tried, resetTestAlice); ok {
+		t.Fatal("固定账号时不能换号")
+	}
+	only := transcription
+	only.AllowedAccountIDs = []string{resetTestAlice}
+	if _, ok := service.dataResetSwitchWait(ctx, false, only, tried, resetTestAlice); ok {
+		t.Fatal("候选只剩 alice 时不能换号")
+	}
+	if _, ok := service.dataResetSwitchWait(ctx, false, transcription, map[string]uint64{resetTestAlice: 1, resetTestBob: 1}, resetTestAlice); ok {
+		t.Fatal("bob 也已尝试时不能换号")
+	}
+	coolGlobally(t, service.pool, resetTestBob)
+	if _, ok := service.dataResetSwitchWait(ctx, false, transcription, tried, resetTestAlice); ok {
+		t.Fatal("其余候选都冷却时不能换号")
 	}
 }

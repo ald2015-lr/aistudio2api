@@ -242,6 +242,29 @@ func TestReapIdleWorkerPerPartition(t *testing.T) {
 	}
 }
 
+// TestReapIdleWorkerAfterLongLease 空闲回收按最近活动时间判断：长租约（开始输出后的长流）刚释放的 Worker 不算空闲超时，
+// 回收真正空闲的那个；原先只按取得租约的时间判断，刚结束长流的 Worker 反而先被关闭
+func TestReapIdleWorkerAfterLongLease(t *testing.T) {
+	manager, pool, _ := partitionTestManager(t, []string{partitionNormalA, partitionNormalB}, nil, 1, 3, 1, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	for _, accountID := range []string{partitionNormalA, partitionNormalB} {
+		if _, err := manager.promote(ctx, accountID, testRuntimeModel); err != nil {
+			t.Fatal(err)
+		}
+	}
+	releaseLong := holdLease(t, pool, partitionNormalA)
+	holdLease(t, pool, partitionNormalB)()
+	time.Sleep(100 * time.Millisecond)
+	releaseLong()
+	if !manager.reapIdleWorker(time.Now().Add(-50 * time.Millisecond)) {
+		t.Fatal("应回收空闲超时的 Worker")
+	}
+	if warm := sortedWarm(manager); !slices.Equal(warm, []string{partitionNormalA}) {
+		t.Fatalf("回收后驻留 %v，期望留下刚结束长租约的 %s、回收空闲的 %s", warm, partitionNormalA, partitionNormalB)
+	}
+}
+
 // TestStandbyCapacityPerPartition 请求调度按备用账户所在分区判断能否启动：普通分区已满时选同一批候选里的 Ultra 账户；
 // 都满时只有允许淘汰且同分区有空闲 Worker 才选
 func TestStandbyCapacityPerPartition(t *testing.T) {

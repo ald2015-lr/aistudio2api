@@ -926,3 +926,148 @@ func TestRuntimeAvailableLockFree(t *testing.T) {
 		t.Fatalf("解除占用后可用账户 %v，原因 %v", available, err)
 	}
 }
+
+// TestDrainTimeoutCoversLongStreams W1：生成请求开始输出后最长到总时长上限，排空超时按它计算：REQUEST_TIMEOUT 短于 1 小时时为
+// 1 小时 + 30 秒，更长时按 REQUEST_TIMEOUT + 30 秒，没有设置时按默认请求超时；后台关闭的上限默认等于排空超时，resetLimit 优先
+func TestDrainTimeoutCoversLongStreams(t *testing.T) {
+	manager := &accountWorkerManager{}
+	manager.requestTimeout.Store(int64(time.Second))
+	if got := manager.drainTimeout(); got != generateMaxDuration+drainTimeoutGrace {
+		t.Fatalf("REQUEST_TIMEOUT=1s 时排空超时 = %s，期望 %s", got, generateMaxDuration+drainTimeoutGrace)
+	}
+	manager.requestTimeout.Store(int64(2 * time.Hour))
+	if got := manager.drainTimeout(); got != 2*time.Hour+30*time.Second {
+		t.Fatalf("REQUEST_TIMEOUT=2h 时排空超时 = %s，期望 2h0m30s", got)
+	}
+	manager.requestTimeout.Store(0)
+	if got := manager.drainTimeout(); got != generateMaxDuration+drainTimeoutGrace {
+		t.Fatalf("没有设置时排空超时 = %s，期望按默认请求超时计算为 %s", got, generateMaxDuration+drainTimeoutGrace)
+	}
+	if got := manager.workerResetLimit(); got != manager.drainTimeout() {
+		t.Fatalf("后台关闭上限 = %s，期望默认等于排空超时 %s", got, manager.drainTimeout())
+	}
+	manager.resetLimit.Store(int64(100 * time.Millisecond))
+	if got := manager.workerResetLimit(); got != 100*time.Millisecond {
+		t.Fatalf("设置 resetLimit 后后台关闭上限 = %s，期望 100ms", got)
+	}
+}
+
+// TestOverdueDrainFreesDrainSlot 排空超过 REQUEST_TIMEOUT + 30 秒（长流还在用旧 Worker）后不再占排空名额：同分区另一个忙碌的死槽位 B
+// 照常排空（不再分给不固定账户的请求），替补因槽位已满没有启动，B 的请求结束后关闭、再补上替补；A 保持排空（标记到排空超时才清除），
+// 全程浏览器数不超过 峰值 + drainLimit
+func TestOverdueDrainFreesDrainSlot(t *testing.T) {
+	accounts := []string{"drain-a@example.com", "drain-b@example.com", "drain-c@example.com", "drain-d@example.com",
+		"drain-e@example.com", "drain-f@example.com", "drain-g@example.com"}
+	env := newDrainEnv(t, accounts, 2, 4)
+	env.promote(t, accounts[:4]...)
+	limit := env.manager.drainLimit(aistudio.PoolScopeNormal)
+	if limit != 1 {
+		t.Fatalf("峰值 4 时 drainLimit 应为 1，实际 %d", limit)
+	}
+	stopPeak := env.watchBrowsers()
+	releaseA := env.startBusyDrain(t, accounts[0])
+	defer releaseA()
+	if !waitUntil(3*time.Second, func() bool { return len(env.manager.WarmAccountIDs()) == 5 }) {
+		t.Fatalf("A 排空开始时应启动替补，驻留 Worker = %v", sortedWarm(env.manager))
+	}
+	// A 的长流已超过旧口径（REQUEST_TIMEOUT + 30 秒），还没到排空超时（总时长上限 + 30 秒）
+	drainA := env.manager.drainOf(accounts[0])
+	drainA.startedAt.Store(time.Now().Add(-env.manager.drainSlotTimeout() - time.Minute).UnixNano())
+	if age := drainA.age(time.Now()); age >= env.manager.drainTimeout() {
+		t.Fatalf("排空时长 %s 不应达到排空超时 %s", age, env.manager.drainTimeout())
+	}
+	releaseB := env.startBusyDrain(t, accounts[1])
+	defer releaseB()
+	if !waitUntil(3*time.Second, func() bool { return hasLogContaining(env.requests, "替补未启动", "原因=排空") }) {
+		t.Fatalf("槽位已满时 B 的替补应记为没有启动，日志 = %v", serviceLogMessages(env.requests))
+	}
+	lease, err := env.service.acquireWarmLease(env.ctx, aistudio.AccountSelection{ModelID: testRuntimeModel, Method: "generateContent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id := lease.Account().ID; id == accounts[0] || id == accounts[1] {
+		t.Fatalf("排空中的 %s 不应得到不固定账户的新租约", id)
+	}
+	_ = lease.Release()
+	releaseB()
+	if !waitUntil(3*time.Second, func() bool {
+		warm := env.manager.WarmAccountIDs()
+		return !slices.Contains(warm, accounts[1]) && len(warm) == 5
+	}) {
+		t.Fatalf("B 的请求结束后应关闭并补上替补，驻留 Worker = %v", sortedWarm(env.manager))
+	}
+	if !env.pool.Draining(accounts[0]) || env.manager.drainOf(accounts[0]) == nil {
+		t.Fatal("A 仍有长流在输出，应保持排空")
+	}
+	releaseA()
+	if !waitUntil(3*time.Second, func() bool {
+		warm := env.manager.WarmAccountIDs()
+		return !slices.Contains(warm, accounts[0]) && len(warm) == 4
+	}) {
+		t.Fatalf("A 的长流结束后应关闭，驻留数回到 4，驻留 Worker = %v", sortedWarm(env.manager))
+	}
+	if peak := stopPeak(); peak > 4+limit {
+		t.Fatalf("浏览器总数最多为 峰值 + drainLimit = %d，实际 %d", 4+limit, peak)
+	}
+	for _, accountID := range sortedWarm(env.manager) {
+		if env.pool.AccountLongCooling(accountID, drainProModel, rotationMinRemaining) {
+			t.Fatalf("替补不应是主用模型冷却的账号: %s", accountID)
+		}
+	}
+}
+
+// TestOverdueDrainsCapped 长流各自占着的死槽位逐个超过 drainSlotTimeout、逐个再排空时，排空总数不超过 2 × drainLimit：
+// 峰值 4、drainLimit 1 时 A（替补已启动）与 B（替补因槽位已满没有启动）都超时后，C、D 不再排空，照常接不固定账户的请求，
+// 分区可接单的 Worker 不少于 峰值 - drainLimit；“WAA Worker 排空”日志写出全部排空数与占名额数
+func TestOverdueDrainsCapped(t *testing.T) {
+	accounts := []string{"drain-a@example.com", "drain-b@example.com", "drain-c@example.com", "drain-d@example.com",
+		"drain-e@example.com", "drain-f@example.com", "drain-g@example.com", "drain-h@example.com"}
+	env := newDrainEnv(t, accounts, 2, 4)
+	env.promote(t, accounts[:4]...)
+	limit := env.manager.drainLimit(aistudio.PoolScopeNormal)
+	if limit != 1 || env.manager.drainTotalLimit(aistudio.PoolScopeNormal) != 2 {
+		t.Fatalf("峰值 4 时 drainLimit 应为 1、排空总数上限为 2，实际 %d、%d", limit, env.manager.drainTotalLimit(aistudio.PoolScopeNormal))
+	}
+	// overdue 把排空开始时间调到 drainSlotTimeout 之前：长流还在用旧 Worker，排空不再占名额
+	overdue := func(accountID string) {
+		env.manager.drainOf(accountID).startedAt.Store(time.Now().Add(-env.manager.drainSlotTimeout() - time.Minute).UnixNano())
+	}
+	releaseA := env.startBusyDrain(t, accounts[0])
+	defer releaseA()
+	if !waitUntil(3*time.Second, func() bool { return len(env.manager.WarmAccountIDs()) == 5 }) {
+		t.Fatalf("A 排空开始时应启动替补，驻留 Worker = %v", sortedWarm(env.manager))
+	}
+	overdue(accounts[0])
+	releaseB := env.startBusyDrain(t, accounts[1])
+	defer releaseB()
+	if !waitUntil(3*time.Second, func() bool { return hasLogContaining(env.requests, "替补未启动", "原因=排空") }) {
+		t.Fatalf("槽位已满时 B 的替补应记为没有启动，日志 = %v", serviceLogMessages(env.requests))
+	}
+	if !hasLogContaining(env.requests, "WAA Worker 排空", "排空中=2（占名额 1/1）") {
+		t.Fatalf("B 的排空日志应写出全部排空数 2 与占名额 1/1，日志 = %v", serviceLogMessages(env.requests))
+	}
+	overdue(accounts[1])
+	// C、D 同样是忙碌的死槽位：排空总数已到 2 × drainLimit，不再排空
+	for _, accountID := range accounts[2:4] {
+		release := holdLease(t, env.pool, accountID)
+		defer release()
+		env.retirePro(t, accountID)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if env.pool.Draining(accounts[2]) || env.pool.Draining(accounts[3]) {
+		t.Fatalf("排空总数已到上限时 C、D 不应排空，排空中 = %v", env.manager.drainingAccounts())
+	}
+	if got := env.manager.drainCount(aistudio.PoolScopeNormal); got != 2*limit {
+		t.Fatalf("排空数 = %d，期望 2 × drainLimit = %d", got, 2*limit)
+	}
+	accepting := 0
+	for _, accountID := range env.manager.WarmAccountIDs() {
+		if !env.pool.Draining(accountID) {
+			accepting++
+		}
+	}
+	if accepting < 4-limit {
+		t.Fatalf("可接单的 Worker = %d，期望不少于 峰值 - drainLimit = %d；驻留 %v，排空中 %v",
+			accepting, 4-limit, sortedWarm(env.manager), env.manager.drainingAccounts())
+	}
+}

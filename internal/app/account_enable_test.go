@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -427,5 +428,47 @@ func TestDeleteAccountClearsDisableNote(t *testing.T) {
 	}
 	if notes.manual(accounts[0].ID) {
 		t.Fatal("删除账户后应清除停用原因")
+	}
+}
+
+// TestAccountOperationWaitBounded 管理端保存账户、重新登录、验证登录等独占租约有上限：默认 REQUEST_TIMEOUT + 30 秒（拆分期限之前的隐含上限）；
+// 同账号有请求一直占着租约（开始输出的长流）时等满上限返回 account_busy 并撤销登记，账户恢复发租约；占用的请求在上限内结束时照常生效
+func TestAccountOperationWaitBounded(t *testing.T) {
+	isolateDisableNotes(t)
+	admin, _, accounts := enableTestAdmin(t, "a@example.com")
+	accountID := accounts[0].ID
+	if got, want := admin.accountOperationWait(), time.Minute+drainTimeoutGrace; got != want {
+		t.Fatalf("默认等待上限 = %s，期望 REQUEST_TIMEOUT + 30s = %s", got, want)
+	}
+	admin.operationWait = 200 * time.Millisecond
+	input := manualDisableInput(accountID, true)
+	release := holdLease(t, admin.pool, accountID)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for name, operation := range map[string]func() error{
+		"保存账户": func() error { _, err := admin.UpdateAccount(ctx, accountID, input); return err },
+		"重新登录": func() error { _, err := admin.LoginAccount(ctx, accountID); return err },
+		"验证登录": func() error { _, err := admin.VerifyAccount(ctx, accountID); return err },
+	} {
+		startedAt := time.Now()
+		err := operation()
+		var operationErr *adminOperationError
+		if !errors.As(err, &operationErr) || operationErr.code != "account_busy" || !strings.Contains(operationErr.message, "长时间生成") {
+			t.Fatalf("%s：err = %v，期望等满上限后返回 account_busy", name, err)
+		}
+		if elapsed := time.Since(startedAt); elapsed > 2*time.Second {
+			t.Fatalf("%s：用时 %s，期望在等待上限附近返回", name, elapsed)
+		}
+		// 登记已撤销：账户照常发出新租约
+		lease, err := admin.pool.AcquireFor(context.Background(), aistudio.AccountSelection{AccountID: accountID})
+		if err != nil {
+			t.Fatalf("%s：返回后账户应恢复发租约: %v", name, err)
+		}
+		_ = lease.Release()
+	}
+	admin.operationWait = 2 * time.Second
+	time.AfterFunc(100*time.Millisecond, release)
+	if _, err := admin.UpdateAccount(ctx, accountID, input); err != nil {
+		t.Fatalf("占用的请求在上限内结束时应照常保存: %v", err)
 	}
 }

@@ -16,7 +16,7 @@ import (
 //
 // 号池的同时生成数约为 峰值 Worker 数 × 单账户并发（MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY，Ultra 分区另算），每个账号每分钟的
 // 生成次数另受 ACCOUNT_RPM_LIMIT 约束（满了按忙碌换号，见 aistudio/rate_limit.go）。并发超过它时
-// 请求在 acquireLease 里排队等空闲的账号或 Worker，原先一直等到请求超时（REQUEST_TIMEOUT，默认 5 分钟）：客户端看到的是几分钟的
+// 请求在 acquireLease 里排队等空闲的账号或 Worker，原先一直等到首事件前期限（REQUEST_TIMEOUT，默认 5 分钟）：客户端看到的是几分钟的
 // 首字延迟与随后的 504，排队的请求越积越多。列表中的模型的生成请求改为最多排队到排队上限，超过后按 CapacityBusyError
 // 结束（对外 429 + Retry-After），由客户端稍后重试，不换号、不冷却、不记降级记忆、不退避。
 //

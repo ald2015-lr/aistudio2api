@@ -13,8 +13,8 @@ import (
 // 也成不了死槽位（剩余不到 rotationMinRemaining），分区满时换不上新号。同一账号同一模型（两个通道共用额度时共用一份，见 sharedFor）
 // 在冷却到期后再次裸限流就升一档（见 aistudio.MarkRateLimitCooldown），该通道成功一次即清零：
 //   - 第 2 档 5 分钟：剩余 5m→2m 这 3 分钟内算冷却中，分区满时可被 coolingVictim、victimCooling 替换；
-//   - 第 3 档 30 分钟：剩余 30m→15m 这 15 分钟内是死槽位（登记淘汰、补登记、轮换），足够排空超时（默认 REQUEST_TIMEOUT+30s=5m30s，
-//     超时后 1 分钟再试）；
+//   - 第 3 档 30 分钟：剩余 30m→15m 这 15 分钟内是死槽位（登记淘汰、补登记、轮换），足够排空超时（对不超过 REQUEST_TIMEOUT 的请求成立；
+//     更长的流由冷却登记在 15 分钟窗口结束时撤销、随之清除排空，见 worker_retire.go）；
 //   - 第 4 档 2 小时，第 5 档起冷却到太平洋时间次日零点。
 //
 // 每档都不超过太平洋时间次日零点：23:30 之后各档被截短，可能不足 15 分钟，只算冷却中，零点后额度恢复。
@@ -23,7 +23,7 @@ import (
 const (
 	rateLimitLevel1 = 30 * time.Second // 与 aistudio 的 unknownRateLimitCooldown 相同
 	rateLimitLevel2 = 5 * time.Minute  // > ShortCooldownMax(2m)+1m：算“冷却中”，分区满时可被 coolingVictim/victimCooling 替换
-	rateLimitLevel3 = 30 * time.Minute // >= rotationMinRemaining(15m)+10m：成为死槽位，留出 ≥ 排空超时(REQUEST_TIMEOUT+30s) 的余量
+	rateLimitLevel3 = 30 * time.Minute // >= rotationMinRemaining(15m)+10m：成为死槽位，对不超过 REQUEST_TIMEOUT 的请求留出足够的排空余量
 	rateLimitLevel4 = 2 * time.Hour
 	// 第 5 档起冷却到太平洋时间次日零点（NextQuotaDay）
 

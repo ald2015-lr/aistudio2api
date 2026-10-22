@@ -24,8 +24,14 @@ import (
 //
 // 先启后停：分区的容量判断把排空中的 Worker 视为已让出槽位（最多 drainLimit 个，见 drainCredit），排空开始时立即在后台启动替补
 // （startReplacement），不等旧 Worker 关闭；分区的浏览器总数因此最多为 峰值 + drainLimit。
+// 排空超过 drainSlotTimeout（REQUEST_TIMEOUT + 30 秒，多半是开始输出后的长流还在用这个 Worker）后保留排空标记，但不再占 startDrain 的名额：
+// 长流最长到总时长上限，一直占着名额时同分区其他忙碌的死槽位排空不了、替补也不启动。让出额度仍按全部排空计、最多 drainLimit 个，
+// 这时开始的排空多半因槽位已满记为替补没有启动（replacementFailed），旧 Worker 空闲关闭后由 finishRetirement 补上。
+// 排空总数另有上限 2 × drainLimit（见 drainTotalLimit）：替补起不来的排空只减少可接单的 Worker，长流各自占着的死槽位逐个超时、
+// 逐个再排空时不设上限的话，分区可接单的 Worker 会降到远低于峰值；有这个上限，可接单的 Worker 不少于 峰值 - drainLimit。
 // 排空在每条退出路径上清除：Worker 关闭（含 ResetAll 与 Close，见 closeCleanupLeftovers）、登记被放弃（冷却被清除或缩短）、
-// 淘汰出错、排空超时（REQUEST_TIMEOUT + 30 秒后仍有请求，多半是固定账户或文件绑定的请求一直在用：清除标记，1 分钟后再试）。
+// 淘汰出错、排空超时（总时长上限 + 30 秒后仍有请求，多半是固定账户或文件绑定的请求一直在用：清除标记，1 分钟后再试；
+// 总时长上限见 generateMaxDurationFor）。
 //
 // 替补：淘汰（排空开始、空闲淘汰、清扫、轮换）之后在同一分区挑一个能服务登记模型、对热门与主用模型都没有长时间冷却的
 // 备用账号，经后台冷启动名额启动。WARM_WORKER_LIMIT 低于驻留数时预热不会补齐空出的槽位，驻留数靠替补保持；分区低于预热目标时
@@ -33,7 +39,7 @@ import (
 // 替补只在分区有空槽（含排空让出的）时启动，不替换其他账号的空闲 Worker
 
 const (
-	// drainTimeoutGrace 为排空超时在 REQUEST_TIMEOUT 之外的余量
+	// drainTimeoutGrace 为排空超时在进行中请求最长持续时间之外的余量
 	drainTimeoutGrace = 30 * time.Second
 	// drainRetryBackoff 为排空超时后同一登记再次尝试的间隔
 	drainRetryBackoff = time.Minute
@@ -92,7 +98,15 @@ func (manager *accountWorkerManager) drainLimit(partition aistudio.PoolScope) in
 	return min(max(manager.warmConcurrencyValue(), 1)*2, max(1, maxActive/4))
 }
 
-// startDrain 在分区排空数低于上限时把账号标记排空并返回排空状态；已在排空、达到上限、账号已没有驻留 Worker、
+// drainTotalLimit 返回分区同时排空（含已超过 drainSlotTimeout、不再占名额的）的总数上限：2 × drainLimit。
+// 让出额度最多 drainLimit 个，超出的排空替补起不来，只让账号不再接不固定账户的请求：总数不超过 2 × drainLimit 时，
+// 分区可接单的 Worker 不少于 峰值 - drainLimit
+func (manager *accountWorkerManager) drainTotalLimit(partition aistudio.PoolScope) int {
+	return 2 * manager.drainLimit(partition)
+}
+
+// startDrain 在分区排空数低于上限时把账号标记排空并返回排空状态；已在排空、达到上限（占名额的排空数达到 drainLimit，
+// 或全部排空数达到 drainTotalLimit）、账号已没有驻留 Worker、
 // 已被其他路径选中淘汰、已不在账户池，或账号已不在 partition 时返回 nil。partition 为调用方（retirePass）在一轮开始时按成员快照
 // 算出的分区，调用方按它核对了能否排空与可接替账户，排空开始后还要在它里面启动替补。ULTRA_INCLUDE_PRO 恰好在取快照与这里之间
 // 切换时，这些判断都是对旧分区做的：照常写入的话，排空记在新分区（poolRuleChanged 会改标），替补却在旧分区启动，新分区少一个
@@ -105,7 +119,8 @@ func (manager *accountWorkerManager) startDrain(accountID string, partition aist
 	if partitionOf(accountID, manager.pool.UltraAccountIDs()) != partition {
 		return nil
 	}
-	if manager.drains[accountID] != nil || manager.drainCountLocked(partition) >= manager.drainLimit(partition) {
+	if manager.drains[accountID] != nil || manager.drainSlotCountLocked(partition, time.Now()) >= manager.drainLimit(partition) ||
+		manager.drainCountLocked(partition) >= manager.drainTotalLimit(partition) {
 		return nil
 	}
 	// 在 drainMu 内核对账号仍有驻留 Worker、没有被其他路径选中淘汰：retirePass 核对驻留之后，现场回收或清扫可能已关闭 Worker 并删除登记，
@@ -194,6 +209,26 @@ func (manager *accountWorkerManager) drainingAccounts() map[string]struct{} {
 	return accounts
 }
 
+// drainSlotCount 返回分区内占着排空名额（排空未超过 drainSlotTimeout）的账号数
+func (manager *accountWorkerManager) drainSlotCount(partition aistudio.PoolScope) int {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	return manager.drainSlotCountLocked(partition, time.Now())
+}
+
+// drainSlotCountLocked 返回分区内占着排空名额的账号数（调用方持有 drainMu）：排空超过 drainSlotTimeout 的仍在排空、仍计入 drainCredit，
+// 但不计入这里，startDrain 按它与 drainLimit 比较
+func (manager *accountWorkerManager) drainSlotCountLocked(partition aistudio.PoolScope, now time.Time) int {
+	limit := manager.drainSlotTimeout()
+	count := 0
+	for _, drain := range manager.drains {
+		if drain.partition == partition && drain.age(now) < limit {
+			count++
+		}
+	}
+	return count
+}
+
 func (manager *accountWorkerManager) drainCountLocked(partition aistudio.PoolScope) int {
 	count := 0
 	for _, drain := range manager.drains {
@@ -224,13 +259,24 @@ func (manager *accountWorkerManager) drainCredit(partition aistudio.PoolScope, o
 	return min(count, manager.drainLimit(partition))
 }
 
-// drainTimeout 返回排空超时：REQUEST_TIMEOUT + 30 秒（生成服务没有设置时按默认请求超时）
-func (manager *accountWorkerManager) drainTimeout() time.Duration {
+// drainSlotTimeout 返回排空占用排空名额的时限：REQUEST_TIMEOUT + 30 秒（拆分期限之前的排空超时，不超过 REQUEST_TIMEOUT 的请求都在
+// 这之内结束）；生成服务没有设置时按默认请求超时。超过后排空标记保留，到 drainTimeout 才清除
+func (manager *accountWorkerManager) drainSlotTimeout() time.Duration {
 	timeout := time.Duration(manager.requestTimeout.Load())
 	if timeout <= 0 {
 		timeout = config.Default().RequestTimeout
 	}
 	return timeout + drainTimeoutGrace
+}
+
+// drainTimeout 返回排空超时：进行中的请求最长可能持续的时间加 30 秒。生成请求开始输出后不再受 REQUEST_TIMEOUT 限制，
+// 最长到总时长上限（generateMaxDurationFor：1 小时，REQUEST_TIMEOUT 更长时按它）；生成服务没有设置时按默认请求超时
+func (manager *accountWorkerManager) drainTimeout() time.Duration {
+	timeout := time.Duration(manager.requestTimeout.Load())
+	if timeout <= 0 {
+		timeout = config.Default().RequestTimeout
+	}
+	return generateMaxDurationFor(timeout) + drainTimeoutGrace
 }
 
 // workerPrimaryModels 为 Worker 管理器使用的两份主用模型（已按降级判定的规则整理并排序）：normal 为普通号池的列表（PRIMARY_MODELS），

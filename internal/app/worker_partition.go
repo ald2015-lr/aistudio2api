@@ -128,7 +128,7 @@ func partitionLabel(partition aistudio.PoolScope) string {
 
 // poolRuleChanged 在 ULTRA_INCLUDE_PRO 实际切换之后调用：Pro 账户换了号池，它们的 Worker 从此计入另一个分区。
 // 分区计数、预热目标与容量判断每次调用都重新读取成员，不需要迁移；这里只处理按分区固定下来的状态并唤醒等待者：
-//  1. 排空状态在排空开始时记下了分区，按当前成员改标，否则排空中的 Pro Worker 会在最长 REQUEST_TIMEOUT+30 秒内
+//  1. 排空状态在排空开始时记下了分区，按当前成员改标，否则排空中的 Pro Worker 会在最长排空超时内
 //     继续给旧分区记让出额度；
 //  2. 唤醒等待容量的请求，按新成员重新判断（账户池的变化通知已唤醒等待账户的请求与调度队首）；
 //  3. 记录生效日志，分区超过峰值时提示空闲 Worker 将逐步回收。

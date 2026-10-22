@@ -37,6 +37,8 @@ type runtimeAdmin struct {
 	// catalogSlots 为启用后在后台同步模型目录的共用并发名额（见 bulk_enable.go），首次使用时创建
 	catalogSlotsOnce sync.Once
 	catalogSlots     chan struct{}
+	// operationWait 大于 0 时为管理端账户操作等待独占租约的上限（见 accountOperationWait），只给包内测试调低
+	operationWait time.Duration
 }
 
 // requestRegistry 保存活动请求与事件订阅
@@ -395,9 +397,9 @@ func (admin *runtimeAdmin) updateAccount(
 	if err := accountConfig.Validate(); err != nil {
 		return api.AdminAccount{}, invalidAccount(err)
 	}
-	lease, err := admin.pool.AcquireAccount(ctx, accountID)
+	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
-		return api.AdminAccount{}, accountOperationError(err)
+		return api.AdminAccount{}, err
 	}
 	account := lease.Account()
 	wasEnabled := account.Config.Enabled
@@ -512,9 +514,9 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 }
 
 func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
-	lease, err := admin.pool.AcquireAccount(ctx, accountID)
+	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
-		return api.AdminAccount{}, accountOperationError(err)
+		return api.AdminAccount{}, err
 	}
 	account := lease.Account()
 	if err := admin.workers.Reset(account.ID); err != nil {
@@ -588,9 +590,9 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 // verifyLogin 启动隔离浏览器验证登录并写回账户状态，返回浏览器的验证结果。停用账户的对外状态始终是 disabled
 // （登录失效也不会显示为需要登录），调用方判断验证是否通过必须看返回的 Authenticated，不能看账户状态
 func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (aistudio.LoginVerification, error) {
-	lease, err := admin.pool.AcquireAccount(ctx, accountID)
+	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
-		return aistudio.LoginVerification{}, accountOperationError(err)
+		return aistudio.LoginVerification{}, err
 	}
 	account := lease.Account()
 	startedAt := time.Now()
@@ -811,6 +813,45 @@ func invalidAccount(err error) error {
 	return &adminOperationError{
 		status: http.StatusBadRequest, code: "invalid_account", message: err.Error(),
 	}
+}
+
+// accountOperationWait 返回管理端账户操作（保存账户、重新登录、验证登录）等待独占租约的上限：REQUEST_TIMEOUT + 30 秒，即拆分期限之前
+// 进行中的请求都受 REQUEST_TIMEOUT 限制时的隐含上限；生成服务没有设置时按默认请求超时
+func (admin *runtimeAdmin) accountOperationWait() time.Duration {
+	if admin.operationWait > 0 {
+		return admin.operationWait
+	}
+	var timeout time.Duration
+	if admin.service != nil {
+		timeout = time.Duration(admin.service.timeout.Load())
+	}
+	if timeout <= 0 {
+		timeout = config.Default().RequestTimeout
+	}
+	return timeout + drainTimeoutGrace
+}
+
+// errAccountLongBusy 返回管理端账户操作等满上限仍有请求在用账户的错误：多半是开始输出后的长流（最长到总时长上限，见 generate_context.go）
+func errAccountLongBusy() error {
+	return &adminOperationError{
+		status: http.StatusConflict, code: "account_busy", message: "账户有长时间生成在进行，稍后重试",
+	}
+}
+
+// acquireAccountForOperation 为管理端账户操作取得独占租约，最多等 accountOperationWait：不超过 REQUEST_TIMEOUT 的请求照常等它们结束后生效；
+// 开始输出的长流可以持续到总时长上限，登记独占等待期间账户不发出新租约，不能让一次点击把账户挂到长流结束，等满后返回 account_busy。
+// 不用秒级上限：持续有负载的账户几乎等不到短时间的空闲，保存代理或语言会一直失败。只限制取得租约，取得后的登录、验证照常用 ctx
+func (admin *runtimeAdmin) acquireAccountForOperation(ctx context.Context, accountID string) (*aistudio.AccountLease, error) {
+	acquireCtx, cancel := context.WithTimeout(ctx, admin.accountOperationWait())
+	defer cancel()
+	lease, err := admin.pool.AcquireAccount(acquireCtx, accountID)
+	if err != nil {
+		if acquireCtx.Err() != nil && ctx.Err() == nil {
+			return nil, errAccountLongBusy()
+		}
+		return nil, accountOperationError(err)
+	}
+	return lease, nil
 }
 
 func accountOperationError(err error) error {

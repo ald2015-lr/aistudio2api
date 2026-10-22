@@ -220,7 +220,7 @@ type accountWorkerManager struct {
 	resetLimit  atomic.Int64
 	// primaryModels 为两份主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS，由生成服务设置），按分区与热门模型一起判断死槽位、
 	// 挑替补与放置请求（见 worker_drain.go）；
-	// requestTimeout 为请求超时（REQUEST_TIMEOUT），排空超时按它计算；serviceActive 返回生成服务是否在运行，替补只在运行时启动
+	// requestTimeout 为请求超时（REQUEST_TIMEOUT），排空超时按它与总时长上限计算；serviceActive 返回生成服务是否在运行，替补只在运行时启动
 	primaryModels  atomic.Pointer[workerPrimaryModels]
 	requestTimeout atomic.Int64
 	serviceActive  atomic.Pointer[func() bool]
@@ -2281,6 +2281,8 @@ type trackedService struct {
 	queueProgress queueProgressLimiter
 	// resetWait 为不固定账号的请求等待同账号关闭失败 Worker 的上限，nil 时为 defaultWorkerResetWait（见 worker_reset.go，测试调整）
 	resetWait atomic.Pointer[time.Duration]
+	// maxDuration 为生成请求的总时长上限（见 generate_context.go），0 为默认（generateMaxDurationFor），只给包内测试调低
+	maxDuration atomic.Int64
 }
 
 type modelCatalogService interface {
@@ -2303,7 +2305,7 @@ func newTrackedService(
 		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(), rateLimits: newRateLimitGuard(),
 	}
 	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断。
-	// 替补只在生成服务运行时启动，排空超时按请求超时计算（见 worker_drain.go）
+	// 替补只在生成服务运行时启动，排空超时按请求超时与总时长上限计算（见 worker_drain.go）
 	if workers != nil {
 		refill := tracked.prewarmIfRunning
 		workers.afterRetire.Store(&refill)
@@ -2314,7 +2316,8 @@ func newTrackedService(
 	return tracked
 }
 
-// setRequestTimeout 更新请求超时（REQUEST_TIMEOUT），同步给 Worker 管理器计算排空超时
+// setRequestTimeout 更新请求超时（REQUEST_TIMEOUT），同步给 Worker 管理器计算排空超时（总时长上限 + 30 秒）。
+// 进行中的生成请求的三段期限在建立时已取值，只影响新请求
 func (service *trackedService) setRequestTimeout(timeout time.Duration) {
 	service.timeout.Store(int64(timeout))
 	if service.workers != nil {
@@ -3144,6 +3147,8 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 		}
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(cause)
 		expectedGeneration := workerGenerations[accountID]
+		// 一直等关闭完成后在原账号重放（受 REQUEST_TIMEOUT 限制），不按 dataResetSwitchWait 只等一小会儿：aistudio 层的视频循环
+		// 只对 401/403/429/5xx 换号，协议 Code 5（404）与 Worker 浏览器失败都不换号，等不到返回未恢复时请求直接失败（Code 5 对外 502）
 		recovered, _, _, recoveryErr := service.recoverWorkerOnce(
 			recoveryCtx, nil, accountID, expectedGeneration, recoveredWorkers,
 			recoverCurrentGeneration, workerFailed || waaRuntimeFailed, workerResetWaitUnbounded,
@@ -3684,9 +3689,13 @@ func waitWarmCandidate(ctx context.Context, delay time.Duration) error {
 
 const streamStallThreshold = 15 * time.Second
 
+// activityEpoch 为 upstreamActivity 记录时间的起点：lastMono 存相对它的单调时钟纳秒，墙钟跳变不影响首事件后空闲判断
+var activityEpoch = time.Now()
+
 type upstreamActivity struct {
-	bytes    atomic.Int64
-	lastNano atomic.Int64
+	bytes atomic.Int64
+	// lastMono 为最近一次收到上游字节相对 activityEpoch 的纳秒数加 1（0 表示还没有字节）
+	lastMono atomic.Int64
 }
 
 type requestPreparationTiming struct {
@@ -3755,22 +3764,39 @@ func (activity *upstreamActivity) observe(count int) {
 	if count <= 0 {
 		return
 	}
-	now := time.Now().UnixNano()
-	activity.lastNano.Store(now)
+	activity.lastMono.Store(int64(time.Since(activityEpoch)) + 1)
 	activity.bytes.Add(int64(count))
 }
 
-func (activity *upstreamActivity) logFields(now time.Time) string {
+// sinceLastByte 返回最近一次上游字节距 now 的时间（now 应来自 time.Now()，带单调时钟读数）；还没有字节时 ok 为假
+func (activity *upstreamActivity) sinceLastByte(now time.Time) (time.Duration, bool) {
 	if activity == nil {
-		return "网络字节=0"
+		return 0, false
 	}
-	lastNano := activity.lastNano.Load()
-	if lastNano == 0 {
+	last := activity.lastMono.Load()
+	if last == 0 {
+		return 0, false
+	}
+	return now.Sub(activityEpoch) - time.Duration(last-1), true
+}
+
+// quietFor 返回上游连续没有活动的时间：从 progress（最近一次收到事件或向下游交付完成）与最近一次上游字节中较晚的一个算起
+func (activity *upstreamActivity) quietFor(now, progress time.Time) time.Duration {
+	quiet := now.Sub(progress)
+	if since, ok := activity.sinceLastByte(now); ok && since < quiet {
+		quiet = since
+	}
+	return quiet
+}
+
+func (activity *upstreamActivity) logFields(now time.Time) string {
+	since, ok := activity.sinceLastByte(now)
+	if !ok {
 		return "网络字节=0"
 	}
 	return fmt.Sprintf(
 		"网络字节=%d | 最近网络=%s",
-		activity.bytes.Load(), now.Sub(time.Unix(0, lastNano)).Round(time.Millisecond),
+		activity.bytes.Load(), since.Round(time.Millisecond),
 	)
 }
 
@@ -3894,7 +3920,7 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 		service.requests.finish(request.ID, "failed", remembered)
 		return nil, nil, remembered
 	}
-	requestCtx, cancel, err := service.dataRequestContext(ctx)
+	requestCtx, cancel, err := service.generateRequestContext(ctx)
 	if err != nil {
 		api.SetAccessLogError(ctx, err)
 		service.requests.start(ctx, request, func() {})
@@ -3904,6 +3930,10 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	service.requests.start(ctx, request, cancel)
 	resourceID, err := service.pool.ResourceIDForContents(requestCtx, request.Contents)
 	if err != nil {
+		// 文件资源刷新属于首事件前：期限到期时同样标明是本服务的首事件前期限
+		if cut, ok := generateContextFrom(requestCtx).startDeadlineError(err, "文件资源刷新"); ok {
+			err = cut
+		}
 		api.SetAccessLogError(requestCtx, err)
 		cancel()
 		service.requests.finish(request.ID, finalRequestState(err), err)
@@ -3932,6 +3962,10 @@ func (service *trackedService) generateWithRetry(
 	trace := aistudio.TraceFromContext(requestCtx)
 	// scope 为请求可以使用的号池：换号、文件复制与通道回退都只在这个号池内进行
 	scope := aistudio.PoolScopeFromContext(requestCtx)
+	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，各方法按原来的整段期限处理
+	phase := generateContextFrom(requestCtx)
+	// startCutWhere 为首事件前期限在某次尝试中到期时那次尝试停在哪一步（写进最终错误，见 startDeadlineError）
+	startCutWhere := ""
 	maxAttempts := 1
 	requestedAccountID := strings.TrimSpace(request.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
@@ -4203,8 +4237,10 @@ func (service *trackedService) generateWithRetry(
 		service.requests.markRunning(request.ID, request.AccountID, accountLabel)
 		service.requests.markChannel(request.ID, string(lease.Channel()))
 		service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "等待上游响应")
-		// 每次尝试有自己的上下文：首事件超时只取消这一次尝试，请求本身继续换号重试
-		attemptCtx, cancelAttempt := context.WithCancelCause(aistudio.ContextWithAccountLease(requestCtx, lease))
+		// 每次尝试有自己的上下文：首事件超时只取消这一次尝试，请求本身继续换号重试。先从 requestCtx 派生再附加租约：
+		// 直接子上下文登记在请求上下文上（不起 goroutine），收到首事件后随请求上下文延长到总时长上限
+		attemptBase, cancelAttempt := context.WithCancelCause(requestCtx)
+		attemptCtx := aistudio.ContextWithAccountLease(attemptBase, lease)
 		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
@@ -4342,6 +4378,24 @@ func (service *trackedService) generateWithRetry(
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 				"上游首事件超时 | 超时=%s | 模型=%s | %s", firstEvent.timeout, modelID, activity.logFields(time.Now()),
 			))
+		}
+		// 停止首事件超时计时之后、转发首事件之前切到首事件后（期限延长到总时长上限）。首事件与首事件前期限到期（或请求取消）
+		// 同时发生时期限已经结束了请求：这个事件不转发（还没有向客户端输出任何内容），按请求结束的错误处理（到期对外 504，取消 499/503），
+		// 读完事件流确认上游 goroutine 退出后再释放租约。顺序不能反：先切换再检查首事件超时，会交出一个已被首事件超时取消的尝试
+		sameTime := false
+		if err == nil && !phase.beginStreaming() {
+			sameTime = true
+			err = requestCtx.Err()
+			cancelAttempt(err)
+			if !drainAttemptEvents(source, attemptDrainTimeout) {
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "首事件到达时请求已结束，上游事件流未及时结束")
+			}
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "上游首事件到达时请求已结束，不转发 | 原因="+progressReason(err))
+		}
+		// 首事件前期限在这次尝试中到期：记下停在哪一步，写进最终错误（见 startDeadlineError）
+		if err != nil && startCutWhere == "" && phase.startExpired() &&
+			(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+			startCutWhere = startCutStage(generated, source != nil, sameTime, prepareTiming)
 		}
 		if err == nil {
 			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
@@ -4640,6 +4694,19 @@ func (service *trackedService) generateWithRetry(
 		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents
 		err = aistudio.PoolNotReadyIn(scope, fmt.Sprintf("模型 %s 换号结束时没有可用账号", modelID), nil)
 	}
+	// 首事件前期限到期：错误标明是本服务自己的期限（与上游的“协议错误码 4”、上游断流区分开），仍满足 context.DeadlineExceeded（对外 504）
+	if cut, ok := phase.startDeadlineError(err, startCutWhere); ok {
+		reason := progressReason(err)
+		err = cut
+		where := cut.where
+		if where == "" {
+			where = "-"
+		}
+		service.requests.logRequestProgress(request.ID, "service", "WARN", fmt.Sprintf(
+			"本服务期限截断 | 阶段=首事件前 | 期限=%s | 已用时=%s | 停在=%s | 原因=%s",
+			cut.limit, cut.elapsed.Round(time.Millisecond), where, reason))
+		trace.Note("本服务首事件前期限到期: " + cut.Error())
+	}
 	if err != nil {
 		if activity != nil {
 			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
@@ -4894,6 +4961,24 @@ func drainAttemptEvents(source <-chan aistudio.Event, limit time.Duration) bool 
 	}
 }
 
+// startCutStage 返回首事件前期限到期时本次尝试停在哪一步（写进最终错误与进度日志）：streamOpened 为 Generate 已返回事件流，
+// sameTime 为首事件与期限同时到达（首事件已丢弃）
+func startCutStage(generated, streamOpened, sameTime bool, timing *requestPreparationTiming) string {
+	switch {
+	case sameTime:
+		return "首事件与期限同时到达（已丢弃，未向客户端输出）"
+	case !generated:
+		return "文件复制或附件上传"
+	case streamOpened:
+		return "等待上游首事件"
+	}
+	current, _, _ := timing.snapshot(time.Now())
+	if current == "流已建立" {
+		return "等待上游首事件"
+	}
+	return current
+}
+
 var errStreamClosedBeforeFirstEvent = errors.New("AI Studio stream closed before first event")
 var errStreamClosedBeforeFinish = errors.New("AI Studio stream closed before finish")
 
@@ -4907,6 +4992,11 @@ func firstGenerateEvent(ctx context.Context, source <-chan aistudio.Event, onWai
 		select {
 		case event, ok := <-source:
 			if !ok {
+				// 本次尝试的上下文已结束时上游不再发错误事件、直接关闭事件流（aistudio/generate.go），与 ctx.Done 同时就绪时
+				// select 可能先读到关闭：按 ctx 的错误返回（首事件超时、本服务期限、请求取消照常识别），不当成上游在首事件前断流
+				if err := ctx.Err(); err != nil {
+					return aistudio.Event{}, err
+				}
 				return aistudio.Event{}, errStreamClosedBeforeFirstEvent
 			}
 			if onEvent != nil {
@@ -4981,6 +5071,29 @@ func (service *trackedService) lifecycleRequestContext(ctx context.Context) (con
 	}
 }
 
+// generateRequestContext 为生成请求建立上下文（见 generate_context.go）：首事件前期限与首事件后空闲期限按此刻的 REQUEST_TIMEOUT，
+// 总时长上限按 generateMaxDurationFor（maxDuration 大于 0 时用它，测试调低）；生成服务停止时随之取消。
+// 其他数据请求（CountTokens、视频、转写）仍用 dataRequestContext，整段受 REQUEST_TIMEOUT 限制
+func (service *trackedService) generateRequestContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
+	service.lifecycleMu.Lock()
+	if service.state.Load() != serviceRunning || service.dataContext == nil {
+		service.lifecycleMu.Unlock()
+		return nil, nil, &serviceStoppedError{}
+	}
+	timeout := time.Duration(service.timeout.Load())
+	maxDuration := generateMaxDurationFor(timeout)
+	if limit := time.Duration(service.maxDuration.Load()); limit > 0 {
+		maxDuration = max(limit, timeout)
+	}
+	requestCtx := newGenerateContext(ctx, time.Now(), timeout, maxDuration)
+	stopData := context.AfterFunc(service.dataContext, requestCtx.cancel)
+	service.lifecycleMu.Unlock()
+	return requestCtx, func() {
+		stopData()
+		requestCtx.cancel()
+	}, nil
+}
+
 func (service *trackedService) dataRequestContext(ctx context.Context) (context.Context, context.CancelFunc, error) {
 	service.lifecycleMu.Lock()
 	if service.state.Load() != serviceRunning || service.dataContext == nil {
@@ -5012,6 +5125,8 @@ func (service *trackedService) forwardEvents(
 ) {
 	state := "completed"
 	trace := aistudio.TraceFromContext(requestCtx)
+	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，不检查空闲
+	phase := generateContextFrom(requestCtx)
 	replyBytes := 0
 	var requestErr error
 	terminal := false
@@ -5059,12 +5174,45 @@ func (service *trackedService) forwardEvents(
 		stallTimer.Reset(streamStallThreshold)
 		stall = stallTimer.C
 	}
+	// 首事件后空闲期限（见 generate_context.go）：上游连续 idleLimit 没有事件、也没有网络字节时以本服务期限错误结束；
+	// 向下游交付被阻塞的时间不算上游空闲（只在接收处检查，交付完成后重新计时；下游一直不读由总时长上限兜底）。
+	// 计时器到时才复查实际空闲时间，不在每个事件上重设
+	idleLimit := phase.idleTimeout()
+	lastProgress := time.Now()
+	var idleTimer *time.Timer
+	var idle <-chan time.Time
+	if idleLimit > 0 {
+		idleTimer = time.NewTimer(idleLimit)
+		defer idleTimer.Stop()
+		idle = idleTimer.C
+	}
+	// publishResult 把网络字节、用量与工具调用数写进访问日志，每次把错误事件交给下游之前调用：API 层收到错误事件就结束请求并记录
+	// 访问日志（requests.db、request.finished），不等事件流关闭；截断后还要读完事件流（最长 attemptDrainTimeout）时只在 defer 里写会丢失。
+	// defer 里的同样写入保留，作为正常结束与终态路径的兜底（重复写为覆盖）
+	publishResult := func() {
+		api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
+		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+	}
 	finishFromContext := func() {
 		requestErr = requestCtx.Err()
+		if cause := phase.deadlineCause(); cause != nil {
+			// 本服务的空闲期限或总时长上限：错误写明是哪一段与已输出的事件数，仍满足 context.DeadlineExceeded（对外 504）
+			cut := cause.withOutput(reasoningEvents, contentEvents)
+			requestErr = cut
+			if !terminal {
+				now := time.Now()
+				service.requests.logRequestProgress(requestID, accountLabel, "WARN", fmt.Sprintf(
+					"本服务期限截断 | 阶段=%s | 期限=%s | 已用时=%s | 最近事件=%s | 推理=%d | 正文=%d | %s",
+					cut.stage.label(), cut.limit, now.Sub(phase.startedAt).Round(time.Millisecond),
+					lastEventKind, reasoningEvents, contentEvents, activity.logFields(now)))
+				trace.Note("本服务期限截断: " + cut.Error())
+			}
+		}
 		state = finalRequestState(requestErr)
 		if requestErr == nil || terminal || clientCtx.Err() != nil {
 			return
 		}
+		publishResult()
 		select {
 		case destination <- aistudio.Event{Kind: aistudio.EventError, Err: requestErr}:
 		case <-clientCtx.Done():
@@ -5118,6 +5266,29 @@ func (service *trackedService) forwardEvents(
 					activity.logFields(time.Now()),
 				))
 				continue
+			case <-idle:
+				now := time.Now()
+				if remaining := idleLimit - activity.quietFor(now, lastProgress); remaining > 0 {
+					idleTimer.Reset(remaining)
+					continue
+				}
+				idle = nil
+				expired := phase.expire(&serviceDeadlineError{
+					stage: serviceDeadlineIdle, limit: idleLimit, elapsed: now.Sub(phase.startedAt),
+				})
+				if expired && terminal {
+					// 终态已经交给下游：只结束上游与租约，结果仍按终态记录（不把已完整的回复记成失败）
+					service.requests.logRequestProgress(requestID, accountLabel, "WARN", fmt.Sprintf(
+						"终态后上游事件流 %s 内没有结束，结束转发 | 模型=%s | %s", idleLimit, modelID, activity.logFields(now)))
+				} else {
+					// 本服务空闲期限到期（已被其他原因结束时按那个原因）：往流里写错误后结束
+					finishFromContext()
+				}
+				// 读完事件流确认上游 goroutine 退出后再返回，defer 随后释放租约（与首事件前取消尝试后的做法相同）
+				if !drainAttemptEvents(source, attemptDrainTimeout) {
+					service.requests.logRequestProgress(requestID, accountLabel, "WARN", "本服务期限截断后上游事件流未及时结束")
+				}
+				return
 			case <-requestCtx.Done():
 				finishFromContext()
 				return
@@ -5129,6 +5300,7 @@ func (service *trackedService) forwardEvents(
 			} else if !terminal {
 				requestErr = errStreamClosedBeforeFinish
 				state = "failed"
+				publishResult()
 				select {
 				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: requestErr}:
 				case <-clientCtx.Done():
@@ -5145,6 +5317,7 @@ func (service *trackedService) forwardEvents(
 			stalled = false
 		}
 		lastEventAt = now
+		lastProgress = now
 		lastEventKind = string(event.Kind)
 		trace.RecordEvent(event)
 		switch event.Kind {
@@ -5207,8 +5380,13 @@ func (service *trackedService) forwardEvents(
 		} else {
 			resetStallTimer()
 		}
+		if event.Kind == aistudio.EventError {
+			// 上游错误之后事件流可能迟迟不关闭：先写访问日志的结果字段，再交给下游
+			publishResult()
+		}
 		select {
 		case destination <- event:
+			lastProgress = time.Now()
 		case <-requestCtx.Done():
 			finishFromContext()
 			return

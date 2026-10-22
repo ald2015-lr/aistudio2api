@@ -38,6 +38,12 @@ func (service *trackedService) Transcribe(
 	}
 	workerGenerations := make(map[string]uint64)
 	recoveredWorkers := make(map[string]struct{})
+	// resetSelection 为判断恢复时还能不能换号的选号条件（见 dataResetSwitchWait）；转写不固定账号
+	modelID := strings.TrimPrefix(request.Model, "models/")
+	resetSelection := aistudio.AccountSelection{
+		ModelID: modelID, ModelAccessScope: modelID, Method: "generateContent", Capability: "transcription_output",
+		AllowedAccountIDs: request.CandidateAccountIDs,
+	}
 	request.ObserveAccountFailure = func(accountID string, cause error) {
 		label := accountID
 		for _, status := range service.pool.Status() {
@@ -62,9 +68,19 @@ func (service *trackedService) Transcribe(
 		}
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(cause)
 		expectedGeneration := workerGenerations[accountID]
+		// Code 5 且还有其他候选（有进行中后台关闭的账号不算，见 dataResetSwitchWait）时只等一小会儿，等不到返回未恢复，aistudio 层换号；
+		// 只剩这个账号时照旧等关闭完成（受 REQUEST_TIMEOUT 限制）。
+		// Worker 浏览器失败（不是 Code 5）的错误类型不一，aistudio 层只对超时、网络错误、断流换号，其余直接失败：照旧等关闭完成后
+		// 在原账号重放。浏览器退出时同账号的流随之断开，关闭很快完成；浏览器卡死时，同账号的流最多在 60 秒无进展（protectedStallLimit）后断开
+		wait := workerResetWaitUnbounded
+		if waaRuntimeFailed {
+			if switchWait, ok := service.dataResetSwitchWait(recoveryCtx, false, resetSelection, workerGenerations, accountID); ok {
+				wait = switchWait
+			}
+		}
 		recovered, currentGeneration, _, recoveryErr := service.recoverWorkerOnce(
 			recoveryCtx, nil, accountID, expectedGeneration, recoveredWorkers, true, workerFailed || waaRuntimeFailed,
-			workerResetWaitUnbounded,
+			wait,
 		)
 		if recoveryErr != nil {
 			return false, recoveryErr
@@ -82,7 +98,6 @@ func (service *trackedService) Transcribe(
 				break
 			}
 		}
-		modelID := strings.TrimPrefix(request.Model, "models/")
 		if workerFailed || waaRuntimeFailed {
 			service.requests.log(label, "WARN", "WAA Worker 重建 | 模型="+modelID)
 		}

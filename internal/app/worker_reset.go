@@ -4,21 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 // 失败 Worker 的后台关闭。
 //
 // 请求遇到 Worker 失败（浏览器退出、控制连接断开）或协议 Code 5 时要关闭这个 Worker 版本，关闭前要等同账户其他进行中的请求结束：
-// 它们经同一个浏览器流式返回，每个最长可达 REQUEST_TIMEOUT。原先失败的请求同步等这次关闭，自己干等几分钟，等到超时还直接失败、不换号。
+// 它们经同一个浏览器流式返回，每个最长可达总时长上限（生成请求开始输出后不再受 REQUEST_TIMEOUT 限制，见 generateMaxDurationFor）。
+// 原先失败的请求同步等这次关闭，自己干等几分钟，等到超时还直接失败、不换号。
 // 现在关闭交给后台（scheduleWorkerReset）：
 //   - 同一账户的同一 Worker 版本只关闭一次，并发失败的请求与失败 Worker 巡检共用这一次；
 //   - 请求释放租约与登记独占等待在账户池的同一次加锁内完成（aistudio.AccountLease.ReleaseToExclusiveReservation），登记保持到关闭结束，
 //     期间账户不发出新租约：排队的请求不会落到坏掉的 Worker 上，也不会因 Worker 已失败而原地替换浏览器、切断同账户还在输出的流；
-//   - 后台最多等排空超时（REQUEST_TIMEOUT + 30 秒），请求取消后照常继续；ResetAll 与 Close 取消它们并等 goroutine 退出。
+//   - 后台最多等排空超时（总时长上限 + 30 秒），请求取消后照常继续；ResetAll 与 Close 取消它们并等 goroutine 退出。
 //
 // 请求只等一小会儿（见 workerResetWaitFor）：不固定账号、还能换号的请求等不到就换号（原账号仍算已尝试），换号找不到可用账号时
 // 回到原账号一直等关闭结束后重放；固定账号与文件绑定的请求只能用这个账号，照旧等关闭结束后在原账号重放。
@@ -27,7 +30,14 @@ import (
 // 换号后的选号在排队时（其他账号都忙），原账号的关闭结束、可以重放就不再排除它，按原来的排队位置重新选号（见 wakeWait）：
 // 关闭后原账号没有 Worker，要冷启动并占一个 Worker 槽位，不固定到它，原账号与其他账号哪个先能用就用哪个。
 // 换号的取舍：解释器更新后整个号池的驻留 Worker 都可能返回 Code 5，换号会落到另一个同样过时的 Worker 上，原账号重放才是新实例；
-// 每次换号仍计入连续失败上限，没有其他进行中请求的账号通常在等待时间内关闭完成、直接在新实例重放，不受影响
+// 每次换号仍计入连续失败上限，没有其他进行中请求的账号通常在等待时间内关闭完成、直接在新实例重放，不受影响。
+// 转写与 Live 没有“换号找不到账号再回到原账号等”的逻辑：不固定账号、还有其他候选（有进行中后台关闭的账号不算）时同样只等一小会儿
+// 就换号，否则照旧等关闭结束，见 dataResetSwitchWait。Live 遇到 Worker 失败或协议 Code 5 时这样做；转写只在协议 Code 5 时短等待，
+// Worker 浏览器失败时照旧等关闭结束（aistudio 层的转写只对超时、网络错误、断流换号，见 Transcribe）。
+// 转写的等待受 REQUEST_TIMEOUT 限制；Live 的请求没有期限，最多等 REQUEST_TIMEOUT 后以 503 结束，之后按同一账号重试时
+// 关闭还没结束同样最多等 REQUEST_TIMEOUT（见 awaitLiveReset），会话建立的取租约另有同样的期限（见 liveSetupDeadline）。
+// 视频照旧一直等关闭结束后在原账号重放（受 REQUEST_TIMEOUT 限制）：aistudio 层的视频循环遇到协议 Code 5 与 Worker 浏览器失败不换号，
+// 等不到就返回未恢复的话请求直接失败
 
 const (
 	// defaultWorkerResetWait 为不固定账号、还能换号的请求等待同账号关闭失败 Worker 的默认上限。没有其他进行中的请求时关闭只要
@@ -308,8 +318,8 @@ func (manager *accountWorkerManager) logWorkerResetExpired(accountID string, wai
 	))
 }
 
-// workerResetLimit 返回后台关闭等待独占租约的上限：默认为排空超时（REQUEST_TIMEOUT + 30 秒，进行中的请求都受 REQUEST_TIMEOUT 限制），
-// resetLimit 大于 0 时用它（测试调低）
+// workerResetLimit 返回后台关闭等待独占租约的上限：默认为排空超时（总时长上限 + 30 秒：进行中的生成请求最长到总时长上限，
+// 见 generateMaxDurationFor），resetLimit 大于 0 时用它（测试调低）
 func (manager *accountWorkerManager) workerResetLimit() time.Duration {
 	if limit := time.Duration(manager.resetLimit.Load()); limit > 0 {
 		return limit
@@ -349,6 +359,111 @@ func (service *trackedService) workerResetWaitFor(budget *leaseWaitBudget) time.
 		wait = max(min(wait, primaryWorkerResetWait, budget.remaining()/4), 0)
 	}
 	return wait
+}
+
+// dataResetSwitchWait 返回 Live 遇到 Worker 失败或协议 Code 5、转写遇到协议 Code 5 时能否不等同账号关闭失败 Worker 完成就换号，
+// 以及换号前最多等多久。
+// 关闭要等同账号进行中的请求都释放租约，开始输出的长流最长到总时长上限：一直等的话，转写等满 REQUEST_TIMEOUT 后 504、全程不换号，
+// Live 没有期限，会挂到长流结束。这两条路径没有 generate 路径“换号找不到账号再回到原账号等”的逻辑，所以只在确实能换号时才不等完
+// （视频不用它：aistudio 层的视频循环遇到 Code 5 不换号，见 GenerateVideo）：
+// 不固定账号（pinned 为假：没有指定账户、文件或会话绑定），并且除已尝试的账号（tried 的键与 accountID）和有进行中后台关闭的账号外
+// 还有能服务 selection 的候选（冷却中的不算，忙碌的算）时，返回 workerResetWaitFor(nil) 与 true：等不到时恢复回调返回未恢复，
+// aistudio 层把原账号记为失败并换号。
+// 有进行中后台关闭的账号登记着独占等待，关闭结束前不发出新租约（要等它同账号的请求都结束，长流最长到总时长上限）：换过去会在
+// aistudio 层的取租约里排到那次关闭结束，原账号先关闭完成也唤不醒（原账号已被排除），转写等满 REQUEST_TIMEOUT 后 504，Live 没有期限，
+// 所以不算可换的候选。关闭马上就要结束的候选也排除：原账号的关闭更慢时，本可换过去的请求照旧等原账号，
+// 转写等满 REQUEST_TIMEOUT 后 504，Live 在 liveResetWait 后 503，与拆分前一直等原账号相同（事先无法知道哪边的关闭先结束）。
+// 否则返回 false（只剩这个账号，单账号号池换号只会直接失败），调用方照旧等关闭完成（转写受 REQUEST_TIMEOUT 限制，Live 另加上限）
+func (service *trackedService) dataResetSwitchWait(
+	ctx context.Context,
+	pinned bool,
+	selection aistudio.AccountSelection,
+	tried map[string]uint64,
+	accountID string,
+) (time.Duration, bool) {
+	if pinned {
+		return 0, false
+	}
+	excluded := append(append([]string(nil), selection.ExcludedAccountIDs...), accountID)
+	for triedID := range tried {
+		if triedID != accountID {
+			excluded = append(excluded, triedID)
+		}
+	}
+	excluded = append(excluded, service.workers.resettingAccountIDs()...)
+	selection.ExcludedAccountIDs = excluded
+	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
+	if err != nil ||
+		len(groups.WarmReady)+len(groups.WarmAvailable)+len(groups.WarmBusy)+len(groups.StandbyReady)+len(groups.StandbyBusy) == 0 {
+		return 0, false
+	}
+	return service.workerResetWaitFor(nil), true
+}
+
+// liveResetWait 返回 Live 会话建立不能换号时等同账号关闭失败 Worker 的上限：REQUEST_TIMEOUT（生成服务没有设置时按默认请求超时）。
+// Live 的请求上下文没有期限，同账号有长流时不加上限会一直挂到长流结束
+func (service *trackedService) liveResetWait() time.Duration {
+	if timeout := time.Duration(service.timeout.Load()); timeout > 0 {
+		return timeout
+	}
+	return config.Default().RequestTimeout
+}
+
+// liveResetExpired 返回 Live 会话建立不能换号、又没能在原账号重放时的错误：号池暂时不可用（503），客户端稍后重试。
+// pending 为这次后台关闭，wait 为已等的上限；按原因区分文案：关闭还没结束（等满 wait，同账号多半有长时间生成）、
+// 关闭出错（带上关闭的错误）、后台关闭被放弃（等不到同账号的请求结束，或 ResetAll、Close 期间不登记），
+// 以及等待到期与这里检查之间关闭恰好成功结束（可以重放，只是这次没赶上）
+func liveResetExpired(ctx context.Context, pending *workerReset, wait time.Duration) error {
+	reason := fmt.Sprintf("账号的失败 Worker 在 %s 内没有关闭重建（同账号可能有长时间生成在进行），稍后重试", wait)
+	var cause error
+	select {
+	case <-pending.done:
+		switch {
+		case pending.err != nil:
+			reason, cause = "关闭账号的失败 Worker 出错，稍后重试", pending.err
+		case pending.expired:
+			reason = "账号的失败 Worker 后台关闭已放弃（同账号的请求一直没有结束，或服务正在重启），稍后重试"
+		default:
+			reason = "账号的失败 Worker 刚完成关闭重建，稍后重试"
+		}
+	default:
+	}
+	return aistudio.PoolNotReadyIn(aistudio.PoolScopeFromContext(ctx), reason, cause)
+}
+
+// pendingWorkerReset 返回账户进行中的后台关闭（任一 Worker 版本），没有时为 nil
+func (manager *accountWorkerManager) pendingWorkerReset(accountID string) *workerReset {
+	manager.resetMu.Lock()
+	defer manager.resetMu.Unlock()
+	for key, pending := range manager.resets {
+		if key.accountID == accountID {
+			return pending
+		}
+	}
+	return nil
+}
+
+// resettingAccountIDs 返回有进行中后台关闭的账户（任一 Worker 版本，同一账户只出现一次）
+func (manager *accountWorkerManager) resettingAccountIDs() []string {
+	manager.resetMu.Lock()
+	defer manager.resetMu.Unlock()
+	if len(manager.resets) == 0 {
+		return nil
+	}
+	accountIDs := make([]string, 0, len(manager.resets))
+	for key := range manager.resets {
+		if !slices.Contains(accountIDs, key.accountID) {
+			accountIDs = append(accountIDs, key.accountID)
+		}
+	}
+	return accountIDs
+}
+
+// hasPendingWorkerResets 判断是否有进行中的后台关闭
+func (manager *accountWorkerManager) hasPendingWorkerResets() bool {
+	manager.resetMu.Lock()
+	defer manager.resetMu.Unlock()
+	return len(manager.resets) > 0
 }
 
 // switchUnavailable 判断换号是否没有别的账号可用：没有账号符合条件、候选全部冷却，或不等待的选号没有立即可用的账号

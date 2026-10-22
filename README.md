@@ -565,7 +565,7 @@ cp .env.example .env
 | `PROXY_API_KEY` | `sk-onechat-fun-fun` | 公开 API key；调用 API 必须携带，留空即使用默认值。默认密钥随源码公开，对外监听时务必改为自定义密钥 |
 | `PROXY` | 空 | Chrome 导入、登录和账户默认使用的 HTTP、HTTPS 或 SOCKS5 代理 |
 | `INIT_TIMEOUT` | `2m` | 单账户 WAA 初始化超时 |
-| `REQUEST_TIMEOUT` | `5m` | 单次请求最大执行时间 |
+| `REQUEST_TIMEOUT` | `5m` | 生成请求在首个上游事件之前的总期限：排队、冷启动、WAA proof、附件上传、等首字与首事件前的换号都计入，到时返回 504。开始输出后改为空闲上限：上游连续这么久既没有事件也没有网络字节才以 504 结束；整条生成请求最长 1 小时（本项更长时按本项）。计数、视频与转写等其他请求整段受它限制。修改只影响新请求，见[长回复中途截断或重新生成](#长回复中途截断或重新生成) |
 | `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
 | `WARM_WORKER_LIMIT` | `5` | 普通号池的常驻预热账户数（不含 Ultra 号池的账户）。应不小于希望常驻的 Worker 数：超出它的 Worker 空闲 5 分钟后被回收，预热也不会补齐超出部分空出的槽位，只能靠请求现场冷启动 |
 | `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS` 之和。淘汰仍在服务请求的冷却占位时替补先启动，排空期间每个分区最多再多 `min(WARM_STARTUP_CONCURRENCY×2, 峰值/4)` 个（至少 1 个） |
@@ -595,7 +595,7 @@ cp .env.example .env
 
 号池的同时生成数约为 `MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`（Ultra 号池为 `ULTRA_MAX_ACTIVE_WORKERS × PER_ACCOUNT_CONCURRENCY`，开启 `ULTRA_INCLUDE_PRO` 时由 Ultra 与 Pro 账户共用），每分钟生成次数不超过 Worker 数 × `ACCOUNT_RPM_LIMIT`：上游每账号每分钟最多 12 次生成请求，单账号并发调得再高，一分钟内也只能发出这么多。并发请求超过它时，多出来的请求在选号时排队等空闲的账号或 Worker，首字延迟随之拉长，直到 `REQUEST_TIMEOUT` 到期返回 504；账号因每日限额冷却却仍占着 Worker 时可用容量更少。这样的冷却占位（账号全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）即使一直有其他模型的请求在用，也会被排空：不再接新的请求，替补账号先启动，进行中的请求结束后关闭；其他模型的请求优先分给冷却占位，把还能服务主用模型的 Worker 留给主用模型。`PRIMARY_MODELS` 的快速失败只是对症状的处理：列表中的模型排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429 让客户端稍后重试，不会增加容量；长期高于容量时，扩容靠增加 Worker 数（`MAX_ACTIVE_WORKERS`、`ULTRA_MAX_ACTIVE_WORKERS`）；单账号并发受每分钟次数上限（`ACCOUNT_RPM_LIMIT`）约束，不宜调高；或者减少并发。
 
-管理页侧栏的容量显示：“冷却占位 N · 待淘汰”为常驻 Worker 中账号长时间冷却（全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）的死槽位，其中正在排空的另显示“排空中 N”（不再接新请求，正在服务的请求结束后关闭，替补已先启动）；设置了 `PRIMARY_MODELS` 时每个主用模型一行“主用 <模型>：热 N · 冷却 C · 备用 M”，热为能服务它的常驻 Worker 数，冷却为对它冷却中的常驻 Worker 数（含 2 分钟内到期的短冷却，冷却到期前服务不了它），备用为还能服务它的空闲账号数（最多统计 1000 个，显示为 1000+），约每 30 秒更新，备用为 0 时标黄（见[故障排除](#主用模型返回-429-或首字很慢)）；`ULTRA_PRIMARY_MODELS` 的每个模型在 Ultra Worker 一行下面另有一行“Ultra 主用 <模型>：热 N · 冷却 C · 备用 M”，只统计 Ultra 分区的常驻 Worker 与 Ultra 号池的空闲账号（开启 `ULTRA_INCLUDE_PRO` 时含 Pro 账户，切换后约 5 秒内按新的号池重新统计）。`/api/status` 中对应 `workers` 与 `ultra_workers` 的 `dead`、`draining`、`retiring`（待淘汰登记数）与 `primary_supply`（Ultra 主用模型的条目带 `"pool": "ultra"`）；`primary_supply` 的每个条目另有 `cooling`：对该模型冷却中的常驻 Worker 数（不在排空中、是该模型的候选，但所有支持的启用通道都在冷却，含 2 分钟内就恢复的短冷却），这些 Worker 既不计入热，也不计入备用。
+管理页侧栏的容量显示：“冷却占位 N · 待淘汰”为常驻 Worker 中账号长时间冷却（全局冷却，或在主用模型、大量 Worker 都冷却的模型上冷却）的死槽位，其中正在排空的另显示“排空中 N”（不再接新请求，正在服务的请求结束后关闭；有空槽时替补已先启动，否则旧 Worker 关闭后补上）；设置了 `PRIMARY_MODELS` 时每个主用模型一行“主用 <模型>：热 N · 冷却 C · 备用 M”，热为能服务它的常驻 Worker 数，冷却为对它冷却中的常驻 Worker 数（含 2 分钟内到期的短冷却，冷却到期前服务不了它），备用为还能服务它的空闲账号数（最多统计 1000 个，显示为 1000+），约每 30 秒更新，备用为 0 时标黄（见[故障排除](#主用模型返回-429-或首字很慢)）；`ULTRA_PRIMARY_MODELS` 的每个模型在 Ultra Worker 一行下面另有一行“Ultra 主用 <模型>：热 N · 冷却 C · 备用 M”，只统计 Ultra 分区的常驻 Worker 与 Ultra 号池的空闲账号（开启 `ULTRA_INCLUDE_PRO` 时含 Pro 账户，切换后约 5 秒内按新的号池重新统计）。`/api/status` 中对应 `workers` 与 `ultra_workers` 的 `dead`、`draining`、`retiring`（待淘汰登记数）与 `primary_supply`（Ultra 主用模型的条目带 `"pool": "ultra"`）；`primary_supply` 的每个条目另有 `cooling`：对该模型冷却中的常驻 Worker 数（不在排空中、是该模型的候选，但所有支持的启用通道都在冷却，含 2 分钟内就恢复的短冷却），这些 Worker 既不计入热，也不计入备用。
 
 ### 主用模型
 
@@ -722,7 +722,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 
 - **备用 0（黄色）**：普通号池里已经没有还能服务该模型的空闲账号，多半是可用账号当天的该模型额度已经用完。冷却占位淘汰后换不上能服务它的替补，请求只能等仍能服务它的常驻 Worker 空出，排队超过 `PRIMARY_QUEUE_WAIT` 就返回 429。额度在太平洋时间零点重置（北京时间夏令时 15:00、冬令时 16:00），之后供给自动恢复；在此之前只能加入新的账号，或减少该模型的请求。
 - **备用不为 0 但热很少**：检查 `WARM_WORKER_LIMIT`，它应不小于希望常驻的 Worker 数。低于驻留数时，淘汰或回收空出的槽位预热不补，超出的空闲 Worker 5 分钟后被回收，主用模型的请求要等现场冷启动。
-- **“冷却占位”与“排空中”长时间不下降**：在运行日志中搜索“替补跳过”（分区内没有能服务这些模型、没有冷却的备用账号）与“排空超时”（固定账户或文件绑定的请求一直在用该 Worker）。
+- **“冷却占位”与“排空中”长时间不下降**：在运行日志中搜索“替补跳过”（分区内没有能服务这些模型、没有冷却的备用账号）与“排空超时”（固定账户或文件绑定的请求一直在用该 Worker）。另有两种情况不写日志，属于正常：排空中的 Worker 上有开始输出后的长流时，排空保持到流结束，最长到总时长上限（默认 1 小时），“排空超时”要到总时长上限 + 30 秒后才出现；“排空中”已达 2 × 排空名额（`drainLimit`，为 `max(WARM_STARTUP_CONCURRENCY, 1) × 2`，且不超过分区峰值的 1/4、至少 1）时，其余冷却占位要等其中一个排空结束才排空，期间照常服务其他模型。排空让出的名额已满时，新排空的替补因槽位已满没有启动（日志“替补未启动 | 原因=排空”，错误为槽位已满），旧 Worker 关闭后补上。
 - **Ultra 主用模型的 429**：看 Ultra Worker 下面的“Ultra 主用 <模型>”一行，口径同上，只统计 Ultra 号池。这些模型没有额度时立即返回 429（见[主用模型](#主用模型)），运行日志里对应“Ultra 主用模型候选全部冷却，立即返回 429”或“Ultra 主用模型额度不足，立即返回 429”，后者写明原因与额度失败次数；客户端按 `Retry-After` 稍后重试即可。
 - **冷却很多、热很少**：常驻 Worker 大多对该模型在冷却，多为连续限流或当天额度用完；号池繁忙的 429 看下一节的候选快照与连续限流，或直接运行 `bash tools/diag_busy.sh`。
 
@@ -797,6 +797,33 @@ OFFLINE=1 LOG_FILE=<日志> LEDGER_DB=<账本> DIAG_NOW=2026-10-22T08:00:00Z bas
 - 缩短思考：用 `-low`、`-medium` 后缀（如 `gemini-4-argon-low`，后缀优先于客户端参数），或在客户端传 `reasoning_effort`（`low`、`medium`）。
 - 确认 `ULTRA_PRIMARY_MODELS` 里有它（默认就有），没有额度时让客户端按 `Retry-After` 重试，而不是在服务里换号、冷启动。
 - Ultra 账号少、常常全部冷却时，可以开启 `ULTRA_INCLUDE_PRO` 让 Pro 账户一起服务 `/ultra`，前提是 Pro 账户的 Build 目录里有它（开启后看侧栏“Ultra 主用 gemini-4-argon”的备用数是否计入了 Pro 账户），同时调大 `ULTRA_WARM_WORKER_LIMIT` 与 `ULTRA_MAX_ACTIVE_WORKERS`，见 [Ultra 号池](#ultra-号池ultra-前缀)。
+
+### 长回复中途截断或重新生成
+
+`REQUEST_TIMEOUT` 只限制首个上游事件之前的阶段（排队、冷启动、WAA proof、等首字）。开始输出后，只要上游还在出事件或有网络字节就不会切断：上游连续 `REQUEST_TIMEOUT` 既没有事件也没有字节才以 504 结束，整条请求最长 1 小时（`REQUEST_TIMEOUT` 更长时按它）。输出开始后的截断照旧以错误结束，不会伪造正常结束。客户端看到的文案都是 504 `Deadline expired before operation could complete.`（流式时在流内），来源要看管理日志的 `request.error` 或用量账本的 `error`：
+
+| `error` | 来源 | 处理 |
+| --- | --- | --- |
+| `本服务首事件前期限 <期限> 到期[（停在 <位置>）]: …` | 首字之前就到时：排队、现场冷启动，或隐藏思考（Anthropic `thinking.type=disabled`、Gemini `includeThoughts=false`：Build 通道上游不返回思考，Playground 通道上游返回但本服务丢弃）时的长思考。在某次尝试中到期时带 `（停在 …）`，文件资源刷新时到期带 `（停在 文件资源刷新）`；排队或回到原账号等待时到期为 `…到期: 排队 … 后请求超时（…）`、`…到期: 回到原账号等待 … 后请求超时（…）`；其他不在尝试中到期的情形（如换号退避中、上一次为超时类错误）为 `…到期: <上一次错误>` | 调大 `REQUEST_TIMEOUT`，或排查排队（`bash tools/diag_busy.sh`） |
+| `本服务首事件后空闲期限 <期限> 到期（已输出 推理=N 正文=M）: …` | 开始输出后上游卡住：连续 `REQUEST_TIMEOUT` 没有事件也没有字节 | 看请求时间线里最后一次 `事件流停顿` |
+| `本服务总时长上限 1h0m0s 到期（…）: …` | 整条请求超过总时长上限 | 需要更长时调大 `REQUEST_TIMEOUT` |
+| `… 返回 HTTP 504、协议错误码 4: …` | Google 侧自己的期限 | 缩短思考或输出 |
+| `AI Studio stream closed before finish` | 上游在结束帧之前断流 | 看同账号同一时刻的告警 |
+| 只有 `context deadline exceeded` 本身（没有“本服务”前缀） | 旧版本的整段期限，或计数、视频、转写请求。带 `AI Studio … 协议位置` 或 `BiDi … 等待回复超时` 的是上游或浏览器链路超时，不是本服务期限 | 升级；链路超时看同账号同一时刻的告警 |
+
+“截断后又重新生成”在本服务这边是相同输入、请求 ID 不同的新请求：收到首个上游事件后本服务不会再换号或重做，重新生成来自客户端或中转。最常见的是 new-api 的 Claude 类型渠道开了失败重试：它把流内错误改写成 500，在同一个连接里重新请求，客户端在一条回复里先看到截断的前半段，再看到从头生成的第二段。把 new-api 的重试次数设为 0，或把接本服务的渠道改成 OpenAI 类型。非流式请求在生成完之前没有任何字节，前面有 Cloudflare 时约 100 秒返回 524（本服务记为约 100 秒的取消 499），客户端重发就是整段重新生成，长思考模型请用流式。完整说明（含 new-api 不转发 `: ping` 时的处理、Worker 层的影响）见[长生成与中转重试](docs/development.md#长生成与中转重试)。
+
+**一键诊断**：`bash tools/diag_regen.sh`（在程序目录下运行，或用 `APP_DIR=/path/to/app` 指定程序目录）按上表给截断分类，找出相同输入的重发，最后给出自动结论：
+
+```bash
+bash tools/diag_regen.sh                          # 最近 24 小时，重点模型取截断最多的模型
+MINUTES=4320 MODEL=<模型> bash tools/diag_regen.sh  # 扩大统计窗口、指定模型（MODEL=all 看全部模型）
+RETRY_GAP=600 bash tools/diag_regen.sh            # 前一个请求结束后 600 秒内的相同输入算重发（默认 300）
+OFFLINE=1 LOG_FILE=<日志> LEDGER_DB=<账本> DIAG_NOW=2026-10-22T08:00:00Z bash tools/diag_regen.sh  # 分析日志与账本的副本
+```
+
+- 内容：相关配置与 nginx 超时设置、各结束原因与耗时分布（含扎堆点）、本服务期限截断的阶段与已输出事件数、相同输入的重发（客户端或中转重试）与服务端首事件前的换号、日志关键字（`本服务期限截断`、`事件流停顿`、`协议错误码 4`、`stream closed before finish` 等）、服务停止或改配置前后被打断的请求。
+- 只读：只对本机管理接口发 GET 请求（自动读取 `.admin-token`），用量账本以只读方式打开，只读 nginx 配置文件，不改配置、冷却、账号与 Worker，也不发生成请求；临时文件放在系统临时目录、退出时删除；管理接口连不上时只分析运行日志与用量账本，python3 没有 sqlite3 模块时只分析运行日志。输出不含提示词原文，账号已打码。
 
 ### 错误响应格式
 

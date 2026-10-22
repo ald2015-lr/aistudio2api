@@ -358,9 +358,9 @@ func (manager *accountWorkerManager) retirePass() int {
 				}
 				spare[key]--
 				manager.requests.log(accountID, "INFO", fmt.Sprintf(
-					"WAA Worker 排空 | 范围=%s | 登记后=%s | 排空中=%d/%d | 进行中的请求结束后关闭，替补先启动",
+					"WAA Worker 排空 | 范围=%s | 登记后=%s | 排空中=%d（占名额 %d/%d） | 进行中的请求结束后关闭，替补先启动",
 					candidate.entry.scopeLabel(), now.Sub(candidate.entry.since).Round(time.Millisecond),
-					manager.drainCount(partition), manager.drainLimit(partition),
+					manager.drainCount(partition), manager.drainSlotCount(partition), manager.drainLimit(partition),
 				))
 				manager.startReplacement(partition, candidate.entry.models, "排空", drain)
 				continue

@@ -421,6 +421,9 @@ type Account struct {
 	stateMessage          string
 	initializedAt         time.Time
 	buildModels           []Model
+	// lastReleased 为最近一次普通租约全部释放（active 归零）的时间，受账户池 mu 保护。LastUsed 只在取得租约时写，
+	// 长流结束时它还停在流开始的时刻；空闲回收与淘汰选号按两者中较晚的一个判断空闲（见 lastActivityLocked），状态页的 last_used 不变
+	lastReleased time.Time
 	// modelIndex 按模型 ID 与别名索引 Models（取第一个匹配的位置）；buildGenerates 为 Build 目录中可生成的模型 ID。
 	// 目录切片被整体替换时按切片身份判断并重建；均受账户池 mu 保护
 	modelIndex          map[string]int
@@ -2361,6 +2364,10 @@ func (l *AccountLease) releaseLocked() {
 		l.account.active--
 	}
 	l.pool.busyChangedLocked(l.account)
+	if !l.exclusive && l.account.active == 0 {
+		// 普通租约全部释放：记下最近活动时间（独占租约是管理与关闭操作，取得时也不更新 LastUsed）
+		l.account.lastReleased = time.Now()
+	}
 	if l.account.active == 0 && !l.account.exclusive && l.account.authRefreshers == 0 && l.account.leaseLock != nil {
 		if err := l.account.leaseLock.Unlock(); err != nil {
 			l.err = err
@@ -3791,7 +3798,7 @@ func (p *AccountPool) Draining(accountID string) bool {
 	return account != nil && account.draining
 }
 
-// Activity 返回账户是否存在活动租约或独占操作及最近使用时间
+// Activity 返回账户是否存在活动租约或独占操作及最近活动时间（见 lastActivityLocked）
 func (p *AccountPool) Activity(accountID string) (bool, time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -3799,7 +3806,16 @@ func (p *AccountPool) Activity(accountID string) (bool, time.Time) {
 	if account == nil {
 		return false, time.Time{}
 	}
-	return account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0, account.LastUsed
+	return account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0, account.lastActivityLocked()
+}
+
+// lastActivityLocked 返回账户最近活动时间：最近一次取得普通租约（LastUsed）与最近一次普通租约全部释放中较晚的一个。
+// 只按取得租约的时间判断时，刚结束一条长流的账户会被当成空闲了整条流的时长，比真正空闲的账户先被回收（调用方持有 p.mu）
+func (account *Account) lastActivityLocked() time.Time {
+	if account.lastReleased.After(account.LastUsed) {
+		return account.lastReleased
+	}
+	return account.LastUsed
 }
 
 // Changed 返回账户池下一次租约或状态变化时关闭的通道
