@@ -303,8 +303,9 @@ def quota_class(text):
     message = upstream_message(text).lower()
     if any(key in message for key in ("/min/", "perminute", "per_min", "per minute")):
         return Q_MIN
+    # "reached your usage limit" 为 pro/ultra 号的每日限额文案（You've reached your usage limit. Retry with an alternative Gemini model…）
     if any(key in message for key in ("/day/", "perday", "per_day", "per day", "daily limit", "try again tomorrow",
-                                      "you exceeded your current quota")):
+                                      "you exceeded your current quota", "reached your usage limit")):
         return Q_DAY
     if message.rstrip(" .。!") == "quota exceeded":
         return Q_BARE
@@ -948,7 +949,10 @@ others = collections.Counter(a[3] for a in attempt_records if not a[3].startswit
 if others:
     print(f"  非 429 的失败尝试：{top(others, 6)}")
 
-# 冷却日志：类型（每日限额/分钟限额/限流）、指标（如 generate_requests_global）与范围（全局、模型=Playground、build:模型）
+# 冷却日志：类型（每日限额/分钟限额/限流）、指标（如 generate_requests_global）、额度计数的模型（如 gemini-3.1-pro）与
+# 范围（全局、模型=Playground、build:模型）；没有指标的冷却另带详情类型（上游附带、没有解析的 details 类型）。
+# 每日限额已判定两个通道共用额度时另一通道的同步冷却行（“与另一通道共用额度，同步冷却”）本来就不带上限、指标与模型：
+# 只计入范围、另计行数，不进类型·指标与上限、模型、详情类型的统计，免得被当成没带额度详情的每日限额
 cool_lines = [e for e in logs if e["t"] >= SINCE and (e["msg"].startswith("账号冷却 |") or e["msg"].startswith("账号冷却未写入 |"))]
 if cool_lines:
     written = [e for e in cool_lines if e["msg"].startswith("账号冷却 |")]
@@ -956,19 +960,35 @@ if cool_lines:
     kinds = collections.Counter()
     scopes = collections.Counter()
     limits = collections.Counter()
+    quota_models = collections.Counter()
+    detail_types = collections.Counter()
+    synced_daily = 0
     for e in written:
         info = fields(e["msg"])
-        tag = "逐级" if "连续限流" in info else (info.get("指标") or "无元数据")
-        kinds[f"{info.get('类型', '?')}·{tag}"] += 1
         scope = info.get("范围", "?")
         channel = "全局（整个账号）" if scope == "全局" else "build" if scope.startswith("build:") else "playground"
         scopes[(bare_scope(scope), channel)] += 1
+        if "与另一通道共用额度，同步冷却" in e["msg"]:
+            synced_daily += 1
+            continue
+        tag = "逐级" if "连续限流" in info else (info.get("指标") or "无元数据")
+        kinds[f"{info.get('类型', '?')}·{tag}"] += 1
         if info.get("上限"):
             limits[f"{info.get('类型')}={info.get('上限')}"] += 1
-    print(f"    类型·指标：{top(kinds, 6, len(written))}（“限流·逐级”为裸限流 429 的连续限流冷却，见第 4 段）")
+        if info.get("模型"):
+            quota_models[f"{info.get('类型')}·{info.get('模型')}" + (f"={info.get('上限')}" if info.get("上限") else "")] += 1
+        if info.get("详情类型") and not info.get("指标"):
+            detail_types[info.get("详情类型")] += 1
+    print(f"    类型·指标：{top(kinds, 6, len(written) - synced_daily)}（“限流·逐级”为裸限流 429 的连续限流冷却，见第 4 段）")
+    if synced_daily:
+        print(f"    同步冷却另一通道（每日限额，与另一通道共用额度）：{synced_daily} 行")
     print("    范围：" + "，".join(f"{m}@{c} {n}" for (m, c), n in scopes.most_common(6)))
     if limits:
         print(f"    上游给出的上限值：{top(limits, 4)}")
+    if quota_models:
+        print(f"    额度计数的模型（模型=，可能与请求的模型名不同）：{top(quota_models, 6)}")
+    if detail_types:
+        print(f"    没有指标的冷却带的详情类型：{top(detail_types, 4)}（裸 429 带着没有解析的详情，请把这一行发给开发者）")
 
 
 def sharing_separate(stats):
@@ -1015,7 +1035,7 @@ if not rate_written and not cleared and not systemic_lines:
 else:
     flat = len(rate_written) - len(laddered)
     print(f"  写入的限流冷却 {len(rate_written)} 行：逐级 {len(laddered)} 行"
-          + (f"，不逐级 {flat} 行（上游给了 RetryInfo/Retry-After、账号全局限流，或文件复制、附件上传返回的 429，按原样冷却）" if flat else "")
+          + (f"，不逐级 {flat} 行（上游给了恢复时间（RetryInfo、错误文案里的 retry in、Retry-After）、账号全局限流，或文件复制、附件上传返回的 429，按原样冷却）" if flat else "")
           + f"；未写入 {len(rate_skipped)} 行；档位清零 {len(cleared)} 行；号池级限流告警 {len(systemic_lines)} 行")
     if laddered:
         levels = collections.Counter(ladder_name(min(item["level"], 5)) for item in laddered)

@@ -61,8 +61,8 @@ const (
 	// 经过账户池锁才返回错误，留出余量让 429 以 HTTP 状态返回而不是 200 之后的流内错误
 	primaryStreamStartGrace = 5 * time.Second
 	// primaryQuotaSwitchLimit 为 Ultra 主用模型遇到每日类额度失败（每日限额，以及剩余不少于 rotationMinRemaining 的长冷却）后
-	// 最多再换的账号数：每日类额度失败超过 2 次就结束。每日限额多半是号池里一批账号一起用完，挨个换下去只是把请求拖到超时；
-	// 换两次还不行就让客户端稍后重试
+	// 最多再换的账号数：遇到每日类额度失败的账号超过 2 个就结束（同账号另一通道的探测不另计，见 primaryQuotaTracker）。
+	// 每日限额多半是号池里一批账号一起用完，挨个换下去只是把请求拖到超时；换两次还不行就让客户端稍后重试
 	primaryQuotaSwitchLimit = 2
 	// primaryRateLimitSwitchLimit 为限流类额度失败（分钟限额、没有额度信息的 30 秒限流）后最多再换的账号数，与每日类分开计：
 	// 分钟窗口按账号计（每账号每分钟 12 次，所有模型、两个通道共用），一个账号用满不代表其他账号也满。
@@ -76,7 +76,7 @@ const (
 
 // Ultra 主用模型额度不足时 PrimaryQuotaError 的原因
 const (
-	// primaryQuotaReasonLimit 为每日类额度失败的次数超过换号上限（primaryQuotaSwitchLimit）
+	// primaryQuotaReasonLimit 为遇到每日类额度失败的账号数超过换号上限（primaryQuotaSwitchLimit）
 	primaryQuotaReasonLimit = "额度失败已达换号上限"
 	// primaryQuotaReasonRateLimit 为限流类额度失败（分钟限额、限流）的次数超过换号上限（primaryRateLimitSwitchLimit）
 	primaryQuotaReasonRateLimit = "限流失败已达换号上限"
@@ -425,14 +425,17 @@ func primaryQuotaClassOf(cooldown aistudio.QuotaCooldown, now time.Time) primary
 	return primaryQuotaRate
 }
 
-// primaryQuotaTracker 记录一个 Ultra 主用模型请求遇到的额度失败：daily、rate 为两类的次数（上游额度 429，以及租约账号在发出前
-// 被长冷却拦下，见 coolingDownLong）；until 为全部额度失败中最早的冷却恢复时间，rateUntil 为限流类中最早的（不知道时为零值）；
-// last 为最近一次的类别，lastErr 为最后一次额度错误。与连续失败上限分开计数；只在请求 goroutine 内使用，不加锁
+// primaryQuotaTracker 记录一个 Ultra 主用模型请求遇到的额度失败：daily 为遇到每日类的账号数、rate 为限流类的次数（上游额度 429，
+// 以及租约账号在发出前被长冷却拦下，见 coolingDownLong）；until 为全部额度失败中最早的冷却恢复时间，rateUntil 为限流类中最早的（不知道时为零值）；
+// last 为最近一次的类别，lastErr 为最后一次额度错误。每日类按账号计（dailyAccounts 为已记过每日类的账号）：每日限额的通道共用额度
+// 还在观察中（或定期复核）时会在同账号另一通道再试一次，那次探测不是换号，再遇到每日类不重复计数。
+// 与连续失败上限分开计数；只在请求 goroutine 内使用，不加锁
 type primaryQuotaTracker struct {
 	daily, rate      int
 	until, rateUntil time.Time
 	last             primaryQuotaClass
 	lastErr          error
+	dailyAccounts    map[string]struct{}
 }
 
 // hits 返回两类额度失败的总次数
@@ -440,8 +443,9 @@ func (tracker *primaryQuotaTracker) hits() int {
 	return tracker.daily + tracker.rate
 }
 
-// record 记一次额度失败；until 为这次写入的冷却恢复时间，零值表示不知道
-func (tracker *primaryQuotaTracker) record(class primaryQuotaClass, err error, until time.Time) {
+// record 记一次额度失败；accountID 为这次尝试的账号，until 为这次写入的冷却恢复时间，零值表示不知道。
+// 每日类同一账号只计一次（同账号换通道的探测不算换号），只更新最近一次的类别、错误与恢复时间
+func (tracker *primaryQuotaTracker) record(class primaryQuotaClass, accountID string, err error, until time.Time) {
 	tracker.last, tracker.lastErr = class, err
 	tracker.until = earlierTime(tracker.until, until)
 	if class == primaryQuotaRate {
@@ -449,6 +453,13 @@ func (tracker *primaryQuotaTracker) record(class primaryQuotaClass, err error, u
 		tracker.rateUntil = earlierTime(tracker.rateUntil, until)
 		return
 	}
+	if _, counted := tracker.dailyAccounts[accountID]; counted {
+		return
+	}
+	if tracker.dailyAccounts == nil {
+		tracker.dailyAccounts = make(map[string]struct{})
+	}
+	tracker.dailyAccounts[accountID] = struct{}{}
 	tracker.daily++
 }
 
@@ -531,7 +542,7 @@ func earlierTime(left time.Time, right time.Time) time.Time {
 	}
 }
 
-// primaryQuotaMessage 为 Ultra 主用模型额度不足立即返回时写进请求进度的一句话：额度失败为每日类的次数，有限流类失败时另写限流失败
+// primaryQuotaMessage 为 Ultra 主用模型额度不足立即返回时写进请求进度的一句话：额度失败为遇到每日类额度失败的账号数，有限流类失败时另写限流失败
 func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError) string {
 	hits := fmt.Sprintf("额度失败=%d", quota.QuotaHits)
 	if quota.RateHits > 0 {
@@ -541,15 +552,21 @@ func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError) string {
 		quota.Reason, hits, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
 }
 
-// primaryQuotaSwitchMessage 为 Ultra 主用模型额度失败后换号时写进请求进度的一句话：按最近一次额度失败的类别写，两类各按 次数/换号上限，
-// 第 N 次某类失败后是这一类的第 N 次换号，超过该类换号上限的那次失败不再换号、按额度不足结束；kind 为冷却类型
-func primaryQuotaSwitchMessage(tracker *primaryQuotaTracker, kind string, cause error) string {
-	if tracker.last == primaryQuotaRate {
-		return fmt.Sprintf("限流 429，换号重试（只用已启动的 Worker）| 限流失败=%d/%d | 类型=%s | 额度失败=%d/%d | 原因=%s",
-			tracker.rate, primaryRateLimitSwitchLimit, kind, tracker.daily, primaryQuotaSwitchLimit, progressReason(cause))
+// primaryQuotaSwitchMessage 为 Ultra 主用模型额度失败后换号时写进请求进度的一句话：按最近一次额度失败的类别写，两类各按 计数/换号上限
+// （每日类为账号数：同账号换通道的探测与紧接着的换号同为 N），第 N 次某类失败后是这一类的第 N 次换号，超过该类换号上限的那次失败
+// 不再换号、按额度不足结束；kind 为冷却类型。
+// sameAccount 为这次不换号、在同账号另一通道再试（每日限额的通道共用额度还在观察中，或冷却只写在本通道）
+func primaryQuotaSwitchMessage(tracker *primaryQuotaTracker, kind string, sameAccount bool, cause error) string {
+	retry := "换号重试（只用已启动的 Worker）"
+	if sameAccount {
+		retry = "同账号换通道重试 "
 	}
-	return fmt.Sprintf("额度 429，换号重试（只用已启动的 Worker）| 额度失败=%d/%d | 类型=%s | 原因=%s",
-		tracker.daily, primaryQuotaSwitchLimit, kind, progressReason(cause))
+	if tracker.last == primaryQuotaRate {
+		return fmt.Sprintf("限流 429，%s| 限流失败=%d/%d | 类型=%s | 额度失败=%d/%d | 原因=%s",
+			retry, tracker.rate, primaryRateLimitSwitchLimit, kind, tracker.daily, primaryQuotaSwitchLimit, progressReason(cause))
+	}
+	return fmt.Sprintf("额度 429，%s| 额度失败=%d/%d | 类型=%s | 原因=%s",
+		retry, tracker.daily, primaryQuotaSwitchLimit, kind, progressReason(cause))
 }
 
 // primaryAllCoolingMessage 为 Ultra 主用模型还没遇到额度 429 时选号就遇到候选全部冷却、立即返回时写进请求进度的一句话：

@@ -8,6 +8,8 @@ import (
 	"io"
 	"mime"
 	"net/http"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -123,13 +125,26 @@ type RPCError struct {
 	StatusCode int
 	Code       int64
 	Message    string
-	Metadata   map[string]string
-	// RetryDelay 为上游建议的重试等待时间，来自 google.rpc.RetryInfo 或 HTTP Retry-After；0 表示没有
+	// Metadata 为 ErrorInfo 的元数据，并补上 QuotaFailure（含 GeminiApiErrorDetails 里的同形状）违规项的字段：
+	// quota_metric、quota_id、quota_limit_value（违规项的 quota_value），以及维度 quota_dimension_<键>
+	// （如 quota_dimension_model=gemini-3.1-pro、quota_dimension_location=global）；ErrorInfo 已给出的字段不覆盖
+	Metadata map[string]string
+	// RetryDelay 为上游建议的重试等待时间，依次取 google.rpc.RetryInfo、文案里的 “retry in <时长>”、HTTP Retry-After；0 表示没有
 	RetryDelay time.Duration
+	// DetailTypes 为状态 details 里出现过的全部类型（去掉 type.googleapis.com/ 前缀，按出现顺序去重），
+	// 包括没有解析的类型：冷却日志在没有识别出额度指标时写出它，用来核实裸 429 带了哪些详情
+	DetailTypes []string
 }
 
 // maxRetryDelay 为采纳上游重试建议的上限，异常的超大值按此截断
 const maxRetryDelay = 24 * time.Hour
+
+// rpcDetailTypePrefix 为 details 类型 URL 的通用前缀，DetailTypes 去掉它
+const rpcDetailTypePrefix = "type.googleapis.com/"
+
+// retryInMessagePattern 匹配错误文案里的恢复时间（Gemini API 形状的 429 只在文案里给出，如 “Please retry in 16h6m4.716518794s.”），
+// 时长为 Go 的 time.ParseDuration 格式；“Retry with an alternative Gemini model” 不匹配
+var retryInMessagePattern = regexp.MustCompile(`(?i)\bretry in ((?:\d+(?:\.\d+)?(?:h|ms|us|µs|ns|m|s))+)`)
 
 // Error 返回结构化上游错误
 func (e *RPCError) Error() string {
@@ -264,20 +279,47 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 	if len(provider) > 2 && !isJSONNull(provider[2]) {
 		decodeRPCErrorMetadata(rpcError, provider[2])
 	}
+	// 没有 RetryInfo 时采纳文案里的 “retry in <时长>”；validateRPCResponse 只在两者都没有时才读 Retry-After 头
+	if rpcError.RetryDelay <= 0 {
+		rpcError.RetryDelay = retryDelayFromMessage(rpcError.Message)
+	}
 	return rpcError
 }
 
+// retryDelayFromMessage 解析错误文案里的 “retry in <Go 时长>”：没有或无法解析时返回 0，超过 maxRetryDelay 时截到 maxRetryDelay
+// （不像 RetryInfo 那样丢弃：文案给出的是额度恢复时间，免费层每日限额可能接近一整天）
+func retryDelayFromMessage(message string) time.Duration {
+	match := retryInMessagePattern.FindStringSubmatch(message)
+	if match == nil {
+		return 0
+	}
+	delay, err := time.ParseDuration(match[1])
+	if err != nil || delay <= 0 {
+		return 0
+	}
+	return min(delay, maxRetryDelay)
+}
+
+// decodeRPCErrorMetadata 读取状态 details（[[类型 URL, 值]...]）：RetryInfo、QuotaFailure、GeminiApiErrorDetails 与 ErrorInfo，
+// 并把出现过的全部类型记进 DetailTypes。单个详情项或字段解析失败只跳过它，不影响其余详情
 func decodeRPCErrorMetadata(rpcError *RPCError, raw json.RawMessage) {
-	var details [][]json.RawMessage
-	if err := json.Unmarshal(raw, &details); err != nil {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
 		return
 	}
-	for _, detail := range details {
-		if len(detail) < 2 {
+	for _, item := range items {
+		var detail []json.RawMessage
+		if json.Unmarshal(item, &detail) != nil || len(detail) == 0 {
 			continue
 		}
 		var typeURL string
 		if err := json.Unmarshal(detail[0], &typeURL); err != nil {
+			continue
+		}
+		if name := strings.TrimPrefix(strings.TrimSpace(typeURL), rpcDetailTypePrefix); name != "" && !slices.Contains(rpcError.DetailTypes, name) {
+			rpcError.DetailTypes = append(rpcError.DetailTypes, name)
+		}
+		if len(detail) < 2 {
 			continue
 		}
 		if typeURL == "type.googleapis.com/google.rpc.RetryInfo" {
@@ -289,6 +331,12 @@ func decodeRPCErrorMetadata(rpcError *RPCError, raw json.RawMessage) {
 		}
 		if typeURL == "type.googleapis.com/google.rpc.QuotaFailure" {
 			decodeRPCQuotaFailure(rpcError, detail[1])
+			continue
+		}
+		// AI Studio 网页后端的每日限额（free 每天 10 次、pro/ultra 每天 50 次）只在这里给出指标、限额名、模型与限额值，
+		// 文案是通用的 “You exceeded your current quota” 或 “You've reached your usage limit”。按后缀匹配，包名变化时仍能识别
+		if strings.HasSuffix(typeURL, ".GeminiApiErrorDetails") {
+			decodeGeminiAPIErrorDetails(rpcError, detail[1])
 			continue
 		}
 		if typeURL != "type.googleapis.com/google.rpc.ErrorInfo" {
@@ -366,29 +414,64 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return delay
 }
 
-// decodeRPCQuotaFailure 读取 google.rpc.QuotaFailure 违规项的 quota_metric 与 quota_id（数组协议下标 3、4）。
+// geminiAPIErrorQuotaFailureIndex 为 GeminiApiErrorDetails 数组里 QuotaFailure 形状的下标（现场样本：前 28 个元素为 null）
+const geminiAPIErrorQuotaFailureIndex = 28
+
+// decodeGeminiAPIErrorDetails 读取 GeminiApiErrorDetails（AI Studio 网页后端的私有详情）里的 QuotaFailure 形状 [[违规项...]]：
+// 先试下标 28，不是这种形状时扫描第一层的其余元素，取第一个像 QuotaFailure 的（见 quotaFailureShape），按 decodeRPCQuotaFailure 读取。
+// 解析失败只跳过
+func decodeGeminiAPIErrorDetails(rpcError *RPCError, raw json.RawMessage) {
+	var fields []json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return
+	}
+	if len(fields) > geminiAPIErrorQuotaFailureIndex && quotaFailureShape(fields[geminiAPIErrorQuotaFailureIndex]) {
+		decodeRPCQuotaFailure(rpcError, fields[geminiAPIErrorQuotaFailureIndex])
+		return
+	}
+	for index, field := range fields {
+		if index != geminiAPIErrorQuotaFailureIndex && quotaFailureShape(field) {
+			decodeRPCQuotaFailure(rpcError, field)
+			return
+		}
+	}
+}
+
+// quotaFailureShape 判断 raw 是否像数组协议的 QuotaFailure：[[违规项...]]，且至少一个违规项的下标 3 是带 “/” 的指标名
+// （如 generativelanguage.googleapis.com/generate_requests_per_model_per_user），或下标 4 是带 “Per” 的限额名
+// （如 GenerateRequestsPerProjectPerUserPerModelPerDay），免得把其他嵌套数组误认成违规项
+func quotaFailureShape(raw json.RawMessage) bool {
+	var failure []json.RawMessage
+	if json.Unmarshal(raw, &failure) != nil || len(failure) == 0 {
+		return false
+	}
+	for _, violation := range quotaViolations(failure[0]) {
+		var metric, id string
+		if len(violation) > 3 && json.Unmarshal(violation[3], &metric) == nil && strings.Contains(metric, "/") {
+			return true
+		}
+		if len(violation) > 4 && json.Unmarshal(violation[4], &id) == nil && strings.Contains(id, "Per") {
+			return true
+		}
+	}
+	return false
+}
+
+// decodeRPCQuotaFailure 读取 google.rpc.QuotaFailure 违规项（数组协议下标为 proto 字段号减一）：3=quota_metric、4=quota_id、
+// 5=quota_dimensions（[[键, 值]...]，键的顺序不固定，写成 quota_dimension_<键>，如 quota_dimension_model、quota_dimension_location）、
+// 6=quota_value（int64，字符串或数字都接受，写成与 ErrorInfo 同名的 quota_limit_value）。
 // Gemini API 形状的 429 只在这里给出额度周期（如 GenerateRequestsPerDayPerProjectPerModel-FreeTier），
 // 文案只是通用的 "You exceeded your current quota"；ErrorInfo 已给出的字段不覆盖。
 // 常见的免费层 429 同时列出分钟和每日违规项且分钟在前：有每日违规项时取它，否则取第一个，
-// 避免每日额度已耗尽的账户按分钟限额冷却后整天被反复选中
+// 避免每日额度已耗尽的账户按分钟限额冷却后整天被反复选中。解析失败的字段只跳过
 func decodeRPCQuotaFailure(rpcError *RPCError, raw json.RawMessage) {
 	var failure []json.RawMessage
 	if json.Unmarshal(raw, &failure) != nil || len(failure) == 0 {
 		return
 	}
-	var violations [][]json.RawMessage
-	if json.Unmarshal(failure[0], &violations) != nil {
-		return
-	}
 	var chosen map[string]string
-	for _, violation := range violations {
-		fields := make(map[string]string, 2)
-		for key, index := range map[string]int{"quota_metric": 3, "quota_id": 4} {
-			var value string
-			if len(violation) > index && json.Unmarshal(violation[index], &value) == nil && value != "" {
-				fields[key] = value
-			}
-		}
+	for _, violation := range quotaViolations(failure[0]) {
+		fields := quotaViolationFields(violation)
 		if len(fields) == 0 {
 			continue
 		}
@@ -408,4 +491,72 @@ func decodeRPCQuotaFailure(rpcError *RPCError, raw json.RawMessage) {
 			rpcError.Metadata[key] = value
 		}
 	}
+}
+
+// quotaViolations 读取 QuotaFailure 的违规项列表，不是数组的违规项跳过
+func quotaViolations(raw json.RawMessage) [][]json.RawMessage {
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &items) != nil {
+		return nil
+	}
+	violations := make([][]json.RawMessage, 0, len(items))
+	for _, item := range items {
+		var violation []json.RawMessage
+		if json.Unmarshal(item, &violation) == nil && len(violation) > 0 {
+			violations = append(violations, violation)
+		}
+	}
+	return violations
+}
+
+// quotaDimensionPrefix 为 QuotaFailure 违规项维度写进 RPCError.Metadata 的键前缀
+const quotaDimensionPrefix = "quota_dimension_"
+
+// quotaViolationFields 读取一个违规项的指标、限额名、维度与限额值；都没有时返回空
+func quotaViolationFields(violation []json.RawMessage) map[string]string {
+	fields := make(map[string]string, 4)
+	for key, index := range map[string]int{"quota_metric": 3, "quota_id": 4} {
+		var value string
+		if len(violation) > index && json.Unmarshal(violation[index], &value) == nil && strings.TrimSpace(value) != "" {
+			fields[key] = strings.TrimSpace(value)
+		}
+	}
+	var dimensions []json.RawMessage
+	if len(violation) > 5 && json.Unmarshal(violation[5], &dimensions) == nil {
+		for _, item := range dimensions {
+			var pair []json.RawMessage
+			var key, value string
+			if json.Unmarshal(item, &pair) != nil || len(pair) < 2 || json.Unmarshal(pair[0], &key) != nil || json.Unmarshal(pair[1], &value) != nil {
+				continue
+			}
+			if key, value = strings.TrimSpace(key), strings.TrimSpace(value); key != "" && value != "" {
+				fields[quotaDimensionPrefix+key] = value
+			}
+		}
+	}
+	if len(violation) > 6 {
+		if value, ok := quotaValueText(violation[6]); ok {
+			fields["quota_limit_value"] = value
+		}
+	}
+	return fields
+}
+
+// quotaValueText 读取 quota_value（int64：数组协议里可能编码为字符串，也可能是数字），返回十进制文本
+func quotaValueText(raw json.RawMessage) (string, bool) {
+	var text string
+	if json.Unmarshal(raw, &text) != nil {
+		var number json.Number
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		if decoder.Decode(&number) != nil {
+			return "", false
+		}
+		text = number.String()
+	}
+	value, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+	if err != nil {
+		return "", false
+	}
+	return strconv.FormatInt(value, 10), true
 }

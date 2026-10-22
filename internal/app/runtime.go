@@ -4391,12 +4391,13 @@ func (service *trackedService) generateWithRetry(
 		// modelForbidden：本次尝试的单模型 403 已写入冷却。换号不退避，但仍计入连续失败上限：模型对整个号池都返回 403 时
 		// （号池里没有付费账号、纯 Go proof 稳定 403 等）不会一个请求把账号逐个试完，逐个冷却、登记淘汰并现场冷启动
 		modelForbidden := false
-		// quotaFailure：本次尝试是计入换号上限的 Ultra 主用模型额度失败（只在 failFast 时计数，见上文 quota）；quotaKind 为写进进度的类型
-		quotaFailure, quotaKind := false, ""
+		// quotaFailure：本次尝试是计入换号上限的 Ultra 主用模型额度失败（只在 failFast 时计数，见上文 quota）；quotaKind 为写进进度的类型；
+		// quotaSameAccount 为额度冷却后不换号、在同账号另一通道再试（进度写“同账号换通道重试”）
+		quotaFailure, quotaKind, quotaSameAccount := false, "", false
 		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, attemptErr, "", scope, true, generated); ok {
 			cooled = true
 			if failFast {
-				quota.record(primaryQuotaClassOf(cooldown, time.Now()), err, cooldown.Until)
+				quota.record(primaryQuotaClassOf(cooldown, time.Now()), request.AccountID, err, cooldown.Until)
 				quotaFailure, quotaKind = true, cooldown.Kind
 			}
 			if stateErr != nil {
@@ -4405,6 +4406,7 @@ func (service *trackedService) generateWithRetry(
 			} else if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
 				delete(attempted, request.AccountID)
 				maxAttempts++
+				quotaSameAccount = true
 			}
 		}
 		// 租约账号在请求发出前进入冷却（多半是同账号别的请求刚遇到额度 429，请求没有发到上游）：任何模型都按已冷却处理，
@@ -4415,7 +4417,7 @@ func (service *trackedService) generateWithRetry(
 			cooled = true
 			if failFast {
 				if until, long := coolingDownLong(service.pool, err, request.AccountID, modelID, time.Now()); long {
-					quota.record(primaryQuotaDaily, err, until)
+					quota.record(primaryQuotaDaily, request.AccountID, err, until)
 					quotaFailure, quotaKind = true, "发出前已冷却"
 				}
 			}
@@ -4629,7 +4631,7 @@ func (service *trackedService) generateWithRetry(
 		service.requests.log(accountLabel, "WARN", switchMessage)
 		// 换号原因同时写进请求时间线：请求详情里能直接看到每一次失败的原因
 		if quotaFailure {
-			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", primaryQuotaSwitchMessage(&quota, quotaKind, err))
+			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", primaryQuotaSwitchMessage(&quota, quotaKind, quotaSameAccount, err))
 		} else {
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
 		}
@@ -4751,7 +4753,8 @@ func (service *trackedService) applyQuotaCooldown(
 	return cooldown, true, nil
 }
 
-// quotaCooldownFields 为冷却日志补记上游给出的限额值与指标（核实各档位的真实上限）；没有时为空
+// quotaCooldownFields 为冷却日志补记上游给出的限额值、指标与额度计数的模型（核实各档位、各模型的真实上限）；没有时为空。
+// 没有指标时写出状态 details 的类型（只用于排查裸 429 带了哪些没有解析的详情），没有 details 时不写
 func quotaCooldownFields(cooldown aistudio.QuotaCooldown) string {
 	fields := ""
 	if cooldown.LimitValue != "" {
@@ -4759,6 +4762,12 @@ func quotaCooldownFields(cooldown aistudio.QuotaCooldown) string {
 	}
 	if cooldown.Metric != "" {
 		fields += " | 指标=" + cooldown.Metric
+	}
+	if cooldown.Model != "" {
+		fields += " | 模型=" + cooldown.Model
+	}
+	if cooldown.Metric == "" && cooldown.DetailTypes != "" {
+		fields += " | 详情类型=" + cooldown.DetailTypes
 	}
 	return fields
 }

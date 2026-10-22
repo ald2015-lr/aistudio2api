@@ -28,11 +28,16 @@ type QuotaCooldown struct {
 	Global bool
 	Kind   string
 	Reason string
-	// LimitValue 为上游给出的限额值（ErrorInfo 的 quota_limit_value，如 12），Metric 为限额指标（quota_metric 去掉服务名前缀，
-	// 如 generate_requests_global）：只写进冷却日志，用来核实各档位的真实上限；上游没给时为空
+	// LimitValue 为上游给出的限额值（ErrorInfo 的 quota_limit_value，或 QuotaFailure、GeminiApiErrorDetails 违规项的 quota_value，
+	// 如分钟限额 12、free 每日 10、pro/ultra 每日 50），Metric 为限额指标（quota_metric 去掉服务名前缀，如 generate_requests_global、
+	// generate_requests_per_model_per_user），Model 为违规项维度里的模型（quota_dimension_model，如 gemini-3.1-pro：额度按它计，
+	// 可能与请求的模型名不同）：只写进冷却日志，用来核实各档位的真实上限；上游没给时为空
 	LimitValue string
 	Metric     string
-	// Escalate 为没有额度周期信息、上游也没给恢复时间（RetryInfo、Retry-After）的非全局限流 429：app 层按连续次数逐级加长冷却
+	Model      string
+	// DetailTypes 为状态 details 的全部类型（RPCError.DetailTypes，逗号分隔）：冷却日志在没有指标时写出，用来核实裸 429 带了哪些详情
+	DetailTypes string
+	// Escalate 为没有额度周期信息、上游也没给恢复时间（RetryInfo、文案里的 “retry in”、Retry-After）的非全局限流 429：app 层按连续次数逐级加长冷却
 	// （见 AccountPool.MarkRateLimitCooldown）。分钟限额、每日限额、全局冷却与带恢复时间的 429 都为 false，按原样冷却
 	Escalate bool
 }
@@ -46,7 +51,7 @@ type QuotaCooldown struct {
 // 只有元数据明确为全局（_global、PerProjectPerUser）且没有按模型标记时才冻结整个账号，
 // 否则只冷却失败的模型或通道。
 //
-// 上游给出 RetryInfo 或 Retry-After 时：分钟限额和无周期证据的 429 以它为准；
+// 上游给出恢复时间（RetryInfo、文案里的 “retry in <时长>”、Retry-After，见 RPCError.RetryDelay）时：分钟限额和无周期证据的 429 以它为准；
 // 每日限额取它与太平洋时间次日零点中较晚的一个，避免额度耗尽的账号每隔几十秒被重新选中。
 //
 // 输入 token 超过上限（提示词过长，见 InputTokenLimitError）即使按 429 返回也不是额度问题：不冷却账号
@@ -95,9 +100,11 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 	}
 	return QuotaCooldown{
 		Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error(),
-		LimitValue: strings.TrimSpace(rpcError.Metadata["quota_limit_value"]),
-		Metric:     quotaMetricName(rpcError.Metadata["quota_metric"]),
-		Escalate:   kind == RateLimitKind && !global && rpcError.RetryDelay <= 0,
+		LimitValue:  strings.TrimSpace(rpcError.Metadata["quota_limit_value"]),
+		Metric:      quotaMetricName(rpcError.Metadata["quota_metric"]),
+		Model:       strings.TrimSpace(rpcError.Metadata[quotaDimensionPrefix+"model"]),
+		DetailTypes: strings.Join(rpcError.DetailTypes, ","),
+		Escalate:    kind == RateLimitKind && !global && rpcError.RetryDelay <= 0,
 	}, true
 }
 
@@ -140,10 +147,14 @@ func minuteQuotaEvidence(value string) bool {
 		strings.Contains(value, "per_min") || strings.Contains(value, "per minute")
 }
 
+// dailyQuotaEvidence 判断小写后的字段或文案带每日周期。“reached your usage limit” 为 pro/ultra 每日限额的文案
+// （“You've reached your usage limit. Retry with an alternative Gemini model or upgrade your Google AI plan…”）；
+// 不收更宽的 “usage limit”，免得误伤其他周期的文案
 func dailyQuotaEvidence(value string) bool {
 	return strings.Contains(value, "/day/") || strings.Contains(value, "perday") ||
 		strings.Contains(value, "per_day") || strings.Contains(value, "per day") ||
-		strings.Contains(value, "daily limit") || strings.Contains(value, "try again tomorrow")
+		strings.Contains(value, "daily limit") || strings.Contains(value, "try again tomorrow") ||
+		strings.Contains(value, "reached your usage limit")
 }
 
 // minuteQuotaReset 按 window_start_time 推算分钟窗口结束时间；时间异常（已过期或远在未来）时冷却一分钟

@@ -215,7 +215,7 @@ type PrimaryQuotaError struct {
 	Pool PoolScope
 	// Reason 为结束的原因（额度失败已达换号上限、其余候选全部冷却、额度 429 后没有已启动的 Worker 等）
 	Reason string
-	// QuotaHits 为本请求遇到的每日类额度失败的次数，RateHits 为限流类额度失败（分钟限额、限流）的次数，
+	// QuotaHits 为本请求遇到每日类额度失败的账号数（同一账号只计一次），RateHits 为限流类额度失败（分钟限额、限流）的次数，
 	// Elapsed 为请求从第一次选号起的总耗时
 	QuotaHits int
 	RateHits  int
