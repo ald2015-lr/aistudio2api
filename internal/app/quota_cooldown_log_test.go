@@ -21,7 +21,7 @@ func TestQuotaCooldownLogFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = lease.Release() }()
-	cooldown, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalMinuteQuotaError(time.Now().Add(-10*time.Second)), "")
+	cooldown, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalMinuteQuotaError(time.Now().Add(-10*time.Second)), "", aistudio.PoolScopeNormal, true, true)
 	if !ok || stateErr != nil || cooldown.Kind != aistudio.MinuteQuotaKind || !cooldown.Global {
 		t.Fatalf("用户样本应按全局分钟限额冷却: %+v ok=%v err=%v", cooldown, ok, stateErr)
 	}
@@ -37,7 +37,7 @@ func TestQuotaCooldownLogFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = other.Release() }()
-	if _, ok, stateErr := service.applyQuotaCooldown(other, partitionNormalB, testRuntimeModel, minuteQuotaError(), ""); !ok || stateErr != nil {
+	if _, ok, stateErr := service.applyQuotaCooldown(other, partitionNormalB, testRuntimeModel, minuteQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok || stateErr != nil {
 		t.Fatalf("分钟限额应被识别为额度错误: ok=%v err=%v", ok, stateErr)
 	}
 	found := false
@@ -75,7 +75,7 @@ func TestQuotaCooldownLogSkipped(t *testing.T) {
 		pool.ModelAccessGeneration(partitionNormalA), time.Now().Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	cooldown, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "")
+	cooldown, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "", aistudio.PoolScopeNormal, true, true)
 	if !ok || stateErr != nil || cooldown.Kind != aistudio.DailyQuotaKind {
 		t.Fatalf("每日限额应被识别为额度错误: %+v ok=%v err=%v", cooldown, ok, stateErr)
 	}

@@ -747,7 +747,7 @@ func TestQuotaSharingGroupsByRealTier(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		cooldown, ok, stateErr := service.applyQuotaCooldown(lease, test.accountID, testRuntimeModel, daily, "")
+		cooldown, ok, stateErr := service.applyQuotaCooldown(lease, test.accountID, testRuntimeModel, daily, "", aistudio.PoolScopeNormal, true, true)
 		_ = lease.Release()
 		if !ok || stateErr != nil || cooldown.Kind != dailyQuotaKind || cooldown.Global {
 			t.Fatalf("%s：额度冷却 = %+v ok=%t err=%v，期望模型级每日限额", test.accountID, cooldown, ok, stateErr)

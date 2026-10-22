@@ -188,6 +188,14 @@ func (copies *TemporaryFileCopies) Cleanup() error {
 	return copies.err
 }
 
+// NewTemporaryFileCopiesForTest 返回没有临时文件、Cleanup 固定返回 cleanupErr 的副本集合，供其他包的测试模拟删除临时 Drive 副本失败
+// （例如 Drive 删除返回 429）；请求路径不使用
+func NewTemporaryFileCopiesForTest(cleanupErr error) *TemporaryFileCopies {
+	copies := &TemporaryFileCopies{}
+	copies.once.Do(func() { copies.err = cleanupErr })
+	return copies
+}
+
 func (closer *releaseReadCloser) Read(target []byte) (int, error) {
 	return closer.body.Read(target)
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -339,5 +340,41 @@ func TestValidateStopSequences(t *testing.T) {
 	}
 	if ValidateStopSequences([]string{string(make([]byte, maxStopSequenceBytes+1))}) == nil {
 		t.Fatal("超过长度上限应返回错误")
+	}
+}
+
+// TestQuotaCooldownEscalate 只有没有额度周期信息、上游也没给恢复时间的非全局限流 429（裸 “Quota exceeded”）按连续次数逐级加长冷却；
+// 带 RetryInfo 或 Retry-After、分钟限额、每日限额与全局冷却都不逐级加长
+func TestQuotaCooldownEscalate(t *testing.T) {
+	now := time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	bare, ok := QuotaCooldownForError(quotaError("Quota exceeded", nil, 0), now)
+	if !ok || bare.Kind != RateLimitKind || bare.Global || !bare.Escalate || !bare.Until.Equal(now.Add(unknownRateLimitCooldown)) {
+		t.Fatalf("裸 Quota exceeded：%+v，期望非全局限流、30 秒、逐级加长", bare)
+	}
+	// HTTP Retry-After（没有 RetryInfo 时由响应头补上）
+	response := &RPCResponse{
+		StatusCode: http.StatusTooManyRequests, Header: http.Header{"Retry-After": []string{"45"}},
+		Body: io.NopCloser(strings.NewReader(`[8,"Quota exceeded"]`)),
+	}
+	_, retryAfter := validateRPCResponse("GenerateContent", response)
+	for name, err := range map[string]error{
+		"RetryInfo":   quotaError("Quota exceeded", nil, 20*time.Second),
+		"Retry-After": retryAfter,
+		"分钟限额":        quotaError("Quota exceeded", map[string]string{"quota_limit": "GenerateRequestsPerMinutePerProjectPerModel"}, 0),
+		"每日限额":        quotaError("Quota exceeded", map[string]string{"quota_limit": "GenerateRequestsPerDayPerProjectPerModel"}, 0),
+		"通用文案按每日限额":   quotaError("You exceeded your current quota", nil, 0),
+		"全局":          quotaError("Quota exceeded", map[string]string{"quota_metric": "alkalimakersuite-pa.googleapis.com/generate_requests_global"}, 0),
+	} {
+		cooldown, ok := QuotaCooldownForError(err, now)
+		if !ok || cooldown.Escalate {
+			t.Fatalf("%s：%+v ok=%t，期望不逐级加长", name, cooldown, ok)
+		}
+	}
+	var rpcError *RPCError
+	if !errors.As(retryAfter, &rpcError) || rpcError.RetryDelay != 45*time.Second {
+		t.Fatalf("Retry-After 应写进 RetryDelay：%v", retryAfter)
+	}
+	if global, _ := QuotaCooldownForError(quotaError("Quota exceeded", map[string]string{"quota_metric": "x/generate_requests_global"}, 0), now); !global.Global || global.Kind != RateLimitKind {
+		t.Fatalf("全局限流的用例应为全局限流：%+v", global)
 	}
 }

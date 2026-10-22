@@ -60,9 +60,28 @@ func (p *AccountPool) MarkModelAccessVerifiedAsync(
 	finish := p.background.begin()
 	go func() {
 		defer finish()
-		changed, err := p.markModelAccessVerified(accountID, modelID, generation, checkedAt)
+		changed, _, err := p.markModelAccessVerifiedClearing(accountID, modelID, generation, checkedAt)
 		if done != nil {
 			done(changed, err)
+		}
+	}()
+}
+
+// MarkGenerationVerifiedAsync 与 MarkModelAccessVerifiedAsync 相同（同样登记为后台写入），另外清零这次成功所在通道的连续限流档位
+// （见 rate_strike.go）：modelID 为成功记录的作用域（Build 为 build:<模型>），done 的 clearedLevel 为被清档位中的最高档，没有时为 0
+func (p *AccountPool) MarkGenerationVerifiedAsync(
+	accountID string,
+	modelID string,
+	generation uint64,
+	checkedAt time.Time,
+	done func(changed bool, clearedLevel int, err error),
+) {
+	finish := p.background.begin()
+	go func() {
+		defer finish()
+		changed, cleared, err := p.markModelAccessVerifiedClearing(accountID, modelID, generation, checkedAt)
+		if done != nil {
+			done(changed, cleared, err)
 		}
 	}()
 }

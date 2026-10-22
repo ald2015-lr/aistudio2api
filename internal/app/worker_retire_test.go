@@ -101,13 +101,13 @@ func TestCooldownRetiresIdleWorkerPromptly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, minuteQuotaError(), ""); !ok || stateErr != nil {
+	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, minuteQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok || stateErr != nil {
 		t.Fatalf("分钟限额应被识别为额度错误: ok=%v err=%v", ok, stateErr)
 	}
 	if got := manager.retirementCount(); got != 0 {
 		t.Fatalf("分钟限额不应登记淘汰，登记数 = %d", got)
 	}
-	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), ""); !ok || stateErr != nil {
+	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok || stateErr != nil {
 		t.Fatalf("每日限额应被识别为额度错误: ok=%v err=%v", ok, stateErr)
 	}
 	if got := manager.retirementCount(); got != 1 {
@@ -149,7 +149,7 @@ func TestCooldownRetiresBusyWorkerAfterRelease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), ""); !ok || stateErr != nil {
+	if _, ok, stateErr := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok || stateErr != nil {
 		t.Fatalf("每日限额应被识别为额度错误: ok=%v err=%v", ok, stateErr)
 	}
 	if err := lease.Release(); err != nil {
@@ -183,7 +183,7 @@ func TestRetirementKeepsWorkerWithoutSpareAccount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), ""); !ok {
+	if _, ok, _ := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok {
 		t.Fatal("每日限额应被识别为额度错误")
 	}
 	if err := lease.Release(); err != nil {
@@ -540,7 +540,7 @@ func TestRetirementDroppedWhenCooldownCleared(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, _ := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), ""); !ok {
+	if _, ok, _ := service.applyQuotaCooldown(lease, partitionNormalA, testRuntimeModel, globalDailyQuotaError(), "", aistudio.PoolScopeNormal, true, true); !ok {
 		t.Fatal("每日限额应被识别为额度错误")
 	}
 	if err := lease.Release(); err != nil {

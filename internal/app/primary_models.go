@@ -214,14 +214,14 @@ func (service *trackedService) primaryBudget(modelID string, pool aistudio.PoolS
 	}
 }
 
-// primaryQueueExceededMessage 为排队超限时写进请求进度的一句话
+// primaryQueueExceededMessage 为排队超限时写进请求进度的一句话，末尾追加超限时的候选快照（busy.Detail，见 waitQueued）
 func primaryQueueExceededMessage(busy *aistudio.CapacityBusyError) string {
 	if busy.Limit <= 0 {
-		return fmt.Sprintf("主用模型不排队，立即返回 429 | 原因=%s | 总耗时=%s | 尝试=%d",
-			busy.Reason, busy.Elapsed.Round(time.Millisecond), busy.Attempt)
+		return fmt.Sprintf("主用模型不排队，立即返回 429 | 原因=%s | 总耗时=%s | 尝试=%d%s",
+			busy.Reason, busy.Elapsed.Round(time.Millisecond), busy.Attempt, busy.Detail)
 	}
-	return fmt.Sprintf("主用模型排队超过 %s，立即返回 429 | 原因=%s | 已排队=%s | 总耗时=%s | 尝试=%d",
-		busy.Limit, busy.Reason, busy.Waited.Round(time.Millisecond), busy.Elapsed.Round(time.Millisecond), busy.Attempt)
+	return fmt.Sprintf("主用模型排队超过 %s，立即返回 429 | 原因=%s | 已排队=%s | 总耗时=%s | 尝试=%d%s",
+		busy.Limit, busy.Reason, busy.Waited.Round(time.Millisecond), busy.Elapsed.Round(time.Millisecond), busy.Attempt, busy.Detail)
 }
 
 // leaseWaitBudget 为一个主用模型请求的排队预算：截止时间 = 创建时间 + 排队上限 + 现场冷启动抵扣 + 冷却等待，按墙钟计。

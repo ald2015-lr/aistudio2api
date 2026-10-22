@@ -543,7 +543,13 @@ onUnmounted(() => {
               {{ tf('app.primarySupplyModel', { model: supply.model }) }}
             </span>
             <span class="whitespace-nowrap">
-              {{ tf('app.primarySupply', { warm: supply.warm, standby: supply.standbyLabel }) }}
+              {{
+                tf('app.primarySupply', {
+                  warm: supply.warm,
+                  cooling: supply.cooling ?? 0,
+                  standby: supply.standbyLabel,
+                })
+              }}
             </span>
           </div>
           <div
@@ -573,7 +579,13 @@ onUnmounted(() => {
               {{ tf('app.ultraPrimarySupplyModel', { model: supply.model }) }}
             </span>
             <span class="whitespace-nowrap">
-              {{ tf('app.primarySupply', { warm: supply.warm, standby: supply.standbyLabel }) }}
+              {{
+                tf('app.primarySupply', {
+                  warm: supply.warm,
+                  cooling: supply.cooling ?? 0,
+                  standby: supply.standbyLabel,
+                })
+              }}
             </span>
           </div>
           <template v-if="status.workers?.prewarm">
@@ -646,53 +658,56 @@ onUnmounted(() => {
         <span v-else-if="eventsState === 'reconnecting'">{{ t('app.eventsReconnecting') }}</span>
         <span v-else>{{ t('app.statusUnreachable') }}</span>
       </div>
-      <LogsPanel v-if="currentTab === 'logs'" :logs="logs" @clear="clearLogs" />
-      <AccountsPanel
-        v-else-if="currentTab === 'accounts'"
-        :accounts="accounts"
-        :loading="loading.accounts"
-        :error="errors.accounts"
-        :worker-sets="workerSets"
-        :worker-counts="status?.workers ?? null"
-        :ultra-worker-counts="status?.ultra_workers ?? null"
-        :cooldowns="cooldowns"
-        @refresh="loadAccountData"
-        @notice="showNotice"
-      />
-      <ModelsTable
-        v-else-if="currentTab === 'models'"
-        :models="models"
-        :loading="loading.models"
-        :error="errors.models"
-      />
-      <RequestsPanel
-        v-else-if="currentTab === 'requests'"
-        :accounts="accounts"
-        :cooldowns="cooldowns"
-        :requests="requests"
-        :loading="loading.requests || loading.cooldowns"
-        :cooldown-error="errors.cooldowns"
-        :request-error="errors.requests"
-        @refresh="loadRequestData"
-        @notice="showNotice"
-      />
-      <UsagePanel v-else-if="currentTab === 'usage'" />
-      <SettingsPanel
-        v-else-if="currentTab === 'settings'"
-        :config="config"
-        :loading="loading.config"
-        :error="errors.config"
-        :running="serviceState === 'running' || serviceState === 'launching'"
-        :models="models"
-        @saved="config = $event"
-        @notice="showNotice"
-      />
-      <PlaygroundPanel
-        v-else
-        :models="models"
-        :accounts="accounts"
-        :api-key="config?.proxy_api_key ?? ''"
-      />
+      <!-- API 试用页切走后保留组件：进行中的请求不中止，回来时结果仍在；其他面板照旧卸载 -->
+      <KeepAlive include="PlaygroundPanel">
+        <LogsPanel v-if="currentTab === 'logs'" :logs="logs" @clear="clearLogs" />
+        <AccountsPanel
+          v-else-if="currentTab === 'accounts'"
+          :accounts="accounts"
+          :loading="loading.accounts"
+          :error="errors.accounts"
+          :worker-sets="workerSets"
+          :worker-counts="status?.workers ?? null"
+          :ultra-worker-counts="status?.ultra_workers ?? null"
+          :cooldowns="cooldowns"
+          @refresh="loadAccountData"
+          @notice="showNotice"
+        />
+        <ModelsTable
+          v-else-if="currentTab === 'models'"
+          :models="models"
+          :loading="loading.models"
+          :error="errors.models"
+        />
+        <RequestsPanel
+          v-else-if="currentTab === 'requests'"
+          :accounts="accounts"
+          :cooldowns="cooldowns"
+          :requests="requests"
+          :loading="loading.requests || loading.cooldowns"
+          :cooldown-error="errors.cooldowns"
+          :request-error="errors.requests"
+          @refresh="loadRequestData"
+          @notice="showNotice"
+        />
+        <UsagePanel v-else-if="currentTab === 'usage'" />
+        <SettingsPanel
+          v-else-if="currentTab === 'settings'"
+          :config="config"
+          :loading="loading.config"
+          :error="errors.config"
+          :running="serviceState === 'running' || serviceState === 'launching'"
+          :models="models"
+          @saved="config = $event"
+          @notice="showNotice"
+        />
+        <PlaygroundPanel
+          v-else
+          :models="models"
+          :accounts="accounts"
+          :api-key="config?.proxy_api_key ?? ''"
+        />
+      </KeepAlive>
     </main>
 
     <Transition name="notice">

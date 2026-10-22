@@ -1,11 +1,18 @@
 <script setup lang="ts">
 import { computed, onUnmounted, reactive, ref, watch } from 'vue'
-import { ApiError, playgroundPrefix, runPlayground, type PlaygroundChunk } from '@/api'
+import {
+  ApiError,
+  StreamIncompleteError,
+  playgroundPrefix,
+  runPlayground,
+  type PlaygroundChunk,
+} from '@/api'
 import { copyText } from '@/clipboard'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
   Model,
+  PlaygroundError,
   PlaygroundInput,
   PlaygroundMode,
   PlaygroundProtocol,
@@ -15,13 +22,16 @@ import type {
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 
+// 显式命名：App.vue 的 KeepAlive 按名称只缓存这个面板，切到其他页时进行中的请求不中止、结果保留
+defineOptions({ name: 'PlaygroundPanel' })
+
 const props = defineProps<{
   models: Model[]
   accounts: Account[]
   apiKey: string
 }>()
 
-const { t } = useI18n()
+const { t, tf, errorText } = useI18n()
 const protocols: { id: PlaygroundProtocol; label: string }[] = [
   { id: 'openai-chat', label: 'OpenAI Chat' },
   { id: 'openai-responses', label: 'OpenAI Responses' },
@@ -66,6 +76,9 @@ const result = reactive<PlaygroundResult>({
   raw: '',
   durationMs: 0,
   status: 0,
+  finish: '',
+  completed: false,
+  stopped: false,
 })
 const isRunning = ref(false)
 const outputMode = ref<'output' | 'raw'>('output')
@@ -73,7 +86,15 @@ const copied = ref(false)
 const hasRun = ref(false)
 const submittedPrompt = ref('')
 const submittedModel = ref('')
+// received 为本次请求已收到事件；之前显示“等待响应 Ns”（waitSeconds 每秒刷新），之后显示“生成中”
+const received = ref(false)
+const waitSeconds = ref(0)
+let waitTimer: number | undefined
 let controller: AbortController | undefined
+// stopRequested 为用户点了停止：中止后显示“已停止”；清空对话引起的中止不显示
+let stopRequested = false
+// lastInput 为上一次实际发出的输入快照：重试按它重发，输出类型、协议、号池与模型保持一致，不与之后改动的表单拼在一起
+let lastInput: PlaygroundInput | undefined
 
 // ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 号池时模型列表只显示这些模型，还没有读到时显示全部模型。
 // 账户的 models 只含 Playground 目录，只在 Build 通道提供的模型（如 gemini-4-argon）不会出现在这里，过滤时要放过它们
@@ -165,20 +186,40 @@ const endpointPath = computed(() => {
   if (form.protocol === 'openai-chat') return '/v1/chat/completions'
   if (form.protocol === 'openai-responses') return '/v1/responses'
   if (form.protocol === 'anthropic') return '/v1/messages'
-  const method = form.stream ? 'streamGenerateContent' : 'generateContent'
+  const method = form.stream ? 'streamGenerateContent?alt=sse' : 'generateContent'
   return `/v1beta/models/${form.model || '{model}'}:${method}`
 })
 const endpoint = computed(() => `${playgroundPrefix(form)}${endpointPath.value}`)
 
 const visibleOutput = computed(() => {
   if (outputMode.value === 'raw') return result.raw
-  return [result.text, result.reasoning, result.tools, ...result.media.map((media) => media.url)]
+  return [
+    result.text,
+    result.reasoning,
+    result.tools,
+    ...result.media.map((media) => media.url),
+    result.error?.message ?? '',
+  ]
     .filter(Boolean)
     .join('\n')
 })
-const hasOutput = computed(
+// emptyNotice 为正常结束却没有正文、工具调用与媒体时的提示：只有思考时单独说明，没有结束原因时显示“未知”
+const emptyNotice = computed(() => {
+  if (!result.completed || result.error !== undefined || result.stopped) return ''
+  if (result.text.trim() !== '' || result.tools !== '' || result.media.length > 0) return ''
+  const reason = result.finish || t('playground.finishUnknown')
+  return tf(result.reasoning === '' ? 'playground.emptyReply' : 'playground.emptyThinkingOnly', {
+    reason,
+  })
+})
+// showReply 为回复框有内容可显示：原始响应、正文、等待或生成中、空回复提示、已停止；只有错误或只有媒体时不显示空框
+const showReply = computed(
   () =>
-    result.text !== '' || result.reasoning !== '' || result.tools !== '' || result.media.length > 0,
+    outputMode.value === 'raw' ||
+    result.text !== '' ||
+    isRunning.value ||
+    emptyNotice.value !== '' ||
+    result.stopped,
 )
 
 // clearMedia 释放浏览器创建的媒体资源
@@ -189,23 +230,8 @@ function clearMedia(): void {
   result.media = []
 }
 
-// appendChunk 追加一次协议解析结果
-function appendChunk(chunk: PlaygroundChunk): void {
-  result.text += chunk.text
-  result.reasoning += chunk.reasoning
-  result.tools += chunk.tools
-  result.media.push(...chunk.media)
-}
-
-// execute 发送公开协议请求并实时追加结果
-async function execute(): Promise<void> {
-  if (isRunning.value || form.model === '' || form.prompt.trim() === '') return
-  const input = { ...form }
-  controller = new AbortController()
-  submittedPrompt.value = form.prompt
-  submittedModel.value = form.model
-  hasRun.value = true
-  form.prompt = ''
+// resetResult 清空上一次的结果、结束原因、错误与停止标记
+function resetResult(): void {
   clearMedia()
   result.text = ''
   result.reasoning = ''
@@ -213,24 +239,113 @@ async function execute(): Promise<void> {
   result.raw = ''
   result.durationMs = 0
   result.status = 0
+  result.finish = ''
+  result.completed = false
+  result.stopped = false
+  delete result.error
+}
+
+// appendChunk 追加一次协议解析结果，记录最后一个非空的结束原因
+function appendChunk(chunk: PlaygroundChunk): void {
+  result.text += chunk.text
+  result.reasoning += chunk.reasoning
+  result.tools += chunk.tools
+  result.media.push(...chunk.media)
+  if (chunk.finish !== '') result.finish = chunk.finish
+}
+
+// startWaiting 开始“等待响应”计时：每秒刷新，收到首个事件或请求结束时停止
+function startWaiting(started: number): void {
+  stopWaiting()
+  received.value = false
+  waitSeconds.value = 0
+  waitTimer = window.setInterval(() => {
+    waitSeconds.value = Math.floor((performance.now() - started) / 1000)
+  }, 1000)
+}
+
+function stopWaiting(): void {
+  if (waitTimer !== undefined) window.clearInterval(waitTimer)
+  waitTimer = undefined
+}
+
+// playgroundError 把请求异常整理为错误卡片的内容：流在结束事件前断开、读响应体时连接中断都按“已连接后失败”显示本地化说明
+// （中断时带上浏览器给出的原因）；只有 fetch 本身连不上服务时显示服务离线
+function playgroundError(error: unknown): PlaygroundError {
+  if (error instanceof ApiError) {
+    return {
+      status: error.status,
+      code: error.code,
+      message: error.message || t('common.error'),
+      inStream: error.inStream,
+      ...(error.retryAfter === undefined ? {} : { retryAfter: error.retryAfter }),
+    }
+  }
+  if (error instanceof StreamIncompleteError) {
+    return {
+      status: error.status,
+      code: '',
+      message:
+        error.reason === ''
+          ? t('playground.streamIncomplete')
+          : tf('playground.streamInterrupted', { reason: error.reason }),
+      inStream: true,
+    }
+  }
+  return { status: 0, code: '', message: errorText(error), inStream: false }
+}
+
+// execute 发送输入框中的消息
+function execute(): void {
+  if (isRunning.value || form.model === '' || form.prompt.trim() === '') return
+  const input = { ...form }
+  form.prompt = ''
+  void run(input)
+}
+
+// retry 重发上一次实际发出的请求（只换成当前填写的 API Key）：之后切换输出类型等不影响重试，免得把模型发到不匹配的接口
+function retry(): void {
+  if (isRunning.value || lastInput === undefined) return
+  void run({ ...lastInput, apiKey: form.apiKey })
+}
+
+// run 发送公开协议请求并实时追加结果；失败时保留已收到的内容并显示错误卡片
+async function run(input: PlaygroundInput): Promise<void> {
+  const current = new AbortController()
+  controller = current
+  stopRequested = false
+  lastInput = { ...input }
+  submittedPrompt.value = input.prompt
+  submittedModel.value = input.model
+  hasRun.value = true
+  resetResult()
   outputMode.value = 'output'
   isRunning.value = true
   const started = performance.now()
+  startWaiting(started)
 
   try {
-    const response = await runPlayground(input, controller.signal, (chunk, raw) => {
+    const response = await runPlayground(input, current.signal, (chunk, raw) => {
+      if (!received.value) {
+        received.value = true
+        stopWaiting()
+      }
       appendChunk(chunk)
       result.raw += `${raw}\n`
     })
     result.status = response.status
     if (response.chunk !== undefined) appendChunk(response.chunk)
     result.raw += response.raw ?? ''
+    result.completed = true
   } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') return
-    result.status = error instanceof ApiError ? error.status : 0
-    result.raw = error instanceof Error ? error.message : t('common.error')
-    outputMode.value = 'raw'
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      result.stopped = stopRequested
+      return
+    }
+    result.error = playgroundError(error)
+    result.status = result.error.status
   } finally {
+    stopWaiting()
     result.durationMs = Math.round(performance.now() - started)
     isRunning.value = false
   }
@@ -238,21 +353,18 @@ async function execute(): Promise<void> {
 
 // clearConversation 清空当前试用结果
 function clearConversation(): void {
+  stopRequested = false
   controller?.abort()
-  clearMedia()
   hasRun.value = false
+  lastInput = undefined
   submittedPrompt.value = ''
   submittedModel.value = ''
-  result.text = ''
-  result.reasoning = ''
-  result.tools = ''
-  result.raw = ''
-  result.durationMs = 0
-  result.status = 0
+  resetResult()
 }
 
 // stop 中止当前浏览器请求并触发服务端取消
 function stop(): void {
+  stopRequested = true
   controller?.abort()
 }
 
@@ -265,7 +377,9 @@ async function copyOutput(): Promise<void> {
   }, 1200)
 }
 
+// 面板由 KeepAlive 缓存，切页不会触发这里；只在真正卸载时中止请求并释放媒体
 onUnmounted(() => {
+  stopWaiting()
   controller?.abort()
   clearMedia()
 })
@@ -321,20 +435,78 @@ onUnmounted(() => {
             </details>
 
             <div
+              v-if="showReply"
               class="relative rounded-lg border border-[#30363d] bg-[#161b22] p-3 text-sm leading-relaxed text-gray-200 shadow-sm"
             >
               <pre
                 v-if="outputMode === 'raw'"
                 class="overflow-x-auto font-mono text-xs whitespace-pre-wrap text-gray-300"
                 >{{ result.raw }}</pre>
-              <pre v-else-if="result.text" class="font-sans whitespace-pre-wrap text-gray-200">{{
-                result.text
+              <template v-else>
+                <pre v-if="result.text" class="font-sans whitespace-pre-wrap text-gray-200">{{
+                  result.text
+                }}</pre>
+                <!-- 还没有收到任何事件时显示已等待的秒数（排队、冷启动），收到首个事件后显示生成中 -->
+                <span v-else-if="isRunning" class="animate-pulse text-gray-500" role="status">
+                  {{
+                    received
+                      ? t('playground.generating')
+                      : tf('playground.waitingResponse', { seconds: waitSeconds })
+                  }}
+                </span>
+                <p v-if="emptyNotice" class="text-xs text-yellow-300" role="status">
+                  {{ emptyNotice }}
+                </p>
+                <p
+                  v-if="result.stopped"
+                  class="text-xs text-gray-500"
+                  :class="{ 'mt-2': result.text !== '' }"
+                >
+                  {{ t('playground.stopped') }}
+                </p>
+              </template>
+            </div>
+
+            <!-- 错误卡片：已收到的正文保留在上面；流已建立后失败时不显示 HTTP 状态码（建流时为 200） -->
+            <div
+              v-if="result.error"
+              class="rounded-lg border border-red-500/40 bg-red-950/30 p-3 text-sm shadow-sm"
+              role="alert"
+            >
+              <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-red-300">
+                <UiIcon name="info" :size="14" />
+                <span class="font-bold">{{ t('playground.errorTitle') }}</span>
+                <span
+                  v-if="result.error.inStream || result.error.status > 0"
+                  class="rounded bg-red-900/40 px-1.5 font-mono"
+                >
+                  {{
+                    result.error.inStream
+                      ? t('playground.errorInStream')
+                      : `HTTP ${result.error.status}`
+                  }}
+                </span>
+                <span v-if="result.error.code" class="font-mono text-red-300/80">
+                  {{ t('playground.errorCode') }} {{ result.error.code }}
+                </span>
+              </div>
+              <pre class="mt-2 font-mono text-xs break-words whitespace-pre-wrap text-red-200">{{
+                result.error.message
               }}</pre>
-              <span v-else-if="isRunning" class="animate-pulse text-gray-500">...</span>
-              <pre
-                v-else-if="result.raw && !hasOutput"
-                class="font-mono text-xs whitespace-pre-wrap text-red-300"
-                >{{ result.raw }}</pre>
+              <div class="mt-3 flex items-center gap-3 text-xs">
+                <span v-if="result.error.retryAfter !== undefined" class="text-red-300/80">
+                  {{ tf('playground.retryAfter', { seconds: result.error.retryAfter }) }}
+                </span>
+                <button
+                  class="ml-auto flex items-center gap-1 rounded border border-red-500/40 px-2 py-1 text-red-200 transition hover:bg-red-900/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  type="button"
+                  :disabled="isRunning"
+                  @click="retry"
+                >
+                  <UiIcon name="refresh" :size="12" />
+                  {{ t('playground.retry') }}
+                </button>
+              </div>
             </div>
 
             <details

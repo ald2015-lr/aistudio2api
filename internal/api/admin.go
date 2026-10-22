@@ -61,11 +61,14 @@ type AdminStatus struct {
 // 不在启动中、对它没有冷却），最多统计 1000 个，达到上限时 StandbyCapped 为真。
 // Standby 为 0 表示没有还能服务该模型的空闲账号（多半是当天额度已用完，太平洋时间零点重置）
 type AdminPrimarySupply struct {
-	Model         string `json:"model"`
-	Pool          string `json:"pool,omitempty"`
-	Warm          int    `json:"warm"`
-	Standby       int    `json:"standby"`
-	StandbyCapped bool   `json:"standby_capped,omitempty"`
+	Model   string `json:"model"`
+	Pool    string `json:"pool,omitempty"`
+	Warm    int    `json:"warm"`
+	Standby int    `json:"standby"`
+	// Cooling 为对它冷却中的驻留 Worker：不在排空中、是该模型的候选、但所有支持的启用通道都在冷却（含剩余不到 2 分钟的短冷却，
+	// 与调度分类口径一致），既不计入 Warm 也不计入 Standby；驻留 Worker 大多在这里时，主用模型的请求只能等冷却到期或换上新号
+	Cooling       int  `json:"cooling"`
+	StandbyCapped bool `json:"standby_capped,omitempty"`
 }
 
 // AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限

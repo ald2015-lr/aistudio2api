@@ -28,30 +28,31 @@ func (env *drainEnv) runningAdmin() *runtimeAdmin {
 }
 
 // TestPrimarySupplyCounts 主用模型供给的口径：warm 只数对主用模型没有冷却、不在排空中的驻留 Worker；standby 只数空闲、
-// 对主用模型没有冷却、不在启动中的备用账号，达到上限时标记 capped
+// 对主用模型没有冷却、不在启动中的备用账号，达到上限时标记 capped；cooling 只数对主用模型冷却中、不在排空中的驻留 Worker
 func TestPrimarySupplyCounts(t *testing.T) {
 	accounts := []string{"drain-a@example.com", "drain-b@example.com", "drain-c@example.com", "drain-d@example.com",
 		"drain-e@example.com", "drain-f@example.com"}
 	env := newDrainEnv(t, accounts, 3, 4)
 	env.promote(t, accounts[:3]...)
-	// a 能服务主用模型；b 排空中；c 驻留但主用模型已冷却
+	// a 能服务主用模型；b 排空中（主用模型也冷却，排空中的不计入 cooling）；c 驻留但主用模型已冷却
 	if env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal) == nil {
 		t.Fatal("b 应进入排空")
 	}
 	defer env.manager.clearDrain(accounts[1])
+	env.coolPro(t, accounts[1])
 	env.coolPro(t, accounts[2])
 	// 备用：d 主用模型已冷却，e 正被占用，f 空闲
 	env.coolPro(t, accounts[3])
 	release := holdLease(t, env.pool, accounts[4])
 	entries := env.manager.computePrimarySupply(normalSupplyTargets(drainProModel), primarySupplyStandbyLimit)
-	want := api.AdminPrimarySupply{Model: drainProModel, Warm: 1, Standby: 1}
+	want := api.AdminPrimarySupply{Model: drainProModel, Warm: 1, Standby: 1, Cooling: 1}
 	if len(entries) != 1 || entries[0] != want {
 		t.Fatalf("供给 = %+v，应为 %+v", entries, want)
 	}
 	// 其他模型不受主用模型冷却影响：a、c 能服务，b 排空中不计；e 被占用、f 空闲，d 能服务
 	other := env.manager.computePrimarySupply(normalSupplyTargets(testRuntimeModel), primarySupplyStandbyLimit)
-	if got := other[0]; got.Warm != 2 || got.Standby != 2 {
-		t.Fatalf("其他模型的供给 = %+v，应为 热 2 · 备用 2", got)
+	if got := other[0]; got.Warm != 2 || got.Standby != 2 || got.Cooling != 0 {
+		t.Fatalf("其他模型的供给 = %+v，应为 热 2 · 冷却 0 · 备用 2", got)
 	}
 	release()
 	// e 空闲后备用为 2：上限 1 时只数到 1 并标记 capped，上限 2 时不标记
@@ -109,8 +110,8 @@ func TestPrimarySupplyCachedForStatus(t *testing.T) {
 	if !env.manager.refreshPrimarySupply(start.Add(primarySupplyInterval)) {
 		t.Fatal("缓存过期后应重新统计")
 	}
-	if got, _ := supplyOf(status(), drainProModel); got.Warm != 0 || got.Standby != 2 {
-		t.Fatalf("重新统计后供给 = %+v，应为 热 0 · 备用 2", got)
+	if got, _ := supplyOf(status(), drainProModel); got.Warm != 0 || got.Cooling != 1 || got.Standby != 2 {
+		t.Fatalf("重新统计后供给 = %+v，应为 热 0 · 冷却 1 · 备用 2", got)
 	}
 	// 主用模型列表变化后立即重新统计（不等 30 秒）
 	env.service.setPrimaryModels([]string{drainProModel, testRuntimeModel}, 10*time.Second)
@@ -191,7 +192,7 @@ func TestStatusShowsDrainingAndRetiring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, field := range []string{`"draining":1`, `"retiring":1`, `"primary_supply":[{"model":"` + drainProModel + `"`} {
+	for _, field := range []string{`"draining":1`, `"retiring":1`, `"primary_supply":[{"model":"` + drainProModel + `"`, `"cooling":`} {
 		if !strings.Contains(string(encoded), field) {
 			t.Fatalf("状态 JSON 缺少 %s: %s", field, encoded)
 		}

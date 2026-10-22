@@ -371,8 +371,12 @@ type WarmWorkerState struct {
 	// Busy 为账户有进行中的请求、独占操作或认证续签，LastUsed 为最近使用时间
 	Busy     bool
 	LastUsed time.Time
-	// Cooling 为账户在该模型上（或全局）冷却中、且剩余不少于 ShortCooldownMax（分钟限额、限流这类一分钟内就恢复的短冷却不算）；
-	// Dead 为长时间不可用（全局冷却或该模型所有启用通道都冷却），这样的 Worker 对该模型是死槽位
+	// Cooling 为账户冷却中、且剩余不少于 ShortCooldownMax（分钟限额、限流第一档这类一分钟内就恢复的短冷却不算）：全局冷却，
+	// 或该模型生成请求所有支持的启用通道都在冷却（按 Build 键 build:<模型> 与 Playground 键分别判断，取最早恢复的通道）；
+	// 只有一个通道冷却、另一支持的通道可用时不算（它还能服务该模型），账户对该模型没有任何支持的通道时也不算。
+	// 账户目录里有该模型、但它不支持 generateContent（视频、Live 等）时没有生成通道可判断，按 Playground 的模型键与全局冷却判断。
+	// Dead 为长时间不可用（全局冷却或该模型所有启用通道都冷却，不看通道是否支持该模型，与淘汰、补登记、轮换的死槽位口径一致），
+	// 这样的 Worker 对该模型是死槽位
 	Cooling bool
 	Dead    bool
 }
@@ -385,6 +389,8 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		return states
 	}
 	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	// 按该模型生成请求的通道判断冷却；modelID 为空时只走 Playground、作用域为空，只看全局冷却
+	selection := AccountSelection{ModelID: modelID, Method: "generateContent"}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -393,13 +399,22 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		if account == nil {
 			continue
 		}
-		cooldown, cooling := accountCooldown(account, modelID, now)
+		until, cooling := p.accountChannelCooldownLocked(account, selection, now)
+		if !cooling && modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
+			accountSupportsSelection(account, AccountSelection{ModelID: modelID}) {
+			// 账户能服务该模型、只是它不走 generateContent（视频、Live 等，请求按模型取 Worker）：退回原先按模型键的口径，
+			// 否则在该模型上冷却的空闲 Worker 不算冷却中，分区满时不被替换
+			if cooldown, active := accountCooldown(account, canonicalAccountModelID(account, modelID), now); active {
+				until, cooling = cooldown.Until, true
+			}
+		}
 		states[accountID] = WarmWorkerState{
 			Busy:     account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active > 0,
 			LastUsed: account.LastUsed,
-			// 剩余不到 ShortCooldownMax 的冷却（分钟限额、限流）不算冷却中：一分钟内就恢复，关掉它换一个要冷启动 10–30 秒的账号得不偿失
-			Cooling: cooling && cooldown.Until.Sub(now) >= ShortCooldownMax,
-			Dead:    p.longCoolingLocked(account, modelID, now, minRemaining),
+			// 剩余不到 ShortCooldownMax 的冷却（分钟限额、限流第一档）不算冷却中：一分钟内就恢复，关掉它换一个要冷启动 10–30 秒的账号得不偿失
+			Cooling: longCooldownActive(account, globalCooldownKey, now, ShortCooldownMax) ||
+				cooling && until.Sub(now) >= ShortCooldownMax,
+			Dead: p.longCoolingLocked(account, modelID, now, minRemaining),
 		}
 	}
 	return states
@@ -573,6 +588,35 @@ func (p *AccountPool) ServeableCounts(accountIDs []string, modelIDs []string, mi
 		counts[account.ID] = served
 	}
 	return counts
+}
+
+// CoolingCandidateCount 返回 accountIDs 中有几个账户是选择条件的候选、且所有支持的启用通道都在冷却（含剩余不到 ShortCooldownMax 的
+// 短冷却），口径与调度分类一致（候选集的恢复时间，见 candidateStateLocked）：分类时这些账户不进任何分组，主用模型供给的 warm 与
+// standby 都不计它们。不是候选（不在号池、目录或启用通道不支持、停用、未就绪）的账户不计。单次加锁，候选集已缓存时每个账户是常数时间
+func (p *AccountPool) CoolingCandidateCount(selection AccountSelection, accountIDs []string) int {
+	if p == nil || len(accountIDs) == 0 {
+		return 0
+	}
+	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	set := p.candidateSetLocked(selection, now)
+	set.expireLocked(p, nowNanos)
+	count := 0
+	for _, accountID := range accountIDs {
+		account := p.byID[strings.TrimSpace(accountID)]
+		if account == nil {
+			continue
+		}
+		// 候选集里 0 为非候选、-1 为可用、正数为冷却到期时刻
+		if position := account.position; position >= 0 && position < len(set.until) && p.accounts[position] == account &&
+			set.until[position] > nowNanos {
+			count++
+		}
+	}
+	return count
 }
 
 // spareSetsLocked 返回各指定模型生成请求在号池内的候选集，供判断账户能否接替；调用方持有 p.mu

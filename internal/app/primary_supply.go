@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"slices"
 	"time"
 
@@ -12,7 +13,9 @@ import (
 // 普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）统计 Ultra 分区（条目 pool 为 ultra），
 // 同一个模型在两份列表里时各有一条：
 //   - warm 为能服务它的驻留 Worker：分区内的驻留 Worker 中，是该模型的候选、对它没有冷却、不在排空中的账号；
-//   - standby 为能服务它的空闲备用账号：分区内没有驻留 Worker、不在启动中、空闲、对它没有冷却的候选账号，最多统计 primarySupplyStandbyLimit 个。
+//   - standby 为能服务它的空闲备用账号：分区内没有驻留 Worker、不在启动中、空闲、对它没有冷却的候选账号，最多统计 primarySupplyStandbyLimit 个；
+//   - cooling 为对它冷却中的驻留 Worker：分区内不在排空中的驻留 Worker 中，是该模型的候选、但所有支持的启用通道都在冷却的账号
+//     （含剩余不到 2 分钟的短冷却，与调度分类口径一致），既不计入 warm，也不计入 standby。
 // standby 为 0 表示分区内已经没有还能服务该模型的空闲账号（多半是当天额度已用完，太平洋时间零点重置）：
 // 死槽位淘汰后换不上能服务它的替补，主用模型的请求只能等能服务它的驻留 Worker 空出
 
@@ -112,9 +115,25 @@ func (manager *accountWorkerManager) primarySupplyStatus() []api.AdminPrimarySup
 	return entries
 }
 
+// supplyCoolingField 返回排队超限快照里的驻留冷却字段（“ | 驻留冷却=N”）：读主用模型供给缓存（约 30 秒内的统计），
+// pool 为 Ultra 号池时找 Ultra 列表的条目，其余找普通列表的条目；没有缓存或没有对应条目时为空。只读缓存，不加锁扫描账户
+func (manager *accountWorkerManager) supplyCoolingField(pool aistudio.PoolScope, modelID string) string {
+	if manager == nil {
+		return ""
+	}
+	label, model := supplyPoolLabel(pool), normalizeGuardModel(modelID)
+	for _, entry := range manager.primarySupplyStatus() {
+		if entry.Pool == label && normalizeGuardModel(entry.Model) == model {
+			return fmt.Sprintf(" | 驻留冷却=%d", entry.Cooling)
+		}
+	}
+	return ""
+}
+
 // computePrimarySupply 统计每个模型在它所在列表对应分区的供给（口径见本文件开头）：每个模型按调度索引分类一次（只读内存状态，
 // 不读磁盘），分类限定在该号池，另一分区的驻留 Worker 不计入；排空中的驻留 Worker 不传作热账户，分类时随排空标记落入忙碌分组，
-// 不计入 warm；正在启动的账号不计入 standby。模型在号池里找不到（目录尚未同步、配置写错）时两项都为 0
+// 不计入 warm；正在启动的账号不计入 standby。冷却中的候选不进任何分组，cooling 用同一个选择条件与同一份热账户另数一次。
+// 模型在号池里找不到（目录尚未同步、配置写错）时各项都为 0
 func (manager *accountWorkerManager) computePrimarySupply(targets []primarySupplyTarget, standbyLimit int) []api.AdminPrimarySupply {
 	draining := manager.drainingAccounts()
 	warm := excludeAccountIDs(manager.WarmAccountIDs(), draining)
@@ -125,10 +144,10 @@ func (manager *accountWorkerManager) computePrimarySupply(targets []primarySuppl
 	entries := make([]api.AdminPrimarySupply, 0, len(targets))
 	for _, target := range targets {
 		entry := api.AdminPrimarySupply{Model: target.model, Pool: supplyPoolLabel(target.pool)}
-		groups, err := manager.pool.ClassifyCandidatesCached(aistudio.AccountSelection{
-			ModelID: target.model, Method: "generateContent", Pool: target.pool,
-		}, warm)
+		selection := aistudio.AccountSelection{ModelID: target.model, Method: "generateContent", Pool: target.pool}
+		groups, err := manager.pool.ClassifyCandidatesCached(selection, warm)
 		if err == nil {
+			entry.Cooling = manager.pool.CoolingCandidateCount(selection, warm)
 			entry.Warm = len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy)
 			for _, accountID := range groups.StandbyReady {
 				if _, starting := opening[accountID]; starting {

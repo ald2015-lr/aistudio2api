@@ -13,7 +13,8 @@ ADMIN_TOKEN="$(tr -cd '0-9a-fA-F' < "$APP_DIR/.admin-token" 2>/dev/null)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 NAME="aistudio-report-$STAMP"
 OUT_DIR="$APP_DIR/reports"
-WORK="$(mktemp -d)"
+# mktemp 失败（TMPDIR 不存在、磁盘已满）时 WORK 为空，临时文件会写到根目录且不会清理：直接退出
+WORK="$(mktemp -d)" && [ -n "$WORK" ] && [ -d "$WORK" ] || { echo "无法创建临时目录（检查 TMPDIR 与磁盘空间）"; exit 1; }
 BUNDLE="$WORK/$NAME"
 trap 'rm -rf "$WORK"' EXIT
 command -v python3 >/dev/null || { echo "需要 python3：apt install -y python3"; exit 1; }

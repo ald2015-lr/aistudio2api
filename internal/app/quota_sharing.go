@@ -153,6 +153,19 @@ func (sharing *quotaSharing) verdictLocked(statsKey string) string {
 	}
 }
 
+// sharedFor 判断模型在权益分组（TierPoolOf 的结果）内的两个通道是否按共用额度处理：只有已判定为独立（与 verdictLocked 的“独立”
+// 条件一致）时返回 false，共用、观察中与没有记录都返回 true。只读，不改等待验证的观察与复核计数。
+// 连续裸限流的冷却档位按它决定两个通道是否共用一份（见 rate_limit_guard.go）：未知时按共用，免得同一账号在两个通道上轮流白试；nil 时为 true
+func (sharing *quotaSharing) sharedFor(modelID string, pool aistudio.PoolScope) bool {
+	if sharing == nil {
+		return true
+	}
+	sharing.mu.Lock()
+	defer sharing.mu.Unlock()
+	stats := sharing.models[quotaStatsKey(modelID, pool)]
+	return stats == nil || stats.Independent <= 0 || stats.Independent*quotaSharedRatio <= stats.Shared
+}
+
 // recordLocked 记录模型在权益分组内的一次证据并保存、写日志；调用方持有 mu
 func (sharing *quotaSharing) recordLocked(modelID string, pool aistudio.PoolScope, shared bool) {
 	statsKey := quotaStatsKey(modelID, pool)

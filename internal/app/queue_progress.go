@@ -250,7 +250,9 @@ func (snapshot queueSnapshot) text(now time.Time) string {
 
 // waitQueued 为 acquireLease 的一次等待：等待本身与 budget.wait 完全相同（同一个唤醒通道、复查间隔与原因），
 // 只在等待前按需写排队进度；请求在等待中超时或被取消时返回的 ctx 错误带上最后的等待原因。
-// 换号的选号带着没等到关闭就换走的原账号时另有一个唤醒：原账号关闭结束、可以重放时返回 errWorkerResetReady
+// 换号的选号带着没等到关闭就换走的原账号时另有一个唤醒：原账号关闭结束、可以重放时返回 errWorkerResetReady。
+// 主用模型排队超限（CapacityBusyError，只经这里产生）时把这一刻的候选快照与主用模型供给里的驻留冷却数记进错误的 Detail，
+// 由“主用模型排队超过…”一句写进请求进度
 func (service *trackedService) waitQueued(
 	ctx context.Context, progress *leaseWaitProgress, budget *leaseWaitBudget, changed <-chan struct{},
 	delay time.Duration, reason string, detail func(time.Time) string,
@@ -262,6 +264,10 @@ func (service *trackedService) waitQueued(
 	})
 	if err != nil && ctx.Err() != nil {
 		return progress.queueEnded(err)
+	}
+	var busy *aistudio.CapacityBusyError
+	if detail != nil && errors.As(err, &busy) {
+		busy.Detail = detail(time.Now()) + service.workers.supplyCoolingField(busy.Pool, busy.ModelID)
 	}
 	return err
 }

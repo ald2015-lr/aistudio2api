@@ -2234,6 +2234,10 @@ type trackedService struct {
 	requests  *requestRegistry
 	workers   *accountWorkerManager
 	forbidden *forbiddenTracker
+	// rateLimits 判断号池级限流（号池内多个账号对同一模型连续裸限流、又没有成功时不升级冷却，见 rate_limit_guard.go）；为空时不判断
+	rateLimits *rateLimitGuard
+	// rateLimitLadder 为连续裸限流各档的冷却时长，为空时取默认四档（见 rateLimitSteps）；只给包内测试改小
+	rateLimitLadder []time.Duration
 	// permissionDenied 为 403 无权限账户的登记表（见 permission_denied.go），保存在账户目录，跨重启保留；为空时不登记
 	permissionDenied *permissionDeniedRegistry
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
@@ -2296,7 +2300,7 @@ func newTrackedService(
 	catalog := service.(modelCatalogService)
 	tracked := &trackedService{
 		lifecycle: lifecycle, service: service, catalog: catalog, pool: pool, requests: requests, workers: workers,
-		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(),
+		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(), rateLimits: newRateLimitGuard(),
 	}
 	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断。
 	// 替补只在生成服务运行时启动，排空超时按请求超时计算（见 worker_drain.go）
@@ -2556,13 +2560,19 @@ func (service *trackedService) markModelAccessVerifiedAsync(
 	accessGeneration uint64,
 	checkedAt time.Time,
 ) {
-	// 写入由账户池登记为后台写入，停止或测试清理账户目录前可用 pool.WaitBackground 等待结束
-	service.pool.MarkModelAccessVerifiedAsync(accountID, modelID, accessGeneration, checkedAt, func(changed bool, err error) {
+	// 写入由账户池登记为后台写入，停止或测试清理账户目录前可用 pool.WaitBackground 等待结束；
+	// 同时清零该通道的连续限流档位（见 rate_limit_guard.go），此前到第二档以上时写一行，排查时能看到档位从哪里回到第一档
+	service.pool.MarkGenerationVerifiedAsync(accountID, modelID, accessGeneration, checkedAt, func(changed bool, clearedLevel int, err error) {
 		if err != nil {
 			service.requests.log(accountLabel, "ERROR", fmt.Sprintf(
 				"模型资格保存失败 | 模型=%s | 错误=%s", modelID, strings.TrimSpace(err.Error()),
 			))
 			return
+		}
+		if clearedLevel >= 2 {
+			service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+				"限流档位清零 | 范围=%s | 此前连续=第 %d 档", modelID, clearedLevel,
+			))
 		}
 		if changed {
 			service.publishModelAccess()
@@ -4342,6 +4352,7 @@ func (service *trackedService) generateWithRetry(
 			service.forbidden.reset(request.AccountID)
 			service.forbidden.resetModel(request.AccountID, lease.CooldownScope(modelID))
 			service.forbidden.modelSucceeded(scope, modelID, time.Now())
+			service.rateLimits.succeeded(scope, modelID, time.Now())
 			service.permissionDenied.succeeded(request.AccountID, modelID, lease.Channel())
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
@@ -4349,6 +4360,10 @@ func (service *trackedService) generateWithRetry(
 			break
 		}
 		cancelAttempt(nil)
+		// attemptErr 为本次尝试本身的错误（文件复制、附件上传或生成），不含随后删除临时 Drive 副本的错误：额度冷却与单模型 403
+		// 只按它判断。清理错误照旧并入 err 写日志与返回；Drive 删除返回的 429、403 与模型额度、模型权限无关，一次非额度的生成失败
+		// （连接重置、首事件超时等）不能因为清理时的 DriveDelete 429 被当成生成本身的裸限流逐级冷却、同步冷却另一通道
+		attemptErr := err
 		if attemptCopies != nil {
 			err = errors.Join(err, attemptCopies.Cleanup())
 		}
@@ -4378,7 +4393,7 @@ func (service *trackedService) generateWithRetry(
 		modelForbidden := false
 		// quotaFailure：本次尝试是计入换号上限的 Ultra 主用模型额度失败（只在 failFast 时计数，见上文 quota）；quotaKind 为写进进度的类型
 		quotaFailure, quotaKind := false, ""
-		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, err, ""); ok {
+		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, attemptErr, "", scope, true, generated); ok {
 			cooled = true
 			if failFast {
 				quota.record(primaryQuotaClassOf(cooldown, time.Now()), err, cooldown.Until)
@@ -4433,7 +4448,7 @@ func (service *trackedService) generateWithRetry(
 		// 候选里，空出的槽位又最多，几乎每个新请求的第一次尝试都落在它上面白耗一次。冷却后换号不退避，但仍计入连续失败上限，
 		// 同一账号另一通道可用时在那里再试一次，驻留 Worker 因此成了死槽位时登记淘汰。只处理没有文件绑定、错误来自
 		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理；号池级 403 见下文
-		modelDenied := isPermissionDenied(err) && resourceID == "" && generated && requestCtx.Err() == nil &&
+		modelDenied := isPermissionDenied(attemptErr) && resourceID == "" && generated && requestCtx.Err() == nil &&
 			!aistudio.DefinitiveAuthenticationFailure(err) && !waaRuntimeFailed
 		// 号池级 403：号池内多个账号对该模型连续 403、这段时间又没有任何成功，多半是 proof、请求形态等号池一侧的问题，不是账号没有
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
@@ -4656,14 +4671,23 @@ func channelFallback(selection aistudio.AccountSelection) aistudio.AccountSelect
 
 // applyQuotaCooldown 在上游返回额度 429 时冷却该账号的模型（或整个账号），并记录日志；
 // 每日限额且该模型已判定两个通道共用额度时，同时冷却另一个通道，避免请求再去另一个通道失败一次。
+// 没有额度周期信息、上游也没给恢复时间的非全局限流（裸 “Quota exceeded”，cooldown.Escalate）按连续次数逐级加长冷却
+// （见 rate_limit_guard.go）：pool 为请求的号池（号池级限流判定的范围），escalate 为这次失败能否升档（已向客户端输出后为假），
+// fromGeneration 为错误来自生成本身（不是文件复制、附件上传等发出生成请求之前的步骤）。
 // ok 表示 err 是额度错误；stateErr 为写入冷却状态失败的原因。冷却没有写入（模型目录已更新，或同账号取得租约更晚的请求已写回结果）时
 // 如实记一行 INFO，不登记淘汰、不做通道共用额度的学习，ok 仍为真：调用方照常按已冷却换号
 func (service *trackedService) applyQuotaCooldown(
 	lease *aistudio.AccountLease, accountLabel string, modelID string, err error, note string,
+	pool aistudio.PoolScope, escalate bool, fromGeneration bool,
 ) (cooldown aistudio.QuotaCooldown, ok bool, stateErr error) {
 	cooldown, ok = aistudio.QuotaCooldownForError(err, time.Now())
 	if !ok {
 		return cooldown, false, nil
+	}
+	// 只有生成本身返回的裸限流逐级冷却：文件复制、附件上传（Drive）返回的 429 与模型额度无关（同 403 只处理生成本身的错误），
+	// 照原路径只冷却本通道 30 秒，不建档位、不同步另一通道、不计入号池级限流，之后照常在同账号另一通道再试
+	if cooldown.Escalate && fromGeneration {
+		return service.applyRateLimitCooldown(lease, accountLabel, modelID, cooldown, note, pool, escalate)
 	}
 	accountID := lease.Account().ID
 	modelAccessScope := lease.CooldownScope(modelID)
@@ -4672,7 +4696,10 @@ func (service *trackedService) applyQuotaCooldown(
 		modelAccessScope = ""
 		scopeLabel = "全局"
 	}
-	write, stateErr := service.pool.TryMarkCooldownIfGeneration(
+	// 不缩短已有的冷却：同账号并发请求刚写入的更长冷却（例如连续限流第 3 档的 30 分钟，或分钟限额、每日限额）仍生效且更晚时保留它，
+	// 只推进检查时间（CooldownKeptLater）。原先无条件覆盖，租约稍晚的附件上传 429（只冷却本通道 30 秒）会把第 3 档缩短成 30 秒，
+	// 驻留 Worker 的淘汰登记随之失去理由被丢掉，30 秒后账号又被选中白白失败一次
+	write, effectiveUntil, stateErr := service.pool.TryExtendCooldownIfGeneration(
 		accountID, modelAccessScope, lease.ModelAccessGeneration(), lease.CheckedAt(),
 		cooldown.Until, cooldown.Reason,
 	)
@@ -4684,9 +4711,14 @@ func (service *trackedService) applyQuotaCooldown(
 		suffix = " | " + note
 	}
 	if write != aistudio.CooldownWritten {
+		// 保留了更晚的冷却时写它的恢复时间（实际生效的），不登记淘汰：原冷却写入时已经判断过
+		recoverAt := cooldown.Until
+		if write == aistudio.CooldownKeptLater {
+			recoverAt = effectiveUntil
+		}
 		service.requests.log(accountLabel, "INFO", fmt.Sprintf(
 			"账号冷却未写入 | 类型=%s | 范围=%s | 恢复=%s%s | 原因=%s%s",
-			cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), quotaCooldownFields(cooldown), write.String(), suffix,
+			cooldown.Kind, scopeLabel, recoverAt.Format(time.RFC3339), quotaCooldownFields(cooldown), write.String(), suffix,
 		))
 		return cooldown, true, nil
 	}
@@ -5133,8 +5165,11 @@ func (service *trackedService) forwardEvents(
 					requestErr = errors.Join(requestErr, stateErr)
 					event.Err = requestErr
 				}
-			} else if _, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, requestedModelID, event.Err, "已输出内容后"); ok && stateErr != nil {
-				// 已经开始输出后才出现的 429 无法换号重试，但仍写回冷却，后续请求不再选中这个账号或模型
+			} else if _, ok, stateErr := service.applyQuotaCooldown(
+				lease, accountLabel, requestedModelID, event.Err, "已输出内容后", aistudio.PoolScopeFromContext(requestCtx), false, true,
+			); ok && stateErr != nil {
+				// 已经开始输出后才出现的 429 无法换号重试，但仍写回冷却，后续请求不再选中这个账号或模型；
+				// 这次尝试已经拿到上游输出，裸限流不作为“冷却到期后仍失败”的证据，不升档
 				requestErr = errors.Join(requestErr, stateErr)
 				event.Err = requestErr
 			}

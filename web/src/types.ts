@@ -183,12 +183,15 @@ export interface UltraWorkerCounters {
 
 // PrimarySupply 为一个主用模型的可用供给（约每 30 秒统计一次）：warm 为能服务它的常驻 Worker，
 // standby 为还能服务它的空闲备用账号，最多统计 1000 个，达到上限时 standby_capped 为 true。
+// cooling 为对它冷却中的常驻 Worker（不在排空中、所有支持的启用通道都在冷却，含剩余不到 2 分钟的短冷却），
+// 既不计入 warm 也不计入 standby；旧版服务端不返回 cooling。
 // pool 为 "ultra" 时是 Ultra 主用模型（ULTRA_PRIMARY_MODELS），只统计 Ultra 分区的 Worker 与 Ultra 号池的账号；
 // 没有该字段时是普通主用模型（PRIMARY_MODELS），只统计普通分区。旧版服务端不返回 pool
 export interface PrimarySupply {
   model: string
   pool?: string
   warm: number
+  cooling?: number
   standby: number
   standby_capped?: boolean
 }
@@ -443,6 +446,18 @@ export interface PlaygroundMedia {
   url: string
 }
 
+// PlaygroundError 为试用请求失败的详情：status 为 HTTP 状态码（流已建立后失败时 inStream 为 true，status 为建流时的 200），
+// code 为错误外壳中的错误码或类型，retryAfter 为响应头 Retry-After 的秒数
+export interface PlaygroundError {
+  status: number
+  code: string
+  message: string
+  retryAfter?: number
+  inStream: boolean
+}
+
+// PlaygroundResult 为一次试用的结果：finish 为最后一个非空的结束原因（各协议原文），
+// completed 为请求正常结束，stopped 为用户点了停止，error 为失败详情（已收到的内容保留）
 export interface PlaygroundResult {
   text: string
   reasoning: string
@@ -451,6 +466,10 @@ export interface PlaygroundResult {
   raw: string
   durationMs: number
   status: number
+  finish: string
+  completed: boolean
+  stopped: boolean
+  error?: PlaygroundError
 }
 
 // UsageDimension 为用量可筛选与分组的维度；pool 为号池，取值为 normal 或 ultra

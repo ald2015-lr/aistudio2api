@@ -157,6 +157,9 @@ type CapacityBusyError struct {
 	Attempt   int
 	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
 	Until time.Time
+	// Detail 为排队超限时的候选快照（模型、同条件队列、热空闲、热忙碌、备用、每分钟已满、最早恢复、驻留冷却等，以“ | 键=值”拼接），
+	// 只写进内部请求进度的排队超限一句，不进 Error()：Error() 会进内部日志与用量账本，对外 429 的文案与 Retry-After 另由 API 层给出
+	Detail string
 }
 
 func (e *CapacityBusyError) Error() string {
@@ -443,6 +446,8 @@ type Account struct {
 	draining bool
 	// rate 为最近一个窗口的生成请求记录（每账号每分钟限速，见 rate_limit.go），第一次取得生成租约时创建；受账户池 mu 保护
 	rate *accountRate
+	// rateStrikes 为连续裸限流 429 的冷却档位（见 rate_strike.go），只在内存中（重启后从第一档起，冷却本身照常落盘）；受账户池 mu 保护
+	rateStrikes map[rateStrikeKey]rateStrike
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -2469,35 +2474,50 @@ func (p *AccountPool) markModelAccessVerified(
 	generation uint64,
 	checkedAt time.Time,
 ) (bool, error) {
+	changed, _, err := p.markModelAccessVerifiedClearing(accountID, modelID, generation, checkedAt)
+	return changed, err
+}
+
+// markModelAccessVerifiedClearing 与 markModelAccessVerified 相同，另外清零这次成功所在通道的连续限流档位（见 rate_strike.go）：
+// modelID 为成功记录的作用域（Build 为 build:<模型>），档位最近一次失败早于这次租约时才清，返回被清档位中的最高档（没有时为 0）。
+// 目录代际不符时不清；档位在运行态写盘成功后才删除
+func (p *AccountPool) markModelAccessVerifiedClearing(
+	accountID string,
+	modelID string,
+	generation uint64,
+	checkedAt time.Time,
+) (bool, int, error) {
 	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
 	if modelID == "" {
-		return false, fmt.Errorf("模型 ID 不能为空")
+		return false, 0, fmt.Errorf("模型 ID 不能为空")
 	}
 	checkedAt = checkedAt.UTC()
 	if checkedAt.IsZero() {
-		return false, fmt.Errorf("模型资格检查时间不能为空")
+		return false, 0, fmt.Errorf("模型资格检查时间不能为空")
 	}
 	p.mu.Lock()
 	account := p.byID[accountID]
 	if account == nil {
 		p.mu.Unlock()
-		return false, fmt.Errorf("账户不存在: %s", accountID)
+		return false, 0, fmt.Errorf("账户不存在: %s", accountID)
 	}
 	canonicalModelID := canonicalAccountModelID(account, modelID)
 	current := account.runtime.ModelAccess[canonicalModelID]
 	_, cooling := account.runtime.Cooldowns[canonicalModelID]
 	globalAccess := account.runtime.ModelAccess[globalCooldownKey]
 	// 账号全局 * 上短的分钟限额或限流冷却不会被这次成功清除，不算要写回的变化（见 shortCooldownActive）
+	now := time.Now()
 	globalCooldown, globalCooling := account.runtime.Cooldowns[globalCooldownKey]
-	globalBlocks := globalCooling && !shortCooldownActive(globalCooldown, time.Now())
+	globalBlocks := globalCooling && !shortCooldownActive(globalCooldown, now)
+	// 有可清零的限流档位时必须走下面的慢路径：另一通道成功、该键没有冷却且 CheckedAt 不早于本次时，原先的快路径会漏清
 	unchanged := generation == account.modelAccessGeneration && current.State == ModelAccessVerified &&
 		!cooling && !current.CheckedAt.Before(checkedAt) && !globalBlocks &&
-		!globalAccess.CheckedAt.Before(checkedAt)
+		!globalAccess.CheckedAt.Before(checkedAt) && !clearableRateStrikeLocked(account, modelID, checkedAt, now)
 	p.mu.Unlock()
 	if unchanged {
-		return false, nil
+		return false, 0, nil
 	}
-	changed := false
+	changed, cleared := false, 0
 	_, err := p.updateRuntime(accountID, func(account *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
 		if generation != account.modelAccessGeneration {
 			return false, nil, nil
@@ -2531,12 +2551,19 @@ func (p *AccountPool) markModelAccessVerified(
 			globalAccess.CheckedAt = checkedAt.UTC()
 			runtimeState.ModelAccess[globalCooldownKey] = globalAccess
 		}
-		return runtimeChanged, nil, nil
+		// 档位在写盘成功后清零（apply 同样在账户池锁内执行）；没有可清的档位时不返回 apply，免得没有变化也通知调度
+		var apply func(*Account)
+		if now := time.Now(); clearableRateStrikeLocked(account, modelID, checkedAt, now) {
+			apply = func(account *Account) {
+				cleared = clearRateStrikesLocked(account, modelID, checkedAt, now)
+			}
+		}
+		return runtimeChanged, apply, nil
 	})
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
-	return changed, nil
+	return changed, cleared, nil
 }
 
 // ResetModelAccess 清空账户的实测模型资格
@@ -2643,6 +2670,9 @@ const (
 	CooldownSkippedGeneration
 	// CooldownSkippedStale 表示该作用域已有不早于本次租约的记录（同账号取得租约更晚的请求已写回）
 	CooldownSkippedStale
+	// CooldownKeptLater 表示该作用域已有仍生效且更晚的冷却，保留它（原因也保留），只把检查时间推进到本次租约
+	// （只由 TryExtendCooldownIfGeneration 返回）
+	CooldownKeptLater
 )
 
 // String 返回写入结果的中文说明，供冷却日志的“原因”字段使用
@@ -2654,6 +2684,8 @@ func (w CooldownWrite) String() string {
 		return "模型目录已更新，旧租约的结果不再写回"
 	case CooldownSkippedStale:
 		return "同账号取得租约更晚的请求已写回结果"
+	case CooldownKeptLater:
+		return "已有更晚的冷却，保留原冷却"
 	default:
 		return "未知"
 	}
@@ -2682,19 +2714,50 @@ func (p *AccountPool) TryMarkCooldownIfGeneration(
 	until time.Time,
 	reason string,
 ) (CooldownWrite, error) {
+	write, _, err := p.markCooldownIfGeneration(accountID, modelAccessScope, generation, checkedAt, until, reason, false)
+	return write, err
+}
+
+// TryExtendCooldownIfGeneration 与 TryMarkCooldownIfGeneration 相同，但不缩短已有的冷却：该作用域已有仍生效且晚于 until 的冷却时
+// 保留它（原因也保留），只把该作用域的检查时间推进到本次租约，返回 CooldownKeptLater。另外返回该作用域实际生效的恢复时间
+// （写入时为 until，保留时为原冷却的恢复时间，没有写入时为零值）。额度冷却用它：同账号并发请求刚写入的更长冷却
+// （例如连续限流第 3 档的 30 分钟）不会被随后处理、租约稍晚的短冷却（附件上传返回的 30 秒限流等）覆盖成短冷却
+func (p *AccountPool) TryExtendCooldownIfGeneration(
+	accountID string,
+	modelAccessScope string,
+	generation uint64,
+	checkedAt time.Time,
+	until time.Time,
+	reason string,
+) (CooldownWrite, time.Time, error) {
+	return p.markCooldownIfGeneration(accountID, modelAccessScope, generation, checkedAt, until, reason, true)
+}
+
+// markCooldownIfGeneration 为 TryMarkCooldownIfGeneration 与 TryExtendCooldownIfGeneration 的实现：keepLater 为真时不缩短已有的冷却
+func (p *AccountPool) markCooldownIfGeneration(
+	accountID string,
+	modelAccessScope string,
+	generation uint64,
+	checkedAt time.Time,
+	until time.Time,
+	reason string,
+	keepLater bool,
+) (CooldownWrite, time.Time, error) {
 	if !until.After(time.Now()) {
-		return 0, fmt.Errorf("冷却期限必须在未来")
+		return 0, time.Time{}, fmt.Errorf("冷却期限必须在未来")
 	}
 	checkedAt = checkedAt.UTC()
 	if checkedAt.IsZero() {
-		return 0, fmt.Errorf("冷却检查时间不能为空")
+		return 0, time.Time{}, fmt.Errorf("冷却检查时间不能为空")
 	}
 	modelAccessScope = strings.TrimSpace(modelAccessScope)
 	if modelAccessScope == "" {
 		modelAccessScope = globalCooldownKey
 	}
 	var write CooldownWrite
+	var effective time.Time
 	_, err := p.updateRuntime(accountID, func(account *Account, runtimeState *accountRuntimeState) (bool, func(*Account), error) {
+		write, effective = 0, time.Time{}
 		if generation != account.modelAccessGeneration {
 			write = CooldownSkippedGeneration
 			return false, nil, nil
@@ -2705,17 +2768,20 @@ func (p *AccountPool) TryMarkCooldownIfGeneration(
 			write = CooldownSkippedStale
 			return false, nil, nil
 		}
-		next := CooldownState{Until: until.UTC(), Reason: reason}
 		currentAccess.CheckedAt = checkedAt
 		runtimeState.ModelAccess[modelAccessScope] = currentAccess
-		runtimeState.Cooldowns[modelAccessScope] = next
-		write = CooldownWritten
+		if current, cooling := runtimeState.Cooldowns[modelAccessScope]; keepLater && cooling && current.Active(time.Now()) && current.Until.After(until) {
+			write, effective = CooldownKeptLater, current.Until
+			return true, nil, nil
+		}
+		runtimeState.Cooldowns[modelAccessScope] = CooldownState{Until: until.UTC(), Reason: reason}
+		write, effective = CooldownWritten, until.UTC()
 		return true, nil, nil
 	})
 	if err != nil {
-		return 0, err
+		return 0, time.Time{}, err
 	}
-	return write, nil
+	return write, effective, nil
 }
 
 // ClearCooldownIfGeneration 清除当前目录代际中的作用域冷却

@@ -60,25 +60,116 @@ export interface EventConnection {
   close: () => void
 }
 
+// ApiErrorDetails 为试用请求错误的补充信息：code 为错误外壳中的错误码或类型，retryAfter 为 Retry-After 的秒数，
+// inStream 表示流已建立（HTTP 200）后在事件里返回的错误
+export interface ApiErrorDetails {
+  code?: string
+  retryAfter?: number
+  inStream?: boolean
+}
+
 export class ApiError extends Error {
   readonly status: number
+  readonly code: string
+  readonly retryAfter: number | undefined
+  readonly inStream: boolean
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, details: ApiErrorDetails = {}) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.code = details.code ?? ''
+    this.retryAfter = details.retryAfter
+    this.inStream = details.inStream ?? false
+  }
+}
+
+// StreamIncompleteError 表示流式响应在协议的结束事件之前断开（或没有响应体），界面按本地化文案显示；
+// status 为建流时的 HTTP 状态码；reason 为读响应体时连接中断的浏览器原因（正常读到流末尾时为空）
+export class StreamIncompleteError extends Error {
+  readonly status: number
+  readonly reason: string
+
+  constructor(message: string, status: number, reason = '') {
+    super(message)
+    this.name = 'StreamIncompleteError'
+    this.status = status
+    this.reason = reason
+  }
+}
+
+// readResponseBody 读取已建立响应的响应体：读的过程中连接中断时浏览器抛 TypeError（如 network error），与 fetch
+// 连不上服务时相同；这里改抛带 HTTP 状态与原因的 StreamIncompleteError，界面按“已连接后失败”显示，不误报服务离线
+async function readResponseBody<T>(response: Response, read: () => Promise<T>): Promise<T> {
+  try {
+    return await read()
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw new StreamIncompleteError(error.message, response.status, error.message)
+    }
+    throw error
+  }
+}
+
+// errorCode 读取错误外壳中的错误码：OpenAI 为 error.code，Anthropic 为 error.type，Gemini 与 Interactions 为 error.status
+// 或字符串 error.code。Gemini 的 error.code 是与 HTTP 状态相同的数字，排在字符串之后，避免盖住 RESOURCE_EXHAUSTED 这类状态名
+function errorCode(error: unknown): string {
+  if (!isRecord(error)) return ''
+  for (const value of [error.code, error.type, error.status]) {
+    if (typeof value === 'string' && value !== '') return value
+  }
+  return typeof error.code === 'number' ? String(error.code) : ''
+}
+
+// responseErrorBody 提取四套公开协议共享的错误消息与错误码；声明为 JSON 却无法解析时按原文返回。
+// 读错误响应体时连接中断（浏览器抛 TypeError）按状态行返回，调用方照常得到带 HTTP 状态的 ApiError，不误报服务离线；
+// 用户中止（AbortError 为 DOMException）照常抛出
+async function responseErrorBody(response: Response): Promise<{ message: string; code: string }> {
+  let body: string
+  try {
+    body = await response.text()
+  } catch (error) {
+    if (error instanceof TypeError) return { message: response.statusText || error.message, code: '' }
+    throw error
+  }
+  if (body === '') return { message: response.statusText, code: '' }
+  if (!response.headers.get('content-type')?.includes('application/json')) {
+    return { message: body, code: '' }
+  }
+
+  let value: unknown
+  try {
+    value = JSON.parse(body)
+  } catch {
+    return { message: body, code: '' }
+  }
+  const message = pathValue(value, ['error', 'message'])
+  return {
+    message: typeof message === 'string' ? message : body,
+    code: errorCode(pathValue(value, ['error'])),
   }
 }
 
 // responseErrorMessage 提取四套公开协议共享的错误消息
 async function responseErrorMessage(response: Response): Promise<string> {
-  const body = await response.text()
-  if (body === '') return response.statusText
-  if (!response.headers.get('content-type')?.includes('application/json')) return body
+  return (await responseErrorBody(response)).message
+}
 
-  const value: unknown = JSON.parse(body)
-  const message = pathValue(value, ['error', 'message'])
-  return typeof message === 'string' ? message : body
+// retryAfterSeconds 读取 Retry-After 响应头的秒数；HTTP 日期等非数字写法忽略
+function retryAfterSeconds(response: Response): number | undefined {
+  const value = response.headers.get('retry-after')?.trim() ?? ''
+  if (!/^\d+$/.test(value)) return undefined
+  return Number(value)
+}
+
+// playgroundResponseError 把试用请求的非 2xx 响应转为带错误码与 Retry-After 的 ApiError
+async function playgroundResponseError(response: Response): Promise<ApiError> {
+  const { message, code } = await responseErrorBody(response)
+  const retryAfter = retryAfterSeconds(response)
+  return new ApiError(message, response.status, {
+    code,
+    ...(retryAfter === undefined ? {} : { retryAfter }),
+  })
 }
 
 // requestJSON 执行管理端 JSON 请求并保留服务端错误语义
@@ -249,11 +340,13 @@ interface PlaygroundRequest {
   responseType: 'json' | 'audio'
 }
 
+// PlaygroundChunk 为一次事件或完整响应解析出的内容；finish 为其中的结束原因（各协议原文），没有时为空
 export interface PlaygroundChunk {
   text: string
   reasoning: string
   tools: string
   media: PlaygroundMedia[]
+  finish: string
 }
 
 function toolPayload(input: PlaygroundInput): unknown[] | undefined {
@@ -413,7 +506,8 @@ function buildPlaygroundRequest(input: PlaygroundInput): PlaygroundRequest {
     }
   }
 
-  const suffix = input.stream ? 'streamGenerateContent' : 'generateContent'
+  // 流式必须带 alt=sse：不带时服务端与官方一致返回逐块写出的 JSON 数组，事件流解析器读不出任何事件
+  const suffix = input.stream ? 'streamGenerateContent?alt=sse' : 'generateContent'
   return {
     path: `/v1beta/models/${encodeURIComponent(input.model)}:${suffix}`,
     headers,
@@ -483,14 +577,15 @@ function waitForVideoPoll(signal: AbortSignal): Promise<void> {
   })
 }
 
-// completeVideo 轮询视频任务并下载结果；prefix 为创建任务时的号池前缀，任务只能在同一号池查询
+// completeVideo 轮询视频任务并下载结果；prefix 为创建任务时的号池前缀，任务只能在同一号池查询。
+// 各响应体都经 readResponseBody 读取：读到一半连接中断（下载视频时最常见）按已连接后失败显示，不误报服务离线
 async function completeVideo(
   response: Response,
   headers: Headers,
   signal: AbortSignal,
   prefix: string,
 ): Promise<{ status: number; chunk: PlaygroundChunk; raw: string }> {
-  let value: unknown = await response.json()
+  let value: unknown = await readResponseBody(response, () => response.json())
   let state = videoState(value)
   while (state.status === 'queued') {
     await waitForVideoPoll(signal)
@@ -499,9 +594,9 @@ async function completeVideo(
       signal,
     })
     if (!poll.ok) {
-      throw new ApiError(await responseErrorMessage(poll), poll.status)
+      throw await playgroundResponseError(poll)
     }
-    value = await poll.json()
+    value = await readResponseBody(poll, () => poll.json())
     state = videoState(value)
   }
   if (state.status === 'failed') {
@@ -512,9 +607,9 @@ async function completeVideo(
     signal,
   })
   if (!content.ok) {
-    throw new ApiError(await responseErrorMessage(content), content.status)
+    throw await playgroundResponseError(content)
   }
-  const blob = await content.blob()
+  const blob = await readResponseBody(content, () => content.blob())
   return {
     status: content.status,
     chunk: {
@@ -526,7 +621,7 @@ async function completeVideo(
 }
 
 function emptyChunk(): PlaygroundChunk {
-  return { text: '', reasoning: '', tools: '', media: [] }
+  return { text: '', reasoning: '', tools: '', media: [], finish: '' }
 }
 
 function mediaFrom(value: unknown): PlaygroundMedia | undefined {
@@ -547,8 +642,22 @@ function toolLine(value: unknown): string {
   return name === '' ? argumentsText : `${name} ${argumentsText}`
 }
 
+// geminiFinish 读取 Gemini 的结束原因：有 finishMessage 时拼在后面；没有候选时为输入被拦截的 blockReason
+function geminiFinish(value: unknown): string {
+  const candidates = pathValue(value, ['candidates'])
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    const blocked = pathValue(value, ['promptFeedback', 'blockReason'])
+    return typeof blocked === 'string' ? blocked : ''
+  }
+  const reason = pathValue(candidates, [0, 'finishReason'])
+  if (typeof reason !== 'string' || reason === '') return ''
+  const message = pathValue(candidates, [0, 'finishMessage'])
+  return typeof message === 'string' && message !== '' ? `${reason}: ${message}` : reason
+}
+
 function geminiChunk(value: unknown): PlaygroundChunk {
   const chunk = emptyChunk()
+  chunk.finish = geminiFinish(value)
   const parts = pathValue(value, ['candidates', 0, 'content', 'parts'])
   if (!Array.isArray(parts)) return chunk
   for (const part of parts) {
@@ -572,6 +681,8 @@ function geminiChunk(value: unknown): PlaygroundChunk {
 
 function chatChunk(value: unknown): PlaygroundChunk {
   const chunk = emptyChunk()
+  const finish = pathValue(value, ['choices', 0, 'finish_reason'])
+  if (typeof finish === 'string') chunk.finish = finish
   const message =
     pathValue(value, ['choices', 0, 'delta']) ?? pathValue(value, ['choices', 0, 'message'])
   if (!isRecord(message)) return chunk
@@ -586,6 +697,16 @@ function chatChunk(value: unknown): PlaygroundChunk {
   return chunk
 }
 
+// responsesFinish 读取 Responses 的结束原因：status 为 incomplete 时取 incomplete_details.reason，否则为 status
+function responsesFinish(response: unknown): string {
+  const status = pathValue(response, ['status'])
+  if (status === 'incomplete') {
+    const reason = pathValue(response, ['incomplete_details', 'reason'])
+    if (typeof reason === 'string' && reason !== '') return reason
+  }
+  return typeof status === 'string' ? status : ''
+}
+
 function responsesChunk(value: unknown): PlaygroundChunk {
   const chunk = emptyChunk()
   const type = isRecord(value) && typeof value.type === 'string' ? value.type : ''
@@ -597,8 +718,12 @@ function responsesChunk(value: unknown): PlaygroundChunk {
     const item = pathValue(value, ['item'])
     if (isRecord(item) && item.type === 'function_call') chunk.tools = `${toolLine(item)}\n`
   }
-  if (type !== '') return chunk
   const response = isRecord(value) && isRecord(value.response) ? value.response : value
+  // 结束原因只看完整响应与完成事件：response.created 等中间事件的 status 为 in_progress
+  if (type === '' || type === 'response.completed' || type === 'response.incomplete') {
+    chunk.finish = responsesFinish(response)
+  }
+  if (type !== '') return chunk
   if (!isRecord(response)) return chunk
   // output_text 是 output 中全部消息正文的合并，两者都累加会把正文显示两遍；只在没有 output 时使用
   if (!Array.isArray(response.output)) {
@@ -635,6 +760,9 @@ function anthropicChunk(value: unknown): PlaygroundChunk {
   if (typeof deltaText === 'string') chunk.text = deltaText
   if (typeof thinking === 'string') chunk.reasoning = thinking
   if (typeof partialJSON === 'string') chunk.tools = partialJSON
+  // 流式的结束原因在 message_delta 的 delta.stop_reason，非流式在顶层 stop_reason
+  const stopReason = pathValue(value, ['delta', 'stop_reason']) ?? pathValue(value, ['stop_reason'])
+  if (typeof stopReason === 'string') chunk.finish = stopReason
   const blocks = isRecord(value) && Array.isArray(value.content) ? value.content : []
   for (const block of blocks) {
     if (!isRecord(block)) continue
@@ -677,29 +805,57 @@ function responseChunk(input: PlaygroundInput, value: unknown): PlaygroundChunk 
   return anthropicChunk(value)
 }
 
+// throwStreamError 检查流式事件中的错误（含 Responses 的 response.failed）：流已建立后返回的错误标为 inStream
+function throwStreamError(value: unknown, raw: string, status: number): void {
+  const error = pathValue(value, ['error']) ?? pathValue(value, ['response', 'error'])
+  if (error == null) return
+  const message = pathValue(error, ['message'])
+  throw new ApiError(typeof message === 'string' ? message : raw, status, {
+    code: errorCode(error),
+    inStream: true,
+  })
+}
+
 // readEventStream 逐帧读取公开协议流式响应
 async function readEventStream(
   response: Response,
   input: PlaygroundInput,
   onDelta: (chunk: PlaygroundChunk, raw: string) => void,
 ): Promise<void> {
-  if (response.body === null) throw new Error('Empty event stream')
+  if (response.body === null) throw new StreamIncompleteError('Empty event stream', response.status)
 
   const events = response.body
     .pipeThrough(new TextDecoderStream())
     .pipeThrough(new EventSourceParserStream())
-  for await (const { data } of events) {
-    if (input.protocol === 'openai-chat' && data === '[DONE]') return
-    const value: unknown = JSON.parse(data)
-    const error = pathValue(value, ['error']) ?? pathValue(value, ['response', 'error'])
-    if (error != null) {
-      const message = pathValue(error, ['message'])
-      throw new ApiError(typeof message === 'string' ? message : data, response.status)
+  const finished = await readResponseBody(response, async () => {
+    for await (const { data } of events) {
+      if (input.protocol === 'openai-chat' && data === '[DONE]') return true
+      const value: unknown = JSON.parse(data)
+      throwStreamError(value, data, response.status)
+      onDelta(responseChunk(input, value), data)
+      if (streamFinished(input, value)) return true
     }
-    onDelta(responseChunk(input, value), data)
-    if (streamFinished(input, value)) return
+    return false
+  })
+  if (finished) return
+  throw new StreamIncompleteError(
+    'Event stream ended before the protocol completion event',
+    response.status,
+  )
+}
+
+// readJSONStream 兜底读取以 JSON 返回的流式响应（Gemini 不带 alt=sse 时为 JSON 数组）：数组逐项、对象按一项交给 onDelta
+async function readJSONStream(
+  response: Response,
+  input: PlaygroundInput,
+  onDelta: (chunk: PlaygroundChunk, raw: string) => void,
+): Promise<void> {
+  const value: unknown = await readResponseBody(response, () => response.json())
+  for (const item of Array.isArray(value) ? value : [value]) {
+    const raw = JSON.stringify(item)
+    throwStreamError(item, raw, response.status)
+    onDelta(responseChunk(input, item), raw)
   }
-  throw new Error('Event stream ended before the protocol completion event')
 }
 
 // streamFinished 按各公开协议的结束事件确认请求完成
@@ -725,7 +881,14 @@ export async function runPlayground(
   signal: AbortSignal,
   onDelta: (chunk: PlaygroundChunk, raw: string) => void,
 ): Promise<{ status: number; chunk?: PlaygroundChunk; raw?: string }> {
-  const request = buildPlaygroundRequest(input)
+  let request: PlaygroundRequest
+  try {
+    request = buildPlaygroundRequest(input)
+  } catch (error) {
+    // 构造请求头失败（如 API Key 含非 Latin-1 字符）同样抛 TypeError：改为普通错误，界面显示浏览器给出的原因而不是服务离线
+    if (error instanceof TypeError) throw new Error(error.message, { cause: error })
+    throw error
+  }
   const prefix = playgroundPrefix(input)
   const response = await fetch(`${prefix}${request.path}`, {
     method: 'POST',
@@ -735,7 +898,7 @@ export async function runPlayground(
   })
 
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await playgroundResponseError(response)
   }
 
   if (input.mode === 'video') {
@@ -743,7 +906,7 @@ export async function runPlayground(
   }
 
   if (request.responseType === 'audio') {
-    const blob = await response.blob()
+    const blob = await readResponseBody(response, () => response.blob())
     return {
       status: response.status,
       chunk: {
@@ -755,11 +918,15 @@ export async function runPlayground(
   }
 
   if (input.mode === 'text' && input.stream) {
-    await readEventStream(response, input, onDelta)
+    if (response.headers.get('content-type')?.includes('application/json')) {
+      await readJSONStream(response, input, onDelta)
+    } else {
+      await readEventStream(response, input, onDelta)
+    }
     return { status: response.status }
   }
 
-  const value: unknown = await response.json()
+  const value: unknown = await readResponseBody(response, () => response.json())
   return {
     status: response.status,
     chunk: responseChunk(input, value),

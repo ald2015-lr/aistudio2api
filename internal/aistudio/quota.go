@@ -32,6 +32,9 @@ type QuotaCooldown struct {
 	// 如 generate_requests_global）：只写进冷却日志，用来核实各档位的真实上限；上游没给时为空
 	LimitValue string
 	Metric     string
+	// Escalate 为没有额度周期信息、上游也没给恢复时间（RetryInfo、Retry-After）的非全局限流 429：app 层按连续次数逐级加长冷却
+	// （见 AccountPool.MarkRateLimitCooldown）。分钟限额、每日限额、全局冷却与带恢复时间的 429 都为 false，按原样冷却
+	Escalate bool
 }
 
 // QuotaCooldownForError 解析上游分钟或每日额度限制。
@@ -94,6 +97,7 @@ func QuotaCooldownForError(err error, now time.Time) (QuotaCooldown, bool) {
 		Until: until, Global: global, Kind: kind, Reason: kind + ": " + err.Error(),
 		LimitValue: strings.TrimSpace(rpcError.Metadata["quota_limit_value"]),
 		Metric:     quotaMetricName(rpcError.Metadata["quota_metric"]),
+		Escalate:   kind == RateLimitKind && !global && rpcError.RetryDelay <= 0,
 	}, true
 }
 
@@ -112,16 +116,17 @@ const DailyQuotaKind = "每日限额"
 // MinuteQuotaKind 为分钟限额的冷却类型（quota_unit、quota_limit 等带每分钟周期，如 AI Studio 每账号每分钟 12 次的 GeneratePerMinutePerProjectPerUser）
 const MinuteQuotaKind = "分钟限额"
 
-// RateLimitKind 为没有额度周期信息的 429 的冷却类型（冷却 unknownRateLimitCooldown；上游给出 RetryInfo 时以它为准）
+// RateLimitKind 为没有额度周期信息的 429 的冷却类型（冷却 unknownRateLimitCooldown；上游给出 RetryInfo 时以它为准）。
+// 非全局、上游没给恢复时间的这类 429 由 app 层按连续次数逐级加长冷却（见 QuotaCooldown.Escalate）
 const RateLimitKind = "限流"
 
 // unknownRateLimitCooldown 为没有额度信息的 429 的冷却时长
 const unknownRateLimitCooldown = 30 * time.Second
 
-// ShortCooldownMax 为“短冷却”的上限：剩余不到它的冷却（分钟限额最长一分钟、没有额度信息的限流 30 秒，或长冷却的最后一段）
-// 很快自行恢复。淘汰选号不把这样的空闲 Worker 当作冷却中（WarmWorkerStates，不看冷却原因）；账号全局 * 上剩余不到它的
-// 额度类冷却（分钟限额、限流，见 rateCooldownReason）只等到期，同账号其他请求或非生成操作的成功不提前清除
-// （markModelAccessVerified、ClearCooldownIfGeneration）
+// ShortCooldownMax 为“短冷却”的上限：剩余不到它的冷却（分钟限额最长一分钟、没有额度信息的限流第一档 30 秒，或长冷却的最后一段）
+// 很快自行恢复。淘汰选号不把这样的空闲 Worker 当作冷却中（WarmWorkerStates：全局冷却剩余不少于它，或该模型所有支持的启用通道
+// 都在冷却且最早恢复不少于它才算，不看冷却原因）；账号全局 * 上剩余不到它的额度类冷却（分钟限额、限流，见 rateCooldownReason）
+// 只等到期，同账号其他请求或非生成操作的成功不提前清除（markModelAccessVerified、ClearCooldownIfGeneration）
 const ShortCooldownMax = 2 * time.Minute
 
 // rateCooldownReason 判断冷却原因来自分钟限额或限流的 429（QuotaCooldownForError 写的原因为“类型: 原文”，落盘后前缀照样保留）。
