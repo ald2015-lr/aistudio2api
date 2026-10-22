@@ -760,6 +760,8 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 - pro/ultra 账号的每日限额（文案 `You've reached your usage limit …`，每天 50 次）：按每日限额冷却到太平洋时间次日零点，日志带 `上限=50`；不再当作裸限流 30 秒、逐级加长（原先同一账号要白试几次、过 5 分钟以上才淘汰）。
 - pro/ultra 账号每分钟 12 次的限额（所有模型、两个通道共用）：按分钟限额冷却整个账号到这一分钟结束，日志带 `上限=12 | 指标=generate_requests_global`；`ACCOUNT_RPM_LIMIT` 提前限速。
 
+运行日志里出现 `额度 429 详情未识别` 时，请把整行发给开发者：这种 429 带着 GeminiApiErrorDetails，但布局与上面几种不同、没有解析出指标（冷却日志带 `详情类型=`、没有 `指标=`），冷却只能按文案判断（裸 `Quota exceeded` 按裸限流逐级冷却），这一行带着详情原文，用来扩展解析（同一种 10 分钟最多一条，见[运行日志](docs/logging.md#额度冷却日志)；`bash tools/diag_busy.sh` 的第 3 段也会列出这些行）。
+
 每日限额在两个通道已判定共用额度时（运行日志的“每日额度通道判定”为共用）同时冷却另一个通道，常驻 Worker 立即登记淘汰（冷却剩余不少于 15 分钟时），请求立即换号、不退避；观察中时先在同账号的另一个通道再试一次。`模型=` 是上游计额度用的模型，可能与请求的模型名不同（如请求 `gemini-3.1-pro-preview`、日志为 `gemini-3.1-pro`）。没有指标的 429 另带 `详情类型=`（上游附带的详情类型），用来核实裸 `Quota exceeded` 是否带了没有解析的额度详情。
 
 **一键诊断**：`bash tools/diag_busy.sh`（在程序目录下运行，或用 `APP_DIR=/path/to/app` 指定程序目录）汇总号池繁忙的原因，最后给出自动结论：

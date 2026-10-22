@@ -479,7 +479,7 @@ LOG_KEYS = [key.encode() for key in (
     "账号冷却", "账号切换", "账号每分钟请求已满", "排队等待 |", "主用模型", "限流档位清零", "号池级限流",
     "Worker 就绪", "Worker 启动失败", "按需扩容", "按需替换", "空闲回收", "冷却轮换", "冷却淘汰", "补登记淘汰", "排空",
     "Worker 重建", "Worker 停止 |", "替补", "回收冷却占位", "常驻 Worker 已失败",
-    "管理服务就绪", "收到停止信号", "排队进度日志已省略", "请求账本写入队列已满")]
+    "管理服务就绪", "收到停止信号", "排队进度日志已省略", "请求账本写入队列已满", "额度 429 详情未识别")]
 
 
 def first_time_from(handle, position, size):
@@ -989,6 +989,32 @@ if cool_lines:
         print(f"    额度计数的模型（模型=，可能与请求的模型名不同）：{top(quota_models, 6)}")
     if detail_types:
         print(f"    没有指标的冷却带的详情类型：{top(detail_types, 4)}（裸 429 带着没有解析的详情，请把这一行发给开发者）")
+
+# 额度 429 详情未识别（app/quota_detail_log.go）：429 带着 GeminiApiErrorDetails 却没有解析出指标（冷却日志带 详情类型=），行里带这份详情的原文；
+# 服务端同一种（类型 + 文案，文案里的数字不计）10 分钟最多写一条、任意 10 分钟最多 64 条。这里同样把文案里的连续数字换成 N 再分种，
+# 每种最多列 3 条原文不同的行（照原样列），长行截断到 1500 字
+UNPARSED_RE = re.compile(r"^额度 429 详情未识别 \| 类型=(.*?) \| 文案=(.*?) \| 原文=(.*) \| 请把这一行发给开发者$")
+unparsed_lines = [e for e in logs if e["t"] >= SINCE and e["msg"].startswith("额度 429 详情未识别 |")]
+if unparsed_lines:
+    unparsed_kinds = {}
+    for e in unparsed_lines:
+        line = e["msg"].split("\n")[0]
+        match = UNPARSED_RE.match(line)
+        if match:
+            kind, raw = (match.group(1), re.sub(r"[0-9]+", "N", match.group(2))), match.group(3)
+        else:
+            kind, raw = ("?", re.sub(r"[0-9]+", "N", line[:200])), line
+        samples = unparsed_kinds.setdefault(kind, {})
+        if raw not in samples and len(samples) < 3:
+            samples[raw] = (e["t"], line if len(line) <= 1500 else line[:1500] + f"…（截断，共 {len(line)} 字）")
+    print(f"  ⚠ 额度 429 详情未识别：{len(unparsed_lines)} 行、{len(unparsed_kinds)} 种文案（429 带着 GeminiApiErrorDetails，"
+          "却没有解析出指标，冷却只能按文案判断，裸 Quota exceeded 按裸限流逐级冷却）")
+    print("    请把下面这几行原样发给开发者，用来扩展解析（每种文案最多 3 条，文案里的数字不计）：")
+    for samples in unparsed_kinds.values():
+        for moment, line in samples.values():
+            print(f"    {local(moment)}  {line}")
+    VERDICTS.append(f"日志里有 {len(unparsed_lines)} 行“额度 429 详情未识别”（{len(unparsed_kinds)} 种文案）："
+                    "这种 429 没有解析出指标，请把第 3 段列出的这几行发给开发者")
 
 
 def sharing_separate(stats):

@@ -2279,6 +2279,8 @@ type trackedService struct {
 	primaryModels atomic.Pointer[primaryModelSettings]
 	// queueProgress 为重复的排队进度日志全进程共用的限流（见 queue_progress.go）
 	queueProgress queueProgressLimiter
+	// unparsedQuotaDetails 为“额度 429 详情未识别”日志的去重状态（见 quota_detail_log.go）
+	unparsedQuotaDetails unparsedQuotaDetailLog
 	// resetWait 为不固定账号的请求等待同账号关闭失败 Worker 的上限，nil 时为 defaultWorkerResetWait（见 worker_reset.go，测试调整）
 	resetWait atomic.Pointer[time.Duration]
 	// maxDuration 为生成请求的总时长上限（见 generate_context.go），0 为默认（generateMaxDurationFor），只给包内测试调低
@@ -4744,7 +4746,8 @@ func channelFallback(selection aistudio.AccountSelection) aistudio.AccountSelect
 // （见 rate_limit_guard.go）：pool 为请求的号池（号池级限流判定的范围），escalate 为这次失败能否升档（已向客户端输出后为假），
 // fromGeneration 为错误来自生成本身（不是文件复制、附件上传等发出生成请求之前的步骤）。
 // ok 表示 err 是额度错误；stateErr 为写入冷却状态失败的原因。冷却没有写入（模型目录已更新，或同账号取得租约更晚的请求已写回结果）时
-// 如实记一行 INFO，不登记淘汰、不做通道共用额度的学习，ok 仍为真：调用方照常按已冷却换号
+// 如实记一行 INFO，不登记淘汰、不做通道共用额度的学习，ok 仍为真：调用方照常按已冷却换号。
+// 额度错误带着 GeminiApiErrorDetails、却没有解析出额度指标时，在冷却日志之后另记一行“额度 429 详情未识别”（见 quota_detail_log.go）
 func (service *trackedService) applyQuotaCooldown(
 	lease *aistudio.AccountLease, accountLabel string, modelID string, err error, note string,
 	pool aistudio.PoolScope, escalate bool, fromGeneration bool,
@@ -4753,6 +4756,8 @@ func (service *trackedService) applyQuotaCooldown(
 	if !ok {
 		return cooldown, false, nil
 	}
+	// 最先登记、最后执行：排在冷却日志（含另一通道的同步冷却与淘汰登记）之后，各个返回路径都会写
+	defer service.logUnparsedQuotaDetail(accountLabel, err)
 	// 只有生成本身返回的裸限流逐级冷却：文件复制、附件上传（Drive）返回的 429 与模型额度无关（同 403 只处理生成本身的错误），
 	// 照原路径只冷却本通道 30 秒，不建档位、不同步另一通道、不计入号池级限流，之后照常在同账号另一通道再试
 	if cooldown.Escalate && fromGeneration {
