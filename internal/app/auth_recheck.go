@@ -284,6 +284,11 @@ func (service *trackedService) noteLoginRestored(accountID string) {
 	}
 	service.catalogSync.noteAuthValid(accountID)
 	service.authRecheck.forget(accountID)
+	// “Drive 不可用”记忆（见 aistudio drive_memory.go）：重新登录与认证文件更新推进认证代际，记录本来就失效；管理验证不推进代际，
+	// 在这里清掉，下一个带图请求重新探测 Drive 授权（例如在官网补做了 Drive 同意之后）
+	if forgetter, ok := service.service.(driveUnavailableForgetter); ok {
+		forgetter.ForgetDriveUnavailable(accountID)
+	}
 	if service.pool == nil {
 		return
 	}

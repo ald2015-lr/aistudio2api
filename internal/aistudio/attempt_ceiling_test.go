@@ -188,8 +188,9 @@ func TestAttemptCeilingTranscribeVeoLive(t *testing.T) {
 	}
 }
 
-// TestAttemptCeilingLimitsUpload 自动选号的上传在 GenerateAccessToken 401（出口被拒、Cookie 批量作废）时换号：带换号上限 4 时只试 4 个账户，
-// 只有这 4 个写全局短冷却；没有上限时照旧把就绪账户试一遍（第 2 轮复查：原先一次上传能把整个号池试个遍、全部写冷却）
+// TestAttemptCeilingLimitsUpload 自动选号的上传在 GenerateAccessToken 401（没有 Drive 授权、出口被拒、Cookie 批量作废）时换号：
+// 带换号上限 4 时只试 4 个账户；这些账户都不写冷却（别的请求照常使用），只记“Drive 不可用”；没有上限时照旧把就绪账户试一遍
+// （第 2 轮复查：原先一次上传能把整个号池试个遍；原先每个失败账户还写 2 分钟全局冷却）
 func TestAttemptCeilingLimitsUpload(t *testing.T) {
 	upload := func(ctx context.Context) (*PooledService, *accessTokenTransport, int, error) {
 		transport := &accessTokenTransport{}
@@ -236,8 +237,11 @@ func TestAttemptCeilingLimitsUpload(t *testing.T) {
 			cooled++
 		}
 	}
-	if cooled != 4 {
-		t.Fatalf("写了全局冷却的账户 %d 个，期望只有试过的 4 个", cooled)
+	if cooled != 0 {
+		t.Fatalf("写了全局冷却的账户 %d 个，期望没有（GenerateAccessToken 的 401 不写冷却）", cooled)
+	}
+	if remembered := service.drive.count(); remembered != 4 {
+		t.Fatalf("记着 Drive 不可用的账户 %d 个，期望试过的 4 个", remembered)
 	}
 	if _, _, attempts, _ := upload(context.Background()); attempts != 6 {
 		t.Fatalf("没有上限时尝试 %d 个账户，期望 6 个", attempts)

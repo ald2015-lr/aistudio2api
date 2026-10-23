@@ -2576,6 +2576,8 @@ type trackedService struct {
 	egressQueueWait time.Duration
 	// authNotes 为“账号需要登录”日志的去重状态（同账号 1 分钟最多一条，见 worker_unschedulable.go），零值可用
 	authNotes authRequiredNotes
+	// driveInlineNotes 为“Drive 未授权，附件改为内联”日志的去重状态（同账号 10 分钟最多一条，见 drive_inline.go），零值可用
+	driveInlineNotes driveInlineNotes
 	// authMarks 为“账号需要登录”的最近计数（状态接口的 auth_required_10m），零值可用
 	authMarks recentEvents
 	// authRecheck 为登录复核器（疑似登录失效的复核与需要登录账户的定期复核，见 auth_recheck.go）；只在 newRuntime 创建并挂上账户池的 gate，
@@ -4564,10 +4566,21 @@ func (service *trackedService) generateWithRetry(
 				request.Contents, attemptCopies, err = uploader.UploadInlineMediaToLease(
 					requestCtx, lease, request.Contents, attemptCopies,
 				)
-				if err == nil {
+				uploadElapsed := time.Since(uploadStartedAt).Round(time.Millisecond)
+				if retained, _ := inlineMediaInput(request.Contents); err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild {
+					// Playground 通道上附件仍是 inline data：账号没有 Drive 授权（GenerateAccessToken 401 / Code 16，或记着它刚返回过），
+					// 附件随生成请求内联发送，不冷却、不换号（见 aistudio.UploadInlineMediaToLease）。只写这一行、不写“内联附件处理完成”，
+					// 诊断按开头分开计数；同账号 10 分钟最多一行。去重名额先占后写，所以走 logDurable：普通日志在控制台队列满时会丢，
+					// 丢了这个账号 10 分钟内都不会再有这一行（带图请求高峰正是队列容易满的时候）
+					trace.Note("Drive 未授权，附件改为内联发送")
+					if service.driveInlineNotes.allow(request.AccountID, time.Now()) {
+						service.requests.logDurable(accountLabel, "INFO", fmt.Sprintf(
+							"Drive 未授权，附件改为内联 | 附件=%d | 原始=%dB | 耗时=%s", mediaCount, mediaBytes, uploadElapsed,
+						))
+					}
+				} else if err == nil {
 					service.requests.log(accountLabel, "INFO", fmt.Sprintf(
-						"内联附件处理完成 | 附件=%d | 原始=%dB | 耗时=%s",
-						mediaCount, mediaBytes, time.Since(uploadStartedAt).Round(time.Millisecond),
+						"内联附件处理完成 | 附件=%d | 原始=%dB | 耗时=%s", mediaCount, mediaBytes, uploadElapsed,
 					))
 				}
 			}

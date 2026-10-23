@@ -17,6 +17,8 @@ import (
 type PooledService struct {
 	pool   *AccountPool
 	client *Client
+	// drive 为按账号记住的“Drive 不可用”（GenerateAccessToken 401 / Code 16，见 drive_memory.go），只在内存
+	drive driveMemory
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文
@@ -463,8 +465,8 @@ var ErrAuthenticationRequired = errors.New("登录态失效")
 // DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证：登录页跳转、签名 Cookie 缺失或过期（ErrAuthenticationRequired），
 // 或用 Cookie 认证的 MakerSuite RPC 返回 HTTP 401 / 协议错误码 16。以下 401 不算登录失效证据（第 5 项，需要登录从 334 涨到 2041 的排查）：
 //   - Drive*（DriveUpload、DriveDownload、DriveDelete 等）：用的是 GenerateAccessToken 换来的 Bearer token，401 只说明 token 过期；
-//   - GenerateAccessToken：Drive 授权缺失（unauthorized_client）只表示没有 Drive 权限；其余 401 只让本次附件尝试失败，
-//     由调用方写短冷却（见 AccessTokenAuthFailure），不改账户状态。原先一次 401 就把账号标成需要登录，线上带图请求每次尝试都先换 token，
+//   - GenerateAccessToken：401 / Code 16（含 unauthorized_client）表示账号没有 Drive 授权（见 driveUnavailableError），不改账户状态、
+//     不写冷却：内联附件改为内联发送，其他需要 Drive 的路径只让这次尝试失败。原先一次 401 就把账号标成需要登录，线上带图请求每次尝试都先换 token，
 //     “发送 AI Studio GenerateAccessToken … 返回 HTTP 401”占了需要登录的大头
 func DefinitiveAuthenticationFailure(err error) bool {
 	if errors.Is(err, ErrAuthenticationRequired) {
@@ -475,8 +477,10 @@ func DefinitiveAuthenticationFailure(err error) bool {
 		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
 }
 
-// AccessTokenAuthFailure 判断错误是否为 GenerateAccessToken 返回的认证失败（401 / Code 16，Drive 授权缺失除外）：
-// 只让本次附件尝试失败，调用方对账号写模型无关的短冷却（AccessTokenFailureCooldown），不标需要登录、不登记淘汰
+// AccessTokenAuthFailure 判断错误是否为 GenerateAccessToken 返回的认证失败（401 / Code 16，明确的 unauthorized_client 除外，
+// 两者都按 Drive 不可用处理，见 driveUnavailableError）：不标需要登录、不写冷却、不登记淘汰。内联附件改为内联发送；
+// 文件上传、下载、删除、跨账户复制与转写的上传只让这次尝试失败，按“Drive 不可用”记住这个账号。
+// 原先对账号写 2 分钟模型无关的全局冷却，导入的账号大多没有 Drive 授权，一批带图请求就把大部分驻留 Worker 挡住，纯文字请求也用不上
 func AccessTokenAuthFailure(err error) bool {
 	if errors.Is(err, ErrAuthenticationRequired) || driveAuthorizationMissing(err) {
 		return false
@@ -485,10 +489,6 @@ func AccessTokenAuthFailure(err error) bool {
 	return errors.As(err, &rpcError) && strings.EqualFold(strings.TrimSpace(rpcError.Method), "GenerateAccessToken") &&
 		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
 }
-
-// AccessTokenFailureCooldown 为 GenerateAccessToken 认证失败后账号的全局冷却：短到不算“冷却中”的淘汰对象（不超过 ShortCooldownMax），
-// 又能让紧接着的换号避开它
-const AccessTokenFailureCooldown = ShortCooldownMax
 
 // cookieAuthenticatedMethod 判断 RPC 是否用账号 Cookie 认证（它的 401 才是登录失效的证据）：Drive* 用 Bearer token，
 // GenerateAccessToken 的 401 另按 AccessTokenAuthFailure 处理
@@ -523,8 +523,9 @@ func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessSco
 		_, markErr := lease.MarkAuthenticationFailure(err)
 		return markErr
 	}
-	if AccessTokenAuthFailure(err) {
-		return s.markAccessTokenCooldown(lease, err)
+	if driveUnavailableError(err) {
+		// Drive 不可用不写冷却：记忆在换 token 的地方已经记下（见 drive_memory.go）。生成与计数本身不换 Drive token，这里只是兜底
+		return nil
 	}
 	now := time.Now()
 	until := now.Add(30 * time.Second)

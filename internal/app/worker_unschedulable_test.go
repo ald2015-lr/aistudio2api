@@ -18,7 +18,7 @@ import (
 )
 
 // authFailureError 构造上游确认登录失效的错误（HTTP 401、协议错误码 16，用户报告的原文）。用 GenerateContent：
-// GenerateAccessToken 的 401 只让附件尝试失败并短冷却，不算登录失效（见 aistudio.AccessTokenAuthFailure）
+// GenerateAccessToken 的 401 表示账号没有 Drive 授权（附件改为内联发送），不算登录失效（见 aistudio.AccessTokenAuthFailure）
 func authFailureError() error {
 	return &aistudio.RPCError{
 		Method: "GenerateContent", StatusCode: http.StatusUnauthorized, Code: 16,

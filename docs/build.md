@@ -160,7 +160,7 @@ Build 目录保存在账户内存中，不写入 `runtime-state.json`。读取�
 
 | 输入 | Build | Playground |
 | --- | --- | --- |
-| 内联附件 | 直接写入 `inlineData` | 上传到本次生成账户的 Drive，以 file ID 引用 |
+| 内联附件 | 直接写入 `inlineData` | 上传到本次生成账户的 Drive，以 file ID 引用；账户没有 Drive 授权时保持 inline data 内联发送（见 [protocol.md](protocol.md)） |
 | YouTube 链接 | `fileData` | external media Part |
 | Drive 文件引用 | 不接受 | 使用文件所属账户 |
 

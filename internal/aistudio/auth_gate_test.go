@@ -204,9 +204,10 @@ func (transport *accessTokenTransport) DeleteDrive(context.Context, string, stri
 	return nil
 }
 
-// TestInlineMediaAccessTokenUnauthorizedCools 带图请求换 token 时 GenerateAccessToken 返回 401：只让本次附件尝试失败，
-// 账户写模型无关的短冷却（不超过 ShortCooldownMax），不标需要登录
-func TestInlineMediaAccessTokenUnauthorizedCools(t *testing.T) {
+// TestInlineMediaAccessTokenUnauthorizedInlines 带图请求换 token 时 GenerateAccessToken 返回 401 / Code 16（线上原文
+// “Request is missing required authentication credential”，不是 unauthorized_client）：按账号没有 Drive 授权处理，
+// 原样返回 inline data Part、没有错误，账户不写任何冷却、不标需要登录（原先写 2 分钟模型无关的全局冷却并换号）
+func TestInlineMediaAccessTokenUnauthorizedInlines(t *testing.T) {
 	accountID := "token@example.com"
 	pool := testPoolWithAccount(t, accountID)
 	client := &Client{transport: &accessTokenTransport{}, catalogs: make(map[string]modelCatalog), tiers: make(map[string]BenefitTier)}
@@ -220,26 +221,24 @@ func TestInlineMediaAccessTokenUnauthorizedCools(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer lease.Release()
-	contents := []Content{{Role: RoleUser, Parts: []Part{{InlineData: &Blob{MIME: "image/png", Data: []byte{1, 2, 3}}}}}}
-	_, _, uploadErr := service.UploadInlineMediaToLease(ctx, lease, contents, nil)
-	if !AccessTokenAuthFailure(uploadErr) || DefinitiveAuthenticationFailure(uploadErr) {
-		t.Fatalf("应以 GenerateAccessToken 授权失败结束，实际 %v", uploadErr)
+	blob := &Blob{MIME: "image/png", Data: []byte{1, 2, 3}}
+	contents := []Content{{Role: RoleUser, Parts: []Part{{Text: "看图"}, {InlineData: blob}}}}
+	rewritten, temporary, uploadErr := service.UploadInlineMediaToLease(ctx, lease, contents, nil)
+	if uploadErr != nil {
+		t.Fatalf("Drive 未授权应改为内联发送、不报错，实际 %v", uploadErr)
+	}
+	if len(rewritten) != 1 || len(rewritten[0].Parts) != 2 || rewritten[0].Parts[1].InlineData != blob || rewritten[0].Parts[1].File != nil {
+		t.Fatalf("应原样保留 inline data Part，实际 %+v", rewritten)
+	}
+	if temporary.Count() != 0 {
+		t.Fatalf("内联发送不应创建临时 Drive 文件：%d 个", temporary.Count())
 	}
 	status, _ := pool.StatusOf(accountID)
 	if status.State == AccountAuthRequired {
 		t.Fatal("GenerateAccessToken 的 401 不应把账户标为需要登录")
 	}
-	if !pool.AccountCoolingDown(accountID, "") {
-		t.Fatal("GenerateAccessToken 的 401 后账户应有全局短冷却")
-	}
-	pool.mu.Lock()
-	cooldown := pool.byID[accountID].runtime.Cooldowns[globalCooldownKey]
-	pool.mu.Unlock()
-	if remaining := time.Until(cooldown.Until); remaining <= 0 || remaining > ShortCooldownMax {
-		t.Fatalf("冷却剩余 %s，期望不超过 %s", remaining, ShortCooldownMax)
-	}
-	if !strings.Contains(cooldown.Reason, "GenerateAccessToken") {
-		t.Fatalf("冷却原因 = %q", cooldown.Reason)
+	if pool.AccountCoolingDown(accountID, "") || len(status.Cooldowns) != 0 {
+		t.Fatalf("GenerateAccessToken 的 401 不应写任何冷却：%+v", status.Cooldowns)
 	}
 }
 

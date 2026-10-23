@@ -341,9 +341,11 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 			// 上传不限模型，任何就绪账户都能承担：一个都没有时是号池一侧的原因（需要重新登录、已停用或号池为空）
 			return FileRef{}, s.pool.NoEligibleError(AccountSelection{Pool: scope})
 		}
+		// 记着 Drive 不可用的账户排到最后：导入的账号大多没有 Drive 授权，换号上限只有几次时先试可能有授权的账户
+		candidateAccountIDs = s.preferDriveCandidates(candidateAccountIDs)
 		maxAttempts = len(candidateAccountIDs)
 		// 换号上限（app 层的数据请求设为 4，见 WithAttemptCeiling）：认证失败只要还没读请求体就换号，出口被拒、Cookie 批量作废时
-		// 原先一次上传能把就绪账户试个遍，每个失败账户还写一次全局短冷却（GenerateAccessToken 401），连带挡住空闲热 Worker 的生成
+		// 原先一次上传能把就绪账户试个遍（当时每个失败账户还写一次全局短冷却，连带挡住空闲热 Worker 的生成）
 		if ceiling := attemptCeilingFrom(ctx); ceiling > 0 {
 			maxAttempts = min(maxAttempts, ceiling)
 		}
@@ -366,7 +368,7 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 		counter := &uploadCountingReader{reader: source}
 		request.Reader = counter
 		var token string
-		file, token, uploadErr = s.client.uploadFile(attemptCtx, request)
+		file, token, uploadErr = s.uploadFileForLease(attemptCtx, lease, request)
 		if uploadErr == nil && purpose == "" {
 			purpose, uploadErr = request.ResolvePurpose(attemptCtx)
 			purpose = strings.TrimSpace(purpose)
@@ -385,7 +387,8 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 				slog.Warn("Drive 文件回收失败", "account", request.AccountID, "file", file.ID, "error", cleanupErr)
 			}
 		}
-		// 认证失败（登录失效、GenerateAccessToken 或 Drive 的 401）时自动选号的上传换一个账户再试；只有登录失效会改账户状态
+		// 认证失败（登录失效、GenerateAccessToken 或 Drive 的 401）时自动选号的上传换一个账户再试（按候选列表逐个换，不会选回失败的账户）；
+		// 只有登录失效会改账户状态，GenerateAccessToken 的 401 只记“Drive 不可用”，不写冷却，别的请求照常使用这个账户
 		authFailure := uploadAuthFailure(uploadErr)
 		stateErr := error(nil)
 		if uploadErr != nil {
@@ -523,7 +526,7 @@ func (s *PooledService) DownloadFile(ctx context.Context, fileID string) (MediaS
 		return MediaStream{}, err
 	}
 	accountID := lease.Account().ID
-	token, downloadErr := s.client.GenerateAccessToken(ContextWithAccountLease(ctx, lease), accountID)
+	token, downloadErr := s.accessTokenForLease(ctx, lease)
 	var media MediaStream
 	if downloadErr == nil {
 		drive, ok := s.client.transport.(DriveTransport)
@@ -570,7 +573,7 @@ func (s *PooledService) DeleteFile(ctx context.Context, fileID string) error {
 	}
 	accountID := lease.Account().ID
 	attemptCtx := ContextWithAccountLease(ctx, lease)
-	token, deleteErr := s.client.GenerateAccessToken(attemptCtx, accountID)
+	token, deleteErr := s.accessTokenForLease(attemptCtx, lease)
 	if deleteErr == nil {
 		deleteErr = s.client.deleteDriveFile(attemptCtx, accountID, token, fileID)
 	}
@@ -608,32 +611,19 @@ func driveFileNotFound(err error, method string) bool {
 	return errors.As(err, &rpcError) && rpcError.Method == method && rpcError.StatusCode == http.StatusNotFound
 }
 
-// driveAuthorizationMissing 判断账户仅缺少 Google Drive 授权
-// markLeaseAuthFailure 处理文件与附件路径上的认证失败：GenerateAccessToken 的 401 只写模型无关的短冷却（不改账户状态、不登记淘汰）；
-// Drive* 的 Bearer 401 不算登录失效，不处理；其余登录失效按 MarkAuthenticationFailure（上游 401 先记疑似失效并复核，见 auth_gate.go）
+// markLeaseAuthFailure 处理文件与附件路径上的认证失败：GenerateAccessToken 的 401 / Code 16 是 Drive 不可用（记忆在换 token 处已记下，
+// 见 drive_memory.go），不改账户状态、不写冷却、不登记淘汰，别的请求照常使用这个账户；Drive* 的 Bearer 401 不算登录失效，不处理；
+// 其余登录失效按 MarkAuthenticationFailure（上游 401 先记疑似失效并复核，见 auth_gate.go）。
+// 原先 GenerateAccessToken 的 401 写 2 分钟模型无关的全局冷却（原因“附件授权失败…”），没有 Drive 授权的账号一多，带图请求把大部分驻留 Worker 挡住
 func (s *PooledService) markLeaseAuthFailure(lease *AccountLease, err error) error {
 	switch {
-	case AccessTokenAuthFailure(err):
-		return s.markAccessTokenCooldown(lease, err)
+	case driveUnavailableError(err):
+		return nil
 	case DefinitiveAuthenticationFailure(err):
 		_, markErr := lease.MarkAuthenticationFailure(err)
 		return markErr
 	}
 	return nil
-}
-
-// markAccessTokenCooldown 对 GenerateAccessToken 认证失败的账户写 AccessTokenFailureCooldown 的全局冷却：紧接着的换号避开它，
-// 不缩短已有的更长冷却；时长不到“冷却中”的门槛（ShortCooldownMax），不会因此被当成冷却的 Worker 替换或登记淘汰
-func (s *PooledService) markAccessTokenCooldown(lease *AccountLease, err error) error {
-	if lease == nil || lease.Account() == nil || s.pool == nil {
-		return nil
-	}
-	reason := "附件授权失败（GenerateAccessToken 认证失败，不标需要登录）：" + err.Error()
-	_, _, markErr := s.pool.TryExtendCooldownIfGeneration(
-		lease.Account().ID, "", lease.ModelAccessGeneration(), lease.CheckedAt(),
-		time.Now().Add(AccessTokenFailureCooldown), reason,
-	)
-	return markErr
 }
 
 // uploadAuthFailure 判断上传失败是否为认证失败（换账户可能成功）：登录失效、GenerateAccessToken 的 401，以及 Drive 的 Bearer 401；
@@ -649,6 +639,7 @@ func uploadAuthFailure(err error) bool {
 	return errors.As(err, &rpcError) && (rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
 }
 
+// driveAuthorizationMissing 判断 GenerateAccessToken 明确返回 Drive 授权缺失（401、Code 16、unauthorized_client）
 func driveAuthorizationMissing(err error) bool {
 	var rpcError *RPCError
 	return errors.As(err, &rpcError) && rpcError.Method == "GenerateAccessToken" &&
@@ -703,7 +694,7 @@ func (s *PooledService) CopyFileReferencesToLease(
 				return nil, nil, errors.Join(err, copies.Cleanup())
 			}
 			targetCtx := ContextWithAccountLease(ctx, target)
-			copy, token, uploadErr := s.client.uploadFile(targetCtx, UploadRequest{
+			copy, token, uploadErr := s.uploadFileForLease(targetCtx, target, UploadRequest{
 				AccountID: targetID,
 				Name:      metadata.Name,
 				MIME:      metadata.MIME,
@@ -760,7 +751,10 @@ func (s *PooledService) CopyFileReferencesToLease(
 	return rewritten, copies, nil
 }
 
-// UploadInlineMediaToLease 将内联附件上传到目标账户并改写为临时 Drive 引用
+// UploadInlineMediaToLease 将内联附件上传到目标账户并改写为临时 Drive 引用。目标账户的 Drive 不可用时（GenerateAccessToken 返回
+// 401 / 协议 Code 16，或记忆里这个账户刚返回过，见 drive_memory.go）不报错，原样保留 inline data Part 随生成请求内联发送：
+// 不写冷却、不换号、不改账户状态。Playground 通道上返回的内容仍带 inline data 即为这种内联发送（Build 通道本来就直接携带 inlineData），
+// app 层据此写“Drive 未授权，附件改为内联”。登录失效（ErrAuthenticationRequired）照旧按认证失败处理并返回错误
 func (s *PooledService) UploadInlineMediaToLease(
 	ctx context.Context,
 	target *AccountLease,
@@ -818,16 +812,23 @@ func (s *PooledService) UploadInlineMediaToLease(
 			})
 		}
 	}
-	token, uploadErr := s.client.GenerateAccessToken(targetCtx, targetID)
+	// 记着 Drive 不可用（认证代际没变、没过期）的账户不再换 token，省掉一次往返，直接内联发送
+	if len(jobs) > 0 && s.driveKnownUnavailable(target) {
+		return rewritten, temporary, nil
+	}
+	token, uploadErr := s.accessTokenForLease(targetCtx, target)
 	drive, ok := s.client.transport.(DriveTransport)
 	if uploadErr == nil && !ok {
 		uploadErr = fmt.Errorf("AI Studio transport 不支持 Drive")
 	}
 	if uploadErr != nil {
-		if driveAuthorizationMissing(uploadErr) {
+		if driveUnavailableError(uploadErr) {
+			// 账户没有 Drive 授权（unauthorized_client 与其他 401 / Code 16 一样）：保留原始 inline data Part，在这个账户上继续生成，
+			// 不写冷却、不换号、不改账户状态，也不计入认证失败。账户其实已登出时随后的 GenerateContent 返回 401，由生成的认证流程处理。
+			// 原先除 unauthorized_client 外的 401 让这次尝试失败、对账户写 2 分钟全局冷却后换号，线上连续几个账户都换不到附件授权
 			return rewritten, temporary, nil
 		}
-		// GenerateAccessToken 的 401 只让本次附件尝试失败并短暂冷却（换号避开它），不标需要登录
+		// 登录失效（签名 Cookie 缺失、登录页跳转）照旧按认证失败处理
 		uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
 		return nil, nil, errors.Join(uploadErr, temporary.Cleanup())
 	}

@@ -322,6 +322,11 @@ def short_text(text, limit=50):
     return text[:limit] or "(无详情)"
 
 
+# 换 Drive token（GenerateAccessToken）返回 401 / 协议错误码 16：账号没有授权 Google Drive，不是登录失效（aistudio/drive_memory.go
+# driveUnavailableError）；错误原文为“AI Studio GenerateAccessToken 返回 HTTP 401、协议错误码 16: …”（aistudio/client.go RPCError）
+DRIVE_TOKEN_401_RE = re.compile(r"GenerateAccessToken 返回 HTTP (?:401|\d+、协议错误码 16)")
+
+
 def attempt_class(error):
     error = error or ""
     lower = error.lower()
@@ -329,6 +334,10 @@ def attempt_class(error):
         return "发出前已冷却（没有发到上游）"
     if "HTTP 429" in error:
         return "429·" + quota_class(error)
+    # 必须在通用的 401 之前：旧版本带图请求每次尝试先换 Drive token，没有 Drive 授权的账号这里 401 后换号，归为登录失效会把
+    # 号池繁忙的此前失败与结论引向 Cookie 失效（与第 9 段“附件授权”矛盾）；新版本转写上传、跨账户复制文件引用仍会这样失败
+    if DRIVE_TOKEN_401_RE.search(error):
+        return "401 附件授权（Drive 未授权）"
     if "HTTP 401" in error:
         return "401 登录失效"
     if "HTTP 403" in error or "permission_denied" in lower:
@@ -420,8 +429,11 @@ def busy_fields(error):
 
 
 def cooldown_kind(reason):
-    # 冷却原因为"类型: 原文"（aistudio/quota.go），连续裸限流写成"限流: 连续限流第 N 档，原文"（aistudio/rate_strike.go）
+    # 冷却原因为"类型: 原文"（aistudio/quota.go），连续裸限流写成"限流: 连续限流第 N 档，原文"（aistudio/rate_strike.go）；
+    # 旧版本对 GenerateAccessToken 401 写的 2 分钟全局冷却以“附件授权失败（GenerateAccessToken 认证失败…）：”开头（新版本不再写）
     reason = reason or ""
+    if reason.startswith("附件授权失败"):
+        return "附件授权失败"
     level = re.search(r"连续限流第 (\d+) 档", reason[:40])
     if level:
         return "限流·" + ladder_name(int(level.group(1)))
@@ -515,6 +527,8 @@ LOG_KEYS += [key.encode() for key in ("模型目录", "账号需要登录 |")]
 LOG_KEYS += [key.encode() for key in ("出口限流", "出口限速", "出口每分钟请求已满", "出口几乎完全被拒")]
 # 第 9 段：登录复核（app/auth_recheck.go）与坏号记忆（app/bad_accounts.go）、管理验证的结论
 LOG_KEYS += [key.encode() for key in ("登录复核", "疑似登录失效", "连续裸限流", "账户验证完成")]
+# 第 9 段：附件授权（app/runtime.go）：Drive 上传成功与账号没有 Drive 授权时改为内联发送
+LOG_KEYS += [key.encode() for key in ("内联附件处理完成", "Drive 未授权，附件改为内联")]
 
 
 def first_time_from(handle, position, size):
@@ -1801,8 +1815,8 @@ if sent:
         if hit * 3 >= len(values) and len(values) >= 5:
             VERDICTS.append(f"有 {hit}/{len(values)} 个账号在某个 60 秒内用满了 ACCOUNT_RPM_LIMIT={rpm_limit}：每分钟上限是吞吐的硬约束之一")
 
-# ================= 9. 模型目录同步与登录失效 =================
-section(f"9. 模型目录同步与登录失效（最近 {MINUTES} 分钟的运行日志）")
+# ================= 9. 模型目录同步、登录失效与附件授权 =================
+section(f"9. 模型目录同步、登录失效与附件授权（最近 {MINUTES} 分钟的运行日志）")
 catalog_logs = [e for e in logs if e["t"] >= SINCE]
 catalog_starts = [e for e in catalog_logs if "准备模型目录" in e["msg"]]
 for entry in catalog_starts:
@@ -1881,6 +1895,56 @@ if verify_lines:
 if not (catalog_starts or catalog_summary_lines or catalog_pauses or catalog_failures or catalog_empties or auth_required_lines
         or suspect_lines or recheck_lines or recovered_lines or bad_lines or verify_lines):
     print("  窗口内没有模型目录同步与需要登录的日志")
+# 附件授权（aistudio/upload.go UploadInlineMediaToLease）：带图请求每次尝试先换 Drive token（GenerateAccessToken）。
+# 新版本：401 / Code 16（账号没有 Drive 授权，导入的账号多半没走过官网的 Drive 同意）不冷却、不换号，附件改为内联发送，
+# 写“Drive 未授权，附件改为内联”（同账号 10 分钟最多一行，记住的账号 6 小时内不再换 token）；上传成功写“内联附件处理完成”
+# （Build 通道直接携带附件，同样写这一行，所以它不说明账号有 Drive 授权）。
+# 换号原因为 GenerateAccessToken 401 的“账号切换”：旧版本来自附件尝试（401 后写 2 分钟全局冷却再换号）；新版本附件不再这样换号，
+# 这类行只来自仍需要 Drive 的转写上传（app/transcriptions.go）与跨账户复制文件引用（app/runtime.go），只让这次尝试失败、换号、不冷却。
+# 窗口内有“Drive 未授权，附件改为内联”即已运行新版本，早于其中第一行的 401 换号行可能是升级前的附件尝试。
+# 被冷却挡住的换号原因含“已进入冷却”（截到的冷却原因里仍有“GenerateAccessToken 返回 HTTP 401”），这里不计。日志 source 为账号
+attach_done = [e for e in catalog_logs if e["msg"].startswith("内联附件处理完成")]
+attach_inline = [e for e in catalog_logs if e["msg"].startswith("Drive 未授权，附件改为内联")]
+attach_401 = [e for e in catalog_logs if e["msg"].startswith("账号切换") and DRIVE_TOKEN_401_RE.search(e["msg"])
+              and "已进入冷却" not in e["msg"]]
+if attach_done or attach_inline or attach_401:
+    attach_ok_accounts = {e["source"] for e in attach_done}
+    attach_inline_accounts = {e["source"] for e in attach_inline}
+    attach_401_accounts = {e["source"] for e in attach_401}
+    attach_never = attach_401_accounts - attach_ok_accounts
+    attach_since = min(e["t"] for e in attach_inline) if attach_inline else None
+    attach_401_new = [e for e in attach_401 if attach_since is not None and e["t"] >= attach_since]
+    # 401 占比只在旧版本口径（窗口内没有“Drive 未授权，附件改为内联”）下使用，分母为 401 换号行与“内联附件处理完成”之和
+    attach_ratio = len(attach_401) * 100 // (len(attach_401) + len(attach_done)) if attach_401 else 0
+    print(f"  附件授权：内联附件处理完成 {len(attach_done)} 行（{len(attach_ok_accounts)} 个账号，含 Build 通道直接携带附件的请求），"
+          f"Drive 未授权、附件改为内联 {len(attach_inline)} 行（{len(attach_inline_accounts)} 个账号，同账号 10 分钟最多一行）")
+    if attach_401:
+        if not attach_inline:
+            origin = "旧版本的附件尝试：401 后冷却 2 分钟再换号"
+        else:
+            origin = "已运行新版本：这些来自转写上传、跨账户复制文件引用等仍需要 Drive 的请求"
+            if len(attach_401_new) < len(attach_401):
+                origin += (f"，其中 {len(attach_401) - len(attach_401_new)} 行早于第一条“Drive 未授权，附件改为内联”，"
+                           "可能是升级前的附件尝试")
+        # 新版本这类行只来自转写与跨账户复制、按尝试逐条记，与限频的“Drive 未授权”行口径不同，比值没有意义，不给占比
+        ratio_note = "" if attach_inline else f"，占附件授权相关行（这类 401 与内联附件处理完成之和）的 {attach_ratio}%"
+        print(f"    换号原因为 GenerateAccessToken 401 的“账号切换”{len(attach_401)} 行（{origin}；不含被冷却挡住的{ratio_note}），"
+              f"涉及 {len(attach_401_accounts)} 个账号，其中窗口内没有“内联附件处理完成”的 "
+              f"{len(attach_never)} 个" +
+              (f"、窗口内也有“Drive 未授权，附件改为内联”的 {len(attach_401_accounts & attach_inline_accounts)} 个" if attach_inline else ""))
+    if attach_inline:
+        # 新版本：带图请求的附件已改为内联，401 换号只来自转写与跨账户复制；“Drive 未授权”行限频，占比没有意义，只按次数提示
+        if len(attach_401_new) >= 20:
+            new_accounts = {e["source"] for e in attach_401_new}
+            VERDICTS.append(
+                f"GenerateAccessToken 401 换号 {len(attach_401_new)} 次（{len(new_accounts)} 个账号）：已运行新版本，带图请求的附件不再因此换号，"
+                "这些 401 来自转写上传、跨账户复制文件引用等仍需要 Drive 的请求（只让这次尝试失败并换号、不冷却），涉及的账号没有 Drive 授权；"
+                "号池里这类账号多时这些请求容易失败，需要这些功能请为账号补做 Drive 授权；看第 9 段“附件授权”")
+    elif len(attach_401) >= 20 and attach_ratio >= 50:
+        VERDICTS.append(
+            f"附件授权（GenerateAccessToken）401 {len(attach_401)} 次（占附件授权相关行的 {attach_ratio}%），{len(attach_never)} 个账号窗口内没有"
+            "“内联附件处理完成”（该行含 Build 通道，实际没有 Drive 授权的账号只多不少）：账号没有 Drive 授权，窗口内没有"
+            "“Drive 未授权，附件改为内联”，多半还是旧版本，新版本会改为内联发送（不冷却、不换号）；看第 9 段“附件授权”")
 # 复核确认的账户本身也写一条带“复核=仍失效”的“账号需要登录”，已在 auth_required_lines 里：只按它计数，不再加疑似确认（原先重复计算）
 if len(auth_required_lines) >= 30 and recheck_total["疑似排除"] * 2 < recheck_total["疑似确认"]:
     VERDICTS.append(f"登录复核确认 {recheck_total['疑似确认']} 个账号仍是 401（排除 {recheck_total['疑似排除']}）：Cookie 多半已被 Google 作废，"
