@@ -78,12 +78,21 @@ func runCommand(args []string) error {
 	serveErr := runServer(ctx, cfg, options, manager)
 	cancelLifecycle()
 	// 账本最后关闭：关闭前写完已排队的记录
-	return errors.Join(serveErr, manager.Close(), ledger.Close())
+	err = errors.Join(serveErr, manager.Close(), ledger.Close())
+	// 写入协程随生命周期结束开始收尾：等它写完队列里剩下的日志与丢弃汇总再退出
+	manager.requests.waitConsole(consoleFlushWait)
+	return err
 }
 
 // openRequestLedger 打开用量账本并交给管理器；打开失败只写 WARN，本次运行不记录用量，服务照常启动
 func openRequestLedger(manager *runtimeManager, path string, bodyCapture bool) *requestdb.Store {
 	ledger, err := requestdb.Open(path, func(level, message string) {
+		// “请求账本写入队列已满”已汇总、丢弃计数写前已清零，负载高时出现，控制台队列满时也不丢；
+		// 写入失败可能每批一条，仍走普通队列，不挤占独立队列
+		if strings.HasPrefix(message, "请求账本写入队列已满") {
+			manager.requests.logDurable("service", level, message)
+			return
+		}
 		manager.requests.log("service", level, message)
 	})
 	if err != nil {
@@ -234,13 +243,13 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		manager.beginShutdown()
 		// 停止接收新请求，等进行中的请求完成（原先只等 10 秒，而一次请求中位要二十多秒）
 		grace := shutdownGrace()
-		manager.requests.log("service", "INFO", fmt.Sprintf(
+		manager.requests.logDurable("service", "INFO", fmt.Sprintf(
 			"收到停止信号 | 停止接收新请求，等待进行中的 %d 个请求完成（最多 %s）", manager.requests.count(), grace,
 		))
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), grace)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			manager.requests.log("service", "WARN", fmt.Sprintf(
+			manager.requests.logDurable("service", "WARN", fmt.Sprintf(
 				"等待超时，仍有 %d 个请求未完成，将被中断 | %v", manager.requests.count(), err,
 			))
 			return nil

@@ -134,12 +134,12 @@ func (service *trackedService) applyRateLimitCooldown(
 			allow = false
 		}
 		if warn {
-			// applyQuotaCooldown 拿不到请求 ID，只写服务日志
+			// applyQuotaCooldown 拿不到请求 ID，只写服务日志；紧跟在成批的冷却日志之后，控制台队列满时也不丢
 			poolField := ""
 			if label := pool.Label(); label != "" {
 				poolField = " | 号池=" + label
 			}
-			service.requests.log("service", "WARN", fmt.Sprintf(
+			service.requests.logDurable("service", "WARN", fmt.Sprintf(
 				"号池级限流 | 模型=%s%s | 号池内 %d 分钟内至少 %d 个账号返回限流且没有成功，不升级冷却",
 				modelID, poolField, int(rateLimitSystemicWindow/time.Minute), rateLimitSystemicAccounts,
 			))

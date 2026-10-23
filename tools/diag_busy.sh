@@ -479,7 +479,7 @@ LOG_KEYS = [key.encode() for key in (
     "账号冷却", "账号切换", "账号每分钟请求已满", "排队等待 |", "主用模型", "限流档位清零", "号池级限流",
     "Worker 就绪", "Worker 启动失败", "按需扩容", "按需替换", "空闲回收", "冷却轮换", "冷却淘汰", "补登记淘汰", "排空",
     "Worker 重建", "Worker 停止 |", "替补", "回收冷却占位", "常驻 Worker 已失败",
-    "管理服务就绪", "收到停止信号", "排队进度日志已省略", "请求账本写入队列已满", "额度 429 详情未识别")]
+    "管理服务就绪", "收到停止信号", "排队进度日志已省略", "请求账本写入队列已满", "控制台队列已满", "额度 429 详情未识别")]
 
 
 def first_time_from(handle, position, size):
@@ -509,7 +509,8 @@ def last_time(handle, size):
 
 
 def seek_since(handle, size, since):
-    # 日志按时间追加：二分查找窗口起点，避免从头读几个 GB 的日志；多往前读 1MB 容忍时间轻微乱序
+    # 日志按时间追加：二分查找窗口起点，避免从头读几个 GB 的日志；多往前读 8MB 容忍时间乱序
+    # （控制台队列最多积压 4096 条，独立队列与汇总行会越过积压先写出，文件顺序与 time 最多差一整个队列）
     low, high = 0, size
     while high - low > 1 << 16:
         middle = (low + high) // 2
@@ -518,7 +519,7 @@ def seek_since(handle, size, since):
             high = middle
         else:
             low = middle
-    return max(0, low - (1 << 20))
+    return max(0, low - (8 << 20))
 
 
 def read_logs(paths, since, want_finished):
@@ -660,9 +661,12 @@ if not coverage:
 print(f"  日志中与本诊断相关的事件：{len(logs)} 条（时间范围内）")
 if API_STATE in ("down", "denied", "offline"):
     print("  管理接口不可用：第 0 段的配置与容量、第 4 段的当前冷却、第 6 段的驻留 Worker 核对会缺失")
-omitted = sum(int((re.search(r"已省略 (\d+) 条", e["msg"]) or [0, 0])[1]) for e in logs if "排队进度日志已省略" in e["msg"])
-dropped = sum(int((re.search(r"丢弃=(\d+)", e["msg"]) or [0, 0])[1]) for e in logs if "请求账本写入队列已满" in e["msg"])
-print("  说明：控制台日志在缓冲满时会丢条（app/admin.go 控制台队列 256 条，满了直接丢），计数以账本为准，日志只看比例与文案")
+omitted = sum(int((re.search(r"已省略 (\d+) 条", e["msg"]) or [0, 0])[1]) for e in logs if e["t"] >= SINCE and "排队进度日志已省略" in e["msg"])
+dropped = sum(int((re.search(r"丢弃=(\d+)", e["msg"]) or [0, 0])[1]) for e in logs if e["t"] >= SINCE and "请求账本写入队列已满" in e["msg"])
+console_dropped = sum(int((re.search(r"丢弃=(\d+)", e["msg"]) or [0, 0])[1]) for e in logs if e["t"] >= SINCE and "控制台队列已满" in e["msg"])
+print("  说明：控制台日志在缓冲满时会丢条（app/admin.go 控制台队列 4096 条，满了直接丢，每 10 秒检查一次、有丢弃时汇总一行“控制台队列已满”；“额度 429 详情未识别”等少数几种不丢），计数以账本为准，日志只看比例与文案")
+if console_dropped:
+    print(f"  ⚠ 控制台队列满，运行日志丢弃 {console_dropped} 条：来自日志的统计偏少")
 if omitted:
     print(f"  排队进度日志被全局限流省略 {omitted} 条（每秒最多 2 条）")
 if dropped:

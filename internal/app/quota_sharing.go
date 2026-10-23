@@ -190,10 +190,16 @@ func (sharing *quotaSharing) recordLocked(modelID string, pool aistudio.PoolScop
 		if pool == aistudio.PoolScopeUltra {
 			poolField = " | 权益=Ultra"
 		}
-		sharing.requests.log("service", level, fmt.Sprintf(
+		message := fmt.Sprintf(
 			"每日额度通道判定 | 模型=%s%s | 另一通道也达到限额=%d | 另一通道仍可用=%d | 结论=%s",
 			modelID, poolField, stats.Shared, stats.Independent, sharing.verdictLocked(statsKey),
-		))
+		)
+		if level == "WARN" {
+			// 结论变化决定两个通道是否同步冷却，很少出现，控制台队列满时也不丢
+			sharing.requests.logDurable("service", level, message)
+		} else {
+			sharing.requests.log("service", level, message)
+		}
 	}
 }
 

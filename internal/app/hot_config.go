@@ -105,7 +105,8 @@ func (manager *runtimeManager) RestartService(ctx context.Context) (api.AdminSta
 	}
 	// 进入重启后不再受页面请求取消影响，避免停在已停止状态
 	detached := context.WithoutCancel(ctx)
-	manager.requests.log("service", "INFO", "应用新配置 | 重启生成服务")
+	// 生命周期分界行（诊断脚本据此把失败归因到重启），热更新常在负载下发生，控制台队列满时也不丢
+	manager.requests.logDurable("service", "INFO", "应用新配置 | 重启生成服务")
 	// 重启内部的停止不改变用户期望的运行状态；随后的启动不会覆盖期间用户按下的停止
 	if _, err := manager.stopCurrent(detached); err != nil {
 		return api.AdminStatus{}, err

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -48,6 +49,18 @@ type requestRegistry struct {
 	logs        []api.AdminLog
 	subscribers map[*eventSubscriber]struct{}
 	console     chan api.AdminLog
+	// consoleDurable 为 logDurable 的独立队列：写入协程优先写出，不和普通日志抢 console 的名额
+	consoleDurable chan api.AdminLog
+	// consoleDropped 为队列满时丢弃的日志条数，由 writeConsole 定期汇总记一行（见 consoleDropReportInterval）
+	consoleDropped atomic.Int64
+	// consoleStopped 在生命周期 ctx 结束、写入协程开始收尾时置位（持有 mu），之后的日志在调用方协程直接写运行日志
+	consoleStopped atomic.Bool
+	// consoleDone 在写入协程收尾完成（写完两个队列与丢弃汇总）后关闭，见 waitConsole
+	consoleDone chan struct{}
+	// consoleHandler 为写运行日志的处理器，nil 时用 slog 默认处理器（只给包内测试注入）
+	consoleHandler slog.Handler
+	// dropReportInterval 大于 0 时替代 consoleDropReportInterval（只给包内测试调低）
+	dropReportInterval time.Duration
 }
 
 type eventSubscriber struct {
@@ -67,6 +80,15 @@ const (
 	adminRequestRetain         = 512
 	adminRequestCompactAt      = 640
 	adminRequestRefreshLatency = 50 * time.Millisecond
+	// consoleQueueSize 为写运行日志的控制台队列长度：号池繁忙时冷却、换号与排队日志成批出现，队列满时新日志直接丢弃
+	// （管理页面只保留最近 adminLogRetain 条）
+	consoleQueueSize = 4096
+	// consoleDurableQueueSize 为 logDurable 独立队列的长度：走这个队列的日志很少出现或已限频，写入协程优先写出
+	consoleDurableQueueSize = 256
+	// consoleFlushWait 为进程退出前等写入协程收尾的上限
+	consoleFlushWait = 5 * time.Second
+	// consoleDropReportInterval 为检查并汇总“控制台队列已满”的周期
+	consoleDropReportInterval = 10 * time.Second
 )
 
 type trackedRequest struct {
@@ -117,7 +139,10 @@ func newRequestRegistry(ctx context.Context) *requestRegistry {
 		active:      make(map[string]trackedRequest),
 		logs:        make([]api.AdminLog, 0, 128),
 		subscribers: make(map[*eventSubscriber]struct{}),
-		console:     make(chan api.AdminLog, 256),
+		console:     make(chan api.AdminLog, consoleQueueSize),
+		// 独立队列：普通日志占满 console 时，logDurable 的日志仍能排进来
+		consoleDurable: make(chan api.AdminLog, consoleDurableQueueSize),
+		consoleDone:    make(chan struct{}),
 	}
 	go registry.writeConsole(ctx)
 	return registry
@@ -1322,8 +1347,22 @@ func (registry *requestRegistry) log(source string, level string, message string
 	registry.recordLog(api.AdminLog{Source: source, Level: level, Message: message, Event: "runtime.message"})
 }
 
-// recordLog 将同一结构化事件发布到管理页面与控制台
+// logDurable 与 log 相同，但进入独立的小队列、由写入协程优先写出：普通日志占满控制台队列时也不丢，调用方协程也不阻塞
+// （独立队列满时同样丢弃并计数）。只用于很少出现或已限频、又必须留在运行日志里的行
+// （如“额度 429 详情未识别”，同一种 10 分钟只写一条，丢了要再等 10 分钟）
+func (registry *requestRegistry) logDurable(source string, level string, message string) {
+	registry.recordLogWith(api.AdminLog{Source: source, Level: level, Message: message, Event: "runtime.message"}, true)
+}
+
+// recordLog 将同一结构化事件发布到管理页面与控制台；控制台队列满时丢弃并计数（见 writeConsole）
 func (registry *requestRegistry) recordLog(entry api.AdminLog) {
+	registry.recordLogWith(entry, false)
+}
+
+// recordLogWith 为 recordLog 的实现：durable 为真时进入 consoleDurable 队列。从不阻塞：队列满时丢弃并计数；
+// 写入协程开始收尾（生命周期结束后的关闭阶段）后在当前协程直接写运行日志。
+// 判断与入队都在 mu 内（发送不阻塞），与写入协程置位 consoleStopped 互斥：不会在队列写空后才入队、无人再读
+func (registry *requestRegistry) recordLogWith(entry api.AdminLog, durable bool) {
 	entry.Time = time.Now().UTC()
 	registry.mu.Lock()
 	registry.logs = append(registry.logs, entry)
@@ -1332,34 +1371,118 @@ func (registry *requestRegistry) recordLog(entry api.AdminLog) {
 		registry.logs = registry.logs[:adminLogRetain]
 	}
 	registry.publishLocked(api.AdminEvent{Type: "log", Data: entry})
+	stopped := registry.consoleStopped.Load()
+	if !stopped {
+		queue := registry.console
+		if durable {
+			queue = registry.consoleDurable
+		}
+		select {
+		case queue <- entry:
+		default:
+			registry.consoleDropped.Add(1)
+		}
+	}
 	registry.mu.Unlock()
-	select {
-	case registry.console <- entry:
-	default:
+	if stopped {
+		registry.writeConsoleEntry(context.Background(), entry)
 	}
 }
 
+// writeConsole 把控制台队列里的日志写进运行日志，consoleDurable 优先；每 consoleDropReportInterval 检查一次丢弃计数，
+// 有丢弃时汇总记一行 WARN “控制台队列已满，丢弃 N 条日志”（汇总行本身不经过队列，也不进管理页面）。
+// ctx 结束时先在 mu 内置位 consoleStopped（之后的日志由调用方直接写），再写完两个队列里剩下的日志、汇总丢弃数，
+// 最后关闭 consoleDone 后退出
 func (registry *requestRegistry) writeConsole(ctx context.Context) {
+	if registry.consoleDone != nil {
+		defer close(registry.consoleDone)
+	}
+	interval := consoleDropReportInterval
+	if registry.dropReportInterval > 0 {
+		interval = registry.dropReportInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
 	for {
 		select {
+		case entry := <-registry.consoleDurable:
+			registry.writeConsoleEntry(ctx, entry)
+			continue
+		default:
+		}
+		select {
+		case entry := <-registry.consoleDurable:
+			registry.writeConsoleEntry(ctx, entry)
 		case entry := <-registry.console:
-			level := slog.LevelInfo
-			switch strings.ToUpper(entry.Level) {
-			case "ERROR":
-				level = slog.LevelError
-			case "WARN":
-				level = slog.LevelWarn
-			}
-			record := slog.NewRecord(entry.Time, level, entry.Message, 0)
-			record.AddAttrs(slog.String("event", entry.Event), slog.String("source", entry.Source))
-			if entry.Request != nil {
-				record.AddAttrs(slog.Any("request", entry.Request))
-			}
-			_ = slog.Default().Handler().Handle(ctx, record)
+			registry.writeConsoleEntry(ctx, entry)
+		case <-ticker.C:
+			registry.reportConsoleDrops(ctx)
 		case <-ctx.Done():
+			registry.mu.Lock()
+			registry.consoleStopped.Store(true)
+			registry.mu.Unlock()
+			// 关闭阶段处理器仍可用：用不会取消的上下文写完剩下的日志
+			flushCtx := context.WithoutCancel(ctx)
+			for drained := false; !drained; {
+				select {
+				case entry := <-registry.consoleDurable:
+					registry.writeConsoleEntry(flushCtx, entry)
+				case entry := <-registry.console:
+					registry.writeConsoleEntry(flushCtx, entry)
+				default:
+					drained = true
+				}
+			}
+			registry.reportConsoleDrops(flushCtx)
 			return
 		}
 	}
+}
+
+// reportConsoleDrops 在有丢弃时汇总记一行 WARN 并清零计数
+func (registry *requestRegistry) reportConsoleDrops(ctx context.Context) {
+	dropped := registry.consoleDropped.Swap(0)
+	if dropped <= 0 {
+		return
+	}
+	registry.writeConsoleEntry(ctx, api.AdminLog{
+		Time: time.Now().UTC(), Source: "service", Level: "WARN", Event: "runtime.message",
+		Message: fmt.Sprintf("控制台队列已满，丢弃 %d 条日志 | 丢弃=%d | 管理页面只保留最近 %d 条，计数以用量账本为准", dropped, dropped, adminLogRetain),
+	})
+}
+
+// waitConsole 等写入协程收尾完成，最多等 timeout：进程退出前调用，保证队列里剩下的日志与丢弃汇总写出
+func (registry *requestRegistry) waitConsole(timeout time.Duration) {
+	if registry == nil || registry.consoleDone == nil {
+		return
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-registry.consoleDone:
+	case <-timer.C:
+	}
+}
+
+// writeConsoleEntry 把一条日志写进运行日志（consoleHandler，未注入时为 slog 默认处理器；处理器可并发调用）
+func (registry *requestRegistry) writeConsoleEntry(ctx context.Context, entry api.AdminLog) {
+	level := slog.LevelInfo
+	switch strings.ToUpper(entry.Level) {
+	case "ERROR":
+		level = slog.LevelError
+	case "WARN":
+		level = slog.LevelWarn
+	}
+	record := slog.NewRecord(entry.Time, level, entry.Message, 0)
+	record.AddAttrs(slog.String("event", entry.Event), slog.String("source", entry.Source))
+	if entry.Request != nil {
+		record.AddAttrs(slog.Any("request", entry.Request))
+	}
+	handler := registry.consoleHandler
+	if handler == nil {
+		handler = slog.Default().Handler()
+	}
+	_ = handler.Handle(ctx, record)
 }
 
 func (registry *requestRegistry) clearLogs() {

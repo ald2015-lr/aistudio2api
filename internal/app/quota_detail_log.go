@@ -111,7 +111,8 @@ func (service *trackedService) logUnparsedQuotaDetail(accountLabel string, err e
 	if !service.unparsedQuotaDetails.allow(newUnparsedQuotaDetailKey(rpcError.UnparsedDetailType, message), time.Now()) {
 		return
 	}
-	service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+	// 控制台队列满时不丢弃（号池繁忙时这一行紧跟在成批的冷却日志之后，丢了同一种要再等 10 分钟）
+	service.requests.logDurable(accountLabel, "INFO", fmt.Sprintf(
 		"额度 429 详情未识别 | 类型=%s | 文案=%s | 原文=%s | 请把这一行发给开发者",
 		rpcError.UnparsedDetailType, message, rpcError.UnparsedDetail,
 	))

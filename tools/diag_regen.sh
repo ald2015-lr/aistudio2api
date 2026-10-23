@@ -591,7 +591,8 @@ def last_time(handle, size):
 
 
 def seek_since(handle, size, since):
-    # 日志按时间追加：二分查找窗口起点，避免从头读几个 GB 的日志；多往前读 1MB 容忍时间轻微乱序
+    # 日志按时间追加：二分查找窗口起点，避免从头读几个 GB 的日志；多往前读 8MB 容忍时间乱序
+    # （控制台队列最多积压 4096 条，独立队列与汇总行会越过积压先写出，文件顺序与 time 最多差一整个队列）
     low, high = 0, size
     while high - low > 1 << 16:
         middle = (low + high) // 2
@@ -600,7 +601,7 @@ def seek_since(handle, size, since):
             high = middle
         else:
             low = middle
-    return max(0, low - (1 << 20))
+    return max(0, low - (8 << 20))
 
 
 def read_logs(paths, since):
@@ -887,7 +888,10 @@ print(f"  {MODEL} 在窗口内：{len(window_rows)} 个已结束的请求" + (f"
 if API_STATE in ("down", "denied", "offline"):
     print("  管理接口不可用：REQUEST_TIMEOUT 按 CONFIG_FILE、DIAG_REQUEST_TIMEOUT、.env 的顺序判断，都没有时按 5m；"
           "第 4b 段（正在进行的请求）会缺失")
-print("  说明：控制台日志在缓冲满时会丢条（app/admin.go recordLog 非阻塞写入 console 通道），计数以账本为准，日志看比例与时间线")
+print("  说明：控制台日志在缓冲满时会丢条（app/admin.go 控制台队列 4096 条，满了直接丢，每 10 秒检查一次、有丢弃时汇总一行“控制台队列已满”；“额度 429 详情未识别”、生命周期分界行等少数几种不丢），计数以账本为准，日志看比例与时间线")
+console_dropped = sum(int((re.search(r"丢弃=(\d+)", e["msg"]) or [0, 0])[1]) for e in logs if e["t"] >= SINCE and "控制台队列已满" in e["msg"])
+if console_dropped:
+    print(f"  ⚠ 控制台队列满，运行日志丢弃 {console_dropped} 条：时间线可能缺行")
 if bodies_total:
     print(f"  请求正文（REQUEST_BODY_LOG）：bodies 表共 {bodies_total} 条，其中 {len(bodies)} 条属于 {MODEL}：这些请求用正文摘要做指纹、判断是否流式")
 

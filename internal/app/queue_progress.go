@@ -295,8 +295,8 @@ func (service *trackedService) noteQueueWait(
 			return
 		}
 		if suppressed > 0 {
-			// 省略数是全进程的，作为服务日志单独写，不挂到当前请求的时间线上
-			service.requests.log("service", "WARN", fmt.Sprintf(
+			// 省略数是全进程的，作为服务日志单独写，不挂到当前请求的时间线上；省略数已清零，控制台队列满时也不丢
+			service.requests.logDurable("service", "WARN", fmt.Sprintf(
 				"排队进度日志已省略 %d 条（全局限流：每秒最多 %g 条）", suppressed, queueProgressRate,
 			))
 		}
