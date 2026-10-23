@@ -60,6 +60,8 @@ const zhCN = {
   'accounts.empty': '暂无账户',
   'accounts.emptyHint': '通过浏览器登录或从 Chrome 导入账户',
   'accounts.proxy': '账户代理',
+  'accounts.proxyHelp':
+    '留空使用服务配置的默认代理。写法同默认代理；动态 IP 建议在代理商处开启固定会话（粘性 IP），否则浏览器页面与后台请求可能从不同 IP 出网。',
   'accounts.locale': '语言区域',
   'accounts.timezone': '时区',
   'accounts.models': '模型',
@@ -145,6 +147,23 @@ const zhCN = {
   'settings.listen': '监听地址',
   'settings.apiKey': '本地 API 密钥',
   'settings.proxy': '默认代理',
+  'settings.proxyHelp':
+    '支持 http、https、socks5，可带账号密码：http://用户名:密码@IP:端口、socks5://用户名:密码@IP:端口、IP:端口:用户名:密码、用户名:密码@IP:端口；不写协议按 http。保存时统一改写成 URL 形式，密码里的特殊字符自动编码。URL 写法与 用户名:密码@ 写法里的 %XX 按百分号编码解码，密码里要保留 %41 这类字面内容时请用 IP:端口:用户名:密码 写法。带账号密码时，浏览器经本机中转连接代理。',
+  'proxy.placeholder': 'http://用户名:密码@1.2.3.4:8080',
+  'proxy.editHint': '点击显示并编辑完整代理（含账号密码）',
+  'proxy.authTag': '带认证',
+  'proxy.test': '测试代理',
+  'proxy.testing': '测试中…',
+  'proxy.testHint': '经代理访问 api.ipify.org 查询出口 IP，不访问 Google。',
+  'proxy.testBrowser': '浏览器路径',
+  'proxy.testBrowserRelay': '浏览器路径（经本机中转）',
+  'proxy.testDirect': '后台请求路径',
+  'proxy.testOK': '出口 IP {ip} · {ms} 毫秒',
+  'proxy.testFailed': '失败：{error}',
+  'proxy.warnRotating':
+    '两次连接的出口 IP 不同：这是按连接轮换的动态代理，浏览器页面与后台请求会从不同 IP 出网。建议在代理商处使用固定会话并设置较长的会话时长。',
+  'proxy.warnHttpsPlain':
+    'https:// 且不带账号密码的代理，浏览器（Camoufox）会以明文 HTTP 代理的方式连接，登录与 WAA 多半不可用；请改用 http:// 写法，或使用带账号密码的写法（由本机中转负责 TLS）。',
   'settings.initTimeout': '初始化超时',
   'settings.requestTimeout': '请求超时',
   'settings.requestTimeoutHelp':
@@ -749,6 +768,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.empty': 'No accounts',
   'accounts.emptyHint': 'Log in with a browser or import accounts from Chrome',
   'accounts.proxy': 'Account proxy',
+  'accounts.proxyHelp':
+    'Leave empty to use the default proxy. Same formats as the default proxy; for rotating IPs, enable a sticky session at your provider, otherwise browser pages and background requests may leave from different IPs.',
   'accounts.locale': 'Locale',
   'accounts.timezone': 'Timezone',
   'accounts.models': 'Models',
@@ -834,6 +855,24 @@ const en: Record<TranslationKey, string> = {
   'settings.listen': 'Listen address',
   'settings.apiKey': 'Local API key',
   'settings.proxy': 'Default proxy',
+  'settings.proxyHelp':
+    'Supports http, https and socks5, with optional credentials: http://user:pass@IP:port, socks5://user:pass@IP:port, IP:port:user:pass or user:pass@IP:port; http is assumed when no scheme is given. Saved in URL form with special characters encoded. In the URL and user:pass@ forms, %XX sequences are percent-decoded; to keep a literal sequence such as %41 in the password, use the IP:port:user:pass form. With credentials, the browser connects through a local relay.',
+  'proxy.placeholder': 'http://user:pass@1.2.3.4:8080',
+  'proxy.editHint': 'Click to show and edit the full proxy (including credentials)',
+  'proxy.authTag': 'auth',
+  'proxy.test': 'Test proxy',
+  'proxy.testing': 'Testing…',
+  'proxy.testHint':
+    'Queries api.ipify.org through the proxy for the exit IP; Google is not contacted.',
+  'proxy.testBrowser': 'Browser path',
+  'proxy.testBrowserRelay': 'Browser path (via local relay)',
+  'proxy.testDirect': 'Background request path',
+  'proxy.testOK': 'Exit IP {ip} · {ms} ms',
+  'proxy.testFailed': 'Failed: {error}',
+  'proxy.warnRotating':
+    'The two connections left from different IPs: this proxy rotates per connection, so browser pages and background requests will use different IPs. Use a sticky session with a long duration.',
+  'proxy.warnHttpsPlain':
+    'For https:// proxies without credentials, the browser (Camoufox) connects as a plain HTTP proxy, so login and WAA will likely fail; use http:// or a credentialed URL (the local relay handles TLS).',
   'settings.initTimeout': 'Init timeout',
   'settings.requestTimeout': 'Request timeout',
   'settings.requestTimeoutHelp':
@@ -1429,7 +1468,7 @@ const legacyKeyMap: Partial<Record<TranslationKey, string>> = {
   'logs.warn': 'logs.warn',
   'logs.error': 'logs.error',
   'models.model': 'chat.model',
-  'settings.proxy': 'config.httpProxy',
+  'settings.proxy': 'config.proxyAddress',
   'playground.model': 'chat.model',
   'playground.system': 'chat.systemPrompt',
   'playground.prompt': 'chat.placeholder',

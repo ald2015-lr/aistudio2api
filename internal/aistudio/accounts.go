@@ -3898,6 +3898,8 @@ func readAccountConfig(filePath string) (AccountConfig, error) {
 	if err := ensureJSONEnd(decoder); err != nil {
 		return AccountConfig{}, fmt.Errorf("解析 %s: %w", accountConfigName, err)
 	}
+	// 外部手写的 host:port:用户名:密码 等写法在内存里改写成规范 URL；读取时不回写磁盘，下次保存配置时写入规范值
+	value.Proxy = appconfig.CanonicalProxy(value.Proxy)
 	if err := value.Validate(); err != nil {
 		return AccountConfig{}, err
 	}

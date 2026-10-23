@@ -16,6 +16,7 @@ import type {
   PlaygroundMedia,
   Cooldown,
   PermissionDeniedAccount,
+  ProxyTestResult,
   RequestBody,
   RequestSummary,
   ServiceConfig,
@@ -287,6 +288,12 @@ export const api = {
     requestJSON<ServiceConfig>('/api/config', {
       method: 'PUT',
       body: JSON.stringify(config),
+    }),
+  // testProxy 测试代理的出口 IP；proxy 为空时测试服务配置的默认代理
+  testProxy: (proxy: string) =>
+    requestJSON<ProxyTestResult>('/api/proxy/test', {
+      method: 'POST',
+      body: JSON.stringify({ proxy }),
     }),
   cancelRequest: (id: string) =>
     requestCommand(`/api/requests/${encodeURIComponent(id)}/cancel`, {

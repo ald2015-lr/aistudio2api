@@ -407,6 +407,25 @@ export interface ServiceConfig {
   downgrade_guard: DowngradeGuardConfig
 }
 
+// ProxyTestProbe 为“测试代理”一条路径的结果：成功时 ip 为出口 IP，失败时 error 为说明（不含账号密码）
+export interface ProxyTestProbe {
+  ip?: string
+  elapsed_ms: number
+  error?: string
+}
+
+// ProxyTestResult 为“测试代理”的结果：browser 为 Camoufox 的路径（带账号密码时经本机中转），direct 为后台请求的路径
+// （直连上游代理）；same_ip 在两边都拿到 IP 且相同时为真
+export interface ProxyTestResult {
+  proxy: string // 去掉账号密码的 scheme://host:port
+  authenticated: boolean
+  relayed: boolean
+  browser: ProxyTestProbe
+  direct: ProxyTestProbe
+  same_ip: boolean
+  warnings?: Array<'rotating_ip' | 'https_plain_browser'>
+}
+
 export type AdminEvent =
   | { type: 'status'; data: ServiceStatus }
   | { type: 'log'; data: AdminLog }

@@ -120,6 +120,9 @@ func shutdownGrace() time.Duration {
 	return 60 * time.Second
 }
 
+// unknownArgumentAfterProxy 为传了 --proxy 又有位置参数时的固定文案：位置参数可能是没加引号的 --proxy 值的后半段
+const unknownArgumentAfterProxy = "未知参数（已隐藏：可能是 --proxy 值的一部分，值里有空格时请整体加引号）"
+
 // parseFlags 使用命令行参数覆盖本次启动配置
 func parseFlags(args []string, cfg *config.Config) (commandOptions, error) {
 	flags := flag.NewFlagSet("aistudio2api", flag.ContinueOnError)
@@ -130,18 +133,33 @@ func parseFlags(args []string, cfg *config.Config) (commandOptions, error) {
 	}
 	authStates := flags.String("auth", cfg.AuthStates, "账户状态文件、目录或逗号分隔的多个路径")
 	listenAddr := flags.String("listen", cfg.ListenAddr, "服务监听地址")
-	proxy := flags.String("proxy", cfg.Proxy, "本次启动使用的 HTTP、HTTPS 或 SOCKS5 代理")
+	// 默认值留空：.env 的 PROXY 可能带账号密码，-h 与参数解析出错时 PrintDefaults 会把默认值打印出来
+	proxy := flags.String("proxy", "", "本次启动使用的 HTTP、HTTPS 或 SOCKS5 代理，可带账号密码，写法同 .env 的 PROXY；不指定时使用 .env 的值")
 	openUI := flags.Bool("open-ui", len(args) == 0, "启动后打开管理界面")
 	if err := flags.Parse(args); err != nil {
 		return commandOptions{}, err
 	}
+	// 显式传了 --proxy 才覆盖（--proxy "" 表示本次直连）；没传时沿用 .env 的值（Load 已规范化）
+	proxySet := false
+	flags.Visit(func(value *flag.Flag) { proxySet = proxySet || value.Name == "proxy" })
 	if flags.NArg() != 0 {
-		return commandOptions{}, fmt.Errorf("未知参数 %q", flags.Arg(0))
+		if proxySet {
+			// --proxy 的值里有空格又没加引号时，后半段（可能是密码的一部分）成了位置参数，整体不回显
+			return commandOptions{}, errors.New(unknownArgumentAfterProxy)
+		}
+		// 位置参数可能是忘了写 --proxy 的带账号密码代理，错误会写进日志，不回显账号密码
+		return commandOptions{}, fmt.Errorf("未知参数 %q", config.RedactArgument(flags.Arg(0)))
 	}
 
 	cfg.AuthStates = strings.TrimSpace(*authStates)
 	cfg.ListenAddr = strings.TrimSpace(*listenAddr)
-	cfg.Proxy = strings.TrimSpace(*proxy)
+	if proxySet {
+		normalized, err := config.NormalizeProxy(*proxy)
+		if err != nil {
+			return commandOptions{}, err
+		}
+		cfg.Proxy = normalized
+	}
 	if err := cfg.Validate(); err != nil {
 		return commandOptions{}, err
 	}

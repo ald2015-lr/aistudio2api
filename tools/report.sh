@@ -104,15 +104,17 @@ fi
 
 echo "  6/6 脱敏并打包"
 python3 - "$BUNDLE" <<'PY'
-import hashlib, os, re, sys
+import hashlib, ipaddress, os, re, sys, urllib.parse
 root = sys.argv[1]
 # 每个包随机盐：同一包内代号一致，拿到包的人无法用猜测的邮箱比对代号
 ALIAS_SALT = os.urandom(16)
 # 邮箱（含 URL 编码的 %40 形式）
 email = re.compile(r"[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 rules = [
-    # 代理地址中的账号密码
-    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+:[^\s/@\"']+@"), r"\1<账号>:<密码>@"),
+    # 代理地址中的账号密码（协议不区分大小写；也覆盖只有用户名的 scheme://用户名@host）
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+(?::[^\s/@\"']*)?@"), r"\1<账号>:<密码>@"),
+    # host:port:用户名:密码 写法的代理（代理商面板最常见）
+    (re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):(\d{2,5}):[^\s:\"']+:[^\s\"']+"), r"\1:\2:<账号>:<密码>"),
     # 查询参数中的 key/token 先整体隐藏，再处理其他位置出现的谷歌 API Key 与 Bearer 令牌
     (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|admin_token)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
     # 管理令牌（启动日志里的登录地址、X-Admin-Token 请求头）
@@ -127,6 +129,58 @@ rules = [
     # JSON 形式保存的 Cookie（storage-state 结构：{"name":"SAPISID","value":"..."}）
     (re.compile(r"(?i)(\"name\"\s*:\s*\"(?:SAPISID|APISID|SSID|HSID|SIDCC|SID|__Secure-[^\"]+|NID)\"\s*,\s*\"value\"\s*:\s*\")[^\"]*"), r"\1<已隐藏>"),
 ]
+# PROXY 整行（只用于 config.txt）：只保留协议与 host:port，账号密码替换掉；解析不了时整值隐藏。
+# PROXY 后面紧跟等号，不会误伤 PROXY_API_KEY；拆分规则与程序的规范化一致（host:port:用户名:密码 优先，否则按最后一个 @）
+proxy_line = re.compile(r"^(\s*(?:export\s+)?PROXY\s*=\s*)(.*)$", re.M)
+# 用户名:密码 段像 IPv4、带点域名或 [v6] 加端口、host 段又不像主机：账号密码与 host:port 可能写反了
+# （用户名:密码:host:port、host:port@用户名:密码），程序报错，这里整值隐藏
+host_port_like = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|(?:[A-Za-z0-9_-]|[^\x00-\x7F])+(?:\.(?:[A-Za-z0-9_-]|[^\x00-\x7F])+)+):[0-9]{1,5}/?$")
+def bare_ipv6(host_port):
+    # 没加方括号的 IPv6 地址，可以带端口（2001:db8::1、2001:db8::1:8080）
+    if host_port.count(":") < 2 or "[" in host_port or "]" in host_port:
+        return False
+    for candidate in (host_port, host_port.rsplit(":", 1)[0]):
+        try:
+            ipaddress.IPv6Address(candidate)
+            return True
+        except ValueError:
+            pass
+    return False
+def path_unescape(value):
+    # 与程序的 url.PathUnescape 一致：有不合法的 %XX 时整段按字面
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        return value
+    return urllib.parse.unquote(value, errors="replace")
+def ambiguous_order(host, credentials):
+    return not host.startswith("[") and "." not in host and host_port_like.match(credentials) is not None
+def redact_proxy_value(value):
+    raw = value.strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+        raw = raw[1:-1]
+    if raw == "":
+        return value
+    match = re.match(r"(?i)^([a-z][a-z0-9+.-]*)://(.*)$", raw)
+    scheme, rest = (match.group(1).lower(), match.group(2)) if match else ("http", raw)
+    if match and "@" not in rest and bare_ipv6(rest.rstrip("/")):
+        # 带协议、不加方括号的 IPv6：程序按不带认证的旧值原样保留
+        return raw
+    colon = re.match(r"^(\[[0-9A-Fa-f:.]+\]|[^:@\[\]/]+):([0-9]{1,5}):(.*)$", rest)
+    if colon:
+        host = colon.group(1)
+        if ambiguous_order(host, colon.group(3)):
+            return "<已隐藏>"
+        return f"{scheme}://<账号>:<密码>@{host}:{colon.group(2)}"
+    if "@" in rest:
+        userinfo, host_port = rest.rstrip("/").rsplit("@", 1)
+        user, has_password, password = userinfo.partition(":")
+        credentials = path_unescape(user) + (":" + path_unescape(password) if has_password else "")
+        # 按解码后的值判断，与程序一致
+        if ambiguous_order(host_port.rsplit(":", 1)[0], credentials):
+            return "<已隐藏>"
+        return f"{scheme}://<账号>:<密码>@{host_port}"
+    if re.match(r"^(\[[0-9A-Fa-f:.]+\]|[^:@\[\]/\s]+)(:[0-9]{1,5})?/?$", rest):
+        return raw
+    return "<已隐藏>"
 def alias(match):
     value = match.group(0).lower()
     return "acct-" + hashlib.sha256(ALIAS_SALT + value.encode()).hexdigest()[:8]
@@ -137,6 +191,8 @@ for name in os.listdir(root):
             text = source.read()
     except OSError:
         continue
+    if name == "config.txt":
+        text = proxy_line.sub(lambda m: m.group(1) + redact_proxy_value(m.group(2)), text)
     # 先隐藏代理账号密码、查询参数、令牌与 Cookie，最后替换邮箱：
     # 否则代理地址里的"密码@主机"会先被当成邮箱替换，账号名反而漏出来
     for pattern, replacement in rules:

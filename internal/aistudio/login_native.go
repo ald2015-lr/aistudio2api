@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 )
 
 // NativeLoginDriver 通过纯 Go WebDriver BiDi 完成隔离登录
@@ -49,9 +50,17 @@ func (driver *NativeLoginDriver) Login(ctx context.Context, request IsolatedLogi
 	if driver == nil {
 		return IsolatedLoginResult{}, errors.New("纯 Go Camoufox 登录驱动未初始化")
 	}
-	result, err := camoufoxnative.Login(ctx, driver.options(request))
+	options, relay, err := driver.relayOptions(request, "登录")
 	if err != nil {
 		return IsolatedLoginResult{}, err
+	}
+	// camoufoxnative.Login 返回前会在 defer 里 session.Close()，但 Close 的错误被 errors.Join 进返回值，
+	// 驱动分不清浏览器是否已退出；这里照常释放，监听器按活动判定关闭，浏览器还在发连接就不会关
+	defer relay.Release()
+	startedAt := time.Now()
+	result, err := camoufoxnative.Login(ctx, options)
+	if err != nil {
+		return IsolatedLoginResult{}, relay.WrapFailure(err, startedAt, proxyrelay.GoogleTarget)
 	}
 	var state StorageState
 	if err := json.Unmarshal(result.StorageStateJSON, &state); err != nil {
@@ -82,15 +91,38 @@ func (driver *NativeLoginDriver) Verify(ctx context.Context, request IsolatedLog
 	if err != nil {
 		return LoginVerification{}, fmt.Errorf("编码隔离验证状态: %w", err)
 	}
-	verification, err := camoufoxnative.Verify(ctx, driver.options(request), encoded)
+	options, relay, err := driver.relayOptions(request, "验证")
 	if err != nil {
 		return LoginVerification{}, err
+	}
+	// 释放时机同 Login：监听器按活动判定关闭
+	defer relay.Release()
+	startedAt := time.Now()
+	verification, err := camoufoxnative.Verify(ctx, options, encoded)
+	if err != nil {
+		return LoginVerification{}, relay.WrapFailure(err, startedAt, proxyrelay.GoogleTarget)
 	}
 	return LoginVerification{
 		Authenticated: verification.Authenticated,
 		VerifiedAt:    verification.VerifiedAt,
 		Reason:        verification.Reason,
 	}, nil
+}
+
+// relayOptions 生成 Camoufox 登录参数：带账号密码的代理换成本机中转地址，调用方负责释放租约（对 nil 安全）。
+// operation 与账户 ID 组成中转日志里的使用者，新账户与 setup 登录还没有账户 ID，记为“新账户”
+func (driver *NativeLoginDriver) relayOptions(request IsolatedLoginRequest, operation string) (camoufoxnative.LoginOptions, *proxyrelay.Lease, error) {
+	owner := operation + ":" + request.AccountID
+	if request.AccountID == "" || request.AccountID == "new" || request.AccountID == "setup" {
+		owner = operation + ":新账户"
+	}
+	relay, proxy, err := acquireProxyRelay(request.Proxy, owner)
+	if err != nil {
+		return camoufoxnative.LoginOptions{}, nil, err
+	}
+	options := driver.options(request)
+	options.Proxy = proxy
+	return options, relay, nil
 }
 
 func (driver *NativeLoginDriver) options(request IsolatedLoginRequest) camoufoxnative.LoginOptions {

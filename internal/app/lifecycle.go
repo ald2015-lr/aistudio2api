@@ -12,6 +12,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
 
@@ -84,6 +85,12 @@ type runtimeManager struct {
 	shuttingDown bool
 	// ledger 为用量账本，在开始接收请求之前设置、之后不再改变；打开失败时为 nil（方法对 nil 安全）
 	ledger *requestdb.Store
+	// proxyTestMu 让“测试代理”逐次进行（见 proxy_probe.go）
+	proxyTestMu sync.Mutex
+	// probeProxy 经指定代理访问一次出口 IP 服务，nil 时为 probeProxyExit；测试替换
+	probeProxy func(context.Context, string) api.ProxyTestProbe
+	// proxyRelays 为“测试代理”申请本机中转的注册表，nil 时用包级默认注册表；测试注入
+	proxyRelays *proxyrelay.Registry
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。
@@ -96,6 +103,8 @@ func newRuntimeManager(
 	overrides dataConfigOverrides,
 ) (*runtimeManager, error) {
 	requests := newRequestRegistry(ctx)
+	// 本机代理中转（只服务 Camoufox）的日志写进管理页与控制台；注册表是进程级的，多次构造 manager 时原子替换
+	proxyrelay.SetLogger(func(level, message string) { requests.log("service", level, message) })
 	manager := &runtimeManager{
 		lifecycle: ctx, configPath: configPath, activeManagement: cfg,
 		overrides: overrides, requests: requests, factory: buildRuntimeGeneration,
@@ -572,8 +581,9 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		}
 		ultraPrimaryQueueWait = parsed
 	}
+	// 默认代理按规范值比较（幂等、无副作用）：写法不同但上游相同时不误报需要重启
 	saved := config.Config{
-		AuthStates: value.AuthStates, Proxy: value.Proxy,
+		AuthStates: value.AuthStates, Proxy: config.CanonicalProxy(value.Proxy),
 		InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,

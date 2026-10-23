@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { api } from '@/api'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import type { DowngradeGuardConfig, Model, ServiceConfig, UpstreamChannel } from '@/types'
+import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import { readStorage, writeStorage } from '@/storage'
@@ -242,6 +243,10 @@ function addStreamModel(model: string): void {
 }
 let saveTimer: number | undefined
 let countdownTimer: number | undefined
+// proxyTesting 为“测试代理”进行中：期间不开始自动应用的倒计时，免得没测完的代理先重启生效（键盘 Tab 到测试按钮时
+// 输入框先失焦保存）；applyDeferred 记下期间被推迟的倒计时，测试通过后再开始，没通过就留给用户点“立即应用”
+const proxyTesting = ref(false)
+let applyDeferred = false
 let saveChain: Promise<unknown> = Promise.resolve()
 
 // snapshot 序列化可编辑字段，用于判断是否有未保存的修改
@@ -449,8 +454,12 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
   }
   saving.value = true
   try {
-    const saved = await api.saveConfig(payload(includeBlurFields))
+    const submitted = payload(includeBlurFields)
+    const saved = await api.saveConfig(submitted)
     savedConfig.value = saved
+    // 代理由服务端规范化（host:port:用户名:密码 保存为 http://用户名:密码@host:port），提交后没有再改动时表单同步显示，
+    // 避免一直提示未保存、每次失焦重复保存；自动保存时 proxy 取的是已保存的值，form.proxy 可能是还没提交的编辑，不能覆盖
+    if (includeBlurFields && form.proxy === submitted.proxy) form.proxy = saved.proxy
     // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
     if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
     // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s），时长相同时表单同步显示，避免一直提示未保存
@@ -475,7 +484,8 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
     saveError.value = ''
     emit('saved', saved)
     if (saved.service_restart_required && props.running && autoApply.value && !applying.value) {
-      startCountdown()
+      if (proxyTesting.value) applyDeferred = true
+      else startCountdown()
     }
     return saved
   } catch (error) {
@@ -507,6 +517,30 @@ function commitBlurField(): void {
   const base = savedConfig.value
   if (base === null || snapshot(form, BLUR_KEYS) === snapshot(base, BLUR_KEYS)) return
   void save(true)
+}
+
+// onProxyTesting 测试开始时暂停进行中的倒计时，结束后只在测试通过、仍需要应用时重新开始
+function onProxyTesting(running: boolean, passed: boolean): void {
+  proxyTesting.value = running
+  if (running) {
+    if (countdownTimer !== undefined) {
+      cancelCountdown()
+      applyDeferred = true
+    }
+    return
+  }
+  const deferred = applyDeferred
+  applyDeferred = false
+  if (
+    deferred &&
+    passed &&
+    savedConfig.value?.service_restart_required === true &&
+    props.running &&
+    autoApply.value &&
+    !applying.value
+  ) {
+    startCountdown()
+  }
 }
 
 // applyNow 等待进行中的请求结束后重启生成服务，让已保存的配置生效
@@ -715,19 +749,18 @@ onBeforeUnmount(() => {
         </label>
       </div>
 
+      <!-- 代理输入里有掩码按钮与“测试代理”按钮，标题不用 label 包裹，避免点说明文字或测试结果时触发掩码按钮 -->
       <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <label class="block">
-          <span class="mb-1 block text-sm font-medium text-gray-300">{{
-            t('settings.proxy')
-          }}</span>
-          <input
-            v-model.trim="form.proxy"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-            placeholder="http://127.0.0.1:7890"
-            autocomplete="off"
-            @change="commitBlurField"
-          />
-        </label>
+        <span class="mb-1 block text-sm font-medium text-gray-300">{{ t('settings.proxy') }}</span>
+        <ProxyInput
+          v-model="form.proxy"
+          input-class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          :help="t('settings.proxyHelp')"
+          :allow-empty-test="false"
+          :label="t('settings.proxy')"
+          @commit="commitBlurField"
+          @testing="onProxyTesting"
+        />
       </div>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">

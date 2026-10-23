@@ -68,7 +68,10 @@ ALIAS_SALT = os.urandom(16)
 # 邮箱（含 URL 编码的 %40 形式）
 email = re.compile(r"[A-Za-z0-9._%+-]+(?:@|%40)[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 rules = [
-    (re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+:[^\s/@\"']+@"), r"\1<账号>:<密码>@"),
+    # 代理地址中的账号密码（协议不区分大小写；也覆盖只有用户名的 scheme://用户名@host）
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^\s/@:\"']+(?::[^\s/@\"']*)?@"), r"\1<账号>:<密码>@"),
+    # host:port:用户名:密码 写法的代理（代理商面板最常见）
+    (re.compile(r"\b((?:\d{1,3}\.){3}\d{1,3}|[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+):(\d{2,5}):[^\s:\"']+:[^\s\"']+"), r"\1:\2:<账号>:<密码>"),
     (re.compile(r"(?i)([?&](?:key|token|access_token|api_key|admin_token)=)[^&\s\"'<]+"), r"\1<已隐藏>"),
     # 管理令牌（启动日志里的登录地址、X-Admin-Token 请求头）
     (re.compile(r"(?i)(admin_token=|x-admin-token:\s*)[0-9a-f]{16,}"), r"\1<已隐藏>"),

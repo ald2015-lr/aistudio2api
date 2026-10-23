@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -226,7 +228,8 @@ func Load(path string) (Config, error) {
 		cfg.ProxyAPIKey = EffectiveProxyAPIKey(value)
 	}
 	if value, ok := values["PROXY"]; ok {
-		cfg.Proxy = strings.TrimSpace(value)
+		// 手写的 host:port:用户名:密码 等写法在这里改写成规范 URL，保存侧与生效侧都从这里来；无法规范化的值留给 Validate 报错
+		cfg.Proxy = CanonicalProxy(value)
 	}
 	if value, ok := values["INIT_TIMEOUT"]; ok {
 		cfg.InitTimeout, err = parsePositiveDuration("INIT_TIMEOUT", value)
@@ -711,7 +714,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
 		ProxyAPIKey:            EffectiveProxyAPIKey(value.ProxyAPIKey),
-		Proxy:                  strings.TrimSpace(value.Proxy),
+		Proxy:                  CanonicalProxy(value.Proxy),
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,
 		FirstEventTimeout:      firstEventTimeout,
@@ -745,28 +748,383 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// ValidateProxy 校验账户或全局代理 URL
-func ValidateProxy(value string) error {
+// 代理规范化的错误文案：全部是固定文本，不含任何输入内容（输入里可能有账号密码）
+var (
+	errProxyFormat           = errors.New("PROXY 格式无效：支持 http://host:port、http://用户名:密码@host:port、socks5://用户名:密码@host:port、host:port:用户名:密码、用户名:密码@host:port（不写协议按 http）")
+	errProxyScheme           = errors.New("PROXY 协议必须是 http、https 或 socks5（socks5h 按 socks5 处理）")
+	errProxyPath             = errors.New("PROXY 不能包含路径、查询参数或片段")
+	errProxyPort             = errors.New("PROXY 端口必须是 1 到 65535 的数字")
+	errProxySOCKS5Port       = errors.New("SOCKS5 代理必须写端口")
+	errProxyNoPort           = errors.New("PROXY 不写协议时必须写端口，例如 1.2.3.4:8080")
+	errProxyUser             = errors.New("PROXY 的用户名不能为空")
+	errProxyControl          = errors.New("PROXY 不能包含换行、制表符等控制字符")
+	errProxySOCKS5Length     = errors.New("SOCKS5 代理的用户名和密码都不能超过 255 字节")
+	errProxyCredentialLength = errors.New("PROXY 的用户名和密码合计不能超过 1024 字节")
+	errProxyUserColon        = errors.New("HTTP 代理的用户名不能包含冒号（:），Basic 认证会在第一个冒号处拆开用户名和密码")
+	errProxyAmbiguous        = errors.New("PROXY 无法判断账号密码与 host:port 的先后（host:port:用户名:密码、host:port@用户名:密码 还是 用户名:密码:host:port），请改用 http://用户名:密码@host:port 写法；代理主机名不含点时请写成 IP")
+	errProxyIPv6             = errors.New("PROXY 的 IPv6 地址必须加方括号，例如 http://[2001:db8::1]:8080")
+	errProxyPathCredential   = errors.New("PROXY 不能包含路径、查询参数或片段；密码里有 / ? # 时请写成 %2F、%3F、%23，或改用 host:port:用户名:密码 写法")
+)
+
+// unrecognizedProxy 为 RedactProxy 无法识别代理时的占位文本
+const unrecognizedProxy = "<无法识别的代理>"
+
+// proxySchemePattern 匹配 URL 的协议名（RFC 3986：字母开头，后面是字母、数字与 + - .）
+var proxySchemePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*$`)
+
+// colonProxyPattern 匹配 host:port:用户名:密码（代理商面板最常见的写法），密码里可以有 : 和 @；IPv6 必须写成 [v6]
+var colonProxyPattern = regexp.MustCompile(`^(\[[0-9A-Fa-f:.]+\]|[^:@\[\]/]+):([0-9]{1,5}):(.*)$`)
+
+// hostPortLikePattern 匹配像 host:port 的 用户名:密码 段：IPv4、带点的域名或 [v6]，加数字端口。host 段又不像主机时
+// （不是 IP、不含点），整串更像把账号密码与 host:port 写反了，数字密码会被当成端口、真实密码会进日志，所以报错
+var hostPortLikePattern = regexp.MustCompile(`^(?:\[[0-9A-Fa-f:.]+\]|(?:[A-Za-z0-9_-]|[^\x00-\x7F])+(?:\.(?:[A-Za-z0-9_-]|[^\x00-\x7F])+)+):[0-9]{1,5}/?$`)
+
+// NormalizeProxy 把代理写法统一成上游 URL：不带认证的合法 URL 只去首尾空白、原样返回；带账号密码或简写的写法
+// 改写成 scheme://用户名:密码@host:port（账号密码按百分号编码，只保留字母、数字与 - . _ ~）。
+// 函数幂等；错误文案不含输入内容（url.Parse 的错误里有原文和密码，不能用 %w 包装）
+func NormalizeProxy(value string) (string, error) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return nil
+		return "", nil
 	}
-	parsed, err := url.Parse(value)
-	if err != nil || parsed.Hostname() == "" {
-		return fmt.Errorf("PROXY 必须是 http、https 或 socks5 URL")
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return "", errProxyControl
+		}
+	}
+	scheme, rest, explicit := "http", value, false
+	// :// 前面是合法的协议名才算写了协议：不写协议的 host:port:用户名:密码 与 用户名:密码@host:port，密码里可以有 ://
+	if index := strings.Index(value, "://"); index >= 0 && proxySchemePattern.MatchString(value[:index]) {
+		scheme, rest, explicit = strings.ToLower(value[:index]), value[index+3:], true
+		// 带协议的 host:port:用户名:密码 先按冒号写法处理，不走 url.Parse 的判定：密码是纯数字或为空时 url.Parse 会把它读成
+		// 主机名带冒号的无认证 URL（http://h:1:u:123 的主机名是 h:1:u），密码含 / ? # 时又会读成带路径或查询的 URL。
+		// 这类值主机名里有冒号，原来也连不上，不属于需要原样保留的旧值。
+		// 例外是不加方括号的 IPv6（http://2001:db8::1:3128）与用户名为空的值（http://h:1::2，见 colonProxyCredentials）：
+		// 原规则原样接受，这里照旧走直通分支
+		if !colonProxyCredentials(rest) || bareIPv6URL(value) {
+			// 不带认证、原规则就接受的 URL 原样返回：Firefox prefs、Go 传输与 chromeauth 拿到的字符串与改动前逐字节一致
+			if handled, err := legacyProxyValid(value); handled {
+				if err != nil {
+					if pathHidesCredentials(rest) {
+						return "", errProxyPathCredential
+					}
+					return "", err
+				}
+				return value, nil
+			}
+			if parsed, err := url.Parse(value); err == nil && (parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "") {
+				if pathHidesCredentials(rest) {
+					return "", errProxyPathCredential
+				}
+				return "", errProxyPath
+			}
+		}
+	}
+	switch scheme {
+	case "http", "https", "socks5":
+	case "socks5h":
+		scheme = "socks5"
+	default:
+		return "", errProxyScheme
+	}
+	var user, password, hostPort string
+	hasUser, hasPassword, atForm := false, false, false
+	if !strings.Contains(rest, "@") && bareIPv6(strings.TrimSuffix(rest, "/")) {
+		// 2001:db8::1:8080 不能按冒号写法拆成 host 2001、端口 db8……
+		return "", errProxyIPv6
+	}
+	if match := colonProxyPattern.FindStringSubmatch(rest); match != nil {
+		// host:port:用户名:密码：第 3 个冒号之后全部算密码，两段都按字面处理；不去掉末尾的 /，它可能属于密码
+		credentials := strings.SplitN(match[3], ":", 2)
+		if len(credentials) != 2 {
+			return "", errProxyFormat
+		}
+		if ambiguousProxyOrder(match[1], match[3]) {
+			return "", errProxyAmbiguous
+		}
+		hostPort = match[1] + ":" + match[2]
+		user, password, hasUser, hasPassword = credentials[0], credentials[1], true, true
+	} else if rest = strings.TrimSuffix(rest, "/"); strings.Contains(rest, "@") {
+		// 用户名:密码@host:port：按最后一个 @ 拆分，密码里可以有 @；URL 写法末尾的 / 去掉
+		at := strings.LastIndex(rest, "@")
+		userinfo := rest[:at]
+		hostPort, hasUser, atForm = rest[at+1:], true, true
+		if colon := strings.IndexByte(userinfo, ':'); colon >= 0 {
+			user, password, hasPassword = unescapeUserinfo(userinfo[:colon]), unescapeUserinfo(userinfo[colon+1:]), true
+		} else {
+			user = unescapeUserinfo(userinfo)
+		}
+	} else {
+		hostPort = rest
+	}
+	if strings.Contains(hostPort, "://") {
+		// :// 前面不是合法的协议名，例如 ://h:1
+		return "", errProxyScheme
+	}
+	if strings.ContainsAny(hostPort, "/?#") {
+		return "", errProxyPath
+	}
+	if !explicit && !hasExplicitPort(hostPort) {
+		return "", errProxyNoPort
+	}
+	host, port, err := splitProxyHostPort(hostPort, scheme)
+	if err != nil {
+		return "", err
+	}
+	if !hasUser {
+		// 不写协议的 host:port，或 socks5h 无认证：补协议后作为无认证 URL 返回
+		return scheme + "://" + net.JoinHostPort(host, port), nil
+	}
+	if atForm {
+		// host:port@用户名:密码（http://1.2.3.4:8080@user:12345）：按最后一个 @ 拆会把真实主机当用户名、数字密码当端口，
+		// 真实密码进日志与页面。与冒号写法同一判定；用解码后的值判断，规范输出再规范化一次结果不变
+		credentials := user
+		if hasPassword {
+			credentials += ":" + password
+		}
+		if ambiguousProxyOrder(host, credentials) {
+			return "", errProxyAmbiguous
+		}
+	}
+	if user == "" {
+		return "", errProxyUser
+	}
+	// RFC 7617：Basic 认证的用户名不能含冒号，否则上游在第一个冒号处拆分、必然 407；SOCKS5（RFC 1929）按长度传，不受影响
+	if (scheme == "http" || scheme == "https") && strings.Contains(user, ":") {
+		return "", errProxyUserColon
+	}
+	if scheme == "socks5" && (len(user) > 255 || len(password) > 255) {
+		return "", errProxySOCKS5Length
+	}
+	if len(user)+len(password) > 1024 {
+		return "", errProxyCredentialLength
+	}
+	userinfo := escapeUserinfo(user)
+	if hasPassword {
+		userinfo += ":" + escapeUserinfo(password)
+	}
+	return scheme + "://" + userinfo + "@" + net.JoinHostPort(host, port), nil
+}
+
+// CanonicalProxy 返回规范化后的代理；无法规范化时返回去掉首尾空白的原值，留给 Validate 报错
+func CanonicalProxy(value string) string {
+	if normalized, err := NormalizeProxy(value); err == nil {
+		return normalized
+	}
+	return strings.TrimSpace(value)
+}
+
+// ValidateProxy 校验账户或全局代理，接受 NormalizeProxy 支持的全部写法
+func ValidateProxy(value string) error {
+	_, err := NormalizeProxy(value)
+	return err
+}
+
+// RedactProxy 返回去掉账号密码的 scheme://host:port，供日志与提示使用；空值返回空串，无法识别时返回 "<无法识别的代理>"。
+// 不用 url.URL.Redacted()：它保留用户名，而动态 IP 的用户名里常带 session 参数
+func RedactProxy(value string) string {
+	normalized, err := NormalizeProxy(value)
+	if err != nil {
+		return unrecognizedProxy
+	}
+	if normalized == "" {
+		return ""
+	}
+	parsed, err := url.Parse(normalized)
+	if err != nil {
+		return unrecognizedProxy
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + parsed.Host
+}
+
+// RedactArgument 用于把命令行位置参数写进错误：位置参数可能是忘了写 --proxy 的带账号密码代理。像代理写法（含 @、://，
+// 或含 2 个及以上冒号，覆盖 host:port:用户名:密码 与 用户名:密码:host:port）时，带账号密码的只保留 scheme://host:port，
+// 无法识别的整体隐藏；其余原样返回。位置参数在这里一律非法，多隐藏一些没有代价
+func RedactArgument(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if !strings.Contains(trimmed, "@") && !strings.Contains(trimmed, "://") && strings.Count(trimmed, ":") < 2 {
+		return value
+	}
+	normalized, err := NormalizeProxy(trimmed)
+	if err != nil {
+		return "<已隐藏>"
+	}
+	if ProxyHasCredentials(normalized) {
+		return RedactProxy(normalized)
+	}
+	return value
+}
+
+// ProxyHasCredentials 判断代理是否带账号密码（按规范化结果判断）；无法规范化时为 false
+func ProxyHasCredentials(value string) bool {
+	normalized, err := NormalizeProxy(value)
+	if err != nil || normalized == "" {
+		return false
+	}
+	parsed, err := url.Parse(normalized)
+	return err == nil && parsed.User != nil
+}
+
+// legacyProxyValid 是原 ValidateProxy 去掉“不能包含认证信息”之后的判定：handled 为 true 表示按原规则处理
+// （不带认证、能解析、有主机名、协议是 http/https/socks5），这时 err 为空就原样返回
+func legacyProxyValid(value string) (handled bool, err error) {
+	parsed, parseErr := url.Parse(value)
+	if parseErr != nil || parsed.User != nil || parsed.Hostname() == "" {
+		return false, nil
 	}
 	switch parsed.Scheme {
 	case "http", "https", "socks5":
 	default:
-		return fmt.Errorf("PROXY 必须是 http、https 或 socks5 URL")
-	}
-	if parsed.User != nil {
-		return fmt.Errorf("PROXY 不能包含认证信息")
+		return false, nil
 	}
 	if parsed.Path != "" && parsed.Path != "/" || parsed.RawQuery != "" || parsed.Fragment != "" {
-		return fmt.Errorf("PROXY 不能包含路径、查询参数或片段")
+		return true, errProxyPath
 	}
-	return nil
+	return true, nil
+}
+
+// colonProxyCredentials 判断 rest（去掉协议之后的部分）是否为 host:port:用户名:密码 写法：前两段是 host 与数字端口，第 3 段里还有冒号，
+// 而且用户名不为空。用户名为空（http://h:1::2）不可能是账号密码，照旧走直通分支，原规则接受的值原样返回
+func colonProxyCredentials(rest string) bool {
+	match := colonProxyPattern.FindStringSubmatch(rest)
+	return match != nil && strings.Contains(match[3], ":") && !strings.HasPrefix(match[3], ":")
+}
+
+// ambiguousProxyOrder 判断账号密码与 host:port 是否可能写反了：host 段不是 IP、不含点、也不是 [v6]，而 用户名:密码 段本身像
+// IPv4 或带点域名加端口。冒号写法（myuser:54321:1.2.3.4:8080 其实是 用户名:密码:host:port）与 @ 写法
+// （1.2.3.4:8080@user:12345 其实是 host:port@用户名:密码）共用这一判定
+func ambiguousProxyOrder(host, credentials string) bool {
+	if strings.HasPrefix(host, "[") || strings.Contains(host, ".") || net.ParseIP(host) != nil {
+		return false
+	}
+	return hostPortLikePattern.MatchString(credentials)
+}
+
+// bareIPv6 判断没加方括号的 IPv6 地址，可以带端口（2001:db8::1、2001:db8::1:8080）
+func bareIPv6(hostPort string) bool {
+	if strings.Count(hostPort, ":") < 2 || strings.ContainsAny(hostPort, "[]") {
+		return false
+	}
+	if net.ParseIP(hostPort) != nil {
+		return true
+	}
+	return net.ParseIP(hostPort[:strings.LastIndexByte(hostPort, ':')]) != nil
+}
+
+// bareIPv6URL 判断带协议的值是否为不带认证、主机是不加方括号的 IPv6 的 URL
+func bareIPv6URL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && parsed.User == nil && bareIPv6(parsed.Host)
+}
+
+// pathHidesCredentials 判断带协议的值里最后一个 @ 是否在第一个 / ? # 之后：密码以数字开头又含 / ? # 时，url.Parse 把
+// 用户名:数字 读成 host:port、其余读成路径（http://user:12/ab@h:8080），提示改写法而不是只说“不能包含路径”
+func pathHidesCredentials(rest string) bool {
+	separator := strings.IndexAny(rest, "/?#")
+	return separator >= 0 && strings.LastIndex(rest, "@") > separator
+}
+
+// hasExplicitPort 判断 host[:port] 是否写了端口；冒号后面为空（1.2.3.4:）不算写了端口
+func hasExplicitPort(hostPort string) bool {
+	if strings.HasPrefix(hostPort, "[") {
+		index := strings.Index(hostPort, "]:")
+		return index >= 0 && index+2 < len(hostPort)
+	}
+	index := strings.LastIndexByte(hostPort, ':')
+	return index >= 0 && index+1 < len(hostPort)
+}
+
+// splitProxyHostPort 严格拆分 host[:port]：IPv6 必须加方括号，host 只能是 IP 或主机名（见 validProxyHost），端口为 1-65535 的
+// 十进制数（不允许前导零）；没写端口时 http 补 80、https 补 443，socks5 报错
+func splitProxyHostPort(hostPort string, scheme string) (string, string, error) {
+	host, port := hostPort, ""
+	if strings.HasPrefix(hostPort, "[") || strings.Count(hostPort, ":") == 1 {
+		var err error
+		if !strings.HasPrefix(hostPort, "[") || strings.Contains(hostPort, "]:") {
+			host, port, err = net.SplitHostPort(hostPort)
+			if err != nil {
+				return "", "", errProxyFormat
+			}
+		} else {
+			// [v6] 不带端口时必须以 ] 结尾：缺右方括号的 [::1 不能当成 ::1
+			if !strings.HasSuffix(hostPort, "]") {
+				return "", "", errProxyFormat
+			}
+			host = strings.TrimSuffix(strings.TrimPrefix(hostPort, "["), "]")
+		}
+	} else if strings.Contains(hostPort, ":") {
+		if bareIPv6(hostPort) {
+			return "", "", errProxyIPv6
+		}
+		return "", "", errProxyFormat
+	}
+	if !validProxyHost(host) {
+		return "", "", errProxyFormat
+	}
+	if port == "" {
+		switch scheme {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return "", "", errProxySOCKS5Port
+		}
+	}
+	number, err := strconv.Atoi(port)
+	if err != nil || number < 1 || number > 65535 || strconv.Itoa(number) != port {
+		return "", "", errProxyPort
+	}
+	return host, port, nil
+}
+
+// validProxyHost 判断代理主机：IP 字面量，或只含字母、数字、. - _ 与非 ASCII 字符（国际化域名）的主机名。
+// 引号、$、&、; 等字符不是合法主机名，拒绝后规范输出写进 .env 不需要引号，也不含 shell 元字符
+func validProxyHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	for index := 0; index < len(host); index++ {
+		character := host[index]
+		if character >= 0x80 || 'a' <= character && character <= 'z' || 'A' <= character && character <= 'Z' ||
+			'0' <= character && character <= '9' || character == '.' || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// unescapeUserinfo 按 URL 规则解码 @ 写法与 URL 写法里的百分号编码（不用 QueryUnescape，否则 + 会变成空格）；
+// 不是合法编码时按字面保留
+func unescapeUserinfo(value string) string {
+	decoded, err := url.PathUnescape(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+// escapeUserinfo 对用户名或密码做百分号编码：只保留 RFC 3986 的非保留字符（字母、数字与 - . _ ~），
+// 其余字节一律编码，结果写进 .env 不需要引号，也不含 shell 元字符；url.Parse 解码后与原文一致
+func escapeUserinfo(value string) string {
+	const hex = "0123456789ABCDEF"
+	var builder strings.Builder
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if 'a' <= character && character <= 'z' || 'A' <= character && character <= 'Z' || '0' <= character && character <= '9' ||
+			character == '-' || character == '.' || character == '_' || character == '~' {
+			builder.WriteByte(character)
+			continue
+		}
+		builder.WriteByte('%')
+		builder.WriteByte(hex[character>>4])
+		builder.WriteByte(hex[character&15])
+	}
+	return builder.String()
 }
 
 func readEnvFile(path string) (map[string]string, error) {

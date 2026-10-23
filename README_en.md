@@ -499,7 +499,7 @@ cp .env.example .env
 | `AISTUDIO_AUTH_STATES` | `auth` | Account file, directory, or comma-separated paths |
 | `LISTEN_ADDR` | `127.0.0.1:2048` | Management UI and API listen address |
 | `PROXY_API_KEY` | `sk-onechat-fun-fun` | Public API key; every API call must send it, and an empty value means the default. The default key is public in the source code, so set your own key before listening on a public address |
-| `PROXY` | empty | HTTP, HTTPS, or SOCKS5 proxy used by Chrome import, login, and accounts without an override |
+| `PROXY` | empty | Proxy used by Chrome import, login, and accounts without an override: http, https, or socks5, optionally with credentials (`http://user:pass@IP:port`, `IP:port:user:pass`, and more); saved in URL form, see [Proxy Configuration](#proxy-configuration) |
 | `INIT_TIMEOUT` | `2m` | Per-account WAA initialization timeout |
 | `REQUEST_TIMEOUT` | `5m` | Deadline before the first upstream event of a generation request: queuing, cold starts, WAA proof, attachment uploads, waiting for the first token and account switches before it all count, and it returns 504 when it expires. Once output starts it becomes an idle limit: the request ends with 504 only when upstream sends no event and no bytes for this long; a whole generation request is capped at 1 hour (or this value if longer). Token counting, video and transcription requests are limited by it as a whole. Changes apply to new requests only; see [Long replies cut off or regenerated](#long-replies-cut-off-or-regenerated) |
 | `FIRST_EVENT_TIMEOUT` | `0` (disabled) | How long each attempt waits for its first upstream event after sending upstream; on timeout only that attempt is abandoned and the request retries on another account, returning 504 when no retry is possible. Must be shorter than `REQUEST_TIMEOUT`; models that think for a long time may take a while to emit their first event, so leave plenty of headroom |
@@ -569,11 +569,31 @@ Before writing response headers, a streaming request waits for the first event f
 
 ### Proxy Configuration
 
-HTTP, HTTPS, and SOCKS5 proxies without embedded credentials are supported:
+HTTP, HTTPS, and SOCKS5 proxies are supported, with or without credentials (static and rotating IP accounts from proxy providers can be entered as they are):
 
-1. Set the global proxy under Service Configuration
-2. Edit an account to set an account-specific proxy
+1. Set the default proxy under Service Configuration (`PROXY` in `.env`)
+2. Set an account-specific proxy when editing an account, logging in with a browser, or importing from Chrome; leave it empty to use the default proxy
 3. The account proxy is used for login, WAA, and business requests
+
+Five formats are accepted; http is assumed when no scheme is given, and `socks5h://` is treated as `socks5://`:
+
+- `http://host:port` (no credentials; likewise `https://` and `socks5://`)
+- `http://user:pass@host:port` (likewise `https://`)
+- `socks5://user:pass@host:port`
+- `host:port:user:pass` (the most common format in provider dashboards; everything after the third colon is the password, and a scheme may be added, for example `socks5://1.2.3.4:1080:user:pass`)
+- `user:pass@host:port`
+
+The `user:pass:host:port` and `host:port@user:pass` orders, which put the credentials and host:port the wrong way round, are not supported: with a numeric password they cannot be told apart from `host:port:user:pass` and `user:pass@host:port` (for example `myuser:54321:1.2.3.4:8080` and `1.2.3.4:8080@myuser:54321`), so saving fails with a hint to use `http://user:pass@host:port` instead. The check fires when the host part is not an IP and has no dot while `user:pass` looks like an IP or dotted domain plus a port; it also fires for a dotless proxy host name (for example `localhost` or a LAN host name) with a domain-like username and a numeric password, so write the proxy host as an IP in that case. IPv6 addresses need brackets, for example `http://user:pass@[2001:db8::1]:8080`.
+
+Notes:
+
+- **Saved in URL form**: for example `1.2.3.4:8080:user:pass` is saved as `http://user:pass@1.2.3.4:8080`. Every character of the username and password other than letters, digits, and `- . _ ~` is percent-encoded, so `.env` needs no quotes; a valid URL without credentials is saved unchanged. The only exception is the colon form with a scheme and a numeric or empty password (for example `http://1.2.3.4:8080:user:123`): earlier versions read it as a URL without credentials whose host name contains colons (which never worked), and it is now treated as credentials and saved as `http://user:123@1.2.3.4:8080`; such a value that fails the rule above (for example `http://myuser:54321:1.2.3.4:8080`) stops the service from starting when it is in `.env`, and keeps that account from loading when it is in `account.json`, so rewrite it as the error message says. In the URL and `user:pass@` forms, `%XX` sequences are percent-decoded; to keep a literal sequence such as `%41` in the password, use the colon form. With a scheme and credentials but no port, http gets 80 and https gets 443; without a scheme a port is required; SOCKS5 always requires a port; the username of an HTTP/HTTPS proxy cannot contain a colon (Basic authentication splits the username and password at the first colon), and the SOCKS5 username and password are each limited to 255 bytes.
+- **Two egress paths**: with credentials, the browser (the Camoufox WAA worker, browser login, and login verification) reaches the upstream proxy through a relay on a random `127.0.0.1` port (Firefox proxy settings have no credentials; the relay adds the authentication and forwards the tunnel bytes unchanged), while background requests (business requests, WAA of the Go backend, Chrome import, and auth renewal) connect to the upstream proxy with the credentials directly. Both paths use the same upstream, so the exit IP is the same with a static IP or a sticky session. Proxies without credentials do not go through the relay and behave exactly as before.
+- **Rotating IPs**: enable a sticky session at your provider and set a long session duration. A proxy that rotates per connection makes browser pages and background requests leave from different IPs, and the IP also changes when a session expires.
+- **Test proxy**: the default proxy and account proxy inputs have a "Test proxy" button that queries the third-party exit IP service `api.ipify.org` through the proxy and shows the exit IP and time for the browser path and the background request path, warning when the two IPs differ (the proxy rotates per connection). Only api.ipify.org is contacted, not Google, and api.ipify.org sees your exit IP. In the account dialogs an empty proxy tests the default proxy; the test also works while the service is stopped. The button tests the value currently in the input without saving it first; on the settings page the auto-apply countdown does not start while a test is running and does not run after a failed test, so click "Apply now" yourself if needed.
+- **`https://` without credentials**: the browser (Camoufox) connects to the proxy's TLS port as a plain HTTP proxy, so login and WAA will likely fail (current behavior); use the `http://` form or a credentialed URL (the local relay handles TLS to the upstream).
+- **Storage and display of credentials**: `.env` and `account.json` store the proxy with its credentials in plain text, with file mode 0600; the management API returns the full proxy (at the same level as `PROXY_API_KEY`; the management page itself requires the admin token), and the page shows only `scheme://host:port` without credentials plus an "auth" tag until you click into the input. Credentials passed with `--proxy` on the command line are visible to other users of the machine in `ps`, so prefer `.env`. Accounts imported with `setup` get the default proxy of that moment written into their own `account.json`; after the proxy password changes, update those accounts one by one (or clear their account proxy to use the default proxy). Opening the management page directly by server IP and port (for example `http://<server IP>:2048`) uses plain HTTP, so the proxy credentials in the configuration, the account list, and the live event stream travel in clear text, just like the admin token; put the page behind an HTTPS reverse proxy, or use an SSH tunnel `ssh -L 2048:127.0.0.1:2048 <server>` and open `http://127.0.0.1:2048`.
+- **Relay security**: the relay listens only on `127.0.0.1` on a port chosen by the system and has no authentication of its own: while a browser is running, other local processes could use it to go out through your proxy (the same level of exposure as the debugging port Camoufox opens on the loopback address). Credentials are not written into the Camoufox temporary profile.
 
 ### Authentication File Management
 
@@ -581,7 +601,7 @@ Authentication files are stored in `auth/` by default:
 
 | Path | Contents |
 | --- | --- |
-| `auth/<Google email>/account.json` | Account email, proxy, locale, timezone, and enabled state (a missing `enabled` field means enabled; `false` without a manual disable record is switched to enabled and written back at startup or import) |
+| `auth/<Google email>/account.json` | Account email, proxy, locale, timezone, and enabled state (a missing `enabled` field means enabled; `false` without a manual disable record is switched to enabled and written back at startup or import); the proxy is stored with its credentials in plain text, with file mode 0600 |
 | `auth/<Google email>/storage-state.json` | Google cookies and authentication renewal material |
 | `auth/<Google email>/runtime-state.json` | Benefit tier, model eligibility, cooldowns, and resource ownership |
 | `auth/.permission-denied.json` | List of 403 permission denied accounts (account, model, channel, count, and time); an account is removed once its auth file is updated |

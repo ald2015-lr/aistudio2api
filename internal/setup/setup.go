@@ -17,6 +17,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/chromeauth"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 )
 
 type setupStrings []string
@@ -48,6 +49,8 @@ type setupOptions struct {
 
 // Run 执行本机 Chrome 导入、文件导入或隔离登录
 func Run(ctx context.Context, cfg config.Config, args []string) error {
+	// 本机代理中转（setup --login 带账号密码的代理）的日志写到标准错误，遇到 407 等能看到原因；日志里不含账号密码
+	proxyrelay.SetLogger(func(level, message string) { fmt.Fprintf(os.Stderr, "%s %s\n", level, message) })
 	options, err := parseSetupFlags(args, cfg)
 	if err != nil {
 		return err
@@ -245,24 +248,37 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	storageState := flags.String("storage-state", "", "Playwright storage state 文件")
 	login := flags.Bool("login", false, "使用隔离 Camoufox 登录")
 	chromeRoot := flags.String("chrome-root", "", "Chrome User Data 目录")
-	proxy := flags.String("proxy", cfg.Proxy, "账户固定 HTTP、HTTPS 或 SOCKS5 代理")
+	// 默认值留空：.env 的 PROXY 可能带账号密码，-h 与参数解析出错时 PrintDefaults 会把默认值打印出来
+	proxy := flags.String("proxy", "", "账户固定代理，可带账号密码，写法同 .env 的 PROXY；不指定时使用 .env 的值")
 	locale := flags.String("locale", aistudio.DefaultAccountLocale(), "账户语言")
 	timezone := flags.String("timezone", aistudio.DefaultAccountTimezone(), "账户时区")
 	if err := flags.Parse(args); err != nil {
 		return setupOptions{}, err
 	}
 	if flags.NArg() != 0 {
-		return setupOptions{}, fmt.Errorf("未知参数 %q", flags.Arg(0))
+		proxyGiven := false
+		flags.Visit(func(value *flag.Flag) { proxyGiven = proxyGiven || value.Name == "proxy" })
+		if proxyGiven {
+			// --proxy 的值里有空格又没加引号时，后半段（可能是密码的一部分）成了位置参数，整体不回显
+			return setupOptions{}, errors.New("未知参数（已隐藏：可能是 --proxy 值的一部分，值里有空格时请整体加引号）")
+		}
+		// 位置参数可能是忘了写 --proxy 的带账号密码代理，错误会写进日志，不回显账号密码
+		return setupOptions{}, fmt.Errorf("未知参数 %q", config.RedactArgument(flags.Arg(0)))
 	}
+	// 没传 --proxy 时使用 .env 的值（Load 已规范化并校验）
 	options := setupOptions{
 		storageState: strings.TrimSpace(*storageState), login: *login,
 		chromeRoot: strings.TrimSpace(*chromeRoot), profiles: profiles, emails: emails,
-		proxy:  strings.TrimSpace(*proxy),
+		proxy:  strings.TrimSpace(cfg.Proxy),
 		locale: strings.TrimSpace(*locale), timezone: strings.TrimSpace(*timezone),
 	}
+	proxySet := false
 	flags.Visit(func(value *flag.Flag) {
-		if value.Name == "locale" {
+		switch value.Name {
+		case "locale":
 			options.localeSet = true
+		case "proxy":
+			proxySet = true
 		}
 	})
 	chromeSelection := options.chromeRoot != "" || len(options.profiles) != 0 || len(options.emails) != 0
@@ -275,8 +291,13 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	if options.locale == "" || options.timezone == "" {
 		return setupOptions{}, fmt.Errorf("locale 和 timezone 不能为空")
 	}
-	if err := config.ValidateProxy(options.proxy); err != nil {
-		return setupOptions{}, err
+	if proxySet {
+		// 显式传了 --proxy：规范化成上游 URL（--proxy "" 表示直连），错误文案不含输入内容
+		normalized, err := config.NormalizeProxy(*proxy)
+		if err != nil {
+			return setupOptions{}, err
+		}
+		options.proxy = normalized
 	}
 	return options, nil
 }

@@ -26,7 +26,9 @@ import type {
   WorkerCounters,
   WorkerState,
 } from '@/types'
+import { maskProxy, proxyHasAuth } from '@/proxy'
 import OnboardingPanel from './OnboardingPanel.vue'
+import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiPager from './UiPager.vue'
 
@@ -635,8 +637,9 @@ const filtered = computed(() => {
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
     if (term === '') return true
-    return [account.label, account.proxy, account.message, account.benefit_tier].some((value) =>
-      value.toLowerCase().includes(term),
+    // 代理按掩码后的显示值匹配，搜不到账号密码
+    return [account.label, maskProxy(account.proxy), account.message, account.benefit_tier].some(
+      (value) => value.toLowerCase().includes(term),
     )
   })
   if (sortKey.value === 'state') {
@@ -1543,8 +1546,16 @@ function closeBulkPanel(): void {
                   {{ account.models.length === 0 ? '—' : account.models.length }}
                 </td>
                 <td>
-                  <div v-tooltip="account.proxy" class="cell-truncate text-xs text-gray-400">
-                    {{ account.proxy || t('accounts.direct') }}
+                  <div
+                    v-tooltip="maskProxy(account.proxy)"
+                    class="cell-truncate text-xs text-gray-400"
+                  >
+                    {{ maskProxy(account.proxy) || t('accounts.direct')
+                    }}<span
+                      v-if="proxyHasAuth(account.proxy)"
+                      class="ml-1 rounded bg-[#21262d] px-1 text-[10px] text-gray-400"
+                      >{{ t('proxy.authTag') }}</span
+                    >
                   </div>
                 </td>
                 <td>
@@ -1691,16 +1702,19 @@ function closeBulkPanel(): void {
               <span class="text-sm font-medium text-gray-400">{{ t('common.enable') }}</span>
               <input v-model="draft.enabled" class="h-4 w-4 accent-blue-600" type="checkbox" />
             </label>
-            <label class="block">
+            <!-- 代理输入里有掩码按钮与“测试代理”按钮，标题不用 label 包裹，避免点说明文字或测试结果时触发掩码按钮 -->
+            <div>
               <span class="mb-1 block text-sm font-medium text-gray-400">{{
                 t('accounts.proxy')
               }}</span>
-              <input
-                v-model.trim="draft.proxy"
-                class="input w-full"
-                placeholder="socks5://127.0.0.1:1080"
+              <ProxyInput
+                v-model="draft.proxy"
+                input-class="input w-full"
+                :help="t('accounts.proxyHelp')"
+                allow-empty-test
+                :label="t('accounts.proxy')"
               />
-            </label>
+            </div>
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label class="block">
                 <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -1751,16 +1765,18 @@ function closeBulkPanel(): void {
             </button>
           </div>
           <div class="space-y-4">
-            <label class="block">
+            <div>
               <span class="mb-1 block text-sm font-medium text-gray-400">{{
                 t('accounts.proxy')
               }}</span>
-              <input
-                v-model.trim="accountEnvironment.proxy"
-                class="input w-full"
-                placeholder="socks5://127.0.0.1:1080"
+              <ProxyInput
+                v-model="accountEnvironment.proxy"
+                input-class="input w-full"
+                :help="t('accounts.proxyHelp')"
+                allow-empty-test
+                :label="t('accounts.proxy')"
               />
-            </label>
+            </div>
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label class="block">
                 <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -1816,16 +1832,18 @@ function closeBulkPanel(): void {
             </button>
           </div>
           <div class="mb-4 space-y-4">
-            <label class="block">
+            <div>
               <span class="mb-1 block text-sm font-medium text-gray-400">{{
                 t('accounts.proxy')
               }}</span>
-              <input
-                v-model.trim="accountEnvironment.proxy"
-                class="input w-full"
-                placeholder="socks5://127.0.0.1:1080"
+              <ProxyInput
+                v-model="accountEnvironment.proxy"
+                input-class="input w-full"
+                :help="t('accounts.proxyHelp')"
+                allow-empty-test
+                :label="t('accounts.proxy')"
               />
-            </label>
+            </div>
             <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label class="block">
                 <span class="mb-1 block text-sm font-medium text-gray-400">{{

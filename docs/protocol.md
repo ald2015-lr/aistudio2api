@@ -149,7 +149,7 @@ Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secu
 
 | 文件 | 内容 |
 | --- | --- |
-| `auth/<Google 邮箱>/account.json` | 邮箱、enabled（缺少该字段按启用读取）、proxy、locale、timezone |
+| `auth/<Google 邮箱>/account.json` | 邮箱、enabled（缺少该字段按启用读取）、proxy（规范化后的上游 URL，可含账号密码，明文保存，文件 0600）、locale、timezone |
 | `auth/<Google 邮箱>/storage-state.json` | Cookie、localStorage 和可选 Chrome 续签材料 |
 | `auth/<Google 邮箱>/camoufox-fingerprint.json` | 账户固定的 navigator、屏幕、字体、语言、地区和时区配置 |
 | `auth/<Google 邮箱>/runtime-state.json` | 账户权益、实测模型资格、冷却与 Drive/Veo 资源绑定 |
@@ -158,7 +158,7 @@ Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secu
 | `auth/.leases/<Google 邮箱>.runtime.lock` | 每次 `runtime-state.json` 读取、合并与写回的短事务锁 |
 | `[用户缓存]/AIStudio2API/runtime-leases/<Google 邮箱>.lock` | 当前电脑上该邮箱的 WAA Worker 占用锁 |
 
-Google 邮箱的小写形式同时作为账户目录、管理页面标识和日志来源。新账户的 locale 与 timezone 读取当前电脑设置，管理页面使用浏览器语言和 IANA 时区；CLI 使用操作系统语言和时区。初始化、WAA、MakerSuite、OAuth 续签和 Drive 使用账户固定代理。locale 同时设置 navigator language、Accept-Language 与地区，timezone 设置浏览器时区；重新登录和 WAA runtime 复用同一账户指纹。同一电脑上的多个进程按邮箱共享 WAA runtime lease，调度器只会为未被占用的邮箱创建 Worker。
+Google 邮箱的小写形式同时作为账户目录、管理页面标识和日志来源。新账户的 locale 与 timezone 读取当前电脑设置，管理页面使用浏览器语言和 IANA 时区；CLI 使用操作系统语言和时区。初始化、WAA、MakerSuite、OAuth 续签和 Drive 使用账户固定代理。代理带账号密码时，Camoufox（WAA Worker、隔离登录与登录验证）经 `127.0.0.1` 随机端口上的本机中转连接上游代理（Firefox prefs 没有账号密码字段），隧道内字节不变；Go 侧请求（MakerSuite、Drive、WebChannel、Go WAA、Chrome OAuth 导入与续签）直接带认证连接上游，两条路径的出口相同；不带账号密码的代理不经过中转，见 [开发文档](development.md#本机代理中转)。locale 同时设置 navigator language、Accept-Language 与地区，timezone 设置浏览器时区；重新登录和 WAA runtime 复用同一账户指纹。同一电脑上的多个进程按邮箱共享 WAA runtime lease，调度器只会为未被占用的邮箱创建 Worker。
 
 `runtime-state.json` 根字段为 `cooldowns`、`resources`、`model_access`、`benefit_tier`、`catalog_fingerprint`。cooldown value 为 `{until,reason?}`；model access value 为 `{state,checked_at,reason?}`；resource value 为 `{kind?,name?,mime?,size?,purpose?,created_at,video?:{model,seconds,size}}`。
 
@@ -1115,6 +1115,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}`、`POST /api/accounts/bulk-delete` |
 | 账户认证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
+| 代理测试 | `POST /api/proxy/test` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
 | 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
@@ -1137,6 +1138,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/accounts/bulk-delete` | 200 | `BulkDeleteResult` |
 | `POST /api/control/start`、`stop` | 200 | `AdminStatus` |
 | `GET /api/config`、`PUT /api/config` | 200 | `RuntimeConfig` |
+| `POST /api/proxy/test` | 200 | `ProxyTestResult`，见下文“代理测试” |
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
 | `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...]}`，按最近一次 403 从新到旧 |
 | `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400；账户 ID 只去掉首尾空白，匹配不区分大小写）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
@@ -1172,11 +1174,13 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md) |
 | `AdminEvent` | `type`、`data` |
 
+`AdminAccount`、`AccountCreateInput`、`AccountInput`、`ChromeImportInput` 与 `RuntimeConfig` 的 `proxy` 字段不变：提交时接受任何支持的写法，服务端规范化后保存；读取时返回完整的规范值（含账号密码），只在管理页前端掩码显示。
+
 `AdminStatus.state` 为 `STOPPED`、`LAUNCHING` 或 `RUNNING`；`running` 只在 `RUNNING` 为 true；`ready` 要求 `RUNNING` 且至少一个账户处于 ready 或 busy；`version` 来自构建信息；`active_requests` 是当前进程请求注册表数量。`AdminAccount.message` 保存当前状态原因，`models` 是该账户实时目录 ID。`until` 与 `started_at` 使用 RFC 3339 JSON time。
 
 Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个列出账号，同一 Profile 可以包含多个账号，同一邮箱只列出一次。`ChromeImportProfile.id` 为 `<Profile>/<Gaia ID>`；导入读取 `token_service` 中 service 为 `AccountId-<Gaia ID>` 的凭据。管理页列表默认不勾选，并提供全选。CLI 的 `--profile` 导入该 Profile 下的全部账号，交互编号对应单个账号。
 
-`AccountCreateInput` 启动隔离 Camoufox 登录，邮箱由 AI Studio 页面读取。`ChromeImportInput.account_ids` 可一次选择多个账号。`AccountInput.label` 必须与不可变的 Google 邮箱 ID 一致，`locale` 与 `timezone` 必须非空，`proxy` 使用无 credentials、path、query 或 fragment 的 HTTP、HTTPS、SOCKS5 origin。新增、导入、登录和验证成功后立即刷新该账户模型目录，并发布最新账户与模型事件。
+`AccountCreateInput` 启动隔离 Camoufox 登录，邮箱由 AI Studio 页面读取。`ChromeImportInput.account_ids` 可一次选择多个账号。`AccountInput.label` 必须与不可变的 Google 邮箱 ID 一致，`locale` 与 `timezone` 必须非空，`proxy` 接受 `config.NormalizeProxy` 支持的全部写法：不带认证的 `http`/`https`/`socks5` URL、`http://用户名:密码@host:port`、`socks5://用户名:密码@host:port`、`host:port:用户名:密码`、`用户名:密码@host:port`（不写协议按 http，`socks5h` 按 `socks5`），不能带 path、query 或 fragment；三个入口在校验与 Chrome 导入之前规范化，格式错误返回 400 `invalid_account`，文案以固定前缀 `账户 proxy 无效: ` 开头、不含输入内容。保存与返回的 `AdminAccount.proxy` 是规范化后的上游 URL（例如 `1.2.3.4:8080:u:p` 保存为 `http://u:p@1.2.3.4:8080`），不是本机中转地址。管理接口与 `.env`、`account.json` 的信任级别相同（需要管理令牌或管理密码），因此照旧返回含账号密码的完整规范值，与 `proxy_api_key` 明文返回同级：服务端返回掩码的话，新账户自动处理的回写、启停与编辑草稿会把掩码写回磁盘。新增、导入、登录和验证成功后立即刷新该账户模型目录，并发布最新账户与模型事件。
 
 `POST /api/accounts/bulk-enable` 一次请求启用一批账户：去重后只处理停用的账户，单次最多 1000 个（其余计入 `remaining`），16 个并行取得账户独占租约（最多等 3 秒，等不到记为 `account_busy`）并只把 `account.json` 的 `enabled` 改为 `true`，代理、语言、时区不变，不重建固定出口与 Worker 配置，清除停用原因；全部写完后登记一次模型变化、合并并推送一次快照，再在后台为没有模型目录的账户同步目录（与单个启用共用 16 个并发名额，整批同步完合并一次）。启用不等待目录，登录已失效的账户由目录同步标为 `auth_required`。请求体缺少 `account_ids` 且 `all_disabled` 不为 `true` 时返回 400 `invalid_account`。管理页“一键启用”与选中账户的启用按 500 个一批依次提交，两批之间可以停止。
 
@@ -1190,7 +1194,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 
 | 字段 | 读写与生效时机 |
 | --- | --- |
-| `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用 |
+| `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 保存值；下一次启动生成服务时使用。`proxy` 提交时接受任何支持的写法，服务端先规范化再写入 `.env`（格式错误返回 400 `invalid_config`，文案为固定文本），响应里是规范值；管理页保存后把它同步回表单 |
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
 | `account_rpm_limit` | 保存值，保存后立即热更新：单账号最近 60 秒最多发出的生成请求数（整数 `0..1000`，默认 `10`，`0` 为关闭），满窗的账号按忙碌处理、请求换到其他账号；读取时总是返回，提交时省略（旧版页面）则沿用现值；超出范围时返回 400 `invalid_config` |
@@ -1205,7 +1209,49 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | `management_restart_required` | response-only；保存的 listen/key 与当前管理进程不同 |
 | `service_restart_required` | response-only；保存的生成服务配置与当前生成服务实例不同 |
 
-`PUT /api/config` 原子保存配置。监听地址和 API key 在管理进程重启后生效；账户路径、代理、timeout、容量与临时对话在 Stop/Start 创建的新生成服务实例中生效。启动时读取最新配置；配置加载、校验、实例创建失败或启用前取消时保留原实例，切换到新实例后由它完成启动或进入 `STOPPED`。
+`PUT /api/config` 原子保存配置。监听地址和 API key 在管理进程重启后生效；账户路径、代理、timeout、容量与临时对话在 Stop/Start 创建的新生成服务实例中生效。`proxy` 的保存值与生效值都是规范化后的上游 URL（`config.Load`、命令行 `--proxy` 与页面提交都经同一个规范化函数），`service_restart_required` 比较时对提交值再规范化一次，写法不同但上游相同不算变化，只有上游真正变化时才为真。启动时读取最新配置；配置加载、校验、实例创建失败或启用前取消时保留原实例，切换到新实例后由它完成启动或进入 `STOPPED`。
+
+**代理测试**：`POST /api/proxy/test` 经代理访问第三方出口 IP 服务 `https://api.ipify.org?format=json`，分别测试 Camoufox 的路径（带账号密码时经本机中转）与 Go 后台请求的路径（直连上游代理），检查账号密码是否有效、IP 是否按连接轮换。只访问 api.ipify.org，不访问 Google 的任何域名；api.ipify.org 会看到出口 IP。实现挂在生成服务管理器上，生成服务 `STOPPED` 时也能测试。请求体为 `ProxyTestInput`：
+
+```json
+{"proxy":"1.2.3.4:8080:user:pass"}
+```
+
+`proxy` 为输入框原文（任何支持的写法）；为空时测试当前生成服务实例的默认代理，即登录与 Worker 实际使用的那份配置快照（保存后还没重启生成服务时仍是旧值）。服务端先按 `config.NormalizeProxy` 规范化，再并发跑两次探测，每次用一条新连接，共用 40 秒期限（不小于中转连上游的 25 秒加 TLS 与一次请求的余量）；探测与 Go 后台请求使用同一个 `aistudio.NewProxyHTTPClient`，不跟随跳转（3xx 报 `出口 IP 服务返回 HTTP 30x`），状态码必须是 200，响应最多读 4 KiB，`ip` 用 `net.ParseIP` 校验。浏览器路径失败时，用本次中转租约自己的失败记录（只认上游层面的失败与目标为 `api.ipify.org` 的失败）替换错误说明，例如 407 显示为 `上游代理拒绝了账号密码（407），请检查用户名和密码`。成功时返回 200 与 `ProxyTestResult`：
+
+```json
+{
+  "proxy": "http://1.2.3.4:8080",
+  "authenticated": true,
+  "relayed": true,
+  "browser": {"ip": "203.0.113.7", "elapsed_ms": 812},
+  "direct": {"ip": "203.0.113.9", "elapsed_ms": 640},
+  "same_ip": false,
+  "warnings": ["rotating_ip"]
+}
+```
+
+| 字段 | 语义 |
+| --- | --- |
+| `proxy` | 去掉账号密码的 `scheme://host:port`（`config.RedactProxy`），不含用户名 |
+| `authenticated` | 规范化后的代理是否带账号密码 |
+| `relayed` | 浏览器路径是否经本机中转（带账号密码时为 `true`） |
+| `browser`、`direct` | `ProxyTestProbe`：`ip`（成功时的出口 IP，失败时省略）、`elapsed_ms`（耗时毫秒）、`error`（失败时的中文说明，已去掉账号密码，最长 200 个字符，成功时省略） |
+| `same_ip` | 两边都拿到 IP 且相同时为 `true` |
+| `warnings` | 可选：`rotating_ip`（两边都成功但 IP 不同，代理按连接轮换）、`https_plain_browser`（`https://` 且不带账号密码，Camoufox 会以明文 HTTP 代理的方式连接） |
+
+两条路径都失败也返回 200，失败写在各自的 `error` 里。接口本身的错误按管理端错误外壳返回：
+
+| 状态 | `error.code` | 情况 |
+| --- | --- | --- |
+| 400 | `invalid_request` | 请求体不是合法 JSON |
+| 400 | `invalid_config` | 代理格式无效，文案为规范化的固定错误文本，不含输入内容 |
+| 400 | `proxy_required` | `没有填写代理，服务配置的默认代理也为空` |
+| 409 | `proxy_test_busy` | `上一次代理测试还没有结束`：同一时间只跑一次测试 |
+| 500 | `proxy_relay_failed` | 启动本机中转失败（如监听 `127.0.0.1:0` 失败）；错误文本不含代理地址与账号密码 |
+| 501 | `proxy_test_unsupported` | 管理服务不支持代理测试 |
+
+每次测试在 `service` 来源记一条日志，两边都成功为 INFO，否则为 WARN，代理只写 `RedactProxy` 的结果（格式见 [logging.md](logging.md#本机代理中转)）。
 
 `GET /api/events` 的初始顺序为 `status`、`models`、`accounts`、最近 200 条 `log`、`cooldowns`、按开始时间排序的活动 `request`。后续事件的 `data` 形状：
 

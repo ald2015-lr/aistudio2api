@@ -210,17 +210,28 @@ func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error)
 	return accounts, nil
 }
 
+// normalizeAccountProxy 规范化管理接口提交的账户代理（见 config.NormalizeProxy），出错按 400 invalid_account 返回。
+// 错误加“账户 proxy 无效: ”前缀，与 AccountConfig.Validate 一致，避免在账户对话框里误以为是全局 PROXY；前缀与文案都是固定文本
+func normalizeAccountProxy(value string) (string, error) {
+	proxy, err := config.NormalizeProxy(value)
+	if err != nil {
+		return "", invalidAccount(fmt.Errorf("账户 proxy 无效: %w", err))
+	}
+	return proxy, nil
+}
+
 func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountCreateInput) (api.AdminAccount, error) {
+	accountProxy, err := normalizeAccountProxy(input.Proxy)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
 	accountConfig := aistudio.DefaultAccountConfig("")
-	accountConfig.Proxy = strings.TrimSpace(input.Proxy)
+	accountConfig.Proxy = accountProxy
 	if locale := strings.TrimSpace(input.Locale); locale != "" {
 		accountConfig.Locale = locale
 	}
 	if timezone := strings.TrimSpace(input.Timezone); timezone != "" {
 		accountConfig.Timezone = timezone
-	}
-	if err := config.ValidateProxy(accountConfig.Proxy); err != nil {
-		return api.AdminAccount{}, invalidAccount(err)
 	}
 	directory, err := os.MkdirTemp("", "aistudio2api-account-login-*")
 	if err != nil {
@@ -296,11 +307,15 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	if len(input.AccountIDs) == 0 {
 		return nil, invalidAccount(fmt.Errorf("未选择 Chrome 账号"))
 	}
+	// 代理先规范化：原先要等 Chrome 导入（含 OAuth 网络请求）做完才校验，代理写错时白白等一轮导入
+	accountProxy, err := normalizeAccountProxy(input.Proxy)
+	if err != nil {
+		return nil, err
+	}
 	root, err := chromeauth.DefaultChromeRoot()
 	if err != nil {
 		return nil, err
 	}
-	accountProxy := strings.TrimSpace(input.Proxy)
 	results, err := chromeauth.Import(ctx, chromeauth.ImportOptions{
 		ChromeRoot: root, Proxy: admin.effectiveProxy(accountProxy), AccountIDs: input.AccountIDs,
 	})
@@ -414,9 +429,14 @@ func (admin *runtimeAdmin) updateAccount(
 	if !strings.EqualFold(strings.TrimSpace(input.Label), strings.TrimSpace(accountID)) {
 		return api.AdminAccount{}, invalidAccount(fmt.Errorf("账户邮箱不可修改"))
 	}
+	// 代理规范化：onboarding 与管理页回传的已经是规范值，规范化后不变
+	accountProxy, err := normalizeAccountProxy(input.Proxy)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
 	accountConfig := aistudio.DefaultAccountConfig(strings.ToLower(strings.TrimSpace(accountID)))
 	accountConfig.Enabled = input.Enabled
-	accountConfig.Proxy = strings.TrimSpace(input.Proxy)
+	accountConfig.Proxy = accountProxy
 	accountConfig.Locale = strings.TrimSpace(input.Locale)
 	accountConfig.Timezone = strings.TrimSpace(input.Timezone)
 	if err := accountConfig.Validate(); err != nil {
@@ -992,9 +1012,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	} else if ultraPrimaryQueueWait > requestTimeout {
 		ultraPrimaryQueueWait = requestTimeout
 	}
+	// 默认代理先规范化：写进 .env 的与返回给页面的都是规范值，页面同步回表单后不再显示未保存，也不误报需要重启
+	proxy, err := config.NormalizeProxy(value.Proxy)
+	if err != nil {
+		return api.RuntimeConfig{}, invalidConfigError(err)
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
-		Proxy: value.Proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
+		Proxy: proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,

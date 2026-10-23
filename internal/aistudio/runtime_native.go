@@ -8,14 +8,18 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 )
 
 // NativeWorker 将单个账户的 Camoufox 或纯 Go WAA runtime 适配为受保护请求 preparer
 type NativeWorker struct {
-	accountID   string
-	runtime     workerRuntime
+	accountID string
+	runtime   workerRuntime
+	// relay 为带账号密码的代理经本机中转时持有的租约；直通与纯 Go runtime 为 nil 或直通租约（方法对 nil 安全）
+	relay       *proxyrelay.Lease
 	operationMu sync.Mutex
 	stateMu     sync.RWMutex
 	state       WorkerState
@@ -24,19 +28,32 @@ type NativeWorker struct {
 var _ ProtectedPreparer = (*NativeWorker)(nil)
 var _ ProtocolHeaderProvider = (*NativeWorker)(nil)
 
-// NewNativeWorker 启动单个账户的 Camoufox WAA runtime
+// NewNativeWorker 启动单个账户的 Camoufox WAA runtime；带账号密码的代理经本机中转交给 Camoufox（prefs 不能带账号密码），
+// 不带账号密码的代理原样交给 Camoufox
 func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnative.Options) (*NativeWorker, error) {
 	if accountID == "" {
 		return nil, fmt.Errorf("缺少账户 ID")
 	}
+	relay, proxy, err := acquireProxyRelay(options.Proxy, accountID)
+	if err != nil {
+		return nil, err
+	}
+	// 只替换这里的局部参数：账户配置、生成服务配置与 Worker 配置里存的仍然是上游代理
+	options.Proxy = proxy
+	startedAt := time.Now()
 	runtime, err := camoufoxnative.Start(ctx, options)
 	if err != nil {
+		// Start 失败时内部 abort 已按进程组结束浏览器，但结果被丢弃、确认不了；租约释放后监听器按活动判定关闭：
+		// 浏览器若还在发连接就一直保留，连续 5 分钟没有连接才关
+		err = relay.WrapFailure(err, startedAt, proxyrelay.GoogleTarget)
+		relay.Release()
 		return nil, err
 	}
 	runtimeState := runtime.State()
 	return &NativeWorker{
 		accountID: accountID,
 		runtime:   runtime,
+		relay:     relay,
 		state: WorkerState{
 			AccountID: accountID,
 			Phase:     WorkerReady,
@@ -45,6 +62,20 @@ func NewNativeWorker(ctx context.Context, accountID string, options camoufoxnati
 			PageURL:   runtimeState.PageURL,
 		},
 	}, nil
+}
+
+// acquireProxyRelay 为 Camoufox 申请本机代理中转：带账号密码时返回租约与 http://127.0.0.1:N 或 socks5://127.0.0.1:N，
+// 不带账号密码时返回直通租约与原值。中转解析不了的值（只会来自未经校验的配置）不起中转、原样交给 Camoufox，
+// 由它按原有规则报固定文案的错误（不含账号密码），与改动前一致
+func acquireProxyRelay(proxy string, owner string) (*proxyrelay.Lease, string, error) {
+	relay, err := proxyrelay.Acquire(proxy, owner)
+	if errors.Is(err, proxyrelay.ErrInvalidUpstream) {
+		return nil, proxy, nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return relay, relay.Address(), nil
 }
 
 // errWorkerClosed 表示 runtime 已开始关闭，不再生成 proof
@@ -188,6 +219,11 @@ func (worker *NativeWorker) Close() error {
 		state.LastError = ""
 	})
 	err := worker.runtime.Close()
+	if err == nil {
+		// 浏览器进程已确认退出才释放中转：浏览器还活着时关掉监听器，端口可能被别的账户复用，或触发 Firefox 回退直连；
+		// 关闭失败、停在 WorkerClosing 时保留租约，关闭重试成功后再释放（Release 幂等）
+		worker.relay.Release()
+	}
 	worker.updateState(func(state *WorkerState) {
 		if err != nil {
 			state.LastError = err.Error()

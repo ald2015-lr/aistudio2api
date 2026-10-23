@@ -54,13 +54,13 @@ go run ./cmd/aistudio2api
 | 参数 | 作用 |
 | --- | --- |
 | `--chrome-root <DIR>` | 指定 Chrome User Data 根目录 |
-| `--proxy <URL>` | 固定到账户初始化、WAA 与业务请求 |
+| `--proxy <URL>` | 固定到账户初始化、WAA 与业务请求；可带账号密码，写法同 `.env` 的 `PROXY`，不指定时使用 `.env` 的 `PROXY` |
 | `--locale <LOCALE>` | 设置账户语言 |
 | `--timezone <IANA_ZONE>` | 设置账户时区 |
 
 `--storage-state`、`--login` 与 Chrome 导入参数分别构成文件导入、隔离登录和浏览器导入模式。隔离登录使用 `--login`。`setup` 要求 `AISTUDIO_AUTH_STATES` 指向一个账户目录。
 
-`--proxy` 会同时固定到新账户的初始化、WAA 与业务请求，接受无认证信息的 HTTP、HTTPS 或 SOCKS5 URL。`--locale` 和 `--timezone` 设置账户环境；Chrome 导入未显式指定语言时读取 Profile 的首选语言。Camoufox 按以下顺序定位：进程环境变量 `CAMOUFOX_PATH`、`runtime/camoufox/`、可执行文件旁的同名目录、Windows 本机 Camoufox 缓存。全部不存在时自动下载当前平台的固定版本。
+`--proxy` 会同时固定到新账户的初始化、WAA 与业务请求，接受带账号密码的写法（与 `.env` 的 `PROXY` 相同，见下文[代理写法与规范化](#代理写法与规范化)）；显式传入时按 `config.NormalizeProxy` 规范化，`--proxy ""` 表示新账户直连。没有传入时使用 `.env` 的 `PROXY`（`config.Load` 已规范化）：setup 会把全局 `PROXY` 固定写进每个新账户的 `account.json`（`parseSetupFlags` 取 `cfg.Proxy`，`setupAccountConfig` 写入），代理密码轮换后需要逐个账户修改，或清空账户代理改用全局代理。flag 默认值为空，`-h` 与参数解析出错时不会打印 `.env` 里的账号密码；写在命令行的账号密码同机用户能在 `ps` 里看到，建议写进 `.env`（0600）。`--locale` 和 `--timezone` 设置账户环境；Chrome 导入未显式指定语言时读取 Profile 的首选语言。Camoufox 按以下顺序定位：进程环境变量 `CAMOUFOX_PATH`、`runtime/camoufox/`、可执行文件旁的同名目录、Windows 本机 Camoufox 缓存。全部不存在时自动下载当前平台的固定版本。
 
 日常启动只需运行二进制或 Go 入口，再从管理页面启动生成服务：
 
@@ -75,7 +75,7 @@ go run ./cmd/aistudio2api --listen 127.0.0.1:2048 --open-ui
 | --- | --- | --- |
 | `--auth <PATHS>` | 覆盖本次进程使用的账户文件、目录或逗号分隔路径 | `AISTUDIO_AUTH_STATES` |
 | `--listen <HOST:PORT>` | 覆盖管理页面与 API 的监听地址 | `LISTEN_ADDR` |
-| `--proxy <URL>` | 覆盖每次新建生成服务实例使用的全局代理 | `PROXY` |
+| `--proxy <URL>` | 覆盖每次新建生成服务实例使用的全局代理；可带账号密码，显式传入时规范化，`--proxy ""` 表示本次直连，flag 默认值为空（`-h` 不打印 `.env` 的值） | `PROXY` |
 | `--open-ui` | 启动后打开管理页面 | 无参数启动时为 `true` |
 
 管理页面与 `/api` 控制面在生成服务停止时继续运行。停止生成服务会取消活动生成请求并关闭 WAA worker；再次启动会重新读取账户模型目录。关闭启动窗口或按 `Ctrl+C` 才会退出整个管理进程。
@@ -91,7 +91,8 @@ internal/api/            OpenAI、Responses、Anthropic、Gemini 与管理端 HT
 internal/camoufoxnative/ 原生 WebDriver BiDi、WAA bootstrap 与隔离登录
 internal/waa/            纯 Go WAA：BotGuard VM、Firefox 形状宿主与 goja 分叉
 internal/chromeauth/     Windows Chrome OAuth/DBSC 发现、导入和续签
-internal/config/         全局配置的读取、校验和原子写回
+internal/config/         全局配置的读取、校验、代理规范化和原子写回
+internal/proxyrelay/     带账号密码的代理的本机中转（只给 Camoufox 用）
 internal/webui/          嵌入并提供 Vue 构建产物
 web/                     Vue 3、TypeScript、Vite 和 Tailwind CSS 源码
 docs/                    开发流程与私有协议说明
@@ -150,7 +151,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `AISTUDIO_AUTH_STATES` | 账户文件、目录或逗号分隔的多个路径 | `auth` |
 | `LISTEN_ADDR` | HTTP 服务监听地址 | `127.0.0.1:2048` |
 | `PROXY_API_KEY` | 公开 API 访问密钥，调用 API 必须携带；留空使用默认值 | `sk-onechat-fun-fun` |
-| `PROXY` | setup 与未设置账户代理时使用的固定出口 | 空 |
+| `PROXY` | setup 与未设置账户代理时使用的固定出口：`http`、`https` 或 `socks5`，可带账号密码（`http://用户名:密码@host:port`、`host:port:用户名:密码` 等，见[代理写法与规范化](#代理写法与规范化)）；`Load` 读入时规范化 | 空 |
 | `INIT_TIMEOUT` | 单账户初始化超时 | `2m` |
 | `REQUEST_TIMEOUT` | 生成请求在首个上游事件之前的总期限（排队、冷启动、WAA proof、文件复制与附件上传、等首字与首事件前的换号都计入，到时 504）；开始输出后改为空闲上限（上游连续这么久既没有事件也没有网络字节才以 504 结束）；整条生成请求最长 `max(1h, REQUEST_TIMEOUT)`。三段都在请求开始时取值，可热更新、只影响新请求，见下文[长生成与中转重试](#长生成与中转重试)。计数、视频、转写等其他请求整段受它限制 | `5m` |
 | `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
@@ -176,13 +177,13 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值，修改后重启程序生效 | `false` |
 | `ADMIN_PASSWORD` | 远程管理密码；非空时非回环请求经 HTTP Basic 认证后可访问管理页面与 `/api/`，同一 IP 10 分钟内错 10 次封禁 15 分钟；管理进程重启后生效 | 空 |
 
-`LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT`、`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`，两个主用模型排队上限都不超过 `REQUEST_TIMEOUT`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`，`ACCOUNT_RPM_LIMIT` 为 `0..1000` 的整数（超出时报 `ACCOUNT_RPM_LIMIT 必须是 0 到 1000 的整数`）。管理页面保存时没有带四个 Ultra 字段、`account_rpm_limit`、`stream_playground_models`、`primary_models`、`primary_queue_wait`、`ultra_primary_models` 或 `ultra_primary_queue_wait`（旧版页面）则沿用 `.env` 中的现值（省略排队上限而把 `request_timeout` 调到现值以下时按 `request_timeout` 封顶）；`stream_playground_models`、`primary_models` 与 `ultra_primary_models` 为空数组表示清空，排队上限为 `0s` 表示不排队。保存的配置 JSON 缺少 `ultra_primary_models`（旧版数据）时取默认列表，显式的空数组为关闭；缺少 `ultra_include_pro` 时按关闭处理；缺少 `account_rpm_limit` 时取默认值 10，显式的 `0` 为关闭。全局代理 URL 使用 `http`、`https` 或 `socks5` 纯 origin 形状。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
+`LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT`、`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`，两个主用模型排队上限都不超过 `REQUEST_TIMEOUT`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`，`ACCOUNT_RPM_LIMIT` 为 `0..1000` 的整数（超出时报 `ACCOUNT_RPM_LIMIT 必须是 0 到 1000 的整数`）。管理页面保存时没有带四个 Ultra 字段、`account_rpm_limit`、`stream_playground_models`、`primary_models`、`primary_queue_wait`、`ultra_primary_models` 或 `ultra_primary_queue_wait`（旧版页面）则沿用 `.env` 中的现值（省略排队上限而把 `request_timeout` 调到现值以下时按 `request_timeout` 封顶）；`stream_playground_models`、`primary_models` 与 `ultra_primary_models` 为空数组表示清空，排队上限为 `0s` 表示不排队。保存的配置 JSON 缺少 `ultra_primary_models`（旧版数据）时取默认列表，显式的空数组为关闭；缺少 `ultra_include_pro` 时按关闭处理；缺少 `account_rpm_limit` 时取默认值 10，显式的 `0` 为关闭。全局代理与账户代理的写法和规范化规则见 `config.NormalizeProxy` 与下文[代理写法与规范化](#代理写法与规范化)。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
 
 `GET /api/config` 与 `PUT /api/config` 同时暴露保存值和当前生效值：
 
 | 字段 | 语义 |
 | --- | --- |
-| `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 下一次启动生成服务时使用的保存值 |
+| `auth_states`、`proxy`、`init_timeout`、`request_timeout` | 下一次启动生成服务时使用的保存值；`proxy` 是规范化后的上游 URL（含账号密码，与 `proxy_api_key` 同级明文返回），`PUT` 时先规范化再写入 `.env`，响应里同样是规范值，不存本机中转地址 |
 | `first_event_timeout` | 每次尝试的首事件超时，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `stream_playground_models` | 流式请求优先走 Playground 的模型（字符串数组，读取时总是返回），保存后立即生效；提交时省略则沿用现值 |
 | `primary_models`、`primary_queue_wait` | 普通号池的主用模型（字符串数组，读取时总是返回）与它们的排队上限（时长文本，`0s` 为不排队，不超过 `request_timeout`），保存后立即生效；提交时省略则沿用现值（排队上限超过新的 `request_timeout` 时按它封顶） |
@@ -212,7 +213,7 @@ POST /api/control/stop
 
 POST /api/control/start
   -> 完成当前已停止实例的清理
-  -> 重新读取 .env 并应用命令行 --auth/--proxy 覆盖
+  -> 重新读取 .env 并应用命令行 --auth/--proxy 覆盖（PROXY 两边都已规范化，是上游 URL，不是本机中转地址）
   -> 创建并启用新的生成服务实例
   -> 从当前 generation 的 CachedModels 建立内存目录
   -> 并发刷新全部 enabled ready/busy 账户
@@ -229,7 +230,7 @@ POST /api/control/start
 
 | 文件 | 内容 | 生命周期 |
 | --- | --- | --- |
-| `account.json` | label、enabled、proxy、locale、timezone | 创建或编辑账户时写入；缺少 `enabled` 字段按启用读取。账户默认启用：启动与目录扫描导入时，`enabled` 为 `false` 但 `.disable-reasons.json` 中没有手动停用记录的账户在加入账户池之前改为启用并原子写回（16 个并行，只写一条汇总日志）；只有管理页或管理接口停用的保持停用。手动停用记录立即写入，目录移出账户池时保留；`.disable-reasons.json` 无法读取时没有记录的停用账户保持停用并补记为手动停用 |
+| `account.json` | label、enabled、proxy、locale、timezone | 创建或编辑账户时写入，`proxy` 保存规范化后的上游 URL（含账号密码明文，文件 0600），不存本机中转地址；外部手写的冒号写法读入时规范化（`readAccountConfig`，读时不回写，下次保存时写入规范值）；缺少 `enabled` 字段按启用读取。账户默认启用：启动与目录扫描导入时，`enabled` 为 `false` 但 `.disable-reasons.json` 中没有手动停用记录的账户在加入账户池之前改为启用并原子写回（16 个并行，只写一条汇总日志）；只有管理页或管理接口停用的保持停用。手动停用记录立即写入，目录移出账户池时保留；`.disable-reasons.json` 无法读取时没有记录的停用账户保持停用并补记为手动停用 |
 | `storage-state.json` | Cookie、localStorage 与可选 Chrome OAuth/DBSC 续签材料 | 合并 `Set-Cookie` 或认证续签后原子写回 |
 | `camoufox-fingerprint.json` | 账户固定的浏览器指纹、语言与时区 | 首次运行生成，空值、窗口几何、字体、语音与媒体设备按 Camoufox 官方启动器规则规范化；重新登录和 WAA runtime 继续复用 |
 | `runtime-state.json` | 权益等级、模型资格、冷却与资源账户绑定 | 权益同步、首次模型结果或资源变化后原子写回 |
@@ -358,6 +359,124 @@ Worker 同样按账户当前所在的号池分为普通分区与 Ultra 分区（
 - 空闲回收与淘汰选号按最近活动时间判断空闲（取得租约与普通租约全部释放中较晚的一个，`Account.lastReleased`），刚结束长流的 Worker 不会被当成空闲了整条流的时长先被关闭；状态页的 `last_used` 仍是最近一次取得租约的时间。
 - 管理端保存账户、重新登录、验证登录最多等 `REQUEST_TIMEOUT` + 30 秒取得账户（`acquireAccountForOperation`）：不超过 `REQUEST_TIMEOUT` 的请求照常等它们结束后生效，同账号有长流仍在输出时返回 409 `account_busy`（`账户有长时间生成在进行，稍后重试`），登记随之撤销，不让一次点击把账户挂到长流结束。
 - 认证续签（等同账号其他请求最多 12 秒后照常续签）、需要重建生成服务的配置修改（最多等 30 秒）与退出（最多等 `SHUTDOWN_GRACE`，默认 60 秒）仍会中断进行中的长流。
+
+### 代理写法与规范化
+
+全局 `PROXY` 与账户 `proxy` 只经 `config.NormalizeProxy`（`internal/config/config.go`）一个函数规范化，并且只在值进入系统的入口调用：`config.Load`（`.env` 与进程环境变量，经 `CanonicalProxy`）、`Config.UnmarshalJSON`、`UpdateRuntimeConfig`（`PUT /api/config`）、账户的创建、Chrome 导入与编辑（三个管理入口在 `Validate` 之前规范化，错误加固定前缀 `账户 proxy 无效: `；Chrome 导入在 OAuth 网络导入之前就校验）、`readAccountConfig`（外部手写的写法读入时改写，读时不回写磁盘）、`parseFlags` 与 `parseSetupFlags`（只在显式传了 `--proxy` 时）。`sameDataConfig` 对页面提交值再做一次 `CanonicalProxy`，幂等、无副作用。`.env`、`account.json`、`config.Config`、`AccountConfig` 与 `generation.config` 里一律存规范化后的上游 URL，永远不存本机中转地址，因此保存值与生效值逐字节相等：`requiresRebuild`、`sameDataConfig`、`clientForProxy` 的缓存键两边一致，不会出现“需要重启”的循环，`ServiceRestartRequired` 只在上游真正变化时为真。设置页保存后把服务端返回的规范值同步回表单（`SettingsPanel.vue` 的 `doSave`，只在提交了失焦字段且提交后没有再改动时同步），否则会一直显示未保存、每次失焦重复保存。`ProxyInput.vue` 的“测试代理”按钮在 `mousedown` 上 `preventDefault`，点击时输入框不失焦、不触发失焦保存，测的是当前输入的值；键盘 Tab 到按钮时输入框会先失焦保存，所以组件在测试开始与结束时发 `testing` 事件，`SettingsPanel.vue` 的 `onProxyTesting` 在测试期间暂停或推迟“自动应用”的倒计时，结束后只在两条路径都拿到出口 IP、而且仍需要应用时重新开始，否则留给用户点“立即应用”。
+
+| 输入 | 规范输出 | 说明 |
+| --- | --- | --- |
+| ` http://127.0.0.1:7890 `、`HTTP://Proxy.example.com:8080/`、`http://h` | 去首尾空白后原样返回 | 不带认证的合法 URL 走直通分支（`legacyProxyValid`，即旧 `ValidateProxy` 去掉“不能包含认证信息”），Firefox prefs、user.js、Go 传输拿到的字符串都与以前逐字节相同；唯一的例外见下面 `http://h:1:u:123` 一行 |
+| `http://h:1:u:123`、`http://h:1:u:` | `http://u:123@h:1`、`http://u:@h:1` | 旧规则接受、但会改变的唯一一类值：带协议的冒号写法、密码为纯数字或为空时，`url.Parse` 把它读成主机名带冒号（`h:1:u`）的无认证 URL，原来就连不上。这里先判冒号写法（`colonProxyCredentials`）、再走直通分支，与方案 2.3 的“直通分支优先”顺序不同，是有意的；其中按冒号写法报错的值（`http://myuser:54321:1.2.3.4:8080` 报 `errProxyAmbiguous`，`http://h:0:u:1` 报 `errProxyPort`）旧规则接受、现在拒绝，写在 `.env` 里时 `config.Load` 失败、进程启动即退出，写在 `account.json` 里时 `LoadTolerant` 跳过这个账户。`TestNormalizeProxyLegacyPassthrough` 把这类值作为例外逐条列出 |
+| `1.2.3.4:8080:user:pass` | `http://user:pass@1.2.3.4:8080` | 不写协议按 http；冒号写法里第 3 个冒号之后全部算密码，按字面处理 |
+| `user:pass@1.2.3.4:8080` | `http://user:pass@1.2.3.4:8080` | 按最后一个 `@` 拆分，userinfo 按第一个 `:` 拆成用户名与密码，各自 `url.PathUnescape`（解码失败按字面） |
+| `socks5://1.2.3.4:1080:user:pass` | `socks5://user:pass@1.2.3.4:1080` | 带协议也可以用冒号写法 |
+| `socks5h://u:p@h:1080`、`socks5h://h:1080` | `socks5://…` | socks5h 按 socks5 处理 |
+| `1.2.3.4:8080` | `http://1.2.3.4:8080` | 旧规则拒绝，现在补上 http |
+| `http://u:p@h` | `http://u:p@h:80` | 带认证时补默认端口：http 补 80、https 补 443，SOCKS5 必须写端口 |
+| `[::1]:8080:u:p` | `http://u:p@[::1]:8080` | IPv6 必须写成 `[v6]` |
+| `http://2001:470::1:3128` | 原样 | 不带认证、不加方括号的 IPv6 旧值照旧走直通分支（`bareIPv6URL`），不当成冒号写法拆账号密码；不写协议或带账号密码时报 `errProxyIPv6` |
+| `http://h:1::2` | 原样 | 冒号写法的用户名为空不可能是账号密码（`colonProxyCredentials` 要求用户名非空），照旧走直通分支 |
+| `myuser:54321:1.2.3.4:8080`、`1.2.3.4:8080@myuser:54321` | 报 `errProxyAmbiguous` | host 段不是 IP、不含点、也不是 `[v6]`，而 用户名:密码 段本身像 IPv4、带点域名或 `[v6]` 加端口（`ambiguousProxyOrder`）：整串更像把账号密码与 host:port 写反了（`用户名:密码:host:port` 或 `host:port@用户名:密码`），照常拆分会把数字密码当成端口、真实密码进日志与页面。冒号写法按字面判断；`@` 写法与 URL 写法按解码后的用户名与密码判断（`a%2Eb:1234@localhost:8080` 同样报错，否则规范输出 `http://a.b:1234@localhost:8080` 再规范化会报错，函数不幂等）。代理主机名不含点、用户名像域名、密码是纯数字时同样报错，只能把代理主机写成 IP |
+| `http://user:12/ab@h:8080` | 报 `errProxyPathCredential` | `url.Parse` 把 `user:12` 读成 host:port、其余读成路径；最后一个 `@` 在第一个 `/?#` 之后时提示把 `/ ? #` 编码或改用冒号写法（不改判定，`http://h:8080/x@y` 照旧拒绝） |
+
+账号密码按严格的百分号编码输出：只保留 `A-Za-z0-9-._~`，其余字节（包括 `$&+,;=:@/?#` 与空格）一律编码，因此 `formatEnvValue` 写回 `.env` 时不需要引号，`source .env` 也不会遇到 shell 元字符；`url.Parse` 解码后与原文完全一致，Go 传输、tls-client 与 x/net 都按 `User.Username()`、`Password()` 取用。规范输出里密码的 `:` 已编码、用户名不含 `:`，不会再命中冒号写法，函数是幂等的。`@` 写法与 URL 写法里合法的 `%XX` 会被解码，要原样保留 `%41` 这类字面量请用冒号写法（界面说明里写了这一条）；不写协议时只要开头是 `host:数字端口:` 就按冒号写法处理（例如 `user:123:x@host:99` 会被当成 host `user`、端口 123、用户名 `x@host`、密码 `99`；只有 用户名:密码 段整体像 `IPv4 或带点域名:端口` 时才按上一段的歧义报错），不写协议时端口为空（`1.2.3.4:`）算没写端口，首尾空白会去掉，所以密码不能以空格开头或结尾。
+
+错误全部是固定文本，不含任何输入内容（`url.Parse` 的错误里有原文与密码，不能用 `%w` 包装）：
+
+| 错误 | 文案 |
+| --- | --- |
+| `errProxyFormat` | `PROXY 格式无效：支持 http://host:port、http://用户名:密码@host:port、socks5://用户名:密码@host:port、host:port:用户名:密码、用户名:密码@host:port（不写协议按 http）` |
+| `errProxyScheme` | `PROXY 协议必须是 http、https 或 socks5（socks5h 按 socks5 处理）` |
+| `errProxyPath` | `PROXY 不能包含路径、查询参数或片段` |
+| `errProxyPort` | `PROXY 端口必须是 1 到 65535 的数字`（不允许前导零） |
+| `errProxySOCKS5Port` | `SOCKS5 代理必须写端口` |
+| `errProxyNoPort` | `PROXY 不写协议时必须写端口，例如 1.2.3.4:8080` |
+| `errProxyUser` | `PROXY 的用户名不能为空` |
+| `errProxyControl` | `PROXY 不能包含换行、制表符等控制字符` |
+| `errProxySOCKS5Length` | `SOCKS5 代理的用户名和密码都不能超过 255 字节` |
+| `errProxyCredentialLength` | `PROXY 的用户名和密码合计不能超过 1024 字节` |
+| `errProxyUserColon` | `HTTP 代理的用户名不能包含冒号（:），Basic 认证会在第一个冒号处拆开用户名和密码`（只可能来自 `%3A` 解码；SOCKS5 按长度传用户名，不受影响） |
+| `errProxyAmbiguous` | `PROXY 无法判断账号密码与 host:port 的先后（host:port:用户名:密码、host:port@用户名:密码 还是 用户名:密码:host:port），请改用 http://用户名:密码@host:port 写法；代理主机名不含点时请写成 IP` |
+| `errProxyIPv6` | `PROXY 的 IPv6 地址必须加方括号，例如 http://[2001:db8::1]:8080` |
+| `errProxyPathCredential` | `PROXY 不能包含路径、查询参数或片段；密码里有 / ? # 时请写成 %2F、%3F、%23，或改用 host:port:用户名:密码 写法` |
+
+旧文案“PROXY 不能包含认证信息”已删除。`config.RedactProxy` 返回去掉账号密码的 `scheme://host:port`（不用 `url.URL.Redacted()`：它保留用户名，动态 IP 的用户名里常带 session 参数），供日志、“测试代理”结果与提示使用；`config.ProxyHasCredentials` 按规范化结果判断是否带认证。管理接口照旧返回完整的规范值（与 `proxy_api_key` 明文返回同级），只在前端脱敏显示（`web/src/proxy.ts` 的 `maskProxy`，账户表格、搜索与 `ProxyInput.vue` 的掩码按钮都用它）：服务端返回掩码的话，onboarding 回写、`setEnabled`、编辑草稿和设置页的 payload 会把掩码写回磁盘。`maskProxy` 与服务端的歧义判定一致：会报 `errProxyAmbiguous` 的值（冒号写法与 `@` 写法，`@` 写法同样按解码后的值判断）显示为 `***`（不把被当成端口的数字密码显示出来），不加方括号的 IPv6 旧值、以及服务端按直通分支原样保留的 `http://h:1:2`、`http://h:1::2` 这类旧值原样显示，不标“带认证”；`tools/report.sh` 写 config.txt 时对前者输出 `<已隐藏>`。
+
+### 本机代理中转
+
+Camoufox 通过 Firefox prefs 配代理，prefs 里没有账号密码字段（`internal/camoufoxnative/launcher.go` 也拒绝带认证的值），所以带账号密码的代理由 `internal/proxyrelay` 在本机起一个中转交给 Camoufox。只有 Camoufox 走中转：WAA Worker（`aistudio.NewNativeWorker`）、隔离登录与登录验证（`NativeLoginDriver.Login`/`Verify`，覆盖管理页新增账户、重新登录、验证、新账户自动处理、`setup --login` 与 go 后端的 `lazyLoginDriver`）。Go 侧消费者（业务 RPC、Drive、WebChannel、公开头提供器、Go WAA、chromeauth 导入与续签、setup 验证）本来就支持认证，直接拿规范化后的带认证上游 URL：CONNECT 的 Basic 认证在 `transport_browser.go`，SOCKS5 的 RFC 1929 认证经 x/net，chromeauth 经 tls-client。上游代理收到的隧道字节、Google 看到的 TLS ClientHello 与出口 IP 两种方式完全一样，Go 侧走中转没有收益，只会多占 fd、多一段自研代码在流式生成的路径上。不带认证的代理不经过中转，所有路径的行为与以前逐字节一致。中转地址只存在于 `NewNativeWorker` 与 `NativeLoginDriver` 内部的局部变量 `options.Proxy` 里，不会流回 `.env`、`account.json`、配置快照或任何比较。
+
+| 文件 | 内容 |
+| --- | --- |
+| `relay.go` | `Registry`、`Lease`、`Options`、包级默认注册表、`Acquire`、`SetLogger`、监听器生命周期（按活动判定关闭） |
+| `upstream.go` | 上游解析、连上游（TCP 或 TLS）、HTTP CONNECT 握手、自写的 SOCKS5 客户端握手 |
+| `http.go` | 本地 HTTP 中转：CONNECT 与 absolute-form 明文请求（含长连接上游的后台探测） |
+| `socks.go` | 本地 SOCKS5 中转（服务端最小实现） |
+| `pipe.go` | 双向对拷、半关闭、兜底计时 |
+| `failure.go` | 失败分类（上游层面 / 按目标）、每个监听器的失败记录、`Describe`、`Scrub`、日志节流 |
+| `limits_unix.go`、`limits_windows.go` | 进程级连接上限的默认值 |
+
+包只依赖标准库，不依赖 `config` 与 `aistudio`。日志出口由 `proxyrelay.SetLogger` 注入：主程序在 `internal/app/lifecycle.go` 里接到请求日志的 `service` 来源，setup 写到标准错误；日志行见 [日志说明](logging.md#本机代理中转)。
+
+**租约与监听器**：`proxyrelay.Acquire(upstream, owner)` 对不带账号密码的值（含空串与中转地址本身）返回直通租约，`Address()` 为原值，不起监听；带账号密码时每个租约新起一个只给它用的监听器（`127.0.0.1` 字面量、系统随机端口，同一上游的多次申请也各自独立，不共享）。中转协议跟上游一致：`http`/`https` 上游对应本地 HTTP 中转（`http://127.0.0.1:N`），`socks5` 上游对应本地 SOCKS5 中转（`socks5://127.0.0.1:N`），Firefox 继续按“HTTP 代理”或“SOCKS 代理”这一类行为工作，跟直连这个上游时一样。租约释放后，监听器要同时满足“没有进行中的连接”和“连续 5 分钟（`IdleGrace`）没有新连接”才关闭；不主动关闭进行中的隧道。释放后仍有新连接时照常服务（拒绝的话 Firefox 看到的是拒绝连接），并记一次 WARN。每个监听器只服务一个浏览器，连接上限与失败记录都按浏览器计，不会被别的使用者占满或张冠李戴。
+
+| 使用方 | 申请 | 释放 | 浏览器可能还活着时的兜底 |
+| --- | --- | --- | --- |
+| Camoufox Worker | `NewNativeWorker` 启动浏览器之前 | `NativeWorker.Close()` 中 `runtime.Close()` 返回 nil 之后；关闭失败、停在 `WorkerClosing` 时保留租约，关闭重试成功后再释放 | 关闭失败时不释放 |
+| Worker 启动失败 | 同上 | `camoufoxnative.Start` 返回错误后立即释放，错误经 `WrapFailure` 附上中转记录的原因 | `Start` 内部的 abort 结果被丢弃，确认不了浏览器已退出，靠按活动判定关闭：浏览器还在发连接就不关 |
+| 隔离登录、登录验证 | `Login`/`Verify` 开头 | `defer` 释放 | `session.Close()` 的错误被 `errors.Join` 进返回值，驱动分不清浏览器是否已退出，同样靠按活动判定关闭 |
+| 测试代理 | `runtimeManager.TestProxy` | 探测结束后 `defer` 释放 | 不涉及浏览器 |
+
+Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不了的值（`ErrInvalidUpstream`，只会来自未经规范化校验的配置，例如带账号密码的 `socks4://`）不起中转，原值照旧交给 Camoufox，由它按原有规则以固定文案拒绝（不含账号密码），与改动前一致；测试代理的输入已规范化，不会遇到这种值。
+
+残余风险：浏览器在 Close 失败后仍然活着、又连续 5 分钟没有任何连接，之后再发连接时监听器已经关闭，会收到拒绝连接（系统请求可能回退直连）；极小概率下这个端口已被另一个租约的新监听器拿到（约 1/28000），这时会经别的账户的上游出网。
+
+**转发规则**：HTTP 中转手工读请求头并保留原始字节，只删掉所有 `Proxy-Authorization` 行、在空行前追加 `Proxy-Authorization: Basic <base64>`，其余行的顺序、大小写、内容一律不动（不用 `http.ReadRequest` + `WriteProxy` 重建：重建会按字母排序头部、提前 `Content-Length`、遇到 `Pragma: no-cache` 自动加 `Cache-Control`，这些会经上游传给 Google 的 OCSP 服务）。CONNECT 的上游响应头手工解析，只有严格等于 200 才算成功，成功后给浏览器写固定的 `HTTP/1.1 200 Connection established`，先转发两侧缓冲区里的字节再对拷，绝不读或关闭响应体。明文请求只接受 `http://` 绝对 URI（origin-form、`OPTIONS *` 与 `https://` 绝对 URI 回 400：前者挡住本机网页的 fetch 与 DNS rebinding，后者转发的话上游会替我们握 TLS、指纹就变了），每条下游连接对应一条上游连接，不复用、不合并，“每条连接换 IP”的代理语义不变；等下一个请求时后台盯住上游，上游先断开或先发字节就关闭客户端、不写任何字节，非首个请求在收到响应字节前失败也只关连接、不回 502，让 Firefox 像直连时那样重试；转发响应体期间后台盯住浏览器（`watchClient`），浏览器断开就让上游读立即超时，上游停在响应体半路、不再发字节时也不会一直占着 goroutine、fd、上游连接，监听器照常按活动关闭。连接数已满时先读完请求头再回 503（避免内核发 RST），第一个字节也只按 `HeaderTimeout` 等，被拒的连接不计入上限，不能各自占着 fd 等 `FirstByteTimeout`。SOCKS5 中转只支持 CONNECT，原样保留客户端的 ATYP 与地址字节（域名不在本地解析），上游握手用自写客户端（问候 `05 02 00 02` 与 x/net 相同，`io.ReadFull` 精确读取，不多读隧道字节）。隧道阶段不设空闲超时，死连接靠 30 秒的 TCP keepalive 发现。
+
+| 期限或上限 | 默认值 |
+| --- | --- |
+| 接受连接后等第一个字节（`FirstByteTimeout`） | 3 分钟（Firefox 会预先建连、先空闲一段） |
+| 读完请求头或 SOCKS 握手（`HeaderTimeout`，读完后清掉，不作用于请求体） | 30 秒 |
+| 连上游 + TLS + CONNECT 或 SOCKS 握手（`UpstreamTimeout`） | 25 秒（小于 Go 侧 30 秒的握手期限） |
+| 明文请求之间的空闲（`KeepAliveIdle`） | 3 分钟（大于 Firefox 长连接的 115 秒） |
+| 一个方向结束后等另一方向（`HalfCloseGrace`） | 60 秒 |
+| 单个监听器同时处理的连接（`MaxConnections`） | 1024（大于 Firefox `network.http.max-connections` 的 900，正常碰不到） |
+| 整个进程同时处理的连接（`MaxTotalConnections`） | unix 取 `RLIMIT_NOFILE` 软限制的 1/4，夹在 1024 到 65536 之间；Windows 16384 |
+
+都是包内常量，不是配置项。达到上限时不等待：HTTP 回 503（写之前先读完请求头，避免 RST），SOCKS5 回 REP=04；进程级连接数达到 80% 时记 WARN。资源估算：空闲监听器约 1 个 fd、1 个 goroutine、不到 10 KB；活跃隧道 2 个 fd、约 75 KB；监听器总数约等于同时活着的、带认证代理的浏览器数（受 `MAX_ACTIVE_WORKERS` 等约束）加上释放后 5 分钟内的，与账户总数无关；Worker 反复启动失败时每次多留一个监听器 5 分钟，按启动名额与单次启动耗时估算最多几百个。
+
+**错误映射**：上游失败一律用协议层错误表达，不直接断开（直接断开会落进 Firefox 回退直连的列表）。407 不原样转给浏览器：有界面的登录浏览器会弹认证框卡住，无头 Worker 会进入 BiDi authRequired 一直卡到 `INIT_TIMEOUT`；转成 502 后 Firefox 立刻显示错误页，Worker 快速失败，原因由 `Lease.WrapFailure` 附在错误后面（`…；本机代理中转：上游代理拒绝了账号密码（407），请检查用户名和密码`）。
+
+| 上游情况 | 类别 | HTTP 中转回给浏览器 | SOCKS5 中转回给浏览器 | 失败说明（`FailureSince`） |
+| --- | --- | --- | --- | --- |
+| CONNECT 返回 200 | — | `HTTP/1.1 200 Connection established` | 成功回复 | — |
+| 407 | auth | `502 Upstream Proxy Authentication Failed`，不带 `Proxy-Authenticate` | — | `上游代理拒绝了账号密码（407），请检查用户名和密码` |
+| SOCKS5 认证失败 / 不接受账号密码认证 | auth | — | REP=04 | `上游 SOCKS5 代理拒绝了账号密码，请检查用户名和密码` / `上游 SOCKS5 代理不接受账号密码认证` |
+| 其他非 200（403、429、502、503、504…） | target | 状态码原样，原因短语只留可打印 ASCII（最多 64 个字符），不转发响应体 | — | `上游代理拒绝了隧道：403 Forbidden（目标 aistudio.google.com）` |
+| 上游 SOCKS5 回 REP≠0 | target | — | REP=04（上游的 REP 码不转发） | `上游 SOCKS5 代理连接目标失败：05 拒绝连接（目标 …）` |
+| 连不上上游（拒绝连接、无法解析、网络不可达） | unreachable | `502 Upstream Proxy Unreachable` | REP=04 | `连不上上游代理 host:port（连接被拒绝）` 等 |
+| 超时 | timeout | `504 Upstream Proxy Timeout` | REP=04 | `连接上游代理 host:port 超时` |
+| TLS 握手失败（https 上游） | tls | `502 Upstream Proxy TLS Failed` | — | `与上游代理 host:port 的 TLS 握手失败` |
+| 首个请求时上游响应格式错误或提前断开 | malformed | `502 Bad Upstream Response` | REP=04 | `上游代理的响应无法解析` |
+| 长连接上的非首个请求失败 | — | 关闭客户端连接，不写任何字节 | — | 不记 |
+| 中转连接数已满 | busy | `503 Relay Busy` | REP=04 | `本机代理中转连接数已满` |
+
+上游层面的失败（auth、unreachable、timeout、tls、malformed、busy）总是附加；按目标的失败（target）只在调用方的 `relevant` 认为目标相关时附加：Worker 与登录路径传 `proxyrelay.GoogleTarget`，测试代理只认 `api.ipify.org`，某个第三方域名被代理商拦截不会附加到 Worker 的启动错误上。Go 侧错误由 `proxyrelay.Describe` 转成中文说明：x/net 的回复码错误只按 `unknown error ` 前缀识别，拨号阶段的 `*net.OpError` 判为连不上上游，不再匹配 `connection refused` 子串（拨号失败的错误里也有它）。所有拼进日志或错误的外部错误文本先经过 `proxyrelay.Scrub`（去掉用户名与密码的原文、百分号编码与 Basic base64 三种形式）。
+
+**为什么 SOCKS5 中转的失败统一回 10 字节的 REP=04**（对照 `mozilla-firefox/firefox` main 分支的 `nsSOCKSIOLayer.cpp`、`nsHttpChannel.cpp` 等）：
+
+| 中转回给 Firefox 的 | Firefox 内部的 NSPR 错误 | 映射成的 nsresult | 是否在回退直连的列表里 |
+| --- | --- | --- | --- |
+| REP=01、02、05、07 或其他 | `PR_CONNECT_REFUSED_ERROR` | `NS_ERROR_PROXY_CONNECTION_REFUSED` | 是 |
+| REP=03 | `PR_NETWORK_UNREACHABLE_ERROR` | `NS_ERROR_PROXY_CONNECTION_REFUSED` | 是 |
+| REP=06 | `PR_CONNECT_TIMEOUT_ERROR` | `NS_ERROR_NET_TIMEOUT` | 是 |
+| REP=04、08 | `PR_BAD_ADDRESS_ERROR` | `NS_ERROR_UNKNOWN_HOST` | 否 |
+| 直接断开或拒绝连接 | `PR_CONNECT_REFUSED_ERROR` 或 RESET | `NS_ERROR_PROXY_CONNECTION_REFUSED` / `NS_ERROR_NET_RESET` | 是 |
+
+回退直连的列表是 `NS_ERROR_PROXY_CONNECTION_REFUSED`、`NS_ERROR_UNKNOWN_PROXY_HOST`、`NS_ERROR_NET_TIMEOUT`、`NS_ERROR_NET_RESET`。手动配置的单个代理没有 `mNext`，只有编译时定义了 `MOZ_PROXY_DIRECT_FAILOVER`（默认定义）、`network.proxy.failover_direct` 为 true（默认）而且请求是 beConservative 的系统请求时才改走直连：AI Studio 页面请求不会回退，会回退的是 Firefox 自己的系统请求（远程设置、更新等），它们会用真实 IP 连 Mozilla。所以 SOCKS5 中转用 REP=04 表达所有失败，代价是浏览器错误页显示“找不到服务器”，真实原因由 `WrapFailure` 带到管理页。失败回复写满 10 字节（Firefox 先凑齐 5 字节才解析，两字节的简写会让它一直等或按拒绝连接结束），写完后半关闭、最多读 1 秒或 4 KiB 剩余数据再关，避免内核发 RST。HTTP 中转回的 502、503、504 映射成 `NS_ERROR_PROXY_BAD_GATEWAY`、`NS_ERROR_CONNECTION_REFUSED`（无 PROXY_ 前缀）、`NS_ERROR_PROXY_GATEWAY_TIMEOUT` 等，都不在列表里。Camoufox 152 是否与 main 分支一致需要实测（抓包确认 407/503/504、SOCKS 认证失败/REP=01/REP=06 时没有直连外网的 SYN，监听器关闭作对照组）。
+
+**本机安全**：只绑 `127.0.0.1`，端口由系统随机分配（Windows 上同样可行，只绑回环不会触发防火墙弹窗）；拒绝 origin-form 与 `https://` 绝对 URI，SOCKS5 只支持 CONNECT。中转本身没有认证，本机任何进程都能在浏览器存活期间借它出网，这与 Camoufox 以 `--remote-debugging-port=0` 在回环上无认证暴露浏览器控制权是同一级别。账号密码不再写进 Camoufox 临时 profile 的 user.js，带认证时 user.js 里只有 `127.0.0.1:N`。`https://` 不带认证时 Camoufox 以明文连接代理的 TLS 端口（现状，保留；“测试代理”给出 `https_plain_browser` 提示）。
 
 ## 4. Go 协议层、公开端点与 Vue 管理端
 

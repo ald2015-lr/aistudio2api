@@ -137,7 +137,7 @@ Worker 启动时把 `storage-state.json` 的 Cookie 读入 runtime 内存。每�
 
 #### 网络形状
 
-所有出站请求经账户代理（未设置时使用全局 `PROXY`），使用 Firefox 152 的 TLS ClientHello、HTTP/2 设置与伪头顺序，不自动跟随跳转。请求头按以下顺序发送，未列出的头排在其后：
+所有出站请求经账户代理（未设置时使用全局 `PROXY`；带账号密码时，Camoufox 后端经 `127.0.0.1` 本机中转连接上游代理，隧道内字节不变，Go 请求直接带认证连接上游，见 [开发文档](development.md#本机代理中转)），使用 Firefox 152 的 TLS ClientHello、HTTP/2 设置与伪头顺序，不自动跟随跳转。请求头按以下顺序发送，未列出的头排在其后：
 
 ```text
 user-agent, accept, accept-language, accept-encoding, referer, content-type,
