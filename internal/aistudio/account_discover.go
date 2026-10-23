@@ -380,6 +380,61 @@ type WarmWorkerState struct {
 	// 这样的 Worker 对该模型是死槽位
 	Cooling bool
 	Dead    bool
+	// Unschedulable 为账户已不能服务任何模型的原因（见 unschedulableReasonLocked），空为可调度：这样的驻留 Worker
+	// 不是任何模型的候选，却占着驻留槽位，淘汰选号排在死槽位之前
+	Unschedulable string
+	// Unservable 为账户对该模型没有任何可用的目录与通道（目录里没有它，或权益、通道不支持）：modelID 为空时为假。
+	// 同分区有 Worker 在启动时，按需替换也可以换掉这样的健康空闲 Worker（它服务不了这个请求，见 app 的 victimReplaceable）
+	Unservable bool
+}
+
+// 账户不可调度的原因（WarmWorkerState.Unschedulable、UnschedulableSet），调度层写进“WAA Worker 释放 | 原因=”
+const (
+	UnschedulableDisabled     = "已停用"
+	UnschedulableAuthRequired = "需要登录"
+	UnschedulableUnavailable  = "不可用"
+	UnschedulableNotReady     = "不可调度"
+	UnschedulableNoCatalog    = "没有模型目录"
+)
+
+// unschedulableReasonLocked 返回账户不能服务任何模型的原因，空为可调度；调用方持有 p.mu。
+// 停用、需要登录、不可用与其他非就绪状态的账户拿不到不固定账户的租约；目录加载过（initializedAt 非零）却没有可初始化的模型时
+// 同样不是任何模型的候选（目录被同步成空、权益变化后没有可用模型）。只看“目录加载过”：测试里手工标热、从没设过目录的账户不算
+func unschedulableReasonLocked(account *Account) string {
+	switch {
+	case !account.Config.Enabled:
+		return UnschedulableDisabled
+	case account.State == AccountAuthRequired:
+		return UnschedulableAuthRequired
+	case account.State == AccountUnavailable:
+		return UnschedulableUnavailable
+	case account.State != AccountReady:
+		return UnschedulableNotReady
+	case !account.initializedAt.IsZero() && len(accountBootstrapModelsLocked(account)) == 0:
+		return UnschedulableNoCatalog
+	}
+	return ""
+}
+
+// UnschedulableSet 一次加锁返回给定账户中不可调度的账户与原因（可调度与不存在的账户不返回），
+// 供驻留 Worker 的补登记释放与状态计数使用
+func (p *AccountPool) UnschedulableSet(accountIDs []string) map[string]string {
+	result := make(map[string]string)
+	if p == nil {
+		return result
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, accountID := range accountIDs {
+		account := p.byID[accountID]
+		if account == nil {
+			continue
+		}
+		if reason := unschedulableReasonLocked(account); reason != "" {
+			result[accountID] = reason
+		}
+	}
+	return result
 }
 
 // WarmWorkerStates 一次加锁返回给定账户的调度状态，供淘汰选号使用：原先每个驻留 Worker 分别查询活动与冷却，
@@ -415,7 +470,10 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 			// 剩余不到 ShortCooldownMax 的冷却（分钟限额、限流第一档）不算冷却中：一分钟内就恢复，关掉它换一个要冷启动 10–30 秒的账号得不偿失
 			Cooling: longCooldownActive(account, globalCooldownKey, now, ShortCooldownMax) ||
 				cooling && until.Sub(now) >= ShortCooldownMax,
-			Dead: p.longCoolingLocked(account, modelID, now, minRemaining),
+			Dead:          p.longCoolingLocked(account, modelID, now, minRemaining),
+			Unschedulable: unschedulableReasonLocked(account),
+			Unservable: modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
+				!accountSupportsSelection(account, AccountSelection{ModelID: modelID}),
 		}
 	}
 	return states

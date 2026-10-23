@@ -500,11 +500,66 @@ func setRetryAfter(w http.ResponseWriter, err error, status int) {
 	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(until, time.Now()), 10))
 }
 
+// LimitReasonHeader 为 429 响应上区分本地与上游原因的响应头（N5）：对外文案与状态码不变（兼容中转与客户端），
+// 只多一个头，客户端、中转与排查时据此知道 429 是本地排队或冷却产生的，还是上游拒绝
+const LimitReasonHeader = "X-AIStudio2API-Reason"
+
+// 429 原因响应头的取值
+const (
+	// LimitReasonLocalQueue 为本地排队超限（号池繁忙：没有空闲的账号或 Worker），请求多半没有发往上游
+	LimitReasonLocalQueue = "local_queue"
+	// LimitReasonLocalCooling 为本地冷却：候选账户全部冷却，或租约账户在发出前进入冷却
+	LimitReasonLocalCooling = "local_cooling"
+	// LimitReasonUpstreamQuota 为上游额度或限流 429（含换号重试已达上限）
+	LimitReasonUpstreamQuota = "upstream_quota"
+	// LimitReasonEgressLimited 为出口限流：出口限速排队超限，所在出口正在限流、换号已达上限，或要冷启动的 Worker 被出口闸门暂停
+	LimitReasonEgressLimited = "egress_limited"
+)
+
+// limitReasonFor 返回 429 的原因（判断顺序与 publicErrorFor 一致），不认识的错误为空（不写响应头）
+func limitReasonFor(err error) string {
+	var quota *aistudio.PrimaryQuotaError
+	if errors.As(err, &quota) {
+		// Ultra 主用模型在出口限流时达到换号上限：Kind 仍是 QuotaFailUltraPrimary（文案不变），按 Reason 认出口限流
+		if quota.Kind == aistudio.QuotaFailEgress || quota.Reason == aistudio.QuotaReasonEgress {
+			return LimitReasonEgressLimited
+		}
+		return LimitReasonUpstreamQuota
+	}
+	var rpcError *aistudio.RPCError
+	if errors.As(err, &rpcError) {
+		return LimitReasonUpstreamQuota
+	}
+	var cooling *aistudio.AllCoolingError
+	if errors.As(err, &cooling) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
+		return LimitReasonLocalCooling
+	}
+	var busy *aistudio.CapacityBusyError
+	if errors.As(err, &busy) {
+		if busy.Reason == aistudio.EgressBusyReason || busy.Reason == aistudio.EgressColdStartReason {
+			return LimitReasonEgressLimited
+		}
+		return LimitReasonLocalQueue
+	}
+	return ""
+}
+
+// setLimitReason 在 429 响应上写原因响应头（见 LimitReasonHeader）
+func setLimitReason(w http.ResponseWriter, err error, status int) {
+	if status != http.StatusTooManyRequests {
+		return
+	}
+	if reason := limitReasonFor(err); reason != "" {
+		w.Header().Set(LimitReasonHeader, reason)
+	}
+}
+
 // writeOpenAIRequestError 以 OpenAI 官方格式返回请求错误
 func writeOpenAIRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
 	setRetryAfter(w, err, public.Status)
+	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, openAIErrorBody(public))
 }
 
@@ -520,6 +575,7 @@ func writeGeminiRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
 	setRetryAfter(w, err, public.Status)
+	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, geminiErrorBody(public))
 }
 
@@ -535,6 +591,7 @@ func writeAnthropicRequestError(w http.ResponseWriter, err error) {
 	public := publicErrorFor(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
 	setRetryAfter(w, err, public.Status)
+	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, anthropicErrorBody(public, accessLogRequestID(w)))
 }
 

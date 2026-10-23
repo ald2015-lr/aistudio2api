@@ -743,7 +743,8 @@ func TestUltraPrimaryNoSlotStillCapacity(t *testing.T) {
 }
 
 // TestUltraPrimaryQuotaSwitchLimit 6 个热账号都返回额度 429：Ultra 主用模型额度失败 3 次后立即返回额度不足（429，Retry-After 约 5s，
-// 对外不带上游原文），不退避；普通号池的主用模型与 Ultra 号池的非主用模型照旧把 6 个账号都试一遍
+// 对外不带上游原文），不退避；普通号池的主用模型与 Ultra 号池的非主用模型按普通号池的换号上限（每日类 normalQuotaSwitchLimit）
+// 试 5 个账号后同样立即返回额度不足（见 quota_switch.go），不再把 6 个账号都试一遍
 func TestUltraPrimaryQuotaSwitchLimit(t *testing.T) {
 	accounts := ultraTestIDs(6)
 	t.Run("Ultra 主用模型", func(t *testing.T) {
@@ -805,15 +806,38 @@ func TestUltraPrimaryQuotaSwitchLimit(t *testing.T) {
 			} else {
 				service.setPrimaryModelSettings([]string{testRuntimeModel}, 10*time.Second, []string{testRuntimeModel}, 10*time.Second)
 			}
-			_, err, _ := runScopedPrimaryRequest(t, service, test.scope, "req-quota-all", "")
+			_, err, elapsed := runScopedPrimaryRequest(t, service, test.scope, "req-quota-all", "")
 			var quota *aistudio.PrimaryQuotaError
 			var rpcError *aistudio.RPCError
-			if errors.As(err, &quota) || !errors.As(err, &rpcError) {
-				t.Fatalf("err=%v，期望照旧以上游额度错误结束", err)
+			if !errors.As(err, &quota) || errors.As(err, &rpcError) {
+				t.Fatalf("err=%v，期望按普通号池的换号上限返回额度不足（不是上游 RPCError）", err)
 			}
-			if calls := upstream.called(); len(calls) != len(accounts) {
-				t.Fatalf("上游调用 = %v，期望 6 个账号都试一遍", calls)
+			if calls := upstream.called(); len(calls) != normalQuotaSwitchLimit+1 {
+				t.Fatalf("上游调用 = %v，期望 %d 次", calls, normalQuotaSwitchLimit+1)
 			}
+			if quota.Kind != aistudio.QuotaFailSwitchLimit || quota.Reason != primaryQuotaReasonLimit || quota.QuotaHits != normalQuotaSwitchLimit+1 ||
+				quota.Accounts != normalQuotaSwitchLimit+1 || quota.Pool != test.scope {
+				t.Fatalf("额度不足错误 = %+v", quota)
+			}
+			if retry := time.Until(quota.RetryAt()); retry < 4*time.Second || retry > 6*time.Second {
+				t.Fatalf("建议重试间隔 = %s，期望约 5s", retry)
+			}
+			if elapsed > time.Second {
+				t.Fatalf("用时 %s，期望每日类换号不退避、立即返回", elapsed)
+			}
+			for _, fragment := range []string{
+				"额度 429，换号重试 | 额度失败=1/4",
+				"额度 429，换号重试 | 额度失败=4/4",
+				"换号上限，立即返回 429 | 原因=额度失败已达换号上限 | 额度失败=5 | 限流失败=0 | 尝试账号=5",
+			} {
+				if !progressLogged(service, fragment) {
+					t.Fatalf("请求进度应写明 %q", fragment)
+				}
+			}
+			if strings.Contains(err.Error(), "主用模型") || !strings.Contains(err.Error(), "换号重试已达上限") {
+				t.Fatalf("普通号池的额度不足文案 = %q", err.Error())
+			}
+			assertNoBusyAccounts(t, pool)
 		})
 	}
 }
@@ -1608,7 +1632,7 @@ func TestPrimaryQuotaRetryAt(t *testing.T) {
 		{name: "限流上限不超过一分钟", reason: primaryQuotaReasonRateLimit, quota: now.Add(90 * time.Second), want: now.Add(cooldownQueueLimit)},
 		{name: "限流上限不早于 1s", reason: primaryQuotaReasonRateLimit, quota: now.Add(100 * time.Millisecond), want: now.Add(primaryRetryMin)},
 	} {
-		if got := primaryQuotaRetryAt(test.reason, test.quota, test.cooling, now); !got.Equal(test.want) {
+		if got := primaryQuotaRetryAt(aistudio.QuotaFailUltraPrimary, test.reason, test.quota, test.cooling, now); !got.Equal(test.want) {
 			t.Fatalf("%s：建议重试 = %s，期望 %s", test.name, got.Sub(now), test.want.Sub(now))
 		}
 	}

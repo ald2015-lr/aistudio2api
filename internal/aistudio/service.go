@@ -275,7 +275,7 @@ func (p *PoolRequestContextProvider) RequestContext(_ context.Context, accountID
 // Models 刷新可用账户并返回实时模型并集
 func (s *PooledService) Models(ctx context.Context) ([]Model, error) {
 	if lease, ok := AccountLeaseFromContext(ctx); ok {
-		return s.modelsForLease(ctx, lease)
+		return s.modelsForLease(ctx, lease, true)
 	}
 	statuses := s.pool.Status()
 	targets := make([]AccountStatus, 0, len(statuses))
@@ -320,7 +320,7 @@ func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID stri
 	if err != nil {
 		return nil, err
 	}
-	models, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease)
+	models, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, true)
 	releaseErr := lease.Release()
 	if requestErr != nil {
 		failure := fmt.Errorf("刷新账户 %s 的模型目录: %w", accountID, errors.Join(requestErr, releaseErr))
@@ -330,6 +330,47 @@ func (s *PooledService) RefreshAccountModels(ctx context.Context, accountID stri
 		return models, fmt.Errorf("释放账户 %s 的模型目录租约: %w", accountID, releaseErr)
 	}
 	return models, nil
+}
+
+// TryRefreshAccountModels 与 RefreshAccountModels 相同，但只在账户空闲时进行（模型目录后台刷新用）：账户有进行中的请求、
+// 独占或续签时 busy 为真、不发请求，也不登记独占等待（见 TryAcquireIdleAccount）。管理操作仍用 RefreshAccountModels。
+// 后台刷新成功不清账号的全局冷却：目录能列出不代表生成额度已恢复，全局每日限额（到太平洋时间次日零点）、403 自动暂停、
+// 出口限流期间降级写下的账号冷却都应到期自然恢复。原先目录到期（24 小时）就把冷却中的账号放回候选，下一次生成又被 429，
+// 死槽位登记撤掉又补上、Worker 来回启停；重启后缓存条目普遍过期，几小时内会把全部长冷却洗一遍
+// （原先的启动全量同步只取就绪与忙碌的账户，冷却中的本来就不同步）
+func (s *PooledService) TryRefreshAccountModels(ctx context.Context, accountID string) ([]Model, bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	lease, acquired, err := s.pool.TryAcquireIdleAccount(ctx, accountID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !acquired {
+		return nil, true, nil
+	}
+	models, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, false)
+	releaseErr := lease.Release()
+	if requestErr != nil {
+		return nil, false, fmt.Errorf("刷新账户 %s 的模型目录: %w", accountID, errors.Join(requestErr, releaseErr))
+	}
+	if releaseErr != nil {
+		return models, false, fmt.Errorf("释放账户 %s 的模型目录租约: %w", accountID, releaseErr)
+	}
+	return models, false, nil
+}
+
+// CatalogSnapshot 返回账户当前的目录（Client 侧的 Playground 目录与原文、账户池里的权益与 Build 目录、连续空结果），
+// 供 app 层写模型目录缓存；账户不存在或 Client 侧没有目录时 ok 为假
+func (s *PooledService) CatalogSnapshot(accountID string) (CatalogSnapshot, bool) {
+	snapshot, ok := s.pool.catalogStateOf(accountID)
+	if !ok {
+		return CatalogSnapshot{}, false
+	}
+	playground, _, found := s.client.AccountCatalog(accountID)
+	if !found {
+		return CatalogSnapshot{}, false
+	}
+	snapshot.Playground = playground
+	return snapshot, true
 }
 
 // CachedModels 返回启用账户最近同步目录的并集。
@@ -390,7 +431,7 @@ func (s *PooledService) modelsForStatus(ctx context.Context, status AccountStatu
 			err: fmt.Errorf("获取账户 %s 的模型目录租约: %w", status.ID, err),
 		}
 	}
-	accountModels, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease)
+	accountModels, requestErr := s.modelsForLease(ContextWithAccountLease(ctx, lease), lease, true)
 	releaseErr := lease.Release()
 	if requestErr != nil {
 		failure := fmt.Errorf("刷新账户 %s 的模型目录: %w", status.ID, errors.Join(requestErr, releaseErr))
@@ -419,15 +460,44 @@ func (s *PooledService) cachedModels(accountID string) []Model {
 // 或者保存的签名 Cookie 缺失、已过期。与上游 HTTP 401 一样进入认证恢复流程
 var ErrAuthenticationRequired = errors.New("登录态失效")
 
-// DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证。
-// Drive 授权缺失（GenerateAccessToken 返回 401、Code 16、unauthorized_client）只表示没有 Drive 权限，不算登录失效
+// DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证：登录页跳转、签名 Cookie 缺失或过期（ErrAuthenticationRequired），
+// 或用 Cookie 认证的 MakerSuite RPC 返回 HTTP 401 / 协议错误码 16。以下 401 不算登录失效证据（第 5 项，需要登录从 334 涨到 2041 的排查）：
+//   - Drive*（DriveUpload、DriveDownload、DriveDelete 等）：用的是 GenerateAccessToken 换来的 Bearer token，401 只说明 token 过期；
+//   - GenerateAccessToken：Drive 授权缺失（unauthorized_client）只表示没有 Drive 权限；其余 401 只让本次附件尝试失败，
+//     由调用方写短冷却（见 AccessTokenAuthFailure），不改账户状态。原先一次 401 就把账号标成需要登录，线上带图请求每次尝试都先换 token，
+//     “发送 AI Studio GenerateAccessToken … 返回 HTTP 401”占了需要登录的大头
 func DefinitiveAuthenticationFailure(err error) bool {
 	if errors.Is(err, ErrAuthenticationRequired) {
 		return true
 	}
 	var rpcError *RPCError
-	return errors.As(err, &rpcError) && !driveAuthorizationMissing(err) &&
+	return errors.As(err, &rpcError) && cookieAuthenticatedMethod(rpcError.Method) &&
 		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
+}
+
+// AccessTokenAuthFailure 判断错误是否为 GenerateAccessToken 返回的认证失败（401 / Code 16，Drive 授权缺失除外）：
+// 只让本次附件尝试失败，调用方对账号写模型无关的短冷却（AccessTokenFailureCooldown），不标需要登录、不登记淘汰
+func AccessTokenAuthFailure(err error) bool {
+	if errors.Is(err, ErrAuthenticationRequired) || driveAuthorizationMissing(err) {
+		return false
+	}
+	var rpcError *RPCError
+	return errors.As(err, &rpcError) && strings.EqualFold(strings.TrimSpace(rpcError.Method), "GenerateAccessToken") &&
+		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
+}
+
+// AccessTokenFailureCooldown 为 GenerateAccessToken 认证失败后账号的全局冷却：短到不算“冷却中”的淘汰对象（不超过 ShortCooldownMax），
+// 又能让紧接着的换号避开它
+const AccessTokenFailureCooldown = ShortCooldownMax
+
+// cookieAuthenticatedMethod 判断 RPC 是否用账号 Cookie 认证（它的 401 才是登录失效的证据）：Drive* 用 Bearer token，
+// GenerateAccessToken 的 401 另按 AccessTokenAuthFailure 处理
+func cookieAuthenticatedMethod(method string) bool {
+	method = strings.TrimSpace(method)
+	if strings.HasPrefix(strings.ToLower(method), "drive") {
+		return false
+	}
+	return !strings.EqualFold(method, "GenerateAccessToken")
 }
 
 // DefinitiveWAARuntimeFailure 判断上游是否明确拒绝当前 WAA 运行态
@@ -450,7 +520,11 @@ func modelBoundRPCMethod(method string) bool {
 func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessScope string, err error) error {
 	accountID := lease.Account().ID
 	if DefinitiveAuthenticationFailure(err) {
-		return lease.MarkAuthenticationRequired(err.Error())
+		_, markErr := lease.MarkAuthenticationFailure(err)
+		return markErr
+	}
+	if AccessTokenAuthFailure(err) {
+		return s.markAccessTokenCooldown(lease, err)
 	}
 	now := time.Now()
 	until := now.Add(30 * time.Second)
@@ -468,29 +542,56 @@ func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessSco
 	)
 }
 
-func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease) ([]Model, error) {
+// ProbeLogin 用磁盘上的 Cookie 经 Go HTTP 发一次 GetAiStudioBenefitTier，确认账户的登录对接口仍然有效（疑似登录失效的复核、
+// 需要登录账户的定期复核、管理验证通过后的接口复核）：不续签、不重放、不改账户状态（WithoutAuthRecovery），结果由调用方处理。
+// 只发这一个请求，与目录同步的第一步相同，不改变面向 Google 的请求形态
+func (s *PooledService) ProbeLogin(ctx context.Context, lease *AccountLease) error {
+	if s == nil || s.client == nil {
+		return fmt.Errorf("AI Studio 客户端未初始化")
+	}
+	if lease == nil || lease.Account() == nil {
+		return fmt.Errorf("账户租约未初始化")
+	}
+	_, err := s.client.BenefitTierForAccount(WithoutAuthRecovery(ContextWithAccountLease(ctx, lease)), lease.Account().ID)
+	return err
+}
+
+// modelsForLease 在租约内刷新账户的权益与目录；clearCooldown 为真时成功后清账号的全局冷却（管理操作、请求路径的现拉），
+// 后台刷新传假（见 TryRefreshAccountModels）
+func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease, clearCooldown bool) ([]Model, error) {
 	account := lease.Account()
 	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
 		if DefinitiveAuthenticationFailure(err) {
-			err = errors.Join(err, lease.MarkAuthenticationRequired(err.Error()))
+			_, markErr := lease.MarkAuthenticationFailure(err)
+			err = errors.Join(err, markErr)
 		}
 		return nil, err
 	}
-	models, err := s.client.ModelsForAccount(ContextWithAccountLease(ctx, lease), account.ID)
+	catalog, err := s.client.loadModels(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
 		if DefinitiveAuthenticationFailure(err) {
-			err = errors.Join(err, lease.MarkAuthenticationRequired(err.Error()))
+			_, markErr := lease.MarkAuthenticationFailure(err)
+			err = errors.Join(err, markErr)
 		}
 		return nil, err
 	}
-	if err := errors.Join(
-		lease.MarkAuthenticationValid(),
-		s.pool.ClearCooldownIfGeneration(
+	models := cloneModels(catalog.models)
+	err = lease.MarkAuthenticationValid()
+	if clearCooldown {
+		err = errors.Join(err, s.pool.ClearCooldownIfGeneration(
 			account.ID, "", lease.ModelAccessGeneration(), lease.CheckedAt(),
-		),
-	); err != nil {
+		))
+	}
+	if err != nil {
 		return nil, err
+	}
+	// 空模型列表：账户已有非空目录时不覆盖（loadModels 已在 Client 侧保留），连续 3 次且跨 1 小时才两侧都接受，
+	// 真正失去权限的账户最终变成不可调度；偶发的空结果不再让账户整段时间没有目录。登录是好的，上面照常标记有效
+	if empties, since, kept, keep := s.pool.noteCatalogListing(account.ID, len(models), time.Now()); keep {
+		return nil, &EmptyModelCatalogError{AccountID: account.ID, Models: kept, Count: empties, Since: since}
+	} else if len(models) == 0 {
+		s.client.replaceAccountCatalog(account.ID, catalog)
 	}
 	if err := s.pool.SetCatalog(account.ID, tier, models); err != nil {
 		return nil, err
@@ -517,7 +618,9 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 	selection := AccountSelection{ModelID: modelID, ModelAccessScope: modelAccessScope, Method: "countTokens"}
 	var count TokenCount
 	var requestErr error
-	for attempt := 0; attempt < accountAttemptLimit(ctx, s.pool, false); attempt++ {
+	// 换号上限在循环前算一次：统计可调度账户要在账户池锁内扫描全部账户，原先每轮都重算
+	limit := accountAttemptLimit(ctx, s.pool, false)
+	for attempt := 0; attempt < limit; attempt++ {
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
 		if err != nil {
 			if requestErr != nil && errors.Is(err, ErrNoEligibleAccount) {
@@ -537,7 +640,7 @@ func (s *PooledService) CountTokens(ctx context.Context, request TokenCountReque
 				),
 			)
 		} else if DefinitiveAuthenticationFailure(requestErr) {
-			stateErr = lease.MarkAuthenticationRequired(requestErr.Error())
+			_, stateErr = lease.MarkAuthenticationFailure(requestErr)
 		} else if retryable {
 			stateErr = s.markRetryableFailure(lease, modelAccessScope, requestErr)
 		}
@@ -626,16 +729,17 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
 	return nil, requestErr
 }
 
-// accountAttemptLimit 返回不固定账户请求的换号上限：请求号池内启用且就绪或忙碌的账户数
+// accountAttemptLimit 返回不固定账户请求的换号上限：请求号池内启用且就绪或忙碌的账户数，不超过 WithAttemptCeiling 设置的上限
 func accountAttemptLimit(ctx context.Context, pool *AccountPool, pinned bool) int {
 	if pinned {
 		return 1
 	}
-	eligible := pool.attemptCandidatesIn(PoolScopeFromContext(ctx))
-	if eligible > 0 {
-		return eligible
+	attemptLimitScans.Add(1)
+	eligible := max(pool.attemptCandidatesIn(PoolScopeFromContext(ctx)), 1)
+	if ceiling := attemptCeilingFrom(ctx); ceiling > 0 && eligible > ceiling {
+		return ceiling
 	}
-	return 1
+	return eligible
 }
 
 func retryableAccountError(err error) bool {
@@ -695,7 +799,7 @@ func forwardEventsWithLease(
 		if event.Kind == EventError {
 			terminal = true
 			if DefinitiveAuthenticationFailure(event.Err) {
-				if err := lease.MarkAuthenticationRequired(event.Err.Error()); err != nil {
+				if _, err := lease.MarkAuthenticationFailure(event.Err); err != nil {
 					event.Err = errors.Join(event.Err, err)
 				}
 			} else if cooldown, ok := QuotaCooldownForError(event.Err, time.Now()); ok {

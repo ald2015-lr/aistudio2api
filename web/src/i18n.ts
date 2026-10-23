@@ -76,6 +76,8 @@ const zhCN = {
   'accounts.deselectAll': '取消全选',
   'accounts.loginComplete': '账户登录完成',
   'accounts.verified': '账户验证通过',
+  'accounts.verifyInvalid': '登录已失效：{reason}',
+  'accounts.verifyResult': '验证完成：有效 {ok}，失效 {invalid}，出错 {failed}',
   'accounts.saved': '账户已保存',
   'accounts.deleted': '账户已删除',
   'accounts.importComplete': '已导入 {count} 个账户',
@@ -342,6 +344,10 @@ const zhCN = {
   'accounts.progress': '{action} {done}/{total}',
   'accounts.progressSucceeded': '成功 {count}',
   'accounts.progressFailed': '失败 {count}',
+  'accounts.progressValid': '有效 {count}',
+  'accounts.progressInvalid': '登录失效 {count}',
+  'accounts.progressErrored': '出错 {count}',
+  'accounts.progressInvalidList': '登录失效明细（{count}）',
   'accounts.progressActive': '处理中：{names}',
   'accounts.progressStop': '停止',
   'accounts.progressStopped': '已停止',
@@ -415,6 +421,9 @@ const zhCN = {
   'app.workersDraining': '排空中 {count}',
   'app.workersDrainingDetail':
     '冷却占位的 Worker 不再接新请求，正在服务的请求结束后关闭（开始输出的长流会让排空保持到流结束）；有空槽时替补已先启动，否则旧 Worker 关闭后补上',
+  'app.workersUnschedulable': '不可调度 {count}',
+  'app.workersUnschedulableDetail':
+    '驻留 Worker 的账号需要登录、已停用或没有模型目录，已不能服务任何模型：空闲后立即释放，槽位由预热补上',
   'app.primarySupplyModel': '主用 {model}：',
   'app.primarySupply': '热 {warm} · 冷却 {cooling} · 备用 {standby}',
   'app.primarySupplyDetail':
@@ -427,7 +436,33 @@ const zhCN = {
   'app.prewarmIdle': '预热空闲',
   'app.ultraWorkers': 'Ultra Worker {occupied} / {max}',
   'app.ultraWorkersDetail':
-    'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 预热目标 {target} · 峰值 {max}',
+    'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 不可调度 {unschedulable} · 预热目标 {target} · 峰值 {max}',
+  'app.authRecheckLine': '登录复核 · 疑似失效 {suspects} · 10分钟新增需要登录 {recent} · 坏号 {bad}',
+  'app.authRecheckDetail':
+    '上游 401 先记疑似登录失效、冷却 5 分钟，用磁盘 Cookie 复核仍是 401 才标需要登录；按接口判定需要登录的账户每 15 分钟低速复核一轮，通过即恢复；浏览器判定未登录的（管理验证判定未登录、Worker 启动时跳到登录页）不复核，需要重新登录或更新认证文件。最近一小时：排除 {cleared}、确认 {confirmed}、恢复 {recovered}、仍失效 {invalid}。坏号为连续裸限流的账号，2 小时内不参与预热与替补',
+  'app.catalogSyncPaused': '目录同步暂停到 {time}（{reason}）',
+  'app.catalogPauseUpstream': '上游 429',
+  'app.catalogPauseEgress': '出口限流',
+  'app.catalogSyncPending': '目录待同步 {count} · 疑似失效待探测 {suspects}',
+  'app.catalogSyncDetail':
+    '模型目录保存在 runtime/model-catalogs，重启直接载入；缺失或超过 24 小时的账户在后台低速刷新（只刷空闲账户），遇到上游 429 或出口限流时暂停',
+  'app.egressLimited':
+    '出口限速 {label} · 上游拒绝 {ratio}% · 本地限速拒绝 {local}/分钟 · 排队 {queued} · 限速 {limit}',
+  'app.egressLimitRPM': '{limit}/分钟',
+  'app.egressLimitUltra': 'Ultra {limit}/分钟',
+  'app.egressLimitLanes': '普通 {normal}/分钟 · Ultra {ultra}/分钟',
+  'app.egressLimitOff': '未启用',
+  'app.egressSuspended': '出口限流 {label} · 限速无效已停止 · 上游拒绝 {ratio}% · 本地拒绝 {local}/分钟',
+  'app.egressLimitedDetail':
+    '经同一出口的多个账号同时被上游限流（新换上的账号第一次请求就被拒）：已停止逐级冷却与按需冷启动，按出口限速发送，主用模型优先。“上游拒绝”是发往上游的请求被拒的比例；“本地限速拒绝”是排队超过上限、在本地直接返回的 429。限流解除后自动恢复。给账号设置不同代理（增加出口）才能提高上限',
+  'app.egressRejected': '出口 {label} 判定已撤销（{by}）',
+  'app.egressRejectedDetail':
+    '被拒的账号再试都不成功（更像账号额度用完），或已手动撤销：已交回逐级冷却，{minutes} 分钟内不再判定',
+  'app.egressRejectedByValve': '安全阀',
+  'app.egressRejectedByAdmin': '管理操作',
+  'app.egressDirect': '直连',
+  'app.egressWithdraw': '撤销判定',
+  'app.egressResume': '恢复判定',
   'onboard.title': '新账户自动处理',
   'onboard.off': '已关闭',
   'onboard.idle': '队列为空',
@@ -784,6 +819,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.deselectAll': 'Deselect all',
   'accounts.loginComplete': 'Account login complete',
   'accounts.verified': 'Account verified',
+  'accounts.verifyInvalid': 'Login expired: {reason}',
+  'accounts.verifyResult': 'Verification finished: {ok} valid, {invalid} invalid, {failed} failed',
   'accounts.saved': 'Account saved',
   'accounts.deleted': 'Account deleted',
   'accounts.importComplete': 'Imported {count} accounts',
@@ -1056,6 +1093,10 @@ const en: Record<TranslationKey, string> = {
   'accounts.progress': '{action} {done}/{total}',
   'accounts.progressSucceeded': '{count} succeeded',
   'accounts.progressFailed': '{count} failed',
+  'accounts.progressValid': '{count} valid',
+  'accounts.progressInvalid': '{count} login expired',
+  'accounts.progressErrored': '{count} failed',
+  'accounts.progressInvalidList': 'Expired logins ({count})',
   'accounts.progressActive': 'Working on: {names}',
   'accounts.progressStop': 'Stop',
   'accounts.progressStopped': 'Stopped',
@@ -1133,6 +1174,9 @@ const en: Record<TranslationKey, string> = {
   'app.workersDraining': '{count} draining',
   'app.workersDrainingDetail':
     'These dead-slot workers take no new requests and close once their in-flight requests finish (a long stream that has started output keeps the drain going until it ends); their replacements have already been started when a slot was free, otherwise they start once the old worker closes',
+  'app.workersUnschedulable': '{count} unschedulable',
+  'app.workersUnschedulableDetail':
+    'Resident workers whose accounts need login, are disabled or have no model catalog; released when idle and refilled by prewarm',
   'app.primarySupplyModel': 'Primary {model}:',
   'app.primarySupply': '{warm} warm · {cooling} cooling · {standby} standby',
   'app.primarySupplyDetail':
@@ -1145,7 +1189,34 @@ const en: Record<TranslationKey, string> = {
   'app.prewarmIdle': 'Prewarm idle',
   'app.ultraWorkers': 'Ultra workers {occupied} / {max}',
   'app.ultraWorkersDetail':
-    'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · prewarm target {target} · limit {max}',
+    'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · {unschedulable} unschedulable · prewarm target {target} · limit {max}',
+  'app.authRecheckLine': 'Login recheck · {suspects} suspected · {recent} new login-required in 10 min · {bad} bad accounts',
+  'app.authRecheckDetail':
+    'An upstream 401 first marks the login as suspected (5-minute cooldown); it is rechecked with the saved cookies and only marked as login-required if it is still 401. Accounts marked login-required by the API are rechecked every 15 minutes and restored when the recheck passes; accounts the browser found logged out (an admin verification found no login, or a worker start landed on the sign-in page) are not rechecked and need a new login or an updated auth file. Last hour: {cleared} cleared, {confirmed} confirmed, {recovered} recovered, {invalid} still invalid. Bad accounts kept getting bare rate limits and are left out of prewarm and replacements for 2 hours',
+  'app.catalogSyncPaused': 'Catalog sync paused until {time} ({reason})',
+  'app.catalogPauseUpstream': 'upstream 429',
+  'app.catalogPauseEgress': 'egress rate limited',
+  'app.catalogSyncPending': '{count} catalogs pending · {suspects} suspected logins to probe',
+  'app.catalogSyncDetail':
+    'Model catalogs are saved in runtime/model-catalogs and loaded directly on restart; accounts whose catalog is missing or older than 24 hours are refreshed slowly in the background (idle accounts only), pausing on upstream 429 or while the egress is rate limited',
+  'app.egressLimited':
+    'Egress limited {label} · upstream rejected {ratio}% · local 429 {local}/min · queued {queued} · {limit}',
+  'app.egressLimitRPM': '{limit}/min',
+  'app.egressLimitUltra': 'Ultra {limit}/min',
+  'app.egressLimitLanes': 'normal {normal}/min · Ultra {ultra}/min',
+  'app.egressLimitOff': 'not throttled',
+  'app.egressSuspended':
+    'Egress limited {label} · throttling stopped (ineffective) · upstream rejected {ratio}% · local 429 {local}/min',
+  'app.egressLimitedDetail':
+    'Many accounts behind this egress are rate limited at once (freshly switched-in accounts are rejected on their first request): escalating cooldowns and on-demand cold starts are paused, and requests are sent at the egress rate limit with primary models first. "Upstream rejected" is the share of requests sent upstream that were rejected; "local 429" counts requests that queued past the limit and were rejected locally. Recovers automatically once the limiting ends. Only more egresses (different proxies for some accounts) can raise the ceiling',
+  'app.egressRejected': 'Egress {label} verdict withdrawn ({by})',
+  'app.egressRejectedDetail':
+    'Rejected accounts never succeeded when retried (more like used-up account quota), or the verdict was withdrawn manually: escalating cooldowns are back, and no new verdict for {minutes} minutes',
+  'app.egressRejectedByValve': 'safety valve',
+  'app.egressRejectedByAdmin': 'manual',
+  'app.egressDirect': 'direct',
+  'app.egressWithdraw': 'Withdraw',
+  'app.egressResume': 'Resume',
   'onboard.title': 'New account automation',
   'onboard.off': 'Off',
   'onboard.idle': 'Queue empty',

@@ -22,6 +22,8 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 		api.SetAccessLogError(ctx, err)
 		return nil, err
 	}
+	// 不固定账户的 Live 会话建立最多换 dataAttemptCeiling-1 个账号（见 quota_switch.go）
+	requestCtx = aistudio.WithAttemptCeiling(requestCtx, dataAttemptCeiling)
 	if request.AccountID == "" && len(request.AllowedAccountIDs) == 0 {
 		request.AllowedAccountIDs, err = service.bidiCandidates(requestCtx, request.Model, request.ModelAccessScope)
 		if err != nil {
@@ -289,6 +291,7 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	service.withoutLimitedStandby(&groups)
 	warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
 	candidates := service.preferBidiAccounts(warmAvailable, modelID, modelAccessScope)
 	candidates = append(candidates, service.preferBidiAccounts(groups.StandbyReady, modelID, modelAccessScope)...)

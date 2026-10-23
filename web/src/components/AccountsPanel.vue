@@ -10,6 +10,7 @@ import {
   type BulkFailure,
   type BulkState,
   type BulkTarget,
+  type BulkTaskResult,
 } from '@/bulk'
 import { copyText } from '@/clipboard'
 import { confirmAction } from '@/confirm'
@@ -463,21 +464,27 @@ async function toggleAccount(account: Account): Promise<void> {
   }
 }
 
-// runAccountAction 执行登录或会话验证
+// runAccountAction 执行登录或会话验证：验证按返回的 authenticated 提示“有效”或“登录已失效”（HTTP 200 只表示验证做完了）
 async function runAccountAction(account: Account, action: 'login' | 'verify'): Promise<void> {
   pendingAction.value = `${action}:${account.id}`
   try {
     if (action === 'login') {
       await api.loginAccount(account.id)
-    } else {
-      await api.verifyAccount(account.id)
+      emit('refresh')
+      emit('notice', t('accounts.loginComplete'), 'success')
+      return
     }
+    const verified = await api.verifyAccount(account.id)
     emit('refresh')
-    emit(
-      'notice',
-      t(action === 'login' ? 'accounts.loginComplete' : 'accounts.verified'),
-      'success',
-    )
+    if (verified.authenticated === false) {
+      emit(
+        'notice',
+        tf('accounts.verifyInvalid', { reason: verified.verify_reason || verified.message || '-' }),
+        'error',
+      )
+    } else {
+      emit('notice', t('accounts.verified'), 'success')
+    }
   } catch (error) {
     actionError(error)
   } finally {
@@ -768,7 +775,7 @@ async function startBulk(
   action: BulkAction,
   accounts: readonly Account[],
   concurrency: number,
-  task: (account: Account) => Promise<void>,
+  task: (account: Account) => Promise<BulkTaskResult | void>,
 ): Promise<void> {
   if (bulk.running || accounts.length === 0) return
   bulkPanelOpen.value = true
@@ -776,9 +783,21 @@ async function startBulk(
   finishBulk(action)
 }
 
-// finishBulk 批量任务结束后刷新数据并给出汇总通知
+// finishBulk 批量任务结束后刷新数据并给出汇总通知：批量验证按“有效 / 登录失效 / 出错”三项汇总
 function finishBulk(action: BulkAction): void {
   emit('refresh')
+  if (action === 'verify') {
+    emit(
+      'notice',
+      tf('accounts.verifyResult', {
+        ok: bulk.succeeded,
+        invalid: bulk.invalid.length,
+        failed: bulk.failures.length,
+      }),
+      bulk.failures.length === 0 && bulk.invalid.length === 0 ? 'success' : 'error',
+    )
+    return
+  }
   emit(
     'notice',
     tf('accounts.bulkFinished', {
@@ -968,9 +987,12 @@ async function startVerify(): Promise<void> {
     emit('notice', t('accounts.noneToVerify'), 'success')
     return
   }
-  await startBulk('verify', targets, verifyConcurrency.value, (account) =>
-    api.verifyAccount(account.id),
-  )
+  await startBulk('verify', targets, verifyConcurrency.value, async (account) => {
+    const verified = await api.verifyAccount(account.id)
+    if (verified.authenticated === false) {
+      return { invalid: true, message: verified.verify_reason || verified.message || '-' }
+    }
+  })
 }
 
 // bulkSelected 对选中账户执行启用、停用或删除
@@ -1273,12 +1295,25 @@ function closeBulkPanel(): void {
             <strong class="text-gray-200">
               {{ tf('accounts.progress', { action: bulkLabel, done: bulk.done, total: bulk.total }) }}
             </strong>
-            <span class="text-xs text-green-400">
-              {{ tf('accounts.progressSucceeded', { count: bulk.succeeded }) }}
-            </span>
-            <span class="text-xs" :class="bulk.failures.length > 0 ? 'text-red-400' : 'text-gray-500'">
-              {{ tf('accounts.progressFailed', { count: bulk.failures.length }) }}
-            </span>
+            <template v-if="bulk.action === 'verify'">
+              <span class="text-xs text-green-400">
+                {{ tf('accounts.progressValid', { count: bulk.succeeded }) }}
+              </span>
+              <span class="text-xs" :class="bulk.invalid.length > 0 ? 'text-yellow-400' : 'text-gray-500'">
+                {{ tf('accounts.progressInvalid', { count: bulk.invalid.length }) }}
+              </span>
+              <span class="text-xs" :class="bulk.failures.length > 0 ? 'text-red-400' : 'text-gray-500'">
+                {{ tf('accounts.progressErrored', { count: bulk.failures.length }) }}
+              </span>
+            </template>
+            <template v-else>
+              <span class="text-xs text-green-400">
+                {{ tf('accounts.progressSucceeded', { count: bulk.succeeded }) }}
+              </span>
+              <span class="text-xs" :class="bulk.failures.length > 0 ? 'text-red-400' : 'text-gray-500'">
+                {{ tf('accounts.progressFailed', { count: bulk.failures.length }) }}
+              </span>
+            </template>
             <span v-if="!bulk.running" class="text-xs text-gray-500">
               {{ bulk.cancelled ? t('accounts.progressStopped') : t('accounts.progressDone') }}
             </span>
@@ -1308,13 +1343,31 @@ function closeBulkPanel(): void {
         <div class="progress-track mt-2">
           <div
             class="progress-bar"
-            :class="bulk.failures.length > 0 ? 'bg-yellow-500' : ''"
+            :class="bulk.failures.length > 0 || bulk.invalid.length > 0 ? 'bg-yellow-500' : ''"
             :style="{ width: `${bulkPercent}%` }"
           ></div>
         </div>
         <p v-if="bulk.active.length > 0" class="cell-truncate mt-2 font-mono text-xs text-gray-500">
           {{ tf('accounts.progressActive', { names: bulk.active.join(', ') }) }}
         </p>
+        <details v-if="bulk.invalid.length > 0" class="mt-2 text-xs">
+          <summary class="cursor-pointer text-yellow-400">
+            {{ tf('accounts.progressInvalidList', { count: bulk.invalid.length }) }}
+            <button
+              class="btn btn-sm ml-2"
+              type="button"
+              @click.prevent="copyEmails(bulk.invalid.map((entry) => entry.label))"
+            >
+              {{ t('accounts.copyEmails') }}
+            </button>
+          </summary>
+          <ul class="mt-2 max-h-48 space-y-1 overflow-auto">
+            <li v-for="entry in bulk.invalid" :key="entry.id" class="flex gap-2">
+              <span class="shrink-0 font-mono text-gray-300">{{ entry.label }}</span>
+              <span class="min-w-0 break-words text-yellow-300">{{ entry.message }}</span>
+            </li>
+          </ul>
+        </details>
         <details v-if="bulk.failures.length > 0" class="mt-2 text-xs">
           <summary class="cursor-pointer text-red-400">
             {{ tf('accounts.progressFailures', { count: bulk.failures.length }) }}

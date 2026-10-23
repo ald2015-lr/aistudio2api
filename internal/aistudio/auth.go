@@ -130,6 +130,9 @@ type LoginVerification struct {
 	Authenticated bool      `json:"authenticated"`
 	VerifiedAt    time.Time `json:"verified_at"`
 	Reason        string    `json:"reason,omitempty"`
+	// PageURL 为验证结束时隔离浏览器所在页面的 host+path（不含查询参数与片段，查询参数里有账号与回跳地址）：
+	// 判定登录已失效时用来区分普通登录页（会话失效）与安全验证、风控页（challenge、speedbump、rejected 等）
+	PageURL string `json:"page_url,omitempty"`
 }
 
 // IsolatedLoginDriver 定义独立浏览器登录与验证合同

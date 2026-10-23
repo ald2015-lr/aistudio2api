@@ -342,6 +342,11 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 			return FileRef{}, s.pool.NoEligibleError(AccountSelection{Pool: scope})
 		}
 		maxAttempts = len(candidateAccountIDs)
+		// 换号上限（app 层的数据请求设为 4，见 WithAttemptCeiling）：认证失败只要还没读请求体就换号，出口被拒、Cookie 批量作废时
+		// 原先一次上传能把就绪账户试个遍，每个失败账户还写一次全局短冷却（GenerateAccessToken 401），连带挡住空闲热 Worker 的生成
+		if ceiling := attemptCeilingFrom(ctx); ceiling > 0 {
+			maxAttempts = min(maxAttempts, ceiling)
+		}
 	}
 	var file FileRef
 	var uploadErr error
@@ -380,11 +385,12 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 				slog.Warn("Drive 文件回收失败", "account", request.AccountID, "file", file.ID, "error", cleanupErr)
 			}
 		}
-		authFailure := DefinitiveAuthenticationFailure(uploadErr)
+		// 认证失败（登录失效、GenerateAccessToken 或 Drive 的 401）时自动选号的上传换一个账户再试；只有登录失效会改账户状态
+		authFailure := uploadAuthFailure(uploadErr)
 		stateErr := error(nil)
-		if authFailure {
-			stateErr = lease.MarkAuthenticationRequired(uploadErr.Error())
-		} else if uploadErr == nil {
+		if uploadErr != nil {
+			stateErr = s.markLeaseAuthFailure(lease, uploadErr)
+		} else {
 			stateErr = errors.Join(
 				lease.MarkAuthenticationValid(),
 				s.pool.ClearCooldownIfGeneration(
@@ -527,9 +533,9 @@ func (s *PooledService) DownloadFile(ctx context.Context, fileID string) (MediaS
 			media, downloadErr = drive.DownloadDrive(ContextWithAccountLease(ctx, lease), accountID, token, fileID)
 		}
 	}
-	if DefinitiveAuthenticationFailure(downloadErr) {
-		downloadErr = errors.Join(downloadErr, lease.MarkAuthenticationRequired(downloadErr.Error()))
-	} else if downloadErr == nil {
+	if downloadErr != nil {
+		downloadErr = errors.Join(downloadErr, s.markLeaseAuthFailure(lease, downloadErr))
+	} else {
 		downloadErr = errors.Join(
 			lease.MarkAuthenticationValid(),
 			s.pool.ClearCooldownIfGeneration(
@@ -569,9 +575,9 @@ func (s *PooledService) DeleteFile(ctx context.Context, fileID string) error {
 		deleteErr = s.client.deleteDriveFile(attemptCtx, accountID, token, fileID)
 	}
 	stateErr := error(nil)
-	if DefinitiveAuthenticationFailure(deleteErr) {
-		stateErr = lease.MarkAuthenticationRequired(deleteErr.Error())
-	} else if deleteErr == nil {
+	if deleteErr != nil {
+		stateErr = s.markLeaseAuthFailure(lease, deleteErr)
+	} else {
 		stateErr = errors.Join(
 			lease.MarkAuthenticationValid(),
 			s.pool.ClearCooldownIfGeneration(
@@ -603,6 +609,46 @@ func driveFileNotFound(err error, method string) bool {
 }
 
 // driveAuthorizationMissing 判断账户仅缺少 Google Drive 授权
+// markLeaseAuthFailure 处理文件与附件路径上的认证失败：GenerateAccessToken 的 401 只写模型无关的短冷却（不改账户状态、不登记淘汰）；
+// Drive* 的 Bearer 401 不算登录失效，不处理；其余登录失效按 MarkAuthenticationFailure（上游 401 先记疑似失效并复核，见 auth_gate.go）
+func (s *PooledService) markLeaseAuthFailure(lease *AccountLease, err error) error {
+	switch {
+	case AccessTokenAuthFailure(err):
+		return s.markAccessTokenCooldown(lease, err)
+	case DefinitiveAuthenticationFailure(err):
+		_, markErr := lease.MarkAuthenticationFailure(err)
+		return markErr
+	}
+	return nil
+}
+
+// markAccessTokenCooldown 对 GenerateAccessToken 认证失败的账户写 AccessTokenFailureCooldown 的全局冷却：紧接着的换号避开它，
+// 不缩短已有的更长冷却；时长不到“冷却中”的门槛（ShortCooldownMax），不会因此被当成冷却的 Worker 替换或登记淘汰
+func (s *PooledService) markAccessTokenCooldown(lease *AccountLease, err error) error {
+	if lease == nil || lease.Account() == nil || s.pool == nil {
+		return nil
+	}
+	reason := "附件授权失败（GenerateAccessToken 认证失败，不标需要登录）：" + err.Error()
+	_, _, markErr := s.pool.TryExtendCooldownIfGeneration(
+		lease.Account().ID, "", lease.ModelAccessGeneration(), lease.CheckedAt(),
+		time.Now().Add(AccessTokenFailureCooldown), reason,
+	)
+	return markErr
+}
+
+// uploadAuthFailure 判断上传失败是否为认证失败（换账户可能成功）：登录失效、GenerateAccessToken 的 401，以及 Drive 的 Bearer 401；
+// Drive 授权缺失（unauthorized_client）换号也不会好转，不算
+func uploadAuthFailure(err error) bool {
+	if err == nil || driveAuthorizationMissing(err) {
+		return false
+	}
+	if DefinitiveAuthenticationFailure(err) {
+		return true
+	}
+	var rpcError *RPCError
+	return errors.As(err, &rpcError) && (rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
+}
+
 func driveAuthorizationMissing(err error) bool {
 	var rpcError *RPCError
 	return errors.As(err, &rpcError) && rpcError.Method == "GenerateAccessToken" &&
@@ -687,8 +733,8 @@ func (s *PooledService) CopyFileReferencesToLease(
 				}
 			}
 			if uploadErr != nil || closeErr != nil {
-				if DefinitiveAuthenticationFailure(uploadErr) {
-					uploadErr = errors.Join(uploadErr, target.MarkAuthenticationRequired(uploadErr.Error()))
+				if uploadErr != nil {
+					uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
 				}
 				return nil, nil, errors.Join(uploadErr, closeErr, copies.Cleanup())
 			}
@@ -781,9 +827,8 @@ func (s *PooledService) UploadInlineMediaToLease(
 		if driveAuthorizationMissing(uploadErr) {
 			return rewritten, temporary, nil
 		}
-		if DefinitiveAuthenticationFailure(uploadErr) {
-			uploadErr = errors.Join(uploadErr, target.MarkAuthenticationRequired(uploadErr.Error()))
-		}
+		// GenerateAccessToken 的 401 只让本次附件尝试失败并短暂冷却（换号避开它），不标需要登录
+		uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
 		return nil, nil, errors.Join(uploadErr, temporary.Cleanup())
 	}
 	uploadCtx, cancelUploads := context.WithCancel(targetCtx)
@@ -821,9 +866,7 @@ func (s *PooledService) UploadInlineMediaToLease(
 		uploadErr = errors.Join(uploadErr, result.err)
 	}
 	if uploadErr != nil {
-		if DefinitiveAuthenticationFailure(uploadErr) {
-			uploadErr = errors.Join(uploadErr, target.MarkAuthenticationRequired(uploadErr.Error()))
-		}
+		uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
 		return nil, nil, errors.Join(uploadErr, temporary.Cleanup())
 	}
 	for index, job := range jobs {

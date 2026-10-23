@@ -15,6 +15,7 @@ import type {
   Account,
   AdminLog,
   AdminEvent,
+  EgressStatus,
   Model,
   Cooldown,
   RequestSummary,
@@ -115,6 +116,61 @@ const workerSets = computed(() => ({
   starting: new Set(status.value?.workers?.starting_ids ?? []),
 }))
 
+// catalogSyncLine 为侧栏的模型目录同步行：暂停中（上游 429 或出口限流）、有缺失或有疑似失效时才显示
+// catalogPauseReason 为目录同步暂停原因的显示：服务端给的是固定的中文枚举（上游 429、出口限流），按界面语言显示
+function catalogPauseReason(reason: string): string {
+  if (reason === '上游 429') return t('app.catalogPauseUpstream')
+  if (reason === '出口限流') return t('app.catalogPauseEgress')
+  return reason
+}
+
+const catalogSyncLine = computed(() => {
+  const sync = status.value?.catalog_sync
+  if (sync === undefined) return null
+  if (sync.pause_reason) {
+    // 出口限流暂停没有恢复时间；服务端的零值时间（0001-01-01）同样按没有处理
+    const until = sync.paused_until ? new Date(sync.paused_until) : null
+    const time =
+      until !== null && until.getTime() > 0
+        ? until.toLocaleTimeString([], {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: false,
+          })
+        : '-'
+    return {
+      paused: true,
+      text: tf('app.catalogSyncPaused', { time, reason: catalogPauseReason(sync.pause_reason) }),
+    }
+  }
+  const missing = sync.missing ?? 0
+  const suspects = sync.auth_suspects ?? 0
+  if (missing === 0 && suspects === 0) return null
+  return { paused: false, text: tf('app.catalogSyncPending', { count: missing, suspects }) }
+})
+
+// authRecheckLine 为侧栏的登录复核行：有疑似登录失效、最近 10 分钟有新增需要登录或有坏号时才显示
+const authRecheckLine = computed(() => {
+  const value = status.value
+  if (value === null) return null
+  const recheck = value.auth_recheck
+  const suspects = recheck?.suspects ?? 0
+  const recent = value.accounts?.auth_required_10m ?? 0
+  const bad = value.bad_accounts ?? 0
+  if (suspects === 0 && recent === 0 && bad === 0) return null
+  return {
+    text: tf('app.authRecheckLine', { suspects, recent, bad }),
+    detail: tf('app.authRecheckDetail', {
+      cleared: recheck?.cleared_1h ?? 0,
+      confirmed: recheck?.confirmed_1h ?? 0,
+      recovered: recheck?.recovered_1h ?? 0,
+      invalid: recheck?.still_invalid_1h ?? 0,
+    }),
+    warn: suspects > 0 || recent > 0,
+  }
+})
+
 // ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
 // 也没有 Ultra Worker 时不显示
 const ultraWorkers = computed(() => {
@@ -140,6 +196,74 @@ const primarySupply = computed(() =>
 const ultraPrimarySupply = computed(() =>
   ultraWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'ultra') : [],
 )
+
+// limitedEgress 为侧栏的出口限流行：只显示判定成立（limited，黄色）或已撤销（rejected，灰色）的出口，正常的不显示
+const limitedEgress = computed(() =>
+  (status.value?.egress ?? []).filter((egress) => egress.mode !== 'normal'),
+)
+// egressPending 为正在撤销或恢复判定的出口编号
+const egressPending = ref('')
+
+// egressLabelText 为出口的显示名：服务端的直连标签是中文固定值，按界面语言显示；代理出口照原样（已脱敏）
+function egressLabelText(egress: EgressStatus): string {
+  return egress.label === '直连' ? t('app.egressDirect') : egress.label
+}
+
+// egressLine 为一个出口的侧栏文字：上游拒绝为发往上游的请求被拒的比例，本地限速拒绝为排队超限在本地返回的 429
+function egressLine(egress: EgressStatus): string {
+  const ratio = Math.round((egress.ratio_2m ?? 0) * 100)
+  const local = egress.local_429_1m ?? 0
+  const label = egressLabelText(egress)
+  if (egress.mode === 'rejected') {
+    const by =
+      egress.rejected_by === '安全阀'
+        ? t('app.egressRejectedByValve')
+        : egress.rejected_by === '管理操作'
+          ? t('app.egressRejectedByAdmin')
+          : (egress.rejected_by ?? '')
+    return tf('app.egressRejected', { label, by })
+  }
+  if (egress.limiter === 'suspended') {
+    return tf('app.egressSuspended', { label, ratio, local })
+  }
+  return tf('app.egressLimited', {
+    label,
+    ratio,
+    local,
+    queued: egress.queued ?? 0,
+    limit: egressLimitText(egress),
+  })
+}
+
+// egressLimitText 为出口生效的限速：只取限速生效的通道（只挂 Ultra 账号的出口、普通通道已停止而 Ultra 通道仍在限速时，
+// 普通通道的 limit_rpm 为 0，原先显示“限速 0/分钟”像是完全不放行）；两条通道都在限速时分别写出
+function egressLimitText(egress: EgressStatus): string {
+  const normal = egress.lanes?.find((lane) => lane.lane === 'normal')?.limit_rpm ?? 0
+  const ultra = egress.lanes?.find((lane) => lane.lane === 'ultra')?.limit_rpm ?? 0
+  if (normal > 0 && ultra > 0) return tf('app.egressLimitLanes', { normal, ultra })
+  if (ultra > 0) return tf('app.egressLimitUltra', { limit: ultra })
+  if (normal > 0) return tf('app.egressLimitRPM', { limit: normal })
+  return t('app.egressLimitOff')
+}
+
+function egressDetail(egress: EgressStatus): string {
+  if (egress.mode !== 'rejected') return t('app.egressLimitedDetail')
+  const until = egress.rejected_until ? Date.parse(egress.rejected_until) : NaN
+  const minutes = Number.isNaN(until) ? 30 : Math.max(1, Math.ceil((until - Date.now()) / 60000))
+  return tf('app.egressRejectedDetail', { minutes })
+}
+
+// toggleEgress 撤销（限流中）或恢复（已撤销）出口的判定，按返回的最新状态刷新侧栏
+async function toggleEgress(egress: EgressStatus): Promise<void> {
+  egressPending.value = egress.id
+  try {
+    status.value = await api.egressAction(egress.id, egress.mode === 'rejected' ? 'resume' : 'withdraw')
+  } catch (error) {
+    showNotice(messageOf(error), 'error')
+  } finally {
+    egressPending.value = ''
+  }
+}
 
 // navBadge 在导航项旁显示账户就绪数与活动请求数
 function navBadge(id: TabID): string {
@@ -516,11 +640,16 @@ onUnmounted(() => {
           <div
             v-if="
               status.workers &&
-              ((status.workers.dead ?? 0) > 0 || (status.workers.draining ?? 0) > 0)
+              ((status.workers.dead ?? 0) > 0 ||
+                (status.workers.draining ?? 0) > 0 ||
+                (status.workers.unschedulable ?? 0) > 0)
             "
             class="flex items-center gap-2 text-yellow-400"
           >
-            <span v-tooltip="t('app.workersDeadDetail')">
+            <span
+              v-if="(status.workers.dead ?? 0) > 0 || (status.workers.draining ?? 0) > 0"
+              v-tooltip="t('app.workersDeadDetail')"
+            >
               {{ tf('app.workersDead', { count: status.workers.dead ?? 0 }) }}
             </span>
             <span
@@ -529,6 +658,12 @@ onUnmounted(() => {
               class="text-cyan-300"
             >
               {{ tf('app.workersDraining', { count: status.workers.draining ?? 0 }) }}
+            </span>
+            <span
+              v-if="(status.workers.unschedulable ?? 0) > 0"
+              v-tooltip="t('app.workersUnschedulableDetail')"
+            >
+              {{ tf('app.workersUnschedulable', { count: status.workers.unschedulable ?? 0 }) }}
             </span>
           </div>
           <!-- 模型名过长时数量换到下一行，不被截断 -->
@@ -553,6 +688,23 @@ onUnmounted(() => {
             </span>
           </div>
           <div
+            v-for="egress in limitedEgress"
+            :key="`egress:${egress.id}`"
+            v-tooltip="egressDetail(egress)"
+            class="flex flex-wrap items-baseline gap-x-1"
+            :class="egress.mode === 'rejected' ? 'text-gray-500' : 'text-yellow-400'"
+          >
+            <span class="max-w-full min-w-0 break-all">{{ egressLine(egress) }}</span>
+            <button
+              type="button"
+              class="rounded border border-gray-600 px-1 text-[10px] text-gray-300 transition hover:bg-gray-700 disabled:opacity-50"
+              :disabled="egressPending === egress.id"
+              @click="toggleEgress(egress)"
+            >
+              {{ egress.mode === 'rejected' ? t('app.egressResume') : t('app.egressWithdraw') }}
+            </button>
+          </div>
+          <div
             v-if="ultraWorkers"
             v-tooltip="
               tf('app.ultraWorkersDetail', {
@@ -560,6 +712,7 @@ onUnmounted(() => {
                 starting: ultraWorkers.starting,
                 dead: ultraWorkers.dead ?? 0,
                 draining: ultraWorkers.draining ?? 0,
+                unschedulable: ultraWorkers.unschedulable ?? 0,
                 target: ultraWorkers.target,
                 max: ultraWorkers.max,
               })
@@ -587,6 +740,22 @@ onUnmounted(() => {
                 })
               }}
             </span>
+          </div>
+          <div
+            v-if="authRecheckLine"
+            v-tooltip="authRecheckLine.detail"
+            class="cell-truncate"
+            :class="authRecheckLine.warn ? 'text-yellow-400' : ''"
+          >
+            {{ authRecheckLine.text }}
+          </div>
+          <div
+            v-if="catalogSyncLine"
+            v-tooltip="t('app.catalogSyncDetail')"
+            class="cell-truncate"
+            :class="catalogSyncLine.paused ? 'text-yellow-400' : ''"
+          >
+            {{ catalogSyncLine.text }}
           </div>
           <template v-if="status.workers?.prewarm">
             <div v-if="status.workers.prewarm.active" class="text-cyan-300">

@@ -54,6 +54,31 @@ type AdminStatus struct {
 	// PrimarySupply 为每个主用模型的可用供给：普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）
 	// 统计 Ultra 分区（Pool 为 ultra），keepWarm 约每 30 秒统计一次并缓存；没有主用模型或服务还没统计过时为空
 	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
+	// Egress 为各出口（账号代理规范化后的值，空为直连）的限流判定与限速；服务未运行时为空
+	Egress []AdminEgress `json:"egress,omitempty"`
+	// CatalogSync 为模型目录缓存与后台同步的状态；服务未运行时为空
+	CatalogSync *AdminCatalogSync `json:"catalog_sync,omitempty"`
+	// AuthRecheck 为登录复核（疑似登录失效的复核与需要登录账户的定期复核）的状态；服务未运行时为空
+	AuthRecheck *AdminAuthRecheck `json:"auth_recheck,omitempty"`
+	// BadAccounts 为现在标为坏号（连续裸限流、期间没有成功）、移出预热、扩容与替补候选的账号数
+	BadAccounts int `json:"bad_accounts,omitempty"`
+}
+
+// AdminAuthRecheck 表示登录复核：上游 401 先记疑似登录失效、写短冷却并用磁盘 Cookie 复核，仍是 401 才标需要登录；
+// 需要登录的账户每 15 分钟一轮低速复核，复核通过即恢复
+type AdminAuthRecheck struct {
+	Suspects int `json:"suspects"` // 疑似登录失效、等待复核的账户
+	Queued   int `json:"queued"`   // 本轮还没复核的需要登录账户
+	Running  int `json:"running"`
+	// 以下为最近一小时的计数：Cleared 为疑似失效复核通过（排除），Confirmed 为疑似失效复核仍是 401（标需要登录），
+	// Recovered 为需要登录账户复核通过（恢复就绪），StillInvalid 为仍是 401，Skipped 为账户忙、出口限流或复核出错跳过
+	Cleared1h      int       `json:"cleared_1h"`
+	Confirmed1h    int       `json:"confirmed_1h"`
+	Recovered1h    int       `json:"recovered_1h"`
+	StillInvalid1h int       `json:"still_invalid_1h"`
+	Skipped1h      int       `json:"skipped_1h"`
+	NextRound      time.Time `json:"next_round,omitempty"`
+	PauseReason    string    `json:"pause_reason,omitempty"` // 出口限流
 }
 
 // AdminPrimarySupply 表示一个主用模型在它所在分区的可用供给：Pool 为 ultra 时是 Ultra 主用模型、统计 Ultra 分区，为空时是普通主用模型、
@@ -71,6 +96,64 @@ type AdminPrimarySupply struct {
 	StandbyCapped bool `json:"standby_capped,omitempty"`
 }
 
+// AdminEgress 表示一个出口的限流判定与限速
+type AdminEgress struct {
+	ID             string            `json:"id"` // 出口编号（管理动作用），不含代理原文
+	Label          string            `json:"label"`
+	Mode           string            `json:"mode"`    // normal | limited | rejected
+	Limiter        string            `json:"limiter"` // off | active | suspended
+	Since          time.Time         `json:"since,omitempty"`
+	Accounts       int               `json:"accounts"`
+	Lanes          []AdminEgressLane `json:"lanes"`
+	Success1m      int               `json:"success_1m"`
+	Bare1m         int               `json:"bare_429_1m"`
+	Other1m        int               `json:"other_1m"`
+	Ratio2m        float64           `json:"ratio_2m"`              // 裸 429 占 2 分钟内尝试结果的比例（0–1，不含已降级账号）
+	RatioEntry     float64           `json:"ratio_entry,omitempty"` // 判定成立时的比例
+	FreshRejects2m int               `json:"fresh_rejects_2m"`
+	Queued         int               `json:"queued"`              // 正在按“出口限速”排队的请求
+	LocalRejects1m int               `json:"local_429_1m"`        // 本地返回的 429：出口限速排队超限与出口限流换号上限
+	Retried        int               `json:"retried,omitempty"`   // 本次判定期间裸 429 后再被尝试的账号数
+	Recovered      int               `json:"recovered,omitempty"` // 其中后来成功的
+	Demoted        int               `json:"demoted,omitempty"`   // 按账号证据降级的账号数
+	Relaxed        int               `json:"relaxed,omitempty"`   // 判定成立时撤回的逐级冷却账号数
+	RetryAt        time.Time         `json:"retry_at,omitempty"`
+	RejectedUntil  time.Time         `json:"rejected_until,omitempty"`
+	RejectedBy     string            `json:"rejected_by,omitempty"` // 安全阀 | 管理操作
+}
+
+// AdminEgressLane 表示出口内一个分区通道的令牌桶与冷启动配额
+type AdminEgressLane struct {
+	Lane             string `json:"lane"` // normal | ultra
+	Accounts         int    `json:"accounts"`
+	LimitRPM         int    `json:"limit_rpm"` // 0 为不限
+	Burst            int    `json:"burst,omitempty"`
+	Sent1m           int    `json:"sent_1m"`
+	PrimarySent1m    int    `json:"primary_sent_1m"`
+	OtherSent1m      int    `json:"other_sent_1m"`
+	Pending          int    `json:"pending"`
+	ColdStarting     int    `json:"cold_starting"`      // 闸门放行、正在启动的冷启动
+	ColdStarted1m    int    `json:"cold_started_1m"`    // 最近一分钟闸门放行的冷启动
+	RefillDeferred1m int    `json:"refill_deferred_1m"` // 最近一分钟因补位并发已满被推迟的补位
+}
+
+// AdminCatalogSync 表示模型目录缓存与后台同步
+type AdminCatalogSync struct {
+	Cached        int       `json:"cached"`        // 有目录的账户（含来自磁盘的）
+	FromDisk      int       `json:"from_disk"`     // 本代运行时启动时从磁盘恢复的账户
+	Missing       int       `json:"missing"`       // 启用、就绪却没有目录的账户
+	Expired       int       `json:"expired"`       // 目录超过有效期、等待刷新的账户
+	AuthSuspects  int       `json:"auth_suspects"` // 疑似登录失效、等待探测的账户
+	Queued        int       `json:"queued"`
+	Running       int       `json:"running"`
+	PausedUntil   time.Time `json:"paused_until,omitempty"`
+	PauseReason   string    `json:"pause_reason,omitempty"` // 上游 429 | 出口限流
+	Synced1h      int       `json:"synced_1h"`
+	Failed1h      int       `json:"failed_1h"`
+	RateLimited1h int       `json:"rate_limited_1h"`
+	SkippedBusy1h int       `json:"skipped_busy_1h"` // 账户有进行中的请求、推后刷新的次数
+}
+
 // AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限
 type AdminWorkerPartition struct {
 	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的，排空中的按已让出计），
@@ -82,6 +165,8 @@ type AdminWorkerPartition struct {
 	Dead     int `json:"dead"`
 	Draining int `json:"draining"`
 	Retiring int `json:"retiring"`
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、没有可初始化模型），等待释放
+	Unschedulable int `json:"unschedulable"`
 	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
 	Target    int `json:"target"`
 	WarmLimit int `json:"warm_limit"`
@@ -114,6 +199,8 @@ type AdminWorkerCounts struct {
 	Prewarm     AdminPrewarmState `json:"prewarm"`
 	WarmIDs     []string          `json:"warm_ids,omitempty"`
 	StartingIDs []string          `json:"starting_ids,omitempty"`
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、没有可初始化模型），等待释放
+	Unschedulable int `json:"unschedulable"`
 }
 
 // AdminLog 表示管理页面展示的一条运行日志
@@ -218,6 +305,9 @@ type AdminAccountCounts struct {
 	Busy         int `json:"busy"`
 	Cooldown     int `json:"cooldown"`
 	AuthRequired int `json:"auth_required"`
+	// AuthRequired10m 为最近 10 分钟新被标为需要登录的账户数（“账号需要登录”日志的条数，同账号 1 分钟最多一条）；
+	// 只在全部账户的计数里填写，持续增长说明运行期 401 在累积
+	AuthRequired10m int `json:"auth_required_10m,omitempty"`
 }
 
 // AdminAccount 表示管理端账户摘要
@@ -237,6 +327,10 @@ type AdminAccount struct {
 	// Pool 为账户当前所属的号池（成员关系）：ultra（权益为 Ultra，ULTRA_INCLUDE_PRO=true 时也含 Pro）或 normal；
 	// benefit_tier 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍显示 Pro
 	Pool string `json:"pool"`
+	// Authenticated 与 VerifyReason 只在验证接口的返回里填写：验证结论（浏览器已登录且接口复核通过才为 true）与它的原因。
+	// 停用账户的状态始终是 disabled，前端按 Authenticated 计“有效 / 登录失效”，不能看状态或 HTTP 200
+	Authenticated *bool  `json:"authenticated,omitempty"`
+	VerifyReason  string `json:"verify_reason,omitempty"`
 }
 
 // AccountInput 表示已有账户配置
@@ -420,6 +514,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)
+	s.registerEgress(mux)
 }
 
 func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {

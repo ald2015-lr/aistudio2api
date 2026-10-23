@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -119,12 +120,22 @@ func (guard *rateLimitGuard) succeeded(pool aistudio.PoolScope, modelID string, 
 
 // applyRateLimitCooldown 为 applyQuotaCooldown 中裸限流 429（cooldown.Escalate 为真）的分支：按连续次数逐级加长冷却（见本文件开头）。
 // escalate 为这次失败可以作为“冷却到期后仍失败”的证据（请求还没向客户端输出）；号池级限流判定成立时同样不升档。
-// 两个通道没有判定为独立额度时（共用或观察中）共用档位并同步冷却另一个启用通道。返回的 cooldown 带实际写入的恢复时间
+// 两个通道没有判定为独立额度时（共用或观察中）共用档位并同步冷却另一个启用通道。返回的 cooldown 带实际写入的恢复时间。
+// 生成本身返回的裸限流（首事件前与流内）先交给出口判定器（见 egress_guard.go）：账户所在出口判定成立时只短冷却、不升档
+// （或按账号证据降级），不再走号池级判定与逐级冷却
 func (service *trackedService) applyRateLimitCooldown(
 	lease *aistudio.AccountLease, accountLabel string, modelID string, cooldown aistudio.QuotaCooldown, note string,
 	pool aistudio.PoolScope, escalate bool,
 ) (aistudio.QuotaCooldown, bool, error) {
 	accountID := lease.Account().ID
+	// 坏号记忆按账号（不分模型）累计连续裸限流（见 bad_accounts.go），与出口判定解耦；先记它，出口判定的“冷号首发被拒”据此排除坏号
+	service.workers.badAccountMemory().observe(accountID, accountLabel, egressBare)
+	if verdict := service.egress.observeOutcome(egressObservation{
+		Key: lease.EgressKey(), AccountID: accountID, Ultra: lease.EgressLane() == aistudio.EgressLaneUltra,
+		Outcome: egressBare, At: time.Now(),
+	}); verdict.Limited {
+		return service.applyEgressLimitedCooldown(lease, accountLabel, modelID, cooldown, note, verdict)
+	}
 	scopeLabel := lease.CooldownScope(modelID)
 	allow, systemic := escalate, false
 	if escalate {
@@ -181,5 +192,84 @@ func (service *trackedService) applyRateLimitCooldown(
 		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s",
 		cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), quotaCooldownFields(cooldown), fields, suffix,
 	))
+	return cooldown, true, nil
+}
+
+// applyEgressLimitedCooldown 为出口判定成立期间的裸限流冷却：这时被拒的是出口而不是账号，逐级冷却只会把驻留 Worker 盖成死槽位，
+// 引发淘汰与替补冷启动的风暴（线上 30 分钟 700–1000 次启停）。
+//   - 只冷却本通道 egressLimitedCooldown（10 秒）：经 TryExtendCooldownIfGeneration 写入，不缩短更晚的冷却、不建档位、不同步另一通道、
+//     不登记淘汰；10 秒 < ShortCooldownMax，不算冷却中，也成不了死槽位，又足够让并发请求不立刻再选中它；
+//   - 判定器按账号证据降级（verdict.Demote）时改写 egressDemoteCooldown（30 分钟）账号冷却：两个通道共用额度时（sharedFor）两个启用通道
+//     各写一次，随后照常登记淘汰，成为死槽位后由淘汰与补位换掉。原因不以“连续限流第”开头，进入判定时的撤回不动它。
+//
+// 返回的 cooldown 保留 Escalate（换号按限流类计），Until 为实际生效的恢复时间
+func (service *trackedService) applyEgressLimitedCooldown(
+	lease *aistudio.AccountLease, accountLabel string, modelID string, cooldown aistudio.QuotaCooldown, note string, verdict egressVerdict,
+) (aistudio.QuotaCooldown, bool, error) {
+	accountID := lease.Account().ID
+	now := time.Now()
+	original := strings.TrimPrefix(cooldown.Reason, aistudio.RateLimitKind+": ")
+	until := now.Add(service.egress.limitedCooldown())
+	reason := aistudio.RateLimitKind + ": 出口限流短冷却，" + original
+	fields := " | 出口限流不升档 | 出口=" + verdict.Label
+	scopes := []string{lease.CooldownScope(modelID)}
+	if verdict.Demote {
+		until = now.Add(egressDemoteCooldown)
+		reason = fmt.Sprintf("%s: 出口限流期间账号持续被拒（连续 %d 次），%s", aistudio.RateLimitKind, verdict.DemoteStreak, original)
+		fields = fmt.Sprintf(" | 出口限流按账号冷却 | 连续=%d | 出口=%s", verdict.DemoteStreak, verdict.Label)
+		// 共用判定按账户真实权益分组（与逐级冷却一致）；另一通道只在启用时写
+		if service.quota.sharedFor(modelID, service.pool.TierPoolOf(accountID)) {
+			other := aistudio.ChannelBuild
+			enabled := service.pool.BuildEnabled()
+			if lease.Channel() == aistudio.ChannelBuild {
+				other, enabled = aistudio.ChannelPlayground, service.pool.PlaygroundEnabled()
+			}
+			if enabled {
+				scopes = append(scopes, aistudio.ChannelCooldownScope(other, modelID))
+			}
+		}
+	}
+	suffix := ""
+	if note != "" {
+		suffix = " | " + note
+	}
+	cooldown.Reason = reason
+	effective := time.Time{}
+	written := false
+	for index, scope := range scopes {
+		write, effectiveUntil, stateErr := service.pool.TryExtendCooldownIfGeneration(
+			accountID, scope, lease.ModelAccessGeneration(), lease.CheckedAt(), until, reason,
+		)
+		if stateErr != nil {
+			cooldown.Until = until
+			return cooldown, true, stateErr
+		}
+		recoverAt := until
+		if write == aistudio.CooldownKeptLater {
+			recoverAt = effectiveUntil
+		}
+		if index == 0 {
+			effective = recoverAt
+		}
+		if write != aistudio.CooldownWritten {
+			service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+				"账号冷却未写入 | 类型=%s | 范围=%s | 恢复=%s%s | 原因=%s%s%s",
+				cooldown.Kind, scope, recoverAt.Format(time.RFC3339), quotaCooldownFields(cooldown), write.String(), fields, suffix,
+			))
+			continue
+		}
+		written = true
+		service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+			"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s",
+			cooldown.Kind, scope, until.Format(time.RFC3339), quotaCooldownFields(cooldown), fields, suffix,
+		))
+	}
+	cooldown.Until = effective
+	if verdict.Demote && written {
+		// 降级的 30 分钟冷却与逐级冷却第 3 档一样成为死槽位：空闲时立即淘汰，忙碌时等请求释放租约后淘汰（见 worker_retire.go）
+		service.retireCooledWorker(accountID, modelID, aistudio.QuotaCooldown{
+			Until: until, Kind: cooldown.Kind, Reason: reason, Escalate: cooldown.Escalate,
+		})
+	}
 	return cooldown, true, nil
 }

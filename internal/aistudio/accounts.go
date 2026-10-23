@@ -68,6 +68,8 @@ var (
 	ErrAccountLeased = errors.New("账户正在使用")
 	// ErrAccountCoolingDown 表示租约账户在请求发出前进入冷却
 	ErrAccountCoolingDown = errors.New("账户已进入冷却")
+	// ErrEmptyModelCatalog 表示 ListModels 返回空模型列表、账户已有非空目录而暂不覆盖（见 EmptyModelCatalogError）
+	ErrEmptyModelCatalog = errors.New("ListModels 返回空模型列表")
 	// ErrResourceNotFound 表示资源没有创建账户映射
 	ErrResourceNotFound = errors.New("资源账户映射不存在")
 	errAccountLeaseBusy = ErrAccountLeased
@@ -151,9 +153,11 @@ type CapacityBusyError struct {
 	Waited time.Duration
 	Limit  time.Duration
 	// Elapsed 为请求从第一次选号起的总耗时（含失败的尝试、换号退避与现场冷启动），ColdStart 为其中请求自己现场冷启动的时长，
+	// Expansion 为其中等这次选号发起的后台扩容的时长（同样延后截止时间，与现场冷启动分开写），
 	// Attempt 为返回时是第几次尝试；为 0 的项不写进错误文案
 	Elapsed   time.Duration
 	ColdStart time.Duration
+	Expansion time.Duration
 	Attempt   int
 	// Until 为建议客户端重试的时间，供对外错误写 Retry-After
 	Until time.Time
@@ -170,12 +174,25 @@ func (e *CapacityBusyError) Error() string {
 	detail := ""
 	if e.Elapsed > 0 {
 		detail = fmt.Sprintf("，总耗时 %s", roundBusyDuration(e.Elapsed))
+		// 诊断脚本按“含现场冷启动 <时长>”取冷启动时长（到“、”或“）”为止）；等后台扩容另写一项，不算进现场冷启动
+		var parts []string
 		if e.ColdStart > 0 {
-			detail += fmt.Sprintf("（含现场冷启动 %s）", roundBusyDuration(e.ColdStart))
+			parts = append(parts, "现场冷启动 "+roundBusyDuration(e.ColdStart).String())
+		}
+		if e.Expansion > 0 {
+			parts = append(parts, "等后台扩容 "+roundBusyDuration(e.Expansion).String())
+		}
+		if len(parts) > 0 {
+			detail += "（含" + strings.Join(parts, "、") + "）"
 		}
 	}
 	if e.Attempt > 0 {
 		detail += fmt.Sprintf("，第 %d 次尝试", e.Attempt)
+	}
+	if e.Reason == EgressBusyReason {
+		// 只因出口令牌桶已满而排队超限：用独立首段，用户与诊断脚本能把它和号池容量不足区分开（见 egress_rate.go）
+		return fmt.Sprintf("出口限速：模型 %s 所在出口每分钟请求已满，请稍后重试（%s已排队 %s，上限 %s%s）",
+			e.ModelID, pool, roundBusyDuration(e.Waited), e.Limit, detail)
 	}
 	return fmt.Sprintf("号池繁忙：模型 %s 暂时没有空闲的账号或 Worker，请稍后重试（%s已排队 %s，上限 %s%s，最后等待原因：%s）",
 		e.ModelID, pool, roundBusyDuration(e.Waited), e.Limit, detail, e.Reason)
@@ -204,11 +221,28 @@ func (e *CapacityBusyError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
-// PrimaryQuotaError 表示 Ultra 主用模型（ULTRA_PRIMARY_MODELS）的请求因额度不足立即结束：额度 429 的换号次数已达上限
+// QuotaFailKind 为额度不足立即返回的场景；零值为 Ultra 主用模型（原有行为，文案不变）
+type QuotaFailKind uint8
+
+const (
+	// QuotaFailUltraPrimary 为 Ultra 主用模型（ULTRA_PRIMARY_MODELS）没有额度
+	QuotaFailUltraPrimary QuotaFailKind = iota
+	// QuotaFailSwitchLimit 为普通号池（及 /ultra 上的非主用模型）的生成请求额度失败已达换号上限、额度失败后没有已启动的 Worker
+	// 或没有其他可换的账号，以及每请求换号硬上限
+	QuotaFailSwitchLimit
+	// QuotaFailEgress 为上游出口限流：限流类换号已达出口限流时的上限
+	QuotaFailEgress
+)
+
+// QuotaReasonEgress 为 PrimaryQuotaError.Reason 里“账户所在出口判定为限流时限流类换号已达上限”的原因。Ultra 主用模型同样可能以它结束
+// （Kind 仍是 QuotaFailUltraPrimary，文案不变），对外区分 429 原因时按 Kind 或 Reason 认出口限流
+const QuotaReasonEgress = "上游出口限流"
+
+// PrimaryQuotaError 表示生成请求因额度不足立即结束（场景见 Kind）：额度 429 的换号次数已达上限
 // （每日类与限流类各有上限，见 QuotaHits、RateHits）、其余候选全部冷却、额度 429 后号池里没有已启动的 Worker（只剩要现场冷启动的备用账号），
 // 或没有其他可换的账号。对外与全部冷却一样按 429 返回并带 Retry-After，由客户端稍后重试，不在号池里挨个换号、现场冷启动直到超时。
 // Cause 为最后一次上游额度错误，只写进内部日志：刻意不实现 Unwrap，否则会被当成上游 RPCError（对外原文、没有 Retry-After）
-// 或输入超限等错误处理
+// 或输入超限等错误处理。类型名沿用原名：对外映射、协议形状与 Retry-After 的处理都不变
 type PrimaryQuotaError struct {
 	ModelID string
 	// Pool 为请求限定的号池
@@ -224,9 +258,22 @@ type PrimaryQuotaError struct {
 	Until time.Time
 	// Cause 为最后一次上游额度错误（可为空）
 	Cause error
+	// Kind 为结束的场景，零值为 Ultra 主用模型
+	Kind QuotaFailKind
+	// Accounts 为本请求尝试过的不同账号数（普通号池写进文案）
+	Accounts int
+	// Egress 为出口的脱敏标签，EgressLimit 为当时的出口限速（次/分钟，0 为不限或已停止限速），只在 Kind 为 QuotaFailEgress 时有值
+	Egress      string
+	EgressLimit int
 }
 
 func (e *PrimaryQuotaError) Error() string {
+	switch e.Kind {
+	case QuotaFailSwitchLimit:
+		return e.switchLimitError()
+	case QuotaFailEgress:
+		return e.egressError()
+	}
 	pool := e.Pool.Label()
 	if pool == "" {
 		pool = "不限号池"
@@ -247,6 +294,52 @@ func (e *PrimaryQuotaError) Error() string {
 		message += "：" + e.Cause.Error()
 	}
 	return message
+}
+
+// switchLimitError 为普通号池额度失败已达换号上限的文案。不含“主用模型”（诊断脚本按“额度不足：”加“主用模型”识别 Ultra 主用模型），
+// 上游原文（可能含 “You exceeded your current quota”）只在冒号之后的 Cause 里，对外文案另由 API 层给出
+func (e *PrimaryQuotaError) switchLimitError() string {
+	message := fmt.Sprintf("额度不足：%s模型 %s 换号重试已达上限，立即返回（原因：%s，额度失败 %d 次，限流失败 %d 次",
+		quotaPoolPrefix(e.Pool), e.ModelID, e.Reason, e.QuotaHits, e.RateHits)
+	return message + e.quotaErrorTail()
+}
+
+// egressError 为上游出口限流、限流类换号已达出口限流时的上限的文案；限速为 0 时写“限速已停止”
+func (e *PrimaryQuotaError) egressError() string {
+	limit := "限速已停止"
+	if e.EgressLimit > 0 {
+		limit = fmt.Sprintf("限速 %d 次/分钟", e.EgressLimit)
+	}
+	message := fmt.Sprintf("上游限流：%s模型 %s 所在出口 %s 正在限流，立即返回（%s，限流失败 %d 次",
+		quotaPoolPrefix(e.Pool), e.ModelID, e.Egress, limit, e.RateHits)
+	return message + e.quotaErrorTail()
+}
+
+// quotaErrorTail 为两条新文案共用的结尾：尝试账号数、总耗时、建议重试时间（为 0 的项不写）与最后一次上游错误
+func (e *PrimaryQuotaError) quotaErrorTail() string {
+	message := ""
+	if e.Accounts > 0 {
+		message += fmt.Sprintf("，尝试账号 %d 个", e.Accounts)
+	}
+	if e.Elapsed > 0 {
+		message += fmt.Sprintf("，总耗时 %s", roundBusyDuration(e.Elapsed))
+	}
+	if !e.Until.IsZero() {
+		message += "，建议重试时间 " + e.Until.Local().Format(time.RFC3339)
+	}
+	message += "）"
+	if e.Cause != nil {
+		message += "：" + e.Cause.Error()
+	}
+	return message
+}
+
+// quotaPoolPrefix 为额度文案里模型前的号池：号池名加“的”，不限号池为空
+func quotaPoolPrefix(pool PoolScope) string {
+	if label := pool.Label(); label != "" {
+		return label + "的"
+	}
+	return ""
 }
 
 // RetryAt 返回建议重试时间，供对外错误写 Retry-After
@@ -421,6 +514,10 @@ type Account struct {
 	stateMessage          string
 	initializedAt         time.Time
 	buildModels           []Model
+	// emptyCatalogs 与 emptyCatalogSince 为 ListModels 连续返回空列表的次数与第一次为空的时间（见 noteCatalogListing），
+	// 由目录写盘缓存保存并在恢复时带回；受账户池 mu 保护
+	emptyCatalogs     int
+	emptyCatalogSince time.Time
 	// lastReleased 为最近一次普通租约全部释放（active 归零）的时间，受账户池 mu 保护。LastUsed 只在取得租约时写，
 	// 长流结束时它还停在流开始的时刻；空闲回收与淘汰选号按两者中较晚的一个判断空闲（见 lastActivityLocked），状态页的 last_used 不变
 	lastReleased time.Time
@@ -449,6 +546,8 @@ type Account struct {
 	draining bool
 	// rate 为最近一个窗口的生成请求记录（每账号每分钟限速，见 rate_limit.go），第一次取得生成租约时创建；受账户池 mu 保护
 	rate *accountRate
+	// egress 为账户所在的出口通道（按出口键与 Ultra 成员关系，见 egress_rate.go）；不在号池中时为 nil。受账户池 mu 保护
+	egress *egressRate
 	// rateStrikes 为连续裸限流 429 的冷却档位（见 rate_strike.go），只在内存中（重启后从第一档起，冷却本身照常落盘）；受账户池 mu 保护
 	rateStrikes map[rateStrikeKey]rateStrike
 }
@@ -497,6 +596,9 @@ type AccountSelection struct {
 	PreferPlayground bool
 	// Pool 为可以使用的号池；不限号池时由 AcquireFor 等入口取 context 中请求的号池（见 PoolScope）
 	Pool PoolScope
+	// EgressPriority 为主用模型的生成选号：出口令牌桶受限时优先取得令牌（见 egress_rate.go）。
+	// 只影响出口准入，不进候选集的键（selectionKeyOf），也不进调度等待队列的键（见 app/dispatch.go）
+	EgressPriority bool
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -523,6 +625,9 @@ type AccountCandidateGroups struct {
 	// RateLimited 为因每分钟请求已满（ACCOUNT_RPM_LIMIT）而按忙碌分组的候选数，冷却中与被排除的不算；WarmRateLimited 为其中的热账户数
 	RateLimited     int
 	WarmRateLimited int
+	// EgressLimited 为因所在出口通道的令牌桶已满而按忙碌分组的候选数，WarmEgressLimited 为其中的热账户数
+	EgressLimited     int
+	WarmEgressLimited int
 }
 
 // AccountCandidateState 表示账户候选的实时调度指标
@@ -590,6 +695,21 @@ type AccountPool struct {
 	rateFull         map[*Account]struct{}
 	rateWake         *time.Timer
 	rateWakeAt       int64
+	// globalProxy 为全局代理（PROXY），只用于计算出口键；egresses 为出口键 → 出口记录，egressLanes 按编号排列（索引里存编号，
+	// 编号 = 出口序号×2 + 通道），egressFull 为令牌桶对某类选择不准入、登记了下一个令牌时刻的通道（与 rateFull 共用窗口释放计时器），
+	// egressThrottled 为限速大于 0 的通道（为空时出口门控整体关闭；门控只为它们算准入，不按出口总数，见 egress_rate.go），
+	// egressPopulated 为有账户的通道数（全部通道满桶短路用）；egressWindow 只给测试改小统计窗口。
+	// leaseAttempts 为 leaseCandidateLocked 的调用次数，只供测试核对满桶短路。均受 mu 保护
+	globalProxy     string
+	egresses        map[string]*egressRecord
+	egressLanes     []*egressRate
+	egressFull      map[*egressRate]int64
+	egressThrottled []*egressRate
+	egressPopulated int
+	egressWindow    time.Duration
+	leaseAttempts   int
+	// authGate 为租约路径上上游 401 的处理决定（见 auth_gate.go）：为空时一次 401 直接标为需要登录（原行为，测试构造的账户池）
+	authGate atomic.Pointer[AuthFailureGate]
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -610,6 +730,12 @@ type AccountLease struct {
 	// （是否写“已满”日志见 ClaimRateWindowNote），只在创建时写入
 	ratePending bool
 	rateFilled  bool
+	// egress 为取得租约时账户所在的出口通道（只在创建时写入，EgressKey、EgressLane 不加锁读取）；egressPending 为本租约在该通道的预占
+	// 还没被发送或释放抵掉，egressPrimary 为预占时是主用模型的选号，egressCharged 为预占时消耗了令牌（释放时退还）。后三者受账户池 mu 保护
+	egress        *egressRate
+	egressPending bool
+	egressPrimary bool
+	egressCharged bool
 }
 
 // AccountRuntimeLease 保证同一邮箱只有一个 WAA runtime
@@ -1101,6 +1227,8 @@ func NewAccountPool(accounts []*Account, perAccountConcurrency int) *AccountPool
 			p.resources[resourceID] = account.ID
 		}
 	}
+	// 构造时全局代理为空，configurePool 随后经 SetGlobalProxy 重挂
+	p.reattachEgressAllLocked()
 	return p
 }
 
@@ -1187,6 +1315,7 @@ func (p *AccountPool) Add(account *Account) (resultErr error) {
 	p.accountsVersion++
 	p.eligibilityVersion++
 	p.indexAccountAddedLocked(account)
+	p.attachEgressLocked(account)
 	p.invalidateStatusLocked()
 	for resourceID := range account.runtime.Resources {
 		p.resources[resourceID] = account.ID
@@ -1281,6 +1410,8 @@ func (p *AccountPool) removeExclusive(account *Account, leaseLock *flock.Flock, 
 	delete(p.byID, accountID)
 	delete(p.ultraAccounts, accountID)
 	p.ultraSnapshot = nil
+	// Remove 与批量删除（AccountReservation.Remove）都经这里：同一锁段摘下出口通道，出口账户数不漂移
+	p.detachEgressLocked(account)
 	// 移出号池的账户不再排空：调用方另建同 ID 账户时从未排空开始
 	account.draining = false
 	for index, candidate := range p.accounts {
@@ -1386,12 +1517,12 @@ func (r *AccountReservation) Wait(ctx context.Context) (*AccountLease, error) {
 				account.leaseLock = leaseLock
 				account.leasePath = leasePath
 				p.busyChangedLocked(account)
-				// 代际在锁内读取：目录同步与认证结果在锁内递增它们，解锁后再读会与之竞争
-				authGeneration, modelAccessGeneration := account.authGeneration, account.modelAccessGeneration
+				// 代际与出口通道在锁内读取：目录同步与认证结果在锁内递增代际，改代理时在锁内重挂通道，解锁后再读会与之竞争
+				authGeneration, modelAccessGeneration, egress := account.authGeneration, account.modelAccessGeneration, account.egress
 				p.mu.Unlock()
 				lease := &AccountLease{
 					pool: p, account: account, exclusive: true, authGeneration: authGeneration,
-					modelAccessGeneration: modelAccessGeneration, checkedAt: checkedAt,
+					modelAccessGeneration: modelAccessGeneration, checkedAt: checkedAt, egress: egress,
 				}
 				if err := p.refreshAccountRuntime(ctx, account); err != nil {
 					releaseErr := lease.Release()
@@ -1486,7 +1617,8 @@ func (r *AccountReservation) Remove(ctx context.Context, deleteDirectory func(*A
 	}
 }
 
-// AcquireFor 按模型方法账户或资源粘性获取账户槽位
+// AcquireFor 按模型方法账户或资源粘性获取账户槽位。ctx 带 WithEgressWaitLimit 时，只因出口令牌桶已满（见 egress_rate.go）
+// 而等待的时间累计超过上限后返回 CapacityBusyError{Reason: "出口限速"}；其余原因的等待不计入
 func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, error) {
 	if p == nil {
 		return nil, PoolNotReady(poolMissingReason, nil)
@@ -1498,13 +1630,17 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 		}
 	}
 	refreshedCandidates := false
+	egressLimit := egressWaitLimitFrom(ctx)
+	var egressWaited time.Duration
 	for {
 		p.mu.Lock()
 		if err := p.validateSelectionLocked(selection); err != nil {
 			p.mu.Unlock()
 			return nil, err
 		}
-		lease, earliest, waitable, err := p.tryAcquireLocked(selection, time.Now())
+		now := time.Now()
+		egress := egressAttempt{gate: p.egressGateLocked(selection, now)}
+		lease, earliest, waitable, err := p.tryAcquireAttemptLocked(selection, now, &egress)
 		if err != nil {
 			p.mu.Unlock()
 			return nil, err
@@ -1546,35 +1682,53 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 			p.mu.Unlock()
 			return nil, err
 		}
+		// 出口排队上限：只累计本轮复查因出口令牌桶已满而跳过候选之后的等待
+		egressWaiting := egressLimit > 0 && egress.blocked
+		if egressWaiting && egressWaited >= egressLimit {
+			p.mu.Unlock()
+			return nil, egressBusyError(selection, egressWaited, egressLimit, egress.next, time.Now())
+		}
 		changed := p.changed
 		p.mu.Unlock()
 
-		if earliest.IsZero() {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-changed:
+		delay := time.Duration(-1)
+		if !earliest.IsZero() {
+			if delay = time.Until(earliest); delay <= 0 {
+				continue
 			}
-			continue
 		}
-		delay := time.Until(earliest)
-		if delay <= 0 {
-			continue
+		if egressWaiting && (delay < 0 || delay > egressLimit-egressWaited) {
+			delay = egressLimit - egressWaited
 		}
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return nil, ctx.Err()
-		case <-changed:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
+		waitStart := time.Now()
+		if err := waitPoolChange(ctx, changed, delay); err != nil {
+			return nil, err
+		}
+		if egressWaiting {
+			egressWaited += time.Since(waitStart)
 		}
 	}
+}
+
+// waitPoolChange 等账户池变化、delay 到期（为负时不定时）或 ctx 结束，ctx 结束时返回它的错误
+func waitPoolChange(ctx context.Context, changed <-chan struct{}, delay time.Duration) error {
+	if delay < 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-changed:
+	case <-timer.C:
+	}
+	return nil
 }
 
 // TryAcquireFor 尝试获取账户槽位并立即返回当前结果
@@ -2132,6 +2286,8 @@ func (l *AccountLease) SaveConfig(value AccountConfig) error {
 	l.pool.mu.Lock()
 	wasDisabled := l.account.State == AccountDisabled
 	l.account.Config = value
+	// 代理变化时换出口通道；在途租约的预占记在各自租约的通道上，释放时退还原通道
+	l.pool.attachEgressLocked(l.account)
 	if !value.Enabled {
 		l.account.State = AccountDisabled
 		l.account.stateMessage = ""
@@ -2169,7 +2325,9 @@ func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	return state, nil
 }
 
-// ReplaceCookies 以固定指纹浏览器当前 Cookie 替换账户最新持久状态
+// ReplaceCookies 把固定指纹浏览器当前的 Cookie 合并进账户最新持久状态（见 mergeStateCookies：按 name、domain、path 新值覆盖旧值，
+// 浏览器没有导出的旧 Cookie 保留）。原先整份替换：浏览器导出缺某些 Cookie 时，磁盘上 Go 通道（GenerateAccessToken、
+// GetAiStudioBenefitTier、目录同步）要用的 Cookie 跟着丢了
 func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	if l == nil || l.account == nil || l.pool == nil {
 		return fmt.Errorf("账户租约未初始化")
@@ -2193,7 +2351,7 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	if err != nil {
 		return err
 	}
-	state.Cookies = append([]StateCookie(nil), cookies...)
+	state.Cookies = mergeStateCookies(state.Cookies, cookies, time.Now())
 	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
 		return err
 	}
@@ -2201,6 +2359,88 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	l.account.StorageState = state
 	l.pool.mu.Unlock()
 	return nil
+}
+
+// MergeBrowserCookies 在没有请求租约的路径（Worker 启动完成）把浏览器 Cookie 合并进账户持久状态，返回是否写入：
+// generation 为启动前读取的认证代际，期间保存过新登录或续签（代际变化）时不写，免得旧浏览器会话的 Cookie 盖住新登录。
+// 浏览器 Cookie 与磁盘相同时不写文件。合并规则同 ReplaceCookies
+func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, cookies []StateCookie) (bool, error) {
+	if p == nil {
+		return false, ErrAccountNotFound
+	}
+	if len(cookies) == 0 {
+		return false, nil
+	}
+	p.mu.Lock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	p.mu.Unlock()
+	if account == nil {
+		return false, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	p.mu.Lock()
+	current := p.byID[account.ID] == account && account.authGeneration == generation
+	p.mu.Unlock()
+	if !current {
+		return false, nil
+	}
+	state, err := LoadStorageState(account.StoragePath)
+	if err != nil {
+		return false, err
+	}
+	merged := mergeStateCookies(state.Cookies, cookies, time.Now())
+	if slices.EqualFunc(merged, state.Cookies, func(left, right StateCookie) bool { return left == right }) {
+		return false, nil
+	}
+	state.Cookies = merged
+	if err := WriteStorageState(account.StoragePath, state); err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	account.StorageState = state
+	p.mu.Unlock()
+	return true, nil
+}
+
+// stateCookieKey 为 Cookie 的身份：同名 Cookie 在不同 domain、path 下是不同的 Cookie
+type stateCookieKey struct{ name, domain, path string }
+
+// mergeStateCookies 按 (name, domain, path) 合并：浏览器的新值覆盖旧值、新增的追加；浏览器没有导出的旧 Cookie 保留，
+// 但已过期的（Expires>0 且早于 now）丢掉。结果先按旧顺序、再按新 Cookie 的顺序排列
+func mergeStateCookies(previous []StateCookie, fresh []StateCookie, now time.Time) []StateCookie {
+	latest := make(map[stateCookieKey]StateCookie, len(fresh))
+	order := make([]stateCookieKey, 0, len(fresh))
+	for _, cookie := range fresh {
+		key := stateCookieKey{cookie.Name, strings.ToLower(cookie.Domain), cookie.Path}
+		if _, seen := latest[key]; !seen {
+			order = append(order, key)
+		}
+		latest[key] = cookie
+	}
+	expiry := float64(now.Unix())
+	merged := make([]StateCookie, 0, len(previous)+len(fresh))
+	used := make(map[stateCookieKey]struct{}, len(fresh))
+	for _, cookie := range previous {
+		key := stateCookieKey{cookie.Name, strings.ToLower(cookie.Domain), cookie.Path}
+		if replacement, ok := latest[key]; ok {
+			if _, done := used[key]; !done {
+				merged = append(merged, replacement)
+				used[key] = struct{}{}
+			}
+			continue
+		}
+		if cookie.Expires > 0 && cookie.Expires < expiry {
+			continue
+		}
+		merged = append(merged, cookie)
+	}
+	for _, key := range order {
+		if _, done := used[key]; !done {
+			merged = append(merged, latest[key])
+		}
+	}
+	return merged
 }
 
 // BindResource 将资源固定到当前租约账户
@@ -2375,8 +2615,9 @@ func (l *AccountLease) releaseLocked() {
 		l.account.leaseLock = nil
 		l.account.leasePath = ""
 	}
-	// 没有发出的生成租约退还每分钟名额的预占（独占租约没有预占）
+	// 没有发出的生成租约退还每分钟名额与出口通道的预占（独占租约没有预占）
 	l.releaseRateLocked()
+	l.releaseEgressLocked(time.Now().UnixNano())
 	l.pool.notifyLocked()
 }
 
@@ -3236,6 +3477,7 @@ func (p *AccountPool) classifyCandidatesAtLocked(
 	if err := p.validateCandidateSelectionLocked(selection); err != nil {
 		return AccountCandidateGroups{}, err
 	}
+	egress := p.egressGateLocked(selection, now)
 	if strings.TrimSpace(selection.AccountID) != "" || selection.ResourceID != "" {
 		indices, err := p.selectionIndicesLocked(selection)
 		if err != nil {
@@ -3245,7 +3487,7 @@ func (p *AccountPool) classifyCandidatesAtLocked(
 		warm := warmAccountSet(warmAccountIDs)
 		channels := p.selectionChannelsLocked(selection)
 		for _, index := range indices {
-			p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now)
+			p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now, egress)
 		}
 		return groups, nil
 	}
@@ -3258,9 +3500,9 @@ func (p *AccountPool) classifyCandidatesAtLocked(
 				allowed[accountID] = struct{}{}
 			}
 		}
-		return p.classifyAllowedLocked(set, allowed, warmAccountIDs, now, exclusion), nil
+		return p.classifyAllowedLocked(set, allowed, warmAccountIDs, now, exclusion, egress), nil
 	}
-	return p.classifyIndexedLocked(set, warmAccountIDs, now, exclusion), nil
+	return p.classifyIndexedLocked(set, warmAccountIDs, now, exclusion, egress), nil
 }
 
 // validateCandidateSelectionLocked 检查号池内存在请求的模型与方法；调用方持有 p.mu，ModelID 已去掉前缀
@@ -3308,8 +3550,9 @@ func (p *AccountPool) classifyCandidatesBruteLocked(
 	warm := warmAccountSet(warmAccountIDs)
 	groups := AccountCandidateGroups{}
 	channels := p.selectionChannelsLocked(selection)
+	egress := p.egressGateLocked(selection, now)
 	for _, index := range indices {
-		p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now)
+		p.classifyAccountBruteLocked(&groups, p.accounts[index], selection, channels, warm, now, egress)
 	}
 	return groups, nil
 }
@@ -3322,6 +3565,7 @@ func (p *AccountPool) classifyAccountBruteLocked(
 	channels []Channel,
 	warm map[string]struct{},
 	now time.Time,
+	egress egressGate,
 ) {
 	if account == nil || !account.Config.Enabled || account.State != AccountReady {
 		return
@@ -3344,7 +3588,7 @@ func (p *AccountPool) classifyAccountBruteLocked(
 		}
 		return
 	}
-	classifyCandidate(groups, account, warm, p.perAccountConcurrency, sharedSelection(selection), p.rateGateLocked(selection, now))
+	classifyCandidate(groups, account, warm, p.perAccountConcurrency, sharedSelection(selection), p.rateGateLocked(selection, now), egress)
 }
 
 // sharedSelection 判断选择不固定账户：既没有指定账户，也没有绑定文件资源。排空标记只对这类选择生效
@@ -3353,8 +3597,16 @@ func sharedSelection(selection AccountSelection) bool {
 }
 
 func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
+	egress := egressAttempt{gate: p.egressGateLocked(selection, now)}
+	return p.tryAcquireAttemptLocked(selection, now, &egress)
+}
+
+// tryAcquireAttemptLocked 为 tryAcquireLocked 的实现：egress 带本次选号的出口门控，返回时记下是否有候选只因出口令牌桶已满被跳过
+func (p *AccountPool) tryAcquireAttemptLocked(
+	selection AccountSelection, now time.Time, egress *egressAttempt,
+) (*AccountLease, time.Time, bool, error) {
 	if strings.TrimSpace(selection.AccountID) == "" && selection.ResourceID == "" && selection.AllowedAccountIDs == nil {
-		return p.tryAcquireIndexedLocked(selection, now)
+		return p.tryAcquireIndexedLocked(selection, now, egress)
 	}
 	indices, err := p.selectionIndicesLocked(selection)
 	if err != nil {
@@ -3371,7 +3623,7 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 			continue
 		}
 		waitable = true
-		lease, err := p.leaseCandidateLocked(account, candidate.channel, selection, now, &earliest)
+		lease, err := p.leaseCandidateLocked(account, candidate.channel, selection, now, &earliest, egress)
 		if lease != nil || err != nil {
 			return lease, time.Time{}, true, err
 		}
@@ -3379,12 +3631,14 @@ func (p *AccountPool) tryAcquireLocked(selection AccountSelection, now time.Time
 	return nil, earliest, waitable, nil
 }
 
-// leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却、每分钟请求已满或文件租约被其他进程占用时
-// 返回 nil 并把冷却恢复、窗口释放或轮询时间并入 earliest；排空中的账户不给不固定账户的选择新租约（排空结束时唤醒等待方）。
-// 生成选择取得的租约预占一个每分钟名额（见 rate_limit.go）。调用方持有 p.mu
+// leaseCandidateLocked 尝试在一个已确认支持选择的账户通道上取得租约：账户忙碌、通道冷却、每分钟请求已满、所在出口通道的令牌桶已满
+// 或文件租约被其他进程占用时返回 nil 并把冷却恢复、窗口释放、下一个令牌或轮询时间并入 earliest；排空中的账户不给不固定账户的选择新租约
+// （排空结束时唤醒等待方）。生成选择取得的租约预占一个每分钟名额（见 rate_limit.go）与所在出口通道的一个令牌（见 egress_rate.go）。
+// 调用方持有 p.mu
 func (p *AccountPool) leaseCandidateLocked(
-	account *Account, channel Channel, selection AccountSelection, now time.Time, earliest *time.Time,
+	account *Account, channel Channel, selection AccountSelection, now time.Time, earliest *time.Time, egress *egressAttempt,
 ) (*AccountLease, error) {
+	p.leaseAttempts++
 	if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
 		return nil, nil
 	}
@@ -3407,6 +3661,15 @@ func (p *AccountPool) leaseCandidateLocked(
 			if at := time.Unix(0, until).UTC(); earliest.IsZero() || at.Before(*earliest) {
 				*earliest = at
 			}
+		}
+		return nil, nil
+	}
+	// 所在出口通道的令牌桶已满：按忙碌处理，下一个令牌的时刻并入 earliest（窗口释放计时器另发调度信号）
+	if !egress.gate.admits(account.egress) {
+		_, next := p.egressAdmitLocked(account.egress, egress.gate.primary, egress.gate.now)
+		egress.refuse(next)
+		if at := time.Unix(0, next).UTC(); earliest.IsZero() || at.Before(*earliest) {
+			*earliest = at
 		}
 		return nil, nil
 	}
@@ -3435,11 +3698,12 @@ func (p *AccountPool) leaseCandidateLocked(
 	lease := &AccountLease{
 		pool: p, account: account, authGeneration: account.authGeneration,
 		modelAccessGeneration: account.modelAccessGeneration, refreshRuntime: refreshRuntime, checkedAt: now.UTC(),
-		channel: channel,
+		channel: channel, egress: account.egress,
 	}
-	// 上限为 0 或文件绑定时不拦但照常预占，重新打开限速时窗口仍然准确
+	// 上限为 0 或文件绑定时不拦但照常预占，重新打开限速时窗口仍然准确；出口通道同样不论是否限速都预占（指定账户的选号不拦也预占）
 	if gated {
 		p.reserveRateLocked(account, lease, now)
+		p.reserveEgressLocked(lease, now, selection.EgressPriority)
 	}
 	return lease, nil
 }
@@ -3447,8 +3711,10 @@ func (p *AccountPool) leaseCandidateLocked(
 // tryAcquireIndexedLocked 为不限账户的选择在候选集中取租约：只遍历未冷却的候选，账户与通道顺序和
 // channelCandidatesLocked 相同（按账户 ID 轮询，上次选中账户在上次通道之后的通道排在最前）。
 // 全部通道都在冷却的候选不再逐个检查，最早恢复时间取自冷却堆（含忙碌账户，等待方至多提前醒来复查一次）。
-// 排除列表中的账户跳过，不计入可等待与最早恢复时间
-func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now time.Time) (*AccountLease, time.Time, bool, error) {
+// 排除列表中的账户跳过，不计入可等待与最早恢复时间。出口门控打开且每个有账户的出口通道都不准入时不逐个尝试（见 egressAllBlockedLocked）
+func (p *AccountPool) tryAcquireIndexedLocked(
+	selection AccountSelection, now time.Time, egress *egressAttempt,
+) (*AccountLease, time.Time, bool, error) {
 	set := p.candidateSetLocked(selection, now)
 	set.expireLocked(p, now.UnixNano())
 	exclusion := p.exclusionLocked(selection)
@@ -3456,6 +3722,13 @@ func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now ti
 	var earliest time.Time
 	if until, cooling := set.earliestCoolingLocked(exclusion); cooling {
 		earliest = time.Unix(0, until).UTC()
+	}
+	if next, blocked := p.egressAllBlockedLocked(egress.gate); blocked && len(set.available) > 0 {
+		egress.refuse(next)
+		if at := time.Unix(0, next).UTC(); earliest.IsZero() || at.Before(earliest) {
+			earliest = at
+		}
+		return nil, earliest, waitable, nil
 	}
 	channels := p.selectionChannelsLocked(selection)
 	preferPlayground := selection.PreferPlayground && len(channels) > 1 && slices.Contains(channels, ChannelPlayground)
@@ -3490,7 +3763,7 @@ func (p *AccountPool) tryAcquireIndexedLocked(selection AccountSelection, now ti
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, channel, selection) {
 			return nil, nil
 		}
-		return p.leaseCandidateLocked(account, channel, selection, now, &earliest)
+		return p.leaseCandidateLocked(account, channel, selection, now, &earliest, egress)
 	}
 	if lastPosition >= 0 {
 		for _, channel := range channels {

@@ -8,7 +8,15 @@ export interface BulkFailure {
   message: string
 }
 
-// BulkState 描述一次批量账户操作的进度
+// BulkTaskResult 为单个账户操作的结论：invalid 为操作做完了、但结论是否定的（批量验证的“登录失效”），message 为原因；
+// 不返回（undefined）表示成功。操作本身出错仍以抛出错误表示（计为出错）
+export interface BulkTaskResult {
+  invalid: true
+  message: string
+}
+
+// BulkState 描述一次批量账户操作的进度：succeeded 为成功（验证时为“有效”），invalid 为结论否定（验证时为“登录失效”），
+// failures 为操作出错
 export interface BulkState {
   action: BulkAction | ''
   running: boolean
@@ -16,6 +24,7 @@ export interface BulkState {
   total: number
   done: number
   succeeded: number
+  invalid: BulkFailure[]
   failures: BulkFailure[]
   active: string[]
 }
@@ -29,6 +38,7 @@ export function emptyBulkState(): BulkState {
     total: 0,
     done: 0,
     succeeded: 0,
+    invalid: [],
     failures: [],
     active: [],
   }
@@ -40,7 +50,7 @@ export async function runBulk(
   action: BulkAction,
   accounts: readonly Account[],
   concurrency: number,
-  task: (account: Account) => Promise<void>,
+  task: (account: Account) => Promise<BulkTaskResult | void>,
 ): Promise<void> {
   const queue = [...accounts]
   Object.assign(state, emptyBulkState(), { action, running: true, total: queue.length })
@@ -53,8 +63,12 @@ export async function runBulk(
       if (account === undefined) return
       state.active = [...state.active, account.label]
       try {
-        await task(account)
-        state.succeeded += 1
+        const result = await task(account)
+        if (result?.invalid) {
+          state.invalid = [...state.invalid, { id: account.id, label: account.label, message: result.message }]
+        } else {
+          state.succeeded += 1
+        }
       } catch (error) {
         state.failures = [
           ...state.failures,

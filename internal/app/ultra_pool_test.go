@@ -95,8 +95,17 @@ func sortedUnique(values []string) []string {
 	return slices.Compact(result)
 }
 
+// quotaExhaustedAfterUpstream429 判断请求是否在号池内账号都返回额度 429 后按普通号池的换号规则结束：额度不足（429，带 Retry-After，
+// 见 quota_switch.go），最后一次上游错误为额度 429
+func quotaExhaustedAfterUpstream429(err error) bool {
+	var quota *aistudio.PrimaryQuotaError
+	var rpcError *aistudio.RPCError
+	return errors.As(err, &quota) && quota.Kind == aistudio.QuotaFailSwitchLimit &&
+		errors.As(quota.Cause, &rpcError) && rpcError.StatusCode == http.StatusTooManyRequests
+}
+
 // TestGenerateStaysInPool 生成请求的换号只在请求号池内进行：/ultra 只试 Ultra 账号，独占模式的普通路径只试普通账号，
-// 非独占模式（不限号池）两边都试；号池内账号都返回限额后按限额（429）结束
+// 非独占模式（不限号池）两边都试；号池内账号都返回限额后按额度不足（429）结束
 func TestGenerateStaysInPool(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -114,9 +123,8 @@ func TestGenerateStaysInPool(t *testing.T) {
 			service, _ := ultraTestService(t, upstream, []string{ultraTestUltraA, ultraTestUltraB},
 				ultraTestNormalA, ultraTestNormalB, ultraTestUltraA, ultraTestUltraB)
 			err := runScopedGenerate(t, service, test.scope, test.scoped)
-			var rpcError *aistudio.RPCError
-			if !errors.As(err, &rpcError) || rpcError.StatusCode != http.StatusTooManyRequests {
-				t.Fatalf("err = %v，期望号池内账号都返回每日限额", err)
+			if !quotaExhaustedAfterUpstream429(err) {
+				t.Fatalf("err = %v，期望号池内账号都返回每日限额后按普通号池的换号规则返回额度不足", err)
 			}
 			if got := sortedUnique(upstream.called()); !slices.Equal(got, test.want) {
 				t.Fatalf("尝试的账号 = %v，期望 %v", got, test.want)

@@ -270,11 +270,16 @@ export const api = {
     }),
   loginAccount: (id: string) =>
     requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' }),
-  verifyAccount: (id: string) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' }),
+  // verifyAccount 返回带验证结论的账户（authenticated 与 verify_reason）：HTTP 200 只表示验证做完了，不表示登录有效。
+  // 服务端返回 {"account": …}，取出里面的账户（原先把外壳当成账户，authenticated 永远读不到）
+  verifyAccount: async (id: string) =>
+    (await requestJSON<AccountResponse>(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' })).account,
   startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
   stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
   restartService: () => requestJSON<ServiceStatus>('/api/control/restart', { method: 'POST' }),
+  // egressAction 撤销（withdraw，30 分钟内不再判定）或恢复（resume）出口限流判定，返回最新状态；只改服务端内存，不落盘
+  egressAction: (id: string, action: 'withdraw' | 'resume') =>
+    requestJSON<ServiceStatus>(`/api/egress/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
   onboarding: () => requestJSON<OnboardingStatus>('/api/onboarding'),
   queueDisabledOnboarding: () =>
     requestJSON<OnboardingStatus>('/api/onboarding/queue-disabled', { method: 'POST' }),

@@ -29,6 +29,10 @@ export interface Account {
   // pool 为账户当前所属的号池，表示成员关系而不是权益：权益为 Ultra 的账户属于 ultra；
   // 开启 ULTRA_INCLUDE_PRO 时权益为 Pro 的账户也属于 ultra；其余属于 normal
   pool: AccountPool
+  // authenticated 与 verify_reason 只在验证接口的返回里有：验证结论（浏览器已登录且接口复核通过才为 true）与原因。
+  // 停用账户的状态始终是 disabled，验证结果按 authenticated 判断，不能看状态或 HTTP 200
+  authenticated?: boolean
+  verify_reason?: string
 }
 
 // AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
@@ -66,6 +70,8 @@ export interface AccountCounters {
   busy: number
   cooldown: number
   auth_required: number
+  // auth_required_10m 为最近 10 分钟新被标为需要登录的账户数（只在全部账户的计数里有），持续增长说明运行期 401 在累积
+  auth_required_10m?: number
 }
 
 // OnboardingPolicy 为新账户自动处理设置
@@ -151,7 +157,8 @@ export interface PrewarmState {
 
 // WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户；
 // dead 为 warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位；
-// draining 为其中排空中的 Worker（不再接新请求，正在服务的请求结束后关闭，替补已先启动），retiring 为待淘汰登记数
+// draining 为其中排空中的 Worker（不再接新请求，正在服务的请求结束后关闭，替补已先启动），retiring 为待淘汰登记数；
+// unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、没有模型目录），等待释放；旧版服务端不返回
 export interface WorkerCounters {
   warm: number
   starting: number
@@ -161,6 +168,7 @@ export interface WorkerCounters {
   dead?: number
   draining?: number
   retiring?: number
+  unschedulable?: number
   prewarm?: PrewarmState
   warm_ids?: string[]
   starting_ids?: string[]
@@ -168,7 +176,7 @@ export interface WorkerCounters {
 
 // UltraWorkerCounters 为 Ultra 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
 // dead 为其中账号长时间冷却、等待淘汰的死槽位，draining 为其中排空中的，retiring 为待淘汰登记数，
-// warm_limit 与 max 为 Ultra 常驻数与峰值数设置
+// unschedulable 为其中账号已不能服务任何模型、等待释放的，warm_limit 与 max 为 Ultra 常驻数与峰值数设置
 export interface UltraWorkerCounters {
   warm: number
   starting: number
@@ -176,6 +184,7 @@ export interface UltraWorkerCounters {
   dead?: number
   draining?: number
   retiring?: number
+  unschedulable?: number
   target: number
   warm_limit: number
   max: number
@@ -196,6 +205,86 @@ export interface PrimarySupply {
   standby_capped?: boolean
 }
 
+// AuthRecheckStatus 为登录复核：上游 401 先记疑似登录失效、用磁盘 Cookie 复核，仍是 401 才标需要登录；
+// 按接口证据标记的需要登录账户每 15 分钟一轮低速复核，复核通过即恢复。*_1h 为最近一小时的计数
+export interface AuthRecheckStatus {
+  suspects?: number
+  queued?: number
+  running?: number
+  cleared_1h?: number
+  confirmed_1h?: number
+  recovered_1h?: number
+  still_invalid_1h?: number
+  skipped_1h?: number
+  next_round?: string
+  pause_reason?: string
+}
+
+// CatalogSyncStatus 为模型目录写盘缓存与后台同步的状态（服务运行时才有；旧版服务端不返回）：
+// cached 为有目录的账户（含来自磁盘的），from_disk 为本代运行时启动时从磁盘恢复的，missing 为启用、就绪却没有目录的，
+// expired 为超过有效期等待刷新的，auth_suspects 为疑似登录失效、等待探测的；queued、running 为排队与进行中的同步；
+// paused_until 与 pause_reason（上游 429 | 出口限流）为暂停；*_1h 为最近一小时的计数，skipped_busy_1h 为账户有进行中的请求、推后刷新的次数
+export interface CatalogSyncStatus {
+  cached?: number
+  from_disk?: number
+  missing?: number
+  expired?: number
+  auth_suspects?: number
+  queued?: number
+  running?: number
+  paused_until?: string
+  pause_reason?: string
+  synced_1h?: number
+  failed_1h?: number
+  rate_limited_1h?: number
+  skipped_busy_1h?: number
+}
+
+// EgressLane 为出口内一个分区通道（普通、Ultra）的令牌桶与冷启动配额：limit_rpm 为每分钟生成请求上限（0 为不限），
+// sent_1m 为最近 60 秒发往上游的生成请求，cold_starting 为冷启动闸门放行、正在启动的，refill_deferred_1m 为最近一分钟因补位并发已满被推迟的补位
+export interface EgressLane {
+  lane: 'normal' | 'ultra'
+  accounts?: number
+  limit_rpm?: number
+  burst?: number
+  sent_1m?: number
+  primary_sent_1m?: number
+  other_sent_1m?: number
+  pending?: number
+  cold_starting?: number
+  cold_started_1m?: number
+  refill_deferred_1m?: number
+}
+
+// EgressStatus 为一个出口（账号代理规范化后的值，直连为“直连”）的限流判定与限速：mode 为 normal（没有判定）、limited（判定为出口限流）
+// 或 rejected（判定已撤销，期间不再判定）；limiter 为 off、active（限速生效）或 suspended（限速无效已停止）。
+// ratio_2m 为发往上游的请求被裸 429 拒绝的比例（0–1），local_429_1m 为本地返回的出口限速 429；id 用于撤销与恢复判定。
+// 字段均可选，兼容旧版服务端
+export interface EgressStatus {
+  id: string
+  label: string
+  mode: 'normal' | 'limited' | 'rejected'
+  limiter?: 'off' | 'active' | 'suspended'
+  since?: string
+  accounts?: number
+  lanes?: EgressLane[]
+  success_1m?: number
+  bare_429_1m?: number
+  other_1m?: number
+  ratio_2m?: number
+  ratio_entry?: number
+  fresh_rejects_2m?: number
+  queued?: number
+  local_429_1m?: number
+  retried?: number
+  recovered?: number
+  demoted?: number
+  relaxed?: number
+  retry_at?: string
+  rejected_until?: string
+  rejected_by?: string
+}
+
 export interface ServiceStatus {
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
@@ -211,6 +300,14 @@ export interface ServiceStatus {
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
   // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
+  // catalog_sync 为模型目录缓存与后台同步的状态，服务未运行时没有
+  catalog_sync?: CatalogSyncStatus
+  // egress 为各出口的限流判定与限速（只有直连一个出口且没有判定时也有一条），服务未运行时没有
+  egress?: EgressStatus[]
+  // auth_recheck 为登录复核的状态，服务未运行时没有
+  auth_recheck?: AuthRecheckStatus
+  // bad_accounts 为标为坏号（连续裸限流、期间没有成功）、移出预热与替补候选的账号数
+  bad_accounts?: number
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'

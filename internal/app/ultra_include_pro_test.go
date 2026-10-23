@@ -637,9 +637,8 @@ func TestGenerateExcludesProWhenIncluded(t *testing.T) {
 			}
 			pool.SetUltraIncludePro(test.includePro)
 			err := runScopedGenerate(t, service, test.scope, true)
-			var rpcError *aistudio.RPCError
-			if !errors.As(err, &rpcError) || rpcError.StatusCode != http.StatusTooManyRequests {
-				t.Fatalf("err = %v，期望号池内账号都返回每日限额", err)
+			if !quotaExhaustedAfterUpstream429(err) {
+				t.Fatalf("err = %v，期望号池内账号都返回每日限额后按普通号池的换号规则返回额度不足", err)
 			}
 			if got := sortedUnique(upstream.called()); !slices.Equal(got, test.want) {
 				t.Fatalf("尝试的账号 = %v，期望 %v", got, test.want)

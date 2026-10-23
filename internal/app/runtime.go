@@ -7,10 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"math/rand/v2"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -70,6 +68,9 @@ func newRuntime(
 		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, cfg.TemporaryChat,
 	)
 	workers.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
+	// 按需替换与扩容的启动宽限、每分区每分钟的替换上限（N6，见 replace_rate.go）
+	workers.replaceGrace.Store(int64(rotationWarmupGrace))
+	workers.replacements.limit.Store(replacementsPerMinute)
 	protected, err := aistudio.NewWorkerProtectedTransport(aistudio.WorkerProtectedTransportOptions{
 		Transport: transport, Workers: workers, SetupTimeout: cfg.InitTimeout,
 	})
@@ -103,6 +104,19 @@ func newRuntime(
 		return nil, nil, nil, errors.Join(err, workers.Close())
 	}
 	service := newTrackedService(lifecycle, pooled, pool, requests, workers, cfg.RequestTimeout)
+	// 出口限流判定（见 egress_guard.go）与冷启动闸门：闸门按账户取出口键与分区通道，补位并发按 WARM_STARTUP_CONCURRENCY 计算（热更新即生效）
+	service.egress = newEgressGuard(pool, requests)
+	coldStartGate := service.egressColdStartGate()
+	workers.coldStartGate.Store(&coldStartGate)
+	// 坏号记忆（见 bad_accounts.go）：连续裸限流的账号移出冷启动候选，出口判定的“冷号首发被拒”不计它们；记录跨重启保留
+	badAccounts := openBadAccountMemory(badAccountPath(), requests)
+	workers.badAccounts.Store(badAccounts)
+	service.egress.badAccount = badAccounts.bad
+	// 登录复核（见 auth_recheck.go）：租约路径上的上游 401 先记疑似登录失效、写短冷却，用磁盘 Cookie 复核仍是 401 才标需要登录
+	service.authRecheck = newAuthRecheck(service)
+	if service.authRecheck != nil {
+		pool.SetAuthFailureGate(service.authRecheck.gate)
+	}
 	service.firstEventTimeout.Store(int64(cfg.FirstEventTimeout))
 	// 账户因登录失效退出调度后用合并推送更新管理页，不为单个账户立即推送全部账户状态
 	refresher.publish = service.publishModelAccess
@@ -118,6 +132,10 @@ func newRuntime(
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	service.setPrimaryModelSettings(cfg.PrimaryModels, cfg.PrimaryQueueWait, cfg.UltraPrimaryModels, cfg.UltraPrimaryQueueWait)
+	// 模型目录写盘缓存：一次加锁恢复账户池与 Client 的目录与权益（含 Pro/Ultra 的权益头），启动时不发目录请求即可预热，
+	// 后台只低速刷新缺失与过期的账户（见 catalog_cache.go、catalog_sync.go）。要在账户目录扫描与新账户处理开始之前
+	catalogCache := openCatalogCache(catalogCacheDir, requests)
+	service.catalogSync.attach(catalogCache, catalogCache.restore(pool, client, pool.BuildEnabled()))
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	admin.onboard = newAccountOnboarder(admin, store.PrimaryDirectory())
@@ -137,6 +155,14 @@ func newRuntime(
 		headers.Close()
 		// 403 无权限账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
 		service.permissionDenied.flush()
+		// 模型目录缓存平时最多每 30 秒写一次，停止服务时调度器退出前已写过；这里兜底（没有变化时是空操作）
+		if flushErr := catalogCache.close(); flushErr != nil {
+			requests.log("service", "WARN", "模型目录缓存写入失败 | 错误="+flushErr.Error())
+		}
+		// 坏号记忆平时最多每 30 秒（badAccountSaveInterval）写一次，停止服务时已写过；关闭时再兜底写出
+		if flushErr := badAccounts.close(); flushErr != nil {
+			requests.log("service", "WARN", "坏号记忆写入失败 | 错误="+flushErr.Error())
+		}
 		return err
 	}
 	return service, admin, closeRuntime, nil
@@ -145,6 +171,8 @@ func newRuntime(
 // configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、ULTRA_INCLUDE_PRO 与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
 // 必须在创建 Worker 管理器、同步目录与预热之前调用，第一次 Worker 分区与预热目标就按正确的号池成员计算
 func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
+	// 出口键按账户固定代理或全局代理计算（见 aistudio.EgressKey）：先设全局代理，账户按出口分组；PROXY 变化本来就要重建运行时
+	pool.SetGlobalProxy(cfg.Proxy)
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
 	pool.SetUltraIncludePro(cfg.UltraIncludePro)
@@ -154,6 +182,12 @@ func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 
 // accountWorkerManager 管理每账户的长驻 WAA worker
 type accountWorkerManager struct {
+	// replacements 为各分区最近一分钟的按需替换（每分钟上限，见 replace_rate.go）；replaceGrace 为按需替换与扩容不换刚就绪的 Worker 的宽限
+	// （见 pickReplaceVictim）。两者都只在 newRuntime 打开，测试直接构造的管理器不限
+	replacements replacementRate
+	replaceGrace atomic.Int64
+	// badAccounts 为坏号记忆（连续裸限流的账号移出冷启动候选，见 bad_accounts.go）；只在 newRuntime 挂上，测试构造的管理器为空（不调整候选）
+	badAccounts atomic.Pointer[badAccountMemory]
 	// bootstrapCache 为预热概况的短时缓存（见 bootstrapSummary）；bootstrapVersion 为计算前读到的号池规则版本
 	bootstrapMu      sync.Mutex
 	bootstrapCache   aistudio.BootstrapSummary
@@ -235,6 +269,13 @@ type accountWorkerManager struct {
 	refresher *authRuntimeRefresher
 	// launch 启动单个账户的 WAA Worker，为空时使用 newWAAWorker（测试替换为不启动浏览器的实现）
 	launch func(context.Context, string, camoufoxnative.Options) (*aistudio.NativeWorker, error)
+	// coldStartGate 为冷启动闸门（出口限流期间按路径放行，见 egress_guard.go）；nil 时不限
+	coldStartGate atomic.Pointer[coldStartGateFunc]
+	// authSuspects 为疑似登录失效的账户（目录缓存记过需要登录、认证文件没变），预热时排在最后（见 catalog_sync.go）；nil 时为空
+	authSuspects atomic.Pointer[map[string]struct{}]
+	// authRequired 为账户确认需要登录后写“账号需要登录”日志的生成服务回调（见 worker_unschedulable.go）；newTrackedService 挂上，
+	// nil 时只登记释放 Worker、不写日志
+	authRequired atomic.Pointer[authRequiredHook]
 }
 
 type accountWorker struct {
@@ -271,6 +312,8 @@ type accountWorkerPreparer struct {
 	ownsLease      bool
 	startedAt      time.Time
 	pending        bool
+	// source 为冷启动的来源（预热、替补、扩容、按需、补覆盖、重开，见 worker_start_source.go），写进“WAA Worker 就绪”
+	source string
 }
 
 type accountWorkerUpdate struct {
@@ -413,7 +456,7 @@ func newAccountWorkerManager(
 // 它由正在排队的请求发起，冷启动名额按按需启动计（不加 withBackgroundStartup）
 // 返回的通道在这次扩容结束（就绪、失败或被取消）时关闭，发起扩容的选号据此只等自己这一个，不再连着扩容别的账户
 func (manager *accountWorkerManager) expandInBackground(accountID string, modelID string) <-chan struct{} {
-	ctx := manager.backgroundContext()
+	ctx := withWorkerStartSource(manager.backgroundContext(), workerStartExpand)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -597,6 +640,14 @@ func (manager *accountWorkerManager) notifyScheduling() {
 	manager.signal = make(chan struct{})
 	manager.signalMu.Unlock()
 	manager.dispatch.wakeHeads()
+}
+
+// notifySchedulingIfAny 与 notifyScheduling 相同，manager 为 nil 时不做任何事（登录复核恢复账户后唤醒排队的请求）
+func (manager *accountWorkerManager) notifySchedulingIfAny() {
+	if manager == nil || manager.dispatch == nil {
+		return
+	}
+	manager.notifyScheduling()
 }
 
 // finishOpening 结束账户 Worker 启动占位并唤醒等待容量的请求
@@ -1061,9 +1112,19 @@ func (manager *accountWorkerManager) WorkerFailed(accountID string) bool {
 	return account.worker != nil && account.worker.State().Phase == aistudio.WorkerFailed
 }
 
-// Worker 在活动上限内返回账户的通用 WAA preparer
+// Worker 在活动上限内返回账户的通用 WAA preparer。冷启动来源由调用方标记：生成请求的每次尝试标为重开（generateWithRetry：
+// 租约来自 acquireLease，取得租约前已确认或启动了 Worker，发送时 Worker 不在了才要重新启动），冷启动闸门不拦它。
+// 没有标记的是转写、Live、Veo 这些数据路径：它们经账户池直接取租约，候选里有没有 Worker 的备用账号，这里按“按需”经冷启动闸门，
+// 原先一律记为重开，出口限流期间在受限出口上绕过了补位、补覆盖的配额。闸门暂停时按号池繁忙返回（429，带 Retry-After），不冷启动
 func (manager *accountWorkerManager) Worker(ctx context.Context, accountID string, modelID string) (aistudio.ProtectedPreparer, error) {
-	return manager.ensureWorker(ctx, accountID, modelID, true)
+	if workerStartSourceFrom(ctx) == "" {
+		ctx = withWorkerStartSource(ctx, workerStartOnDemand)
+	}
+	preparer, err := manager.ensureWorker(ctx, accountID, modelID, true)
+	if err != nil && errors.Is(err, errEgressColdStartPaused) {
+		return nil, newEgressColdStartBusy(modelID, partitionOf(accountID, manager.pool.UltraAccountIDs()), err)
+	}
+	return preparer, err
 }
 
 func (manager *accountWorkerManager) readyWorker(accountID string, bootstrapModel string) (aistudio.ProtectedPreparer, bool, error) {
@@ -1230,6 +1291,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 	return &accountWorkerPreparer{
 		account: account, worker: worker, bootstrapModel: bootstrapModel, manager: manager,
 		runtimeLease: runtimeLease, ownsLease: ownsLease, startedAt: startedAt, pending: true,
+		source: workerStartSourceFrom(ctx),
 	}, nil
 }
 
@@ -1271,9 +1333,14 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
 	preparer.manager.notifyScheduling()
+	// 末尾写启动来源，诊断按来源统计冷启动（预热、替补、扩容、按需、补覆盖、重开）
+	source := ""
+	if preparer.source != "" {
+		source = " | 来源=" + preparer.source
+	}
 	preparer.manager.requests.log(label, "INFO", fmt.Sprintf(
-		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s",
-		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond),
+		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s%s",
+		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond), source,
 	))
 	preparer.pending = false
 	preparer.account.startupMu.Unlock()
@@ -1357,8 +1424,9 @@ func (manager *accountWorkerManager) victimReserved(accountID string) bool {
 	return reserved
 }
 
-// idleWarmVictimFor 在分区内选择空闲热 Worker：账号长时间冷却的死槽位优先，其次冷却中的账户，再次最久未用；
-// coolingOnly 时只返回冷却中的账户。冷却中只算剩余不少于 aistudio.ShortCooldownMax 的冷却：分钟限额、限流这类短冷却一分钟内就恢复，
+// idleWarmVictimFor 在分区内选择空闲热 Worker：账号已不可调度（需要登录、已停用、没有模型目录）的优先，其次账号长时间冷却的死槽位、
+// 冷却中的账户，再次最久未用；coolingOnly 时只返回冷却中或不可调度的账户（分区有 Worker 正在启动时按需替换也能换掉僵尸 Worker）。
+// 冷却中只算剩余不少于 aistudio.ShortCooldownMax 的冷却：分钟限额、限流这类短冷却一分钟内就恢复，
 // 与健康的空闲 Worker 同档按最久未用排序，不为它优先关掉。只从同一分区选：Ultra 账户的启动不会淘汰普通 Worker，反之亦然。
 // 候选的活动与冷却状态由账户池一次加锁给出（见 pickIdleVictim）
 func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID string, coolingOnly bool, partition aistudio.PoolScope) string {
@@ -1467,11 +1535,26 @@ func (manager *accountWorkerManager) ensureWorker(
 		_, replacing := occupied[accountID]
 		// 排空中的 Worker 按已让出槽位计（最多 drainLimit 个）：替补可以在旧 Worker 排空前启动，分区浏览器总数不超过 峰值 + drainLimit
 		if replacing || occupancy.effectiveSlots() < manager.maxActiveFor(partition) {
+			// 冷启动闸门（出口限流期间按路径放行，见 egress_guard.go）：低于常驻数的补位只受并发约束，补覆盖另受每分钟配额，
+			// 已不低于常驻数的扩容暂停；账户自己重开不经闸门
+			path := coldStartExpand
+			switch {
+			case workerStartSourceFrom(ctx) == workerStartCoverage:
+				path = coldStartCoverage
+			case occupancy.effectiveSlots() < manager.warmTargetFor(partition):
+				path = coldStartRefill
+			}
+			releaseGate, gateErr := manager.admitColdStart(ctx, accountID, modelID, path, replacing)
+			if gateErr != nil {
+				manager.rebalanceMu.Unlock()
+				return nil, gateErr
+			}
 			opening := make(chan struct{})
 			manager.openings[accountID] = opening
 			manager.openingSet.Store(accountID, struct{}{})
 			manager.rebalanceMu.Unlock()
 			preparer, err := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
+			releaseGate(err == nil)
 			manager.rebalanceMu.Lock()
 			if err == nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -1483,10 +1566,12 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.finishOpening(accountID, opening)
 			warmCount := len(manager.warmAccountIDsIn(partition))
 			manager.rebalanceMu.Unlock()
-			// 替补由 startReplacement 自己记录，不算按需扩容
-			if err == nil && warmCount > manager.warmTargetFor(partition) && !replacementStartup(ctx) {
+			// 替补由 startReplacement 自己记录，预热由预热循环记录，不算按需扩容；其余无条件写，标明是否超出常驻
+			// （原先只在超出常驻时写，诊断数不出低于常驻数的现场启动）
+			if err == nil && !replacementStartup(ctx) && workerStartSourceFrom(ctx) != workerStartPrewarm {
 				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"%s 按需扩容 | Worker=%d/%d", workerLogName(partition), warmCount, manager.maxActiveFor(partition),
+					"%s 按需扩容 | Worker=%d/%d | 超出常驻=%s",
+					workerLogName(partition), warmCount, manager.maxActiveFor(partition), aboveResidentText(warmCount > manager.warmTargetFor(partition)),
 				))
 			}
 			return preparer, err
@@ -1497,8 +1582,13 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return nil, errAccountWorkerCapacity
 		}
-		// 同分区有 Worker 正在启动时只淘汰冷却中的空闲 Worker（剩余不到 ShortCooldownMax 的短冷却不算）
-		victim := manager.idleWarmVictimFor(accountID, modelID, manager.openingIn(partition, ultra), partition)
+		// 淘汰选号与现场提升判断“能否替换”同一口径（replaceVictimFor，N3）：同分区有 Worker 正在启动时只换冷却中、死槽位、不可调度的，
+		// 以及对该模型不可服务或空闲超过 victimIdleReplaceAfter 的健康空闲 Worker；刚就绪不到 rotationWarmupGrace 的不换（N6）。
+		// 每个分区每分钟的按需替换不超过 replacementsPerMinute（N6），超过时排队等待（不等待的选号按容量已满返回）
+		victim := ""
+		if manager.replacementAllowed(ctx, partition) {
+			victim = manager.replaceVictimFor(accountID, modelID, partition)
+		}
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
 		if victim != "" && !manager.tryReserveVictim(victim) {
 			victim = ""
@@ -1513,12 +1603,28 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			continue
 		}
+		// 冷启动闸门：出口限流期间替换空闲 Worker 一律暂停，只有补覆盖（驻留里没有能服务该模型的热 Worker）按配额放行；
+		// 选中淘汰对象之后才判断，等待淘汰对象的复查不会重复计数
+		path := coldStartReplace
+		if workerStartSourceFrom(ctx) == workerStartCoverage {
+			path = coldStartCoverage
+		}
+		releaseGate, gateErr := manager.admitColdStart(ctx, accountID, modelID, path, false)
+		if gateErr != nil {
+			manager.releaseVictim(victim)
+			manager.rebalanceMu.Unlock()
+			return nil, gateErr
+		}
+		// 闸门放行后才记一次按需替换（N6）：被闸门拒掉的尝试没有启动浏览器，不占每分钟的替换名额。原先选中淘汰对象就记，
+		// 出口限流期间每个排队请求每次复查都用掉一次，名额很快用完，闸门本来会放行的补覆盖也拿不到可替换的 Worker
+		manager.noteReplacement(ctx, partition)
 		defer func() { manager.releaseVictim(victim) }()
 		opening := make(chan struct{})
 		manager.openings[accountID] = opening
 		manager.openingSet.Store(accountID, struct{}{})
 		manager.rebalanceMu.Unlock()
 		pending, startErr := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
+		releaseGate(startErr == nil)
 		if startErr != nil {
 			manager.rebalanceMu.Lock()
 			manager.finishOpening(accountID, opening)
@@ -1534,7 +1640,7 @@ func (manager *accountWorkerManager) ensureWorker(
 				return nil, errors.Join(ctxErr, discardErr)
 			}
 			if victim == "" {
-				victim = manager.idleWarmVictimFor(accountID, modelID, false, partition)
+				victim = manager.pickReplaceVictim(accountID, modelID, victimAny, partition)
 				if victim != "" && !manager.tryReserveVictim(victim) {
 					victim = ""
 				}
@@ -1559,9 +1665,10 @@ func (manager *accountWorkerManager) ensureWorker(
 				if activationErr != nil {
 					return nil, activationErr
 				}
-				if warmCount > manager.warmTargetFor(partition) {
+				if workerStartSourceFrom(ctx) != workerStartPrewarm {
 					manager.requests.log("service", "INFO", fmt.Sprintf(
-						"%s 按需替换 | Worker=%d/%d", workerLogName(partition), warmCount, manager.maxActiveFor(partition),
+						"%s 按需替换 | Worker=%d/%d | 超出常驻=%s",
+						workerLogName(partition), warmCount, manager.maxActiveFor(partition), aboveResidentText(warmCount > manager.warmTargetFor(partition)),
 					))
 				}
 				return pending, nil
@@ -1579,6 +1686,35 @@ func (manager *accountWorkerManager) ensureWorker(
 	}
 }
 
+// admitColdStart 经冷启动闸门（见 egress_guard.go）判断这次冷启动：没有闸门、账户自己重开（replacing，或来源为重开：请求已取得租约、
+// 发送时 Worker 不在了）时直接放行；暂停时返回 errEgressColdStartPaused（调用方按容量处理）。放行时返回的函数在
+// startAuthenticatedWorker 返回后调用一次，退还并发名额
+func (manager *accountWorkerManager) admitColdStart(
+	ctx context.Context, accountID string, modelID string, path coldStartPath, replacing bool,
+) (func(started bool), error) {
+	noop := func(bool) {}
+	gate := manager.coldStartGate.Load()
+	if gate == nil || *gate == nil || replacing || workerStartSourceFrom(ctx) == workerStartReopen {
+		return noop, nil
+	}
+	release, ok := (*gate)(accountID, modelID, path)
+	if !ok {
+		return noop, errEgressColdStartPaused
+	}
+	if release == nil {
+		release = noop
+	}
+	return release, nil
+}
+
+// aboveResidentText 为“按需扩容”“按需替换”日志里的“超出常驻=是|否”
+func aboveResidentText(above bool) string {
+	if above {
+		return "是"
+	}
+	return "否"
+}
+
 // startAuthenticatedWorker 启动账户 Worker。启动阶段确认登录失效（登录页跳转、签名 Cookie 失效）时，
 // 在请求租约内恢复一次认证并重新启动；仍失败时账户标为需要登录，错误带 authHandled，上层不再恢复第二次。
 // 预热与后台扩容没有租约，也不为此另取普通租约（会更新 LastUsed、把账户显示为忙碌，干扰 idleWarmVictimFor
@@ -1587,6 +1723,9 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 	generation := manager.pool.AuthGeneration(accountID)
 	startedAt := time.Now()
 	worker, err := manager.startReservedWorker(ctx, accountID, model)
+	if err == nil {
+		manager.persistStartupCookies(accountID, generation, worker)
+	}
 	if err == nil || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(err) {
 		return worker, err
 	}
@@ -1599,19 +1738,53 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 		return nil, &accountWorkerInitError{err: errors.Join(err, markErr), authHandled: true}
 	}
 	if manager.refresher == nil {
-		return nil, &accountWorkerInitError{err: errors.Join(err, lease.MarkAuthenticationRequired(err.Error())), authHandled: true}
+		marked, markErr := lease.MarkAuthenticationFailure(err)
+		if marked && markErr == nil {
+			manager.confirmAuthRequired(accountID, lease.Account().Config.Label, authFromStartup, err)
+		}
+		return nil, &accountWorkerInitError{err: errors.Join(err, markErr), authHandled: true}
 	}
-	if recoverErr := manager.refresher.Recover(ctx, err); recoverErr != nil {
+	// 续签器确认的登录失效按“启动”来源写“账号需要登录”（没有标记时记成续签重放）
+	recoverCtx := withAuthRequiredSource(ctx, authFromStartup)
+	if recoverErr := manager.refresher.Recover(recoverCtx, err); recoverErr != nil {
 		return nil, &accountWorkerInitError{err: recoverErr, authHandled: true}
 	}
+	renewed := manager.pool.AuthGeneration(accountID)
 	worker, err = manager.startReservedWorker(ctx, accountID, model)
 	if err == nil {
+		manager.persistStartupCookies(accountID, renewed, worker)
 		return worker, nil
 	}
 	if aistudio.DefinitiveAuthenticationFailure(err) {
-		err = manager.refresher.markAuthenticationRequired(ctx, err)
+		err = manager.refresher.markAuthenticationRequired(recoverCtx, err)
 	}
 	return nil, &accountWorkerInitError{err: err, authHandled: true}
+}
+
+// startupCookieTimeout 为 Worker 启动完成后导出浏览器 Cookie 的上限
+const startupCookieTimeout = 5 * time.Second
+
+// persistStartupCookies 在 Worker 启动完成后立即把浏览器 Cookie 合并写回账户的认证文件（N1）：浏览器登录 AI Studio 时会轮换
+// __Secure-1PSIDTS、SIDCC 等 Cookie，原先只在一次生成之后才写回，Worker 启动后还没生成过时，Go 通道（GenerateAccessToken、
+// GetAiStudioBenefitTier、目录同步、登录复核）一直用启动前的旧 Cookie，401 多半来自这里。generation 为启动前读取的认证代际，
+// 期间保存过新登录或续签时不写；同步执行（有上限），不在测试的临时目录清理之后还写文件。失败只写一条警告，不影响启动
+func (manager *accountWorkerManager) persistStartupCookies(accountID string, generation uint64, preparer *accountWorkerPreparer) {
+	if manager == nil || manager.pool == nil || preparer == nil || preparer.worker == nil {
+		return
+	}
+	base := manager.lifecycle
+	if base == nil {
+		base = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(base, startupCookieTimeout)
+	defer cancel()
+	state, err := preparer.worker.BrowserStorageState(ctx)
+	if err != nil || len(state.Cookies) == 0 {
+		return
+	}
+	if _, err := manager.pool.MergeBrowserCookies(accountID, generation, state.Cookies); err != nil && manager.requests != nil {
+		manager.requests.log(accountID, "WARN", "WAA Worker 启动后写回 Cookie 失败 | 错误="+err.Error())
+	}
 }
 
 // markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录
@@ -1625,17 +1798,28 @@ func (manager *accountWorkerManager) markStartupAuthRequired(
 	if err != nil {
 		return false, err
 	}
-	if state, loadErr := aistudio.LoadStorageState(account.StoragePath); loadErr == nil && authRefreshMaterial(state) {
+	// 有续签材料、且本平台能续签时留给带租约的按需启动恢复；非 Windows 上续签必然失败，按没有材料处理
+	if state, loadErr := aistudio.LoadStorageState(account.StoragePath); loadErr == nil && authRefreshMaterial(state) &&
+		manager.refresher.renewPlatform() {
 		return false, nil
 	}
+	// 启动阶段的登录失效多为登录页跳转或签名 Cookie 失效（本地证据），直接标记；上游 401 的复核只在请求路径（见 auth_recheck.go）
 	marked, err := manager.pool.MarkAuthenticationRequiredIfGeneration(accountID, generation, startedAt, cause.Error())
 	if marked && manager.refresher != nil && manager.refresher.publish != nil {
 		manager.refresher.publish()
 	}
+	if marked {
+		// 启动失败的账户没有驻留 Worker，释放登记不做任何事；只写“账号需要登录 | 来源=启动”
+		manager.confirmAuthRequired(accountID, account.Config.Label, authFromStartup, cause)
+	}
 	return marked, err
 }
 
+// promote 为请求现场提升备用账户（来源默认为按需；补覆盖由调用方标记）
 func (manager *accountWorkerManager) promote(ctx context.Context, accountID string, modelID string) (aistudio.ProtectedPreparer, error) {
+	if workerStartSourceFrom(ctx) == "" {
+		ctx = withWorkerStartSource(ctx, workerStartOnDemand)
+	}
 	return manager.ensureWorker(ctx, accountID, modelID, false)
 }
 
@@ -1707,6 +1891,8 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 	launched := 0
 	// capacityFull 为 Worker 槽位已满的分区：该分区本轮不再启动新的
 	capacityFull := make(map[aistudio.PoolScope]bool, len(workerPartitions))
+	// egressPaused 为冷启动被出口闸门暂停（补位并发已满）的分区：同样不再启动新的，直到该分区有一个启动结束（名额退还）
+	egressPaused := make(map[aistudio.PoolScope]bool, len(workerPartitions))
 	// openingElsewhere 记录已由其他路径（如请求按需扩容）在启动的账户，本轮不再重复尝试，避免空转
 	openingElsewhere := make(map[string]struct{})
 	var busySince time.Time
@@ -1721,12 +1907,22 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		partition := inflight[result.accountID]
 		delete(inflight, result.accountID)
 		manager.fillInflight.Store(int32(len(inflight)))
+		// 一个启动结束（成功或失败）就退还了补位名额：被出口闸门暂停的分区可以再试
+		pausedHere := errors.Is(result.err, errEgressColdStartPaused)
+		if !pausedHere {
+			delete(egressPaused, partition)
+		}
 		if result.err == nil {
 			manager.clearWarmFailure(result.accountID)
 			notify(nil)
 			return
 		}
 		if ctx.Err() != nil {
+			return
+		}
+		// 出口限流中、补位名额已满：不算失败，不进预热失败黑名单，原因写明是出口限流而不是槽位已满（先于容量判断：它也满足 errAccountWorkerCapacity）
+		if pausedHere {
+			egressPaused[partition] = true
 			return
 		}
 		// 槽位已满或该账户已在启动：不算失败，该分区本轮不再启动新的，交给 keepWarm 稍后重试
@@ -1788,7 +1984,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		var runtimeBusyErr error
 		for _, partition := range workerPartitions {
 			slots := min(remaining, targets[partition]-warmCounts[partition]-inflightCounts[partition])
-			if capacityFull[partition] || slots <= 0 {
+			if capacityFull[partition] || egressPaused[partition] || slots <= 0 {
 				continue
 			}
 			classified = true
@@ -1823,6 +2019,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			runtimeBusyErr = errors.Join(runtimeBusyErr, readyBusyErr, standbyBusyErr)
 			pendingBusy = pendingBusy || len(busy) > 0
 			ready = manager.preferUncooled(partition, ready)
+			// 坏号（连续裸限流）移出、近期成功过的账号排前（见 bad_accounts.go）
+			ready = manager.orderColdCandidates(ready)
+			// 疑似登录失效的账户（目录缓存记过需要登录、认证文件没变，见 catalog_sync.go）排在最后，预热先用没有嫌疑的账户
+			ready = manager.deferAuthSuspects(ready)
 			readyCount += len(ready)
 			started := ready[:min(slots, len(ready))]
 			for _, accountID := range started {
@@ -1832,7 +2032,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 					// 不等待 Worker 槽位：槽位满时立即返回；冷启动名额按后台启动排队，让给按需启动（见 startupSlots）。
 					// 单个任务限时，避免个别账户拖住整轮预热
 					taskCtx, taskCancel := context.WithTimeout(
-						withBackgroundStartup(ctx), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
+						withWorkerStartSource(withBackgroundStartup(ctx), workerStartPrewarm), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
 					)
 					_, err := manager.ensureWorker(taskCtx, accountID, "", false)
 					taskCancel()
@@ -1867,7 +2067,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				reason := fmt.Sprintf("暂无可启动的账户（预热失败冷却中 %d 个）", len(manager.recentWarmFailures(time.Now())))
 				level := "INFO"
 				full, anyFull := fullPartition(capacityFull)
+				_, anyPaused := fullPartition(egressPaused)
 				switch {
+				case anyPaused && !anyFull:
+					reason = egressColdStartPausedReason
 				case anyFull:
 					occupancy := manager.occupiedWorkersIn(full, manager.pool.UltraAccountIDs())
 					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.effectiveSlots(), manager.maxActiveFor(full))
@@ -1923,8 +2126,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 const (
 	// firstWarmRetryInterval 为启动阶段首个 Worker 未就绪时的重试间隔
 	firstWarmRetryInterval = 3 * time.Second
-	// modelCatalogRefreshConcurrency 为同时刷新模型目录的账户数上限
-	modelCatalogRefreshConcurrency = 32
 	// warmRecheckInterval 为滑动窗口预热在等待结果时重新检查空闲槽位的间隔
 	warmRecheckInterval = time.Second
 	// warmResultBuffer 为预热结果通道容量
@@ -2265,8 +2466,6 @@ type trackedService struct {
 	modelsMu           sync.RWMutex
 	models             []aistudio.Model
 	modelSyncMu        sync.Mutex
-	modelRetriesMu     sync.Mutex
-	modelRetries       map[string]struct{}
 	modelRefreshDone   <-chan struct{}
 	modelChangeMu      sync.Mutex
 	modelRevision      uint64
@@ -2285,6 +2484,22 @@ type trackedService struct {
 	resetWait atomic.Pointer[time.Duration]
 	// maxDuration 为生成请求的总时长上限（见 generate_context.go），0 为默认（generateMaxDurationFor），只给包内测试调低
 	maxDuration atomic.Int64
+	// egress 为按出口的限流判定与限速（见 egress_guard.go）；只在 newRuntime 创建，测试构造的服务为 nil（判定关闭）
+	egress *egressGuard
+	// catalogSync 为模型目录的后台调度器（见 catalog_sync.go）；newTrackedService 创建（不带磁盘缓存），newRuntime 挂上缓存；
+	// 测试直接构造的服务为 nil，syncAccountModels 退回直接同步
+	catalogSync *catalogSyncer
+	// quotaJitter 为普通号池第 2 次限流类换号前的等待，nil 时为默认 300–800ms 随机（见 quota_switch.go，只给包内测试改）
+	quotaJitter func() time.Duration
+	// egressQueueWait 为非主用模型按“出口限速”累计排队的上限，0 为默认 egressQueueWaitMax（只给包内测试改小）
+	egressQueueWait time.Duration
+	// authNotes 为“账号需要登录”日志的去重状态（同账号 1 分钟最多一条，见 worker_unschedulable.go），零值可用
+	authNotes authRequiredNotes
+	// authMarks 为“账号需要登录”的最近计数（状态接口的 auth_required_10m），零值可用
+	authMarks recentEvents
+	// authRecheck 为登录复核器（疑似登录失效的复核与需要登录账户的定期复核，见 auth_recheck.go）；只在 newRuntime 创建并挂上账户池的 gate，
+	// 测试构造的服务为 nil（401 照常直接标记）
+	authRecheck *authRecheck
 }
 
 type modelCatalogService interface {
@@ -2304,8 +2519,9 @@ func newTrackedService(
 	catalog := service.(modelCatalogService)
 	tracked := &trackedService{
 		lifecycle: lifecycle, service: service, catalog: catalog, pool: pool, requests: requests, workers: workers,
-		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(), rateLimits: newRateLimitGuard(),
+		forbidden: newForbiddenTracker(), rateLimits: newRateLimitGuard(),
 	}
+	tracked.catalogSync = newCatalogSyncer(tracked)
 	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断。
 	// 替补只在生成服务运行时启动，排空超时按请求超时与总时长上限计算（见 worker_drain.go）
 	if workers != nil {
@@ -2313,6 +2529,9 @@ func newTrackedService(
 		workers.afterRetire.Store(&refill)
 		running := tracked.Running
 		workers.serviceActive.Store(&running)
+		// 认证续签器与 Worker 启动阶段确认需要登录时同样写“账号需要登录”（见 worker_unschedulable.go）
+		note := authRequiredHook(tracked.noteAuthRequired)
+		workers.authRequired.Store(&note)
 	}
 	tracked.setRequestTimeout(timeout)
 	return tracked
@@ -2335,7 +2554,6 @@ const (
 	serviceStopped int32 = iota
 	serviceLaunching
 	serviceRunning
-	modelCatalogRetryInterval        = 30 * time.Second
 	modelCatalogShutdownTimeout      = 2 * time.Second
 	serviceTransitionShutdownTimeout = 12 * time.Second
 )
@@ -2395,10 +2613,11 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 		launching()
 	}
 	models := service.modelSnapshot()
-	service.requests.log("service", "INFO", fmt.Sprintf(
-		"生成服务启动 | 1/2 | 准备模型目录 | 缓存=%d", len(models),
-	))
-	catalogReady, catalogSynced, catalogDone := service.startModelCatalogRefresh(dataContext)
+	// 目录已在 newRuntime 从写盘缓存恢复：启动时只排缺失、不一致、疑似失效与过期的账户，由后台低速刷新，不再全量同步
+	service.requests.log("service", "INFO", service.catalogSync.plan().startLine(len(models)))
+	catalogReady, catalogSynced, catalogDone := service.catalogSync.start(dataContext)
+	// 登录复核与目录调度器同时开始：启动期间目录同步遇到的上游 401 同样先记疑似登录失效、复核后才标记（见 auth_recheck.go）
+	go service.authRecheck.run(dataContext)
 	service.lifecycleMu.Lock()
 	if service.dataContext == dataContext {
 		service.modelRefreshDone = catalogDone
@@ -2457,6 +2676,8 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 		return models, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, err)
 	}
 	go service.keepWarm(dataContext)
+	// 出口判定器用自己的计时器，不放进 keepWarmPass：清扫死槽位会同步等浏览器关闭，会拖慢限速调整与安全阀计时
+	go service.egress.run(dataContext)
 	return models, true, nil
 }
 
@@ -2669,6 +2890,11 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	service.lifecycleMu.Unlock()
 	service.workers.waitPrewarm()
 	resetErr := service.workers.ResetAll()
+	// 坏号记忆平时最多每 30 秒写一次：停止服务时立即写出。重建运行时（进程内重启、重建服务的配置保存）先停旧服务、再建新一代
+	// （新一代此时读文件）、最后才关闭旧一代，原先旧一代在关闭时才写，新一代读到的是旧数据，随后又被新一代的第一次写盘整份覆盖
+	if err := service.workers.badAccountMemory().save(); err != nil && service.requests != nil {
+		service.requests.log("service", "WARN", "坏号记忆写入失败 | 错误="+err.Error())
+	}
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.dataContext = nil
@@ -2730,158 +2956,38 @@ func (service *trackedService) publishModelAccessNow() {
 	service.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": service.catalogModels()}})
 }
 
-type accountModelRefreshResult struct {
-	accountID string
-	models    []aistudio.Model
-	err       error
-	skipped   bool
-}
-
-// startModelCatalogRefresh 并发刷新全部账户并持续处理失败目录
-func (service *trackedService) startModelCatalogRefresh(ctx context.Context) (<-chan error, <-chan struct{}, <-chan struct{}) {
-	ready := make(chan error, 1)
-	synced := make(chan struct{})
-	done := make(chan struct{})
-	accountIDs := service.modelCatalogAccountIDs()
-	go func() {
-		defer close(done)
-		startedAt := time.Now()
-		firstReady := false
-		synchronized := 0
-		refreshed := 0
-		failures := make([]error, 0)
-		var lastApplied time.Time
-		applyPending := false
-		authRequiredBefore := service.authRequiredAccountIDs()
-		for result := range service.refreshAccountModelCatalogs(ctx, accountIDs, false) {
-			if result.err != nil {
-				failures = append(failures, fmt.Errorf("账户 %s: %w", result.accountID, result.err))
-				continue
-			}
-			synchronized++
-			if len(result.models) == 0 {
-				continue
-			}
-			refreshed++
-			if ctx.Err() == nil {
-				// 首个目录立即生效；之后最多每秒合并应用一次，避免几百个账户逐个重算全量目录并长期占用账户池锁
-				if !firstReady || time.Since(lastApplied) >= catalogApplyInterval {
-					service.applyCachedModelCatalog()
-					service.publishModelAccess()
-					lastApplied = time.Now()
-					applyPending = false
-				} else {
-					applyPending = true
-				}
-			}
-			if !firstReady && ctx.Err() == nil {
-				ready <- nil
-				firstReady = true
-			}
-		}
-		if applyPending && ctx.Err() == nil {
-			service.applyCachedModelCatalog()
-			service.publishModelAccess()
-		}
-		if !firstReady {
-			launchErr := ctx.Err()
-			if launchErr == nil && len(failures) > 0 {
-				launchErr = errors.Join(failures...)
-			}
-			if launchErr == nil {
-				launchErr = aistudio.ErrNoEligibleAccount
-			}
-			ready <- launchErr
-		}
-		close(ready)
-		close(synced)
-		if ctx.Err() != nil {
-			return
-		}
-		if !maps.Equal(service.authRequiredAccountIDs(), authRequiredBefore) {
-			service.publishModelAccess()
-		}
-		service.requests.log("service", "INFO", fmt.Sprintf(
-			"模型目录后台同步完成 | 同步=%d | 非空=%d | 模型=%d | 待重试账户=%d | 耗时=%s",
-			synchronized, refreshed, len(service.modelSnapshot()), service.pendingModelRetryCount(), time.Since(startedAt).Round(time.Millisecond),
-		))
-		service.retryModelCatalogs(ctx)
-	}()
-	return ready, synced, done
-}
-
-func (service *trackedService) modelCatalogAccountIDs() []string {
-	statuses := service.pool.Status()
-	accountIDs := make([]string, 0, len(statuses))
-	for _, status := range statuses {
-		if status.Enabled && (status.State == aistudio.AccountReady || status.State == aistudio.AccountBusy) {
-			accountIDs = append(accountIDs, status.ID)
-		}
-	}
-	sort.Strings(accountIDs)
-	return accountIDs
-}
-
-func (service *trackedService) refreshAccountModelCatalogs(
-	ctx context.Context,
-	accountIDs []string,
-	pendingOnly bool,
-) <-chan accountModelRefreshResult {
-	results := make(chan accountModelRefreshResult, len(accountIDs))
-	var refreshes sync.WaitGroup
-	// 限制同时刷新的账户数：几百个账户同时请求会让出口与代理拥塞，反而拖慢首个目录与 Worker 启动
-	limiter := make(chan struct{}, modelCatalogRefreshConcurrency)
-	for _, accountID := range accountIDs {
-		refreshes.Add(1)
-		go func(accountID string) {
-			defer refreshes.Done()
-			if pendingOnly && !service.modelRetryPending(accountID) {
-				results <- accountModelRefreshResult{accountID: accountID, skipped: true}
-				return
-			}
-			select {
-			case limiter <- struct{}{}:
-			case <-ctx.Done():
-				results <- accountModelRefreshResult{accountID: accountID, err: ctx.Err()}
-				return
-			}
-			defer func() { <-limiter }()
-			models, err := service.refreshAccountModelCatalog(ctx, accountID)
-			results <- accountModelRefreshResult{accountID: accountID, models: models, err: err}
-		}(accountID)
-	}
-	go func() {
-		refreshes.Wait()
-		close(results)
-	}()
-	return results
-}
-
+// refreshAccountModelCatalog 立即同步单个账户的目录（管理操作、导入与批量启用：不受后台同步的暂停与速率限制）
 func (service *trackedService) refreshAccountModelCatalog(ctx context.Context, accountID string) ([]aistudio.Model, error) {
+	models, _, err := service.refreshAccountModelCatalogWith(ctx, accountID, false)
+	return models, err
+}
+
+// refreshAccountModelCatalogWith 为后台调度器与管理操作共用的单账户同步：background 为真时只在账户空闲时进行
+// （TryRefreshAccountModels，账户忙时 busy 为真、不发请求），否则照旧取独占租约（RefreshAccountModels）。
+// 结果交给调度器写缓存、排下次刷新或退避；没有调度器（测试直接构造的服务）时只写失败日志
+func (service *trackedService) refreshAccountModelCatalogWith(
+	ctx context.Context,
+	accountID string,
+	background bool,
+) ([]aistudio.Model, bool, error) {
 	requestCtx, cancel := service.lifecycleRequestContext(ctx)
 	defer cancel()
-	models, err := service.catalog.RefreshAccountModels(requestCtx, accountID)
-	service.modelRetriesMu.Lock()
-	if err != nil {
-		if ctx.Err() == nil {
-			service.modelRetries[accountID] = struct{}{}
-		}
-		service.modelRetriesMu.Unlock()
-		if ctx.Err() == nil {
+	var models []aistudio.Model
+	var busy bool
+	var err error
+	if refresher, ok := service.catalog.(catalogTryRefresher); background && ok {
+		models, busy, err = refresher.TryRefreshAccountModels(requestCtx, accountID)
+	} else {
+		models, err = service.catalog.RefreshAccountModels(requestCtx, accountID)
+	}
+	if service.catalogSync == nil {
+		if err != nil && ctx.Err() == nil {
 			service.requests.log(accountID, "WARN", "模型目录同步失败 | 错误="+err.Error())
 		}
-		return nil, err
+		return models, busy, err
 	}
-	if len(models) == 0 {
-		service.modelRetries[accountID] = struct{}{}
-	} else {
-		delete(service.modelRetries, accountID)
-	}
-	service.modelRetriesMu.Unlock()
-	if len(models) == 0 && ctx.Err() == nil {
-		service.requests.log(accountID, "WARN", "模型目录为空，等待重新同步")
-	}
-	return models, nil
+	service.catalogSync.afterRefresh(ctx, accountID, models, busy, err, background)
+	return models, busy, err
 }
 
 func (service *trackedService) applyCachedModelCatalog() {
@@ -2896,105 +3002,27 @@ func (service *trackedService) applyCachedModelCatalog() {
 	}
 }
 
+// syncAccountModels 为管理操作立即同步单个账户的目录并合并应用（经调度器的 syncNow，结果写缓存、排下次刷新）；
+// 没有调度器（测试直接构造的服务）时直接同步
 func (service *trackedService) syncAccountModels(ctx context.Context, accountID string) ([]aistudio.Model, error) {
-	models, err := service.refreshAccountModelCatalog(ctx, accountID)
+	var models []aistudio.Model
+	var err error
+	if service.catalogSync != nil {
+		models, err = service.catalogSync.syncNow(ctx, accountID)
+	} else {
+		models, err = service.refreshAccountModelCatalog(ctx, accountID)
+	}
 	service.modelSyncMu.Lock()
 	service.applyCachedModelCatalog()
 	service.modelSyncMu.Unlock()
 	return models, err
 }
 
-func (service *trackedService) retryModelCatalogs(ctx context.Context) {
-	ticker := time.NewTicker(modelCatalogRetryInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		if !service.retryAccountModelCatalogs(ctx) {
-			return
-		}
-	}
-}
-
-func (service *trackedService) retryAccountModelCatalogs(ctx context.Context) bool {
-	if ctx.Err() != nil {
-		return false
-	}
-	accountIDs := service.pendingModelRetryIDs()
-	authRequiredBefore := service.authRequiredAccountIDs()
-	for result := range service.refreshAccountModelCatalogs(ctx, accountIDs, true) {
-		if ctx.Err() != nil {
-			return false
-		}
-		if !result.skipped && result.err == nil && len(result.models) > 0 {
-			service.applyCachedModelCatalog()
-			service.publishModelAccess()
-			service.requests.log(result.accountID, "INFO", fmt.Sprintf("模型目录已更新 | 模型=%d", len(result.models)))
-		}
-	}
-	authChanged := !maps.Equal(service.authRequiredAccountIDs(), authRequiredBefore)
-	if authChanged {
-		service.publishModelAccess()
-	}
-	return true
-}
-
+// removeAccountModelRetry 移除已删除或移出号池的账户的后台同步任务与疑似失效记录
 func (service *trackedService) removeAccountModelRetry(accountID string) {
-	service.modelRetriesMu.Lock()
-	delete(service.modelRetries, accountID)
-	service.modelRetriesMu.Unlock()
-}
-
-// pendingModelRetryIDs 清理失效账户并返回当前可同步的重试任务
-func (service *trackedService) pendingModelRetryIDs() []string {
-	states := make(map[string]aistudio.AccountState)
-	for _, status := range service.pool.Status() {
-		if status.Enabled {
-			states[status.ID] = status.State
-		}
-	}
-	service.modelRetriesMu.Lock()
-	accountIDs := make([]string, 0, len(service.modelRetries))
-	for accountID := range service.modelRetries {
-		switch states[accountID] {
-		case aistudio.AccountReady, aistudio.AccountBusy:
-			accountIDs = append(accountIDs, accountID)
-		case aistudio.AccountCooldown:
-		default:
-			delete(service.modelRetries, accountID)
-		}
-	}
-	service.modelRetriesMu.Unlock()
-	sort.Strings(accountIDs)
-	return accountIDs
-}
-
-func (service *trackedService) pendingModelRetryCount() int {
-	service.pendingModelRetryIDs()
-	service.modelRetriesMu.Lock()
-	pending := len(service.modelRetries)
-	service.modelRetriesMu.Unlock()
-	return pending
-}
-
-func (service *trackedService) modelRetryPending(accountID string) bool {
-	service.modelRetriesMu.Lock()
-	_, pending := service.modelRetries[accountID]
-	service.modelRetriesMu.Unlock()
-	return pending
-}
-
-func (service *trackedService) authRequiredAccountIDs() map[string]struct{} {
-	accountIDs := make(map[string]struct{})
-	for _, status := range service.pool.Status() {
-		if status.State == aistudio.AccountAuthRequired {
-			accountIDs[status.ID] = struct{}{}
-		}
-	}
-	return accountIDs
+	service.catalogSync.forget(accountID)
+	service.authRecheck.forget(accountID)
+	service.workers.badAccountMemory().forget(accountID)
 }
 
 func (service *trackedService) replaceModelSnapshot(models []aistudio.Model) {
@@ -3099,6 +3127,8 @@ func (service *trackedService) observedDataRequestContext(
 		api.SetAccessLogError(ctx, err)
 		return nil, nil, err
 	}
+	// 不固定账户的数据请求（CountTokens 等）最多换 dataAttemptCeiling-1 个账号（见 quota_switch.go），固定账户的照旧只用这一个
+	requestCtx = aistudio.WithAttemptCeiling(requestCtx, dataAttemptCeiling)
 	observed := aistudio.ContextWithAccountSelectionObserver(requestCtx, func(account *aistudio.Account) {
 		api.SetAccessLogTarget(requestCtx, model, account.Config.Label)
 	})
@@ -3128,6 +3158,8 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 		return aistudio.VideoOperation{}, err
 	}
 	defer cancel()
+	// 不固定账户的 Veo 请求最多换 dataAttemptCeiling-1 个账号（见 quota_switch.go）
+	requestCtx = aistudio.WithAttemptCeiling(requestCtx, dataAttemptCeiling)
 	workerGenerations := make(map[string]uint64)
 	recoveredWorkers := make(map[string]struct{})
 	selectedAccountID := ""
@@ -3160,6 +3192,10 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 	video, ok := service.service.(aistudio.VideoService)
 	if !ok {
 		return aistudio.VideoOperation{}, fmt.Errorf("video service 不可用")
+	}
+	// 出口限流期间不固定账户（没有指定账户、首帧不是已上传文件）的 Veo 只在热 Worker 与未受限出口的备用账户里选号（见 videoCandidates）
+	if strings.TrimSpace(request.AccountID) == "" && (request.StartImage == nil || request.StartImage.File == nil) {
+		request.AllowedAccountIDs = service.videoCandidates(requestCtx, request.Model)
 	}
 	operation, requestErr := video.GenerateVideo(requestCtx, request)
 	if requestErr == nil && selectedAccountID != "" {
@@ -3334,6 +3370,25 @@ func (service *trackedService) acquireLease(
 	failedWorkers := failures.accounts
 	// 主用模型的选号带排队预算（见 primary_models.go）：容量原因的等待累计超过上限时 wait 返回 CapacityBusyError，没有预算时不限时
 	budget := leaseWaitBudgetFromContext(ctx)
+	// 主用模型的生成选号在出口令牌桶受限时优先取得令牌（只影响出口准入，见 aistudio/egress_rate.go）
+	selection.EgressPriority = budget != nil
+	// 出口限流（见 egress_guard.go）：egressKey 为本轮复查时受限的出口（等待原因是出口限速或驻留额度用完时归属它），egressBucketWait 为
+	// 候选里有因出口令牌桶已满按忙碌分组的；egressLeave 为进入“出口限速”排队的离开函数（原因变化或选号结束时调用）。
+	// 非主用模型按出口排队的时间整个请求累计（egressWaitBudgetFrom，没有时只按本次选号累计），超过上限按 429 返回
+	ultraLane := selection.Pool == aistudio.PoolScopeUltra
+	egressKey, egressBucketWait := "", false
+	var egressLeave func()
+	leaveEgressWait := func() {
+		if egressLeave != nil {
+			egressLeave()
+			egressLeave = nil
+		}
+	}
+	defer func() { leaveEgressWait() }()
+	egressBudget := egressWaitBudgetFrom(ctx)
+	var egressWaitedHere time.Duration
+	// coveragePausedAt 为本次选号的补覆盖被冷启动闸门暂停的时刻：之后几秒内不再尝试，等待原因写驻留账号该模型额度已用完
+	var coveragePausedAt time.Time
 	// warmOnly：Ultra 主用模型每次额度失败后紧接着的那次选号只用已启动的 Worker（见 withoutColdStart）：不回收、不替换、不现场冷启动，
 	// 也不排队等后台扩容；热 Worker 都忙时照常排队（受排队预算限制，其中有每分钟请求已满的另发起一次后台扩容、不等它），
 	// 没有热候选、只剩备用账号时发起一次后台扩容后立即返回（本次选号已发起、还没结束的扩容时不再发起）
@@ -3353,6 +3408,10 @@ func (service *trackedService) acquireLease(
 		if position, total := service.workers.dispatch.position(waiter); position > 0 {
 			text += fmt.Sprintf(" | 同条件队列=%d/%d", position, total)
 		}
+		if snapshot.egressLimited > 0 {
+			// 出口限速与下一个令牌只在真正写进度时取（要读账户池的出口计数）
+			snapshot.egressLimit, snapshot.egressNext = service.egressQueueState(egressKey, ultraLane)
+		}
 		return text + snapshot.text(now)
 	}
 	wait := func(delay time.Duration, reason string) error {
@@ -3366,7 +3425,48 @@ func (service *trackedService) acquireLease(
 			// 不让排除了刚空出槽位的账户的队首挡住后面能用它的请求
 			service.workers.dispatch.passOn(waiter)
 		}
-		return service.waitQueued(ctx, progress, budget, waiter.wake, delay, reason, detail)
+		// 只有因出口令牌桶已满的排队算“出口限速”排队（判定器据此判断限速是否起作用、状态里的排队数）
+		if reason == waitReasonEgress && egressBucketWait {
+			if egressLeave == nil {
+				egressLeave = service.egress.enterEgressWait(egressKey)
+			}
+		} else {
+			leaveEgressWait()
+		}
+		if reason != waitReasonEgress && reason != waitReasonResidentExhausted {
+			return service.waitQueued(ctx, progress, budget, waiter.wake, delay, reason, detail)
+		}
+		if budget != nil {
+			// 主用模型：出口限速的等待照常计入排队预算（PRIMARY_QUEUE_WAIT），超限时建议重试时间按出口的排队长度估计
+			err := service.waitQueued(ctx, progress, budget, waiter.wake, delay, reason, detail)
+			var busy *aistudio.CapacityBusyError
+			if errors.As(err, &busy) {
+				now := time.Now()
+				if verdict := service.egress.verdict(egressKey, ultraLane, now); reason == waitReasonEgress && !verdict.RetryAt.IsZero() {
+					busy.Until = verdict.RetryAt
+				}
+				service.egress.noteLocalReject(egressKey, now)
+			}
+			return err
+		}
+		// 非主用模型：没有排队预算，原先一直排到首事件前期限（线上“超时 504（排队中）”）；按出口排队整个请求累计不超过 egressQueueWaitFor
+		limit := service.egressQueueWaitFor()
+		waited := egressBudget.total() + egressWaitedHere
+		if waited < limit {
+			startedAt := time.Now()
+			err := service.waitQueued(ctx, progress, nil, waiter.wake, min(delay, limit-waited), reason, detail)
+			elapsed := time.Since(startedAt)
+			if egressBudget != nil {
+				waited = egressBudget.add(elapsed)
+			} else {
+				egressWaitedHere += elapsed
+				waited = egressWaitedHere
+			}
+			if err != nil || waited < limit {
+				return err
+			}
+		}
+		return service.egressQueueExceeded(selection, reason, egressKey, ultraLane, waited, limit)
 	}
 	// 带排除列表的请求现场冷启动（及随后等容量）期间不看调度信号：开始前离开等待队列并把这次唤醒交给下一个请求，
 	// 否则号池变化只唤醒仍在队首的它，后面能用被它排除的账户的请求只能等兜底复查；之后还要等待时按到达序号重新排队
@@ -3405,11 +3505,32 @@ func (service *trackedService) acquireLease(
 			len(groups.StandbyReady) + len(groups.StandbyBusy)
 		standbyReady, opening := service.workers.withoutOpening(groups.StandbyReady)
 		groups.StandbyReady = standbyReady
+		// 坏号（连续裸限流，见 bad_accounts.go）不做现场提升、扩容与回收后的启动：还有其他备用账号时去掉；固定账户与文件绑定的选号不去
+		if !fixedAccount {
+			groups.StandbyReady = service.workers.withoutBadAccounts(groups.StandbyReady)
+		}
+		// 出口限流期间不在受限出口上现场提升、扩容或回收（冷启动出来的账号同样经被限的出口，首个请求多半被拒）：剔除这些出口上的备用账户。
+		// 单出口时等于清空备用账户；多出口时扩容自然落到未受限出口的备用账户。固定账户与文件绑定的选号不剔除，交给冷启动闸门
+		// （文件所属账号要冷启动被暂停时调用方改为复制文件）
+		var removedReady []string
+		removedStandby := false
+		limitedEgress := service.egress.limitedKeys()
+		egressKey, egressBucketWait = "", groups.EgressLimited > 0
+		if len(limitedEgress) > 0 {
+			egressKey = service.egressWaitKey(limitedEgress, ultraLane)
+			if !fixedAccount {
+				var removedBusy []string
+				groups.StandbyReady, removedReady = service.pool.FilterAccountsByEgress(groups.StandbyReady, limitedEgress)
+				groups.StandbyBusy, removedBusy = service.pool.FilterAccountsByEgress(groups.StandbyBusy, limitedEgress)
+				removedStandby = len(removedReady) > 0 || len(removedBusy) > 0
+			}
+		}
 		warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
 		snapshot = queueSnapshot{
 			warmIdle: len(warmAvailable), warmBusy: len(groups.WarmBusy),
 			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy),
 			opening: opening, earliestCooldown: groups.EarliestCooldown, rateLimited: groups.RateLimited,
+			egressLimited: groups.EgressLimited,
 		}
 		if len(warmAvailable) > 0 {
 			// 不在主用与热门模型里的请求先用对这些模型是死槽位的热 Worker（它们本来就服务不了主用模型），
@@ -3432,9 +3553,21 @@ func (service *trackedService) acquireLease(
 			}
 		}
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
+		// 补覆盖：驻留里没有能服务该模型的热 Worker（诊断里 pro 的热空闲为 0，或驻留账号对该模型额度都已用完），不是判定期间 10 秒短冷却
+		// 造成的，又没有未受限出口的备用账户时，把剔除的备用账户里按偏好排第一的放回去，按补覆盖启动（冷启动闸门另有每分钟配额，
+		// 同模型同时只启动一个）。只用已启动 Worker 与不等待的选号不放回；能服务该模型的账户正在启动时先等它
+		coverageID := ""
+		if len(removedReady) > 0 && warmCandidates == 0 && len(groups.StandbyReady) == 0 && !opening && !warmOnly && !immediate &&
+			(coveragePausedAt.IsZero() || time.Since(coveragePausedAt) >= egressCoverageRetry) &&
+			(groups.EarliestCooldown.IsZero() || time.Until(groups.EarliestCooldown) > service.egress.limitedCooldown()) {
+			coverageID = removedReady[0]
+			groups.StandbyReady = []string{coverageID}
+			snapshot.standby = 1
+		}
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)
-		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening) {
+		// 出口限流时备用账户已被剔除：同样不扩容，直接按额度 429 后没有已启动的 Worker 返回（Retry-After 5s）
+		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening || removedStandby) {
 			// 额度 429 之后没有已启动的 Worker，只剩要冷启动的备用账号（或正在启动的）：不现场冷启动（10–30s 以上，冷启动出来的账号
 			// 也不一定有额度），为其中一个发起后台扩容（所在分区能扩容时），不等它，立即返回；调用方按额度不足返回 429，
 			// 客户端稍后重试时扩容出来的 Worker 多半已经就绪。候选全部冷却仍走下面的全部冷却。
@@ -3457,7 +3590,12 @@ func (service *trackedService) acquireLease(
 		// 只用已启动 Worker 的选号有启动中的 Worker 时，走到这里一定还有热候选（没有热候选的已在上面返回）：不按 Worker 正在启动等待，
 		// 它不排队等后台扩容（包括下面满窗时自己发起的那次），照常按下面的账号全部忙碌在排队预算内等待
 		if len(groups.StandbyReady) == 0 && opening && !(warmOnly && warmCandidates > 0) {
-			if err := wait(schedulingRecheck, "Worker 正在启动"); err != nil {
+			// 出口限流剔除了备用账户、没有热候选时，正在启动的多半是补覆盖：按驻留账号该模型额度已用完排队（非主用模型受出口排队上限约束）
+			reason := "Worker 正在启动"
+			if removedStandby && warmCandidates == 0 && !fixedAccount {
+				reason = waitReasonResidentExhausted
+			}
+			if err := wait(schedulingRecheck, reason); err != nil {
 				return nil, err
 			}
 			continue
@@ -3484,7 +3622,7 @@ func (service *trackedService) acquireLease(
 				case <-expanding:
 					expanding = nil
 				default:
-					if err := wait(schedulingRecheck, "Worker 正在扩容"); err != nil {
+					if err := wait(schedulingRecheck, waitReasonExpanding); err != nil {
 						return nil, err
 					}
 					continue
@@ -3492,7 +3630,7 @@ func (service *trackedService) acquireLease(
 			}
 			if accountID := capacity.expandable(groups.StandbyReady); accountID != "" {
 				expanding = service.workers.expandInBackground(accountID, selection.ModelID)
-				if err := wait(schedulingRecheck, "Worker 正在扩容"); err != nil {
+				if err := wait(schedulingRecheck, waitReasonExpanding); err != nil {
 					return nil, err
 				}
 				continue
@@ -3536,6 +3674,9 @@ func (service *trackedService) acquireLease(
 			if immediate {
 				promoteCtx = withImmediateStartup(promoteCtx)
 			}
+			if accountID == coverageID {
+				promoteCtx = withWorkerStartSource(promoteCtx, workerStartCoverage)
+			}
 			_, promoteErr := service.workers.promote(promoteCtx, accountID, selection.ModelID)
 			if promoteErr == nil {
 				return lease, nil
@@ -3545,6 +3686,24 @@ func (service *trackedService) acquireLease(
 			}
 			if errors.Is(promoteErr, errAccountWorkerOpening) {
 				continue
+			}
+			if errors.Is(promoteErr, errEgressColdStartPaused) {
+				switch {
+				case immediate:
+					return nil, &noImmediateLeaseError{reason: egressColdStartPausedReason}
+				case fixedAccount:
+					// 固定账户的选号要冷启动、被出口闸门暂停：直接交给调用方，不按“Worker 容量已满”每秒重试（非主用模型没有上限，
+					// 会一直排到请求期限）。文件所属账号由 generateWithRetry 改为把文件复制到已启动的账号（ownerUnavailable），
+					// Worker 重建后回到原账号的重放据此排除原账号换号（replayUnavailable）
+					return nil, promoteErr
+				case accountID == coverageID:
+					// 补覆盖配额已满或同模型正在补覆盖：按驻留账号该模型额度已用完排队（非主用模型同样受出口排队上限约束）
+					coveragePausedAt = time.Now()
+					if err := wait(schedulingRecheck, waitReasonResidentExhausted); err != nil {
+						return nil, err
+					}
+					continue
+				}
 			}
 			if errors.Is(promoteErr, errAccountWorkerCapacity) {
 				if immediate {
@@ -3563,9 +3722,14 @@ func (service *trackedService) acquireLease(
 			failures.last = promoteErr
 			continue
 		}
-		// 热候选取租约时被其他请求抢先（分类时还有空位，TryAcquireFor 返回空）同样按账号全部忙碌等待，不落到下面的冷却判断
+		// 热候选取租约时被其他请求抢先（分类时还有空位，TryAcquireFor 返回空）同样按账号全部忙碌等待，不落到下面的冷却判断。
+		// 没有空闲的热候选、其中有因出口令牌桶已满按忙碌分组的：按“出口限速”排队
+		busyReason := "账号全部忙碌"
+		if len(warmAvailable) == 0 && groups.EgressLimited > 0 {
+			busyReason = waitReasonEgress
+		}
 		if len(warmAvailable) > 0 || len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
-			if err := wait(schedulingRecheck, "账号全部忙碌"); err != nil {
+			if err := wait(schedulingRecheck, busyReason); err != nil {
 				return nil, err
 			}
 			continue
@@ -3574,8 +3738,23 @@ func (service *trackedService) acquireLease(
 		// （主用模型受排队预算限制，其余模型等到请求超时），不按全部冷却返回 429，也不按冷却等待绕过排队预算。EarliestCooldown 是
 		// 候选集里最早恢复的账户（常常是冷却中的热 Worker 或其他备用账户），不代表槽位何时空出，原先据此返回的 Retry-After 可能长达几小时。
 		// 降级判定的 Playground 优先选号除外：它全部冷却时调用方立即改为不限通道选号
-		if len(groups.StandbyReady) > 0 && !selection.PlaygroundFirst {
+		// 补覆盖放回的账户拿不到槽位（分区已满、没有可替换的空闲 Worker）不在这里等：它是出口限流期间剔除的备用账户，
+		// 按下面出口限流的分支排队（非主用模型受出口排队上限约束），原先按没有空闲的 Worker 槽位一直排到请求期限
+		if len(groups.StandbyReady) > 0 && !selection.PlaygroundFirst && coverageID == "" {
 			if err := wait(schedulingRecheck, waitReasonNoSlot); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		// 出口限流剔除了备用账户、又没有热候选：号池里还有健康的备用账户，只是暂不在受限出口上冷启动，按容量原因排队，
+		// 不落到下面的全部冷却（EarliestCooldown 常常是长冷却的热 Worker，Retry-After 可能长达几小时）。补覆盖被暂停或拿不到槽位时
+		// 写驻留账号该模型额度已用完
+		if removedStandby && warmCandidates == 0 && !fixedAccount && !selection.PlaygroundFirst {
+			reason := waitReasonEgress
+			if !coveragePausedAt.IsZero() || coverageID != "" {
+				reason = waitReasonResidentExhausted
+			}
+			if err := wait(schedulingRecheck, reason); err != nil {
 				return nil, err
 			}
 			continue
@@ -3593,7 +3772,11 @@ func (service *trackedService) acquireLease(
 			continue
 		}
 		if candidates > 0 {
-			if err := wait(schedulingRecheck, waitReasonNoSlot); err != nil {
+			reason := waitReasonNoSlot
+			if groups.EgressLimited > 0 {
+				reason = waitReasonEgress
+			}
+			if err := wait(schedulingRecheck, reason); err != nil {
 				return nil, err
 			}
 			continue
@@ -3989,6 +4172,9 @@ func (service *trackedService) generateWithRetry(
 	var err error
 	originalContents := request.Contents
 	attempted := make(map[string]struct{}, maxAttempts)
+	// tried 为本请求取得过租约的不同账号（每请求换号硬上限 generateSwitchCeiling，见 quota_switch.go）：单独维护，
+	// 不受 attempted 的删除（同账号换通道、Worker 重建后重放、回到原账号）与 maxAttempts 的补偿影响
+	tried := make(map[string]struct{}, generateSwitchCeiling)
 	recoveredWorker := make(map[string]struct{})
 	recoveryAccountID := ""
 	copyFiles := false
@@ -4000,6 +4186,8 @@ func (service *trackedService) generateWithRetry(
 	var inputLimitErr error
 	var tierRetryAccountIDs []string
 	immediateRetry, tierRetried := false, false
+	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
+	authFailures := 0
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
 	// 单模型 403 写入冷却后同样计入，但不退避；没等到同账号关闭失败的 Worker 就换号时同样计入，已经等过，不再退避）。
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避。租约账号在发出前已进入冷却（ErrAccountCoolingDown，
@@ -4040,20 +4228,28 @@ func (service *trackedService) generateWithRetry(
 	// 整个请求共用：换号重试不重新计时，失败的尝试与退避都计入截止时间，
 	// 截止时间过后只接受立即可用的账号，否则按 429 结束（见 primary_models.go）；其他模型为 nil，原样排队
 	budget := service.primaryBudget(modelID, scope)
-	// Ultra 主用模型（ULTRA_PRIMARY_MODELS）没有额度时立即按 429 结束（见 primary_models.go）：额度失败分两类计数（每日类、限流类，
-	// 见 primaryQuotaClassOf），两类都不计入连续失败上限、不退避；租约账号在发出前只是短暂冷却时不算额度失败（见 coolingDownLong）。
-	// 某类额度失败超过它的换号上限（primaryQuotaSwitchLimit、primaryRateLimitSwitchLimit），或额度失败后换号没有已启动的 Worker、
-	// 其余候选全部冷却、没有其他可换的账号时按 PrimaryQuotaError 结束。普通号池的主用模型与其他模型 failFast 为假，行为不变
-	failFast := budget.failFastOnQuota()
+	// 额度失败计入换号上限（见 quota_switch.go 与 primary_models.go）：不固定账号与文件绑定的请求额度失败分两类计数（每日类、限流类，
+	// 见 quotaSwitchPolicy.classOf），两类都不计入连续失败上限、不退避；某类额度失败超过它的换号上限，或额度失败后换号没有已启动的 Worker、
+	// 其余候选全部冷却、没有其他可换的账号时按 PrimaryQuotaError 结束。Ultra 主用模型（ULTRA_PRIMARY_MODELS）沿用原规则：
+	// 租约账号在发出前只是短暂冷却时不算额度失败（见 coolingDownLong），候选全部冷却时立即返回（failFast）。指定账号的请求不计数
+	policy := service.quotaPolicyFor(budget, unbound || fileBound || budget.failFastOnQuota())
+	failFast := policy.ultra
+	// meta 为构造额度不足错误的请求信息；accounts 在结束时按 tried 填
+	meta := quotaFailureMeta{modelID: modelID, pool: scope, startedAt: generationStartedAt}
 	// 流式请求：自己现场冷启动时推迟写出响应头，启动结束后才遇到的额度不足仍以 429 返回（见 holdStreamStart）
 	budget.holdStreamStart(aistudio.StreamStartHoldFromContext(clientCtx))
-	var quota primaryQuotaTracker
+	quota := primaryQuotaTracker{policy: policy}
 	// warmOnlyNext：上一次尝试是额度失败，下一次选号只用已启动的 Worker（withoutColdStart），取得租约后清除；
 	// 标记只加在那次选号的 context 上，不进整个请求共用的 acquireCtx
 	warmOnlyNext := false
 	// 排队进度同样整个请求共用一份，带上请求 ID：主路由（没有排查记录）的排队原因与回收记录也能写进请求时间线（见 queue_progress.go）
 	progress := newLeaseWaitProgress(request.ID)
-	acquireCtx := withLeaseWaitProgress(withDispatchOrder(withLeaseWaitBudget(requestCtx, budget)), progress)
+	baseCtx := withLeaseWaitBudget(requestCtx, budget)
+	if budget == nil {
+		// 非主用模型按“出口限速”的排队整个请求累计不超过 egressQueueWaitMax，换号重试不重新计时（见 egress_wait.go）
+		baseCtx = withEgressWaitBudget(baseCtx)
+	}
+	acquireCtx := withLeaseWaitProgress(withDispatchOrder(baseCtx), progress)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		budget.beginAttempt()
 		progress.beginAttempt()
@@ -4156,21 +4352,19 @@ func (service *trackedService) generateWithRetry(
 				err = acquireErr
 				break
 			}
-			var ownerCooling *aistudio.AllCoolingError
-			// ownerUnavailable：文件所属账号不可用（没有符合条件的账号或全部冷却），下面改为复制文件到其他账号再试
-			ownerUnavailable := fileBound && !copyFiles && requestCtx.Err() == nil &&
-				(errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &ownerCooling))
+			// ownerUnavailable：文件所属账号不可用（没有符合条件的账号、全部冷却，或出口限流期间它的冷启动被闸门暂停），
+			// 下面改为复制文件到其他账号再试（见 fileOwnerUnavailable）
+			ownerUnavailable := fileBound && !copyFiles && requestCtx.Err() == nil && fileOwnerUnavailable(acquireErr)
 			// replayUnavailable：不固定账号的请求在 Worker 重建后固定到原账号的重放选号失败，下面只排除这个账号、照常换号
 			replayUnavailable := recoveringAccount && unbound
-			if failFast && quota.hits() > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil {
-				// Ultra 主用模型额度失败后的换号没有可用的已启动 Worker、其余候选全部冷却或没有其他可换的账号：按额度不足立即返回 429，
-				// 不回到没等到关闭的原账号等待（returnToDeferred）。文件所属账号不可用时先照常复制文件到其他账号再试；
+			if policy.counted && quota.hits() > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil {
+				// 额度失败后的换号没有可用的已启动 Worker、其余候选全部冷却或没有其他可换的账号：按额度不足立即返回 429，
+				// 不回到没等到关闭的原账号等待（returnToDeferred），也不回落到原地等待或冷启动。文件所属账号不可用时先照常复制文件到其他账号再试；
 				// Worker 重建后的重放选号只看了原账号一个（例如它在重建期间被其他请求的额度 429 冷却），不代表其余候选，
 				// 同样先排除它换号，下一次选号再按全部候选判断
 				if reason, cooling, ok := primaryQuotaSelectionReason(acquireErr); ok {
-					failure := quota.failure(budget, reason, cooling, nil)
-					service.requests.logRequestProgress(request.ID, "service", "WARN", primaryQuotaMessage(failure))
-					err = failure
+					meta.accounts = len(tried)
+					err = service.finishQuotaFailure(request.ID, "service", &quota, meta, reason, cooling, nil)
 					break
 				}
 			}
@@ -4194,6 +4388,12 @@ func (service *trackedService) generateWithRetry(
 				maxAttempts++
 				continue
 			}
+			if !replayUnavailable && errors.Is(acquireErr, errEgressColdStartPaused) {
+				// 固定账户（指定账户的请求、账号测试）要冷启动、被出口闸门暂停：与数据路径相同按号池繁忙返回（429，Retry-After 5s），
+				// 不以裸错误按 502 结束。只在这里包装：acquireLease 返回原错误，文件绑定的请求据此改为复制文件（上面的 ownerUnavailable），
+				// 包装成 CapacityBusyError 会被上面的号池繁忙分支直接结束
+				acquireErr = newEgressColdStartBusy(selection.ModelID, scope, acquireErr)
+			}
 			if err == nil || !errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
 				err = acquireErr
 			}
@@ -4201,13 +4401,12 @@ func (service *trackedService) generateWithRetry(
 				attempted[selectionAccountID] = struct{}{}
 				continue
 			}
-			if failFast && quota.lastErr != nil && errors.Is(err, quota.lastErr) && requestCtx.Err() == nil {
-				// Ultra 主用模型额度失败后的换号只剩号池一侧暂时不可调度的账号（需要重新登录、已停用、runtime 被其他进程占用等，
+			if policy.counted && quota.lastErr != nil && errors.Is(err, quota.lastErr) && requestCtx.Err() == nil {
+				// 额度失败后的换号只剩号池一侧暂时不可调度的账号（需要重新登录、已停用、runtime 被其他进程占用等，
 				// AccountsNotReadyError），上面也回不到没等到关闭的原账号：按没有其他可换的账号返回额度不足（429，带 Retry-After），
 				// 不以上一次不带 Retry-After 的上游额度错误结束。上一次失败不是额度失败时 err 不是它，照原来的错误结束
-				failure := quota.failure(budget, primaryQuotaReasonNoOther, nil, nil)
-				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryQuotaMessage(failure))
-				err = failure
+				meta.accounts = len(tried)
+				err = service.finishQuotaFailure(request.ID, "service", &quota, meta, primaryQuotaReasonNoOther, nil, nil)
 				break
 			}
 			var cooling *aistudio.AllCoolingError
@@ -4224,6 +4423,9 @@ func (service *trackedService) generateWithRetry(
 		request.AccountID = lease.Account().ID
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
 		attempted[request.AccountID] = struct{}{}
+		tried[request.AccountID] = struct{}{}
+		// 租约取得时账户所在的出口与分区通道：这次尝试的结果按它交给出口判定器（见 egress_guard.go）
+		egressKey, egressUltra := lease.EgressKey(), lease.EgressLane() == aistudio.EgressLaneUltra
 		accountLabel := lease.Account().Config.Label
 		if lease.ClaimRateWindowNote() {
 			// 这个租约刚好占满账号的每分钟窗口（同一账号 10 分钟最多一条，名额在这里写日志时才占用，转写等不写日志的路径不占用）
@@ -4243,6 +4445,9 @@ func (service *trackedService) generateWithRetry(
 		// 直接子上下文登记在请求上下文上（不起 goroutine），收到首事件后随请求上下文延长到总时长上限
 		attemptBase, cancelAttempt := context.WithCancelCause(requestCtx)
 		attemptCtx := aistudio.ContextWithAccountLease(attemptBase, lease)
+		// 租约来自 acquireLease，取得租约前已确认或启动了 Worker：发送时 Worker 不在了（失败后被关闭、被淘汰）才要重新启动，
+		// 来源记为重开，冷启动闸门不拦它（见 accountWorkerManager.Worker）
+		attemptCtx = withWorkerStartSource(attemptCtx, workerStartReopen)
 		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
@@ -4409,6 +4614,12 @@ func (service *trackedService) generateWithRetry(
 			service.forbidden.resetModel(request.AccountID, lease.CooldownScope(modelID))
 			service.forbidden.modelSucceeded(scope, modelID, time.Now())
 			service.rateLimits.succeeded(scope, modelID, time.Now())
+			service.egress.observeOutcome(egressObservation{
+				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressSuccess, At: time.Now(),
+			})
+			// 真正成功过的账户：清掉登录复核的退避（见 auth_recheck.go）与坏号记录，记为近期成功（预热与替补优先，见 bad_accounts.go）
+			service.authRecheck.noteSuccess(request.AccountID)
+			service.workers.badAccountMemory().observe(request.AccountID, accountLabel, egressSuccess)
 			service.permissionDenied.succeeded(request.AccountID, modelID, lease.Channel())
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
@@ -4437,37 +4648,68 @@ func (service *trackedService) generateWithRetry(
 			inputLimitErr = nil
 		}
 		recoverWorker := false
-		if aistudio.DefinitiveAuthenticationFailure(err) {
-			if stateErr := lease.MarkAuthenticationRequired(err.Error()); stateErr != nil {
+		// authMarked：本次生成的 401 已把账号标成需要登录。它的驻留 Worker 已不是任何模型的候选，租约释放后登记释放（见 worker_unschedulable.go）。
+		// 只按本次尝试本身的错误（attemptErr）判断：随后删除临时 Drive 副本的 401（Bearer token 过期）不是登录失效的证据。
+		// 上游 401 先经账户池的 gate：运行时只记“疑似登录失效”、写短冷却并异步复核（见 auth_recheck.go），复核仍是 401 才标记
+		authMarked := false
+		authFailure := aistudio.DefinitiveAuthenticationFailure(attemptErr)
+		if authFailure {
+			if marked, stateErr := lease.MarkAuthenticationFailure(attemptErr); stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
+			} else {
+				authMarked = marked
+			}
+			// 单个请求因登录失效最多换号 authFailureSwitchLimit 次（与额度换号分开计数）：一批账号同时 401（出口被拒、Cookie 批量作废）时
+			// 不把号池逐个试一遍
+			authFailures++
+			if authFailures > authFailureSwitchLimit && retryable {
+				retryable = false
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+					"登录失效换号已达上限，不再换号 | 登录失效=%d/%d | 原因=%s",
+					authFailures, authFailureSwitchLimit+1, progressReason(attemptErr),
+				))
 			}
 		}
 		cooled, switchedToBuild, inputLimitRetry := false, false, false
 		// modelForbidden：本次尝试的单模型 403 已写入冷却。换号不退避，但仍计入连续失败上限：模型对整个号池都返回 403 时
 		// （号池里没有付费账号、纯 Go proof 稳定 403 等）不会一个请求把账号逐个试完，逐个冷却、登记淘汰并现场冷启动
 		modelForbidden := false
-		// quotaFailure：本次尝试是计入换号上限的 Ultra 主用模型额度失败（只在 failFast 时计数，见上文 quota）；quotaKind 为写进进度的类型；
-		// quotaSameAccount 为额度冷却后不换号、在同账号另一通道再试（进度写“同账号换通道重试”）
-		quotaFailure, quotaKind, quotaSameAccount := false, "", false
+		// quotaFailure：本次尝试是计入换号上限的额度失败（只在 policy.counted 时计数，见上文 quota）；quotaKind 为写进进度的类型；
+		// quotaSameAccount 为额度冷却后不换号、在同账号另一通道再试（进度写“同账号换通道重试”）；
+		// bare 为生成本身返回的裸限流（已由 applyQuotaCooldown 交给出口判定器，见 rate_limit_guard.go）
+		quotaFailure, quotaKind, quotaSameAccount, bare := false, "", false, false
 		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, attemptErr, "", scope, true, generated); ok {
 			cooled = true
-			if failFast {
-				quota.record(primaryQuotaClassOf(cooldown, time.Now()), request.AccountID, err, cooldown.Until)
+			now := time.Now()
+			bare = cooldown.Escalate && generated
+			// 这里只读判定结果：限流类上限、文案与 Retry-After 按这次失败时账户所在出口的判定取
+			var verdict egressVerdict
+			if bare {
+				verdict = service.egress.verdict(egressKey, egressUltra, now)
+			}
+			if policy.counted {
+				class := policy.classOf(cooldown, now)
+				quota.record(class, request.AccountID, err, cooldown.Until)
+				if class == primaryQuotaRate {
+					quota.egress, quota.egressKey = verdict, egressKey
+				}
 				quotaFailure, quotaKind = true, cooldown.Kind
 			}
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
-			} else if !cooldown.Global && service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
+			} else if !cooldown.Global && !verdict.Limited &&
+				service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
+				// 出口限流时同账号换通道同样经被限的出口，不再探测
 				delete(attempted, request.AccountID)
 				maxAttempts++
 				quotaSameAccount = true
 			}
 		}
 		// 租约账号在请求发出前进入冷却（多半是同账号别的请求刚遇到额度 429，请求没有发到上游）：任何模型都按已冷却处理，
-		// 不计入连续失败上限、不退避，照常换号。Ultra 主用模型只在拦下它的冷却剩余不少于 rotationMinRemaining（多半是每日限额）时
-		// 记一次每日类额度失败，短冷却的连带拦截不计数
+		// 不计入连续失败上限、不退避，照常换号（计入每请求硬上限）。Ultra 主用模型只在拦下它的冷却剩余不少于 rotationMinRemaining
+		// （多半是每日限额）时记一次每日类额度失败，短冷却的连带拦截不计数；普通号池不计入额度上限：请求没有发到上游，不消耗出口额度
 		coolingDown := errors.Is(err, aistudio.ErrAccountCoolingDown)
 		if coolingDown {
 			cooled = true
@@ -4478,9 +4720,15 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		// 额度失败后下一次选号只用已启动的 Worker；短冷却的连带拦截不计数，此前已有额度失败时同样保持
-		// （否则选号失败时按额度不足结束的判断会漏掉）
-		if quotaFailure || failFast && coolingDown && quota.hits() > 0 {
+		// 已发往上游、与出口有关的其他失败（5xx、首事件超时、带指标的限额、403 等）计入出口被拒比例的分母（见 egressOtherOutcome）
+		if egressOtherOutcome(requestCtx, generated, coolingDown, bare, attemptErr) {
+			service.egress.observeOutcome(egressObservation{
+				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressOther, At: time.Now(),
+			})
+		}
+		// 额度失败后下一次选号只用已启动的 Worker（普通号池只在限流类之后，见 quotaSwitchPolicy）；Ultra 主用模型短冷却的连带拦截不计数，
+		// 此前已有额度失败时同样保持（否则选号失败时按额度不足结束的判断会漏掉）
+		if quotaFailure && policy.warmAfter(quota.last) || policy.ultra && coolingDown && quota.hits() > 0 {
 			warmOnlyNext = true
 		}
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度
@@ -4507,7 +4755,7 @@ func (service *trackedService) generateWithRetry(
 		// 同一账号另一通道可用时在那里再试一次，驻留 Worker 因此成了死槽位时登记淘汰。只处理没有文件绑定、错误来自
 		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理；号池级 403 见下文
 		modelDenied := isPermissionDenied(attemptErr) && resourceID == "" && generated && requestCtx.Err() == nil &&
-			!aistudio.DefinitiveAuthenticationFailure(err) && !waaRuntimeFailed
+			!authFailure && !waaRuntimeFailed
 		// 号池级 403：号池内多个账号对该模型连续 403、这段时间又没有任何成功，多半是 proof、请求形态等号池一侧的问题，不是账号没有
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
 		if modelDenied && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
@@ -4583,7 +4831,7 @@ func (service *trackedService) generateWithRetry(
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
 		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure
-		// Ultra 主用模型最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
+		// 最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
 		exhaustReason, exhausted := quota.exhaustedReason()
 		quotaExhausted := quotaFailure && exhausted
 		if quotaExhausted {
@@ -4599,7 +4847,8 @@ func (service *trackedService) generateWithRetry(
 		resetWait := workerResetWaitUnbounded
 		if requestCtx.Err() != nil || !retryable {
 			resetWait = 0
-		} else if unbound && attempt+1 < maxAttempts && (!countsHard || hardFailures+1 < generateFailureLimit) {
+		} else if unbound && attempt+1 < maxAttempts && (!countsHard || hardFailures+1 < generateFailureLimit) &&
+			len(tried) < generateSwitchCeiling {
 			resetWait = service.workerResetWaitFor(budget)
 		}
 		recovered, _, resetDeferred, recoveryErr := service.recoverWorkerOnce(
@@ -4608,15 +4857,19 @@ func (service *trackedService) generateWithRetry(
 			workerFailed || waaRuntimeFailed, resetWait,
 		)
 		lease = nil
+		if authMarked {
+			// 账号已需要登录：统一写“账号需要登录”，它的驻留 Worker 登记释放（空闲即关，忙碌等请求结束），槽位由预热补上
+			service.noteAuthRequired(request.AccountID, accountLabel, authFromGeneration, err)
+			service.workers.releaseUnschedulable(request.AccountID, unschedulableAuthRequired)
+		}
 		if recoveryErr != nil {
 			err = errors.Join(err, recoveryErr)
 			retryable = false
 		}
 		if !retryable {
 			if quotaExhausted {
-				failure := quota.failure(budget, exhaustReason, nil, err)
-				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", primaryQuotaMessage(failure))
-				err = failure
+				meta.accounts = len(tried)
+				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, exhaustReason, nil, err)
 			}
 			break
 		}
@@ -4644,14 +4897,28 @@ func (service *trackedService) generateWithRetry(
 		// 与换号没有可用账号时相同，不按这次的失败结束（原先只在换号没有可用账号时回去）
 		if attempt+1 == maxAttempts {
 			if quotaFailure && requestCtx.Err() == nil {
-				// Ultra 主用模型最后一次尝试是额度失败、换号次数已用完：按额度不足返回 429（带 Retry-After），不回到原账号等待
-				failure := quota.failure(budget, primaryQuotaReasonNoOther, nil, err)
-				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", primaryQuotaMessage(failure))
-				err = failure
+				// 最后一次尝试是额度失败、换号次数已用完：按额度不足返回 429（带 Retry-After），不回到原账号等待
+				meta.accounts = len(tried)
+				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonNoOther, nil, err)
 				break
 			}
 			if replay, _ := returnToDeferred("换号次数已用完", err); replay {
 				continue
+			}
+			break
+		}
+		// 每请求换号硬上限：已在 generateSwitchCeiling 个不同账号上尝试过，不再换号（同账号重建后重放不算换号）。还有没等到关闭就换走的
+		// 原账号时先回到那里等关闭结束后重放；否则这次是额度失败时按额度不足结束（429，带 Retry-After），其余按这次的错误结束
+		if !recoverWorker && (unbound || fileBound) && len(tried) >= generateSwitchCeiling {
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+				"已尝试 %d 个账号，不再换号 | 原因=%s", len(tried), progressReason(err)))
+			replay, ended := returnToDeferred(fmt.Sprintf("已尝试 %d 个账号", len(tried)), err)
+			if replay {
+				continue
+			}
+			if !ended && quotaFailure && requestCtx.Err() == nil {
+				meta.accounts = len(tried)
+				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonCeiling, nil, err)
 			}
 			break
 		}
@@ -4671,6 +4938,14 @@ func (service *trackedService) generateWithRetry(
 				if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
 					break
 				}
+			}
+		}
+		// 出口正常时第 2 次起的限流类换号前短暂等待（错开并发请求的重试，见 quota_switch.go）：出口限速生效时令牌桶已错开，
+		// 排队预算已过时不等待；走到这里已确定要换号（换号上限、换号次数、硬上限都已检查过）
+		if !recoverWorker && !quotaSameAccount && quotaFailure && quota.last == primaryQuotaRate && quota.rate >= 2 &&
+			policy.jitter && !quota.egress.Throttled && !budget.expired() {
+			if waitErr := waitQuotaJitter(requestCtx, service.quotaJitterDelay(), budget); waitErr != nil {
+				break
 			}
 		}
 		if recoverWorker {
@@ -5348,9 +5623,14 @@ func (service *trackedService) forwardEvents(
 		if event.Kind == aistudio.EventError {
 			requestErr = event.Err
 			if aistudio.DefinitiveAuthenticationFailure(event.Err) {
-				if stateErr := lease.MarkAuthenticationRequired(event.Err.Error()); stateErr != nil {
+				// 上游 401 先经账户池的 gate（疑似登录失效、复核后才标记，见 auth_recheck.go）；没有标记时不释放 Worker、不写“账号需要登录”
+				if marked, stateErr := lease.MarkAuthenticationFailure(event.Err); stateErr != nil {
 					requestErr = errors.Join(requestErr, stateErr)
 					event.Err = requestErr
+				} else if marked {
+					// 流内确认需要登录：驻留 Worker 不再是任何模型的候选，登记释放（这次请求释放租约后关闭），写“账号需要登录”
+					service.workers.releaseUnschedulable(lease.Account().ID, unschedulableAuthRequired)
+					service.noteAuthRequired(lease.Account().ID, accountLabel, authFromStream, event.Err)
 				}
 			} else if _, ok, stateErr := service.applyQuotaCooldown(
 				lease, accountLabel, requestedModelID, event.Err, "已输出内容后", aistudio.PoolScopeFromContext(requestCtx), false, true,

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
@@ -31,6 +32,18 @@ type authRuntimeRefresher struct {
 	renewed func(accountID string, identity string)
 	// waitLimit 为续签等待同账户其他请求结束的上限，为 0 时使用 authRefreshWaitLimit
 	waitLimit time.Duration
+	// workers 在账户被标为需要登录后登记释放它的驻留 Worker 并写“账号需要登录”（见 worker_unschedulable.go confirmAuthRequired）；
+	// 为空时不登记（测试直接构造的续签器），驻留 Worker 由 keepWarm 的补登记释放
+	workers *accountWorkerManager
+	// renewSupported 判断本平台能否原地续签，nil 为按平台（authRenewPlatformSupported）；只给包内测试改
+	renewSupported func() bool
+}
+
+// authRenewPlatformSupported 为本平台能否用 Chrome OAuth 材料原地续签：chromeauth 只支持 Windows（其他平台导入浏览器配置必然失败，
+// 续签根本不发请求，见 chromeauth 的 platform_other.go）。不改 chromeauth，只在这里判断：非 Windows 上视为没有续签材料，
+// 一次 401 不再先走一遍注定失败的续签
+func authRenewPlatformSupported() bool {
+	return runtime.GOOS == "windows"
 }
 
 // authRefreshWaitLimit 为续签等待同账户其他正常请求结束的上限。同账户的请求可能正在等待本次续签所在的
@@ -157,6 +170,7 @@ func newAuthRuntimeRefresher(
 		refresh: chromeauth.Refresh, reset: workers.Reset, prepareHeaders: headers.prepareInvalidate,
 		globalProxy: globalProxy,
 		requests:    requests,
+		workers:     workers,
 	}
 }
 
@@ -179,15 +193,21 @@ func (provider *accountHeaderProvider) prepareInvalidate(accountID string) (func
 }
 
 // markAuthenticationRequired 把当前租约账户标为需要登录并推送账户状态，返回保留原因的错误。
-// 没有租约、请求已取消或错误不是登录失效时原样返回
+// 没有租约、请求已取消或错误不是登录失效时原样返回。标记写入后登记释放账户的驻留 Worker（它已不是任何模型的候选：空闲即关，
+// 忙碌等这次请求释放租约后关闭），并写“账号需要登录”，来源按 ctx 的标记（Worker 启动阶段为“启动”，其余为“续签重放”）
 func (refresher *authRuntimeRefresher) markAuthenticationRequired(ctx context.Context, cause error) error {
 	lease, ok := aistudio.AccountLeaseFromContext(ctx)
 	if !ok || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(cause) {
 		return cause
 	}
-	err := lease.MarkAuthenticationRequired(cause.Error())
-	if refresher.publish != nil {
+	// 上游 401 先经账户池的 gate（运行时挂上“疑似登录失效”复核，见 auth_recheck.go）：没有标记时只写了短冷却，不推送、不释放 Worker
+	marked, err := lease.MarkAuthenticationFailure(cause)
+	if marked && refresher.publish != nil {
 		refresher.publish()
+	}
+	if marked && err == nil {
+		account := lease.Account()
+		refresher.workers.confirmAuthRequired(account.ID, account.Config.Label, authRequiredSourceFrom(ctx), cause)
 	}
 	return errors.Join(cause, err)
 }
@@ -402,8 +422,19 @@ func (refresher *authRuntimeRefresher) waitForOtherRequests(ctx context.Context,
 	return nil
 }
 
-// Available 返回当前租约账户是否保存了 Chrome OAuth 续签材料
+// renewPlatform 判断本平台能否原地续签（refresher 为 nil 时按平台）
+func (refresher *authRuntimeRefresher) renewPlatform() bool {
+	if refresher != nil && refresher.renewSupported != nil {
+		return refresher.renewSupported()
+	}
+	return authRenewPlatformSupported()
+}
+
+// Available 返回当前租约账户能否原地续签：本平台支持（非 Windows 一律不能，见 authRenewPlatformSupported）且保存了 Chrome OAuth 续签材料
 func (refresher *authRuntimeRefresher) Available(ctx context.Context) bool {
+	if !refresher.renewPlatform() {
+		return false
+	}
 	lease, ok := aistudio.AccountLeaseFromContext(ctx)
 	if !ok {
 		return false

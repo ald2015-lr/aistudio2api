@@ -1021,7 +1021,7 @@ func (s *BidiSession) recordScopedModelAccess(event *BidiEvent) {
 	}
 	if event.Kind == BidiEventError && DefinitiveAuthenticationFailure(event.Err) {
 		checkedAt := s.finishQualificationAttempt(true)
-		if err := s.lease.markAuthenticationRequiredAt(event.Err.Error(), checkedAt); err != nil {
+		if _, err := s.lease.markAuthenticationFailureAt(event.Err, checkedAt); err != nil {
 			event.Err = errors.Join(event.Err, err)
 		}
 		return

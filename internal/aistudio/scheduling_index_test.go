@@ -240,8 +240,10 @@ type indexFuzzer struct {
 	leases  []*AccountLease
 	ends    []func()
 	nextID  int
-	// rateLimited 累计分类中因每分钟请求已满按忙碌处理的候选数，只写进测试日志，确认随机变更覆盖到满窗
-	rateLimited int
+	// rateLimited 累计分类中因每分钟请求已满按忙碌处理的候选数，egressLimited 为因出口令牌桶已满的，只写进测试日志，
+	// 确认随机变更覆盖到满窗与满桶
+	rateLimited   int
+	egressLimited int
 }
 
 func (fuzzer *indexFuzzer) randomID() string {
@@ -293,7 +295,7 @@ func (p *AccountPool) syncDerivedLocked(now time.Time) {
 func (fuzzer *indexFuzzer) mutate() {
 	pool, random := fuzzer.pool, fuzzer.random
 	now := time.Now()
-	switch random.Intn(22) {
+	switch random.Intn(23) {
 	case 0, 1, 2:
 		accountID := fuzzer.randomID()
 		until := now.Add(time.Duration(5+random.Intn(60)) * time.Millisecond)
@@ -465,6 +467,25 @@ func (fuzzer *indexFuzzer) mutate() {
 		}
 	case 21:
 		pool.SetAccountRateLimit(random.Intn(4))
+	case 22:
+		// 出口通道：限速开关与调整、全局代理与账户固定代理变化（与 SaveConfig 相同的锁内重挂），覆盖满桶分类与通道编号
+		proxies := []string{"", "http://p1.example:1", "socks5://P2.example:2"}
+		switch random.Intn(3) {
+		case 0:
+			lane := []EgressLane{EgressLaneNormal, EgressLaneUltra}[random.Intn(2)]
+			pool.SetEgressRateLimit(EgressKey(proxies[random.Intn(len(proxies))]), lane, []int{0, 2, 2, 5, 40}[random.Intn(5)])
+		case 1:
+			if random.Intn(3) == 0 {
+				pool.SetGlobalProxy(proxies[random.Intn(len(proxies))])
+			}
+		default:
+			pool.mu.Lock()
+			if account := pool.byID[fuzzer.randomID()]; account != nil {
+				account.Config.Proxy = proxies[random.Intn(len(proxies))]
+				pool.attachEgressLocked(account)
+			}
+			pool.mu.Unlock()
+		}
 	}
 }
 
@@ -521,6 +542,7 @@ func (fuzzer *indexFuzzer) randomSelection() AccountSelection {
 	if random.Intn(8) == 0 {
 		selection.AccountID = fuzzer.randomID()
 	}
+	selection.EgressPriority = random.Intn(2) == 0
 	return selection
 }
 
@@ -557,6 +579,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 			t.Fatalf("第 %d 轮：选择 %+v 的分类不一致\n索引=%+v\n参考=%+v", round, selection, normalizeGroups(indexed), normalizeGroups(brute))
 		}
 		fuzzer.rateLimited += indexed.RateLimited
+		fuzzer.egressLimited += indexed.EgressLimited
 	}
 	now := time.Now()
 	for attempt := 0; attempt < 4; attempt++ {
@@ -761,6 +784,8 @@ func TestSchedulingIndexMatchesBruteForce(t *testing.T) {
 	// 每分钟窗口调短，让满窗与窗口释放在随机变更中来回发生（窗口只在开始时设置一次：中途修改会让缓存的截止时刻失效）
 	fuzzer.pool.mu.Lock()
 	fuzzer.pool.rateWindow = time.Duration(20+random.Intn(40)) * time.Millisecond
+	// 出口统计窗口同样调短：令牌在随机变更中来回耗尽与恢复
+	fuzzer.pool.egressWindow = time.Duration(20+random.Intn(40)) * time.Millisecond
 	fuzzer.pool.mu.Unlock()
 	fuzzer.pool.SetAccountRateLimit(random.Intn(4))
 	for _, id := range fuzzer.ids[:accounts/2] {
@@ -783,7 +808,7 @@ func TestSchedulingIndexMatchesBruteForce(t *testing.T) {
 		}
 		fuzzer.check(round)
 	}
-	t.Logf("分类中因每分钟请求已满按忙碌处理的候选累计 %d 个", fuzzer.rateLimited)
+	t.Logf("分类中因每分钟请求已满按忙碌处理的候选累计 %d 个，因出口令牌桶已满的 %d 个", fuzzer.rateLimited, fuzzer.egressLimited)
 }
 
 // TestSchedulingIndexCooldownExpiry 冷却到期后候选自动回到可用列表，最早恢复时间来自冷却堆

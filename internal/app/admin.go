@@ -165,13 +165,26 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	// 排空中（见 worker_drain.go）与待淘汰登记的数量
 	normalDraining, ultraDraining := admin.workers.drainCounts()
 	normalRetiring, ultraRetiring := admin.workers.retirementCounts(ultra)
+	// 不可调度：驻留 Worker 的账号需要登录、已停用、没有模型目录（见 worker_unschedulable.go），等待释放；口径与死槽位分开
+	normalUnschedulable, ultraUnschedulable := admin.workers.unschedulableWarmCounts(warm, ultra)
 	ultraWorkers := admin.workers.ultraWorkerCounts(ultra, warm, starting, ultraOccupied, ultraDead)
 	ultraWorkers.Draining, ultraWorkers.Retiring = ultraDraining, ultraRetiring
+	ultraWorkers.Unschedulable = ultraUnschedulable
 	// 主用模型供给读 keepWarm 的缓存（见 primary_supply.go），不在状态请求里对账户分类；服务没有运行时不显示
 	var primarySupply []api.AdminPrimarySupply
+	var catalogSync *api.AdminCatalogSync
+	// 出口限流判定与限速（见 egress_guard.go）：O(出口数)，服务没有运行时不显示
+	var egress []api.AdminEgress
+	// 登录复核（见 auth_recheck.go）：疑似登录失效与需要登录账户的复核，服务没有运行时不显示
+	var authRecheck *api.AdminAuthRecheck
 	if running {
 		primarySupply = admin.workers.primarySupplyStatus()
+		catalogSync = admin.service.catalogSync.status()
+		egress = admin.service.egress.status()
+		authRecheck = admin.service.authRecheck.status()
 	}
+	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
+	counts.AuthRequired10m = admin.service.authMarks.count(time.Now(), authRecentWindow)
 	normal := aistudio.PoolScopeNormal
 	return api.AdminStatus{
 		State:          state,
@@ -187,9 +200,14 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			Occupied: normalOccupied, Dead: normalDead, Draining: normalDraining, Retiring: normalRetiring,
 			Prewarm: admin.workers.prewarmState(),
 			WarmIDs: warm, StartingIDs: starting,
+			Unschedulable: normalUnschedulable,
 		},
 		UltraWorkers:  ultraWorkers,
 		PrimarySupply: primarySupply,
+		CatalogSync:   catalogSync,
+		Egress:        egress,
+		AuthRecheck:   authRecheck,
+		BadAccounts:   admin.workers.badAccountMemory().count(),
 	}, nil
 }
 
@@ -603,11 +621,12 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	if err := lease.SaveStorageState(result.StorageState); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
+	// 不清空模型目录：同一邮箱即同一账户，权益与目录的变化由随后的刷新纠正（SetCatalog 发现权益变化时清除模型资格）。
+	// 原先先清空目录，随后的同步遇到 429 时目录一直为空，账号登录成功却不是任何模型的候选
 	if err := admin.service.changeModels(func() error {
 		return errors.Join(
 			admin.pool.MarkReady(account.ID),
 			admin.pool.ResetModelAccess(account.ID),
-			admin.pool.SetCatalog(account.ID, account.BenefitTier, nil),
 		)
 	}); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
@@ -617,6 +636,8 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
+	// 清掉疑似失效、登录复核记录与疑似登录失效冷却（与管理验证通过、认证文件更新同一处理）
+	admin.service.noteLoginRestored(account.ID)
 	admin.syncAccountModelCatalog(ctx, account)
 	admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
 		"账户登录完成 | 耗时=%s",
@@ -625,15 +646,41 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	return admin.account(account.ID)
 }
 
+// VerifyAccount 验证账户登录并返回账户的管理视图，带上验证结论（authenticated）与原因：前端按它计“有效 / 登录失效 / 出错”，
+// 不再把 HTTP 200 一律算成功（原先批量验证显示“成功 44 失败 0”，结果却是 44 个登录已失效）
 func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
-	if _, err := admin.verifyLogin(ctx, accountID); err != nil {
+	verification, err := admin.verifyLogin(ctx, accountID)
+	if err != nil {
 		return api.AdminAccount{}, err
 	}
-	return admin.account(accountID)
+	account, err := admin.account(accountID)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
+	// 与新账户自动处理同一口径（onboardVerifyFailure）：浏览器判定未登录，或验证后账户仍被标为需要登录，都算登录失效
+	status, _ := admin.pool.StatusOf(accountID)
+	failed, reason := onboardVerifyFailure(verification, status)
+	authenticated := !failed
+	account.Authenticated = &authenticated
+	account.VerifyReason = reason
+	return account, nil
 }
 
-// verifyLogin 启动隔离浏览器验证登录并写回账户状态，返回浏览器的验证结果。停用账户的对外状态始终是 disabled
-// （登录失效也不会显示为需要登录），调用方判断验证是否通过必须看返回的 Authenticated，不能看账户状态
+const (
+	// verifyLoginExpiredReason 为浏览器判定登录已失效、没有给出原因时的原因
+	verifyLoginExpiredReason = "AI Studio 登录已失效"
+	// verifyAPIRejectedReason 为浏览器已登录、接口复核却返回 401 时的原因：浏览器带着自己的 Cookie，接口用的是磁盘上保存的 Cookie
+	verifyAPIRejectedReason = "浏览器已登录，但接口认证失败：Cookie 可能已被 Google 作废，需要重新登录"
+)
+
+// verifyLogin 启动隔离浏览器验证登录并写回账户状态，返回验证结论。停用账户的对外状态始终是 disabled
+// （登录失效也不会显示为需要登录），调用方判断验证是否通过必须看返回的 Authenticated，不能看账户状态。
+//   - 浏览器判定已登录：先不动目录，用磁盘 Cookie 经 Go HTTP 复核一次 GetAiStudioBenefitTier（不续签，见 PooledService.ProbeLogin）；
+//     通过（或复核出错、不能下结论）才标就绪并同步目录；返回 401 时保留目录、标需要登录，结论改为未认证，原因为 verifyAPIRejectedReason。
+//     原先不复核就标就绪、同步目录，目录同步用磁盘上的旧 Cookie 又被 401 标回需要登录，模型列变成“—”；
+//   - 浏览器判定未登录：原因带上跳转到的登录页 host+path（不含查询参数），区分普通登录页与安全验证、风控页。
+//
+// 验证不导出浏览器 Cookie（要改 camoufoxnative 的 Verify，不在本批），接口复核失败的账户需要重新登录
 func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (aistudio.LoginVerification, error) {
 	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
@@ -650,18 +697,47 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 		))
 		return aistudio.LoginVerification{}, errors.Join(err, lease.Release())
 	}
+	// apiCheck 为接口复核的结论（写进“账户验证完成”）：通过、401、出错、跳过（浏览器未登录或服务不支持复核）
+	apiCheck := "跳过"
+	if verification.Authenticated {
+		if prober, ok := admin.service.service.(loginProber); ok {
+			probeCtx, cancel := context.WithTimeout(ctx, authRecheckTimeout)
+			probeErr := prober.ProbeLogin(probeCtx, lease)
+			cancel()
+			switch {
+			case probeErr == nil:
+				apiCheck = "通过"
+			case aistudio.DefinitiveAuthenticationFailure(probeErr):
+				apiCheck = "401"
+				verification.Authenticated = false
+				verification.Reason = verifyAPIRejectedReason
+			default:
+				// 上游 429、连接失败等不能说明登录失效：按浏览器的结论处理，随后的目录同步照常
+				apiCheck = "出错"
+				admin.requests.log(account.Config.Label, "WARN", "账户验证 | 接口复核出错，按浏览器结论处理 | 错误="+authRequiredCauseSummary(probeErr))
+			}
+		}
+	}
+	reason := strings.TrimSpace(verification.Reason)
+	if reason == "" {
+		reason = verifyLoginExpiredReason
+	}
+	if !verification.Authenticated && verification.PageURL != "" && apiCheck != "401" {
+		reason += "（跳转到 " + verification.PageURL + "）"
+	}
+	if !verification.Authenticated {
+		verification.Reason = reason
+	}
 	err = admin.service.changeModels(func() error {
 		if verification.Authenticated {
+			// 保留原有目录与 Worker：随后的目录同步照旧刷新，同步失败（如上游 429）时旧目录仍在，账号立刻可调度。
+			// 原先在这里清空目录且不关 Worker，同步失败后目录一直为空，Worker 成了不能服务任何模型的僵尸
 			return errors.Join(
 				admin.pool.MarkReady(account.ID),
 				admin.pool.ResetModelAccess(account.ID),
-				admin.pool.SetCatalog(account.ID, account.BenefitTier, nil),
 			)
 		}
-		reason := strings.TrimSpace(verification.Reason)
-		if reason == "" {
-			reason = "AI Studio 登录已失效"
-		}
+		// 浏览器判定未登录或接口复核 401：直接标需要登录（管理验证是浏览器证据，不经疑似登录失效的复核），目录保留
 		return admin.pool.MarkAuthRequired(account.ID, reason)
 	})
 	if err != nil {
@@ -671,13 +747,25 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 		return aistudio.LoginVerification{}, err
 	}
 	if verification.Authenticated {
+		// 验证通过即清掉目录缓存里的需要登录记录与疑似失效、登录复核的记录与疑似登录失效冷却（不等随后的同步成功：
+		// 同步可能因上游 429 失败），与浏览器登录、认证文件更新同一处理
+		admin.service.noteLoginRestored(account.ID)
 		admin.syncAccountModelCatalog(ctx, account)
 	} else {
 		admin.service.publishModelAccess()
+		// 验证判定登录已失效：登记释放驻留 Worker（不等 keepWarm 补登记），写“账号需要登录 | 来源=管理验证”
+		admin.workers.releaseUnschedulable(account.ID, unschedulableAuthRequired)
+		admin.service.noteAuthRequired(account.ID, account.Config.Label, authFromVerify, errors.New(reason))
+		// 浏览器判定未登录是浏览器证据，定期登录复核（接口、磁盘 Cookie）不复核它；浏览器已登录、接口 401 是接口证据，照常复核
+		admin.service.authRecheck.noteMarked(account.ID, apiCheck != "401")
+	}
+	page := verification.PageURL
+	if page == "" {
+		page = "-"
 	}
 	admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
-		"账户验证完成 | 已认证=%t | 耗时=%s",
-		verification.Authenticated, time.Since(startedAt).Round(time.Millisecond),
+		"账户验证完成 | 已认证=%t | 耗时=%s | 接口复核=%s | 页面=%s",
+		verification.Authenticated, time.Since(startedAt).Round(time.Millisecond), apiCheck, page,
 	))
 	return verification, nil
 }

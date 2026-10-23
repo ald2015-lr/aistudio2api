@@ -26,6 +26,10 @@ func (service *trackedService) Transcribe(
 		service.requests.finish(request.ID, "failed", err)
 		return aistudio.TranscriptionResult{}, err
 	}
+	// 转写经 AcquireFor 直接取生成租约（不经 acquireLease），出口令牌桶已满时的累计等待另设上限，超过按“出口限速”429 返回
+	requestCtx = aistudio.WithEgressWaitLimit(requestCtx, service.egressQueueWaitFor())
+	// 转写最多换 dataAttemptCeiling-1 个账号（见 quota_switch.go）
+	requestCtx = aistudio.WithAttemptCeiling(requestCtx, dataAttemptCeiling)
 	service.requests.start(ctx, aistudio.GenerateRequest{
 		ID: request.ID, Model: request.Model, Config: request.Config,
 	}, cancel)
@@ -146,6 +150,7 @@ func (service *trackedService) transcriptionCandidates(ctx context.Context, mode
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	service.withoutLimitedStandby(&groups)
 	warmAvailable := append(append([]string(nil), groups.WarmReady...), groups.WarmAvailable...)
 	candidates := service.pool.OrderCandidates(warmAvailable, modelID)
 	candidates = append(candidates, service.pool.OrderCandidates(groups.StandbyReady, modelID)...)

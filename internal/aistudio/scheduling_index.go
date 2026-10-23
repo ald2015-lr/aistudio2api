@@ -157,6 +157,9 @@ type schedulingIndex struct {
 	// rateUntil 为账户每分钟窗口已满的截止时刻（rateUntilOf，UnixNano；0 未满，rateUntilPending 为只因预占而满），
 	// 由 rateChangedLocked 更新；分类时满窗的候选按忙碌处理
 	rateUntil []int64
+	// egressID 为账户所在出口通道的编号（egressLaneID，没有通道时为 egressNoLane），由 attachEgressLocked 更新；
+	// 分类时按它查出口门控，所在通道令牌桶已满的候选按忙碌处理（见 egress_rate.go）
+	egressID []uint32
 	// coolVersion 为上次按目录版本核对 coolUntil 时的 eligibilityVersion，coolSyncedAt 为核对时刻：Build 通道是否可用于某模型
 	// 还取决于其他账户的 Playground 目录（见 buildSupportsModelLocked），这个跨账户依赖按节流全量重算（见 refreshCoolingLocked）
 	coolVersion  uint64
@@ -177,7 +180,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			ids: make([]string, size), enabled: make([]bool, size), state: make([]AccountState, size),
 			tier: make([]BenefitTier, size), globalUntil: make([]int64, size), coolUntil: make([]int64, size),
 			blocked: make([]bool, size), active: make([]int32, size), draining: make([]bool, size), warmStamp: make([]uint32, size),
-			rateUntil: make([]int64, size), coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
+			rateUntil: make([]int64, size), egressID: make([]uint32, size), coolVersion: p.eligibilityVersion, coolSyncedAt: time.Now(),
 		}
 		for position, account := range p.accounts {
 			if account == nil {
@@ -190,6 +193,7 @@ func (p *AccountPool) schedulingLocked() *schedulingIndex {
 			index.active[position] = int32(account.active)
 			index.draining[position] = account.draining
 			index.rateUntil[position] = rateUntilOf(account)
+			index.egressID[position] = egressLaneID(account)
 		}
 		p.sched = index
 	}
@@ -416,6 +420,7 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 		index.active = append(index.active, int32(account.active))
 		index.draining = append(index.draining, account.draining)
 		index.rateUntil = append(index.rateUntil, rateUntilOf(account))
+		index.egressID = append(index.egressID, egressLaneID(account))
 		index.warmStamp = append(index.warmStamp, 0)
 		// 新账户可能已在热账户列表里，下次分类重新标记
 		index.lastWarm = nil
@@ -443,6 +448,8 @@ func (p *AccountPool) accountChangedLocked(account *Account) {
 			delete(p.ultraAccounts, account.ID)
 		}
 		p.ultraSnapshot = nil
+		// Ultra 号池的账户挂在出口的 Ultra 通道上（见 egress_rate.go），成员变化时换通道
+		p.attachEgressLocked(account)
 	}
 	if p.sched != nil {
 		if p.sched.positionValid(p, account) {
@@ -647,7 +654,7 @@ func (set *candidateSet) rotationStartLocked(p *AccountPool) int {
 // classifyIndexedLocked 用候选集完成不限账户的分类（AllowedAccountIDs 为 nil）；exclusion 中的账户跳过，
 // 不参与资格、最早恢复时间与分组。只有排除列表的换号重试也走这里，不改走限定账户集合的路径；调用方持有 p.mu
 func (p *AccountPool) classifyIndexedLocked(
-	set *candidateSet, warmAccountIDs []string, now time.Time, exclusion accountExclusion,
+	set *candidateSet, warmAccountIDs []string, now time.Time, exclusion accountExclusion, egress egressGate,
 ) AccountCandidateGroups {
 	index := p.sched
 	set.expireLocked(p, now.UnixNano())
@@ -664,21 +671,22 @@ func (p *AccountPool) classifyIndexedLocked(
 	groups.StandbyReady = make([]string, 0, len(available))
 	for _, position := range available[start:] {
 		if !exclusion.has(position) {
-			classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
+			classifyIndexedCandidate(&groups, index, position, generation, limit, gate, egress)
 		}
 	}
 	for _, position := range available[:start] {
 		if !exclusion.has(position) {
-			classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
+			classifyIndexedCandidate(&groups, index, position, generation, limit, gate, egress)
 		}
 	}
 	return groups
 }
 
 // classifyIndexedCandidate 按忙闲数组与热账户代数把候选分进对应分组；只用于不固定账户的选择，
-// 排空中的账户（见 SetDraining）与每分钟请求已满的账户（gate 打开时）按忙碌处理：热账户分进 WarmBusy，备用账户分进 StandbyBusy
+// 排空中的账户（见 SetDraining）、每分钟请求已满的账户（gate 打开时）与所在出口通道令牌桶已满的账户（egress 打开时）按忙碌处理：
+// 热账户分进 WarmBusy，备用账户分进 StandbyBusy
 func classifyIndexedCandidate(
-	groups *AccountCandidateGroups, index *schedulingIndex, position int, generation uint32, limit int32, gate rateGate,
+	groups *AccountCandidateGroups, index *schedulingIndex, position int, generation uint32, limit int32, gate rateGate, egress egressGate,
 ) {
 	isWarm := index.warmStamp[position] == generation
 	blocked := index.blocked[position] || index.draining[position]
@@ -686,6 +694,13 @@ func classifyIndexedCandidate(
 		groups.RateLimited++
 		if isWarm {
 			groups.WarmRateLimited++
+		}
+		blocked = true
+	}
+	if !egress.admitsID(index.egressID[position]) {
+		groups.EgressLimited++
+		if isWarm {
+			groups.WarmEgressLimited++
 		}
 		blocked = true
 	}
@@ -708,7 +723,7 @@ func classifyIndexedCandidate(
 // classifyAllowedLocked 用候选集完成限定账户集合的分类：只看 AllowedAccountIDs 中、不在 exclusion 中的账户，
 // 顺序与成员判断同不限账户时；调用方持有 p.mu
 func (p *AccountPool) classifyAllowedLocked(
-	set *candidateSet, allowed map[string]struct{}, warmAccountIDs []string, now time.Time, exclusion accountExclusion,
+	set *candidateSet, allowed map[string]struct{}, warmAccountIDs []string, now time.Time, exclusion accountExclusion, egress egressGate,
 ) AccountCandidateGroups {
 	index := p.sched
 	nowNanos := now.UnixNano()
@@ -738,16 +753,17 @@ func (p *AccountPool) classifyAllowedLocked(
 			}
 			continue
 		}
-		classifyIndexedCandidate(&groups, index, position, generation, limit, gate)
+		classifyIndexedCandidate(&groups, index, position, generation, limit, gate, egress)
 	}
 	return groups
 }
 
 // classifyCandidate 按账户字段的忙闲与是否为热账户把候选分进对应分组（逐个账户判断的路径使用）；
 // shared 为不固定账户的选择，这时排空中的账户按忙碌处理，指定账户或文件绑定的选择不看排空；
-// 每分钟请求已满的账户（gate 打开时）同样按忙碌处理
+// 每分钟请求已满的账户（gate 打开时）与所在出口通道令牌桶已满的账户（egress 打开时）同样按忙碌处理
 func classifyCandidate(
 	groups *AccountCandidateGroups, account *Account, warm map[string]struct{}, perAccountConcurrency int, shared bool, gate rateGate,
+	egress egressGate,
 ) {
 	_, isWarm := warm[account.ID]
 	blocked := accountBlocked(account) || shared && account.draining
@@ -755,6 +771,13 @@ func classifyCandidate(
 		groups.RateLimited++
 		if isWarm {
 			groups.WarmRateLimited++
+		}
+		blocked = true
+	}
+	if !egress.admits(account.egress) {
+		groups.EgressLimited++
+		if isWarm {
+			groups.WarmEgressLimited++
 		}
 		blocked = true
 	}
@@ -785,6 +808,9 @@ func (p *AccountPool) candidatePositionsLocked(set *candidateSet) []int {
 
 // verifySchedulingIndexLocked 核对候选索引与按账户逐个计算的结果是否一致，供测试在随机变更后检查增量更新；调用方持有 p.mu
 func (p *AccountPool) verifySchedulingIndexLocked() error {
+	if err := p.verifyEgressLocked(); err != nil {
+		return err
+	}
 	index := p.sched
 	if index == nil {
 		return nil

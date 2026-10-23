@@ -320,17 +320,21 @@ func (capacity *standbyCapacity) coolingVictim(partition aistudio.PoolScope) boo
 	}
 	found, checked := capacity.cooling[partition]
 	if !checked {
-		found = capacity.manager.idleWarmVictimFor("", capacity.modelID, true, partition) != ""
+		// 扩容替换同样不换刚就绪不到 rotationWarmupGrace 的 Worker（N6，见 pickReplaceVictim）
+		found = capacity.manager.pickReplaceVictim("", capacity.modelID, victimCooling, partition) != ""
 		capacity.cooling[partition] = found
 	}
 	return found
 }
 
-// idleVictim 判断分区内是否有可淘汰的空闲 Worker
+// idleVictim 判断分区内是否有按需替换能淘汰的空闲 Worker：与 ensureWorker 的替换同一个函数（replaceVictimFor，N3），
+// 原先这里看任意空闲 Worker、那边有 Worker 在启动时只换冷却中的，选了备用账号去提升却拿不到槽位，返回“Worker 容量已满”；
+// 本分区每分钟的按需替换已达上限时同样为否
 func (capacity *standbyCapacity) idleVictim(partition aistudio.PoolScope) bool {
 	found, checked := capacity.idle[partition]
 	if !checked {
-		found = capacity.manager.idleWarmVictimFor("", "", false, partition) != ""
+		found = capacity.manager.replacementAllowed(context.Background(), partition) &&
+			capacity.manager.replaceVictimFor("", capacity.modelID, partition) != ""
 		capacity.idle[partition] = found
 	}
 	return found

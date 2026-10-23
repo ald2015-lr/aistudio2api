@@ -147,7 +147,7 @@ func enableTestAdmin(t *testing.T, accountIDs ...string) (*runtimeAdmin, *enable
 	catalog := &enableTestCatalog{pool: pool}
 	service := &trackedService{
 		lifecycle: ctx, catalog: catalog, pool: pool, requests: requests, workers: workers,
-		modelRetries: make(map[string]struct{}), forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
 	}
 	service.timeout.Store(int64(time.Minute))
 	admin := &runtimeAdmin{
@@ -259,6 +259,7 @@ func TestNewRuntimeEnablesUnmarkedAccounts(t *testing.T) {
 	cfg.AuthStates = root
 	cfg.WAABackend = config.WAABackendGo
 	lifecycle, stop := context.WithCancel(ctx)
+	useTempCatalogCacheDir(t)
 	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests)
 	if err != nil {
 		t.Fatal(err)

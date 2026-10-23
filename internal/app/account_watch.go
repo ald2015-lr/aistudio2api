@@ -651,11 +651,11 @@ func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, account
 	if err := lease.SaveStorageState(state); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
+	// 不清空模型目录：同一账户换了认证文件，目录与权益由随后的同步刷新纠正，同步失败时旧目录仍在、账号照常可调度
 	if err := admin.service.changeModels(func() error {
 		return errors.Join(
 			admin.pool.MarkReady(account.ID),
 			admin.pool.ResetModelAccess(account.ID),
-			admin.pool.SetCatalog(account.ID, account.BenefitTier, nil),
 		)
 	}); err != nil {
 		return false, errors.Join(err, lease.Release())
@@ -665,6 +665,8 @@ func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, account
 	if err := lease.Release(); err != nil {
 		return false, err
 	}
+	// 清掉疑似失效、登录复核记录与疑似登录失效冷却（与管理验证通过、浏览器登录同一处理）
+	admin.service.noteLoginRestored(account.ID)
 	admin.syncAccountModelCatalog(ctx, account)
 	return true, nil
 }

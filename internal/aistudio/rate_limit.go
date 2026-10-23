@@ -21,6 +21,7 @@ import (
 //     及时唤醒各队首，与租约释放一样按到达序号排队；窗口释放时刻同时并入 AcquireFor 的 earliest 定时复查。只因预占而满时等租约
 //     发出或释放：释放时 releaseLocked 唤醒；最后一个预占经发送转成有限的截止时刻时 rateChangedLocked 唤醒，等待方改按新的截止时刻定时
 //   - 只统计本进程，记录只在内存中，重启或重建号池后从空窗口开始，429 冷却仍然兜底
+//   - 出口令牌桶（见 egress_rate.go）与这里共用窗口释放计时器、发送记账与预占退还的加锁段，不另加锁
 //
 // 全部状态受账户池 mu 保护
 const (
@@ -134,18 +135,23 @@ func (p *AccountPool) rateChangedLocked(account *Account, now time.Time) {
 	}
 }
 
-// armRateWakeLocked 把截止时刻为有限值的满窗账户登记到 rateFull，截止时刻早于计时器当前的触发时刻（或没有设）时把计时器提前到它；
-// 调用方持有 p.mu
+// armRateWakeLocked 把截止时刻为有限值的满窗账户登记到 rateFull，并按截止时刻提前窗口释放计时器；调用方持有 p.mu
 func (p *AccountPool) armRateWakeLocked(account *Account, until int64, nowNanos int64) {
 	if p.rateFull == nil {
 		p.rateFull = make(map[*Account]struct{})
 	}
 	p.rateFull[account] = struct{}{}
-	if p.rateWakeAt != 0 && p.rateWakeAt <= until {
+	p.armPoolWakeLocked(until, nowNanos)
+}
+
+// armPoolWakeLocked 为窗口释放计时器的“提前”一半：at 早于计时器当前的触发时刻（或没有设）时把计时器提前到它。
+// 每账号每分钟窗口（rateFull）与出口令牌桶（egressFull，见 egress_rate.go）共用这一个计时器，各自先登记条目；调用方持有 p.mu
+func (p *AccountPool) armPoolWakeLocked(at int64, nowNanos int64) {
+	if p.rateWakeAt != 0 && p.rateWakeAt <= at {
 		return
 	}
-	p.rateWakeAt = until
-	delay := time.Duration(until - nowNanos)
+	p.rateWakeAt = at
+	delay := time.Duration(at - nowNanos)
 	if p.rateWake == nil {
 		p.rateWake = time.AfterFunc(delay, p.rateWindowReleased)
 		return
@@ -153,10 +159,10 @@ func (p *AccountPool) armRateWakeLocked(account *Account, until int64, nowNanos 
 	p.rateWake.Reset(delay)
 }
 
-// rateWindowReleased 为窗口释放计时器的回调：有账户的窗口已经释放时唤醒等待方（app 层经 forwardPoolChanges 唤醒各队首，
-// 先排队的请求先取得名额），再按 rateFull 里剩下的满窗账户中最早的截止时刻重设计时器。没有新事件时截止时刻不变，扫描结果准确；
-// 已移除、已不满或改为只因预占而满的账户移出 rateFull。号池没有关闭操作，丢弃的号池最多再按剩下的截止时刻触发到窗口结束，
-// 回调只操作自己的号池，没有影响
+// rateWindowReleased 为窗口释放计时器的回调：有账户的窗口已经释放、或有出口通道到了下一个令牌时唤醒等待方（app 层经
+// forwardPoolChanges 唤醒各队首，先排队的请求先取得名额），再按 rateFull 里剩下的满窗账户与 egressFull 里的通道中最早的时刻重设计时器。
+// 没有新事件时截止时刻不变，扫描结果准确；已移除、已不满或改为只因预占而满的账户移出 rateFull，令牌已够的通道移出 egressFull。
+// 号池没有关闭操作，丢弃的号池最多再按剩下的截止时刻触发到窗口结束，回调只操作自己的号池，没有影响
 func (p *AccountPool) rateWindowReleased() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -174,6 +180,11 @@ func (p *AccountPool) rateWindowReleased() {
 		if next == 0 || until < next {
 			next = until
 		}
+	}
+	egressReleased, egressNext := p.egressReleasedLocked(nowNanos)
+	released = released || egressReleased
+	if egressNext != 0 && (next == 0 || egressNext < next) {
+		next = egressNext
 	}
 	if next != 0 {
 		p.rateWakeAt = next
@@ -198,7 +209,8 @@ func (p *AccountPool) reserveRateLocked(account *Account, lease *AccountLease, n
 	}
 }
 
-// recordGenerationSentLocked 记一次发送：抵掉本租约的预占（只抵一次），追加不减的发送时刻；调用方持有 p.mu
+// recordGenerationSentLocked 记一次发送：抵掉本租约的预占（只抵一次），追加不减的发送时刻；同时给租约所在的出口通道抵掉预占、
+// 记一次发送。调用方持有 p.mu
 func (p *AccountPool) recordGenerationSentLocked(lease *AccountLease, now time.Time) {
 	account := lease.account
 	if account.rate == nil {
@@ -221,6 +233,8 @@ func (p *AccountPool) recordGenerationSentLocked(lease *AccountLease, now time.T
 		rate.sent = rate.sent[:copy(rate.sent, rate.sent[extra:])]
 	}
 	p.rateChangedLocked(account, now)
+	// 出口通道同一次加锁内记账（见 egress_rate.go）
+	p.recordEgressSentLocked(lease, now.UnixNano())
 }
 
 // releaseRateLocked 在 releaseLocked 里退还没发出的预占（调用方持有 l.operation 与 p.mu）

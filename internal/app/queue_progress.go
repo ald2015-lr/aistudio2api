@@ -219,12 +219,16 @@ func (limiter *queueProgressLimiter) allow(now time.Time) (bool, int) {
 }
 
 // queueSnapshot 为一次复查时的候选计数，写进排队进度；rateLimited 为其中因每分钟请求已满（ACCOUNT_RPM_LIMIT）按忙碌分组的候选数，
-// 在排除本请求已失败的 Worker 之前取，只作提示
+// 在排除本请求已失败的 Worker 之前取，只作提示。egressLimited 为因所在出口令牌桶已满按忙碌分组的候选数（出口限流判定期间），
+// egressLimit 与 egressNext 为该出口通道的限速与下一个令牌的时刻（写进度时才取）
 type queueSnapshot struct {
 	warmIdle, warmBusy, standby, standbyBusy int
 	rateLimited                              int
 	opening                                  bool
 	earliestCooldown                         time.Time
+	egressLimited                            int
+	egressLimit                              int
+	egressNext                               time.Time
 }
 
 func (snapshot queueSnapshot) text(now time.Time) string {
@@ -235,6 +239,15 @@ func (snapshot queueSnapshot) text(now time.Time) string {
 	}
 	if snapshot.opening {
 		text += " | 启动中=是"
+	}
+	if snapshot.egressLimited > 0 {
+		next := max(snapshot.egressNext.Sub(now), 0)
+		if next >= time.Second {
+			next = next.Round(100 * time.Millisecond)
+		} else {
+			next = next.Round(time.Millisecond)
+		}
+		text += fmt.Sprintf(" | 出口限速=%d/分钟 | 出口已满=%d | 下一个令牌=%s", snapshot.egressLimit, snapshot.egressLimited, next)
 	}
 	if remaining := snapshot.earliestCooldown.Sub(now); remaining > 0 {
 		// 一秒以上按秒取整，一秒内按毫秒（分钟限额的冷却常常只剩几百毫秒）

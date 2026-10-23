@@ -454,7 +454,8 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 		bootstrapModel = models[0]
 	}
 	taskCtx, cancel := context.WithTimeout(
-		withReplacementStartup(withBackgroundStartup(ctx)), time.Duration(manager.initTimeout.Load())+warmTaskGrace,
+		withWorkerStartSource(withReplacementStartup(withBackgroundStartup(ctx)), workerStartReplacement),
+		time.Duration(manager.initTimeout.Load())+warmTaskGrace,
 	)
 	defer cancel()
 	_, err := manager.ensureWorker(taskCtx, accountID, bootstrapModel, false)
@@ -465,6 +466,12 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 	case errors.Is(err, errAccountWorkerOpening):
 		return true
 	case ctx.Err() != nil:
+		return false
+	case errors.Is(err, errEgressColdStartPaused):
+		// 出口限流中、补位名额已满：不算启动失败，空出的槽位由随后的预热按补位名额补上
+		manager.requests.log(accountID, "INFO", fmt.Sprintf(
+			"%s 替补未启动 | 原因=%s | %s", workerLogName(partition), reason, egressColdStartPausedReason,
+		))
 		return false
 	case errors.Is(err, errAccountWorkerCapacity), errors.Is(err, errAccountRuntimeBusy):
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
@@ -486,6 +493,8 @@ func (manager *accountWorkerManager) pickReplacement(ctx context.Context, partit
 	if len(standby) == 0 {
 		return ""
 	}
+	// 坏号（连续裸限流）移出、近期成功过的账号排前（见 bad_accounts.go）
+	standby = manager.orderColdCandidates(standby)
 	avoid := manager.deadSlotModelsFor(partition)
 	if len(models) > 0 {
 		avoid = append(slices.Clone(avoid), models...)

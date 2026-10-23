@@ -99,9 +99,46 @@ type Client struct {
 	catalogs        map[string]modelCatalog
 	tierMu          sync.RWMutex
 	tiers           map[string]BenefitTier
+	// catalogShared 为按内容键共用的目录（见 shareCatalogLocked），catalogShareLimit 为下次重建前的容量；均受 catalogMu 保护
+	catalogShared     map[string]modelCatalog
+	catalogShareLimit int
 }
 
 var _ Service = (*Client)(nil)
+
+// PrimeAccountCatalog 用写盘缓存恢复的目录与权益预置账户的 Client 侧状态，不发请求：权益决定 Pro/Ultra 账户的
+// X-AIStudio-G1-Tier 请求头（见 applyBenefitTier），目录供 Playground 生成查找模型与默认值。不恢复时每个账户第一次生成
+// 都要先在请求路径上拉一次 ListModels，Pro/Ultra 账户在那之前的请求不带权益头。同一份目录可以预置给多个账户（只读共用）
+func (c *Client) PrimeAccountCatalog(accountID string, tier BenefitTier, catalog ModelCatalogData) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	c.tierMu.Lock()
+	c.tiers[accountID] = tier
+	c.tierMu.Unlock()
+	c.catalogMu.Lock()
+	c.catalogs[accountID] = c.shareCatalogLocked(catalog.catalog)
+	c.catalogMu.Unlock()
+}
+
+// AccountCatalog 返回账户在 Client 侧的 Playground 目录与权益（目录同步成功后写缓存用）；没有目录时 ok 为假
+func (c *Client) AccountCatalog(accountID string) (ModelCatalogData, BenefitTier, bool) {
+	accountID = strings.TrimSpace(accountID)
+	c.catalogMu.RLock()
+	catalog, found := c.catalogs[accountID]
+	c.catalogMu.RUnlock()
+	c.tierMu.RLock()
+	tier := c.tiers[accountID]
+	c.tierMu.RUnlock()
+	if !found {
+		return ModelCatalogData{}, tier, false
+	}
+	if catalog.contentKey == "" {
+		catalog.contentKey = catalogContentKey(catalog)
+	}
+	return ModelCatalogData{catalog: catalog}, tier, true
+}
 
 // NewClient 创建协议客户端
 func NewClient(options ClientOptions) (*Client, error) {
@@ -174,6 +211,10 @@ func (e *RPCError) HTTPStatus() int {
 func (c *Client) do(ctx context.Context, method string, accountID string, requestID string, body []byte, streaming bool) (*RPCResponse, error) {
 	rpc := newRPCRequest(method, accountID, requestID, body, streaming)
 	c.applyBenefitTier(method, accountID, rpc.Header)
+	// 带租约的非生成 RPC 计入所在出口通道（只计数，供状态与诊断，不准入、不改请求，见 egress_rate.go）
+	if lease, ok := AccountLeaseFromContext(ctx); ok {
+		lease.noteOtherSend()
+	}
 	response, err := c.transport.Do(ctx, rpc)
 	if err != nil {
 		return nil, fmt.Errorf("发送 AI Studio %s: %w", method, err)

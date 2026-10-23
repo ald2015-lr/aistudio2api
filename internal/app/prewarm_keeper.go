@@ -52,6 +52,8 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	// 驻留 Worker 中的死槽位每个周期补登记淘汰（忙碌的由淘汰循环排空），全局长时间冷却的空闲 Worker 每个周期清扫，
 	// 不等 30 秒一轮的按模型轮换
 	service.registerDeadWorkers()
+	// 已不可调度（需要登录、已停用、没有模型目录）的驻留 Worker 同样每个周期补登记释放（见 worker_unschedulable.go）
+	service.registerUnschedulableWorkers()
 	service.sweepDeadWorkers(dataContext)
 	if time.Since(lastRotation) >= rotationInterval {
 		lastRotation = time.Now()

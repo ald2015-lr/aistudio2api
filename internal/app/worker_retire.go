@@ -22,7 +22,9 @@ import (
 // 三条路径与 ensureWorker 的替换共用 tryReserveVictim，同一个 Worker 不会被两边同时淘汰；淘汰经 evictIdleWorker 取账号的独占租约，
 // 正在服务请求的 Worker 永远不会被关闭。只有分区内有可接替的账户时才淘汰：小规模部署全部账号都冷却时保留 Worker，
 // 冷却到期后能立即服务。登记了却一直忙碌的 Worker（饱和时其他模型的请求一直在用它）先排空再淘汰，替补在排空开始时就启动，
-// 见 worker_drain.go；keepWarm 每个周期把驻留 Worker 中的死槽位补登记（registerDeadWorkers），重启后与其他进程写入的冷却同样会被淘汰
+// 见 worker_drain.go；keepWarm 每个周期把驻留 Worker 中的死槽位补登记（registerDeadWorkers），重启后与其他进程写入的冷却同样会被淘汰。
+// 不可调度的驻留 Worker（账号需要登录、已停用、没有模型目录等，见 worker_unschedulable.go）共用这张登记表与淘汰循环，按释放处理：
+// 空闲即关，忙碌等请求结束，不排空、不要求可接替账户、不走排空超时，关闭后只补齐预热
 
 const (
 	// retireDebounce 为淘汰循环两轮之间的最短间隔：租约释放很频繁，忙碌中的登记不必每次都重试
@@ -43,6 +45,9 @@ type retirement struct {
 	since  time.Time
 	// retryAt 为上次淘汰未成功后下一次尝试的时间，零值为随时可试
 	retryAt time.Time
+	// unschedulable 为不可调度登记的原因（需要登录、已停用、没有模型目录等，见 worker_unschedulable.go），空为冷却登记。
+	// 不可调度登记按释放处理（见 retirePass）；账号恢复可调度后清空，原先另有冷却登记的照常按冷却核对，只有不可调度登记的随后放弃
+	unschedulable string
 }
 
 // global 判断登记是否为全局冷却
@@ -79,6 +84,13 @@ func (entry retirement) scopeLabel() string {
 		return "全局"
 	}
 	return strings.Join(entry.models, ",")
+}
+
+// stillUnschedulable 按淘汰循环本轮一次加锁取得的账户状态核对不可调度：返回写上当前原因的登记，ok 为账号此刻不可调度
+// （冷却登记的账号后来不可调度时同样为真）；账号已恢复可调度时返回清空原因的登记、ok 为假，调用方再按冷却核对
+func (entry retirement) stillUnschedulable(state aistudio.WarmWorkerState) (retirement, bool) {
+	entry.unschedulable = state.Unschedulable
+	return entry, entry.unschedulable != ""
 }
 
 // stillCooling 返回登记中账号仍长时间冷却的范围：全局登记按全局冷却判断，按模型的登记只保留仍冷却的模型；
@@ -135,6 +147,48 @@ func (manager *accountWorkerManager) registerRetirement(accountID string, modelI
 	manager.retireMu.Unlock()
 	manager.wakeRetire()
 	return true, true
+}
+
+// registerUnschedulable 登记释放不可调度账号的驻留 Worker（reason 为原因）并唤醒淘汰循环；账号没有驻留 Worker 时不登记。
+// 与冷却登记同锁、同一张表：已有冷却登记时改为不可调度登记（保留冷却的范围，恢复可调度后仍按冷却核对），并清除推迟：
+// 排空超时被推迟 1 分钟、没有可接替账户被推迟 30 秒的登记都立即处理。registered、added 的含义同 registerRetirement
+// （已是不可调度登记时 added 为假，只更新原因）
+func (manager *accountWorkerManager) registerUnschedulable(accountID string, reason string) (registered bool, added bool) {
+	manager.mu.RLock()
+	account := manager.accounts[accountID]
+	manager.mu.RUnlock()
+	if account == nil || !account.warm.Load() {
+		return false, false
+	}
+	manager.retireMu.Lock()
+	if manager.retirements == nil {
+		manager.retirements = make(map[string]*retirement)
+	}
+	if existing := manager.retirements[accountID]; existing != nil {
+		if existing.unschedulable == "" {
+			existing.retryAt, added = time.Time{}, true
+		}
+		existing.unschedulable = reason
+		manager.retireMu.Unlock()
+		if added {
+			manager.wakeRetire()
+		}
+		return true, added
+	}
+	manager.retirements[accountID] = &retirement{since: time.Now(), unschedulable: reason}
+	manager.retirePending.Store(int32(len(manager.retirements)))
+	manager.retireMu.Unlock()
+	manager.wakeRetire()
+	return true, true
+}
+
+// setUnschedulableReason 写回登记的不可调度原因（retirePass 按本轮的账户状态核对后调用；空为已恢复可调度）；没有登记时不做任何事
+func (manager *accountWorkerManager) setUnschedulableReason(accountID string, reason string) {
+	manager.retireMu.Lock()
+	if entry := manager.retirements[accountID]; entry != nil {
+		entry.unschedulable = reason
+	}
+	manager.retireMu.Unlock()
 }
 
 // wakeRetire 唤醒淘汰循环；没有登记时不唤醒，重复唤醒合并
@@ -228,7 +282,10 @@ func (candidate retirementCandidate) spareKey() string {
 // （冷却被清除或缩短时放弃淘汰并清除排空），再要求分区内有能服务登记模型的可接替账户（按登记的模型统计，不会换上同一模型的
 // 另一个死槽位）；账号正在启动或被其他路径选中时留到下一轮。忙碌的登记（全局冷却，或在主用、热门模型上冷却，见 drainable）
 // 在分区排空数低于 drainLimit 时标记排空（最老的登记先排空）并立即启动替补，排空中的账号空闲后关闭，超过排空超时仍忙碌时
-// 清除排空、1 分钟后再试；只在其他模型上冷却的忙碌登记不排空，空闲后照常淘汰。关闭并发进行，数量不超过启动并发
+// 清除排空、1 分钟后再试；只在其他模型上冷却的忙碌登记不排空，空闲后照常淘汰。关闭并发进行，数量不超过启动并发。
+// 账号不可调度（需要登录、已停用、没有模型目录等；冷却登记的账号后来不可调度的同样）时按释放处理：不核对可接替账户、不排空，
+// 也不走排空超时（已在排空的账号请求结束后下一轮即关闭，不再推迟 1 分钟）；忙碌时留到租约释放后被再次唤醒，空闲时与冷却登记
+// 共用每轮的关闭并发
 func (manager *accountWorkerManager) retirePass() int {
 	now := time.Now()
 	manager.retireMu.Lock()
@@ -302,6 +359,31 @@ func (manager *accountWorkerManager) retirePass() int {
 			manager.dropRetirement(accountID)
 			continue
 		}
+		// 不可调度按本轮一次加锁取得的状态核对（见 stillUnschedulable）：不可调度的账号拿不到不固定账户的新租约，忙碌只是还在跑
+		// 旧请求或独占操作，空闲即关；不核对可接替账户、不排空、不走下面的排空超时分支。账号已恢复可调度（验证通过、重新启用、
+		// 目录恢复）时撤销不可调度登记，原先另有冷却登记的照常按冷却核对，没有的随后放弃
+		release, unschedulable := candidate.entry.stillUnschedulable(states[accountID])
+		if release.unschedulable != candidate.entry.unschedulable {
+			manager.setUnschedulableReason(accountID, release.unschedulable)
+		}
+		candidate.entry = release
+		if unschedulable {
+			if manager.workerStarting(account, accountID) || states[accountID].Busy || !manager.tryReserveVictim(accountID) {
+				continue
+			}
+			// 选中之前其他路径（现场回收、按需替换）可能刚关掉它：持有淘汰标记后再核对一次，免得对已关闭的账号再写一条释放
+			if !account.warm.Load() {
+				manager.releaseVictim(accountID)
+				manager.dropRetirement(accountID)
+				continue
+			}
+			candidate.drain = manager.drainOf(accountID)
+			victims = append(victims, candidate)
+			if len(victims) >= max(manager.warmConcurrencyValue(), 1) {
+				break
+			}
+			continue
+		}
 		// 只要登记里还有一个模型（或全局）仍长时间冷却，账号就仍是死槽位；日志只写仍在冷却的范围
 		cooling, ok := candidate.entry.stillCooling(manager.pool, accountID)
 		if !ok {
@@ -309,14 +391,9 @@ func (manager *accountWorkerManager) retirePass() int {
 			continue
 		}
 		candidate.entry = cooling
-		if _, starting := manager.openingSet.Load(accountID); starting {
+		if manager.workerStarting(account, accountID) {
 			continue
 		}
-		// 与 idleWarmVictimFor 相同：正在启动或替换的账户不淘汰，避免与持有 startupMu 等 rebalanceMu 的启动流程互相等待
-		if !account.startupMu.TryLock() {
-			continue
-		}
-		account.startupMu.Unlock()
 		partition := candidate.partition
 		busy := states[accountID].Busy
 		candidate.drain = manager.drainOf(accountID)
@@ -393,8 +470,12 @@ func (manager *accountWorkerManager) retirePass() int {
 }
 
 // finishRetirement 关闭一个已选中的待淘汰 Worker；调用方已 tryReserveVictim。关闭后补齐预热，并按 replacementsFor 在分区内启动替补
-// （排空开始时的替补已启动或仍在启动时不重复补）
+// （排空开始时的替补已启动或仍在启动时不重复补）。不可调度登记见 finishRelease
 func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate) {
+	if victim.entry.unschedulable != "" {
+		manager.finishRelease(victim)
+		return
+	}
 	accountID := victim.accountID
 	evicted, err := manager.evictIdleWorker(manager.lifecycle, accountID)
 	manager.releaseVictim(accountID)
@@ -425,6 +506,47 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 		}
 		manager.startReplacements(plan, "冷却淘汰")
 	}
+}
+
+// finishRelease 关闭一个不可调度登记的 Worker（写“WAA Worker 释放”，不写“冷却淘汰”）；调用方已 tryReserveVictim。
+// 关闭后只补齐预热（afterRetire），不按 replacementsFor 启替补：替补按冷却模型挑选，这里空出的槽位由预热按偏好补上；
+// 出口限流时预热走补位路径，只受补位并发约束
+func (manager *accountWorkerManager) finishRelease(victim retirementCandidate) {
+	accountID := victim.accountID
+	evicted, err := manager.evictIdleWorker(manager.lifecycle, accountID)
+	manager.releaseVictim(accountID)
+	switch {
+	case err != nil:
+		manager.clearDrain(accountID)
+		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 释放失败 | 原因=%s | 错误=%v", victim.entry.unschedulable, err))
+		manager.deferRetirement(accountID, time.Now().Add(retireFailureBackoff))
+	case !evicted:
+		// 取独占租约时账号又有了请求（指定账户的请求、独占操作），等下一次唤醒
+	default:
+		manager.dropRetirement(accountID)
+		partition := partitionOf(accountID, manager.pool.UltraAccountIDs())
+		manager.requests.log(accountID, "INFO", fmt.Sprintf(
+			"WAA Worker 释放 | 原因=%s | 登记后=%s | %s=%d/%d",
+			victim.entry.unschedulable, time.Since(victim.entry.since).Round(time.Millisecond),
+			workerSlotName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
+		))
+		if refill := manager.afterRetire.Load(); refill != nil {
+			(*refill)()
+		}
+	}
+}
+
+// workerStarting 判断账户正在启动或替换 Worker（与 idleWarmVictimFor 相同的口径）：这时不淘汰、不释放，避免与持有 startupMu
+// 等 rebalanceMu 的启动流程互相等待，留到下一轮
+func (manager *accountWorkerManager) workerStarting(account *accountWorker, accountID string) bool {
+	if _, starting := manager.openingSet.Load(accountID); starting {
+		return true
+	}
+	if !account.startupMu.TryLock() {
+		return true
+	}
+	account.startupMu.Unlock()
+	return false
 }
 
 // retireCooledWorker 在 applyQuotaCooldown 写入冷却后判断该账号的驻留 Worker 是否已成死槽位并登记淘汰：
@@ -517,19 +639,61 @@ func (service *trackedService) registerDeadWorkersIn(warm []string, models []str
 type victimMode int
 
 const (
-	// victimAny 任意空闲 Worker：死槽位优先，其次冷却中的，再次最久未用；剩余不到 aistudio.ShortCooldownMax 的短冷却
-	// （分钟限额、限流）不算冷却中，与健康的空闲 Worker 同档按最久未用排序
+	// victimAny 任意空闲 Worker：不可调度的优先（账号需要登录、已停用、没有模型目录，不是任何模型的候选），其次死槽位、冷却中的，
+	// 再次最久未用；剩余不到 aistudio.ShortCooldownMax 的短冷却（分钟限额、限流）不算冷却中，与健康的空闲 Worker 同档按最久未用排序
 	victimAny victimMode = iota
-	// victimCooling 只选冷却中的（剩余不少于 ShortCooldownMax，见 WarmWorkerStates），死槽位优先
+	// victimCooling 只选冷却中的（剩余不少于 ShortCooldownMax，见 WarmWorkerStates）与不可调度的，不可调度、死槽位优先：
+	// 同分区有 Worker 正在启动时按需替换也能换掉僵尸 Worker
 	victimCooling
-	// victimDead 只选死槽位（账号长时间冷却）
+	// victimDead 只选死槽位（账号长时间冷却）与不可调度的，不可调度的优先：请求现场回收也能回收僵尸 Worker
 	victimDead
+	// victimReplaceable 为同分区有 Worker 正在启动时的按需替换（N3）：除 victimCooling 的范围外，健康的空闲 Worker 对请求的模型不可服务
+	// （目录里没有、权益或通道不支持），或空闲超过 victimIdleReplaceAfter 时也可以换掉。原先这时只换冷却中的，而现场提升判断“能不能替换”
+	// 用的是任意空闲 Worker（promotable），两边口径不一致，线上 pro 227 行、flash 48 行“Worker 容量已满”
+	victimReplaceable
+)
+
+const (
+	// victimIdleReplaceAfter 为 victimReplaceable 下健康空闲 Worker 可以被换掉的最短空闲时间
+	victimIdleReplaceAfter = 2 * time.Minute
 )
 
 // pickIdleVictim 在分区内按 mode 选择空闲热 Worker。账户池只加锁一次取得全部候选的活动与冷却状态；
 // 正在启动、替换、关闭或被其他路径选中的账户不作为候选（原因见 idleWarmVictimFor 的注释）
 func (manager *accountWorkerManager) pickIdleVictim(excludeID string, modelID string, mode victimMode, partition aistudio.PoolScope) string {
-	return manager.pickIdleVictimFor(excludeID, modelID, nil, mode, partition, time.Time{})
+	return manager.pickIdleVictimWith(excludeID, modelID, nil, mode, partition, time.Time{}, false)
+}
+
+// pickReplaceVictim 为按需替换与扩容的淘汰选号（N6）：与 pickIdleVictim 相同，另外不选就绪不到 rotationWarmupGrace 的 Worker
+// （不可调度与死槽位除外）。冷却轮换早就有这条宽限，替换与扩容原先没有：刚冷启动的 Worker 第一个请求被裸限流冷却，
+// 马上又被换掉、再冷启动一个，30 分钟 700–1000 次启停里有一部分就是这样来回换
+func (manager *accountWorkerManager) pickReplaceVictim(excludeID string, modelID string, mode victimMode, partition aistudio.PoolScope) string {
+	return manager.pickIdleVictimWith(excludeID, modelID, nil, mode, partition, time.Time{}, true)
+}
+
+// replaceVictimFor 为按需替换（ensureWorker）与现场提升判断“能否替换”（promotable）共用的淘汰选号（N3）：分区没有 Worker 在启动时
+// 任意空闲 Worker（victimAny），有 Worker 在启动时按 victimReplaceable；都带启动宽限（见 pickReplaceVictim）。
+// 是否有 Worker 在启动读无锁镜像 openingSet，调用方不必持有 rebalanceMu
+func (manager *accountWorkerManager) replaceVictimFor(excludeID string, modelID string, partition aistudio.PoolScope) string {
+	mode := victimAny
+	if manager.openingInSet(partition) {
+		mode = victimReplaceable
+	}
+	return manager.pickReplaceVictim(excludeID, modelID, mode, partition)
+}
+
+// openingInSet 返回分区内是否有 Worker 正在启动（读无锁镜像 openingSet）
+func (manager *accountWorkerManager) openingInSet(partition aistudio.PoolScope) bool {
+	ultra := manager.pool.UltraAccountIDs()
+	opening := false
+	manager.openingSet.Range(func(key, _ any) bool {
+		if accountID, ok := key.(string); ok && partitionOf(accountID, ultra) == partition {
+			opening = true
+			return false
+		}
+		return true
+	})
+	return opening
 }
 
 // pickIdleVictimFor 与 pickIdleVictim 相同，另把在 deadModels 任一模型上长时间冷却的账户也算作死槽位（再多加锁一次）：
@@ -538,8 +702,20 @@ func (manager *accountWorkerManager) pickIdleVictim(excludeID string, modelID st
 func (manager *accountWorkerManager) pickIdleVictimFor(
 	excludeID string, modelID string, deadModels []string, mode victimMode, partition aistudio.PoolScope, idleBefore time.Time,
 ) string {
+	return manager.pickIdleVictimWith(excludeID, modelID, deadModels, mode, partition, idleBefore, false)
+}
+
+// pickIdleVictimWith 为淘汰选号的实现；grace 为真时不选就绪不到 rotationWarmupGrace 的 Worker（不可调度与死槽位除外）
+func (manager *accountWorkerManager) pickIdleVictimWith(
+	excludeID string, modelID string, deadModels []string, mode victimMode, partition aistudio.PoolScope, idleBefore time.Time, grace bool,
+) string {
+	now := time.Now()
+	// 启动宽限只在 newRuntime 打开（replaceGrace 为 rotationWarmupGrace）；测试直接构造的管理器为 0，替换照旧立即可选
+	replaceGrace := time.Duration(manager.replaceGrace.Load())
+	grace = grace && replaceGrace > 0
 	warm := manager.warmAccountIDsIn(partition)
 	candidates := make([]string, 0, len(warm))
+	readyAt := make(map[string]time.Time, len(warm))
 	for _, accountID := range warm {
 		if accountID == excludeID || manager.victimReserved(accountID) {
 			continue
@@ -575,6 +751,7 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 			continue
 		}
 		candidates = append(candidates, accountID)
+		readyAt[accountID] = time.Unix(0, account.readyAt.Load())
 	}
 	if len(candidates) == 0 {
 		return ""
@@ -590,9 +767,13 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 	}
 	rank := func(state aistudio.WarmWorkerState) int {
 		switch {
+		case state.Unschedulable != "":
+			return 4
 		case state.Dead:
-			return 2
+			return 3
 		case state.Cooling:
+			return 2
+		case state.Unservable:
 			return 1
 		}
 		return 0
@@ -601,7 +782,15 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 	var selectedState aistudio.WarmWorkerState
 	for _, accountID := range candidates {
 		state := states[accountID]
-		if state.Busy || mode == victimCooling && !state.Cooling || mode == victimDead && !state.Dead {
+		unschedulable := state.Unschedulable != ""
+		if state.Busy || mode == victimCooling && !state.Cooling && !unschedulable || mode == victimDead && !state.Dead && !unschedulable {
+			continue
+		}
+		if mode == victimReplaceable && !unschedulable && !state.Dead && !state.Cooling && !state.Unservable &&
+			now.Sub(state.LastUsed) < victimIdleReplaceAfter {
+			continue
+		}
+		if grace && !unschedulable && !state.Dead && now.Sub(readyAt[accountID]) < replaceGrace {
 			continue
 		}
 		if !idleBefore.IsZero() && state.LastUsed.After(idleBefore) {
@@ -615,7 +804,7 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 	return selected
 }
 
-// reclaimDeadWorker 现场回收分区内一个对该模型是死槽位的空闲 Worker，返回回收的账户；
+// reclaimDeadWorker 现场回收分区内一个对该模型是死槽位（或账号已不可调度）的空闲 Worker，返回回收的账户；
 // 没有死槽位、已被其他路径选中或淘汰时账号又忙碌时返回空。回收后不启动替补：调用的请求随后自己启动备用账号补上空出的槽位，
 // 另起替补会与它争同一个槽位，替补先占到时请求按替换流程再淘汰一个空闲 Worker，或只能等替补冷启动、主用模型排队超限返回 429
 func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, partition aistudio.PoolScope, modelID string) (string, error) {
@@ -648,4 +837,17 @@ func (manager *accountWorkerManager) deadWarmCounts(warm []string, ultra map[str
 	ultraDead = len(manager.pool.LongCoolingSet(inPartition(warm, ultra, aistudio.PoolScopeUltra),
 		manager.deadSlotModelsFor(aistudio.PoolScopeUltra), rotationMinRemaining, false))
 	return normal, ultraDead
+}
+
+// unschedulableWarmCounts 统计各分区驻留 Worker 中不可调度的账号数（需要登录、已停用、不可用、没有模型目录，等待释放），供状态页显示；
+// 口径与补登记释放（registerUnschedulableWorkers）一致，与死槽位分开计：死槽位的口径不变，同一账号既长时间冷却又不可调度时两边都计
+func (manager *accountWorkerManager) unschedulableWarmCounts(warm []string, ultra map[string]struct{}) (normal int, ultraCount int) {
+	for accountID := range manager.pool.UnschedulableSet(warm) {
+		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
+			ultraCount++
+		} else {
+			normal++
+		}
+	}
+	return normal, ultraCount
 }

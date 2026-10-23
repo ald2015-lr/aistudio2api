@@ -158,7 +158,7 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 		if TranscriptionGenerationFailure(requestErr) {
 			stateErr = s.markRetryableFailure(lease, modelID, requestErr)
 		} else if DefinitiveAuthenticationFailure(requestErr) {
-			stateErr = lease.MarkAuthenticationRequired(requestErr.Error())
+			_, stateErr = lease.MarkAuthenticationFailure(requestErr)
 		} else {
 			stateErr = s.pool.MarkCooldownIfGeneration(
 				accountID, "", accessGeneration, checkedAt,

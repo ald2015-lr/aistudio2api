@@ -353,8 +353,25 @@ def row_class(row):
         return "客户端取消"
     if state == "blocked":
         return "被上游中止（安全审核等）"
+    # 出口限流判定成立期间（app/egress_guard.go）：出口令牌桶已满、排队超过上限的 429 用独立首段（aistudio/accounts.go CapacityBusyError）
+    if error.startswith("出口限速：") or "所在出口每分钟请求已满" in error:
+        return "出口限速排队超限 429"
+    if "号池繁忙" in error and "最后等待原因：驻留账号该模型额度已用完" in error:
+        return "驻留额度用完排队超限 429"
+    # 出口限流期间要冷启动的 Worker 被出口闸门暂停（转写、Live、Veo，指定账户的生成；app/egress_guard.go newEgressColdStartBusy）：
+    # 文案是号池繁忙，但原因是出口限流、没有排队（响应头 egress_limited）
+    if "号池繁忙" in error and "最后等待原因：出口限流中，冷启动按配额进行" in error:
+        return "出口冷启动暂停 429"
     if "号池繁忙" in error:
         return "号池繁忙 429（排队超上限）"
+    # 普通号池的换号上限（aistudio/accounts.go PrimaryQuotaError 的 Kind）：两条新文案都不含“主用模型”，先于 Ultra 的判断
+    if "上游限流：" in error:
+        return "出口限流 429（换号已达上限）"
+    # Ultra 主用模型在出口限流时达到换号上限：文案仍是 Ultra 主用模型额度不足，按原因认出口限流（响应头 egress_limited）
+    if "额度不足：" in error and "主用模型" in error and "原因：上游出口限流" in error:
+        return "出口限流 429（换号已达上限）"
+    if "额度不足：" in error and "换号重试已达上限" in error:
+        return "换号上限 429（普通号池）"
     if "额度不足：" in error and "主用模型" in error:
         return "Ultra 主用模型额度不足 429"
     if "可用账户均在冷却" in error:
@@ -376,9 +393,18 @@ def row_class(row):
     return f"HTTP {status}·" + short_text(error, 30)
 
 
+# 出口限速排队超限、驻留额度用完排队超限、出口冷启动暂停与号池繁忙同属本地返回的 429（文案见 aistudio/accounts.go CapacityBusyError，
+# 最后等待原因分别为“出口限速”“驻留账号该模型额度已用完”“出口限流中，冷启动按配额进行”）
+BUSY_PREFIXES = ("号池繁忙", "出口限速排队超限", "驻留额度用完排队超限", "出口冷启动暂停")
+
+
 def busy_fields(error):
-    # 号池繁忙文案（aistudio/accounts.go CapacityBusyError.Error）：已排队、上限、总耗时、现场冷启动、第几次尝试、最后等待原因
-    if "号池繁忙" not in (error or ""):
+    # 号池繁忙文案（aistudio/accounts.go CapacityBusyError.Error）：已排队、上限、总耗时、现场冷启动、等后台扩容、第几次尝试、最后等待原因；
+    # 总耗时后的括号写成“（含现场冷启动 X、等后台扩容 Y）”，两项都可能单独出现；
+    # 出口限速排队超限的文案以“出口限速：”开头、不写最后等待原因，原因按“出口限速”计
+    error = error or ""
+    egress = error.startswith("出口限速：") or "所在出口每分钟请求已满" in error
+    if "号池繁忙" not in error and not egress:
         return None
 
     def grab(pattern):
@@ -387,8 +413,9 @@ def busy_fields(error):
     attempt = grab(r"第 (\d+) 次尝试")
     return {
         "waited": go_duration(grab(r"已排队 ([^，）]+)")), "limit": go_duration(grab(r"上限 ([^，）]+)")),
-        "elapsed": go_duration(grab(r"总耗时 ([^，）（]+)")), "cold": go_duration(grab(r"含现场冷启动 ([^）]+)")),
-        "attempt": int(attempt) if attempt else None, "reason": (grab(r"最后等待原因：([^）\n]+)") or "未知").strip(),
+        "elapsed": go_duration(grab(r"总耗时 ([^，）（]+)")), "cold": go_duration(grab(r"含现场冷启动 ([^）、]+)")),
+        "attempt": int(attempt) if attempt else None,
+        "reason": "出口限速" if egress else (grab(r"最后等待原因：([^）\n]+)") or "未知").strip(),
     }
 
 
@@ -480,6 +507,14 @@ LOG_KEYS = [key.encode() for key in (
     "Worker 就绪", "Worker 启动失败", "按需扩容", "按需替换", "空闲回收", "冷却轮换", "冷却淘汰", "补登记淘汰", "排空",
     "Worker 重建", "Worker 停止 |", "替补", "回收冷却占位", "常驻 Worker 已失败",
     "管理服务就绪", "收到停止信号", "排队进度日志已省略", "请求账本写入队列已满", "控制台队列已满", "额度 429 详情未识别")]
+# 不可调度驻留 Worker 的释放（app/worker_unschedulable.go）：“WAA Worker 释放 |”“WAA Worker 释放失败”“WAA Worker 补登记释放”
+LOG_KEYS += [key.encode() for key in ("Worker 释放", "补登记释放")]
+# 第 9 段：模型目录缓存与后台同步（app/catalog_sync.go）、账号需要登录
+LOG_KEYS += [key.encode() for key in ("模型目录", "账号需要登录 |")]
+# 出口限流判定（app/egress_guard.go）：判定成立/解除/撤销/恢复、限速调整与停止、撤回逐级冷却、按账号降级、暂停冷启动等，都是持久行
+LOG_KEYS += [key.encode() for key in ("出口限流", "出口限速", "出口每分钟请求已满", "出口几乎完全被拒")]
+# 第 9 段：登录复核（app/auth_recheck.go）与坏号记忆（app/bad_accounts.go）、管理验证的结论
+LOG_KEYS += [key.encode() for key in ("登录复核", "疑似登录失效", "连续裸限流", "账户验证完成")]
 
 
 def first_time_from(handle, position, size):
@@ -684,13 +719,34 @@ model_supplies = [s for s in supplies if model_key(s.get("model")) == MODEL]
 if status:
     print(f"  服务：{status.get('state')}  版本 {status.get('version')}  活动请求 {status.get('active_requests')}")
     print(f"  账户：共 {account_counts.get('total')}，就绪 {account_counts.get('ready')}，忙碌 {account_counts.get('busy')}，"
-          f"冷却 {account_counts.get('cooldown')}，需要登录 {account_counts.get('auth_required')}")
+          f"冷却 {account_counts.get('cooldown')}，需要登录 {account_counts.get('auth_required')}"
+          # auth_required_10m 为 0 时状态接口省略它：按是否有登录复核（同一版本加入）判断新旧版本，旧版本不显示“新增 0”
+          + (f"（最近 10 分钟新增 {account_counts.get('auth_required_10m') or 0}）"
+             if "auth_required_10m" in account_counts or isinstance(status.get("auth_recheck"), dict) else "")
+          + (f"，坏号 {status.get('bad_accounts') or 0}" if status.get("running") else ""))
+    # 登录复核（app/auth_recheck.go status）：上游 401 先记疑似、复核仍是 401 才标需要登录；需要登录的账户每 15 分钟复核一轮
+    auth_recheck = status.get("auth_recheck")
+    if isinstance(auth_recheck, dict):
+        next_round = parse_time(auth_recheck.get("next_round") or "")
+        print(f"  登录复核：疑似失效={auth_recheck.get('suspects') or 0} 本轮待复核={auth_recheck.get('queued') or 0} 进行中={auth_recheck.get('running') or 0} "
+              f"1小时：排除={auth_recheck.get('cleared_1h') or 0} 确认={auth_recheck.get('confirmed_1h') or 0} 恢复={auth_recheck.get('recovered_1h') or 0} "
+              f"仍失效={auth_recheck.get('still_invalid_1h') or 0} 跳过={auth_recheck.get('skipped_1h') or 0} "
+              f"下一轮={local(next_round) if next_round and next_round.year > 2000 else '-'}"
+              + (f" 暂停（{auth_recheck.get('pause_reason')}）" if auth_recheck.get("pause_reason") else ""))
+    elif status.get("running"):
+        print("  登录复核：这个版本的状态接口没有 auth_recheck 字段（一次 401 就标需要登录，运行中不会自动恢复）")
     print(f"  普通分区 Worker：就绪 {workers.get('warm')} / 预热目标 {workers.get('target')} / 峰值 {workers.get('max')}，"
           f"启动中 {workers.get('starting')}，占用槽位 {workers.get('occupied')}，死槽位 {workers.get('dead')}，"
           f"排空中 {workers.get('draining')}，待淘汰 {workers.get('retiring')}")
     if ultra_workers.get("max"):
         print(f"  Ultra 分区 Worker：就绪 {ultra_workers.get('warm')} / 预热目标 {ultra_workers.get('target')} / 峰值 {ultra_workers.get('max')}，"
               f"启动中 {ultra_workers.get('starting')}，死槽位 {ultra_workers.get('dead') or 0}，排空中 {ultra_workers.get('draining') or 0}")
+    # 不可调度（app/worker_unschedulable.go）：驻留 Worker 的账号需要登录、已停用、不可用或没有模型目录，不是任何模型的候选，等待释放
+    if "unschedulable" in workers:
+        print(f"  驻留 Worker 不可调度={(workers.get('unschedulable') or 0) + (ultra_workers.get('unschedulable') or 0)}"
+              f"（普通 {workers.get('unschedulable') or 0}，Ultra {ultra_workers.get('unschedulable') or 0}；需要登录、已停用或没有模型目录，空闲即释放）")
+    else:
+        print("  驻留 Worker 不可调度=-（这个版本的状态接口没有 unschedulable 字段）")
     for supply in supplies:
         pool = "Ultra 分区" if supply.get("pool") == "ultra" else "普通分区"
         cooling = (f"，对它冷却中的驻留 Worker {supply.get('cooling')} 个" if "cooling" in supply
@@ -699,6 +755,35 @@ if status:
               f"空闲备用账号 {supply.get('standby')}{'+' if supply.get('standby_capped') else ''} 个{cooling}")
     if supplies:
         print("    （约 30 秒统计一次；warm 不含冷却中与排空中的，cooling 为所有支持的启用通道都在冷却的驻留 Worker，含 2 分钟内的短冷却）")
+    catalog_sync = status.get("catalog_sync")
+    if isinstance(catalog_sync, dict):
+        # 没有暂停时服务端给的是零值时间 0001-01-01，按没有处理
+        paused_until = parse_time(catalog_sync.get("paused_until") or "")
+        reason = catalog_sync.get("pause_reason") or ""
+        pause_text = (local(paused_until) if paused_until and paused_until.year > 2000 else "-") + (f"（{reason}）" if reason else "")
+        print(f"  目录：有目录={catalog_sync.get('cached', 0)} 来自磁盘={catalog_sync.get('from_disk', 0)} 缺失={catalog_sync.get('missing', 0)} "
+              f"过期={catalog_sync.get('expired', 0)} 疑似失效={catalog_sync.get('auth_suspects', 0)} 队列={catalog_sync.get('queued', 0)} "
+              f"暂停到={pause_text} 账户忙推后={catalog_sync.get('skipped_busy_1h', 0)}")
+    elif status.get("running"):
+        print("  目录：这个版本的状态接口没有 catalog_sync 字段（没有模型目录写盘缓存，每次启动全量同步）")
+    # 出口限流判定与限速（app/egress_guard.go status）：每出口一行，只有直连一个出口且没有判定时也有
+    egress_status = [item for item in status.get("egress") or [] if isinstance(item, dict)]
+    if "egress" not in status and status.get("state") == "RUNNING":
+        print("  出口：状态接口没有 egress 字段（这个版本还没有出口限流判定）")
+    for item in egress_status:
+        lanes = {lane.get("lane"): lane for lane in item.get("lanes") or [] if isinstance(lane, dict)}
+
+        def lane_sum(key):
+            return sum(lane.get(key) or 0 for lane in lanes.values())
+        print(f"  出口：{item.get('label')} 模式={item.get('mode')} 限速器={item.get('limiter')} "
+              f"普通限速={(lanes.get('normal') or {}).get('limit_rpm') or 0}/分钟 Ultra限速={(lanes.get('ultra') or {}).get('limit_rpm') or 0}/分钟 "
+              f"已发1分钟={lane_sum('sent_1m')} 主用={lane_sum('primary_sent_1m')} 其他RPC={lane_sum('other_sent_1m')} "
+              f"成功1分钟={item.get('success_1m') or 0} 裸429={item.get('bare_429_1m') or 0} 比例2分钟={item.get('ratio_2m') or 0:.2f} "
+              f"进入时={item.get('ratio_entry') or 0:.2f} 冷号首发={item.get('fresh_rejects_2m') or 0} 排队={item.get('queued') or 0} "
+              f"本地429={item.get('local_429_1m') or 0} 复试={item.get('retried') or 0} 恢复={item.get('recovered') or 0} "
+              f"降级={item.get('demoted') or 0} 冷启动中={lane_sum('cold_starting')} 补位推迟={lane_sum('refill_deferred_1m')}")
+        if item.get("mode") == "rejected":
+            print(f"    判定已撤销（{item.get('rejected_by') or '?'}），到 {local(parse_time(item.get('rejected_until')))} 前不再判定")
 elif API_STATE in ("down", "denied", "offline"):
     print("  管理接口不可用，跳过")
 else:
@@ -768,7 +853,8 @@ else:
             cell[0] += 1
             if row["success"]:
                 cell[1] += 1
-            elif row["class"].startswith("号池繁忙"):
+            elif row["class"].startswith(BUSY_PREFIXES):
+                # 出口限速、驻留额度用完的排队超限、出口冷启动暂停与号池繁忙同属本地返回的 429（没有发往上游）
                 cell[2] += 1
             elif "429" in row["class"]:
                 cell[3] += 1
@@ -779,7 +865,7 @@ else:
 
 # ================= 2. 号池繁忙与排队快照 =================
 section("2. 号池繁忙 429：最后等待原因、此前的失败与排队超限时的候选快照")
-busy_rows = [row for row in window_rows if row["class"] and row["class"].startswith("号池繁忙")]
+busy_rows = [row for row in window_rows if row["class"] and row["class"].startswith(BUSY_PREFIXES)]
 if not busy_rows:
     print("  账本中窗口内没有号池繁忙 429" + ("" if connection is not None else "（账本读不到）"))
 else:
@@ -798,6 +884,13 @@ else:
         if title == "全部模型" or len(model_busy) != len(busy_rows):
             pools = collections.Counter("Ultra 号池" if row["pool"] == "ultra" else "普通号池" for row, _ in parsed)
             print(f"    {title}：{len(data)} 个（{top(pools)}）；最后等待原因：{top(reasons, 6, len(data))}")
+            paused = reasons.get("出口限流中，冷启动按配额进行", 0)
+            if title == "全部模型" and (reasons.get("出口限速") or reasons.get("驻留账号该模型额度已用完") or paused):
+                advice = ("出口限速：出口被判定限流，排队超过上限即 429，属于预期；吞吐上限约为出口限速"
+                          f"（出口限速 {reasons.get('出口限速', 0)} 个、驻留账号该模型额度已用完 {reasons.get('驻留账号该模型额度已用完', 0)} 个、"
+                          f"冷启动被出口闸门暂停 {paused} 个，见第 4b 段）")
+                print("      " + advice)
+                VERDICTS.append(advice)
             print(f"      结束时是第几次尝试：{top(attempts, 5, len(data))}；账本里此前失败的上游尝试数：" +
                   "，".join(f"{k} 次 {share(v, len(data))}" for k, v in sorted(prior.items())[:6]) +
                   ("" if connection is not None else "（日志回退时没有逐次尝试，一律记为 0）"))
@@ -1048,6 +1141,7 @@ for e in logs:
         "t": e["t"], "account": e["source"], "scope": info.get("范围", ""), "model": bare_scope(info.get("范围", "")),
         "level": level, "synced": info.get("同步") == "两个通道", "systemic": "| 号池级限流不升档" in e["msg"],
         "after_output": "| 已输出内容后" in e["msg"], "until": parse_time(info.get("恢复")),
+        "egress_short": "| 出口限流不升档" in e["msg"],
     })
 laddered = [item for item in rate_written if item["level"]]
 rate_skipped = [e for e in logs if e["t"] >= SINCE and e["msg"].startswith("账号冷却未写入 |") and fields(e["msg"]).get("类型") == "限流"]
@@ -1196,6 +1290,122 @@ if MODEL:
         print(f"  每日额度通道判定 {MODEL}{label}：另一通道也达到限额 {shared} 次，另一通道仍可用 {independent} 次 → {verdict}")
     if not found:
         print(f"  每日额度通道判定：{MODEL} 没有记录（{ENV.get('AUTH_DIR')}/.quota-sharing.json），连续限流按两个通道共用一份档位处理")
+
+# ================= 4b. 出口限流判定 =================
+# app/egress_guard.go：同一出口（账号代理规范化后的值，直连为“直连”）上多个账号同时被裸限流、新换上的账号第一次请求就被拒时判定成立：
+# 裸 429 只冷却 10 秒、不升档，按出口限速发送（主用模型优先），冷启动只做低于常驻数的补位与补覆盖。判定相关的行都是持久行（控制台队列满时不丢）
+section("4b. 出口限流判定（判定成立 → 短冷却不升档、按出口限速、冷启动按配额 → 解除或撤销）")
+
+
+def egress_lines(prefix):
+    return [e for e in logs if e["t"] >= SINCE and e["msg"].startswith(prefix)]
+
+
+egress_entered = egress_lines("出口限流判定成立 |")
+egress_exited = egress_lines("出口限流解除 |")
+egress_withdrawn = egress_lines("出口限流判定撤销 |")
+egress_resumed = egress_lines("出口限流判定恢复 |")
+egress_adjusts = egress_lines("出口限速调整 |")
+egress_stopped = egress_lines("出口限速无效，停止限速 |")
+egress_floor = egress_lines("出口几乎完全被拒 |")
+egress_relaxed = egress_lines("出口限流：撤回逐级冷却 |")
+egress_demoted = egress_lines("出口限流：账号按账号级失败冷却 |")
+egress_paused = egress_lines("出口限流暂停冷启动 |")
+egress_full = egress_lines("出口每分钟请求已满 |")
+egress_short = [item for item in rate_written if item.get("egress_short")]
+egress_account_cool = [e for e in logs if e["t"] >= SINCE and e["msg"].startswith("账号冷却 |") and "| 出口限流按账号冷却" in e["msg"]]
+
+
+def egress_label(e):
+    return fields(e["msg"]).get("出口", "?")
+
+
+# 判定期：成立 → 解除/撤销按出口配对，窗口结束时仍成立算到现在。判定器的状态只在内存：停止、重启服务或重建运行时都不写“解除”，
+# 遇到“管理服务就绪”“生成服务启动 | 1/2 | 准备模型目录”时关闭全部未闭合的判定期（结束取该行时间），重启后再次成立另起一段。
+# 没有未闭合判定期的解除或撤销（窗口开始前已成立）按行里的“持续”反推开始，不早于窗口起点与之前最近一次重启；
+# “持续=0s”的撤销是对没有成立的出口做的撤销（管理操作），不算一段
+egress_restarts = [e["t"] for e in logs if e["t"] >= SINCE and (
+    e["msg"].startswith("管理服务就绪") or e["msg"].startswith("生成服务启动 | 1/2 | 准备模型目录"))]
+EGRESS_PERIODS = collections.defaultdict(list)
+egress_open = {}
+egress_since = SINCE
+egress_marks = [(moment, 0, None) for moment in egress_restarts] + [(e["t"], 1, e) for e in egress_entered + egress_exited + egress_withdrawn]
+for moment, _, e in sorted(egress_marks, key=lambda item: (item[0], item[1])):
+    if e is None:
+        for label, started in egress_open.items():
+            EGRESS_PERIODS[label].append((started, moment))
+        egress_open.clear()
+        egress_since = moment
+        continue
+    label = egress_label(e)
+    if e["msg"].startswith("出口限流判定成立"):
+        egress_open.setdefault(label, moment)
+        continue
+    started = egress_open.pop(label, None)
+    if started is None:
+        held = go_duration(fields(e["msg"]).get("持续", ""))
+        if not held:
+            continue
+        started = max(moment - TD(seconds=held), egress_since)
+    EGRESS_PERIODS[label].append((started, moment))
+for label, started in egress_open.items():
+    EGRESS_PERIODS[label].append((started, NOW))
+
+
+def in_egress_period(moment):
+    return any(start <= moment <= end for periods in EGRESS_PERIODS.values() for start, end in periods)
+
+
+egress_minutes = {label: sum((end - start).total_seconds() for start, end in periods) / 60 for label, periods in EGRESS_PERIODS.items()}
+# 普通通道的限速按出口分开记（多出口时各出口的结论用各自的限速）
+limits = collections.defaultdict(list)
+if not (egress_entered or egress_exited or egress_withdrawn or egress_adjusts or egress_short):
+    print("  窗口内没有出口限流判定的日志" + ("（这个版本可能还没有出口限流判定）" if "egress" not in status and status else ""))
+else:
+    for label, periods in EGRESS_PERIODS.items():
+        print(f"  出口 {label}：判定成立 {len(periods)} 段，合计 {egress_minutes[label]:.1f} 分钟（"
+              + "、".join(f"{local(start)}→{local(end) if end != NOW else '仍在限流'}" for start, end in periods[:4])
+              + ("…" if len(periods) > 4 else "") + "）")
+    for e in egress_entered[-3:]:
+        info = fields(e["msg"])
+        print(f"    成立 {local(e['t'])}：账号 {info.get('账号')}，裸限流 {info.get('裸限流')}/{info.get('尝试')}（{info.get('比例')}），"
+              f"冷号首发被拒 {info.get('冷号首发被拒')}，条件 {info.get('条件')}，初始限速 {info.get('初始限速')}，下限 {info.get('下限')}")
+    # 限速时间线：普通通道的初值与每次调整后的值
+    for e in sorted(egress_entered + egress_adjusts, key=lambda item: item["t"]):
+        info = fields(e["msg"])
+        if e["msg"].startswith("出口限流判定成立"):
+            value = re.match(r"(\d+)", info.get("初始限速", ""))
+        elif info.get("通道") == "普通":
+            value = re.search(r"→(\d+)", info.get("限速", ""))
+        else:
+            continue
+        if value:
+            limits[egress_label(e)].append(int(value.group(1)))
+    for label, values in limits.items():
+        adjusts = [e for e in egress_adjusts if egress_label(e) == label]
+        adjust_reasons = collections.Counter(fields(e["msg"]).get("原因", "?") for e in adjusts)
+        print(f"  出口 {label} 普通通道限速（次/分钟）：最小 {min(values)}，最大 {max(values)}，最终 {values[-1]}；"
+              f"调整 {len(adjusts)} 次：{top(adjust_reasons, 6)}")
+    if egress_stopped:
+        print(f"  限速判为无效、停止限速 {len(egress_stopped)} 次（被拒比例不随发送速率变化；其余保护保留，限流类换号放宽到 4 次）")
+    relaxed_total = sum(int(fields(e["msg"]).get("账号") or 0) for e in egress_relaxed)
+    demoted_total = sum(int(fields(e["msg"]).get("新增") or 0) for e in egress_demoted)
+    print(f"  进入时撤回逐级冷却的账号合计 {relaxed_total}（{len(egress_relaxed)} 次）；按账号证据降级（30 分钟账号冷却）合计 {demoted_total}，"
+          f"降级冷却日志 {len(egress_account_cool)} 行")
+    print(f"  冷却日志中“出口限流不升档”{share(len(egress_short), len(rate_written))}（占全部限流冷却行）")
+    if egress_paused:
+        paths = collections.Counter()
+        for e in egress_paused:
+            info = fields(e["msg"])
+            paths[info.get("路径", "?")] += int(info.get("10分钟内跳过") or 1)
+        print(f"  暂停的冷启动（同出口同路径 10 分钟一行，按行内的跳过数合计）：{top(paths, 5)}")
+    if egress_full:
+        print(f"  “出口每分钟请求已满”{len(egress_full)} 行（同出口 10 分钟一行）：令牌桶在限住发送，新请求按“出口限速”排队")
+    if egress_floor:
+        print(f"  ⚠ “出口几乎完全被拒”{len(egress_floor)} 行：限速停在下限 10 分钟仍 ≥90% 被拒（只告警，判定保持）")
+    if egress_withdrawn or egress_resumed:
+        print(f"  判定撤销 {len(egress_withdrawn)} 次（{top(collections.Counter(fields(e['msg']).get('原因', '?') for e in egress_withdrawn), 3)}）；"
+              f"恢复 {len(egress_resumed)} 次（{top(collections.Counter(fields(e['msg']).get('原因', '?') for e in egress_resumed), 3)}）")
 
 # ================= 5. 裸 Quota exceeded 逐账号 =================
 section(f"5. {MODEL or '-'} 的裸“Quota exceeded”：每日额度还是短期限流（回看 {QE_MINUTES} 分钟）")
@@ -1472,9 +1682,11 @@ LIFECYCLE = [
     ("WAA Worker 排空 |", "排空"), ("WAA Worker 回收冷却占位 |", "请求现场回收死槽位"), ("WAA Worker 重建 |", "失效重建"),
     ("WAA Worker 停止 |", "停止"), ("WAA Worker 替补启动 |", "替补启动"), ("WAA Worker 替补跳过", "替补跳过"),
     ("WAA Worker 替补未启动", "替补未启动"), ("WAA Worker 替补启动失败", "替补启动失败"), ("常驻 Worker 已失败", "失败常驻关闭"),
+    ("WAA Worker 释放 |", "不可调度释放"), ("WAA Worker 释放失败", "不可调度释放失败"), ("WAA Worker 补登记释放", "补登记释放"),
 ]
 lifecycle = collections.Counter()
 retire_scopes = collections.Counter()
+release_reasons = collections.Counter()
 for e in logs:
     if e["t"] < SINCE:
         continue
@@ -1484,10 +1696,12 @@ for e in logs:
     for prefix, name in LIFECYCLE:
         if message.startswith(prefix):
             info = fields(message)
-            amount = int(info.get("替换") or info.get("新增") or 1) if name in ("冷却轮换", "补登记淘汰") else 1
+            amount = int(info.get("替换") or info.get("新增") or 1) if name in ("冷却轮换", "补登记淘汰", "补登记释放") else 1
             lifecycle[partition + name] += amount
             if name in ("冷却淘汰", "排空"):
                 retire_scopes[info.get("范围", "?")] += 1
+            if name == "不可调度释放":
+                release_reasons[info.get("原因", "?")] += 1
             break
 restarts = [e["t"] for e in logs if e["t"] >= SINCE and e["msg"].startswith("管理服务就绪")]
 if lifecycle:
@@ -1495,6 +1709,8 @@ if lifecycle:
     print("    " + "，".join(f"{name} {count}" for name, count in lifecycle.most_common()))
     if retire_scopes:
         print(f"    冷却淘汰/排空的范围：{top(retire_scopes, 5)}")
+    if release_reasons:
+        print(f"    不可调度释放的原因：{top(release_reasons, 5)}")
     starts = lifecycle.get("新启动就绪", 0) + lifecycle.get("Ultra·新启动就绪", 0)
     warm_now = workers.get("warm") or 0
     if warm_now and starts >= warm_now:
@@ -1502,8 +1718,34 @@ if lifecycle:
     skipped = lifecycle.get("替补跳过", 0) + lifecycle.get("Ultra·替补跳过", 0)
     if skipped:
         VERDICTS.append(f"替补跳过 {skipped} 次：分区内没有能服务这些模型、没有长时间冷却的备用账号，淘汰死槽位后换不上新号")
+    # 就绪按启动来源（预热、替补、扩容、按需、补覆盖、重开；旧版本不写来源）；按需扩容与按需替换按是否超出常驻、是否在出口限流判定期内分开
+    sources = collections.Counter()
+    on_demand = collections.Counter()
+    for e in logs:
+        if e["t"] < SINCE:
+            continue
+        message = e["msg"][len("Ultra "):] if e["msg"].startswith("Ultra WAA Worker") else e["msg"]
+        if message.startswith("WAA Worker 就绪"):
+            sources[fields(message).get("来源", "未写")] += 1
+        elif message.startswith(("WAA Worker 按需扩容", "WAA Worker 按需替换")):
+            name = "按需扩容" if message.startswith("WAA Worker 按需扩容") else "按需替换"
+            above = fields(message).get("超出常驻", "未写")
+            period = "判定期内" if in_egress_period(e["t"]) else "判定期外"
+            on_demand[f"{name}·超出常驻={above}·{period}"] += 1
+    if sources:
+        print(f"    就绪按启动来源：{top(sources, 7)}")
+    if on_demand:
+        print(f"    按需扩容/替换：{top(on_demand, 8)}")
 else:
     print("  窗口内日志没有 Worker 变动记录")
+# 驻留 Worker 中不可调度的超过 10%：它们占着槽位却不是任何模型的候选，释放应在持续发生
+unschedulable_now = (workers.get("unschedulable") or 0) + (ultra_workers.get("unschedulable") or 0)
+resident_now = (workers.get("warm") or 0) + (ultra_workers.get("warm") or 0)
+if resident_now and unschedulable_now * 10 > resident_now:
+    released = lifecycle.get("不可调度释放", 0)
+    VERDICTS.append(f"驻留 Worker 中 {unschedulable_now} 个账号已不可调度，检查‘WAA Worker 释放’是否在发生"
+                    f"（占驻留 {share(unschedulable_now, resident_now)}；{MINUTES} 分钟内释放 {released} 次、补登记释放 {lifecycle.get('补登记释放', 0)} 个"
+                    + ("；没有释放记录：版本过旧，或这些 Worker 一直有请求在跑" if not released else "") + "）")
 if restarts:
     print(f"  ⚠ 窗口内服务重启 {len(restarts)} 次：" + "、".join(local(t) for t in restarts[:5]))
 
@@ -1552,12 +1794,126 @@ if sent:
         if hit * 3 >= len(values) and len(values) >= 5:
             VERDICTS.append(f"有 {hit}/{len(values)} 个账号在某个 60 秒内用满了 ACCOUNT_RPM_LIMIT={rpm_limit}：每分钟上限是吞吐的硬约束之一")
 
+# ================= 9. 模型目录同步与登录失效 =================
+section(f"9. 模型目录同步与登录失效（最近 {MINUTES} 分钟的运行日志）")
+catalog_logs = [e for e in logs if e["t"] >= SINCE]
+catalog_starts = [e for e in catalog_logs if "准备模型目录" in e["msg"]]
+for entry in catalog_starts:
+    item = fields(entry["msg"])
+    if "来自磁盘" in item:
+        print(f"  {local(entry['t'])} 启动：缓存模型 {item.get('缓存')} 个，来自磁盘 {item.get('来自磁盘')} 个账户，待同步 {item.get('待同步')}，"
+              f"过期 {item.get('过期')}，不一致 {item.get('不一致')}，疑似失效 {item.get('疑似失效')}")
+    else:
+        print(f"  {local(entry['t'])} 启动：缓存模型 {item.get('缓存')} 个（旧版：没有目录缓存，启动时全量同步）")
+for entry in catalog_logs:
+    if entry["msg"].startswith("模型目录缓存载入 |") or entry["msg"].startswith("模型目录缓存损坏 |"):
+        print(f"  {local(entry['t'])} {entry['msg'].splitlines()[0]}")
+catalog_summary_keys = ("成功", "失败", "限流429", "空目录", "账户忙推后")
+catalog_summary_total = collections.Counter()
+catalog_summary_lines = [fields(e["msg"]) for e in catalog_logs if e["msg"].startswith("模型目录后台同步 |")]
+for item in catalog_summary_lines:
+    for key in catalog_summary_keys:
+        value = item.get(key, "")
+        catalog_summary_total[key] += int(value) if value.isdigit() else 0
+if catalog_summary_lines:
+    print(f"  后台同步（{len(catalog_summary_lines)} 条 5 分钟汇总）：" + "，".join(f"{key} {catalog_summary_total[key]}" for key in catalog_summary_keys)
+          + f"；最后一条：缺失 {catalog_summary_lines[-1].get('缺失')}、过期 {catalog_summary_lines[-1].get('过期')}、疑似失效 {catalog_summary_lines[-1].get('疑似失效')}、"
+          f"队列 {catalog_summary_lines[-1].get('队列')}")
+catalog_pauses = [e for e in catalog_logs if e["msg"].startswith("模型目录同步暂停 |")]
+catalog_pause_seconds = sum(go_duration(fields(e["msg"]).get("暂停")) or 0 for e in catalog_pauses)
+if catalog_pauses:
+    catalog_pause_reasons = collections.Counter(fields(e["msg"]).get("原因") or "?" for e in catalog_pauses)
+    catalog_resumes = sum(1 for e in catalog_logs if e["msg"].startswith("模型目录同步恢复 |"))
+    print(f"  同步暂停 {len(catalog_pauses)} 次（原因：{top(catalog_pause_reasons, 3)}），合计 {catalog_pause_seconds / 60:.1f} 分钟，恢复 {catalog_resumes} 次；"
+          f"最近一次：{fields(catalog_pauses[-1]['msg']).get('错误') or '-'}")
+catalog_failures = [e for e in catalog_logs if e["msg"].startswith("模型目录同步失败 |")]
+if catalog_failures:
+    catalog_failure_kinds = collections.Counter()
+    for entry in catalog_failures:
+        match = re.search(r"AI Studio (\w+) 返回 HTTP (\d+)", entry["msg"])
+        catalog_failure_kinds[f"AI Studio {match.group(1)} 返回 HTTP {match.group(2)}" if match else "其他"] += 1
+    print(f"  同步失败 {len(catalog_failures)} 条（同账户只在连续第 1、2、4、8… 次时写）：{top(catalog_failure_kinds, 6)}")
+catalog_empties = [e for e in catalog_logs if e["msg"].startswith("模型目录为空")]
+if catalog_empties:
+    catalog_kept = sum(1 for e in catalog_empties if e["msg"].startswith("模型目录为空，保留原目录"))
+    print(f"  空目录：保留原目录 {catalog_kept} 次，已接受 {len(catalog_empties) - catalog_kept} 次（连续 3 次且跨 1 小时才接受）")
+auth_required_lines = [fields(e["msg"]) for e in catalog_logs if e["msg"].startswith("账号需要登录 |")]
+if auth_required_lines:
+    auth_required_sources = collections.Counter(f"{item.get('来源') or '?'}·出口限流中={item.get('出口限流中') or '?'}" for item in auth_required_lines)
+    print(f"  账号需要登录 {len(auth_required_lines)} 条（同账号 1 分钟最多一条）：{top(auth_required_sources, 8)}")
+    confirmed = sum(1 for item in auth_required_lines if item.get("复核") == "仍失效")
+    if confirmed:
+        print(f"    其中经登录复核确认（复核仍是 401）{confirmed} 条")
+# 登录复核（app/auth_recheck.go）：疑似登录失效、复核通过（排除）与恢复、每轮汇总
+suspect_lines = [fields(e["msg"]) for e in catalog_logs if e["msg"].startswith("账号疑似登录失效 |")]
+if suspect_lines:
+    suspect_sources = collections.Counter(item.get("来源") or "?" for item in suspect_lines)
+    cleared = sum(1 for e in catalog_logs if e["msg"].startswith("疑似登录失效复核通过 |"))
+    print(f"  疑似登录失效 {len(suspect_lines)} 次（来源：{top(suspect_sources, 6)}），复核通过（排除）{cleared} 次")
+recheck_keys = ("恢复", "仍失效", "跳过", "疑似排除", "疑似确认")
+recheck_total = collections.Counter()
+recheck_lines = [fields(e["msg"]) for e in catalog_logs if e["msg"].startswith("登录复核 |")]
+for item in recheck_lines:
+    for key in recheck_keys:
+        value = item.get(key, "")
+        recheck_total[key] += int(value) if value.isdigit() else 0
+if recheck_lines:
+    print(f"  登录复核（{len(recheck_lines)} 轮汇总）：" + "，".join(f"{key} {recheck_total[key]}" for key in recheck_keys)
+          + f"；最后一轮下一轮在 {recheck_lines[-1].get('下一轮') or '-'} 后")
+recovered_lines = sum(1 for e in catalog_logs if e["msg"].startswith("登录复核恢复 |"))
+if recovered_lines:
+    print(f"  登录复核恢复 {recovered_lines} 个账号（需要登录 → 就绪）")
+bad_lines = sum(1 for e in catalog_logs if e["msg"].startswith("账号连续裸限流，移出预热与替补候选 |"))
+if bad_lines:
+    print(f"  标为坏号（连续裸限流、期间没有成功，2 小时内不参与预热、扩容与替补）{bad_lines} 个账号")
+verify_lines = [fields(e["msg"]) for e in catalog_logs if e["msg"].startswith("账户验证完成 |")]
+if verify_lines:
+    verify_results = collections.Counter(
+        f"已认证={item.get('已认证') or '?'}·接口复核={item.get('接口复核') or '-'}" for item in verify_lines)
+    print(f"  管理验证 {len(verify_lines)} 次：{top(verify_results, 6)}")
+if not (catalog_starts or catalog_summary_lines or catalog_pauses or catalog_failures or catalog_empties or auth_required_lines
+        or suspect_lines or recheck_lines or recovered_lines or bad_lines or verify_lines):
+    print("  窗口内没有模型目录同步与需要登录的日志")
+# 复核确认的账户本身也写一条带“复核=仍失效”的“账号需要登录”，已在 auth_required_lines 里：只按它计数，不再加疑似确认（原先重复计算）
+if len(auth_required_lines) >= 30 and recheck_total["疑似排除"] * 2 < recheck_total["疑似确认"]:
+    VERDICTS.append(f"登录复核确认 {recheck_total['疑似确认']} 个账号仍是 401（排除 {recheck_total['疑似排除']}）：Cookie 多半已被 Google 作废，"
+                    "需要重新登录；看第 9 段“账号需要登录”的来源分布")
+if catalog_pause_seconds > 600:
+    VERDICTS.append(f"模型目录同步因上游 429 暂停 {catalog_pause_seconds / 60:.0f} 分钟：出口在拒绝目录请求，"
+                    "缺失目录的账户要等暂停结束才能补上（已有目录的账户不受影响）")
+
 # ================= 8. 结论 =================
 section("8. 结论（自动推断，请结合上面的数字核对）")
 if model_rows:
     busy = sum(1 for row in model_rows if row["class"] and row["class"].startswith("号池繁忙"))
     success = sum(1 for row in model_rows if row["success"])
     VERDICTS.insert(0, f"{MODEL}：最近 {MINUTES} 分钟 {len(model_rows)} 个请求，成功 {share(success, len(model_rows))}，号池繁忙 {share(busy, len(model_rows))}")
+# 出口限流判定的结论（第 4b 段）
+for label, minutes in sorted(egress_minutes.items(), key=lambda kv: -kv[1]):
+    if minutes < 1:
+        continue
+    periods = EGRESS_PERIODS[label]
+    succeeded = sum(1 for row in window_rows if row["success"] and any(start <= row["end"] <= end for start, end in periods))
+    if not succeeded:
+        # 没有账本（或账本里没有这段时间的请求）时按解除行里的“期间成功”估计
+        succeeded = sum(int(fields(e["msg"]).get("期间成功") or 0) for e in egress_exited if egress_label(e) == label)
+    limit_text = f"、限速约 {pct(limits[label], .5)} 次/分钟" if limits.get(label) else ""
+    VERDICTS.append(
+        f"窗口内出口 {label} 被判定为出口级限流 {minutes:.0f} 分钟，期间每分钟成功约 {succeeded / minutes:.1f} 个{limit_text}："
+        "单一出口时吞吐上限约为此，给账号分配不同代理才能提高")
+if egress_stopped:
+    VERDICTS.append(f"出口限速无效已停止 {len(egress_stopped)} 次：被拒比例不随发送速率变化，可能不是固定容量的出口限流")
+# 只算撤销了成立中判定的（“持续”不为 0）：对没有成立的出口做的撤销（管理操作）不说明什么
+withdrawn_held = [e for e in egress_withdrawn if go_duration(fields(e["msg"]).get("持续", ""))]
+if withdrawn_held:
+    VERDICTS.append(f"出口判定被撤销 {len(withdrawn_held)} 次（复试账号零成功或手动）：更像账号当天额度用完")
+if not egress_entered and not EGRESS_PERIODS:
+    sent_attempts = sum(1 for a in attempt_records if not a[3].startswith("发出前")) + sum(1 for row in window_rows if row["success"])
+    bare_records = [a for a in attempt_records if a[3] == "429·" + Q_BARE]
+    if sent_attempts and len(bare_records) * 2 >= sent_attempts and len({a[2] for a in bare_records}) >= 5:
+        VERDICTS.append(
+            f"疑似出口限流但判定未成立（版本过旧或阈值未达）：账本里裸 Quota exceeded {share(len(bare_records), sent_attempts)} 次（占发出的上游尝试），"
+            f"涉及 {len({a[2] for a in bare_records})} 个账号")
 empty_rows = [row for row in window_rows if row["success"] and not row["reply"] and not row["tools"]]
 if window_rows and len(empty_rows) * 20 >= len(window_rows):
     VERDICTS.append(f"{len(empty_rows)} 个请求成功结束但没有正文也没有工具调用（客户端看到空回复），看第 1 段各模型的“空回复”数")

@@ -119,6 +119,8 @@ func (p *AccountPool) SetUltraIncludePro(on bool) bool {
 		}
 	}
 	p.ultraSnapshot = nil
+	// Ultra 号池的账户挂在出口的 Ultra 通道上（见 egress_rate.go）：成员整体重算后整体重挂
+	p.reattachEgressAllLocked()
 	p.eligibilityVersion++
 	p.invalidateSchedulingLocked()
 	p.invalidateStatusLocked()

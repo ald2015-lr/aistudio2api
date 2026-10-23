@@ -37,6 +37,8 @@ type VideoRequest struct {
 	AccountID         string
 	StartImage        *VideoImage
 	RecoverWAARuntime func(context.Context, string, error) (bool, error)
+	// AllowedAccountIDs 限定不固定账户时的候选账户（app 层在出口限流期间去掉受限出口上的备用账户）；nil 时不限定
+	AllowedAccountIDs []string
 }
 
 // VideoOperation 表示 Veo 私有长任务状态
@@ -251,7 +253,14 @@ func (s *PooledService) GenerateVideo(ctx context.Context, request VideoRequest)
 	selection := AccountSelection{
 		ModelID: modelID, Method: "predictLongRunning", AccountID: requestedAccountID, ResourceID: resourceID,
 	}
+	if requestedAccountID == "" && resourceID == "" && request.AllowedAccountIDs != nil {
+		selection.AllowedAccountIDs = request.AllowedAccountIDs
+	}
 	maxAttempts := accountAttemptLimit(ctx, s.pool, selection.AccountID != "" || selection.ResourceID != "")
+	if candidates := len(selection.AllowedAccountIDs); candidates > 0 && candidates < maxAttempts {
+		// 限定了候选时最多每个候选试一次：失败的账户都已写冷却，再选号只会等这些冷却到期
+		maxAttempts = candidates
+	}
 	recoveryAccountID := ""
 	var operation VideoOperation
 	var generateErr error
@@ -352,7 +361,8 @@ func (s *PooledService) GetGenerateVideoOperation(ctx context.Context, operation
 			pollErr = lease.BindResource(operation.File.ID, "video-file")
 		}
 	} else if DefinitiveAuthenticationFailure(pollErr) {
-		pollErr = errors.Join(pollErr, lease.MarkAuthenticationRequired(pollErr.Error()))
+		_, markErr := lease.MarkAuthenticationFailure(pollErr)
+		pollErr = errors.Join(pollErr, markErr)
 	}
 	if owned {
 		pollErr = errors.Join(pollErr, lease.Release())

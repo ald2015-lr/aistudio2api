@@ -78,6 +78,10 @@ type modelEntry struct {
 type modelCatalog struct {
 	models  []Model
 	entries map[string]modelEntry
+	// raw 为 ListModels 经稀疏数组展开后的原文：模型目录写盘缓存保存它，恢复时用同一个解析器重新解析（解析器升级后自动按新逻辑）。
+	// contentKey 为解析结果的内容键（见 catalogContentKey），相同内容的账户共用一份只读目录（见 Client.shareCatalogLocked）
+	raw        []byte
+	contentKey string
 }
 
 // ParseModels 解码 ListModels 的现场数组协议
@@ -105,7 +109,7 @@ func parseModelCatalog(source io.Reader) (modelCatalog, error) {
 	if err != nil {
 		return modelCatalog{}, withMethod(err, "ListModels")
 	}
-	catalog := modelCatalog{models: make([]Model, 0, len(rows)), entries: make(map[string]modelEntry, len(rows))}
+	catalog := modelCatalog{models: make([]Model, 0, len(rows)), entries: make(map[string]modelEntry, len(rows)), raw: raw}
 	for index, rowRaw := range rows {
 		entry, err := decodeModelRow(rowRaw, index)
 		if err != nil {
@@ -347,6 +351,9 @@ func (c *Client) ModelsForAccount(ctx context.Context, accountID string) ([]Mode
 	return cloneModels(catalog.models), nil
 }
 
+// loadModels 拉取账户的 ListModels 并替换 Client 侧的目录。上游返回空模型列表、而账户已有非空目录时不替换：
+// 偶发的空结果覆盖目录后，Playground 生成会在请求路径上查不到模型、直接以 ErrModelNotFound 失败（不换号）。
+// 是否接受空目录由 PooledService.modelsForLease 按“连续 3 次且跨 1 小时”决定，接受时显式调用 replaceAccountCatalog
 func (c *Client) loadModels(ctx context.Context, accountID string) (modelCatalog, error) {
 	response, err := c.do(ctx, "ListModels", accountID, "", []byte("[]"), false)
 	if err != nil {
@@ -357,10 +364,55 @@ func (c *Client) loadModels(ctx context.Context, accountID string) (modelCatalog
 	if err != nil {
 		return modelCatalog{}, err
 	}
+	catalog.contentKey = catalogContentKey(catalog)
 	c.catalogMu.Lock()
-	c.catalogs[accountID] = catalog
+	catalog = c.shareCatalogLocked(catalog)
+	if existing, found := c.catalogs[accountID]; !found || len(existing.models) == 0 || len(catalog.models) > 0 {
+		c.catalogs[accountID] = catalog
+	}
 	c.catalogMu.Unlock()
 	return catalog, nil
+}
+
+// replaceAccountCatalog 无条件替换账户在 Client 侧的目录（接受空目录时使用）
+func (c *Client) replaceAccountCatalog(accountID string, catalog modelCatalog) {
+	c.catalogMu.Lock()
+	c.catalogs[accountID] = c.shareCatalogLocked(catalog)
+	c.catalogMu.Unlock()
+}
+
+// ReplaceAccountCatalog 无条件替换账户在 Client 侧的目录，空目录同样替换（loadModels 遇到空结果时保留原目录，见上）
+func (c *Client) ReplaceAccountCatalog(accountID string, catalog ModelCatalogData) {
+	c.replaceAccountCatalog(strings.TrimSpace(accountID), catalog.catalog)
+}
+
+// catalogShareMinLimit 为共用目录表的最小容量：超过时按各账户当前引用的目录重建，丢掉已经没有账户引用的旧目录
+const catalogShareMinLimit = 32
+
+// shareCatalogLocked 返回与 catalog 内容相同的共用目录：上万个账户通常只有几种目录，各账户共用一份只读的解析结果与原文，
+// 不各自保存一份（原文每份几十 KB）。目录只读：lookup 不修改，ModelsForAccount 返回前已拷贝。调用方持有 c.catalogMu 写锁
+func (c *Client) shareCatalogLocked(catalog modelCatalog) modelCatalog {
+	if catalog.contentKey == "" {
+		return catalog
+	}
+	if shared, exists := c.catalogShared[catalog.contentKey]; exists {
+		return shared
+	}
+	if c.catalogShared == nil {
+		c.catalogShared = make(map[string]modelCatalog)
+	}
+	if len(c.catalogShared) >= max(c.catalogShareLimit, catalogShareMinLimit) {
+		rebuilt := make(map[string]modelCatalog, len(c.catalogShared))
+		for _, current := range c.catalogs {
+			if current.contentKey != "" {
+				rebuilt[current.contentKey] = current
+			}
+		}
+		c.catalogShared = rebuilt
+		c.catalogShareLimit = 2 * len(rebuilt)
+	}
+	c.catalogShared[catalog.contentKey] = catalog
+	return catalog
 }
 
 func (c *Client) modelEntry(ctx context.Context, accountID string, modelID string) (modelEntry, error) {

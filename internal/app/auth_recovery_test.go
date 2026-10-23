@@ -83,6 +83,8 @@ func newAuthTestRefresher(t *testing.T, counts *authTestCounts) *authRuntimeRefr
 		},
 		prepareHeaders: func(string) (func(bool), error) { return func(bool) {}, nil },
 		requests:       newRequestRegistry(ctx),
+		// 续签测试在任何平台上都按支持续签运行（生产上只有 Windows 能续签，见 authRenewPlatformSupported）
+		renewSupported: func() bool { return true },
 	}
 }
 
