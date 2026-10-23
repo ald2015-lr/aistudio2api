@@ -134,7 +134,13 @@ func (service *trackedService) applyRateLimitCooldown(
 		Key: lease.EgressKey(), AccountID: accountID, Ultra: lease.EgressLane() == aistudio.EgressLaneUltra,
 		Outcome: egressBare, At: time.Now(),
 	}); verdict.Limited {
-		return service.applyEgressLimitedCooldown(lease, accountLabel, modelID, cooldown, note, verdict)
+		result, ok, stateErr := service.applyEgressLimitedCooldown(lease, accountLabel, modelID, cooldown, note, verdict)
+		// 动态 IP：判定成立的出口就是账户当前的会话时换会话（rotateSession 核对出口键；两次之间至少 10 分钟；没有 Worker 的账户
+		// 立即切到新会话，有 Worker 的下次启动生效）。在写完冷却日志之后换，日志里的会话号是被拒的那一个。
+		// 走 PROXY 或旧端口的直通 Worker（开启 IP 池之前启动）所在的共用出口判定成立时不换：被拒的不是账户的会话。
+		// 静态端口与会话各自是独立出口、只有一个账号，凑不够判定门槛，实际走不到：单个会话被上游限流（裸 429）不会自动换会话
+		service.workers.ipPool().rotateSession(accountID, lease.EgressKey(), "出口限流判定成立")
+		return result, ok, stateErr
 	}
 	scopeLabel := lease.CooldownScope(modelID)
 	allow, systemic := escalate, false
@@ -188,9 +194,11 @@ func (service *trackedService) applyRateLimitCooldown(
 	if systemic {
 		fields += " | 号池级限流不升档"
 	}
+	// 行末追加 IP 池出口（端口号或会话号），看得出裸 429 是否集中在某个端口上
 	service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s",
+		"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s%s",
 		cooldown.Kind, scopeLabel, cooldown.Until.Format(time.RFC3339), quotaCooldownFields(cooldown), fields, suffix,
+		proxyPoolLogSuffix(service.workers.ipPool().slotLabel(accountID)),
 	))
 	return cooldown, true, nil
 }
@@ -233,6 +241,7 @@ func (service *trackedService) applyEgressLimitedCooldown(
 	if note != "" {
 		suffix = " | " + note
 	}
+	slot := proxyPoolLogSuffix(service.workers.ipPool().slotLabel(accountID))
 	cooldown.Reason = reason
 	effective := time.Time{}
 	written := false
@@ -260,8 +269,8 @@ func (service *trackedService) applyEgressLimitedCooldown(
 		}
 		written = true
 		service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-			"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s",
-			cooldown.Kind, scope, until.Format(time.RFC3339), quotaCooldownFields(cooldown), fields, suffix,
+			"账号冷却 | 类型=%s | 范围=%s | 恢复=%s%s%s%s%s",
+			cooldown.Kind, scope, until.Format(time.RFC3339), quotaCooldownFields(cooldown), fields, suffix, slot,
 		))
 	}
 	cooldown.Until = effective

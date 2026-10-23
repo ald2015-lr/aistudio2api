@@ -38,7 +38,8 @@ func captureStderr(t *testing.T, run func()) string {
 	return string(output)
 }
 
-// TestParseSetupFlagsProxy 不传 --proxy 时用 .env 的代理；传了就规范化（"" 表示直连）；-h 与参数错误的输出、不合法时的错误都不含账号密码
+// TestParseSetupFlagsProxy 不传 --proxy 时登录用 .env 的代理、账户代理留空（跟随默认代理与 IP 池）；传了就规范化（"" 表示直连）
+// 并写进账户；-h 与参数错误的输出、不合法时的错误都不含账号密码
 func TestParseSetupFlagsProxy(t *testing.T) {
 	const user, password = "user-session-XYZ", "S3cr3t-PW"
 	cfg := config.Default()
@@ -48,8 +49,11 @@ func TestParseSetupFlagsProxy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if options.proxy != cfg.Proxy || setupAccountConfig("a@example.com", options).Proxy != cfg.Proxy {
-		t.Fatalf("不传 --proxy 时应使用 .env 的代理，得到 %q", options.proxy)
+	if options.proxy != cfg.Proxy || options.proxySet {
+		t.Fatalf("不传 --proxy 时登录应使用 .env 的代理，得到 %q", options.proxy)
+	}
+	if accountProxy := setupAccountConfig("a@example.com", options).Proxy; accountProxy != "" {
+		t.Fatalf("不传 --proxy 时账户代理应为空（跟随默认代理），得到 %q", accountProxy)
 	}
 
 	for _, test := range []struct{ input, want string }{

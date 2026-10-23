@@ -91,11 +91,15 @@ func (drain *drainState) replacementFailed() bool {
 
 // drainLimit 返回分区同时排空的上限：max(WARM_STARTUP_CONCURRENCY, 1) × 2，且不超过分区峰值的 1/4（至少 1）；峰值为 0 的分区不排空
 func (manager *accountWorkerManager) drainLimit(partition aistudio.PoolScope) int {
-	maxActive := manager.maxActiveFor(partition)
+	return drainLimitFor(manager.maxActiveFor(partition), manager.warmConcurrencyValue())
+}
+
+// drainLimitFor 为 drainLimit 的纯函数形式（IP 池按它估算可能同时运行的浏览器数，见 proxyPoolCapacity）
+func drainLimitFor(maxActive int, warmConcurrency int) int {
 	if maxActive <= 0 {
 		return 0
 	}
-	return min(max(manager.warmConcurrencyValue(), 1)*2, max(1, maxActive/4))
+	return min(max(warmConcurrency, 1)*2, max(1, maxActive/4))
 }
 
 // drainTotalLimit 返回分区同时排空（含已超过 drainSlotTimeout、不再占名额的）的总数上限：2 × drainLimit。

@@ -572,6 +572,8 @@ func (admin *runtimeAdmin) registerExistingAccount(ctx context.Context, account 
 	}); err != nil {
 		return errors.Join(err, admin.workers.Remove(account.ID), admin.headers.Remove(account.ID))
 	}
+	// 账户已进入账户池：IP 池记下它的固定代理并推送默认出口；旧生成服务的目录监视在这里被忽略（推送目标已是新账户池）
+	admin.ipPool().refresh(admin.pool, account.ID)
 	return nil
 }
 

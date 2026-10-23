@@ -676,7 +676,7 @@ func TestOnDemandLogsUnconditional(t *testing.T) {
 	}
 }
 
-// TestEgressAdminAction 管理动作撤销与恢复判定后返回最新状态（状态里带出口）；未知编号按 404，未知动作报错；
+// TestEgressAdminAction 管理动作撤销与恢复判定后返回最新状态（撤销后列出这个出口，恢复后只计入汇总）；未知编号按 404，未知动作报错；
 // runtimeManager 把动作转给当前生成服务
 func TestEgressAdminAction(t *testing.T) {
 	env := newEgressEnv(t, []string{"a@example.com"}, nil, 1, 1, 0)
@@ -696,9 +696,11 @@ func TestEgressAdminAction(t *testing.T) {
 	if len(status.Egress) != 1 || status.Egress[0].Mode != "rejected" || status.Egress[0].RejectedBy != "管理操作" || status.Egress[0].ID != id {
 		t.Fatalf("撤销后状态 = %+v", status.Egress)
 	}
+	// 恢复后回到正常：出口不多时照常列出（模式为 normal），汇总计入正常
 	status, err = admin.EgressAction(ctx, id, api.EgressActionResume)
-	if err != nil || len(status.Egress) != 1 || status.Egress[0].Mode != "normal" {
-		t.Fatalf("恢复后状态 = %+v，err=%v", status.Egress, err)
+	if err != nil || len(status.Egress) != 1 || status.Egress[0].Mode != "normal" || status.EgressSummary == nil ||
+		status.EgressSummary.Normal != 1 || status.EgressSummary.Rejected != 0 {
+		t.Fatalf("恢复后状态 = %+v（汇总 %+v），err=%v", status.Egress, status.EgressSummary, err)
 	}
 	var notFound interface{ HTTPStatus() int }
 	if _, err := admin.EgressAction(ctx, "000000000000", api.EgressActionWithdraw); !errors.As(err, &notFound) || notFound.HTTPStatus() != http.StatusNotFound {

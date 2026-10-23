@@ -19,11 +19,13 @@ const egressCoverageRetry = 5 * time.Second
 
 // egressColdStartGate 返回挂到 Worker 管理器上的冷启动闸门：没有出口判定成立时直接放行（不查出口键）；
 // 成立时按账户取出口键与分区通道（EgressKeyOf，在 rebalanceMu 内调用，与 ensureWorker 里其他账户池读取的锁顺序相同），
-// 补位并发按当前的 WARM_STARTUP_CONCURRENCY 计算（热更新即生效）
+// 补位并发按当前的 WARM_STARTUP_CONCURRENCY 计算（热更新即生效）。
+// IP 池开启且账户没有自己的代理时直接放行：闸门看的是账户现在的默认出口，真正启动时 IP 池另分出口（静态独占一个端口、
+// 动态用账户自己的会话），每个出口只有这一个账号（锁顺序 rebalanceMu → proxyPool.mu，IP 池不反向取 rebalanceMu）
 func (service *trackedService) egressColdStartGate() coldStartGateFunc {
 	return func(accountID, modelID string, path coldStartPath) (func(bool), bool) {
 		guard := service.egress
-		if !guard.anyLimited() || service.pool == nil {
+		if !guard.anyLimited() || service.pool == nil || service.workers.ipPool().poolsAccount(accountID) {
 			return func(bool) {}, true
 		}
 		key, lane := service.pool.EgressKeyOf(accountID)
@@ -52,7 +54,7 @@ func (service *trackedService) egressWaitKey(limited map[string]struct{}, ultra 
 }
 
 // egressQueueState 返回出口通道当前的限速与下一个令牌的时刻（排队进度的“出口限速”“下一个令牌”）：限速取判定器的，
-// 下一个令牌取账户池的出口计数（一次加锁）；只在真正写排队进度时调用
+// 下一个令牌取账户池这个出口的计数（一次加锁，只取这一个出口）；只在真正写排队进度时调用
 func (service *trackedService) egressQueueState(key string, ultra bool) (int, time.Time) {
 	limit := service.egress.verdict(key, ultra, time.Now()).Limit
 	if service.pool == nil {
@@ -62,7 +64,8 @@ func (service *trackedService) egressQueueState(key string, ultra bool) (int, ti
 	if ultra {
 		lane = aistudio.EgressLaneUltra
 	}
-	for _, status := range service.pool.EgressSnapshot() {
+	statuses, _ := service.pool.EgressSnapshotFor([]string{key})
+	for _, status := range statuses {
 		if status.Key == key {
 			if limit == 0 {
 				limit = status.Lanes[lane].Limit

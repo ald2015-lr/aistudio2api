@@ -1,9 +1,24 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
-import { api } from '@/api'
+import { ApiError, api } from '@/api'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
-import type { DowngradeGuardConfig, Model, ServiceConfig, UpstreamChannel } from '@/types'
+import {
+  DEFAULT_PROXY_POOL_PORT_END,
+  DEFAULT_PROXY_POOL_PORT_START,
+  cloneProxyPool,
+  proxyPoolProblem,
+  proxyPoolProblemKey,
+} from '@/proxyPool'
+import type {
+  DowngradeGuardConfig,
+  Model,
+  ProxyPoolConfig,
+  ProxyPoolStatus,
+  ServiceConfig,
+  UpstreamChannel,
+} from '@/types'
 import ProxyInput from './ProxyInput.vue'
+import ProxyPoolSettings from './ProxyPoolSettings.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import { readStorage, writeStorage } from '@/storage'
@@ -14,6 +29,8 @@ const props = defineProps<{
   error: string
   running: boolean
   models: Model[]
+  // proxyPoolStatus 为状态接口的 IP 池实时状态（没有开启或旧版服务端时为 null）
+  proxyPoolStatus: ProxyPoolStatus | null
 }>()
 
 const emit = defineEmits<{
@@ -51,6 +68,7 @@ type EditableKey =
   | 'repeat_prompt_nonce'
   | 'min_output_tokens'
   | 'downgrade_guard'
+  | 'proxy_pool'
 
 const EDITABLE_KEYS: readonly EditableKey[] = [
   'auth_states',
@@ -82,9 +100,17 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'repeat_prompt_nonce',
   'min_output_tokens',
   'downgrade_guard',
+  'proxy_pool',
 ]
-// 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存
-const BLUR_KEYS: readonly EditableKey[] = ['auth_states', 'listen_addr', 'proxy_api_key', 'proxy']
+// 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存；
+// IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交
+const BLUR_KEYS: readonly EditableKey[] = [
+  'auth_states',
+  'listen_addr',
+  'proxy_api_key',
+  'proxy',
+  'proxy_pool',
+]
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
 // defaultDowngradeGuard 与服务端默认值一致
@@ -249,9 +275,15 @@ const proxyTesting = ref(false)
 let applyDeferred = false
 let saveChain: Promise<unknown> = Promise.resolve()
 
-// snapshot 序列化可编辑字段，用于判断是否有未保存的修改
+// snapshot 序列化可编辑字段，用于判断是否有未保存的修改；IP 池设置按固定的字段顺序序列化，不受服务端返回顺序影响
 function snapshot(source: ServiceConfig, keys: readonly EditableKey[] = EDITABLE_KEYS): string {
-  return JSON.stringify(keys.map((key) => source[key]))
+  return JSON.stringify(
+    keys.map((key) =>
+      key === 'proxy_pool' && source.proxy_pool !== undefined
+        ? cloneProxyPool(source.proxy_pool)
+        : source[key],
+    ),
+  )
 }
 
 const dirty = computed(
@@ -414,6 +446,54 @@ function validate(value: ServiceConfig): string {
   return ''
 }
 
+// proxyPoolRejected 为服务端拒绝的 IP 池设置（前端组合校验查不出的地址格式问题，例如冒号写法的主机里写了 {session}）：pool 为被拒绝的
+// 设置的快照，message 为服务端的错误（固定文案，不含地址）。表单里的 IP 池设置还是这一份时，错误与组合校验的错误一样显示在 IP 池
+// 地址框旁、提交时沿用已保存的值；IP 池字段一改就清掉
+const proxyPoolRejected = ref<{ pool: string; message: string } | null>(null)
+
+function poolSnapshot(pool: ProxyPoolConfig): string {
+  return JSON.stringify(cloneProxyPool(pool))
+}
+
+watch(
+  () => (form.proxy_pool === undefined ? '' : poolSnapshot(form.proxy_pool)),
+  (value) => {
+    if (proxyPoolRejected.value !== null && proxyPoolRejected.value.pool !== value) {
+      proxyPoolRejected.value = null
+    }
+  },
+)
+
+// proxyPoolInvalid 返回 IP 池模式、地址与端口段组合的错误（已翻译），或服务端拒绝这份设置时的错误；旧版服务端没有 IP 池设置时为空
+function proxyPoolInvalid(value: ServiceConfig): string {
+  if (value.proxy_pool === undefined) return ''
+  const key = proxyPoolProblemKey(proxyPoolProblem(value.proxy_pool))
+  if (key !== null) return t(key)
+  const rejected = proxyPoolRejected.value
+  return rejected !== null && rejected.pool === poolSnapshot(value.proxy_pool) ? rejected.message : ''
+}
+
+// proxyPoolServerError 为表单里当前的 IP 池设置被服务端拒绝时的错误（显示在 IP 池地址框旁）
+const proxyPoolServerError = computed(() => {
+  const rejected = proxyPoolRejected.value
+  if (rejected === null || form.proxy_pool === undefined) return ''
+  return rejected.pool === poolSnapshot(form.proxy_pool) ? rejected.message : ''
+})
+
+// proxyPoolForm 为 IP 池分组的 v-model：分组只在服务端返回了 IP 池设置时显示，此时 form.proxy_pool 一定存在
+const proxyPoolForm = computed<ProxyPoolConfig>({
+  get: () =>
+    form.proxy_pool ?? {
+      mode: 'off',
+      url: '',
+      port_start: DEFAULT_PROXY_POOL_PORT_START,
+      port_end: DEFAULT_PROXY_POOL_PORT_END,
+    },
+  set: (value) => {
+    form.proxy_pool = value
+  },
+})
+
 // ultraMaxFloor 为 Ultra 峰值输入框的下限：至少为 1，且不小于 Ultra 常驻数
 const ultraMaxFloor = computed(() =>
   typeof form.ultra_warm_worker_limit === 'number' ? Math.max(1, form.ultra_warm_worker_limit) : 1,
@@ -422,8 +502,15 @@ const ultraMaxFloor = computed(() =>
 // payload 构造保存内容；自动保存时所有失焦字段沿用已保存的值，避免把输入到一半的内容写进去
 function payload(includeBlurFields: boolean): ServiceConfig {
   const base = savedConfig.value
-  if (includeBlurFields || base === null) return { ...form }
-  return { ...form, ...Object.fromEntries(BLUR_KEYS.map((key) => [key, base[key]])) }
+  if (base === null) return { ...form }
+  if (!includeBlurFields) {
+    return { ...form, ...Object.fromEntries(BLUR_KEYS.map((key) => [key, base[key]])) }
+  }
+  // IP 池组合还不合法（例如选了静态 IP、地址还空着）时沿用已保存的值，其余失焦字段照常保存；错误只显示在 IP 池输入框旁
+  if (proxyPoolInvalid(form) !== '' && base.proxy_pool !== undefined) {
+    return { ...form, proxy_pool: base.proxy_pool }
+  }
+  return { ...form }
 }
 
 function cancelCountdown(): void {
@@ -447,6 +534,7 @@ function startCountdown(): void {
 }
 
 async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null> {
+  // IP 池组合不合法时提交已保存的值（见 payload），表单里还没填完的组合不拦住其他字段的保存
   const invalid = validate(form)
   if (invalid !== '') {
     saveError.value = invalid
@@ -454,12 +542,42 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
   }
   saving.value = true
   try {
-    const submitted = payload(includeBlurFields)
-    const saved = await api.saveConfig(submitted)
+    let submitted = payload(includeBlurFields)
+    let saved: ServiceConfig
+    try {
+      saved = await api.saveConfig(submitted)
+    } catch (error) {
+      const base = savedConfig.value?.proxy_pool
+      const rejectedPool = submitted.proxy_pool
+      if (
+        !(error instanceof ApiError) ||
+        error.status !== 400 ||
+        error.code !== 'invalid_config' ||
+        base === undefined ||
+        rejectedPool === undefined ||
+        poolSnapshot(rejectedPool) === poolSnapshot(base)
+      ) {
+        throw error
+      }
+      // 服务端拒绝了这次提交、其中 IP 池设置有改动：沿用已保存的 IP 池设置再提交一次。这次成功说明是 IP 池设置的问题，错误记到
+      // IP 池地址框旁，同一次失焦保存里的密钥、默认代理、监听地址与账户目录照常保存；再失败时按普通的保存错误显示
+      submitted = { ...submitted, proxy_pool: base }
+      saved = await api.saveConfig(submitted)
+      proxyPoolRejected.value = { pool: poolSnapshot(rejectedPool), message: error.message }
+    }
     savedConfig.value = saved
     // 代理由服务端规范化（host:port:用户名:密码 保存为 http://用户名:密码@host:port），提交后没有再改动时表单同步显示，
     // 避免一直提示未保存、每次失焦重复保存；自动保存时 proxy 取的是已保存的值，form.proxy 可能是还没提交的编辑，不能覆盖
     if (includeBlurFields && form.proxy === submitted.proxy) form.proxy = saved.proxy
+    // IP 池地址同样由服务端规范化（{SESSION} 保存为 {session}、冒号写法改写成 URL 形式），提交后没有再改动时同步显示
+    if (
+      includeBlurFields &&
+      saved.proxy_pool !== undefined &&
+      form.proxy_pool !== undefined &&
+      JSON.stringify(form.proxy_pool) === JSON.stringify(submitted.proxy_pool)
+    ) {
+      form.proxy_pool = cloneProxyPool(saved.proxy_pool)
+    }
     // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
     if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
     // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s），时长相同时表单同步显示，避免一直提示未保存
@@ -512,11 +630,17 @@ function scheduleSave(): void {
   }, SAVE_DELAY_MS)
 }
 
-// commitBlurField 失焦字段在输入框失去焦点或按回车时保存
+// commitBlurField 失焦字段在输入框失去焦点或按回车时保存；按实际会提交的内容比较（IP 池组合不合法时为已保存的值），没有变化时不保存
 function commitBlurField(): void {
   const base = savedConfig.value
-  if (base === null || snapshot(form, BLUR_KEYS) === snapshot(base, BLUR_KEYS)) return
+  if (base === null || snapshot(payload(true), BLUR_KEYS) === snapshot(base, BLUR_KEYS)) return
   void save(true)
+}
+
+// commitProxyPool IP 池的模式选完、地址或端口失焦时保存；组合不合法时不提交（不弹提示），错误显示在 IP 池分组的输入框旁
+function commitProxyPool(): void {
+  if (proxyPoolInvalid(form) !== '') return
+  commitBlurField()
 }
 
 // onProxyTesting 测试开始时暂停进行中的倒计时，结束后只在测试通过、仍需要应用时重新开始
@@ -572,13 +696,18 @@ async function saveAndApply(): Promise<void> {
     if (saveError.value !== '') emit('notice', saveError.value, 'error')
     return
   }
+  // IP 池组合不合法时其余字段照常保存、IP 池沿用已保存的值：不提示“已保存”，改为提示 IP 池的错误
+  const poolProblem = proxyPoolInvalid(form)
   if (saved.service_restart_required && props.running) {
     await applyNow()
-  } else if (saved.service_restart_required) {
-    emit('notice', t('settings.savedStopped'), 'success')
-  } else {
-    emit('notice', t('settings.saved'), 'success')
+  } else if (poolProblem === '') {
+    emit(
+      'notice',
+      t(saved.service_restart_required ? 'settings.savedStopped' : 'settings.saved'),
+      'success',
+    )
   }
+  if (poolProblem !== '') emit('notice', poolProblem, 'error')
 }
 
 watch(
@@ -601,6 +730,9 @@ watch(
       form.ultra_primary_models = [...(config.ultra_primary_models ?? DEFAULT_ULTRA_PRIMARY_MODELS)]
       ultraPrimaryModelsText.value = form.ultra_primary_models.join(', ')
       form.ultra_primary_queue_wait = config.ultra_primary_queue_wait ?? '10s'
+      // 旧版服务端不返回 IP 池设置：表单里也去掉，保存时不提交，服务端沿用现值
+      if (config.proxy_pool !== undefined) form.proxy_pool = cloneProxyPool(config.proxy_pool)
+      else delete form.proxy_pool
     }
     savedConfig.value = config
   },
@@ -762,6 +894,20 @@ onBeforeUnmount(() => {
           @testing="onProxyTesting"
         />
       </div>
+
+      <ProxyPoolSettings
+        v-if="form.proxy_pool !== undefined"
+        v-model="proxyPoolForm"
+        :status="proxyPoolStatus"
+        :max-active="form.max_active_workers"
+        :ultra-max-active="form.ultra_max_active_workers"
+        :warm-concurrency="form.warm_startup_concurrency"
+        :has-default-proxy="form.proxy.trim() !== ''"
+        :server-error="proxyPoolServerError"
+        @commit="commitProxyPool"
+        @testing="onProxyTesting"
+        @notice="(message, tone) => emit('notice', message, tone)"
+      />
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <label class="block">

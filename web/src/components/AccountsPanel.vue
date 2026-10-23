@@ -23,11 +23,14 @@ import type {
   ChromeImportProfile,
   Cooldown,
   PermissionDeniedAccount,
+  ProxyPoolAssignment,
+  ProxyPoolStatus,
   UltraWorkerCounters,
   WorkerCounters,
   WorkerState,
 } from '@/types'
 import { maskProxy, proxyHasAuth } from '@/proxy'
+import { proxyPoolActive, slotLabel } from '@/proxyPool'
 import OnboardingPanel from './OnboardingPanel.vue'
 import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
@@ -40,6 +43,8 @@ const props = defineProps<{
   workerSets: { warm: Set<string>; starting: Set<string> }
   workerCounts: WorkerCounters | null
   ultraWorkerCounts: UltraWorkerCounters | null
+  // proxyPool 为状态接口的 IP 池实时状态（每 3 秒更新）：assignments 给出每个账户当前用的端口或会话；没有开启时为 null
+  proxyPool: ProxyPoolStatus | null
   cooldowns: Cooldown[]
 }>()
 
@@ -359,6 +364,14 @@ function closeEditor(): void {
   editingAccountID.value = ''
 }
 
+// editingAccount 为编辑对话框里的已有账户：“测试代理”留空时按账户测试，账户已保存的代理为空时测它实际的出口，
+// 不为空（对话框里清空了）时测清空后 IP 池会给它的出口
+const editingAccount = computed(() =>
+  props.accounts.find((item) => item.id === editingAccountID.value),
+)
+const editingTestAccountID = computed(() => editingAccount.value?.id ?? '')
+const editingTestCleared = computed(() => (editingAccount.value?.proxy ?? '') !== '')
+
 function openBrowserLogin(): void {
   showBrowserLogin.value = true
 }
@@ -592,6 +605,96 @@ function workerState(account: Account): WorkerState {
   return 'none'
 }
 
+// ---------- 代理列与 IP 池 ----------
+
+const poolOn = computed(() => proxyPoolActive(props.proxyPool))
+// poolAssignments 按账户 ID 合并状态接口的活动租约（同一账户的 Worker 与登录、验证同时在用时以 Worker 为准）；
+// 账户列表事件不随 Worker 启停推送，实时端口以这里为准
+const poolAssignments = computed(() => {
+  const assignments = new Map<string, ProxyPoolAssignment>()
+  for (const assignment of props.proxyPool?.assignments ?? []) {
+    if (assignment.account_id === '') continue
+    const current = assignments.get(assignment.account_id)
+    if (current === undefined || (current.kind !== 'worker' && assignment.kind === 'worker')) {
+      assignments.set(assignment.account_id, assignment)
+    }
+  }
+  return assignments
+})
+
+interface ProxyCell {
+  text: string
+  tooltip: string
+  auth: boolean
+  pinned: boolean
+  className: string
+}
+
+// proxyCell 返回代理列的显示：账户代理（服务端按当前生效的默认代理标出不用 IP 池的，proxy_pool_pinned）> IP 池的实时租约 >
+// 仍走默认代理的 Worker（开启 IP 池或改为跟随默认代理之前就在运行）> 没有浏览器时后台请求暂用的出口 > 默认代理
+function proxyCell(account: Account): ProxyCell {
+  const own = account.proxy
+  if (own !== '') {
+    const masked = maskProxy(own)
+    const pinned = poolOn.value && account.proxy_pool_pinned === true
+    return {
+      text: masked,
+      tooltip: pinned ? `${masked} · ${t('accounts.proxyPoolPinnedHelp')}` : masked,
+      auth: proxyHasAuth(own),
+      pinned,
+      className: 'text-gray-400',
+    }
+  }
+  const assignment = poolAssignments.value.get(account.id)
+  if (assignment !== undefined) {
+    const login = assignment.kind === 'login'
+    return {
+      text: `${tf('accounts.proxyPoolSlot', { slot: slotLabel(assignment.slot, tf) })} · ${t(
+        login ? 'accounts.proxyPoolLogin' : 'accounts.proxyPoolActive',
+      )}`,
+      tooltip: t(login ? 'accounts.proxyPoolLoginHelp' : 'accounts.proxyPoolActiveHelp'),
+      auth: false,
+      pinned: false,
+      className: 'text-sky-300',
+    }
+  }
+  if (poolOn.value && (props.proxyPool?.unpooled ?? 0) > 0 && props.workerSets.warm.has(account.id)) {
+    return {
+      text: t('accounts.proxyPoolUnpooled'),
+      tooltip: t('accounts.proxyPoolUnpooledHelp'),
+      auth: false,
+      pinned: false,
+      className: 'text-blue-300',
+    }
+  }
+  const slot = account.proxy_pool_slot ?? ''
+  if (poolOn.value && slot !== '') {
+    return {
+      text: `${tf('accounts.proxyPoolSlot', { slot: slotLabel(slot, tf) })} · ${t('accounts.proxyPoolBackground')}`,
+      tooltip: t('accounts.proxyPoolBackgroundHelp'),
+      auth: false,
+      pinned: false,
+      className: 'text-gray-400',
+    }
+  }
+  if (poolOn.value) {
+    return {
+      text: t('accounts.proxyPoolDefault'),
+      tooltip: t('accounts.proxyPoolDefaultHelp'),
+      auth: false,
+      pinned: false,
+      className: 'text-gray-400',
+    }
+  }
+  return { text: t('accounts.direct'), tooltip: '', auth: false, pinned: false, className: 'text-gray-400' }
+}
+
+// proxySearchText 为搜索用的代理文本：账户代理按掩码后的显示值（搜不到账号密码），另加 IP 池的端口号或会话号
+function proxySearchText(account: Account): string {
+  const slot = poolAssignments.value.get(account.id)?.slot ?? account.proxy_pool_slot ?? ''
+  return `${maskProxy(account.proxy)} ${slot}`
+}
+
 const query = ref('')
 const stateFilter = ref<StateFilter>('all')
 const workerFilter = ref<WorkerFilter>('all')
@@ -644,8 +747,8 @@ const filtered = computed(() => {
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
     if (term === '') return true
-    // 代理按掩码后的显示值匹配，搜不到账号密码
-    return [account.label, maskProxy(account.proxy), account.message, account.benefit_tier].some(
+    // 代理按掩码后的显示值匹配，搜不到账号密码；IP 池的端口号或会话号也能搜
+    return [account.label, proxySearchText(account), account.message, account.benefit_tier].some(
       (value) => value.toLowerCase().includes(term),
     )
   })
@@ -1600,15 +1703,23 @@ function closeBulkPanel(): void {
                 </td>
                 <td>
                   <div
-                    v-tooltip="maskProxy(account.proxy)"
-                    class="cell-truncate text-xs text-gray-400"
+                    v-tooltip="proxyCell(account).tooltip"
+                    class="cell-truncate text-xs"
+                    :class="proxyCell(account).className"
                   >
-                    {{ maskProxy(account.proxy) || t('accounts.direct')
+                    {{ proxyCell(account).text
                     }}<span
-                      v-if="proxyHasAuth(account.proxy)"
+                      v-if="proxyCell(account).auth"
                       class="ml-1 rounded bg-[#21262d] px-1 text-[10px] text-gray-400"
                       >{{ t('proxy.authTag') }}</span
                     >
+                  </div>
+                  <div
+                    v-if="proxyCell(account).pinned"
+                    v-tooltip="t('accounts.proxyPoolPinnedHelp')"
+                    class="cell-truncate text-[11px] text-yellow-400"
+                  >
+                    {{ t('accounts.proxyPoolPinned') }}
                   </div>
                 </td>
                 <td>
@@ -1765,6 +1876,8 @@ function closeBulkPanel(): void {
                 input-class="input w-full"
                 :help="t('accounts.proxyHelp')"
                 allow-empty-test
+                :account-id="editingTestAccountID"
+                :account-cleared="editingTestCleared"
                 :label="t('accounts.proxy')"
               />
             </div>

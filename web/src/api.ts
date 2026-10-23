@@ -15,7 +15,9 @@ import type {
   PlaygroundInput,
   PlaygroundMedia,
   Cooldown,
+  FollowDefaultProxyResult,
   PermissionDeniedAccount,
+  ProxyPoolConfig,
   ProxyTestResult,
   RequestBody,
   RequestSummary,
@@ -299,6 +301,32 @@ export const api = {
     requestJSON<ProxyTestResult>('/api/proxy/test', {
       method: 'POST',
       body: JSON.stringify({ proxy }),
+    }),
+  // testProxyPool 抽测 IP 池的出口 IP：用输入框里当前的设置（不必先保存），静态抽首、中、尾等端口，动态用临时会话号；
+  // samples 为抽测的出口数（服务端默认 3，最多 10）
+  testProxyPool: (pool: ProxyPoolConfig, samples: number) =>
+    requestJSON<ProxyTestResult>('/api/proxy/test', {
+      method: 'POST',
+      body: JSON.stringify({ pool, samples }),
+    }),
+  // testAccountProxy 测试账户实际使用的出口（账户代理、IP 池分配或默认代理），结果的 slot 为端口号或会话号
+  testAccountProxy: (accountID: string) =>
+    requestJSON<ProxyTestResult>('/api/proxy/test', {
+      method: 'POST',
+      body: JSON.stringify({ account_id: accountID }),
+    }),
+  // checkProxyPool 在后台逐个检查静态 IP 端口段里每个端口的出口 IP（返回 202，已在进行时 409）；pool 省略时用当前生效的设置。
+  // 进度与结果在状态接口的 proxy_pool.check
+  checkProxyPool: (pool?: ProxyPoolConfig) =>
+    requestCommand('/api/proxy/pool/check', {
+      method: 'POST',
+      body: JSON.stringify(pool === undefined ? {} : { pool }),
+    }),
+  // followDefaultProxy 把账户代理与默认代理相同的账户改为跟随默认代理（清空账户代理），之后它们按 IP 池出网；
+  // 运行中的 Worker 不重启，关闭后才改用 IP 池
+  followDefaultProxy: () =>
+    requestJSON<FollowDefaultProxyResult>('/api/accounts/proxy/follow-default', {
+      method: 'POST',
     }),
   cancelRequest: (id: string) =>
     requestCommand(`/api/requests/${encodeURIComponent(id)}/cancel`, {

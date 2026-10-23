@@ -129,9 +129,10 @@ rules = [
     # JSON 形式保存的 Cookie（storage-state 结构：{"name":"SAPISID","value":"..."}）
     (re.compile(r"(?i)(\"name\"\s*:\s*\"(?:SAPISID|APISID|SSID|HSID|SIDCC|SID|__Secure-[^\"]+|NID)\"\s*,\s*\"value\"\s*:\s*\")[^\"]*"), r"\1<已隐藏>"),
 ]
-# PROXY 整行（只用于 config.txt）：只保留协议与 host:port，账号密码替换掉；解析不了时整值隐藏。
-# PROXY 后面紧跟等号，不会误伤 PROXY_API_KEY；拆分规则与程序的规范化一致（host:port:用户名:密码 优先，否则按最后一个 @）
-proxy_line = re.compile(r"^(\s*(?:export\s+)?PROXY\s*=\s*)(.*)$", re.M)
+# PROXY 与 PROXY_POOL_URL 整行（只用于 config.txt）：只保留协议与 host:port，用户名（含 {session} 等会话参数）与密码都替换掉；
+# 解析不了时整值隐藏。键名后面紧跟等号，不会误伤 PROXY_API_KEY 与其他 PROXY_POOL_* 键；
+# 拆分规则与程序的规范化一致（host:port:用户名:密码 优先，否则按最后一个 @）
+proxy_line = re.compile(r"^(\s*(?:export\s+)?(?:PROXY|PROXY_POOL_URL)\s*=\s*)(.*)$", re.M)
 # 用户名:密码 段像 IPv4、带点域名或 [v6] 加端口、host 段又不像主机：账号密码与 host:port 可能写反了
 # （用户名:密码:host:port、host:port@用户名:密码），程序报错，这里整值隐藏
 host_port_like = re.compile(r"^(?:\[[0-9A-Fa-f:.]+\]|(?:[A-Za-z0-9_-]|[^\x00-\x7F])+(?:\.(?:[A-Za-z0-9_-]|[^\x00-\x7F])+)+):[0-9]{1,5}/?$")

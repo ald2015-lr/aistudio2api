@@ -45,6 +45,10 @@ var configKeys = [...]string{
 	"LISTEN_ADDR",
 	"PROXY_API_KEY",
 	"PROXY",
+	"PROXY_POOL_MODE",
+	"PROXY_POOL_URL",
+	"PROXY_POOL_PORT_START",
+	"PROXY_POOL_PORT_END",
 	"INIT_TIMEOUT",
 	"REQUEST_TIMEOUT",
 	"FIRST_EVENT_TIMEOUT",
@@ -101,6 +105,7 @@ type Config struct {
 	ListenAddr             string        `json:"listen_addr"`
 	ProxyAPIKey            string        `json:"proxy_api_key"`
 	Proxy                  string        `json:"proxy"`
+	ProxyPool              ProxyPool     `json:"proxy_pool"` // IP 池（PROXY_POOL_*，见 ProxyPool）：开启时没有自己代理的账户不再用 Proxy；保存后立即生效
 	InitTimeout            time.Duration `json:"-"`
 	RequestTimeout         time.Duration `json:"-"`
 	WarmWorkerLimit        int           `json:"warm_worker_limit"`
@@ -180,6 +185,7 @@ func Default() Config {
 		AuthStates:             defaultAuthStates,
 		ListenAddr:             defaultListenAddr,
 		ProxyAPIKey:            DefaultProxyAPIKey,
+		ProxyPool:              DefaultProxyPool(),
 		InitTimeout:            defaultInitTimeout,
 		RequestTimeout:         defaultRequestTimeout,
 		WarmWorkerLimit:        defaultWarmWorkerLimit,
@@ -230,6 +236,9 @@ func Load(path string) (Config, error) {
 	if value, ok := values["PROXY"]; ok {
 		// 手写的 host:port:用户名:密码 等写法在这里改写成规范 URL，保存侧与生效侧都从这里来；无法规范化的值留给 Validate 报错
 		cfg.Proxy = CanonicalProxy(value)
+	}
+	if err := loadProxyPool(values, &cfg.ProxyPool); err != nil {
+		return Config{}, err
 	}
 	if value, ok := values["INIT_TIMEOUT"]; ok {
 		cfg.InitTimeout, err = parsePositiveDuration("INIT_TIMEOUT", value)
@@ -430,6 +439,9 @@ func (c Config) Save(path string) error {
 	for key, value := range c.DowngradeGuard.envValues() {
 		values[key] = value
 	}
+	for key, value := range c.ProxyPool.envValues() {
+		values[key] = value
+	}
 
 	var output strings.Builder
 	for _, key := range configKeys {
@@ -524,6 +536,9 @@ func (c Config) Validate() error {
 	if err := c.DowngradeGuard.Validate(); err != nil {
 		return err
 	}
+	if err := c.ProxyPool.Validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -581,6 +596,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		ListenAddr             string         `json:"listen_addr"`
 		ProxyAPIKey            string         `json:"proxy_api_key"`
 		Proxy                  string         `json:"proxy"`
+		ProxyPool              ProxyPool      `json:"proxy_pool"`
 		InitTimeout            string         `json:"init_timeout"`
 		RequestTimeout         string         `json:"request_timeout"`
 		FirstEventTimeout      string         `json:"first_event_timeout"`
@@ -612,6 +628,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		ListenAddr:             c.ListenAddr,
 		ProxyAPIKey:            c.ProxyAPIKey,
 		Proxy:                  c.Proxy,
+		ProxyPool:              c.ProxyPool.withDefaults(),
 		InitTimeout:            c.InitTimeout.String(),
 		RequestTimeout:         c.RequestTimeout.String(),
 		FirstEventTimeout:      c.FirstEventTimeout.String(),
@@ -647,6 +664,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		ListenAddr             string          `json:"listen_addr"`
 		ProxyAPIKey            string          `json:"proxy_api_key"`
 		Proxy                  string          `json:"proxy"`
+		ProxyPool              *ProxyPool      `json:"proxy_pool"`
 		InitTimeout            string          `json:"init_timeout"`
 		RequestTimeout         string          `json:"request_timeout"`
 		FirstEventTimeout      string          `json:"first_event_timeout"`
@@ -715,6 +733,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
 		ProxyAPIKey:            EffectiveProxyAPIKey(value.ProxyAPIKey),
 		Proxy:                  CanonicalProxy(value.Proxy),
+		ProxyPool:              proxyPoolOrDefault(value.ProxyPool),
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,
 		FirstEventTimeout:      firstEventTimeout,

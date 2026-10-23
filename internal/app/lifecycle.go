@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -91,6 +92,9 @@ type runtimeManager struct {
 	probeProxy func(context.Context, string) api.ProxyTestProbe
 	// proxyRelays 为“测试代理”申请本机中转的注册表，nil 时用包级默认注册表；测试注入
 	proxyRelays *proxyrelay.Registry
+	// proxyPool 为进程级 IP 池（见 proxy_pool.go）：端口占用对应进程里活着的浏览器，与生成服务实例无关，重建生成服务时交给新实例；
+	// 测试直接构造的管理器为 nil（方法对 nil 安全）
+	proxyPool *proxyPool
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。
@@ -107,9 +111,15 @@ func newRuntimeManager(
 	proxyrelay.SetLogger(func(level, message string) { requests.log("service", level, message) })
 	manager := &runtimeManager{
 		lifecycle: ctx, configPath: configPath, activeManagement: cfg,
-		overrides: overrides, requests: requests, factory: buildRuntimeGeneration,
+		overrides: overrides, requests: requests, proxyPool: newProcessProxyPool(configPath, requests),
 		apiKey: newAPIKeyHolder(cfg.ProxyAPIKey),
 		intent: &serviceIntent{},
+	}
+	// 每个生成服务实例都用同一个进程级 IP 池；runtimeFactory 的签名不变（测试替换 factory 时不涉及 IP 池）
+	manager.factory = func(
+		launchCtx context.Context, parentLifecycle context.Context, cfg config.Config, requests *requestRegistry,
+	) (*runtimeGeneration, error) {
+		return buildRuntimeGeneration(launchCtx, parentLifecycle, cfg, requests, manager.proxyPool)
 	}
 	manager.ultraExclusive.Store(cfg.UltraExclusive)
 	generation, err := manager.factory(launchCtx, ctx, cfg, requests)
@@ -121,15 +131,31 @@ func newRuntimeManager(
 	return manager, nil
 }
 
-// buildRuntimeGeneration 从配置快照创建账户池、Worker 与协议运行时
+// newProcessProxyPool 创建进程级 IP 池：记录文件为配置文件所在目录下的 runtime/proxy-pool.json（生产上为工作目录下的 runtime/，
+// 与 requests.db 同目录），跨进程端口锁与账户 WAA runtime 租约同目录；锁目录不可用时 WARN 并只在本进程内互斥
+func newProcessProxyPool(configPath string, requests *requestRegistry) *proxyPool {
+	lockDir, err := aistudio.ProxyPortLockDirectory()
+	if err != nil {
+		requests.log("service", "WARN", "IP 池跨进程端口锁不可用，多个进程使用同一端口段时会重复分配 | 错误="+err.Error())
+		lockDir = ""
+	}
+	return newProxyPool(proxyPoolOptions{
+		path:     filepath.Join(filepath.Dir(configPath), "runtime", proxyPoolFileName),
+		lockDir:  lockDir,
+		requests: requests,
+	})
+}
+
+// buildRuntimeGeneration 从配置快照创建账户池、Worker 与协议运行时；proxyPool 为进程级 IP 池（可以为 nil）
 func buildRuntimeGeneration(
 	launchCtx context.Context,
 	parentLifecycle context.Context,
 	cfg config.Config,
 	requests *requestRegistry,
+	proxyPool *proxyPool,
 ) (*runtimeGeneration, error) {
 	lifecycle, lifecycleCancel := context.WithCancel(parentLifecycle)
-	service, admin, closeRuntime, err := newRuntime(launchCtx, lifecycle, cfg, requests)
+	service, admin, closeRuntime, err := newRuntime(launchCtx, lifecycle, cfg, requests, proxyPool)
 	if err != nil {
 		lifecycleCancel()
 		return nil, err
@@ -259,9 +285,11 @@ func (manager *runtimeManager) stopCurrent(ctx context.Context) (api.AdminStatus
 	return current.admin.StopService(ctx)
 }
 
-// Close 释放当前生成服务；在锁外关闭，关闭期间仍在收尾的请求可以照常记录访问日志
+// Close 释放当前生成服务；在锁外关闭，关闭期间仍在收尾的请求可以照常记录访问日志。最后写出 IP 池记录
 func (manager *runtimeManager) Close() error {
-	return manager.generation().Close()
+	err := manager.generation().Close()
+	manager.proxyPool.flush()
+	return err
 }
 
 // generation 返回当前生成服务实例的快照。
@@ -597,9 +625,18 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
+		ProxyPool: active.ProxyPool,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
+	}
+	// IP 池：提交时省略（旧版页面）按生效值比较；地址按规范值比较，写法不同但上游相同时不误报
+	if value.ProxyPool != nil {
+		poolSettings, err := config.NormalizeProxyPool(proxyPoolFromAPI(*value.ProxyPool))
+		if err != nil {
+			return false
+		}
+		saved.ProxyPool = poolSettings
 	}
 	if value.UltraExclusive != nil {
 		saved.UltraExclusive = *value.UltraExclusive
@@ -644,7 +681,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
-		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait
+		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
+		saved.ProxyPool.Equal(active.ProxyPool)
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

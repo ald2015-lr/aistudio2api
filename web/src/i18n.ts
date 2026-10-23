@@ -61,7 +61,7 @@ const zhCN = {
   'accounts.emptyHint': '通过浏览器登录或从 Chrome 导入账户',
   'accounts.proxy': '账户代理',
   'accounts.proxyHelp':
-    '留空使用服务配置的默认代理。写法同默认代理；动态 IP 建议在代理商处开启固定会话（粘性 IP），否则浏览器页面与后台请求可能从不同 IP 出网。',
+    '留空：IP 池开启时使用 IP 池（每个浏览器一个 IP），否则使用服务配置的默认代理。留空点“测试代理”：编辑已有账户时测这个账户当前实际的出口，账户原来有自己的代理（在这里清空了）时测清空后 IP 池会给它的出口（IP 池关闭时测默认代理）；添加新账户时测 IP 池此刻会分给登录的出口（IP 池关闭时测默认代理）。写法同默认代理；动态 IP 建议在代理商处开启固定会话（粘性 IP），否则浏览器页面与后台请求可能从不同 IP 出网。',
   'accounts.locale': '语言区域',
   'accounts.timezone': '时区',
   'accounts.models': '模型',
@@ -454,7 +454,7 @@ const zhCN = {
   'app.egressLimitOff': '未启用',
   'app.egressSuspended': '出口限流 {label} · 限速无效已停止 · 上游拒绝 {ratio}% · 本地拒绝 {local}/分钟',
   'app.egressLimitedDetail':
-    '经同一出口的多个账号同时被上游限流（新换上的账号第一次请求就被拒）：已停止逐级冷却与按需冷启动，按出口限速发送，主用模型优先。“上游拒绝”是发往上游的请求被拒的比例；“本地限速拒绝”是排队超过上限、在本地直接返回的 429。限流解除后自动恢复。给账号设置不同代理（增加出口）才能提高上限',
+    '经同一出口的多个账号同时被上游限流（新换上的账号第一次请求就被拒）：已停止逐级冷却与按需冷启动，按出口限速发送，主用模型优先。“上游拒绝”是发往上游的请求被拒的比例；“本地限速拒绝”是排队超过上限、在本地直接返回的 429。限流解除后自动恢复。给账号设置不同代理或开启 IP 池（增加出口）才能提高上限',
   'app.egressRejected': '出口 {label} 判定已撤销（{by}）',
   'app.egressRejectedDetail':
     '被拒的账号再试都不成功（更像账号额度用完），或已手动撤销：已交回逐级冷却，{minutes} 分钟内不再判定',
@@ -520,7 +520,7 @@ const zhCN = {
   'accounts.tierUnknown': '未读取',
   'accounts.tierUnknownHelp': '尚未从官网读取权益，暂按 Free 计入普通号池',
   'settings.liveHint':
-    'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、临时对话保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
+    'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、临时对话、IP 池保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
   'logs.categoryAll': '全部',
   'logs.categoryRequest': '请求',
   'logs.categoryAccount': '账户',
@@ -742,6 +742,123 @@ const zhCN = {
   'usage.protocol.videos': '视频',
   'usage.protocol.files': '文件',
   'usage.protocol.other': '其他',
+  // ---------- IP 池 ----------
+  'proxy.warnDuplicateIP':
+    '有出口的 IP 相同：这些端口或会话可能对应同一个 IP，账号会共用 IP。请检查代理商的分配。',
+  'proxy.warnPoolPartial': '部分出口测试失败，原因见上面各行。',
+  'proxy.slotPort': '端口 {port}',
+  'proxy.slotSession': '会话 {session}',
+  'proxy.testAccountSlot': '这个账户当前的出口：{slot}',
+  'proxy.testAccountClearedSlot':
+    '清空账户代理后由 IP 池分配，例如：{slot}（之后启动的 Worker 可能分到别的端口）',
+  'proxy.testPoolSlot': 'IP 池此刻会分给登录的出口：{slot}（实际以登录时分到的为准）',
+  'settings.proxyPoolTitle': 'IP 池（每个浏览器一个 IP）',
+  'settings.proxyPoolHelp':
+    '没有自己代理的账户改用 IP 池出网。静态 IP：端口段里每个端口是一个固定 IP，每个运行中的浏览器（Worker、登录、验证）独占一个端口，账号尽量回到上次用过的端口；动态 IP：地址里的 {session} 按账户换成固定会话号，一个会话号一个粘性 IP。优先级：账户自己的代理 > IP 池 > 默认代理。“一个账号一个 IP”指同一时刻：账号多于端口时，一个 IP 会先后服务多个账号。',
+  'settings.proxyPoolMode': '模式',
+  'settings.proxyPoolModeOff': '关闭（使用默认代理）',
+  'settings.proxyPoolModeStatic': '静态 IP（端口段，每个浏览器独占一个端口）',
+  'settings.proxyPoolModeDynamic': '动态 IP（会话号，每个账户一个固定会话）',
+  'settings.proxyPoolURL': '代理地址',
+  'settings.proxyPoolURLHelpOff': '关闭时保留地址，方便再次开启。',
+  'settings.proxyPoolURLHelpStatic':
+    '填代理商给的任意一个端口的地址，例如 http://用户名:密码@isp.decodo.com:10000；端口会自动换成下面端口段里的端口（一个端口一个 IP）。写法同默认代理，保存时统一改写成 URL 形式。',
+  'settings.proxyPoolURLHelpDynamic':
+    '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。只在代理连不通时换会话号；裸 429 不换（每个会话只有一个账号，分不清是账号还是 IP 的问题），代理能连通、但被上游限制的会话不会自动换。建议在代理商处设置较长的会话时长。',
+  'settings.proxyPoolURLPlaceholderStatic': 'http://用户名:密码@isp.decodo.com:10000',
+  'settings.proxyPoolURLPlaceholderDynamic':
+    'http://customer-账号-sessid-{session}:密码@gate.ipfoxy.io:58688',
+  'settings.proxyPoolPortStart': '起始端口',
+  'settings.proxyPoolPortEnd': '结束端口',
+  'settings.proxyPoolPortsHelp':
+    '端口段含起止两端，最多 5000 个端口。每台服务器（每个进程）用不重叠的端口段，例如这台 10001–10200、另一台 10201–10400；同一台机器上的多个进程按端口加锁，不会分到同一端口。',
+  'settings.proxyPoolCapacity':
+    '共 {ports} 个端口；最多同时 {need} 个浏览器（普通 {normal}+{normalDrain}、Ultra {ultra}+{ultraDrain}，加号后为排空时先启动的替补），余量 {spare} 个，登录与验证另占（默认验证并发 3）。',
+  'settings.proxyPoolShortage':
+    '端口少于可能同时运行的浏览器数（需要 {need} 个）：超出的浏览器会与其他账号共用端口（同一个 IP）。请扩大端口段，或调低峰值 Worker 上限、启动预热并发。',
+  'settings.proxyPoolTight':
+    '余量只有 {spare} 个：登录与验证同时进行时可能与其他账号共用端口。建议端口数 ≥ 最多同时运行的浏览器数 + 验证并发。',
+  'settings.proxyPoolDefaultProxyHint':
+    '开启后，没有自己代理的账户不再使用默认代理；只有端口全被占用时，没有浏览器的账户的少量后台请求才暂时退回默认代理，端口空出来后自动回到 IP 池。',
+  'settings.proxyPoolLiveHint':
+    '保存后立即生效，不重启生成服务（还有没应用的、需要重启的改动时随重启生效，例如默认代理或账户目录）：运行中的 Worker 继续用原来的出口，关闭后才切换；要立即全部切换，在左下角停止服务后再启动。',
+  'settings.proxyPoolInvalidURL': '请填写代理地址',
+  'settings.proxyPoolInvalidURLPort':
+    '不写协议时必须写端口：填代理商给的任意一个端口的地址，例如 isp.example.com:10000 或 http://用户名:密码@isp.example.com:10000（静态 IP 的端口按端口段自动替换）',
+  'settings.proxyPoolInvalidStaticSession':
+    '静态 IP 的地址不能包含 {session}：端口按端口段自动替换',
+  'settings.proxyPoolInvalidDynamicSession':
+    '动态 IP 的地址必须包含 {session}：写在用户名或密码里会话号的位置，例如 customer-账号-sessid-{session}',
+  'settings.proxyPoolInvalidSessionHost': '{session} 只能写在用户名或密码里',
+  'settings.proxyPoolInvalidPorts': '端口必须是 1 到 65535 的整数，且起始端口不大于结束端口',
+  'settings.proxyPoolInvalidPortsTooMany': '端口段最多 5000 个端口',
+  'settings.proxyPoolSample': '抽测出口',
+  'settings.proxyPoolSampling': '抽测中…',
+  'settings.proxyPoolSampleHint':
+    '“抽测出口”用输入框里当前的设置（不必先保存）测 3 个端口（首、中、尾）或 3 个临时会话号的出口 IP；“检查全部端口”逐个查询端口段里每个端口的出口 IP（后台请求路径，并发 10，最长 5 分钟），确认互不相同。都只访问 api.ipify.org，不访问 Google。',
+  'settings.proxyPoolSampleSummary': '{count} 个出口，不同 IP {distinct} 个',
+  'settings.proxyPoolCheck': '检查全部端口',
+  'settings.proxyPoolCheckRunning': '检查中 {done} / {total}',
+  'settings.proxyPoolCheckBusy': '上一次检查还没有结束，进度见下方',
+  'settings.proxyPoolCheckDone':
+    '检查完成（{time}）：{total} 个端口，成功 {ok}，不同 IP {distinct}，失败 {failed}',
+  'settings.proxyPoolCheckAllDistinct': '全部端口的出口 IP 互不相同',
+  'settings.proxyPoolCheckDuplicates': '出口 IP 相同的端口（{count} 组）：',
+  'settings.proxyPoolCheckFailed': '失败的端口（{count} 个）：',
+  'settings.proxyPoolStatusStatic':
+    '当前：使用中 {inUse} / {total} · 租约 {leases} · 冷却 {cooling} · 共用 {shared}',
+  'settings.proxyPoolStatusDynamic': '当前：使用中的会话 {inUse} · 租约 {leases} · 换会话 {rotations}',
+  'settings.proxyPoolAffinity': '本次运行回到上次端口 {hits} 次，未能回到 {misses} 次',
+  'settings.proxyPoolUnpooled':
+    '{count} 个运行中的 Worker 仍走默认代理（例如开启 IP 池或改为跟随默认代理之前就在运行），Worker 重启后切换到 IP 池；要立即切换，停止服务后再启动。',
+  'settings.proxyPoolStale': '{count} 个浏览器仍在用改配置前的出口，关闭后归还。',
+  'settings.proxyPoolExternal':
+    '{count} 个端口被账户自己的代理、默认代理指向或被其他进程占用，不会分配。',
+  'settings.proxyPoolOrphaned': '{count} 个已删除账户的浏览器关闭失败，仍占着出口。',
+  'settings.proxyPoolRelayLimit':
+    '本机代理中转的连接上限只有 {limit}，浏览器多时可能出现“连接数已满”：建议把 ulimit -n 调到 65536 以上后重启程序。',
+  'settings.proxyPoolPinned':
+    '{count} 个账户的账户代理与默认代理相同（多半是 setup 导入时写进去的），不会使用 IP 池。',
+  'settings.proxyPoolFollow': '改为跟随默认代理',
+  'settings.proxyPoolFollowConfirm':
+    '清空这 {count} 个账户的账户代理（改为跟随默认代理），之后它们按 IP 池出网。运行中的 Worker 不重启，继续走默认代理，关闭后才改用 IP 池；正在被其他操作使用的账户会跳过，稍后可以再点一次。',
+  'settings.proxyPoolFollowAction': '改为跟随',
+  'settings.proxyPoolFollowDone':
+    '已改为跟随默认代理：{changed} 个账户（其中 {running} 个的 Worker 关闭后改用 IP 池），跳过 {skipped} 个',
+  'app.proxyPoolStatic': 'IP 池 {inUse}/{total} · 冷却 {cooling} · 共用 {shared}',
+  'app.proxyPoolDynamic': 'IP 池（动态）· 会话 {inUse} · 换会话 {rotations}',
+  'app.proxyPoolOff': 'IP 池（已关闭）',
+  'app.proxyPoolStale': '旧出口 {count}',
+  'app.proxyPoolUnpooled': '仍走默认代理 {count}',
+  'app.proxyPoolExternal': '外部占用 {count}',
+  'app.proxyPoolOrphaned': '已删账户占用 {count}',
+  'app.proxyPoolDetailStatic':
+    '{endpoint} 端口 {start}-{end}：租约 {leases}（Worker 与登录、验证）· 最多同时 {capacity} 个浏览器 · 回到上次端口 {hits} 次 / 未回到 {misses} 次',
+  'app.proxyPoolDetailDynamic': '{endpoint}：租约 {leases}（Worker 与登录、验证）· 换会话 {rotations} 次',
+  'app.proxyPoolDetailCooling': '冷却：{ports}',
+  'app.proxyPoolDetailCoolingPort': '{port}（至 {until}，第 {level} 档）',
+  'app.proxyPoolDetailHot': '最近 10 分钟裸 429 最多：{ports}',
+  'app.proxyPoolDetailHotPort': '{port}（{count} 次 / {accounts} 个账号）',
+  'app.proxyPoolDetailShortage': '端口少于可能同时运行的 {capacity} 个浏览器，超出的与其他账号共用端口',
+  'app.proxyPoolDetailEgress':
+    '出口限流判定按端口或会话分别统计：共 {total} 个出口，判定成立 {limited} 个、已撤销 {rejected} 个（判定成立或撤销的出口在上方单独列出）',
+  'accounts.proxyPoolSlot': 'IP 池 · {slot}',
+  'accounts.proxyPoolActive': '使用中',
+  'accounts.proxyPoolLogin': '登录中',
+  'accounts.proxyPoolBackground': '后台',
+  'accounts.proxyPoolActiveHelp':
+    '这个账户的浏览器正在独占这个出口（静态 IP 时端口归它独占），后台请求与浏览器同一出口',
+  'accounts.proxyPoolLoginHelp': '这个账户正在登录或验证，浏览器用这个出口',
+  'accounts.proxyPoolBackgroundHelp':
+    '没有运行中的浏览器：后台请求（目录同步、复核、续签）暂用这个出口，启动 Worker 时重新分配（尽量回到上次的端口）',
+  'accounts.proxyPoolUnpooled': '默认代理（Worker 重启后切换到 IP 池）',
+  'accounts.proxyPoolUnpooledHelp':
+    '这个 Worker 仍走默认代理（例如开启 IP 池或改为跟随默认代理之前就在运行）；Worker 重启后切换到 IP 池。要立即切换，停止服务后再启动',
+  'accounts.proxyPoolDefault': '默认代理',
+  'accounts.proxyPoolDefaultHelp': 'IP 池端口都被占用：没有浏览器的账户的后台请求暂用默认代理',
+  'accounts.proxyPoolPinned': '固定为默认代理（不使用 IP 池）',
+  'accounts.proxyPoolPinnedHelp':
+    '账户代理与默认代理相同，因此不使用 IP 池；可在“服务配置 → IP 池”改为跟随默认代理',
 } as const
 
 export type TranslationKey = keyof typeof zhCN
@@ -804,7 +921,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.emptyHint': 'Log in with a browser or import accounts from Chrome',
   'accounts.proxy': 'Account proxy',
   'accounts.proxyHelp':
-    'Leave empty to use the default proxy. Same formats as the default proxy; for rotating IPs, enable a sticky session at your provider, otherwise browser pages and background requests may leave from different IPs.',
+    'Leave empty to use the IP pool when it is on (one IP per browser), otherwise the default proxy. "Test proxy" with an empty value: when editing an account it tests the exit the account actually uses now, or, if the account had its own proxy that you cleared here, the exit the IP pool would give it after clearing (the default proxy when the IP pool is off); when adding an account it tests the IP pool exit a login would get right now (the default proxy when the IP pool is off). Same formats as the default proxy; for rotating IPs, enable a sticky session at your provider, otherwise browser pages and background requests may leave from different IPs.',
   'accounts.locale': 'Locale',
   'accounts.timezone': 'Timezone',
   'accounts.models': 'Models',
@@ -1208,7 +1325,7 @@ const en: Record<TranslationKey, string> = {
   'app.egressSuspended':
     'Egress limited {label} · throttling stopped (ineffective) · upstream rejected {ratio}% · local 429 {local}/min',
   'app.egressLimitedDetail':
-    'Many accounts behind this egress are rate limited at once (freshly switched-in accounts are rejected on their first request): escalating cooldowns and on-demand cold starts are paused, and requests are sent at the egress rate limit with primary models first. "Upstream rejected" is the share of requests sent upstream that were rejected; "local 429" counts requests that queued past the limit and were rejected locally. Recovers automatically once the limiting ends. Only more egresses (different proxies for some accounts) can raise the ceiling',
+    'Many accounts behind this egress are rate limited at once (freshly switched-in accounts are rejected on their first request): escalating cooldowns and on-demand cold starts are paused, and requests are sent at the egress rate limit with primary models first. "Upstream rejected" is the share of requests sent upstream that were rejected; "local 429" counts requests that queued past the limit and were rejected locally. Recovers automatically once the limiting ends. Only more egresses (different proxies for some accounts, or the IP pool) can raise the ceiling',
   'app.egressRejected': 'Egress {label} verdict withdrawn ({by})',
   'app.egressRejectedDetail':
     'Rejected accounts never succeeded when retried (more like used-up account quota), or the verdict was withdrawn manually: escalating cooldowns are back, and no new verdict for {minutes} minutes',
@@ -1275,7 +1392,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.tierUnknown': 'Not read',
   'accounts.tierUnknownHelp': 'The tier has not been read from AI Studio yet; the account counts as Free in the normal pool for now',
   'settings.liveHint':
-    'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts and temporary chat apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
+    'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts, temporary chat and the IP pool apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
   'logs.categoryAll': 'All',
   'logs.categoryRequest': 'Requests',
   'logs.categoryAccount': 'Accounts',
@@ -1502,6 +1619,129 @@ const en: Record<TranslationKey, string> = {
   'usage.protocol.videos': 'Videos',
   'usage.protocol.files': 'Files',
   'usage.protocol.other': 'Other',
+  // ---------- IP pool ----------
+  'proxy.warnDuplicateIP':
+    'Some exits share the same IP: these ports or sessions may map to one IP, so accounts would share it. Check the allocation at your provider.',
+  'proxy.warnPoolPartial': 'Some exits failed; see the lines above for the reasons.',
+  'proxy.slotPort': 'port {port}',
+  'proxy.slotSession': 'session {session}',
+  'proxy.testAccountSlot': 'Current exit of this account: {slot}',
+  'proxy.testAccountClearedSlot':
+    'After clearing the account proxy the IP pool assigns, for example: {slot} (workers started later may get another port)',
+  'proxy.testPoolSlot':
+    'IP pool exit a login would get right now: {slot} (the login itself may get another)',
+  'settings.proxyPoolTitle': 'IP pool (one IP per browser)',
+  'settings.proxyPoolHelp':
+    'Accounts without their own proxy go out through the IP pool. Static IPs: each port in the range is one fixed IP, every running browser (worker, login, verification) gets a port of its own, and an account returns to the port it used last when possible. Rotating IPs: {session} in the address is replaced with a fixed session ID per account, one sticky IP per session. Priority: the account proxy > the IP pool > the default proxy. "One IP per account" holds at any one moment: with more accounts than ports, one IP serves several accounts over time.',
+  'settings.proxyPoolMode': 'Mode',
+  'settings.proxyPoolModeOff': 'Off (use the default proxy)',
+  'settings.proxyPoolModeStatic': 'Static IPs (port range, one port per browser)',
+  'settings.proxyPoolModeDynamic': 'Rotating IPs (session IDs, one fixed session per account)',
+  'settings.proxyPoolURL': 'Proxy address',
+  'settings.proxyPoolURLHelpOff': 'The address is kept while off so the pool can be turned on again.',
+  'settings.proxyPoolURLHelpStatic':
+    'Enter the address of any port from your provider, for example http://user:pass@isp.decodo.com:10000; the port is replaced with each port of the range below (one IP per port). Same formats as the default proxy; saved in URL form.',
+  'settings.proxyPoolURLHelpDynamic':
+    'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters), which changes only when the proxy cannot be reached; bare 429s never change it (each session has a single account, so they cannot tell the account from the IP), and a session that the upstream limits while the proxy still works is not changed automatically. Set a long session duration at your provider.',
+  'settings.proxyPoolURLPlaceholderStatic': 'http://user:pass@isp.decodo.com:10000',
+  'settings.proxyPoolURLPlaceholderDynamic':
+    'http://customer-account-sessid-{session}:pass@gate.ipfoxy.io:58688',
+  'settings.proxyPoolPortStart': 'First port',
+  'settings.proxyPoolPortEnd': 'Last port',
+  'settings.proxyPoolPortsHelp':
+    'Both ends are included, at most 5000 ports. Give each server (each process) a range of its own, for example 10001–10200 here and 10201–10400 on another; processes on the same machine lock ports and never get the same one.',
+  'settings.proxyPoolCapacity':
+    '{ports} ports; at most {need} browsers at once (normal {normal}+{normalDrain}, Ultra {ultra}+{ultraDrain}; the second number is replacements started before draining workers close), {spare} spare, and logins and verifications take ports too (default verification concurrency 3).',
+  'settings.proxyPoolShortage':
+    'Fewer ports than browsers that may run at once ({need} needed): the extra browsers share ports (the same IP) with other accounts. Widen the range or lower the peak worker limit or startup concurrency.',
+  'settings.proxyPoolTight':
+    'Only {spare} spare: logins and verifications running at the same time may share ports with other accounts. Aim for ports ≥ the most browsers at once + the verification concurrency.',
+  'settings.proxyPoolDefaultProxyHint':
+    'Once on, accounts without their own proxy stop using the default proxy; only when every port is taken do the few background requests of accounts without a browser fall back to it for a while, returning to the IP pool once a port frees up.',
+  'settings.proxyPoolLiveHint':
+    'Applies immediately without restarting the generation service (if other saved changes still need a restart, such as the default proxy or the account directory, it applies with that restart): running workers keep their exit and switch after they close; to switch everything now, stop the service at the bottom left and start it again.',
+  'settings.proxyPoolInvalidURL': 'Enter the proxy address',
+  'settings.proxyPoolInvalidURLPort':
+    'Without a scheme the address must include a port: enter the address of any port from your provider, for example isp.example.com:10000 or http://user:password@isp.example.com:10000 (static IP ports are replaced from the port range)',
+  'settings.proxyPoolInvalidStaticSession':
+    'A static-IP address cannot contain {session}: the port is replaced from the port range',
+  'settings.proxyPoolInvalidDynamicSession':
+    'A rotating-IP address must contain {session} where the session ID goes in the username or password, for example customer-account-sessid-{session}',
+  'settings.proxyPoolInvalidSessionHost': '{session} can only appear in the username or password',
+  'settings.proxyPoolInvalidPorts':
+    'Ports must be integers from 1 to 65535, and the first port cannot be greater than the last',
+  'settings.proxyPoolInvalidPortsTooMany': 'The port range can hold at most 5000 ports',
+  'settings.proxyPoolSample': 'Sample exits',
+  'settings.proxyPoolSampling': 'Sampling…',
+  'settings.proxyPoolSampleHint':
+    '"Sample exits" uses the settings currently in the inputs (no need to save first) to test the exit IP of 3 ports (first, middle, last) or 3 temporary session IDs; "Check all ports" queries the exit IP of every port in the range one by one (background request path, 10 at a time, up to 5 minutes) to confirm they all differ. Both contact only api.ipify.org, never Google.',
+  'settings.proxyPoolSampleSummary': '{count} exits, {distinct} distinct IPs',
+  'settings.proxyPoolCheck': 'Check all ports',
+  'settings.proxyPoolCheckRunning': 'Checking {done} / {total}',
+  'settings.proxyPoolCheckBusy': 'The previous check is still running; see its progress below',
+  'settings.proxyPoolCheckDone':
+    'Check finished ({time}): {total} ports, {ok} succeeded, {distinct} distinct IPs, {failed} failed',
+  'settings.proxyPoolCheckAllDistinct': 'Every port has a different exit IP',
+  'settings.proxyPoolCheckDuplicates': 'Ports sharing an exit IP ({count} groups):',
+  'settings.proxyPoolCheckFailed': 'Failed ports ({count}):',
+  'settings.proxyPoolStatusStatic':
+    'Now: {inUse} / {total} in use · {leases} leases · {cooling} cooling · {shared} shared',
+  'settings.proxyPoolStatusDynamic':
+    'Now: {inUse} sessions in use · {leases} leases · {rotations} session changes',
+  'settings.proxyPoolAffinity': 'This run: returned to the last port {hits} times, could not {misses} times',
+  'settings.proxyPoolUnpooled':
+    '{count} running workers still use the default proxy (for example, they were running before the IP pool was turned on or before following the default proxy) and switch to the pool after they restart; to switch now, stop the service and start it again.',
+  'settings.proxyPoolStale': '{count} browsers still use exits from before the change and return them when they close.',
+  'settings.proxyPoolExternal':
+    '{count} ports are taken by account proxies, the default proxy, or another process, and are not assigned.',
+  'settings.proxyPoolOrphaned': '{count} browsers of deleted accounts failed to close and still hold exits.',
+  'settings.proxyPoolRelayLimit':
+    'The local proxy relay allows only {limit} connections, which many browsers can exhaust ("connection limit reached"): raise ulimit -n to 65536 or more and restart the program.',
+  'settings.proxyPoolPinned':
+    '{count} accounts have the default proxy as their account proxy (usually written by setup) and do not use the IP pool.',
+  'settings.proxyPoolFollow': 'Follow the default proxy',
+  'settings.proxyPoolFollowConfirm':
+    'Clear the account proxy of these {count} accounts (follow the default proxy) so that they use the IP pool. Running workers are not restarted: they keep the default proxy and switch to the pool after they close. Accounts busy with another operation are skipped; click again later.',
+  'settings.proxyPoolFollowAction': 'Follow',
+  'settings.proxyPoolFollowDone':
+    'Now following the default proxy: {changed} accounts ({running} of them switch to the pool after their worker closes), {skipped} skipped',
+  'app.proxyPoolStatic': 'IP pool {inUse}/{total} · {cooling} cooling · {shared} shared',
+  'app.proxyPoolDynamic': 'IP pool (rotating) · {inUse} sessions · {rotations} changes',
+  'app.proxyPoolOff': 'IP pool (off)',
+  'app.proxyPoolStale': '{count} old exits',
+  'app.proxyPoolUnpooled': '{count} on default proxy',
+  'app.proxyPoolExternal': '{count} external',
+  'app.proxyPoolOrphaned': '{count} held by deleted accounts',
+  'app.proxyPoolDetailStatic':
+    '{endpoint} ports {start}-{end}: {leases} leases (workers, logins, verifications) · up to {capacity} browsers at once · returned to the last port {hits} times / missed {misses}',
+  'app.proxyPoolDetailDynamic':
+    '{endpoint}: {leases} leases (workers, logins, verifications) · {rotations} session changes',
+  'app.proxyPoolDetailCooling': 'Cooling: {ports}',
+  'app.proxyPoolDetailCoolingPort': '{port} (until {until}, level {level})',
+  'app.proxyPoolDetailHot': 'Most bare 429s in the last 10 minutes: {ports}',
+  'app.proxyPoolDetailHotPort': '{port} ({count} times / {accounts} accounts)',
+  'app.proxyPoolDetailShortage':
+    'Fewer ports than the {capacity} browsers that may run at once; the extra ones share ports with other accounts',
+  'app.proxyPoolDetailEgress':
+    'Egress rate limiting counts each port or session as its own egress: {total} egresses, {limited} limited, {rejected} withdrawn (limited or withdrawn egresses are listed above)',
+  'accounts.proxyPoolSlot': 'IP pool · {slot}',
+  'accounts.proxyPoolActive': 'in use',
+  'accounts.proxyPoolLogin': 'logging in',
+  'accounts.proxyPoolBackground': 'background',
+  'accounts.proxyPoolActiveHelp':
+    'A browser of this account holds this exit (with static IPs the port is its own); background requests use the same exit',
+  'accounts.proxyPoolLoginHelp': 'This account is logging in or being verified; the browser uses this exit',
+  'accounts.proxyPoolBackgroundHelp':
+    'No browser is running: background requests (catalog sync, rechecks, renewal) use this exit for now, and a new one is assigned when a worker starts (the last port when possible)',
+  'accounts.proxyPoolUnpooled': 'Default proxy (switches to the IP pool after the worker restarts)',
+  'accounts.proxyPoolUnpooledHelp':
+    'This worker still uses the default proxy (for example, it was running before the IP pool was turned on or before following the default proxy); it switches to the pool after it restarts. To switch now, stop the service and start it again',
+  'accounts.proxyPoolDefault': 'Default proxy',
+  'accounts.proxyPoolDefaultHelp':
+    'Every IP pool port is taken: background requests of accounts without a browser use the default proxy for now',
+  'accounts.proxyPoolPinned': 'Pinned to the default proxy (no IP pool)',
+  'accounts.proxyPoolPinnedHelp':
+    'The account proxy equals the default proxy, so this account does not use the IP pool; switch it under Service Configuration → IP pool with "Follow the default proxy"',
 }
 
 const legacyKeyMap: Partial<Record<TranslationKey, string>> = {

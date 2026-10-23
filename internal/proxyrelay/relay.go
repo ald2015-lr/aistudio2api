@@ -33,6 +33,18 @@ const (
 // ErrInvalidUpstream 表示上游代理地址无法解析（文案不含地址）
 var ErrInvalidUpstream = errors.New("代理地址无效")
 
+// ErrUpstream 表示本机中转记到了连上游代理的失败（连不上、超时、407 等）：WrapFailure 有失败说明时把它包进返回的错误，
+// 调用方用 errors.Is 判断启动失败是不是代理造成的（IP 池据此判断端口或会话连不通）
+var ErrUpstream = errors.New("上游代理失败")
+
+// upstreamMarker 只用于让 WrapFailure 的结果 errors.Is 命中 ErrUpstream：Error() 为空串，拼进文本后与改动前逐字相同
+// （管理页与 tools/diag_*.sh 按现有文案匹配）
+type upstreamMarker struct{}
+
+func (upstreamMarker) Error() string { return "" }
+
+func (upstreamMarker) Is(target error) bool { return target == ErrUpstream }
+
 // errRegistryClosed 表示注册表已经 Close
 var errRegistryClosed = errors.New("本机代理中转已关闭")
 
@@ -125,6 +137,11 @@ func listenLoopback(ctx context.Context) (net.Listener, error) {
 
 // defaultRegistry 为包级默认注册表：主程序与 setup 各是独立进程，各用自己的
 var defaultRegistry = NewRegistry(Options{})
+
+// TotalConnectionLimit 返回包级默认注册表的进程连接上限（只读）：IP 池开启时按它检查浏览器多时会不会出现“连接数已满：整个进程”
+func TotalConnectionLimit() int {
+	return defaultRegistry.options.MaxTotalConnections
+}
 
 // Acquire 使用包级默认注册表
 func Acquire(upstream string, owner string) (*Lease, error) {
@@ -279,7 +296,8 @@ func (lease *Lease) FailureSince(since time.Time, relevant func(host string) boo
 	return lease.entry.failureSince(since, relevant)
 }
 
-// WrapFailure 在 err 后附上 FailureSince(since, relevant) 的说明，便于管理页直接看到 407 等原因；没有时原样返回 err
+// WrapFailure 在 err 后附上 FailureSince(since, relevant) 的说明，便于管理页直接看到 407 等原因，并让结果 errors.Is 命中
+// ErrUpstream；没有失败说明时原样返回 err
 func (lease *Lease) WrapFailure(err error, since time.Time, relevant func(host string) bool) error {
 	if err == nil {
 		return nil
@@ -288,7 +306,8 @@ func (lease *Lease) WrapFailure(err error, since time.Time, relevant func(host s
 	if failure == "" {
 		return err
 	}
-	return fmt.Errorf("%w；本机代理中转：%s", err, failure)
+	// 第二个 %w 的文本为空串：文本与以前逐字相同，errors.Is 同时命中原错误与 ErrUpstream
+	return fmt.Errorf("%w；本机代理中转：%s%w", err, failure, upstreamMarker{})
 }
 
 // relayEntry 为一个租约独占的监听器

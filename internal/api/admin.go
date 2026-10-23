@@ -54,14 +54,20 @@ type AdminStatus struct {
 	// PrimarySupply 为每个主用模型的可用供给：普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）
 	// 统计 Ultra 分区（Pool 为 ultra），keepWarm 约每 30 秒统计一次并缓存；没有主用模型或服务还没统计过时为空
 	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
-	// Egress 为各出口（账号代理规范化后的值，空为直连）的限流判定与限速；服务未运行时为空
+	// Egress 为出口（账号代理、IP 池端口或会话规范化后的值，空为直连）的限流判定与限速：出口不超过 16 个时全部列出（含正常的，
+	// 诊断要看门槛附近的计数），否则只列出判定成立（limited）或已撤销（rejected）的，正常的只计入 EgressSummary
+	// （IP 池开启后出口多达几百个：静态每个端口、动态每个会话一个）。服务未运行、没有出口或出口多且全部正常时为空
 	Egress []AdminEgress `json:"egress,omitempty"`
+	// EgressSummary 为全部出口的汇总计数；服务运行时总有（没有出口时各项为 0），服务未运行时为空
+	EgressSummary *AdminEgressSummary `json:"egress_summary,omitempty"`
 	// CatalogSync 为模型目录缓存与后台同步的状态；服务未运行时为空
 	CatalogSync *AdminCatalogSync `json:"catalog_sync,omitempty"`
 	// AuthRecheck 为登录复核（疑似登录失效的复核与需要登录账户的定期复核）的状态；服务未运行时为空
 	AuthRecheck *AdminAuthRecheck `json:"auth_recheck,omitempty"`
 	// BadAccounts 为现在标为坏号（连续裸限流、期间没有成功）、移出预热、扩容与替补候选的账号数
 	BadAccounts int `json:"bad_accounts,omitempty"`
+	// ProxyPool 为 IP 池的实时状态（见 AdminProxyPool）：关闭且没有浏览器在用旧出口时省略
+	ProxyPool *AdminProxyPool `json:"proxy_pool,omitempty"`
 }
 
 // AdminAuthRecheck 表示登录复核：上游 401 先记疑似登录失效、写短冷却并用磁盘 Cookie 复核，仍是 401 才标需要登录；
@@ -94,6 +100,14 @@ type AdminPrimarySupply struct {
 	// 与调度分类口径一致），既不计入 Warm 也不计入 Standby；驻留 Worker 大多在这里时，主用模型的请求只能等冷却到期或换上新号
 	Cooling       int  `json:"cooling"`
 	StandbyCapped bool `json:"standby_capped,omitempty"`
+}
+
+// AdminEgressSummary 为出口汇总：Total 为有账户、有活动或有判定记录的出口数，其余为按判定状态的分项（出口多于 16 个时 Normal 不在 Egress 里列出）
+type AdminEgressSummary struct {
+	Total    int `json:"total"`
+	Normal   int `json:"normal"`
+	Limited  int `json:"limited"`
+	Rejected int `json:"rejected"`
 }
 
 // AdminEgress 表示一个出口的限流判定与限速
@@ -331,6 +345,13 @@ type AdminAccount struct {
 	// 停用账户的状态始终是 disabled，前端按 Authenticated 计“有效 / 登录失效”，不能看状态或 HTTP 200
 	Authenticated *bool  `json:"authenticated,omitempty"`
 	VerifyReason  string `json:"verify_reason,omitempty"`
+	// ProxyPoolSlot 为账户没有自己的代理时 IP 池给它的端口号或会话号，ProxyPoolActive 表示有浏览器正在用它；
+	// 账户列表不随 Worker 启停推送，只作兜底，实时端口看状态接口的 proxy_pool.assignments
+	ProxyPoolSlot   string `json:"proxy_pool_slot,omitempty"`
+	ProxyPoolActive bool   `json:"proxy_pool_active,omitempty"`
+	// ProxyPoolPinned 表示 IP 池开启、账户代理与当前生效的默认代理（PROXY）规范值相同，因此不使用 IP 池；与状态接口的
+	// proxy_pool.pinned_default、“改为跟随默认代理”同一份判断
+	ProxyPoolPinned bool `json:"proxy_pool_pinned,omitempty"`
 }
 
 // AccountInput 表示已有账户配置
@@ -412,6 +433,8 @@ type RuntimeConfig struct {
 	// （可以为空数组）；UltraPrimaryQueueWait 为它的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，时长文本）；保存时没有这些字段（旧版页面）则沿用现值
 	UltraPrimaryModels    *[]string `json:"ultra_primary_models,omitempty"`
 	UltraPrimaryQueueWait string    `json:"ultra_primary_queue_wait,omitempty"`
+	// ProxyPool 为 IP 池设置（PROXY_POOL_*，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
+	ProxyPool *ProxyPoolConfig `json:"proxy_pool,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）
@@ -508,6 +531,8 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/config", s.handleRuntimeConfig)
 	mux.HandleFunc("PUT /api/config", s.handleUpdateRuntimeConfig)
 	mux.HandleFunc("POST /api/proxy/test", s.handleTestProxy)
+	mux.HandleFunc("POST /api/proxy/pool/check", s.handleCheckProxyPool)
+	mux.HandleFunc("POST /api/accounts/proxy/follow-default", s.handleFollowDefaultProxy)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
 	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)

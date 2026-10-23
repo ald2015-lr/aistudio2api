@@ -23,6 +23,10 @@ type NativeWorker struct {
 	operationMu sync.Mutex
 	stateMu     sync.RWMutex
 	state       WorkerState
+	// closeHooks 为 runtime 确认关闭后调用一次的回调（见 OnClosed），closed 表示已经确认关闭；均受 hookMu 保护
+	hookMu     sync.Mutex
+	closeHooks []func()
+	closed     bool
 }
 
 var _ ProtectedPreparer = (*NativeWorker)(nil)
@@ -219,10 +223,15 @@ func (worker *NativeWorker) Close() error {
 		state.LastError = ""
 	})
 	err := worker.runtime.Close()
+	var hooks []func()
 	if err == nil {
 		// 浏览器进程已确认退出才释放中转：浏览器还活着时关掉监听器，端口可能被别的账户复用，或触发 Firefox 回退直连；
 		// 关闭失败、停在 WorkerClosing 时保留租约，关闭重试成功后再释放（Release 幂等）
 		worker.relay.Release()
+		worker.hookMu.Lock()
+		worker.closed = true
+		hooks, worker.closeHooks = worker.closeHooks, nil
+		worker.hookMu.Unlock()
 	}
 	worker.updateState(func(state *WorkerState) {
 		if err != nil {
@@ -231,7 +240,28 @@ func (worker *NativeWorker) Close() error {
 		}
 		state.Phase = WorkerClosed
 	})
+	// 关闭回调（IP 池归还端口）与中转释放同一时机，在 hookMu 外依次调用
+	for _, hook := range hooks {
+		hook()
+	}
 	return err
+}
+
+// OnClosed 登记 runtime 确认关闭（Close 成功）后调用一次的回调，与本机中转的释放同一时机：浏览器还活着时不调用，
+// 关闭失败、停在 WorkerClosing 时等关闭重试成功后再调用；已经确认关闭时立即调用。回调在锁外执行（调用 Close 的协程持有
+// operationMu），不能回调 Worker 自身会取 operationMu 的方法；回调里再调用 OnClosed 不会死锁
+func (worker *NativeWorker) OnClosed(hook func()) {
+	if worker == nil || hook == nil {
+		return
+	}
+	worker.hookMu.Lock()
+	if worker.closed {
+		worker.hookMu.Unlock()
+		hook()
+		return
+	}
+	worker.closeHooks = append(worker.closeHooks, hook)
+	worker.hookMu.Unlock()
 }
 
 // phase 返回记录的阶段，不检查浏览器控制连接

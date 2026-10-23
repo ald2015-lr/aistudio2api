@@ -33,6 +33,12 @@ export interface Account {
   // 停用账户的状态始终是 disabled，验证结果按 authenticated 判断，不能看状态或 HTTP 200
   authenticated?: boolean
   verify_reason?: string
+  // proxy_pool_slot 为 IP 池分给账户的端口号或会话号（账户有自己的代理、IP 池关闭或沿用默认代理时没有），
+  // proxy_pool_active 表示有浏览器正在用它。账户列表不随 Worker 启停推送，这两个字段只作兜底，实时端口看 ServiceStatus.proxy_pool.assignments
+  proxy_pool_slot?: string
+  proxy_pool_active?: boolean
+  // proxy_pool_pinned 表示 IP 池开启、账户代理与当前生效的默认代理相同，因此不使用 IP 池（服务端判断，与 pinned_default 一致）
+  proxy_pool_pinned?: boolean
 }
 
 // AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
@@ -256,7 +262,7 @@ export interface EgressLane {
   refill_deferred_1m?: number
 }
 
-// EgressStatus 为一个出口（账号代理规范化后的值，直连为“直连”）的限流判定与限速：mode 为 normal（没有判定）、limited（判定为出口限流）
+// EgressStatus 为一个出口（账号代理、IP 池端口或会话规范化后的值，直连为“直连”）的限流判定与限速：mode 为 normal（没有判定）、limited（判定为出口限流）
 // 或 rejected（判定已撤销，期间不再判定）；limiter 为 off、active（限速生效）或 suspended（限速无效已停止）。
 // ratio_2m 为发往上游的请求被裸 429 拒绝的比例（0–1），local_429_1m 为本地返回的出口限速 429；id 用于撤销与恢复判定。
 // 字段均可选，兼容旧版服务端
@@ -285,6 +291,15 @@ export interface EgressStatus {
   rejected_by?: string
 }
 
+// EgressSummary 为全部出口的汇总：IP 池开启后出口多达几百个（静态每个端口、动态每个会话一个），出口多于 16 个时 egress 只列出
+// 非 normal 的、normal 只计数；total 为有账户、有活动或有判定记录的出口数
+export interface EgressSummary {
+  total: number
+  normal: number
+  limited: number
+  rejected: number
+}
+
 export interface ServiceStatus {
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
@@ -302,12 +317,118 @@ export interface ServiceStatus {
   primary_supply?: PrimarySupply[]
   // catalog_sync 为模型目录缓存与后台同步的状态，服务未运行时没有
   catalog_sync?: CatalogSyncStatus
-  // egress 为各出口的限流判定与限速（只有直连一个出口且没有判定时也有一条），服务未运行时没有
+  // egress 为出口的限流判定与限速：出口不超过 16 个时全部列出（含 normal 的），更多时只列出判定成立（limited）或已撤销（rejected）的，
+  // 正常的只计入 egress_summary；服务未运行时没有。侧栏只显示非 normal 的
   egress?: EgressStatus[]
+  // egress_summary 为全部出口的汇总计数，服务运行时总有；旧版服务端不返回
+  egress_summary?: EgressSummary
   // auth_recheck 为登录复核的状态，服务未运行时没有
   auth_recheck?: AuthRecheckStatus
   // bad_accounts 为标为坏号（连续裸限流、期间没有成功）、移出预热与替补候选的账号数
   bad_accounts?: number
+  // proxy_pool 为 IP 池的实时状态：IP 池开启，或关闭后仍有浏览器在用旧出口时才有；旧版服务端不返回
+  proxy_pool?: ProxyPoolStatus
+}
+
+// ProxyPoolMode 为 IP 池模式：off 关闭（没有自己代理的账户用默认代理），static 静态 IP（端口段里每个浏览器独占一个端口），
+// dynamic 动态 IP（地址里的 {session} 按账户换成固定会话号）
+export type ProxyPoolMode = 'off' | 'static' | 'dynamic'
+
+// ProxyPoolConfig 为 IP 池设置（PROXY_POOL_*，保存后立即生效）。url 可能带账号密码，只在 /api/config 返回给管理页编辑，
+// 页面按掩码显示；port_start、port_end 为静态 IP 的端口段（含两端），任何模式下都要合法
+export interface ProxyPoolConfig {
+  mode: ProxyPoolMode
+  url: string
+  port_start: number
+  port_end: number
+}
+
+// ProxyPoolCoolingPort 为冷却中的端口：until 为恢复时间，level 为冷却档位（第 n 档 15 分钟 × 2^(n-1)，最长 2 小时）
+export interface ProxyPoolCoolingPort {
+  port: number
+  until: string
+  level: number
+}
+
+// ProxyPoolHotPort 为最近 10 分钟裸 429 最多的端口：rate_limited 为次数，accounts 为返回过裸 429 的不同账号数
+export interface ProxyPoolHotPort {
+  port: number
+  rate_limited: number
+  accounts: number
+}
+
+// ProxyPoolAssignment 为一个活动的 IP 池租约：slot 为端口号或会话号；kind 为 worker（Worker）或 login（登录、验证、导入）；
+// 新账户登录中还没有账户 ID 时 account_id 为空
+export interface ProxyPoolAssignment {
+  account_id: string
+  slot: string
+  kind: 'worker' | 'login'
+}
+
+// ProxyPoolDuplicate 为“检查全部端口”中出口 IP 相同的一组端口
+export interface ProxyPoolDuplicate {
+  ip: string
+  ports: number[]
+}
+
+// ProxyPoolFailure 为“检查全部端口”中失败的端口；error 已去掉账号密码
+export interface ProxyPoolFailure {
+  port: number
+  error: string
+}
+
+// ProxyPoolCheck 为最近一次“检查全部端口”（只走后台请求路径）：done 为已检查的端口数，ok 为拿到出口 IP 的端口数，
+// distinct_ips 为其中不同 IP 的个数；duplicates 最多 20 组，failed 最多 50 个
+export interface ProxyPoolCheck {
+  running: boolean
+  started_at: string
+  finished_at?: string
+  total: number
+  done: number
+  ok: number
+  distinct_ips: number
+  duplicates?: ProxyPoolDuplicate[]
+  failed?: ProxyPoolFailure[]
+}
+
+// ProxyPoolStatus 为 IP 池的实时状态（不含账号密码）：
+// total 为静态 IP 的端口数（动态为 0），in_use 为有浏览器占用的端口（动态为有浏览器在用的会话），leases 为 IP 池分配的活动租约
+// （Worker 与登录、验证），capacity 为可能同时运行的浏览器数 Σ(峰值 + 排空上限)（不含登录与验证）；shared 为被两个及以上账号
+// 同时占用的端口，external 为账户固定代理、默认代理指向或被其他进程锁住、不再分配的端口，stale 为改配置前分出、浏览器还没关闭的
+// 出口，unpooled 为 IP 池开启时仍走默认代理的 Worker，orphaned 为账户已删除、浏览器关闭失败仍占着的租约，pinned_default 为
+// 账户代理与默认代理相同、因此不用 IP 池的账户数；relay_limit 为本机代理中转的进程连接上限
+export interface ProxyPoolStatus {
+  mode: ProxyPoolMode
+  endpoint?: string
+  port_start?: number
+  port_end?: number
+  total: number
+  in_use: number
+  leases: number
+  capacity: number
+  shared: number
+  cooling: number
+  external: number
+  stale: number
+  unpooled: number
+  orphaned: number
+  pinned_default: number
+  rotations?: number
+  affinity_hits: number
+  affinity_misses: number
+  cooling_ports?: ProxyPoolCoolingPort[]
+  hot_ports?: ProxyPoolHotPort[]
+  assignments?: ProxyPoolAssignment[]
+  check?: ProxyPoolCheck
+  relay_limit?: number
+}
+
+// FollowDefaultProxyResult 为“改为跟随默认代理”的结果：changed 为清空了账户代理的账户数，running 为其中仍有运行中 Worker
+// （关闭后才改用 IP 池）的账户数，skipped 为正在被其他操作使用、本次跳过的账户数
+export interface FollowDefaultProxyResult {
+  changed: number
+  running: number
+  skipped: number
 }
 
 export type WorkerState = 'warm' | 'starting' | 'none'
@@ -502,6 +623,8 @@ export interface ServiceConfig {
   repeat_prompt_nonce: boolean
   min_output_tokens: number
   downgrade_guard: DowngradeGuardConfig
+  // proxy_pool 为 IP 池设置；旧版服务端不返回，此时设置页不显示 IP 池分组，保存时也不提交（服务端沿用现值）
+  proxy_pool?: ProxyPoolConfig
 }
 
 // ProxyTestProbe 为“测试代理”一条路径的结果：成功时 ip 为出口 IP，失败时 error 为说明（不含账号密码）
@@ -511,8 +634,17 @@ export interface ProxyTestProbe {
   error?: string
 }
 
+// ProxyTestSample 为抽测 IP 池时一个出口的结果：slot 为端口号或临时会话号，其余同 ProxyTestResult
+export interface ProxyTestSample {
+  slot: string
+  browser: ProxyTestProbe
+  direct: ProxyTestProbe
+  same_ip: boolean
+}
+
 // ProxyTestResult 为“测试代理”的结果：browser 为 Camoufox 的路径（带账号密码时经本机中转），direct 为后台请求的路径
-// （直连上游代理）；same_ip 在两边都拿到 IP 且相同时为真
+// （直连上游代理）；same_ip 在两边都拿到 IP 且相同时为真。抽测 IP 池时 samples 为每个出口的结果、distinct_ips 为不同出口 IP 数；
+// 测试账户实际出口时 slot 为它当前的端口号或会话号（不在 IP 池时为空）
 export interface ProxyTestResult {
   proxy: string // 去掉账号密码的 scheme://host:port
   authenticated: boolean
@@ -520,7 +652,10 @@ export interface ProxyTestResult {
   browser: ProxyTestProbe
   direct: ProxyTestProbe
   same_ip: boolean
-  warnings?: Array<'rotating_ip' | 'https_plain_browser'>
+  warnings?: Array<'rotating_ip' | 'https_plain_browser' | 'duplicate_ip' | 'pool_partial'>
+  samples?: ProxyTestSample[]
+  distinct_ips?: number
+  slot?: string
 }
 
 export type AdminEvent =

@@ -1112,10 +1112,10 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | --- | --- |
 | 状态与模型 | `GET /api/status`、`GET /api/models` |
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
-| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}`、`POST /api/accounts/bulk-delete` |
+| 账户 | `GET /api/accounts`、`POST /api/accounts`、`GET/POST /api/accounts/import/chrome`、`POST /api/accounts/bulk-enable`、`PUT /api/accounts/{id}`、`DELETE /api/accounts/{id}`、`POST /api/accounts/bulk-delete`、`POST /api/accounts/proxy/follow-default` |
 | 账户认证 | `POST /api/accounts/{id}/login`、`POST /api/accounts/{id}/verify` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
-| 代理测试 | `POST /api/proxy/test` |
+| 代理测试 | `POST /api/proxy/test`、`POST /api/proxy/pool/check` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
 | 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
 | 出口限流判定 | `POST /api/egress/{id}/withdraw`、`POST /api/egress/{id}/resume` |
@@ -1140,6 +1140,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/control/start`、`stop` | 200 | `AdminStatus` |
 | `GET /api/config`、`PUT /api/config` | 200 | `RuntimeConfig` |
 | `POST /api/proxy/test` | 200 | `ProxyTestResult`，见下文“代理测试” |
+| `POST /api/proxy/pool/check` | 202 | 空 body；请求体 `{"pool"?:ProxyPoolConfig}`（省略 `pool` 或请求体为空时用当前生效的设置，只支持静态 IP），在后台检查端口段里每个端口的出口 IP，进度与结果在 `AdminStatus.proxy_pool.check`；已在进行时 409，见下文“IP 池” |
+| `POST /api/accounts/proxy/follow-default` | 200 | `{"changed":N,"running":N,"skipped":N}`，见下文“IP 池” |
 | `GET /api/cooldowns` | 200 | `{"cooldowns":[AdminCooldown,...]}` |
 | `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...]}`，按最近一次 403 从新到旧 |
 | `POST /api/egress/{id}/withdraw`、`resume` | 200 | `AdminStatus`（动作后的最新状态）；`{id}` 为 `AdminEgress.id`。`withdraw` 撤销该出口的判定，30 分钟内不再判定（交回逐级冷却），`resume` 取消撤销、回到 `normal`；只改内存，不落盘、不是配置项。没有这个出口或管理端不支持时 404 |
@@ -1156,16 +1158,18 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 
 | DTO | 字段 |
 | --- | --- |
-| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略）；服务运行时另有 `egress`（`AdminEgress` 数组，各出口的限流判定与限速）、`catalog_sync`（`AdminCatalogSync`，模型目录缓存与后台同步）、`auth_recheck`（`AdminAuthRecheck`，登录复核）；`bad_accounts` 为现在标为坏号（连续裸限流、期间没有成功）、移出预热、扩容与替补候选的账号数 |
+| `AdminStatus` | `state`、`running`、`ready`、`version`、`active_requests`、`accounts`、`workers`、`ultra_accounts`、`ultra_workers`、可选 `primary_supply`（`AdminPrimarySupply` 数组，`PRIMARY_MODELS` 与 `ULTRA_PRIMARY_MODELS` 的每个模型各一项，同一模型在两份列表里时有两项；两份列表都为空、服务未运行或还没统计过时省略）；服务运行时另有 `egress`（`AdminEgress` 数组，出口的限流判定与限速：出口不超过 16 个时全部列出、含正常的，否则只列出判定成立或已撤销的、正常的不列出，这时全部正常则省略）、`egress_summary`（`AdminEgressSummary`，全部出口的汇总计数）、`catalog_sync`（`AdminCatalogSync`，模型目录缓存与后台同步）、`auth_recheck`（`AdminAuthRecheck`，登录复核）；`bad_accounts` 为现在标为坏号（连续裸限流、期间没有成功）、移出预热、扩容与替补候选的账号数；可选 `proxy_pool`（`AdminProxyPool`：`PROXY_POOL_MODE` 不为 `off`，或关闭后仍有浏览器在用旧出口时返回） |
 | `AdminAccountCounts` | `total`、`ready`、`busy`、`cooldown`、`auth_required`，`accounts` 另有 `auth_required_10m`（最近 10 分钟新被标为需要登录的账户数）；`accounts` 为全部账户，`ultra_accounts` 只含 Ultra 号池成员（`ULTRA_INCLUDE_PRO=true` 时含权益为 Pro 的账户） |
 | `AdminAuthRecheck` | `suspects`（疑似登录失效、等待复核的账户）、`queued`（本轮还没复核的需要登录账户）、`running`、`cleared_1h`（疑似复核通过）、`confirmed_1h`（疑似复核仍是 401、已标需要登录）、`recovered_1h`（需要登录账户复核通过、已恢复）、`still_invalid_1h`、`skipped_1h`（账户忙、出口限流或复核出错）、`next_round`、可选 `pause_reason`（`出口限流`） |
 | `AdminWorkerCounts` | `warm`、`starting`、`target`、`max`、`occupied`、`dead`、`prewarm`、`warm_ids`、`starting_ids`；数量与上限只含普通分区，`warm_ids`、`starting_ids` 包含两个分区；`occupied` 为占用的槽位（含正在关闭的；排空中的 Worker 按已让出计，与调度的容量判断一致，排空期间浏览器数可以比它多）；`dead` 为 `warm` 中账号全局长时间冷却，或在热门冷却模型、所在分区的主用模型（普通分区按 `PRIMARY_MODELS`，Ultra 分区按 `ULTRA_PRIMARY_MODELS`）上长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位，与淘汰登记的口径一致；`draining` 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动）；`retiring` 为待淘汰登记数；`unschedulable` 为 `warm` 中账号已不能服务任何模型（需要登录、已停用、不可用、目录加载过却没有可初始化的模型）、等待释放的驻留 Worker |
 | `AdminWorkerPartition` | `warm`、`starting`、`occupied`、`dead`、`draining`、`retiring`、`unschedulable`、`target`、`warm_limit`、`max`；`ultra_workers` 为 Ultra 分区，`target` 为常驻数与分区内可预热账户数取小，其余字段口径同 `AdminWorkerCounts` |
-| `AdminEgress` | `id`（出口编号，代理键 sha256 前 12 位，管理动作用，不含代理原文）、`label`（脱敏显示：`直连`、`scheme://host:port`，带用户名时追加 `#` 与用户名 sha256 前 4 位，无法解析时为 `<无法识别的代理>#` 加原文哈希）、`mode`（`normal`、`limited`、`rejected`）、`limiter`（`off`、`active`、`suspended`：限速判为无效已停止）、可选 `since`、`accounts`、`lanes`（`AdminEgressLane` 数组）、`success_1m`、`bare_429_1m`、`other_1m`、`ratio_2m`（2 分钟内裸 429 占尝试结果的比例，0–1，不含已降级账号）、可选 `ratio_entry`（判定成立时的比例）、`fresh_rejects_2m`（冷号首发被拒）、`queued`（正在按“出口限速”排队的请求）、`local_429_1m`（本地返回的 429：出口限速排队超限与出口限流换号上限）、可选 `retried`、`recovered`、`demoted`、`relaxed`（本次判定期间复试、复试后成功、按账号证据降级、判定成立时撤回逐级冷却的账号数）、可选 `retry_at`、`rejected_until`、`rejected_by`（`安全阀` 或 `管理操作`） |
+| `AdminEgress` | `id`（出口编号，代理键 sha256 前 12 位，管理动作用，不含代理原文）、`label`（脱敏显示：`直连`、`scheme://host:port`，带用户名时追加 `#` 与用户名 sha256 前 4 位；IP 池的会话号写在密码里时出口键带 `#会话号`，这时是“用户名#会话号”一起取 sha256 前 4 位，同一用户名的不同会话标签不同；无法解析时为 `<无法识别的代理>#` 加原文哈希）、`mode`（`normal`、`limited`、`rejected`）、`limiter`（`off`、`active`、`suspended`：限速判为无效已停止）、可选 `since`、`accounts`、`lanes`（`AdminEgressLane` 数组）、`success_1m`、`bare_429_1m`、`other_1m`、`ratio_2m`（2 分钟内裸 429 占尝试结果的比例，0–1，不含已降级账号）、可选 `ratio_entry`（判定成立时的比例）、`fresh_rejects_2m`（冷号首发被拒）、`queued`（正在按“出口限速”排队的请求）、`local_429_1m`（本地返回的 429：出口限速排队超限与出口限流换号上限）、可选 `retried`、`recovered`、`demoted`、`relaxed`（本次判定期间复试、复试后成功、按账号证据降级、判定成立时撤回逐级冷却的账号数）、可选 `retry_at`、`rejected_until`、`rejected_by`（`安全阀` 或 `管理操作`） |
+| `AdminEgressSummary` | `total`（有账户、有活动或有判定记录的出口数）、`normal`、`limited`、`rejected`；IP 池开启后静态每个端口、动态每个会话各是一个出口，出口多于 16 个时 `egress` 只列出 `limited` 与 `rejected` 的 |
 | `AdminEgressLane` | `lane`（`normal` 或 `ultra`：Ultra 分区的账户单独一条令牌桶）、`accounts`、`limit_rpm`（0 为不限）、可选 `burst`、`sent_1m`、`primary_sent_1m`、`other_sent_1m`（经租约发出的非生成 RPC，只计数）、`pending`（已取得生成租约、还没发出的预占）、`cold_starting`（闸门放行、正在启动的冷启动）、`cold_started_1m`、`refill_deferred_1m`（最近一分钟因补位并发已满被推迟的补位） |
 | `AdminCatalogSync` | `cached`（有目录的账户，含来自磁盘的）、`from_disk`（本代运行时启动时从磁盘恢复的账户）、`missing`（启用、就绪却没有目录）、`expired`（超过有效期、等待刷新）、`auth_suspects`（疑似登录失效、等待探测）、`queued`、`running`、可选 `paused_until`、`pause_reason`（`上游 429` 或 `出口限流`）、`synced_1h`、`failed_1h`、`rate_limited_1h`、`skipped_busy_1h`（账户有进行中的请求、推后刷新的次数） |
 | `AdminPrimarySupply` | `model`、`warm`、`standby`、`cooling`、可选 `standby_capped`、可选 `pool`；一个主用模型在所属分区的可用供给：`PRIMARY_MODELS` 的条目统计普通分区，`pool` 省略；`ULTRA_PRIMARY_MODELS` 的条目 `pool` 为 `ultra`，只统计 Ultra 分区的驻留 Worker 与 Ultra 号池的账号（`ULTRA_INCLUDE_PRO=true` 时含 Pro 账户）。供给由 `keepWarm` 约每 30 秒统计一次并缓存（任一份主用模型列表变化或 `ULTRA_INCLUDE_PRO` 切换后的下一个周期立即重新统计，约 5 秒内），状态请求只读缓存。`warm` 为能服务它的驻留 Worker（是该模型的候选、对它没有冷却、不在排空中），`standby` 为能服务它的空闲备用账号（没有驻留 Worker、不在启动中、空闲、对它没有冷却），最多统计 1000 个，达到上限时 `standby_capped` 为 `true`；`cooling` 总是输出，为对它冷却中的驻留 Worker（不在排空中、是该模型的候选，但所有支持的启用通道都在冷却，含剩余不到 2 分钟的短冷却，与调度分类口径一致），这些 Worker 既不计入 `warm` 也不计入 `standby`，驻留 Worker 大多在这里时，主用模型的请求只能等冷却到期或换上新号；模型在号池里找不到时各项都为 0。`standby` 为 0 表示没有还能服务该模型的空闲账号，多半是当天额度已用完（太平洋时间零点重置） |
-| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`，账户当前所属的号池，即成员关系：`ULTRA_INCLUDE_PRO=true` 时 Pro 账户为 `ultra`）、`message`；`benefit_tier` 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍为 `Pro`。`POST /api/accounts/{id}/verify` 的返回另带 `authenticated`（浏览器已登录且接口复核通过才为 `true`）与 `verify_reason`（未通过的原因：浏览器判定未登录时带跳转到的登录页 host+path，接口复核 401 时为 `浏览器已登录，但接口认证失败：Cookie 可能已被 Google 作废，需要重新登录`）；停用账户的 `state` 始终是 `disabled`，验证结果看 `authenticated` |
+| `AdminAccount` | `id`、`label`、`enabled`、`state`、`proxy`、`locale`、`timezone`、`models`、`benefit_tier`、`benefit_tier_known`、`pool`（`ultra` 或 `normal`，账户当前所属的号池，即成员关系：`ULTRA_INCLUDE_PRO=true` 时 Pro 账户为 `ultra`）、`message`、可选 `proxy_pool_slot`（账户没有自己的代理时 IP 池分给它的端口号或会话号）、可选 `proxy_pool_active`（有浏览器正在用这个出口）、可选 `proxy_pool_pinned`（IP 池开启、账户代理与当前生效的 `PROXY` 规范值相同，因此不用 IP 池；与 `AdminProxyPool.pinned_default`、`POST /api/accounts/proxy/follow-default` 同一份判断，保存了新的 `PROXY` 但还没重启生成服务时仍按旧值）；`benefit_tier` 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍为 `Pro`。`POST /api/accounts/{id}/verify` 的返回另带 `authenticated`（浏览器已登录且接口复核通过才为 `true`）与 `verify_reason`（未通过的原因：浏览器判定未登录时带跳转到的登录页 host+path，接口复核 401 时为 `浏览器已登录，但接口认证失败：Cookie 可能已被 Google 作废，需要重新登录`）；停用账户的 `state` 始终是 `disabled`，验证结果看 `authenticated`；账户列表不随 Worker 启停推送，两个 IP 池字段可能晚于实际，实时端口看 `AdminProxyPool.assignments` |
+| `AdminProxyPool` | `mode`（`off`、`static`、`dynamic`）、可选 `endpoint`（脱敏的 `scheme://host`，不含端口、账号密码与会话号）、可选 `port_start`、`port_end`、`total`（静态的端口数，动态为 0）、`in_use`（静态为有浏览器占用的端口，动态为有浏览器在用的会话）、`leases`（池分配的活动租约：Worker 与登录、验证）、`capacity`（可能同时运行的浏览器数 Σ(峰值 + 排空上限)，不含登录与验证）、`shared`（被两个及以上账号同时占用的端口）、`cooling`、`external`（账户固定代理或 `PROXY` 指向、或被其他进程锁住、不再分配的端口）、`stale`（改配置前分出、浏览器还没关闭的出口）、`unpooled`（IP 池开启时仍走 `PROXY` 的 Worker）、`orphaned`（账户已删除、浏览器关闭失败仍占着的租约）、`pinned_default`（账户代理与 `PROXY` 规范值相同、因此不用 IP 池的账户数）、可选 `rotations`（动态换会话次数）、`affinity_hits`、`affinity_misses`（本次运行回到上次端口的次数与没能回到的次数）、可选 `cooling_ports`（`{port,until,level}`，最多 20 个，按恢复时间）、可选 `hot_ports`（`{port,rate_limited,accounts}`，最近 10 分钟裸 429 最多的 5 个端口）、可选 `assignments`（`{account_id,slot,kind}`：活动的池租约，`kind` 为 `worker` 或 `login`（登录、验证、导入），新账户登录中还没有账户 ID 时 `account_id` 为空）、可选 `check`（最近一次“检查全部端口”：`running`、`started_at`、可选 `finished_at`、`total`、`done`、`ok`、`distinct_ips`、可选 `duplicates`（`{ip,ports}`，出口 IP 相同的端口组，最多 20 组）、可选 `failed`（`{port,error}`，最多 50 个，错误已脱敏））、可选 `relay_limit`（本机代理中转的进程连接上限）。不含账号密码与用户名 |
 | `AccountCreateInput` | `proxy`、`locale`、`timezone` |
 | `AccountInput` | `label`、`enabled`、`proxy`、`locale`、`timezone` |
 | `ChromeImportProfile` | `id`、`profile`、`display_name`、`email`、`locale` |
@@ -1204,6 +1208,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | `first_event_timeout` | 保存值，保存后立即生效；`0s` 为关闭，提交时省略则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 保存值，保存后立即热更新；`warm_worker_limit` 与 `max_active_workers` 只约束普通分区 |
 | `account_rpm_limit` | 保存值，保存后立即热更新：单账号最近 60 秒最多发出的生成请求数（整数 `0..1000`，默认 `10`，`0` 为关闭），满窗的账号按忙碌处理、请求换到其他账号；读取时总是返回，提交时省略（旧版页面）则沿用现值；超出范围时返回 400 `invalid_config` |
+| `proxy_pool` | 保存值，保存后立即热更新（不重启生成服务）：`ProxyPoolConfig` `{mode, url, port_start, port_end}`，对应 `PROXY_POOL_MODE`、`PROXY_POOL_URL`、`PROXY_POOL_PORT_START`、`PROXY_POOL_PORT_END`。读取时总是返回，`url` 与 `proxy` 一样是含账号密码的规范全文（只在这个接口返回，管理页掩码显示）；提交时省略（旧版页面）则沿用现值。`mode` 不区分大小写、保存为小写；`url` 按 `NormalizeProxy` 的全部写法规范化，`{session}` 与 `%7Bsession%7D` 不区分大小写、保存为 `{session}`；端口任何模式下都要 `1..65535` 且起始不大于结束、最多 5000 个；`static` 时 `url` 必填且不能含 `{session}`，`dynamic` 时必填且必须在用户名或密码里含 `{session}`，`off` 时可以保留地址。不合法时返回 400 `invalid_config`，文案为固定文本、不含输入内容 |
 | `ultra_exclusive` | 保存值，保存后立即生效：`true` 时普通路径不使用 Ultra 号池的账户；读取时总是返回，提交时省略则沿用现值 |
 | `ultra_include_pro` | 保存值，保存后立即热更新（不重启生成服务与 Worker）：`true` 时权益为 Pro 的账户并入 Ultra 号池与 Ultra 分区，按全部 Ultra 号池设置调度，账户权益不变；读取时总是返回，提交时省略（旧版页面）则沿用现值；默认 `false`。进程环境变量设置了 `ULTRA_INCLUDE_PRO` 时以环境变量为准 |
 | `ultra_warm_worker_limit`、`ultra_max_active_workers` | 保存值，保存后立即热更新：Ultra 分区的常驻数（可以为 0）与峰值数（至少 1 且不小于常驻数）；读取时总是返回，提交时省略则沿用现值 |
@@ -1223,7 +1228,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 {"proxy":"1.2.3.4:8080:user:pass"}
 ```
 
-`proxy` 为输入框原文（任何支持的写法）；为空时测试当前生成服务实例的默认代理，即登录与 Worker 实际使用的那份配置快照（保存后还没重启生成服务时仍是旧值）。服务端先按 `config.NormalizeProxy` 规范化，再并发跑两次探测，每次用一条新连接，共用 40 秒期限（不小于中转连上游的 25 秒加 TLS 与一次请求的余量）；探测与 Go 后台请求使用同一个 `aistudio.NewProxyHTTPClient`，不跟随跳转（3xx 报 `出口 IP 服务返回 HTTP 30x`），状态码必须是 200，响应最多读 4 KiB，`ip` 用 `net.ParseIP` 校验。浏览器路径失败时，用本次中转租约自己的失败记录（只认上游层面的失败与目标为 `api.ipify.org` 的失败）替换错误说明，例如 407 显示为 `上游代理拒绝了账号密码（407），请检查用户名和密码`。成功时返回 200 与 `ProxyTestResult`：
+`proxy` 为输入框原文（任何支持的写法）；为空时测试新账户登录实际会用的出口：IP 池开启时为此刻会分给登录的池出口（静态为按挑选次序的第一个可分配端口，动态为一个新的临时会话号；不占用，响应另有 `slot`，日志与抽测相同），否则为当前生成服务实例的默认代理，即登录与 Worker 实际使用的那份配置快照（保存后还没重启生成服务时仍是旧值）。服务端先按 `config.NormalizeProxy` 规范化，再并发跑两次探测，每次用一条新连接，共用 40 秒期限（不小于中转连上游的 25 秒加 TLS 与一次请求的余量）；探测与 Go 后台请求使用同一个 `aistudio.NewProxyHTTPClient`，不跟随跳转（3xx 报 `出口 IP 服务返回 HTTP 30x`），状态码必须是 200，响应最多读 4 KiB，`ip` 用 `net.ParseIP` 校验。浏览器路径失败时，用本次中转租约自己的失败记录（只认上游层面的失败与目标为 `api.ipify.org` 的失败）替换错误说明，例如 407 显示为 `上游代理拒绝了账号密码（407），请检查用户名和密码`。成功时返回 200 与 `ProxyTestResult`：
 
 ```json
 {
@@ -1258,6 +1263,20 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 | 501 | `proxy_test_unsupported` | 管理服务不支持代理测试 |
 
 每次测试在 `service` 来源记一条日志，两边都成功为 INFO，否则为 WARN，代理只写 `RedactProxy` 的结果（格式见 [logging.md](logging.md#本机代理中转)）。
+
+**IP 池**：`ProxyTestInput` 另有两种用法，旧请求（只有 `proxy`）行为不变：
+
+```json
+{"pool":{"mode":"static","url":"http://user:pass@isp.decodo.com:10000","port_start":10001,"port_end":10200},"samples":3}
+{"account_id":"a@example.com"}
+```
+
+- `pool`（`ProxyPoolConfig`，输入框里当前的设置，不必先保存）与可选 `samples`（默认 3，最多 10）：抽测 IP 池。静态在端口段里均匀抽首、中、尾等 `min(samples, 端口数)` 个端口，动态用 `t` 开头的临时会话号（15 个字符，等于程序可能生成的会话号最大长度，能提前发现代理商的长度限制）；每个出口各测浏览器路径与后台请求路径，并发 5，共用同一个期限。响应另有 `samples`（`ProxyTestSample` 数组：`slot`（端口号或临时会话号）、`browser`、`direct`、`same_ip`）与 `distinct_ips`（不同出口 IP 数）；`warnings` 可能另有 `duplicate_ip`（有出口的 IP 相同）与 `pool_partial`（部分出口失败）。错误按该出口的上游脱敏。
+- `account_id`（`proxy` 为空）：管理页账户编辑对话框里代理留空点“测试代理”时用它。账户没有自己的代理时测它实际使用的出口（`EffectiveProxy`：IP 池绑定或默认代理），响应另有 `slot`（当前的端口号或会话号，不在 IP 池时省略）；账户有自己的代理（对话框里清空了，还没保存）时测清空后 IP 池会给它的出口：静态为它的默认出口（归自己的端口或探测序列上第一个可用的端口，之后启动的 Worker 可能另分端口），动态为它的会话号，响应另有 `slot`，日志与抽测相同；IP 池关闭、或静态没有可用端口且 `PROXY` 不为空时测当前生成服务的 `PROXY`，`PROXY` 也为空时返回 400 `proxy_required`。
+
+`POST /api/proxy/pool/check` 在后台逐个检查静态 IP 端口段里每个端口的出口 IP：只走后台请求路径，并发 10，最长 5 分钟，不占“测试代理”的单飞（检查进行中也能测试代理）；请求体 `{"pool":ProxyPoolConfig}` 省略 `pool` 或请求体为空时用当前生效的设置（IP 池热更新，保存后即生效；管理页总会带上输入框里当前的设置）。返回 202，进度与结果写进 `AdminStatus.proxy_pool.check`；已在进行时返回 409，动态 IP 或设置不合法时返回 400。结束时记一行 `IP 池检查完成`（见 [logging.md](logging.md#ip-池)）。
+
+`POST /api/accounts/proxy/follow-default` 把 `pinned_default` 里的账户（账户代理与 `PROXY` 规范值相同）改为跟随默认代理：逐个取账户租约后把 `account.json` 的 `proxy` 写为空，与单个账户保存走同一条路径；运行中的 Worker 不重启（补登记直通租约，Go 侧在浏览器关闭前仍走 `PROXY`），关闭后再启动时改用 IP 池；正在被其他操作使用、取不到租约的账户跳过。返回 `changed`（改了的账户数）、`running`（其中仍有运行中 Worker 的）与 `skipped`（跳过的）。
 
 `GET /api/events` 的初始顺序为 `status`、`models`、`accounts`、最近 200 条 `log`、`cooldowns`、按开始时间排序的活动 `request`。后续事件的 `data` 形状：
 

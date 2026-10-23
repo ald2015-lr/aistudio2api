@@ -173,14 +173,16 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	// 主用模型供给读 keepWarm 的缓存（见 primary_supply.go），不在状态请求里对账户分类；服务没有运行时不显示
 	var primarySupply []api.AdminPrimarySupply
 	var catalogSync *api.AdminCatalogSync
-	// 出口限流判定与限速（见 egress_guard.go）：O(出口数)，服务没有运行时不显示
+	// 出口限流判定与限速（见 egress_guard.go adminStatus）：出口不多于 16 个时全部列出，更多时（IP 池开启后多达几百个）只列出
+	// 判定成立或已撤销的出口、正常的只计入汇总；服务没有运行时不显示
 	var egress []api.AdminEgress
+	var egressSummary *api.AdminEgressSummary
 	// 登录复核（见 auth_recheck.go）：疑似登录失效与需要登录账户的复核，服务没有运行时不显示
 	var authRecheck *api.AdminAuthRecheck
 	if running {
 		primarySupply = admin.workers.primarySupplyStatus()
 		catalogSync = admin.service.catalogSync.status()
-		egress = admin.service.egress.status()
+		egress, egressSummary = admin.service.egress.adminStatus()
 		authRecheck = admin.service.authRecheck.status()
 	}
 	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
@@ -206,8 +208,10 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		PrimarySupply: primarySupply,
 		CatalogSync:   catalogSync,
 		Egress:        egress,
+		EgressSummary: egressSummary,
 		AuthRecheck:   authRecheck,
 		BadAccounts:   admin.workers.badAccountMemory().count(),
+		ProxyPool:     admin.ipPool().status(),
 	}, nil
 }
 
@@ -225,6 +229,7 @@ func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error)
 	for _, status := range statuses {
 		accounts = append(accounts, adminAccountDTO(status))
 	}
+	admin.ipPool().markPinned(accounts)
 	return accounts, nil
 }
 
@@ -258,8 +263,11 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	defer os.RemoveAll(directory)
 	startedAt := time.Now()
 	admin.requests.log("auth", "INFO", "账户添加 | 1/2 | 等待隔离登录")
+	// 登录浏览器同样占一个 IP 池出口：新账户还没有 ID，用临时键；登录成功后记到账户名下（adopt），之后的 Worker 回到这个 IP
+	loginProxy, poolLease := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindLogin, "auth", accountConfig.Proxy)
+	defer poolLease.release()
 	result, err := admin.login.Login(ctx, aistudio.IsolatedLoginRequest{
-		AccountID: "new", Directory: directory, Proxy: admin.effectiveProxy(accountConfig.Proxy),
+		AccountID: "new", Directory: directory, Proxy: loginProxy,
 		Locale: accountConfig.Locale, Timezone: accountConfig.Timezone,
 	})
 	if err != nil {
@@ -280,7 +288,9 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	if err := accountConfig.Validate(); err != nil {
 		return api.AdminAccount{}, invalidAccount(err)
 	}
-	created, err := admin.addAccount(ctx, accountConfig, result.StorageState, directory)
+	// 登录出口只在账户新建成功后记到它名下（adopt 在 store.Create 之后、Worker 与账户池挂载之前）：邮箱已存在时
+	// store.Create 失败，已有账户的端口与会话号不受影响；之后为它启动的 Worker 与登录共用这个出口
+	created, err := admin.addAccount(ctx, accountConfig, result.StorageState, directory, poolLease.adopt)
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -330,13 +340,13 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	if err != nil {
 		return nil, err
 	}
-	root, err := chromeauth.DefaultChromeRoot()
+	root, err := chromeImportRoot()
 	if err != nil {
 		return nil, err
 	}
-	results, err := chromeauth.Import(ctx, chromeauth.ImportOptions{
-		ChromeRoot: root, Proxy: admin.effectiveProxy(accountProxy), AccountIDs: input.AccountIDs,
-	})
+	// 逐个导入时每个账号导入完就归还出口、只记下端口号或会话号：新建成功的账户按记下的值登记到名下（见 addAccount 的 onCreated），
+	// 已存在的账户不受影响
+	results, poolClaims, err := admin.importChrome(ctx, root, accountProxy, input.AccountIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -368,7 +378,7 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	}
 	accounts := make([]api.AdminAccount, 0, len(results))
 	for index, result := range results {
-		account, err := admin.addAccount(ctx, configs[index], result.State, "")
+		account, err := admin.addAccount(ctx, configs[index], result.State, "", poolClaims[index].adopt)
 		if err != nil {
 			return nil, err
 		}
@@ -378,15 +388,21 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 	return accounts, nil
 }
 
+// addAccount 保存并挂载新账户；onCreated 在账户新建成功（store.Create）之后、Worker 与账户池挂载之前以账户 ID 调用，
+// 可以为 nil（IP 池在这里把登录或导入用的出口记到新账户名下：邮箱已存在时不会调用）
 func (admin *runtimeAdmin) addAccount(
 	ctx context.Context,
 	accountConfig aistudio.AccountConfig,
 	state aistudio.StorageState,
 	fingerprintDirectory string,
+	onCreated func(accountID string),
 ) (created api.AdminAccount, resultErr error) {
 	account, publishLease, err := admin.store.Create(accountConfig, state)
 	if err != nil {
 		return api.AdminAccount{}, err
+	}
+	if onCreated != nil {
+		onCreated(account.ID)
 	}
 	defer func() {
 		if publishLease != nil {
@@ -411,6 +427,8 @@ func (admin *runtimeAdmin) addAccount(
 			err, admin.workers.Remove(account.ID), admin.headers.Remove(account.ID), admin.store.Delete(account),
 		)
 	}
+	// 账户已进入账户池：IP 池记下它的固定代理（外部占用、固定了默认代理）并推送默认出口
+	admin.ipPool().refresh(admin.pool, account.ID)
 	if err := publishLease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -488,6 +506,8 @@ func (admin *runtimeAdmin) updateAccount(
 	}
 	workerUpdate.Commit()
 	headerUpdate.Commit()
+	// 账户代理可能变了：IP 池重算它的外部占用与默认出口（改代理时旧 Worker 已关闭，租约随之归还）
+	admin.ipPool().refresh(admin.pool, account.ID)
 	switch {
 	case !input.Enabled:
 		// 已经停用的账户再次停用（批量停用选中了它、改代理后仍保存为停用）同样记为手动停用：原先只在启用改为停用时记录，
@@ -595,7 +615,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	startedAt := time.Now()
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 1/2 | 等待隔离登录")
-	result, err := admin.login.Login(ctx, admin.loginRequest(account, directory))
+	loginProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindLogin, account.Config.Label, account.Config.Proxy)
+	defer poolLease.release()
+	result, err := admin.login.Login(ctx, admin.loginRequest(account, directory, loginProxy))
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"账户登录失败 | 耗时=%s | 错误=%s",
@@ -689,7 +711,10 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 	account := lease.Account()
 	startedAt := time.Now()
 	admin.requests.log(account.Config.Label, "INFO", "账户验证 | 访问 AI Studio")
-	verification, err := admin.login.Verify(ctx, admin.loginRequest(account, account.Directory), account.StorageState)
+	// 验证是完整的浏览器会话：同样占一个 IP 池出口（账户已有 Worker 时共用它的端口），返回时归还
+	verifyProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
+	defer poolLease.release()
+	verification, err := admin.login.Verify(ctx, admin.loginRequest(account, account.Directory, verifyProxy), account.StorageState)
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"账户验证失败 | 耗时=%s | 错误=%s",
@@ -907,7 +932,9 @@ func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status ap
 // account 返回单个账户的管理视图：直接构建这一个账户的状态，不经过 Status() 的全量列表与缓存，管理操作刚写入的变化立即可见
 func (admin *runtimeAdmin) account(accountID string) (api.AdminAccount, error) {
 	if status, ok := admin.pool.StatusOf(accountID); ok {
-		return adminAccountDTO(status), nil
+		accounts := []api.AdminAccount{adminAccountDTO(status)}
+		admin.ipPool().markPinned(accounts)
+		return accounts[0], nil
 	}
 	return api.AdminAccount{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, accountID))
 }
@@ -919,9 +946,10 @@ func (admin *runtimeAdmin) effectiveProxy(accountProxy string) string {
 	return strings.TrimSpace(admin.config.Proxy)
 }
 
-func (admin *runtimeAdmin) loginRequest(account *aistudio.Account, directory string) aistudio.IsolatedLoginRequest {
+// loginRequest 为已有账户的隔离登录或验证请求；proxy 为这次浏览器实际使用的出口（见 browserProxy）
+func (admin *runtimeAdmin) loginRequest(account *aistudio.Account, directory string, proxy string) aistudio.IsolatedLoginRequest {
 	return aistudio.IsolatedLoginRequest{
-		AccountID: account.ID, Directory: directory, Proxy: admin.effectiveProxy(account.Config.Proxy),
+		AccountID: account.ID, Directory: directory, Proxy: proxy,
 		Locale: account.Config.Locale, Timezone: account.Config.Timezone,
 	}
 }
@@ -939,6 +967,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		Proxy: status.Proxy, Locale: status.Locale, Timezone: status.Timezone,
 		Models: models, BenefitTier: status.BenefitTier, Message: message,
 		BenefitTierKnown: status.BenefitTierKnown, Pool: status.Pool,
+		ProxyPoolSlot: status.ProxySlot, ProxyPoolActive: status.ProxySlotActive,
 	}
 }
 
@@ -1105,9 +1134,16 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
 	}
+	// IP 池：旧版页面保存时不带该字段，沿用现值；地址写进 .env 与返回给页面的都是规范值
+	poolSettings := saved.ProxyPool
+	if value.ProxyPool != nil {
+		if poolSettings, err = proxyPoolFromInput(*value.ProxyPool); err != nil {
+			return api.RuntimeConfig{}, invalidConfigError(err)
+		}
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
-		Proxy: proxy, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
+		Proxy: proxy, ProxyPool: poolSettings, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
@@ -1834,6 +1870,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		PrimaryQueueWait:       cfg.PrimaryQueueWait.String(),
 		UltraPrimaryModels:     &ultraPrimaryModels,
 		UltraPrimaryQueueWait:  cfg.UltraPrimaryQueueWait.String(),
+		ProxyPool:              proxyPoolToAPI(cfg.ProxyPool),
 	}
 }
 

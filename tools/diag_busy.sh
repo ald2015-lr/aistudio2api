@@ -766,10 +766,17 @@ if status:
               f"暂停到={pause_text} 账户忙推后={catalog_sync.get('skipped_busy_1h', 0)}")
     elif status.get("running"):
         print("  目录：这个版本的状态接口没有 catalog_sync 字段（没有模型目录写盘缓存，每次启动全量同步）")
-    # 出口限流判定与限速（app/egress_guard.go status）：每出口一行，只有直连一个出口且没有判定时也有
+    # 出口限流判定与限速（app/egress_guard.go adminStatus）：出口不超过 16 个时每个一行（含正常的）；更多时只列判定成立或已撤销的，
+    # 正常的只计入 egress_summary（IP 池开启后静态每个端口、动态每个会话各是一个出口，多达几百个）；旧版状态接口没有 egress_summary
     egress_status = [item for item in status.get("egress") or [] if isinstance(item, dict)]
-    if "egress" not in status and status.get("state") == "RUNNING":
+    egress_summary = status.get("egress_summary") if isinstance(status.get("egress_summary"), dict) else None
+    if "egress" not in status and egress_summary is None and status.get("state") == "RUNNING":
         print("  出口：状态接口没有 egress 字段（这个版本还没有出口限流判定）")
+    if egress_summary is not None:
+        hidden_normal = (egress_summary.get('total', 0) or 0) > len(egress_status)
+        print(f"  出口汇总：共 {egress_summary.get('total', 0)} 个  正常={egress_summary.get('normal', 0)}  "
+              f"判定成立={egress_summary.get('limited', 0)}  已撤销={egress_summary.get('rejected', 0)}"
+              + ("（出口多，正常的出口不逐个列出）" if hidden_normal else ""))
     for item in egress_status:
         lanes = {lane.get("lane"): lane for lane in item.get("lanes") or [] if isinstance(lane, dict)}
 
@@ -1360,7 +1367,7 @@ egress_minutes = {label: sum((end - start).total_seconds() for start, end in per
 # 普通通道的限速按出口分开记（多出口时各出口的结论用各自的限速）
 limits = collections.defaultdict(list)
 if not (egress_entered or egress_exited or egress_withdrawn or egress_adjusts or egress_short):
-    print("  窗口内没有出口限流判定的日志" + ("（这个版本可能还没有出口限流判定）" if "egress" not in status and status else ""))
+    print("  窗口内没有出口限流判定的日志" + ("（这个版本可能还没有出口限流判定）" if "egress" not in status and "egress_summary" not in status and status else ""))
 else:
     for label, periods in EGRESS_PERIODS.items():
         print(f"  出口 {label}：判定成立 {len(periods)} 段，合计 {egress_minutes[label]:.1f} 分钟（"

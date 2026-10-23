@@ -47,8 +47,8 @@ type MakerSuiteHTTPTransport struct {
 	headers     ProtocolHeaderProvider
 	globalProxy string
 	now         func() time.Time
-	clientsMu   sync.Mutex
-	clients     map[string]*http.Client
+	// clients 按代理地址缓存 client（最多 proxyClientCacheLimit 个，按最近使用淘汰）
+	clients *proxyClientCache
 }
 
 type accountLeaseContextKey struct{}
@@ -108,7 +108,7 @@ func NewMakerSuiteHTTPTransport(options HTTPTransportOptions) (*MakerSuiteHTTPTr
 		headers:     options.Headers,
 		globalProxy: strings.TrimSpace(options.GlobalProxy),
 		now:         time.Now,
-		clients:     make(map[string]*http.Client),
+		clients:     newProxyClientCache(proxyClientCacheLimit),
 	}
 	if _, err := transport.clientForProxy(transport.globalProxy); err != nil {
 		return nil, err
@@ -230,26 +230,11 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 
 // CloseIdleConnections 关闭全部固定出口的空闲连接
 func (t *MakerSuiteHTTPTransport) CloseIdleConnections() {
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	for _, client := range t.clients {
-		client.CloseIdleConnections()
-	}
+	t.clients.closeIdle()
 }
 
 func (t *MakerSuiteHTTPTransport) clientForProxy(proxyURL string) (*http.Client, error) {
-	proxyURL = strings.TrimSpace(proxyURL)
-	t.clientsMu.Lock()
-	defer t.clientsMu.Unlock()
-	if client := t.clients[proxyURL]; client != nil {
-		return client, nil
-	}
-	client, err := NewProxyHTTPClient(proxyURL)
-	if err != nil {
-		return nil, err
-	}
-	t.clients[proxyURL] = client
-	return client, nil
+	return t.clients.get(strings.TrimSpace(proxyURL), NewProxyHTTPClient)
 }
 
 func prepareProtocolHeaders(

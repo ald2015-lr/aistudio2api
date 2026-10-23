@@ -184,7 +184,7 @@ func TestVerifyAccountReportsAuthenticated(t *testing.T) {
 	})
 }
 
-// TestEgressActionRoutes 管理页的撤销与恢复判定经 HTTP 路由（POST /api/egress/{id}/withdraw|resume）到达运行时，返回最新状态
+// TestEgressActionRoutes 管理页的撤销与恢复判定经 HTTP 路由（POST /api/egress/{id}/withdraw|resume）到达运行时，返回最新状态（只列出非正常的出口与汇总）
 func TestEgressActionRoutes(t *testing.T) {
 	env := newEgressEnv(t, []string{"a@example.com"}, nil, 1, 1, 0)
 	env.service.state.Store(serviceRunning)
@@ -208,8 +208,10 @@ func TestEgressActionRoutes(t *testing.T) {
 	if recorder.Code != http.StatusOK || len(status.Egress) != 1 || status.Egress[0].Mode != "rejected" || status.Egress[0].RejectedBy != "管理操作" {
 		t.Fatalf("撤销：status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
+	// 恢复后回到正常：出口不多（这里只有直连一个）时照常列出、模式为 normal，汇总计入正常
 	recorder, status = post("/api/egress/" + id + "/resume")
-	if recorder.Code != http.StatusOK || len(status.Egress) != 1 || status.Egress[0].Mode != "normal" {
+	if recorder.Code != http.StatusOK || len(status.Egress) != 1 || status.Egress[0].Mode != "normal" || status.EgressSummary == nil ||
+		*status.EgressSummary != (api.AdminEgressSummary{Total: 1, Normal: 1}) {
 		t.Fatalf("恢复：status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if recorder, _ := post("/api/egress/000000000000/withdraw"); recorder.Code != http.StatusNotFound {

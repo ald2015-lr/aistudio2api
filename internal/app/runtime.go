@@ -26,6 +26,7 @@ func newRuntime(
 	lifecycle context.Context,
 	cfg config.Config,
 	requests *requestRegistry,
+	proxyPool *proxyPool,
 ) (*trackedService, *runtimeAdmin, func() error, error) {
 	if err := launchCtx.Err(); err != nil {
 		return nil, nil, nil, err
@@ -50,6 +51,12 @@ func newRuntime(
 	enableUnmarkedAccounts(accounts, requests, "启动时")
 
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")
+	// IP 池（进程级）先按本次配置生效，再给还没进入账户池的账户对象写默认出口：账户池、公共头与 Go 侧请求第一次就按带绑定的
+	// EffectiveProxy 取出口（见 proxy_pool.go）
+	proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg))
+	for _, account := range accounts {
+		proxyPool.prime(account)
+	}
 	pool := aistudio.NewAccountPool(accounts, cfg.PerAccountConcurrency)
 	configurePool(pool, cfg)
 	headers, err := newAccountHeaderProvider(accounts, cfg.Proxy)
@@ -71,6 +78,7 @@ func newRuntime(
 	// 按需替换与扩容的启动宽限、每分区每分钟的替换上限（N6，见 replace_rate.go）
 	workers.replaceGrace.Store(int64(rotationWarmupGrace))
 	workers.replacements.limit.Store(replacementsPerMinute)
+	workers.proxyPool = proxyPool
 	protected, err := aistudio.NewWorkerProtectedTransport(aistudio.WorkerProtectedTransportOptions{
 		Transport: transport, Workers: workers, SetupTimeout: cfg.InitTimeout,
 	})
@@ -142,6 +150,11 @@ func newRuntime(
 	go admin.onboard.run(lifecycle)
 	// 生成服务实例存活期间自动识别新增、删除与重新登录的账户目录
 	go admin.watchAccountDirectories(lifecycle)
+	// 装配成功后 IP 池的推送目标切换为新账户池（装配失败时旧生成服务的账户池仍是推送目标）；之后旧生成服务的 refresh 被忽略，
+	// 旧实例浏览器的归还按账户 ID 推给新账户池。端口冷却的回调同时换成新生成服务的（撤回误伤的逐级冷却、换端口重启 Worker，
+	// 见 proxy_pool_egress.go）
+	proxyPool.setPortCooledHook(service.proxyPortCooled)
+	proxyPool.attach(pool)
 	requests.log("service", "INFO", fmt.Sprintf(
 		"协议运行时就绪 | 账户=%d | 耗时=%s",
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
@@ -151,6 +164,8 @@ func newRuntime(
 		admin.onboard.flush()
 		accountDisableNotes.flush()
 		err := workers.Close()
+		// Worker 关闭时归还的端口改变了亲和与归属：立即写出 IP 池记录
+		proxyPool.flush()
 		transport.CloseIdleConnections()
 		headers.Close()
 		// 403 无权限账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
@@ -276,6 +291,9 @@ type accountWorkerManager struct {
 	// authRequired 为账户确认需要登录后写“账号需要登录”日志的生成服务回调（见 worker_unschedulable.go）；newTrackedService 挂上，
 	// nil 时只登记释放 Worker、不写日志
 	authRequired atomic.Pointer[authRequiredHook]
+	// proxyPool 为进程级 IP 池（见 proxy_pool.go）：没有自己代理的账户每次启动 Worker 时申请出口租约，浏览器确认关闭后归还。
+	// 测试构造的管理器为 nil（方法对 nil 安全），行为与没有 IP 池时完全一样
+	proxyPool *proxyPool
 }
 
 type accountWorker struct {
@@ -301,6 +319,8 @@ type accountWorker struct {
 	// cleanupRetryAt 与 cleanupBackoff 为清理失败后下一次后台重试的时间与间隔（由 account.mu 保护）
 	cleanupRetryAt time.Time
 	cleanupBackoff time.Duration
+	// ownProxy 表示账户固定了自己的代理（account.json 的 proxy 非空）：启动 Worker 时不向 IP 池申请出口；由 mu 保护
+	ownProxy bool
 }
 
 type accountWorkerPreparer struct {
@@ -317,10 +337,11 @@ type accountWorkerPreparer struct {
 }
 
 type accountWorkerUpdate struct {
-	account *accountWorker
-	config  camoufoxnative.Options
-	label   string
-	pending bool
+	account  *accountWorker
+	config   camoufoxnative.Options
+	ownProxy bool
+	label    string
+	pending  bool
 }
 
 var errAccountWorkerReplaced = errors.New("WAA worker 已更新")
@@ -663,6 +684,9 @@ func (manager *accountWorkerManager) Add(account *aistudio.Account) error {
 	if account == nil {
 		return fmt.Errorf("账户未初始化")
 	}
+	// 账户对象还没进入账户池（AccountPool.Add 在这之后）：先写 IP 池的默认出口，账户池挂载时按带绑定的出口计算。
+	// 在 manager.mu 外调用（IP 池会取账户池的锁）；注册失败时这次写入无害
+	manager.proxyPool.prime(account)
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 	if manager.closed {
@@ -788,6 +812,7 @@ func (manager *accountWorkerManager) prepareUpdate(
 	}
 	update := &accountWorkerUpdate{
 		account: worker, config: manager.workerConfigFor(account, config), label: config.Label, pending: true,
+		ownProxy: strings.TrimSpace(config.Proxy) != "",
 	}
 	worker.startupMu.Lock()
 	worker.mu.Lock()
@@ -809,6 +834,7 @@ func (update *accountWorkerUpdate) Commit() {
 	}
 	update.account.mu.Lock()
 	update.account.config = update.config
+	update.account.ownProxy = update.ownProxy
 	update.account.label = update.label
 	update.account.mu.Unlock()
 	update.pending = false
@@ -880,7 +906,10 @@ func (manager *accountWorkerManager) Remove(accountID string) error {
 }
 
 func (manager *accountWorkerManager) newAccountWorker(account *aistudio.Account) *accountWorker {
-	return &accountWorker{id: account.ID, label: account.Config.Label, config: manager.workerConfig(account)}
+	return &accountWorker{
+		id: account.ID, label: account.Config.Label, config: manager.workerConfig(account),
+		ownProxy: strings.TrimSpace(account.Config.Proxy) != "",
+	}
 }
 
 func (manager *accountWorkerManager) workerConfig(account *aistudio.Account) camoufoxnative.Options {
@@ -1219,6 +1248,7 @@ func (manager *accountWorkerManager) startReservedWorker(
 	startedAt := time.Now()
 	label := account.label
 	options := account.config
+	ownProxy := account.ownProxy
 	runtimeLease := account.runtimeLease
 	ownsLease := false
 	account.mu.Unlock()
@@ -1248,6 +1278,8 @@ func (manager *accountWorkerManager) startReservedWorker(
 		account.startupMu.Unlock()
 		return nil, err
 	}
+	// 名额到手后才申请 IP 池出口：排队等名额的启动不占端口。只改这次启动的局部参数，accountWorker.config 不变
+	poolLease := manager.workerProxyLease(account.id, label, ownProxy, &options)
 	manager.requests.log(label, "INFO", "WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型="+bootstrapModel)
 	initTimeout := time.Duration(manager.initTimeout.Load())
 	initCtx, cancel := context.WithTimeout(ctx, initTimeout)
@@ -1275,6 +1307,10 @@ func (manager *accountWorkerManager) startReservedWorker(
 	releaseSlot()
 	budget.creditColdStart(time.Since(launchStartedAt), initTimeout)
 	if initErr != nil {
+		// 这次启动用的出口（端口号或会话号）要在归还之前取：之后账户的出口是默认出口，不是失败的那一个
+		slot := proxyPoolLogSuffix(poolLease.logField())
+		// 归还出口租约：取消的启动与代理无关的失败不计入端口健康与换会话
+		poolLease.launchFailed(initErr, ctx.Err() != nil)
 		if ownsLease {
 			_ = runtimeLease.Release()
 		}
@@ -1283,11 +1319,13 @@ func (manager *accountWorkerManager) startReservedWorker(
 			return nil, err
 		}
 		manager.requests.log(label, "ERROR", fmt.Sprintf(
-			"WAA Worker 启动失败 | 页面模型=%s | 耗时=%s | 错误=%s",
-			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()),
+			"WAA Worker 启动失败 | 页面模型=%s | 耗时=%s | 错误=%s%s",
+			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()), slot,
 		))
 		return nil, &accountWorkerInitError{err: initErr}
 	}
+	// 出口租约随浏览器确认关闭（NativeWorker.Close 成功，与本机中转释放同一时机）归还：发布、替换、丢弃都经 Close
+	poolLease.attach(worker)
 	return &accountWorkerPreparer{
 		account: account, worker: worker, bootstrapModel: bootstrapModel, manager: manager,
 		runtimeLease: runtimeLease, ownsLease: ownsLease, startedAt: startedAt, pending: true,
@@ -2257,8 +2295,15 @@ type accountHeaderProvider struct {
 
 type accountHeaderState struct {
 	mu      sync.Mutex
-	client  *http.Client
 	headers http.Header
+	// account 为账户对象，proxy 为建 client 时的出口：IP 池的绑定会随浏览器启停变化，需要发现公共头时按账户当前的
+	// EffectiveProxy 取出口，与 proxy 不同就换新 client（见 clientFor）。account 为 nil 时一直用 client。
+	// client、proxy、closed 由 clientMu 保护（mu 在发现公共头的网络请求期间一直持有，关闭出口不等它）
+	account  *aistudio.Account
+	clientMu sync.Mutex
+	client   *http.Client
+	proxy    string
+	closed   bool
 }
 
 type accountHeaderUpdate struct {
@@ -2290,7 +2335,8 @@ func (provider *accountHeaderProvider) Add(account *aistudio.Account) error {
 	if account == nil {
 		return fmt.Errorf("账户未初始化")
 	}
-	client, err := aistudio.NewProxyHTTPClient(account.EffectiveProxy(provider.globalProxy))
+	proxy := account.EffectiveProxy(provider.globalProxy)
+	client, err := aistudio.NewProxyHTTPClient(proxy)
 	if err != nil {
 		return fmt.Errorf("创建账户 %s 的固定出口: %w", account.ID, err)
 	}
@@ -2304,7 +2350,7 @@ func (provider *accountHeaderProvider) Add(account *aistudio.Account) error {
 		client.CloseIdleConnections()
 		return fmt.Errorf("账户固定出口已存在: %s", account.ID)
 	}
-	provider.accounts[account.ID] = &accountHeaderState{client: client}
+	provider.accounts[account.ID] = &accountHeaderState{client: client, account: account, proxy: proxy}
 	return nil
 }
 
@@ -2331,7 +2377,8 @@ func (provider *accountHeaderProvider) prepareUpdate(
 		return nil, fmt.Errorf("创建账户 %s 的固定出口: %w", account.ID, err)
 	}
 	return &accountHeaderUpdate{
-		provider: provider, accountID: account.ID, state: &accountHeaderState{client: client}, pending: true,
+		provider: provider, accountID: account.ID, pending: true,
+		state: &accountHeaderState{client: client, account: account, proxy: proxy},
 	}, nil
 }
 
@@ -2350,10 +2397,10 @@ func (update *accountHeaderUpdate) Commit() {
 	update.provider.mu.Unlock()
 	update.pending = false
 	if stale {
-		update.state.client.CloseIdleConnections()
+		update.state.closeIdle()
 		return
 	}
-	current.client.CloseIdleConnections()
+	current.closeIdle()
 }
 
 // Discard 关闭未发布的账户固定出口
@@ -2362,7 +2409,7 @@ func (update *accountHeaderUpdate) Discard() {
 		return
 	}
 	update.pending = false
-	update.state.client.CloseIdleConnections()
+	update.state.closeIdle()
 }
 
 // Remove 删除账户的固定出口
@@ -2376,7 +2423,7 @@ func (provider *accountHeaderProvider) Remove(accountID string) error {
 	if account == nil {
 		return fmt.Errorf("账户固定出口不存在: %s", accountID)
 	}
-	account.client.CloseIdleConnections()
+	account.closeIdle()
 	return nil
 }
 
@@ -2388,7 +2435,7 @@ func (provider *accountHeaderProvider) Close() {
 	provider.closed = true
 	provider.mu.Unlock()
 	for _, account := range accounts {
-		account.client.CloseIdleConnections()
+		account.closeIdle()
 	}
 }
 
@@ -2417,13 +2464,47 @@ func (provider *accountHeaderProvider) ProtocolHeaders(ctx context.Context, acco
 	account.mu.Lock()
 	defer account.mu.Unlock()
 	if len(account.headers) == 0 {
-		headers, err := aistudio.DiscoverPublicHeaders(ctx, account.client)
+		client, err := account.clientFor(provider.globalProxy)
+		if err != nil {
+			return nil, err
+		}
+		headers, err := aistudio.DiscoverPublicHeaders(ctx, client)
 		if err != nil {
 			return nil, err
 		}
 		account.headers = headers.Clone()
 	}
 	return account.headers.Clone(), nil
+}
+
+// clientFor 返回发现公共头用的 client：按账户当前的出口（账户代理 > IP 池绑定 > 默认代理），与建 client 时不同才新建，
+// 并关闭旧 client 的空闲连接（进行中的请求不受影响）；出口已关闭时沿用原 client
+func (state *accountHeaderState) clientFor(globalProxy string) (*http.Client, error) {
+	state.clientMu.Lock()
+	defer state.clientMu.Unlock()
+	if state.account == nil || state.closed {
+		return state.client, nil
+	}
+	proxy := state.account.EffectiveProxy(globalProxy)
+	if proxy == state.proxy {
+		return state.client, nil
+	}
+	client, err := aistudio.NewProxyHTTPClient(proxy)
+	if err != nil {
+		return nil, fmt.Errorf("创建账户 %s 的固定出口: %w", state.account.ID, err)
+	}
+	state.client.CloseIdleConnections()
+	state.client, state.proxy = client, proxy
+	return client, nil
+}
+
+// closeIdle 关闭出口的空闲连接，之后不再换 client
+func (state *accountHeaderState) closeIdle() {
+	state.clientMu.Lock()
+	state.closed = true
+	client := state.client
+	state.clientMu.Unlock()
+	client.CloseIdleConnections()
 }
 
 // trackedService 跟踪生成请求及其唯一账户租约
@@ -2952,6 +3033,7 @@ func (service *trackedService) publishModelAccessNow() {
 	for _, status := range statuses {
 		accounts = append(accounts, adminAccountDTO(status))
 	}
+	service.workers.ipPool().markPinned(accounts)
 	service.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
 	service.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": service.catalogModels()}})
 }
@@ -3510,7 +3592,8 @@ func (service *trackedService) acquireLease(
 			groups.StandbyReady = service.workers.withoutBadAccounts(groups.StandbyReady)
 		}
 		// 出口限流期间不在受限出口上现场提升、扩容或回收（冷启动出来的账号同样经被限的出口，首个请求多半被拒）：剔除这些出口上的备用账户。
-		// 单出口时等于清空备用账户；多出口时扩容自然落到未受限出口的备用账户。固定账户与文件绑定的选号不剔除，交给冷启动闸门
+		// 单出口时等于清空备用账户；多出口时扩容自然落到未受限出口的备用账户。由 IP 池分配出口的账户留下（启动时池另分出口，
+		// 与冷启动闸门一致，见 filterLimitedStandby）。固定账户与文件绑定的选号不剔除，交给冷启动闸门
 		// （文件所属账号要冷启动被暂停时调用方改为复制文件）
 		var removedReady []string
 		removedStandby := false
@@ -3520,8 +3603,8 @@ func (service *trackedService) acquireLease(
 			egressKey = service.egressWaitKey(limitedEgress, ultraLane)
 			if !fixedAccount {
 				var removedBusy []string
-				groups.StandbyReady, removedReady = service.pool.FilterAccountsByEgress(groups.StandbyReady, limitedEgress)
-				groups.StandbyBusy, removedBusy = service.pool.FilterAccountsByEgress(groups.StandbyBusy, limitedEgress)
+				groups.StandbyReady, removedReady = service.filterLimitedStandby(groups.StandbyReady, limitedEgress)
+				groups.StandbyBusy, removedBusy = service.filterLimitedStandby(groups.StandbyBusy, limitedEgress)
 				removedStandby = len(removedReady) > 0 || len(removedBusy) > 0
 			}
 		}
@@ -3679,6 +3762,9 @@ func (service *trackedService) acquireLease(
 			}
 			_, promoteErr := service.workers.promote(promoteCtx, accountID, selection.ModelID)
 			if promoteErr == nil {
+				// 租约在 Worker 启动之前取得，出口是账户当时的默认出口；IP 池静态 IP 下 Worker 另分端口，绑定随之重挂：
+				// 租约跟到实际出口（预占一起搬过去），这次尝试的结果、预占与发送都记在请求实际发出的端口上
+				lease.RebindEgress()
 				return lease, nil
 			}
 			if releaseErr := lease.Release(); releaseErr != nil {
@@ -4424,7 +4510,7 @@ func (service *trackedService) generateWithRetry(
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
 		attempted[request.AccountID] = struct{}{}
 		tried[request.AccountID] = struct{}{}
-		// 租约取得时账户所在的出口与分区通道：这次尝试的结果按它交给出口判定器（见 egress_guard.go）
+		// 租约所在的出口与分区通道（现场提升时已跟到新 Worker 的出口，见 acquireLease）：这次尝试的结果按它交给出口判定器（见 egress_guard.go）
 		egressKey, egressUltra := lease.EgressKey(), lease.EgressLane() == aistudio.EgressLaneUltra
 		accountLabel := lease.Account().Config.Label
 		if lease.ClaimRateWindowNote() {
@@ -4524,6 +4610,8 @@ func (service *trackedService) generateWithRetry(
 		if err == nil {
 			generated = true
 			source, err = service.service.Generate(attemptCtx, request)
+			// 发送时 Worker 不在了、在这个租约内重新启动时可能换了端口：租约在发送前已跟到实际出口（见 RebindEgress），重读一次
+			egressKey, egressUltra = lease.EgressKey(), lease.EgressLane() == aistudio.EgressLaneUltra
 		}
 		if err == nil && copiedFileCount > 0 {
 			sourceLabels := make([]string, 0, len(attemptCopies.SourceAccountIDs()))
@@ -4607,6 +4695,7 @@ func (service *trackedService) generateWithRetry(
 		if err == nil {
 			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
+			service.workers.ipPool().succeeded(request.AccountID)
 			service.quota.attemptSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
 			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
 			temporaryCopies = attemptCopies
@@ -5036,7 +5125,14 @@ func (service *trackedService) applyQuotaCooldown(
 	// 只有生成本身返回的裸限流逐级冷却：文件复制、附件上传（Drive）返回的 429 与模型额度无关（同 403 只处理生成本身的错误），
 	// 照原路径只冷却本通道 30 秒，不建档位、不同步另一通道、不计入号池级限流，之后照常在同账号另一通道再试
 	if cooldown.Escalate && fromGeneration {
-		return service.applyRateLimitCooldown(lease, accountLabel, modelID, cooldown, note, pool, escalate)
+		// IP 池按端口统计生成本身的裸限流 429（不同账号在同一端口上都被限流时冷却端口，见 proxy_pool.go）。在写完这次的逐级冷却之后再记：
+		// 端口因此冷却时，回调撤回的逐级冷却包括这次刚写的（见 proxy_pool_egress.go）。规则 A 要的是这次之前的坏号状态：
+		// applyRateLimitCooldown 先记坏号记忆，第 2 次裸限流当场标上坏号
+		accountID := lease.Account().ID
+		wasBad := service.workers.badAccountMemory().bad(accountID)
+		cooldown, ok, stateErr = service.applyRateLimitCooldown(lease, accountLabel, modelID, cooldown, note, pool, escalate)
+		service.workers.ipPool().rateLimited(accountID, wasBad)
+		return cooldown, ok, stateErr
 	}
 	accountID := lease.Account().ID
 	modelAccessScope := lease.CooldownScope(modelID)

@@ -49,6 +49,22 @@ func (pool *fakeEgressPool) EgressSnapshot() []aistudio.EgressStatus {
 	return result
 }
 
+func (pool *fakeEgressPool) EgressSnapshotFor(keys []string) ([]aistudio.EgressStatus, int) {
+	return egressSnapshotFor(pool.EgressSnapshot(), keys)
+}
+
+// egressSnapshotFor 为假账户池的 EgressSnapshotFor：从全量快照里按 keys 的顺序挑出，总数为全量快照的条数
+func egressSnapshotFor(all []aistudio.EgressStatus, keys []string) ([]aistudio.EgressStatus, int) {
+	byKey := egressStatusIndex(all)
+	var result []aistudio.EgressStatus
+	for _, key := range keys {
+		if status, ok := byKey[key]; ok {
+			result = append(result, status)
+		}
+	}
+	return result, len(all)
+}
+
 func (pool *fakeEgressPool) SetEgressRateLimit(key string, lane aistudio.EgressLane, limit int) {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()

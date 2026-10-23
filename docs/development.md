@@ -152,6 +152,9 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `LISTEN_ADDR` | HTTP 服务监听地址 | `127.0.0.1:2048` |
 | `PROXY_API_KEY` | 公开 API 访问密钥，调用 API 必须携带；留空使用默认值 | `sk-onechat-fun-fun` |
 | `PROXY` | setup 与未设置账户代理时使用的固定出口：`http`、`https` 或 `socks5`，可带账号密码（`http://用户名:密码@host:port`、`host:port:用户名:密码` 等，见[代理写法与规范化](#代理写法与规范化)）；`Load` 读入时规范化 | 空 |
+| `PROXY_POOL_MODE` | IP 池模式（不区分大小写，空值按 `off`）：`off`、`static`（端口段里每个运行中的浏览器独占一个端口）或 `dynamic`（地址里的 `{session}` 按账户换成固定会话号）；开启后没有账户代理的账户按 IP 池出网，可热更新，见[IP 池](#ip-池) | `off` |
+| `PROXY_POOL_URL` | IP 池的上游地址，写法同 `PROXY`（`config.NormalizeProxyPoolURL`：`{session}`、`%7Bsession%7D` 不区分大小写，先换成内部令牌再按 `NormalizeProxy` 规范化，保存为小写 `{session}`）；`static` 不能含 `{session}`、端口会被替换，`dynamic` 必须含且只能在用户名或密码里；`off` 时保留 | 空 |
+| `PROXY_POOL_PORT_START`、`PROXY_POOL_PORT_END` | 静态 IP 的端口段（含两端）：任何模式下都要 `1 <= 起 <= 止 <= 65535`，最多 5000 个端口（`MaxProxyPoolPorts`） | `10001`、`10200` |
 | `INIT_TIMEOUT` | 单账户初始化超时 | `2m` |
 | `REQUEST_TIMEOUT` | 生成请求在首个上游事件之前的总期限（排队、冷启动、WAA proof、文件复制与附件上传、等首字与首事件前的换号都计入，到时 504）；开始输出后改为空闲上限（上游连续这么久既没有事件也没有网络字节才以 504 结束）；整条生成请求最长 `max(1h, REQUEST_TIMEOUT)`。三段都在请求开始时取值，可热更新、只影响新请求，见下文[长生成与中转重试](#长生成与中转重试)。计数、视频、转写等其他请求整段受它限制 | `5m` |
 | `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
@@ -190,6 +193,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `ultra_primary_models`、`ultra_primary_queue_wait` | Ultra 主用模型（字符串数组，读取时总是返回，关闭时为空数组）与它们的排队上限，规则同上，保存后立即生效（不需要重启生成服务）；提交时省略（`null` 或空串，旧版页面）则沿用现值 |
 | `warm_worker_limit`、`max_active_workers`、`warm_startup_concurrency`、`per_account_concurrency` | 下一次启动生成服务时使用的容量参数 |
 | `account_rpm_limit` | 单账号每分钟生成请求上限（整数，`0` 为关闭，读取时总是返回），保存后立即热更新到当前生成服务（`applyLiveFields` 调 `SetAccountRateLimit`）；提交时省略（旧版页面）则沿用现值。只改它不需要重启生成服务：`liveFieldsEqual` 与 `sameDataConfig` 都比较它，`requiresRebuild` 不含它 |
+| `proxy_pool` | IP 池设置 `{mode, url, port_start, port_end}`（读取时总是返回；`url` 与 `proxy` 一样以规范全文返回，只在这一个接口出现），保存后立即热更新（`applyLiveFields` 调 `proxyPool.configure`），不需要重启生成服务；提交时省略（旧版页面）则沿用现值，端口为 0 或组合不合法返回 400 `invalid_config` |
 | `ultra_exclusive`、`ultra_include_pro`、`ultra_warm_worker_limit`、`ultra_max_active_workers` | Ultra 号池设置（读取时总是返回），保存后立即热更新到当前生成服务；提交时省略（旧版页面）则沿用现值。只改这些字段不需要重启生成服务：`sameDataConfig` 与 `liveFieldsEqual` 都比较这四个字段，`requiresRebuild` 不含它们 |
 | `temporary_chat`、`waa_backend`、`upstream_channels` | 下一次启动生成服务时使用的 WAA 与上游通道配置 |
 | `listen_addr`、`proxy_api_key` | 保存的管理监听配置 |
@@ -323,7 +327,7 @@ Worker 同样按账户当前所在的号池分为普通分区与 Ultra 分区（
 线上单出口直连、1.2 万账号时出现过“无缘无故 429”：额度类 429 换号没有上限、号池级保护从不触发、逐级冷却把驻留 Worker 盖成死槽位再淘汰冷启动、每次重启全量同步模型目录、需要登录的驻留 Worker 一直占着槽位、一次 401 就判死且永不恢复。现在的设计：
 
 - **换号上限**（`internal/app/quota_switch.go`、`primary_models.go`）：不固定账号与文件绑定的生成请求额度失败分两类计数，每日类最多再换 4 个账号、限流类最多再换 2 次（出口限速判为无效时放宽到 4 次），限流类失败后紧接着的选号只用已启动的 Worker；每请求最多 8 个不同账号（`generateSwitchCeiling`，单独的 `tried` 集合，不受 `maxAttempts` 补偿影响）；因登录失效换号最多 2 次（`authFailureSwitchLimit`）。达到上限按 `PrimaryQuotaError`（`Kind` 区分 Ultra 主用、普通换号上限、上游出口限流）返回 429 与 `Retry-After`。CountTokens、Live、转写、Veo 与自动选号的文件上传经 `aistudio.WithAttemptCeiling` 最多试 4 个账户（上传原先在认证失败时把就绪账户试个遍）。出口限流期间转写、Live、Veo 的候选去掉受限出口上的备用账户（还有热 Worker 时，`withoutLimitedStandby`；这些路径由账户池按 ID 顺序选号，不认调用方排好的热 Worker 优先），冷启动被闸门暂停时与指定账户的生成请求一样按号池繁忙 429 返回（`newEgressColdStartBusy`）。Ultra 主用模型的规则不变。
-- **出口限流判定**（`internal/app/egress_guard.go`）：按出口键（账号代理规范化值，空为直连，`aistudio.EgressKey`）统计已发往上游的生成尝试（成功、裸 429、其他失败），2 分钟窗口内裸 429 来自足够多的账号、比例足够高（或冷号首发被拒）时成立。成立期间裸 429 只短冷却 10 秒不升档，并撤回第 2 档以上的逐级冷却；判定期间连续被拒、与出口按比例拒绝区分得开的账号写 30 分钟账号冷却。判定器有独立的 5 秒计时器（不放进 `keepWarmPass`：清扫死槽位会同步等浏览器关闭），只在自己的锁内算出动作，解锁后再调账户池与写日志。
+- **出口限流判定**（`internal/app/egress_guard.go`）：按出口键（账号代理或 IP 池出口的规范化值，空为直连，见 `aistudio` 的 `egressKeyOfLocked`；IP 池的接线见下文“IP 池”的“与 egress_guard 的关系”）统计已发往上游的生成尝试（成功、裸 429、其他失败），2 分钟窗口内裸 429 来自足够多的账号、比例足够高（或冷号首发被拒）时成立。成立期间裸 429 只短冷却 10 秒不升档，并撤回第 2 档以上的逐级冷却；判定期间连续被拒、与出口按比例拒绝区分得开的账号写 30 分钟账号冷却。判定器有独立的 5 秒计时器（不放进 `keepWarmPass`：清扫死槽位会同步等浏览器关闭），只在自己的锁内算出动作，解锁后再调账户池与写日志；计时里删除空闲的正常出口状态（`pruneIdleLocked`），状态接口在出口多于 `egressStatusFullLimit`（16）个时只列出判定成立或已撤销的出口（`adminStatus`，正常的计入 `egress_summary`），出口少时与 `status()` 相同、全部列出（诊断第 0 段要看正常出口在门槛附近的计数）。
 - **每出口令牌桶**（`internal/aistudio/egress_rate.go`）：账户池按出口、按分区（普通、Ultra）各一条 GCRA 令牌桶，限速由判定器设下（初值为最近 60 秒成功 ×1.25），主用模型优先、非主用保底 25%；AIMD 降速后成功数下降就回退并锁定 10 分钟，限速 3 分钟仍不改善被拒比例就判为无效、停止限速（其余保护保留）。非主用模型按出口排队整个请求累计不超过 30 秒（`egressWaitBudget`），转写经 `WithEgressWaitLimit`。
 - **冷启动闸门**（`coldStartGateFunc`，`admitColdStart`）：出口限流期间低于常驻数的补位只受并发约束（max(2, WARM_STARTUP_CONCURRENCY/4)），驻留里没有能服务该模型的热 Worker 时的“补覆盖”另受每分钟 6 次配额，按需替换与超出常驻的扩容暂停，账户自己重开不经闸门（生成请求的每次尝试把发送时的冷启动标为重开；转写、Live、Veo 经 `accountWorkerManager.Worker` 的冷启动按“按需”过闸门，暂停时按号池繁忙 429 返回）。按需替换的每分钟次数在闸门放行后才记。按需替换与扩容另有启动宽限：不换就绪不到 2 分钟的 Worker（不可调度与死槽位除外，`pickReplaceVictim`），每个分区每分钟最多 10 次按需替换（`replace_rate.go`）；两项都只在 `newRuntime` 打开。现场提升判断“能否替换”（`promotable`）与 `ensureWorker` 的淘汰选号用同一个函数 `replaceVictimFor`：同分区有 Worker 在启动时（`victimReplaceable`）除冷却、死槽位、不可调度的之外，对请求模型不可服务或空闲超过 2 分钟的健康 Worker 也可以换掉。主用模型等这次选号发起的后台扩容（等待原因 `Worker 正在扩容`）时，等待的时间与现场冷启动一样延后排队截止时间（`leaseWaitBudget.expansionCredit`，合计不超过 `INIT_TIMEOUT`），Ultra 主用模型的流式请求写出响应头前的等待同步推迟；号池繁忙文案把它写成“等后台扩容”，与现场冷启动分开。
 - **坏号记忆**（`internal/app/bad_accounts.go`）：按账号（不分模型）连续 2 次裸限流、期间没有成功即标坏号 2 小时，移出预热、扩容与替补候选（还有其他候选时），成功一次清除；预热与替补优先最近 24 小时成功过的账号；记录写在 `runtime/model-catalogs/bad-accounts.json`。出口判定的冷号首发不计坏号，与出口判定解耦（多出口时每出口的判定门槛很难达到）。
@@ -462,6 +466,8 @@ Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不�
 
 都是包内常量，不是配置项。达到上限时不等待：HTTP 回 503（写之前先读完请求头，避免 RST），SOCKS5 回 REP=04；进程级连接数达到 80% 时记 WARN。资源估算：空闲监听器约 1 个 fd、1 个 goroutine、不到 10 KB；活跃隧道 2 个 fd、约 75 KB；监听器总数约等于同时活着的、带认证代理的浏览器数（受 `MAX_ACTIVE_WORKERS` 等约束）加上释放后 5 分钟内的，与账户总数无关；Worker 反复启动失败时每次多留一个监听器 5 分钟，按启动名额与单次启动耗时估算最多几百个。
 
+**判定上游失败**：`Lease.WrapFailure` 有失败说明时，返回的错误另外包进 `proxyrelay.ErrUpstream`（经一个 `Error()` 为空串的私有标记，错误文字与以前逐字相同，管理页与 `tools/diag_*.sh` 照旧按文案匹配），调用方用 `errors.Is(err, proxyrelay.ErrUpstream)` 判断 Worker 启动失败是不是代理造成的：IP 池的端口健康（规则 B）与动态 IP 换会话只计这一类。`proxyrelay.TotalConnectionLimit()` 返回包级默认注册表的进程连接上限，IP 池开启时低于 `容量 × 16` 会 WARN 并提示调高 `ulimit -n`。
+
 **错误映射**：上游失败一律用协议层错误表达，不直接断开（直接断开会落进 Firefox 回退直连的列表）。407 不原样转给浏览器：有界面的登录浏览器会弹认证框卡住，无头 Worker 会进入 BiDi authRequired 一直卡到 `INIT_TIMEOUT`；转成 502 后 Firefox 立刻显示错误页，Worker 快速失败，原因由 `Lease.WrapFailure` 附在错误后面（`…；本机代理中转：上游代理拒绝了账号密码（407），请检查用户名和密码`）。
 
 | 上游情况 | 类别 | HTTP 中转回给浏览器 | SOCKS5 中转回给浏览器 | 失败说明（`FailureSince`） |
@@ -493,6 +499,67 @@ Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不�
 回退直连的列表是 `NS_ERROR_PROXY_CONNECTION_REFUSED`、`NS_ERROR_UNKNOWN_PROXY_HOST`、`NS_ERROR_NET_TIMEOUT`、`NS_ERROR_NET_RESET`。手动配置的单个代理没有 `mNext`，只有编译时定义了 `MOZ_PROXY_DIRECT_FAILOVER`（默认定义）、`network.proxy.failover_direct` 为 true（默认）而且请求是 beConservative 的系统请求时才改走直连：AI Studio 页面请求不会回退，会回退的是 Firefox 自己的系统请求（远程设置、更新等），它们会用真实 IP 连 Mozilla。所以 SOCKS5 中转用 REP=04 表达所有失败，代价是浏览器错误页显示“找不到服务器”，真实原因由 `WrapFailure` 带到管理页。失败回复写满 10 字节（Firefox 先凑齐 5 字节才解析，两字节的简写会让它一直等或按拒绝连接结束），写完后半关闭、最多读 1 秒或 4 KiB 剩余数据再关，避免内核发 RST。HTTP 中转回的 502、503、504 映射成 `NS_ERROR_PROXY_BAD_GATEWAY`、`NS_ERROR_CONNECTION_REFUSED`（无 PROXY_ 前缀）、`NS_ERROR_PROXY_GATEWAY_TIMEOUT` 等，都不在列表里。Camoufox 152 是否与 main 分支一致需要实测（抓包确认 407/503/504、SOCKS 认证失败/REP=01/REP=06 时没有直连外网的 SYN，监听器关闭作对照组）。
 
 **本机安全**：只绑 `127.0.0.1`，端口由系统随机分配（Windows 上同样可行，只绑回环不会触发防火墙弹窗）；拒绝 origin-form 与 `https://` 绝对 URI，SOCKS5 只支持 CONNECT。中转本身没有认证，本机任何进程都能在浏览器存活期间借它出网，这与 Camoufox 以 `--remote-debugging-port=0` 在回环上无认证暴露浏览器控制权是同一级别。账号密码不再写进 Camoufox 临时 profile 的 user.js，带认证时 user.js 里只有 `127.0.0.1:N`。`https://` 不带认证时 Camoufox 以明文连接代理的 TLS 端口（现状，保留；“测试代理”给出 `https_plain_browser` 提示）。
+
+### IP 池
+
+“没有账户代理时用什么出口”从固定的 `PROXY` 换成可热更新的 IP 池（`PROXY_POOL_*`）：静态 IP 时每个运行中的浏览器（Worker、登录、验证）独占端口段里的一个端口，动态 IP 时每个账户用一个固定会话号。实现分在 `internal/config/proxy_pool.go`（类型、规范化、校验、`StaticURL`/`SessionURL`、`EndpointKey`）、`internal/app/proxy_pool.go`（分配、租约、冷却、状态）、`proxy_pool_store.go`（持久化）、`proxy_pool_check.go`（检查全部端口）、`worker_proxy.go`（Worker 接入、容量、跟随默认代理）、`proxy_pool_admin.go`（登录、验证、导入的租约，`/api/config` 字段，检查全部端口与跟随默认代理的管理接口）与 `proxy_pool_probe.go`（抽测 IP 池与测试账户实际出口）；`internal/aistudio` 只多了 `ProxyBinding` 与账户池的批量推送接口（`proxy_binding.go`）、`NativeWorker.OnClosed`、端口锁（`proxy_port_lock.go`）与 Go 侧 client 缓存上限（`proxy_client_cache.go`），`waa`、`chromeauth`、`camoufoxnative`、`transport_browser.go`、`runtime_go.go` 的网络与指纹逻辑都不变（只是换了上游代理地址）。
+
+**取代理只用 `EffectiveProxy`**：`aistudio.Account.EffectiveProxy(global)` 为 账户固定代理 > IP 池绑定（`ProxyBinding.URL`，为空表示沿用 `global`）> `global`。普通 RPC、WebChannel、上传、续签、公共头发现与登录验证都经它取代理，绑定一变下一次请求就跟着变；公共头提供器在需要发现时按当前 `EffectiveProxy` 取出口，与缓存的 client 不同就换新的。新代码不得绕过它直接读 `Config.Proxy` 或 `PROXY`：绕过的路径会从默认代理、`PROXY` 为空时甚至从服务器真实 IP 出网。
+
+**进程级分配器**：`runtimeManager` 在 `newRuntimeManager` 里创建唯一的 `proxyPool`，经 `newRuntime` 的参数交给每个生成服务实例。端口占用对应进程里活着的浏览器，与生成服务实例、账户目录无关：改 `AISTUDIO_AUTH_STATES` 重建、旧实例关闭失败的浏览器仍占着的端口，新实例都看得到。同机多进程按端口加 flock（`aistudio.TryLockProxyPort`，文件 `proxy-port-<EndpointKey>-<端口>.lock`，与账户 runtime 租约同目录；Linux 上按打开的文件描述互斥），本进程同一端口只持一把锁（持有者从 0 变 1 时加锁、归零时释放），被其他进程锁住的端口 1 分钟后再试。锁出错（打开文件数用满、缓存目录暂时不可写等）时 WARN（一段出错期一次），5 分钟内照常分配、不加锁，到期再试；恢复后第一次加锁成功时给出错期间分出、仍持有的段内端口补锁，补不上的（已被其他进程锁住）记 WARN。默认出口不加锁，但避开有“被其他进程锁住”记录的端口：记录在重试时间之后也不算数，要等本进程真正锁到、或到期后检测一次（`TryLock` 后立即释放，只检测、不持有；本进程当初没锁到、正在共用这个端口时留下这把锁）锁已释放才清掉。
+
+**租约**：每次浏览器类操作申请一个租约（`proxyPool.acquire`），租约记下实际使用的上游 URL 与端口：
+
+| 使用方 | 申请 | 归还 |
+| --- | --- | --- |
+| Worker | `startReservedWorker` 拿到启动名额之后（`workerProxyLease`；池分配时只改这次启动的局部 `options.Proxy`，`accountWorker.config` 不变） | 启动成功后 `lease.attach(worker)` 登记 `NativeWorker.OnClosed`：`Close` 成功时与本机中转同一时机归还；关闭失败停在 `WorkerClosing` 时保持占用，清理重试成功后归还；`Remove` 后关闭失败的计入 `orphaned`。启动失败时 `launchFailed(err, ctx.Err() != nil)` |
+| 新账户浏览器登录 | `CreateAccount` 开头，租约键 `login:<随机串>`（并发的登录各自独占） | `defer`；账户新建成功时 `adopt(账户 ID)`（`addAccount` 的 `onCreated`：`store.Create` 之后、`workers.Add` 与 `AccountPool.Add` 之前）：静态把端口记为它的上次端口与归属，动态把登录用的临时会话号存成它的会话号。邮箱已存在时 `store.Create` 失败、不 adopt，已有账户的端口与会话号不受影响；adopt 之后登录租约在账户名下，归还前启动的 Worker 与它共用端口（登录租约是端口不足时与别人共用的除外：Worker 有空闲端口时另分） |
+| 重新登录、验证 | `LoginAccount`、`verifyLogin` 开头；跟随账户绑定所用的出口（`followServingLocked`，同一账户同时只用一个 IP）：静态共用它的端口（不因冷却拒绝），动态沿用它的会话号（换会话之后、Worker 重启之前仍是旧会话），正在服务的 Worker 走直通出口（IP 池开启前启动、或当时没有可用端口）时用同一个上游、不另分端口或会话（`browserProxy` 返回租约的 URL）；没有正在用的出口时按账户自己的端口或会话申请 | `defer` |
+| Chrome 导入 | IP 池开启且没有填账户代理时逐个账号调用 `chromeauth.Import`（每次 `AccountIDs` 只放一个），各自一个登录租约 | 导入只在 Go 侧做 OAuth、没有浏览器在用，每个账号导入完就归还（`releaseClaim`，不占着独占端口等整批添加结束），只记下独占过的端口号或临时会话号（`proxyPoolClaim`）；账户新建成功时 `proxyPoolClaim.adopt` 按记下的值登记到账户名下（静态在端口仍属同一代理商、在段内且没被其他键持有时记亲和与归属，动态存成账户的基础会话号） |
+| `setup`（独立进程） | 没传 `--proxy` 且 IP 池开启时：静态从随机起点依次 `TryLockProxyPort`，用第一个锁到的端口，全被其他进程锁住时共用随机起点的端口（不加锁，不退回 `PROXY`）；动态用 `n` 开头的临时会话号。一次 setup 只有这一个出口，批量导入 Chrome 时整批共用 | 进程退出；不记上次端口 |
+
+账户有自己的代理时不申请租约。IP 池关闭时申请直通租约（URL 为启动时的 `PROXY`，参数不改，不记日志），off → on 时据此识别仍走 `PROXY` 的 Worker（状态 `unpooled`）。
+
+**绑定经账户池加锁推送**：账户的绑定 = 绑定所用租约的 URL（`Active=true`，`bindingLeaseLocked`）：最新的已启动 Worker 租约（`attach` 之后，或“改为跟随默认代理”补登记的），没有时为最新的活动租约（启动中的 Worker、登录、验证）。先启后停时新浏览器起来之前 Go 侧仍走正在服务的旧浏览器的出口（WAA proof 与 RPC 同一个 IP），启动失败也不来回切换；裸 429 与生成成功同样记在这个租约的端口上。没有活动租约时为按当前配置算出的默认出口（`Active=false`）：静态依次为 归自己的端口（上次端口且最后的使用者是自己、不冷却、没被别人持有）> 账户自己的探测序列上第一个可用端口（可分配且没有“被其他进程锁住”的记录）> 清除（回到 `PROXY`）> 哈希端口（与别人共用）。探测序列（`proxyPoolProbe`）为 `起点 + k × 步长 (mod 端口数)`，起点与步长分别取 `fnv64a(账户 ID)` 的低、高 32 位，步长从与端口数互质的值里取（`configure` 时算好），不重复地走遍全部端口；不同账户的步长不同，一个端口被占时落在它上面的账户各自走到不同的下一个端口（约 账户数 ÷ 空闲端口数 个），不会整批堆到同一个端口上、再在它被占时整批挪走。一批账户（`pushLocked` 至少 16 个、全量重算、重推在等的账户）共用一份端口快照（`proxyPoolDefaultView`，扫描一次端口段），没有可用端口时不逐个探测。后两种情况记进 `defaultWaiting`，端口重新可分配时重推：端口归还后等 30 秒（`proxyPoolWakeDelay`，期间多半有 Worker 来占它，多次归还合并成一次）；冷却到期、其他进程锁的重试时间到时同样重推；由定时器触发，申请、归还与状态接口也顺带检查。重推前先扫描端口段，没有可用端口时它们的结果不变，跳过。动态为账户会话 URL；关闭时清除。写入只有两条路：
+
+1. 装配前直接写对象（`proxyPool.prime`）：`newRuntime` 在 `aistudio.NewAccountPool` 之前、`workers.Add` 在 `AccountPool.Add` 之前，账户池构造时按带绑定的 `EffectiveProxy` 挂出口通道，第一次就挂对。
+2. 运行中经 `AccountPool.SetProxyBindings` / `UpdateProxyBindings` 在账户池的 `p.mu` 内按账户 ID 写“当前账户池”里的对象（`attach` 切换推送目标）；写入有变化的账户在同一次加锁内按新的出口键重挂出口通道（`proxyBindingChangedLocked` → `attachEgressLocked`），有账户换了通道时 `notifyLocked`（按出口排队的请求重新选号），绑定变化与重挂是同一个原子步骤，`verifyEgressLocked` 看不到中间态。重建期间旧实例的目录监视只能 `prime` 旧对象、`refresh` 会因 owner 不符被忽略，碰不到新账户池。
+
+锁序为 `account.startupMu` / `accountWorker.mu` / `NativeWorker.operationMu` / `runtimeMu` → `proxyPool.mu` → `AccountPool.mu`：账户池不回调 app 层（`notifyLocked` 只关通道），任何代码都不能在持有 `AccountPool.mu` 时调 IP 池；`proxyPool.mu` 内只做 map 操作、非阻塞的 `TryLock` 与批量推送，日志与 `onPortCooled` 收集后在锁外执行。`ProxyBinding.EgressTag`：会话号写在密码里时为会话号，静态与会话号写在用户名里时为空。`EgressKey` 去掉密码，不加区分的话全部会话会合成一个出口，所以出口键为 `egressKeyOfLocked`：`EgressKey(EffectiveProxy)`，账户没有自己的代理、绑定 URL 非空且带 `EgressTag` 时追加 `"#" + EgressTag`；`attachEgressLocked`、`verifyEgressLocked` 与 `EgressKeyOf` 都按它算，`EgressLabel` 把 `#会话号` 与用户名一起哈希（同一用户名不同会话的标签不同，不显示会话号）。
+
+**静态端口的挑选**（`acquire`）：同键或同一账户名下（含 adopt 过来的登录租约）已有活动租约时共用它的端口（同一账户先启后停、Worker 运行中重新登录或验证、新账户的 Worker 在登录租约归还前启动）；Worker 遇到冷却的端口另选，登录、验证与导入不因冷却拒绝（冷却只拦把端口新分给其他账号）；Worker 也不加入端口不足时与别人共用的租约（加入后整个生命周期都和别的账号共用一个 IP），先按下面的次序另分，确实没有可分配端口时才回到这个共用端口（仍是这个账户的 IP，来源记 `同账号`）；其次是有效的上次端口（亲和，只在端口最后的使用者是自己时有效，账号之间不会来回抢）；再按次序挑可分配端口：从没分给过账号的 > 归属账号已不指向它的 > 别人的归属端口，同档按最久未用（刚归还的端口不马上分给下一个账号）、落在它上面的默认出口最少（占用后要挪走的账户最少；从零预热时各端口都没用过，靠它分散）、端口号。可分配 = 在段内、没有持有者、不冷却、不是外部占用（账户代理或 `PROXY` 经 `HostMatches` 指向它）、没被其他进程锁住。都没有时与持有键最少的段内端口共用（`shared`，WARN 每分钟一行），全部冷却时用恢复最早的。
+
+**健康与冷却**：观察点只有两个，都只计入账户绑定所用的、池分配的段内静态端口租约：生成本身的裸限流 429（`rateLimited`，附件上传的 429 不算）与收到上游首个事件（`succeeded`）。规则 A：端口 10 分钟内来自至少 2 个不同账号的裸 429，且从第一个起没有生成成功（Worker 启动成功不清零它：独占时端口换手一定是新账号先启动成功再发请求）。只计入被拒像是 IP 问题的账号（`strikeLocked`：账户自最近一次生成成功以来的裸 429 记在 `strikes` 里，只在这个端口上被拒、第一次被拒之前坏号记忆还没标它；第一次在另一个出口上被拒时从第一个端口的记录里删掉它），并要求其中至少一个 24 小时内在别的出口上生成成功过（`successes`：`succeeded` 记下成功时绑定所用的段内端口，不经 IP 池端口的出口记为 0；“这次之前已是坏号”由调用方在记坏号记忆之前取 `bad()`，随 `rateLimited` 传入）：裸 429 多半跟着账号走（见 `bad_accounts.go`），额度用完的账号在端口换手后接连被拒不能当成 IP 的问题。`strikes`、`successes` 只在内存（换代理商或子账号时随端口记录清空），`strikes` 在生成成功时清除，端口冷却撤回坏号时保留（撤回后在新端口上又被拒的账号不计入新端口，误判不会沿着换端口传下去）；规则 B：端口连续 2 次 `ErrUpstream` 启动失败、其间没有启动成功（取消与其他原因的失败不计），同时清除指向它的亲和。冷却第 n 档为 `min(15m × 2^(n-1), 2h)`，24 小时没有再冷却则档位清零；冷却不影响已在用它的浏览器，只重推落在它上面的默认出口。整体故障保护：窗口内出错的端口达到 `max(5, 50% × 使用中端口数)` 时不冷却。动态模式没有端口冷却：同一账户 30 分钟内 2 次 `ErrUpstream` 启动失败、距上次换会话至少 10 分钟时代号加一（会话号为 `sha256` 前 12 位或登录时采用的临时会话号，加 `r` 与 base36 代号，最长 15 个字符），裸 429 不换会话。
+
+**持久化**：`runtime/proxy-pool.json`（与 `runtime/requests.db` 同目录，版本 1，文件 0600、目录 0700），记账户上次的端口、端口归属与冷却档位、动态会话号与代号，不含任何地址、主机名与账号密码；变化后 3 秒合并写一次（锁内复制快照、锁外原子写），生成服务关闭与 `runtimeManager.Close` 时 flush。`endpoint_key`（主机与用户名的哈希）与当前配置不同、或运行中改了主机或用户名时丢掉端口的冷却与归属（不动持有记录）；30 天没用过的账户记录在写文件时修剪。文件坏或版本不认识时 WARN 后从空开始。
+
+**热更新**：`applyLiveFields` 每次都调 `proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg))`（峰值与启动并发变化同样要重新判断端口是否够）；`ProxyPool` 进 `liveFieldsEqual` 与 `sameDataConfig`，不进 `requiresRebuild`，`.env` → `/api/config` → 页面原样提交 → `.env` 逐字节不变、不会出现“需要重启”。`configure` 永不重置持有记录，`release` 按租约自己记的端口归还（不经当前设置），往返切换模式不会把仍在用的端口再分出去。
+
+| 变化 | 运行中的 Worker | 新启动的 Worker | 没有 Worker 的账户（Go 侧） |
+| --- | --- | --- | --- |
+| off → static/dynamic | 不变（直通租约，仍走 `PROXY`，计入 `unpooled`） | 按 IP 池分配 | 立即切到默认出口 |
+| static/dynamic → off | 不变（旧出口，计入 `stale`） | 走 `PROXY` | 立即回到 `PROXY` |
+| static ↔ dynamic、改端口段、改地址 | 不变（`stale`；段外端口归还后不再分出） | 按新设置 | 立即切换 |
+| 改峰值、Ultra 峰值、`WARM_STARTUP_CONCURRENCY` | 不变 | 不变 | 不变（只重新判断端口是否够，状态切换时记一行日志） |
+| 只改账户自己的代理 | 现有流程（先关 Worker，租约随之归还） | 用账户代理，不申请租约 | `refresh` 重算外部占用与默认出口 |
+
+`PROXY` 的修改仍需要重建。`applyLiveFields` 只要发现已保存的配置里有还没应用的、需要重建的改动（`requiresRebuild`：账户目录、`PROXY`、WAA 后端、上游通道），就整体不做热更新：同一次保存既改 `PROXY` 又改 IP 池，或之前保存过需要重建的改动、还没应用时再单独改 IP 池，IP 池都随重建在 `newRuntime` 里生效（设置页状态行为“已保存，待应用”，与此一致）。
+
+**容量**：`proxyPoolCapacity` = Σ各分区（峰值 + `drainLimitFor(峰值, WARM_STARTUP_CONCURRENCY)`），`drainLimitFor` 是从 `drainLimit` 抽出的纯函数（行为不变），不含登录与验证；端口数少于它时 WARN，恢复够用时 INFO。另有两条泄漏报警：已删除账户仍占用（`orphaned` 增加）与池租约数持续 5 分钟大于容量加验证并发上限（不用 `Workers.Occupied` 比较：排空中的 Worker 不计入它，会误报）。
+
+**Go 侧连接复用**：`transport_http.go` 的 `clientForProxy` 按完整 URL 字符串缓存 tls-client，上限 1024、按最近使用淘汰（淘汰时 `CloseIdleConnections`，进行中的请求不受影响）；`configure` 预先算好每个端口的 URL，同一端口、同一会话每次都是同一个字符串。只影响连接复用，不改 TLS 指纹与请求形态。
+
+**管理页**：设置页的 IP 池分组在 `web/src/components/ProxyPoolSettings.vue`。`proxy_pool` 在 `SettingsPanel.vue` 里与 `proxy` 一样属于失焦保存的字段（`BLUR_KEYS`）：自动保存时沿用已保存的值；模式选完、地址或端口失焦时由 `commitProxyPool` 提交，提交前先用 `web/src/proxyPool.ts` 的 `proxyPoolProblem` 校验模式与地址、端口的组合（与服务端 `ProxyPool.Validate` 一致，另粗查“不写协议时必须写端口”），不合法时不提交、不弹提示，错误显示在对应输入框旁；保存后把服务端的规范值同步回表单。前端查不出的地址格式问题（例如冒号写法的主机里写了 `{session}`）由服务端拒绝：`doSave` 收到 400 `invalid_config`、且这次提交的 IP 池设置与已保存的不同时，沿用已保存的 IP 池设置再提交一次，成功说明是 IP 池设置的问题，错误记成 IP 池的服务端错误（显示在地址框旁，提交时沿用已保存的值，IP 池字段一改就清掉），同一次失焦保存的其他字段照常保存；再失败时按普通的保存错误显示。旧版服务端不返回 `proxy_pool` 时不显示分组、不提交。端口需求由 `proxyPoolCapacity` 按表单里的峰值与启动并发现场估算，与服务端 `proxyPoolCapacity` 同一公式。“抽测出口”与 `ProxyInput.vue` 的“测试代理”一样在测试期间发 `testing` 事件、暂停自动应用的倒计时。账户列表不随 Worker 启停推送，代理列的实时端口取状态接口 `proxy_pool.assignments`（按账户 ID 合并，与 `warm_ids` 的做法相同），没有时才用账户 DTO 的 `proxy_pool_slot` 兜底；“固定为默认代理”标记取账户 DTO 的 `proxy_pool_pinned`（`proxyPool.markPinned`，与 `pinned_default`、“改为跟随默认代理”同按当前生效的 `PROXY`），前端不再自己比较字符串。账户编辑对话框的“测试代理”留空时总带 `account_id`：账户原来有自己的代理（对话框里清空了）时服务端测清空后的默认出口（`proxyPool.accountPreview`，只读），文案为“清空账户代理后由 IP 池分配，例如：端口 N”。
+
+**与 egress_guard（429 治理）的关系**（接线见 `internal/app/proxy_pool_egress.go`）：出口统计与限速仍由 egress_guard 负责，出口键为 `egressKeyOfLocked`（账户实际使用的代理的规范化值，会话号在密码里时带 `#会话号`），静态每个端口、动态每个会话是独立出口，`PROXY` 为空时账户不会全部挂在“直连”一个键上。
+
+- 租约跟到实际出口：生成租约的出口通道在取得时定下，而静态 IP 下没有 Worker 的账户挂在默认出口上（探测序列上的空闲端口、端口用满时的 `PROXY`，`PROXY` 为空时与别人共用的哈希端口）。现场提升、补覆盖与转写、Live、Veo、固定账户的冷启动都是先取租约、再启动 Worker，`allocateStaticLocked` 另挑端口、绑定随之重挂。`AccountLease.RebindEgress` 把租约改挂到账户当前的通道（在账户池锁内改写租约的 `egress`，`EgressKey`、`EgressLane` 改为在锁内读）：没发出的预占一起搬过去（旧通道退还预占，消耗过令牌时退还令牌并唤醒等待方；新通道照 `reserveEgressLocked` 预占、限速时消耗一个令牌）。`acquireLease` 在现场提升成功后显式调用，`recordEgressSentLocked` 在每次生成发送前自动调用一次（覆盖转写等经 `Worker()` 冷启动、以及尝试内重开 Worker 的路径），`generateWithRetry` 在 `Generate` 返回后重读出口键；非生成 RPC 的计数（`noteOtherSend`）记在账户当前的通道上。这样尝试结果、`quota.egressKey`、预占与发送计数都记在请求实际发出的端口上，不同账号的冷启动首发不会汇到默认出口（端口快用满时多半是 `PROXY`）上凑成“冷号首发被拒”的判定。
+
+- 冷启动闸门：`egressColdStartGate` 在出口判定成立时先问 `proxyPool.poolsAccount`：IP 池开启（静态有端口段、动态有地址模板）且账户没有自己的代理时直接放行（闸门看的是账户现在的默认出口，真正启动时池会另分端口，每个出口只有这一个账号）。锁序 `rebalanceMu → proxyPool.mu`。同样的理由，剔除受限出口上的备用账户（`acquireLease` 的现场提升、扩容与回收，`withoutLimitedStandby` 的转写、Live、Veo）走 `filterLimitedStandby`：先由账户池 `FilterAccountsByEgress` 剔除，再对剔除的账户问一次 `proxyPool.pooledAccounts`（一次加锁，锁不嵌套），由 IP 池分配出口的留下（端口用满或冷却时它们的默认出口退回 `PROXY`，`PROXY` 判定为限流时不应因此被剔除）。
+- 端口冷却撤回误伤：`newRuntime` 装配成功后 `setPortCooledHook(service.proxyPortCooled)`（进程级 IP 池，每次重建换成新生成服务的）。回调在 IP 池锁外调用，可能持有某个账户的 `startupMu`（Worker 启动失败时），所以在后台执行（与进入出口判定时的撤回共用 `relaxWG`）：规则 A 对计入规则 A 的账号（`proxyPoolCooling.RateLimitedAccounts`，见上文“健康与冷却”）`RelaxRateLimitCooldowns(账号, 现在 + egressLimitedCooldown, 1)`（第 1 档起全部撤回、清除档位，原因前缀改为“出口限流撤回”），并 `badAccountMemory.pardon(账号, proxyPoolFailureWindow)` 撤回坏号记忆（清零连续裸限流次数；窗口内标上的坏号清除、照常写盘，更早标上的保留；不记成功）；规则 A 与 B 都对正用这个端口服务的账户（`proxyPoolCooling.Workers`：绑定所用的租约是这个端口上已启动的 Worker）`scheduleWorkerReset(…, workerResetProxyPort)`，等同账号进行中的请求结束后关闭，补齐预热时换到别的端口：先取 Worker 版本、再用 `servesOnPort` 核对账户仍在这个端口上服务（回调在后台，期间可能已换成别的端口上的新 Worker），日志的“重启 Worker”只计真正登记的关闭，ResetAll、Close 期间或独占等待登记失败的计入“未登记”。裸 429 的 `rateLimited` 放在 `applyRateLimitCooldown` 写完逐级冷却之后，端口因这次 429 冷却时撤回的冷却包括刚写的这一次。
+- 动态换会话：`applyRateLimitCooldown` 在出口判定成立的分支写完冷却日志后调 `proxyPool.rotateSession(账号, lease.EgressKey(), "出口限流判定成立")`，只在判定的出口就是账户当前会话的出口时换（`sessionEgressKeyLocked`：动态模式、账户没有自己的代理，绑定所用的租约是池按当前设置分配的当前会话，或没有活动租约；出口键按 `aistudio.ProxyBinding.EgressKey` 算，与账户池挂通道的键相同），受 10 分钟最短间隔约束。开启动态 IP 之前启动、仍走 `PROXY` 或旧端口的直通 Worker 所在的共用出口判定成立时不换（换一个没用过的会话只会刷日志、占掉间隔）。每个会话各自是独立出口、只有一个账号，凑不够判定门槛（`egressMinAccounts`），所以这里实际走不到：被上游限制、但代理能连通的会话不会自动换（裸 429 单看一个会话分不清是账号还是 IP 的问题，需要另定触发依据）。
+- 出口状态瘦身：账户池侧没有账户、没有预占、窗口内没有发送、不限速、没有登记唤醒的出口记录在取快照时删除（`pruneEgressLocked`），只检查 `egressIdle`（两条通道都没有账户的记录：建立时与账户数减到 0 时记进来，又挂上账户时移出），不扫全部出口；编号对记进 `egressFree` 给新出口复用。动态 IP 下没有 Worker 的账户各自挂在自己的会话上，出口数与账户数相当（上万），全量 `EgressSnapshot` 在账户池锁内要十几毫秒：判定器计时（每 5 秒）只取有判定状态的出口（`EgressSnapshotFor(键)`，O(键数)），状态接口 `adminStatus` 同样只取这些出口的计数、其余出口按 `EgressSnapshotFor` 给的总数计入正常（管理页事件流有请求时最快每 50ms 取一次状态），排队进度只取所排的那一个出口；全量快照只留给 `status()`（测试与诊断）与管理动作按编号找出口。`BenchmarkEgressSnapshot1e4` 对比两者。判定器侧正常、10 分钟历史为空、没有排队与冷启动、没有限速记录的出口状态在计时里删除（`pruneIdleLocked`）。出口多于 16 个时 `egress` 只列出判定成立或已撤销的出口，正常的只计入 `egress_summary`；不多于 16 个时全部列出（全量快照便宜，IP 池关闭时多半只有一个出口）。
+- 日志带出口：裸 429 写入的 `账号冷却` 行末尾追加 `proxyPool.slotLabel(账号)`（` | 端口=10023` 或 ` | 会话=…`），`WAA Worker 启动失败` 行末尾追加这次启动租约的 `logField()`（在 `launchFailed` 归还之前取）。
 
 ## 4. Go 协议层、公开端点与 Vue 管理端
 

@@ -14,17 +14,21 @@ import (
 	"time"
 )
 
-// 出口为账户发往上游的网络出口：账户固定代理或全局代理（Account.EffectiveProxy）规范化后的值，空为直连。
+// 出口为账户发往上游的网络出口：账户固定代理、IP 池分给它的出口或全局代理（Account.EffectiveProxy）规范化后的值，空为直连；
+// IP 池的会话号写在密码里时另带会话号区分（见 egressKeyOfLocked）。
 // 同一出口上的账户共用上游按出口 IP 计的限流；判定与行为在 app 层（egress_guard.go），账户池只按出口与分区通道记账、准入。
 //
 // 每出口、每分区通道一条令牌桶（GCRA）：
 //   - 账户按出口键与是否属于 Ultra 号池挂到一个通道（attachEgressLocked）：构造、加入、SetGlobalProxy、SaveConfig 改代理、
-//     Ultra 成员变化时重挂，删除时摘下；候选索引按账户下标存通道编号（egressID）
+//     IP 池绑定变化（SetProxyBindings、UpdateProxyBindings，与写绑定在同一次加锁内）、Ultra 成员变化时重挂，删除时摘下；
+//     候选索引按账户下标存通道编号（egressID）
 //   - 限速只由 app 层判定器经 SetEgressRateLimit 写入，为 0 时只记账不拦：生成租约照常预占、发送照常记录，供状态与判定使用
 //   - 取得生成租约时预占并立即消耗一个令牌（tat 前移一个间隔），发出时抵掉预占并记一次发送，没有发出就释放时退还令牌。
 //     没有沿用 ACCOUNT_RPM_LIMIT 的 60 秒滑动日志：判定成立时窗口里已有 90–168 条发送，初值 22–31 要等窗口里只剩 L−1 条才放行，
 //     停顿约 44–50 秒，之后旧发送成簇过期、一阵一阵放行；令牌桶从空桶开始，没有停顿，之后均匀放行。
-//     预占在准入时就消耗令牌，文件复制、内联附件上传、WAA proof 慢的请求只是提前用掉自己的令牌，不会堵住整个出口
+//     预占在准入时就消耗令牌，文件复制、内联附件上传、WAA proof 慢的请求只是提前用掉自己的令牌，不会堵住整个出口。
+//     租约的通道在取得时定下；先取租约、再冷启动 Worker 时 IP 池另分端口，租约经 RebindEgress 跟到实际出口（预占一起搬过去，
+//     生成发送前自动重挂一次），出口判定、预占与发送计数都记在请求实际发出的出口上
 //   - 主用模型（AccountSelection.EgressPriority）优先：非主用要多等一个令牌；该通道最近一个窗口里已有发送、非主用占比却低于
 //     egressNonPrimaryMinShare 时反过来（保底），主用让出一个令牌。任一类单独有需求时都不损失速率，只少一个突发容量
 //   - 通道对某类选择不准入时，该通道上的账户分类时按忙碌处理（计 EgressLimited），选号跳过；单出口满桶时不逐个候选尝试（短路）。
@@ -32,7 +36,10 @@ import (
 //   - 指定账户的选号（管理页测试调用）不拦但照常预占；文件绑定的选号照拦（所属账户要冷启动而被暂停时由 app 层改走复制文件）
 //   - 非生成 RPC（ListModels、CountTokens 等经 Client.do 发出、ctx 带租约的）只计数，不准入、不拦
 //
-// 只统计本进程，记录只在内存中。全部状态受账户池 mu 保护
+// 只统计本进程，记录只在内存中。IP 池开启后出口很多（静态每个端口一个；动态每个会话一个，没有 Worker 的账户各自挂在自己的会话上，
+// 出口数与账户数相当），没有账户、没有预占、窗口内没有发送且不限速的出口记录在取快照时删除（只检查没有账户的记录，
+// 编号对留给新出口复用，见 pruneEgressLocked）；判定器与状态接口按键取快照（EgressSnapshotFor），不逐个构造全部出口。
+// 全部状态受账户池 mu 保护
 const (
 	// egressRateWindow 为发送计数与非主用占比的统计窗口，也是限速的单位（每分钟）
 	egressRateWindow = time.Minute
@@ -86,6 +93,7 @@ func EgressKey(proxy string) string {
 }
 
 // EgressLabel 返回出口的脱敏显示：直连、http://host:port，带用户名时追加 #用户名 sha256 前 4 位（如 socks5://gw.example:1080#a3f9）；
+// 出口键带 IP 池会话号（#会话号，见 egressKeyOfLocked）时会话号一起进哈希，同一网关、同一用户名的不同会话显示成不同标签；
 // 解析失败时为 <无法识别的代理>#原文 sha256 前 4 位。从不显示用户名与密码原文。
 // 并行代理改动合入后 scheme://host:port 部分改用 config.RedactProxy(key)，#用户名哈希的后缀仍要保留：RedactProxy 不带用户名，
 // 同一网关、不同用户名（不同会话）的出口会显示成同一个标签，侧栏分不清，诊断第 4b 段按日志里的“出口=”标签配对与汇总也会串到一起
@@ -99,8 +107,12 @@ func EgressLabel(key string) string {
 		return egressUnknownLabel + "#" + egressHash(key, 4)
 	}
 	label := parsed.Scheme + "://" + parsed.Host
-	if username := parsed.User.Username(); username != "" {
-		label += "#" + egressHash(username, 4)
+	seed := parsed.User.Username()
+	if parsed.Fragment != "" {
+		seed += "#" + parsed.Fragment
+	}
+	if seed != "" {
+		label += "#" + egressHash(seed, 4)
 	}
 	return label
 }
@@ -163,7 +175,8 @@ type EgressStatus struct {
 	Lanes          [2]EgressLaneStatus
 }
 
-// egressRecord 为一个出口：键、编号、脱敏标签与两条通道。建立后不删除（出口数等于见过的不同代理数）
+// egressRecord 为一个出口：键、编号、脱敏标签与两条通道。两条通道都没有账户时记进 egressIdle，空闲后（没有账户、没有预占、
+// 窗口内没有发送、不限速）删除，再有账户挂上时重新建立（见 pruneEgressLocked）
 type egressRecord struct {
 	key, id, label string
 	lanes          [2]*egressRate
@@ -301,7 +314,8 @@ func (p *AccountPool) egressWindowLocked() int64 {
 	return int64(egressRateWindow)
 }
 
-// egressLaneLocked 返回出口键与通道对应的令牌桶，没有时建立出口记录（两条通道一起建，编号连续）；调用方持有 p.mu
+// egressLaneLocked 返回出口键与通道对应的令牌桶，没有时建立出口记录（两条通道一起建，编号连续；优先复用已删除出口留下的编号对）；
+// 调用方持有 p.mu
 func (p *AccountPool) egressLaneLocked(key string, lane EgressLane) *egressRate {
 	record := p.egresses[key]
 	if record == nil {
@@ -309,14 +323,93 @@ func (p *AccountPool) egressLaneLocked(key string, lane EgressLane) *egressRate 
 			p.egresses = make(map[string]*egressRecord)
 		}
 		record = &egressRecord{key: key, id: EgressID(key), label: EgressLabel(key)}
+		base := uint32(len(p.egressLanes))
+		reuse := len(p.egressFree) > 0
+		if reuse {
+			base = p.egressFree[len(p.egressFree)-1]
+			p.egressFree = p.egressFree[:len(p.egressFree)-1]
+		}
 		for index := range record.lanes {
-			rate := &egressRate{record: record, lane: EgressLane(index), id: uint32(len(p.egressLanes))}
+			rate := &egressRate{record: record, lane: EgressLane(index), id: base + uint32(index)}
 			record.lanes[index] = rate
-			p.egressLanes = append(p.egressLanes, rate)
+			if reuse {
+				p.egressLanes[rate.id] = rate
+			} else {
+				p.egressLanes = append(p.egressLanes, rate)
+			}
 		}
 		p.egresses[key] = record
+		// 刚建立的记录还没有账户：挂上账户时 pruneEgressLocked 把它移出，没挂上（例如只设了限速）时等空闲后删除
+		p.markEgressIdleLocked(record)
 	}
 	return record.lanes[lane]
+}
+
+// markEgressIdleLocked 把两条通道都没有账户的出口记录记进 egressIdle（删除空闲记录只检查它们）；调用方持有 p.mu
+func (p *AccountPool) markEgressIdleLocked(record *egressRecord) {
+	for _, rate := range record.lanes {
+		if rate.accounts > 0 {
+			return
+		}
+	}
+	if p.egressIdle == nil {
+		p.egressIdle = make(map[*egressRecord]struct{})
+	}
+	p.egressIdle[record] = struct{}{}
+}
+
+// egressKeyOfLocked 返回账户当前的出口键：EgressKey(EffectiveProxy)；账户没有自己的代理、IP 池绑定生效（URL 非空）时为绑定的
+// ProxyBinding.EgressKey，带 EgressTag（会话号写在密码里：EgressKey 去掉密码，不加区分时同一网关的全部会话会并成一个出口）时追加 "#" + EgressTag。
+// 挂出口（attachEgressLocked）、核对（verifyEgressLocked）与 EgressKeyOf 都按它算，静态每个端口、动态每个会话都是独立出口；调用方持有 p.mu
+func (p *AccountPool) egressKeyOfLocked(account *Account) string {
+	if strings.TrimSpace(account.Config.Proxy) == "" {
+		if binding := account.proxyBinding.Load(); binding != nil && binding.URL != "" {
+			return binding.EgressKey()
+		}
+	}
+	return EgressKey(account.EffectiveProxy(p.globalProxy))
+}
+
+// pruneEgressLocked 删除空闲的出口记录：两条通道都没有账户、没有预占、不限速、没有登记唤醒，窗口内也没有生成发送与非生成 RPC。
+// 只检查 egressIdle 里的记录（有账户的出口不会空闲）：又挂上账户的移出 egressIdle（账户再全部离开时重新记进来），
+// 还没空闲的留到下一次。编号对记进 egressFree 给新出口复用（候选索引里不会有指向它们的账户：没有账户挂在上面）。
+// 已发出、还没释放的租约仍指着旧通道：它的预占已抵掉，释放时不再动通道；noteOtherSend 记在账户当前的通道上，401 重放前的
+// recordEgressSentLocked 先重挂到账户当前的通道（见 rebindEgressLocked），都不会再写旧通道。
+// 返回留在 egressIdle 里、快照不列出的记录数（只剩登记的唤醒，列出条件见 egressStatusLocked）。调用方持有 p.mu，now 为 UnixNano
+func (p *AccountPool) pruneEgressLocked(now int64) (hidden int) {
+	window := p.egressWindowLocked()
+	for record := range p.egressIdle {
+		populated, live, armed := false, false, false
+		for _, rate := range record.lanes {
+			if rate.accounts > 0 {
+				populated = true
+				break
+			}
+			rate.sent.prune(now - window)
+			rate.other.prune(now - window)
+			live = live || rate.pending > 0 || rate.limit > 0 || rate.sent.live() > 0 || rate.other.live() > 0
+			if _, waiting := p.egressFull[rate]; waiting {
+				armed = true
+			}
+		}
+		switch {
+		case populated:
+			delete(p.egressIdle, record)
+			continue
+		case live:
+			continue
+		case armed:
+			hidden++
+			continue
+		}
+		delete(p.egressIdle, record)
+		delete(p.egresses, record.key)
+		for _, rate := range record.lanes {
+			p.egressLanes[rate.id] = nil
+		}
+		p.egressFree = append(p.egressFree, record.lanes[0].id)
+	}
+	return hidden
 }
 
 // egressLaneID 返回账户所在通道的编号，没有通道时为 egressNoLane
@@ -329,7 +422,8 @@ func egressLaneID(account *Account) uint32 {
 
 // attachEgressLocked 按账户当前的出口键（固定代理或全局代理）与 Ultra 成员关系把它挂到对应通道，返回是否换了通道：
 // 先从原通道摘下（账户数减一），同步候选索引里的通道编号。账户已不在号池中时只摘下。进行中租约的预占记在租约自己的通道上，
-// 释放时退还原通道（见 releaseEgressLocked），重挂不搬动预占。调用方持有 p.mu
+// 释放时退还原通道（见 releaseEgressLocked），重挂不搬动预占；租约在生成发送前（或 app 层在现场提升之后）经 RebindEgress
+// 跟到账户当前的通道，预占随之搬过去。调用方持有 p.mu
 func (p *AccountPool) attachEgressLocked(account *Account) bool {
 	if account == nil {
 		return false
@@ -340,7 +434,7 @@ func (p *AccountPool) attachEgressLocked(account *Account) bool {
 		if _, ultra := p.ultraAccounts[account.ID]; ultra {
 			lane = EgressLaneUltra
 		}
-		next = p.egressLaneLocked(EgressKey(account.EffectiveProxy(p.globalProxy)), lane)
+		next = p.egressLaneLocked(p.egressKeyOfLocked(account), lane)
 	}
 	if account.egress == next {
 		return false
@@ -372,11 +466,13 @@ func (p *AccountPool) detachEgressLocked(account *Account) {
 	account.egress = nil
 }
 
-// leaveEgressLaneLocked 把一个账户从通道上摘下：账户数减一，减到 0 时有账户的通道数减一。调用方持有 p.mu，通道属于这个账户池
+// leaveEgressLaneLocked 把一个账户从通道上摘下：账户数减一，减到 0 时有账户的通道数减一，两条通道都没有账户时记进 egressIdle。
+// 调用方持有 p.mu，通道属于这个账户池
 func (p *AccountPool) leaveEgressLaneLocked(rate *egressRate) {
 	rate.accounts--
 	if rate.accounts == 0 {
 		p.egressPopulated--
+		p.markEgressIdleLocked(rate.record)
 	}
 }
 
@@ -534,9 +630,10 @@ func (p *AccountPool) reserveEgressLocked(lease *AccountLease, now time.Time, pr
 	p.egressArmLocked(rate, nowNanos)
 }
 
-// recordEgressSentLocked 为租约记一次生成发送：抵掉预占（只抵一次），追加发送记录（带是否主用）。记在租约取得时的通道上；
-// 调用方持有 p.mu
+// recordEgressSentLocked 为租约记一次生成发送：先把租约重挂到账户当前的通道（rebindEgressLocked：冷启动的 Worker 另分了端口时，
+// 这次发送实际从新端口发出），再抵掉预占（只抵一次）、追加发送记录（带是否主用）。调用方持有 p.mu，账户仍在号池中
 func (p *AccountPool) recordEgressSentLocked(lease *AccountLease, now int64) {
+	p.rebindEgressLocked(lease, now)
 	rate := lease.egress
 	if rate == nil {
 		return
@@ -571,16 +668,77 @@ func (l *AccountLease) releaseEgressLocked(now int64) {
 }
 
 // noteOtherSend 为租约记一次经 Client.do 发出的非生成 RPC（ListModels、CountTokens 等）：只计数，供状态与诊断，
-// 不计入限速与 Sent1m（是否与生成共用出口额度未证实，计入会扭曲“限速是否起作用”的判断）
+// 不计入限速与 Sent1m（是否与生成共用出口额度未证实，计入会扭曲“限速是否起作用”的判断）。记在账户当前的通道上（Go 侧按账户当前的
+// 绑定出网；冷启动期间绑定已随新 Worker 的端口重挂），账户已移出号池或被替换时记在租约的通道上。不重挂租约：生成发送前才重挂
 func (l *AccountLease) noteOtherSend() {
-	if l == nil || l.pool == nil || l.egress == nil {
+	if l == nil || l.pool == nil || l.account == nil {
 		return
 	}
 	p := l.pool
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	rate := l.egress
+	if p.byID[l.account.ID] == l.account && l.account.egress != nil {
+		rate = l.account.egress
+	}
+	if rate == nil {
+		return
+	}
 	now := time.Now().UnixNano()
-	l.egress.other.add(now, false, now-p.egressWindowLocked())
+	rate.other.add(now, false, now-p.egressWindowLocked())
+}
+
+// RebindEgress 把租约改挂到账户当前所在的出口通道，返回是否换了通道（账户已移出号池或被替换、通道没变时不动）。
+// 租约的出口在取得时定下，而 IP 池静态 IP 下没有 Worker 的账户挂在默认出口上：现场提升、补覆盖，以及转写、Live、Veo、
+// 固定账户在持有租约时的冷启动，都是先取租约、再启动 Worker，Worker 另分端口，绑定随之重挂到新端口，这次请求实际从新端口发出。
+// 还没发出的预占一起搬过去：旧通道退还预占（消耗过令牌时照 releaseEgressLocked 退还），新通道照 reserveEgressLocked 预占
+// （限速时消耗一个令牌：发送实际占用的是新通道的额度）；已记下的发送留在原通道。生成发送前（recordEgressSentLocked）自动重挂一次；
+// app 层在现场提升成功后显式调用，之后读到的出口键（EgressKey）就是实际出口
+func (l *AccountLease) RebindEgress() bool {
+	if l == nil || l.pool == nil || l.account == nil {
+		return false
+	}
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.rebindEgressLocked(l, time.Now().UnixNano())
+}
+
+// rebindEgressLocked 为 RebindEgress 的实现：旧通道退还过令牌时 notifyLocked 唤醒等待方；调用方持有 p.mu，now 为 UnixNano
+func (p *AccountPool) rebindEgressLocked(lease *AccountLease, now int64) bool {
+	account := lease.account
+	if account == nil || p.byID[account.ID] != account {
+		return false
+	}
+	previous, next := lease.egress, account.egress
+	if next == nil || next == previous {
+		return false
+	}
+	if lease.egressPending {
+		refunded := false
+		if previous != nil {
+			if previous.pending > 0 {
+				previous.pending--
+			}
+			if lease.egressCharged && previous.limit > 0 {
+				previous.tat = max(previous.tat-previous.interval, now)
+				p.egressArmLocked(previous, now)
+				refunded = true
+			}
+		}
+		lease.egressCharged = false
+		next.pending++
+		if next.limit > 0 {
+			next.tat = max(next.tat, now) + next.interval
+			lease.egressCharged = true
+			p.egressArmLocked(next, now)
+		}
+		if refunded {
+			p.notifyLocked()
+		}
+	}
+	lease.egress = next
+	return true
 }
 
 // egressBusyError 返回只因出口令牌桶已满而排队超过上限的错误；next 为下一个令牌的时刻（0 为未知），建议重试时间限定在
@@ -613,7 +771,7 @@ func (p *AccountPool) SetGlobalProxy(proxy string) {
 	}
 }
 
-// EgressKeyOf 返回账户当前的出口键与分区通道；账户不存在时按全局代理与普通通道
+// EgressKeyOf 返回账户当前的出口键（egressKeyOfLocked，与挂载的通道一致）与分区通道；账户不存在时按全局代理与普通通道
 func (p *AccountPool) EgressKeyOf(accountID string) (key string, lane EgressLane) {
 	if p == nil {
 		return "", EgressLaneNormal
@@ -621,14 +779,22 @@ func (p *AccountPool) EgressKeyOf(accountID string) (key string, lane EgressLane
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	account := p.byID[strings.TrimSpace(accountID)]
-	if account == nil || account.egress == nil {
+	if account == nil {
 		return EgressKey(p.globalProxy), EgressLaneNormal
 	}
-	return account.egress.record.key, account.egress.lane
+	lane = EgressLaneNormal
+	if account.egress != nil {
+		lane = account.egress.lane
+	} else if _, ultra := p.ultraAccounts[account.ID]; ultra {
+		lane = EgressLaneUltra
+	}
+	return p.egressKeyOfLocked(account), lane
 }
 
-// EgressSnapshot 返回各出口的账户池侧计数（一次加锁，O(出口数)），按出口建立的顺序；没有账户、没有限速、没有预占、
-// 窗口内没有发送的出口（账户都换了代理后留下的记录）不列出
+// EgressSnapshot 返回各出口的账户池侧计数（一次加锁，O(出口数)），按出口编号的顺序；没有账户、没有限速、没有预占、
+// 窗口内没有发送的出口（账户都换了代理、IP 池换了端口或会话后留下的记录）不列出，并顺带删除（见 pruneEgressLocked）。
+// 出口数与账户数相当（动态 IP）时一次要构造上万条，判定器计时与状态接口改用 EgressSnapshotFor；这里只给全量诊断、
+// 管理动作按编号找出口与测试
 func (p *AccountPool) EgressSnapshot() []EgressStatus {
 	if p == nil {
 		return nil
@@ -637,33 +803,66 @@ func (p *AccountPool) EgressSnapshot() []EgressStatus {
 	defer p.mu.Unlock()
 	now := time.Now().UnixNano()
 	window := p.egressWindowLocked()
+	p.pruneEgressLocked(now)
 	var snapshot []EgressStatus
 	for at := 0; at+1 < len(p.egressLanes); at += 2 {
-		record := p.egressLanes[at].record
-		status := EgressStatus{Key: record.key, ID: record.id, Label: record.label}
-		live := false
-		for index, rate := range record.lanes {
-			rate.sent.prune(now - window)
-			rate.other.prune(now - window)
-			lane := EgressLaneStatus{
-				Lane: rate.lane, Accounts: rate.accounts, Limit: rate.limit, Sent1m: rate.sent.live(),
-				Sent30s: rate.sent.countAfter(now - window/2), PrimarySent1m: rate.sent.primary, OtherSent1m: rate.other.live(),
-				Pending: rate.pending,
-			}
-			if rate.limit > 0 {
-				lane.Burst = rate.burst
-				if ok, next := p.egressAdmitLocked(rate, true, now); !ok {
-					lane.NextAt = time.Unix(0, next).UTC()
-				}
-			}
-			status.Lanes[index] = lane
-			live = live || lane.Accounts > 0 || lane.Limit > 0 || lane.Pending > 0 || lane.Sent1m > 0 || lane.OtherSent1m > 0
+		if p.egressLanes[at] == nil {
+			continue
 		}
-		if live {
+		if status, live := p.egressStatusLocked(p.egressLanes[at].record, now, window); live {
 			snapshot = append(snapshot, status)
 		}
 	}
 	return snapshot
+}
+
+// EgressSnapshotFor 返回这些出口的账户池侧计数（一次加锁，O(键数 + 没有账户的出口记录数)，不扫全部出口），列出条件同 EgressSnapshot，
+// 没有记录或不列出的键不返回，顺序同 keys；total 为删去空闲记录后 EgressSnapshot 会列出的出口数。判定器计时只看有判定状态的出口，
+// 状态接口只列出非正常的出口、其余只计数：动态 IP 下没有 Worker 的账户各自挂在自己的会话上，出口数与账户数相当（上万），
+// 逐个构造会在账户池锁内花十几毫秒。判定器每 5 秒取一次，空闲记录最多留一个窗口加一次计时
+func (p *AccountPool) EgressSnapshotFor(keys []string) (statuses []EgressStatus, total int) {
+	if p == nil {
+		return nil, 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now().UnixNano()
+	window := p.egressWindowLocked()
+	hidden := p.pruneEgressLocked(now)
+	for _, key := range keys {
+		record := p.egresses[key]
+		if record == nil {
+			continue
+		}
+		if status, live := p.egressStatusLocked(record, now, window); live {
+			statuses = append(statuses, status)
+		}
+	}
+	return statuses, len(p.egresses) - hidden
+}
+
+// egressStatusLocked 构造一个出口的账户池侧计数（顺带修剪窗口外的发送记录），live 为快照列出它：有账户、限速、预占或窗口内的发送。
+// 调用方持有 p.mu，now 为 UnixNano
+func (p *AccountPool) egressStatusLocked(record *egressRecord, now int64, window int64) (status EgressStatus, live bool) {
+	status = EgressStatus{Key: record.key, ID: record.id, Label: record.label}
+	for index, rate := range record.lanes {
+		rate.sent.prune(now - window)
+		rate.other.prune(now - window)
+		lane := EgressLaneStatus{
+			Lane: rate.lane, Accounts: rate.accounts, Limit: rate.limit, Sent1m: rate.sent.live(),
+			Sent30s: rate.sent.countAfter(now - window/2), PrimarySent1m: rate.sent.primary, OtherSent1m: rate.other.live(),
+			Pending: rate.pending,
+		}
+		if rate.limit > 0 {
+			lane.Burst = rate.burst
+			if ok, next := p.egressAdmitLocked(rate, true, now); !ok {
+				lane.NextAt = time.Unix(0, next).UTC()
+			}
+		}
+		status.Lanes[index] = lane
+		live = live || lane.Accounts > 0 || lane.Limit > 0 || lane.Pending > 0 || lane.Sent1m > 0 || lane.OtherSent1m > 0
+	}
+	return status, live
 }
 
 // SetEgressRateLimit 设置出口通道每分钟生成请求的上限（负数按 0），0 关闭：
@@ -857,20 +1056,35 @@ func (p *AccountPool) RelaxRateLimitCooldowns(accountID string, until time.Time,
 	return relaxed, nil
 }
 
-// EgressKey 返回租约取得时账户的出口键，不加锁（通道建立后不变）；没有通道时为直连
+// EgressKey 返回租约所在出口的键：取得时账户的出口，冷启动的 Worker 另分端口后为实际出口（见 RebindEgress）；没有通道时为直连
 func (l *AccountLease) EgressKey() string {
-	if l == nil || l.egress == nil {
+	rate := l.egressLane()
+	if rate == nil {
 		return ""
 	}
-	return l.egress.record.key
+	return rate.record.key
 }
 
-// EgressLane 返回租约取得时账户所在的分区通道，不加锁
+// EgressLane 返回租约所在的分区通道（同 EgressKey，随 RebindEgress 改变）
 func (l *AccountLease) EgressLane() EgressLane {
-	if l == nil || l.egress == nil {
+	rate := l.egressLane()
+	if rate == nil {
 		return EgressLaneNormal
 	}
-	return l.egress.lane
+	return rate.lane
+}
+
+// egressLane 在账户池锁内读租约所在的通道（RebindEgress 在锁内改写它）；通道的键与分区建立后不变
+func (l *AccountLease) egressLane() *egressRate {
+	if l == nil {
+		return nil
+	}
+	if l.pool == nil {
+		return l.egress
+	}
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+	return l.egress
 }
 
 type egressWaitLimitContextKey struct{}
@@ -911,15 +1125,32 @@ func (p *AccountPool) verifyEgressLocked() error {
 		if _, ultra := p.ultraAccounts[account.ID]; ultra {
 			lane = EgressLaneUltra
 		}
-		record := p.egresses[EgressKey(account.EffectiveProxy(p.globalProxy))]
+		record := p.egresses[p.egressKeyOfLocked(account)]
 		if record == nil || account.egress != record.lanes[lane] {
-			return fmt.Errorf("账户 %s 的出口通道与代理 %q、通道 %d 不符", account.ID, account.EffectiveProxy(p.globalProxy), lane)
+			return fmt.Errorf("账户 %s 的出口通道与出口 %s、通道 %d 不符", account.ID, EgressLabel(p.egressKeyOfLocked(account)), lane)
 		}
 		counts[account.egress]++
 	}
-	throttled, populated := 0, 0
+	throttled, populated, live := 0, 0, 0
+	free := make(map[uint32]struct{}, len(p.egressFree))
+	for _, base := range p.egressFree {
+		if base%2 != 0 || int(base)+1 >= len(p.egressLanes) || p.egressLanes[base] != nil || p.egressLanes[base+1] != nil {
+			return fmt.Errorf("空闲出口编号 %d 无效或仍在使用", base)
+		}
+		if _, duplicate := free[base]; duplicate {
+			return fmt.Errorf("空闲出口编号 %d 重复", base)
+		}
+		free[base] = struct{}{}
+	}
 	for index, rate := range p.egressLanes {
-		if rate.id != uint32(index) || rate.record.lanes[rate.lane] != rate {
+		if rate == nil {
+			if _, ok := free[uint32(index)&^1]; !ok {
+				return fmt.Errorf("出口通道 %d 已删除，却不在空闲编号里", index)
+			}
+			continue
+		}
+		live++
+		if rate.id != uint32(index) || rate.record.lanes[rate.lane] != rate || p.egresses[rate.record.key] != rate.record {
 			return fmt.Errorf("出口通道 %d 的编号或所属出口不符", index)
 		}
 		if rate.accounts != counts[rate] {
@@ -936,6 +1167,19 @@ func (p *AccountPool) verifyEgressLocked() error {
 		}
 		if rate.accounts > 0 {
 			populated++
+		}
+	}
+	if live != 2*len(p.egresses) {
+		return fmt.Errorf("出口通道 %d 条，出口记录 %d 个", live, len(p.egresses))
+	}
+	for record := range p.egressIdle {
+		if p.egresses[record.key] != record {
+			return fmt.Errorf("待删出口 %s 已不在出口记录里", record.label)
+		}
+	}
+	for _, record := range p.egresses {
+		if _, marked := p.egressIdle[record]; !marked && record.lanes[0].accounts == 0 && record.lanes[1].accounts == 0 {
+			return fmt.Errorf("出口 %s 没有账户，却不在待删出口里", record.label)
 		}
 	}
 	if throttled != len(p.egressThrottled) {
@@ -955,4 +1199,15 @@ func (p *AccountPool) verifyEgressLocked() error {
 		}
 	}
 	return nil
+}
+
+// VerifyEgressForTest 核对出口通道的不变量（见 verifyEgressLocked），只给测试：app 层在随机申请、归还 IP 池出口、改配置与切换账户池后
+// 检查绑定变化与出口通道的重挂是否一致
+func (p *AccountPool) VerifyEgressForTest() error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.verifyEgressLocked()
 }

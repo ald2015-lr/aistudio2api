@@ -32,10 +32,19 @@ const (
 	proxyProbeErrorLimit = 200
 )
 
-// 测试结果里的提示码，前端按码显示文案
+// 测试结果里的提示码，前端按码显示文案：duplicate_ip 为抽测 IP 池时有两个出口的 IP 相同，pool_partial 为抽测的出口有失败的
 const (
 	proxyWarningRotatingIP        = "rotating_ip"
 	proxyWarningHTTPSPlainBrowser = "https_plain_browser"
+	proxyWarningDuplicateIP       = "duplicate_ip"
+	proxyWarningPoolPartial       = "pool_partial"
+)
+
+const (
+	// proxyPoolSampleDefault、proxyPoolSampleMax 为抽测 IP 池的出口数（默认 3，最多 10）；proxyPoolSampleConcurrency 为同时抽测的出口数
+	proxyPoolSampleDefault     = 3
+	proxyPoolSampleMax         = 10
+	proxyPoolSampleConcurrency = 5
 )
 
 // runtimeManager 实现 api 包按可选接口识别的“测试代理”（POST /api/proxy/test），不改 AdminService
@@ -52,9 +61,19 @@ func (manager *runtimeManager) TestProxy(ctx context.Context, input api.ProxyTes
 		}
 	}
 	defer manager.proxyTestMu.Unlock()
+	if input.Pool != nil {
+		return manager.testProxyPool(ctx, *input.Pool, input.Samples)
+	}
+	if accountID := strings.TrimSpace(input.AccountID); accountID != "" && strings.TrimSpace(input.Proxy) == "" {
+		return manager.testAccountProxy(ctx, accountID)
+	}
 	value := input.Proxy
 	if strings.TrimSpace(value) == "" {
-		// 留空时测试登录与 Worker 实际会用的默认代理：当前生成服务的配置快照，与 runtimeAdmin.effectiveProxy 一致
+		// 留空且 IP 池开启：新账户的登录与导入走 IP 池（见 runtimeAdmin.browserProxy），测此刻会分给登录的出口（不占用）
+		if preview, ok := manager.proxyPool.loginPreview(); ok {
+			return manager.testPoolLoginExit(ctx, preview)
+		}
+		// 否则测试登录与 Worker 实际会用的默认代理：当前生成服务的配置快照，与 runtimeAdmin.effectiveProxy 一致
 		value = manager.generation().config.Proxy
 	}
 	if strings.TrimSpace(value) == "" {
@@ -67,10 +86,45 @@ func (manager *runtimeManager) TestProxy(ctx context.Context, input api.ProxyTes
 		// 规范化的错误是固定文案，不含输入内容
 		return api.ProxyTestResult{}, invalidConfigError(err)
 	}
+	result, err := manager.testNormalizedProxy(ctx, normalized)
+	if err != nil {
+		return api.ProxyTestResult{}, err
+	}
+	manager.logProxyTest(result)
+	return result, nil
+}
+
+// testNormalizedProxy 经两条路径测试一个已规范化的代理，返回结果（Proxy 为 scheme://host:port）；不记日志
+func (manager *runtimeManager) testNormalizedProxy(ctx context.Context, normalized string) (api.ProxyTestResult, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, proxyProbeTimeout)
+	defer cancel()
+	browser, direct, relayed, err := manager.probeBothPaths(probeCtx, normalized)
+	if err != nil {
+		return api.ProxyTestResult{}, err
+	}
+	authenticated := config.ProxyHasCredentials(normalized)
+	result := api.ProxyTestResult{
+		Proxy: config.RedactProxy(normalized), Authenticated: authenticated, Relayed: relayed,
+		Browser: browser, Direct: direct,
+		SameIP: browser.IP != "" && browser.IP == direct.IP,
+	}
+	if browser.IP != "" && direct.IP != "" && browser.IP != direct.IP {
+		result.Warnings = append(result.Warnings, proxyWarningRotatingIP)
+	}
+	if !authenticated && proxyScheme(normalized) == "https" {
+		// 现状：Camoufox 用明文连接不带账号密码的 https:// 代理（prefs 只有 HTTP 代理）
+		result.Warnings = append(result.Warnings, proxyWarningHTTPSPlainBrowser)
+	}
+	return result, nil
+}
+
+// probeBothPaths 经 Camoufox 的路径（带账号密码时经本机中转）与 Go 后台请求的路径各访问一次出口 IP 服务（并发、各用一条新连接），
+// 错误已按上游的账号密码脱敏；relayed 表示浏览器路径经过了本机中转。ctx 应已带期限
+func (manager *runtimeManager) probeBothPaths(ctx context.Context, normalized string) (browser, direct api.ProxyTestProbe, relayed bool, err error) {
 	relay, err := manager.acquireTestRelay(normalized)
 	if err != nil {
 		// 这里的错误只有“代理地址无效”“本机代理中转已关闭”与监听 127.0.0.1:0 的失败，不含上游地址
-		return api.ProxyTestResult{}, &adminOperationError{
+		return browser, direct, false, &adminOperationError{
 			status: http.StatusInternalServerError, code: "proxy_relay_failed", message: err.Error(),
 		}
 	}
@@ -80,20 +134,17 @@ func (manager *runtimeManager) TestProxy(ctx context.Context, input api.ProxyTes
 	if probe == nil {
 		probe = probeProxyExit
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, proxyProbeTimeout)
-	defer cancel()
 	startedAt := time.Now()
-	var browser, direct api.ProxyTestProbe
 	var wait sync.WaitGroup
 	wait.Add(2)
 	// 两条路径并发、各用一条新连接：按连接轮换 IP 的代理会给出不同的出口 IP
 	go func() {
 		defer wait.Done()
-		browser = probe(probeCtx, relay.Address())
+		browser = probe(ctx, relay.Address())
 	}()
 	go func() {
 		defer wait.Done()
-		direct = probe(probeCtx, normalized)
+		direct = probe(ctx, normalized)
 	}()
 	wait.Wait()
 	if browser.Error != "" {
@@ -106,22 +157,7 @@ func (manager *runtimeManager) TestProxy(ctx context.Context, input api.ProxyTes
 	// 再按上游的账号密码兜底脱敏：说明文字来自外部错误时也不会带出账号密码
 	browser.Error = limitProbeError(proxyrelay.Scrub(browser.Error, normalized))
 	direct.Error = limitProbeError(proxyrelay.Scrub(direct.Error, normalized))
-
-	authenticated := config.ProxyHasCredentials(normalized)
-	result := api.ProxyTestResult{
-		Proxy: config.RedactProxy(normalized), Authenticated: authenticated, Relayed: relay.Relayed(),
-		Browser: browser, Direct: direct,
-		SameIP: browser.IP != "" && browser.IP == direct.IP,
-	}
-	if browser.IP != "" && direct.IP != "" && browser.IP != direct.IP {
-		result.Warnings = append(result.Warnings, proxyWarningRotatingIP)
-	}
-	if !authenticated && proxyScheme(normalized) == "https" {
-		// 现状：Camoufox 用明文连接不带账号密码的 https:// 代理（prefs 只有 HTTP 代理）
-		result.Warnings = append(result.Warnings, proxyWarningHTTPSPlainBrowser)
-	}
-	manager.logProxyTest(result)
-	return result, nil
+	return browser, direct, relay.Relayed(), nil
 }
 
 // acquireTestRelay 为“测试代理”申请本机中转租约，owner 固定为“代理测试”

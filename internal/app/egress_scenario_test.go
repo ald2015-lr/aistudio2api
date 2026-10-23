@@ -105,6 +105,10 @@ func (pool *stormPool) EgressSnapshot() []aistudio.EgressStatus {
 	return []aistudio.EgressStatus{status}
 }
 
+func (pool *stormPool) EgressSnapshotFor(keys []string) ([]aistudio.EgressStatus, int) {
+	return egressSnapshotFor(pool.EgressSnapshot(), keys)
+}
+
 func (pool *stormPool) SetEgressRateLimit(_ string, lane aistudio.EgressLane, limit int) {
 	pool.mu.Lock()
 	pool.limit[lane] = limit

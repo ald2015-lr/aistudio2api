@@ -263,6 +263,7 @@ func egressRefillLimit(warmConcurrency int) int {
 // egressPool 为判定器用到的账户池方法（包内测试换成假账户池）
 type egressPool interface {
 	EgressSnapshot() []aistudio.EgressStatus
+	EgressSnapshotFor(keys []string) ([]aistudio.EgressStatus, int)
 	SetEgressRateLimit(key string, lane aistudio.EgressLane, limit int)
 	RateLadderAccounts(key string, minLevel int) []string
 	RelaxRateLimitCooldowns(accountID string, until time.Time, minLevel int) (int, error)
@@ -897,17 +898,50 @@ func (guard *egressGuard) catalogPaused(key string) bool {
 // 由账户池在候选里按 ID 顺序（轮询时旋转）选号，不认调用方排好的“热 Worker 在前”的顺序。备用账号占绝大多数（约 1.2 万对 150 个驻留），
 // 几乎每次都选中要冷启动的备用账号，在受限出口上被冷启动闸门暂停后按号池繁忙 429 返回，换号也一样，驻留 Worker 空闲时这些端点
 // 整个限流期间都不可用；候选上万时等出口令牌的选号每次唤醒都在账户池锁内扫一遍全部候选。
-// 还有热 Worker 候选（含忙碌的）时去掉受限出口上的备用账户，只留热 Worker 与未受限出口上的备用账户；一个热候选都没有时照旧保留，
-// 交给冷启动闸门（低于常驻数的补位照常放行）。返回是否剔除了账户
+// 还有热 Worker 候选（含忙碌的）时去掉受限出口上的备用账户，只留热 Worker、未受限出口上的备用账户与由 IP 池分配出口的备用账户
+// （filterLimitedStandby）；一个热候选都没有时照旧保留，交给冷启动闸门（低于常驻数的补位照常放行）。返回是否剔除了账户
 func (service *trackedService) withoutLimitedStandby(groups *aistudio.AccountCandidateGroups) bool {
 	limited := service.egress.limitedKeys()
 	if len(limited) == 0 || len(groups.WarmReady)+len(groups.WarmAvailable)+len(groups.WarmBusy) == 0 {
 		return false
 	}
 	var removedReady, removedBusy []string
-	groups.StandbyReady, removedReady = service.pool.FilterAccountsByEgress(groups.StandbyReady, limited)
-	groups.StandbyBusy, removedBusy = service.pool.FilterAccountsByEgress(groups.StandbyBusy, limited)
+	groups.StandbyReady, removedReady = service.filterLimitedStandby(groups.StandbyReady, limited)
+	groups.StandbyBusy, removedBusy = service.filterLimitedStandby(groups.StandbyBusy, limited)
 	return len(removedReady)+len(removedBusy) > 0
+}
+
+// filterLimitedStandby 剔除受限出口上的备用账户（aistudio.FilterAccountsByEgress，返回约定相同：没有剔除时 kept 就是 ids），
+// 由 IP 池分配出口的账户（poolsAccount）留下：与冷启动闸门一致（见 egressColdStartGate），它们现在的默认出口可能是端口全被占用或冷却时
+// 退回的 PROXY、或与别人共用的端口，真正启动时池另分出口（静态独占一个端口、动态用账户自己的会话），不经受限出口。
+// 先由账户池剔除，再只对剔除的账户问一次 IP 池（锁不嵌套）
+func (service *trackedService) filterLimitedStandby(ids []string, limited map[string]struct{}) (kept []string, removed []string) {
+	kept, removed = service.pool.FilterAccountsByEgress(ids, limited)
+	if len(removed) == 0 {
+		return kept, removed
+	}
+	pooled := service.workers.ipPool().pooledAccounts(removed)
+	if len(pooled) == 0 {
+		return kept, removed
+	}
+	removed = slices.DeleteFunc(removed, func(accountID string) bool {
+		_, ok := pooled[accountID]
+		return ok
+	})
+	if len(removed) == 0 {
+		return ids, nil
+	}
+	blocked := make(map[string]struct{}, len(removed))
+	for _, accountID := range removed {
+		blocked[accountID] = struct{}{}
+	}
+	kept = make([]string, 0, len(ids)-len(removed))
+	for _, accountID := range ids {
+		if _, ok := blocked[accountID]; !ok {
+			kept = append(kept, accountID)
+		}
+	}
+	return kept, removed
 }
 
 // videoCandidates 出口限流期间给不固定账户的 Veo 选号限定候选（Veo 原本不限定候选，由账户池在全部账户里选号，见 withoutLimitedStandby）：
@@ -1114,7 +1148,8 @@ func (guard *egressGuard) tick(now time.Time) {
 		return
 	}
 	guard.ticks.Add(1)
-	snapshot := guard.poolSnapshot()
+	// 只取有判定状态的出口：动态 IP 下出口数与账户数相当，1 万个出口时全量快照在账户池锁内要十几毫秒
+	snapshot, _ := guard.poolSnapshotFor(guard.stateKeys())
 	var actions egressActions
 	guard.mu.Lock()
 	guard.lastSnap = snapshot
@@ -1129,16 +1164,82 @@ func (guard *egressGuard) tick(now time.Time) {
 	for key, state := range guard.states {
 		guard.tickStateLocked(state, snapshot[key], now, &actions)
 	}
+	guard.pruneIdleLocked(now)
 	guard.mu.Unlock()
 	guard.apply(actions)
 }
 
-// poolSnapshot 取账户池侧各出口的计数（一次加锁，O(出口数)），按键索引；没有账户池时为空
+// pruneIdleLocked 删除空闲的正常出口状态（见 idleLocked）。IP 池开启后出口随端口与会话增减，判定器为每个有过结果、排队或查询过的出口
+// 建一份状态（含 10 分钟的分桶历史），只增不删会随换端口、换会话一直增长；删除后再有结果时从零重建，与没见过的出口相同
+// （正常状态下历史只用于进入判定，这时已全部过期）。调用方持有 mu
+func (guard *egressGuard) pruneIdleLocked(now time.Time) {
+	for key, state := range guard.states {
+		if !guard.idleLocked(state, now) {
+			continue
+		}
+		delete(guard.states, key)
+		if guard.byID[state.id] == key {
+			delete(guard.byID, state.id)
+		}
+	}
+}
+
+// idleLocked 判断出口状态空闲：正常（不在判定、没有撤销）、10 分钟历史里没有任何结果与排队、没有排队中的请求与本地 429、
+// 没有在途或最近一分钟的冷启动、通道没有限速记录与待同步的限速，也不是测试写入的判定。调用方持有 mu，计时里已修剪过窗口外的记录
+func (guard *egressGuard) idleLocked(state *egressState, now time.Time) bool {
+	if state.mode != egressNormal || state.queued > 0 || len(state.bareAccounts) > 0 || len(state.localRejects) > 0 {
+		return false
+	}
+	if _, forced := guard.forced[state.key]; forced {
+		return false
+	}
+	for lane := range state.lanes {
+		if state.lanes[lane].active || state.lanes[lane].suspended {
+			return false
+		}
+		if _, dirty := guard.dirty[egressLaneRef{key: state.key, lane: lane}]; dirty {
+			return false
+		}
+		if cold := state.cold[lane]; cold != nil && (cold.starting > 0 || len(cold.started) > 0 || len(cold.coverage) > 0 ||
+			len(cold.coverageOpening) > 0 || len(cold.deferred) > 0) {
+			return false
+		}
+	}
+	total := state.history.sum(now, egressBuckets*egressBucket, -1)
+	return total.attempts() == 0 && total.fresh == 0 && total.waits == 0
+}
+
+// poolSnapshot 取账户池侧全部出口的计数（一次加锁，O(出口数)），按键索引；没有账户池时为空。只给全量的 status
 func (guard *egressGuard) poolSnapshot() map[string]aistudio.EgressStatus {
 	if guard.pool == nil {
 		return nil
 	}
-	statuses := guard.pool.EgressSnapshot()
+	return egressStatusIndex(guard.pool.EgressSnapshot())
+}
+
+// poolSnapshotFor 取账户池侧这些出口的计数（一次加锁，O(键数)，见 aistudio.EgressSnapshotFor），按键索引；total 为账户池现有的出口数。
+// 没有账户池时为空
+func (guard *egressGuard) poolSnapshotFor(keys []string) (map[string]aistudio.EgressStatus, int) {
+	if guard.pool == nil {
+		return nil, 0
+	}
+	statuses, total := guard.pool.EgressSnapshotFor(keys)
+	return egressStatusIndex(statuses), total
+}
+
+// stateKeys 返回判定器有状态的出口键（取账户池计数前在判定器锁内收集，判定器锁不与账户池锁嵌套）
+func (guard *egressGuard) stateKeys() []string {
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	keys := make([]string, 0, len(guard.states))
+	for key := range guard.states {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+// egressStatusIndex 把账户池计数按出口键索引
+func egressStatusIndex(statuses []aistudio.EgressStatus) map[string]aistudio.EgressStatus {
 	snapshot := make(map[string]aistudio.EgressStatus, len(statuses))
 	for _, status := range statuses {
 		snapshot[status.Key] = status
@@ -1440,8 +1541,9 @@ func (guard *egressGuard) startRelax(job egressRelaxJob) {
 	}()
 }
 
-// status 返回各出口的判定与限速（状态接口）：账户池侧的计数来自一次 EgressSnapshot（O(出口数)），其余来自判定器；
-// 受限优先、再按标签排序。只有直连一个出口且一直 normal 时也输出（侧栏只显示非 normal 的）
+// status 返回各出口（含正常的）的判定与限速：账户池侧的计数来自一次 EgressSnapshot（O(出口数)），其余来自判定器；
+// 受限优先、再按标签排序。只有直连一个出口且一直 normal 时也输出。状态接口在出口不多时用它（见 adminStatus），
+// 出口多时只列出非正常的出口与汇总
 func (guard *egressGuard) status() []api.AdminEgress {
 	if guard == nil {
 		return nil
@@ -1463,11 +1565,90 @@ func (guard *egressGuard) status() []api.AdminEgress {
 	if len(result) == 0 {
 		return nil
 	}
+	sortEgressStatus(result)
+	return result
+}
+
+// egressStatusFullLimit 为状态接口逐个列出全部出口（含正常的）的出口数上限：出口少时（IP 池关闭时多半只有直连或 PROXY 一个）
+// 全量快照很便宜，诊断第 0 段在判定门槛附近调参要看正常出口的已发、成功、裸 429、比例与冷号首发；超过时正常的只计入汇总
+const egressStatusFullLimit = 16
+
+// adminStatus 为状态接口的出口部分：出口总数不超过 egressStatusFullLimit 时与 status 相同、逐个列出（含正常的）；否则只列出判定成立
+// 或已撤销的出口（见 adminStatusAbnormal）。汇总都按全部出口计。侧栏只显示非正常的出口，不受影响
+func (guard *egressGuard) adminStatus() ([]api.AdminEgress, *api.AdminEgressSummary) {
+	if guard == nil {
+		return nil, nil
+	}
+	result, summary := guard.adminStatusAbnormal()
+	if summary.Total > egressStatusFullLimit {
+		return result, summary
+	}
+	full := guard.status()
+	summary = &api.AdminEgressSummary{Total: len(full)}
+	for _, entry := range full {
+		switch entry.Mode {
+		case egressLimited.String():
+			summary.Limited++
+		case egressRejected.String():
+			summary.Rejected++
+		default:
+			summary.Normal++
+		}
+	}
+	return full, summary
+}
+
+// adminStatusAbnormal 只列出判定成立或已撤销的出口（排序同 status），正常的只计入汇总。IP 池开启后出口很多
+// （静态每个端口一个，动态每个会话一个、与账户数相当），全部列出会让每 3 秒一次的状态轮询带上几百上万条记录；正常的出口也不投影计数
+// （各出口 10 分钟历史求和）。账户池计数只取判定器有状态的出口（EgressSnapshotFor），其余出口只按账户池给的总数计入正常：
+// 管理页事件流有请求时最快每 50ms 取一次状态，逐个构造全部出口会让账户池锁被长时间占着
+func (guard *egressGuard) adminStatusAbnormal() ([]api.AdminEgress, *api.AdminEgressSummary) {
+	snapshot, total := guard.poolSnapshotFor(guard.stateKeys())
+	now := guard.clock()
+	guard.mu.Lock()
+	defer guard.mu.Unlock()
+	// 账户池里取键时没有判定状态的出口都是正常的
+	others := max(total-len(snapshot), 0)
+	summary := &api.AdminEgressSummary{Total: others, Normal: others}
+	var result []api.AdminEgress
+	count := func(state *egressState, pool aistudio.EgressStatus) {
+		summary.Total++
+		mode := egressNormal
+		if state != nil {
+			mode = state.mode
+			if mode == egressRejected && !now.Before(state.rejectedUntil) {
+				mode = egressNormal
+			}
+		}
+		switch mode {
+		case egressLimited:
+			summary.Limited++
+		case egressRejected:
+			summary.Rejected++
+		default:
+			summary.Normal++
+			return
+		}
+		result = append(result, guard.egressStatusLocked(state, pool, now))
+	}
+	for key, pool := range snapshot {
+		count(guard.states[key], pool)
+	}
+	for key, state := range guard.states {
+		if _, listed := snapshot[key]; !listed {
+			count(state, aistudio.EgressStatus{Key: key, ID: state.id, Label: state.label})
+		}
+	}
+	sortEgressStatus(result)
+	return result, summary
+}
+
+// sortEgressStatus 按“受限优先、再按标签与编号”排序出口状态
+func sortEgressStatus(result []api.AdminEgress) {
 	rank := map[string]int{"limited": 0, "rejected": 1, "normal": 2}
 	slices.SortFunc(result, func(left, right api.AdminEgress) int {
 		return cmp.Or(cmp.Compare(rank[left.Mode], rank[right.Mode]), cmp.Compare(left.Label, right.Label), cmp.Compare(left.ID, right.ID))
 	})
-	return result
 }
 
 // egressStatusLocked 投影一个出口的状态；state 为 nil 时只有账户池侧计数；调用方持有 mu

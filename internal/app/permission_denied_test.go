@@ -536,7 +536,7 @@ func TestPermissionDeniedReconciledAtStartup(t *testing.T) {
 	cfg.WAABackend = config.WAABackendGo
 	lifecycle, stop := context.WithCancel(ctx)
 	useTempCatalogCacheDir(t)
-	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests)
+	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +910,7 @@ func TestPermissionDeniedRenewalKeepsListing(t *testing.T) {
 	cfg.WAABackend = config.WAABackendGo
 	lifecycle, stop := context.WithCancel(ctx)
 	useTempCatalogCacheDir(t)
-	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests)
+	_, admin, closeRuntime, err := newRuntime(ctx, lifecycle, cfg, requests, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

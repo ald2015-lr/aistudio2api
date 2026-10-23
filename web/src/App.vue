@@ -31,6 +31,7 @@ import RequestsPanel from '@/components/RequestsPanel.vue'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
+import { formatClock } from '@/proxyPool'
 import { readStorage, writeStorage } from '@/storage'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
@@ -180,6 +181,104 @@ const ultraWorkers = computed(() => {
   return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0 ? workers : null
 })
 
+// proxyPoolLine 为侧栏 Worker 区下方的 IP 池一行：静态显示端口占用、冷却与共用，动态显示会话数与换会话次数，
+// 有旧出口、仍走默认代理的 Worker、外部占用、已删账户占用时追加；悬停列出冷却端口与裸 429 最多的端口
+const PROXY_POOL_TOOLTIP_PORTS = 5
+
+// listPorts 列出提示里的端口，最多 PROXY_POOL_TOOLTIP_PORTS 个，超出时以省略号结尾
+function listPorts<T>(items: T[] | undefined, format: (item: T) => string): string {
+  const values = (items ?? []).slice(0, PROXY_POOL_TOOLTIP_PORTS).map(format)
+  if ((items?.length ?? 0) > PROXY_POOL_TOOLTIP_PORTS) values.push('…')
+  return values.join('、')
+}
+
+const proxyPoolLine = computed(() => {
+  const pool = status.value?.proxy_pool
+  if (pool === undefined) return null
+  const parts: string[] = []
+  const details: string[] = []
+  const shortage = pool.mode === 'static' && pool.total < pool.capacity
+  if (pool.mode === 'static') {
+    parts.push(
+      tf('app.proxyPoolStatic', {
+        inUse: pool.in_use,
+        total: pool.total,
+        cooling: pool.cooling,
+        shared: pool.shared,
+      }),
+    )
+    details.push(
+      tf('app.proxyPoolDetailStatic', {
+        endpoint: pool.endpoint ?? '',
+        start: pool.port_start ?? '',
+        end: pool.port_end ?? '',
+        leases: pool.leases,
+        capacity: pool.capacity,
+        hits: pool.affinity_hits,
+        misses: pool.affinity_misses,
+      }),
+    )
+    if (shortage) details.push(tf('app.proxyPoolDetailShortage', { capacity: pool.capacity }))
+  } else if (pool.mode === 'dynamic') {
+    parts.push(tf('app.proxyPoolDynamic', { inUse: pool.in_use, rotations: pool.rotations ?? 0 }))
+    details.push(
+      tf('app.proxyPoolDetailDynamic', {
+        endpoint: pool.endpoint ?? '',
+        leases: pool.leases,
+        rotations: pool.rotations ?? 0,
+      }),
+    )
+  } else {
+    parts.push(t('app.proxyPoolOff'))
+  }
+  if (pool.stale > 0) parts.push(tf('app.proxyPoolStale', { count: pool.stale }))
+  if (pool.unpooled > 0) parts.push(tf('app.proxyPoolUnpooled', { count: pool.unpooled }))
+  if (pool.external > 0) parts.push(tf('app.proxyPoolExternal', { count: pool.external }))
+  if (pool.orphaned > 0) parts.push(tf('app.proxyPoolOrphaned', { count: pool.orphaned }))
+  if ((pool.cooling_ports ?? []).length > 0) {
+    details.push(
+      tf('app.proxyPoolDetailCooling', {
+        ports: listPorts(pool.cooling_ports, (port) =>
+          tf('app.proxyPoolDetailCoolingPort', {
+            port: port.port,
+            until: formatClock(port.until, locale.value),
+            level: port.level,
+          }),
+        ),
+      }),
+    )
+  }
+  // 出口限流判定的汇总：IP 池开启后每个端口或会话是一个出口，正常的不在侧栏逐个列出（判定成立或撤销的在上方的出口行里）
+  const egressSummary = status.value?.egress_summary
+  if (pool.mode !== 'off' && egressSummary && egressSummary.total > 0) {
+    details.push(
+      tf('app.proxyPoolDetailEgress', {
+        total: egressSummary.total,
+        limited: egressSummary.limited,
+        rejected: egressSummary.rejected,
+      }),
+    )
+  }
+  if ((pool.hot_ports ?? []).length > 0) {
+    details.push(
+      tf('app.proxyPoolDetailHot', {
+        ports: listPorts(pool.hot_ports, (port) =>
+          tf('app.proxyPoolDetailHotPort', {
+            port: port.port,
+            count: port.rate_limited,
+            accounts: port.accounts,
+          }),
+        ),
+      }),
+    )
+  }
+  return {
+    text: parts.join(' · '),
+    detail: details.join('；'),
+    warn: shortage || pool.shared > 0 || pool.orphaned > 0,
+  }
+})
+
 // primarySupplyRows 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+。
 // 普通条目与 Ultra 条目（pool 为 ultra）分开：同一个模型可能同时在两份列表里，Ultra 条目显示在 Ultra Worker 行下面
 const primarySupplyRows = computed(() =>
@@ -198,6 +297,8 @@ const ultraPrimarySupply = computed(() =>
 )
 
 // limitedEgress 为侧栏的出口限流行：只显示判定成立（limited，黄色）或已撤销（rejected，灰色）的出口，正常的不显示
+// （服务端已只返回非正常的出口，这里仍过滤一次以兼容旧版服务端）。IP 池的端口占用、冷却与裸 429 最多的端口在 Worker 区下方的 IP 池行里，
+// 两处不重复：出口行按限流判定，IP 池行按端口与会话
 const limitedEgress = computed(() =>
   (status.value?.egress ?? []).filter((egress) => egress.mode !== 'normal'),
 )
@@ -791,6 +892,14 @@ onUnmounted(() => {
               }"
             ></div>
           </div>
+          <div
+            v-if="proxyPoolLine"
+            v-tooltip="proxyPoolLine.detail"
+            class="mt-1"
+            :class="proxyPoolLine.warn ? 'text-yellow-400' : 'text-sky-300'"
+          >
+            {{ proxyPoolLine.text }}
+          </div>
         </div>
         <div v-else class="mb-3"></div>
         <button
@@ -838,6 +947,7 @@ onUnmounted(() => {
           :worker-sets="workerSets"
           :worker-counts="status?.workers ?? null"
           :ultra-worker-counts="status?.ultra_workers ?? null"
+          :proxy-pool="status?.proxy_pool ?? null"
           :cooldowns="cooldowns"
           @refresh="loadAccountData"
           @notice="showNotice"
@@ -867,6 +977,7 @@ onUnmounted(() => {
           :error="errors.config"
           :running="serviceState === 'running' || serviceState === 'launching'"
           :models="models"
+          :proxy-pool-status="status?.proxy_pool ?? null"
           @saved="config = $event"
           @notice="showNotice"
         />

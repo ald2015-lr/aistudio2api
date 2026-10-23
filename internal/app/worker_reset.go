@@ -58,6 +58,8 @@ const (
 	workerResetRequest workerResetSource = iota
 	// workerResetSweep：失败 Worker 巡检（见 sweepFailedWorkers）
 	workerResetSweep
+	// workerResetProxyPort：IP 池端口冷却，让正用这个端口的 Worker 换端口重启（见 proxy_pool_egress.go）
+	workerResetProxyPort
 )
 
 // workerResetKey 标识一次后台关闭：账户与它的 Worker 版本
@@ -293,6 +295,10 @@ func (manager *accountWorkerManager) runWorkerReset(
 		}
 	case err != nil && source == workerResetSweep:
 		manager.requests.log(key.accountID, "WARN", "关闭失败的常驻 Worker 出错 | "+strings.TrimSpace(err.Error()))
+	case err != nil && source == workerResetProxyPort:
+		manager.requests.log(key.accountID, "WARN", "IP 池端口冷却后关闭 Worker 出错 | 错误="+strings.TrimSpace(err.Error()))
+	case reset && source == workerResetProxyPort:
+		manager.requests.log(key.accountID, "INFO", "IP 池端口冷却，已关闭用这个端口的 Worker，下次启动换端口")
 	case err != nil:
 		manager.requests.log(key.accountID, "WARN", "WAA Worker 后台恢复出错 | 错误="+strings.TrimSpace(err.Error()))
 	case reset && source == workerResetSweep:

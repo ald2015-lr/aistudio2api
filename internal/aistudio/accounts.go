@@ -550,6 +550,9 @@ type Account struct {
 	egress *egressRate
 	// rateStrikes 为连续裸限流 429 的冷却档位（见 rate_strike.go），只在内存中（重启后从第一档起，冷却本身照常落盘）；受账户池 mu 保护
 	rateStrikes map[rateStrikeKey]rateStrike
+	// proxyBinding 为 IP 池推送的出口（原子替换，见 proxy_binding.go）：装配前由 SetProxyBinding 直接写，进入账户池后只经
+	// AccountPool.SetProxyBindings / UpdateProxyBindings 在 p.mu 内写；nil 表示没有绑定
+	proxyBinding atomic.Pointer[ProxyBinding]
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -570,6 +573,10 @@ type AccountStatus struct {
 	Cooldowns map[string]CooldownState `json:"-"`
 	LastUsed  *time.Time               `json:"last_used,omitempty"`
 	Message   string                   `json:"message,omitempty"`
+	// ProxySlot 为账户没有自己的代理时 IP 池给它的端口号或会话号，ProxySlotActive 表示有浏览器正在用它；
+	// 状态缓存与账户列表事件不随 Worker 启停刷新，只作兜底，实时端口看状态接口的 proxy_pool.assignments
+	ProxySlot       string `json:"proxy_slot,omitempty"`
+	ProxySlotActive bool   `json:"proxy_slot_active,omitempty"`
 }
 
 // AccountSelection 描述账户调度所需的能力或粘性条件
@@ -696,13 +703,17 @@ type AccountPool struct {
 	rateWake         *time.Timer
 	rateWakeAt       int64
 	// globalProxy 为全局代理（PROXY），只用于计算出口键；egresses 为出口键 → 出口记录，egressLanes 按编号排列（索引里存编号，
-	// 编号 = 出口序号×2 + 通道），egressFull 为令牌桶对某类选择不准入、登记了下一个令牌时刻的通道（与 rateFull 共用窗口释放计时器），
+	// 编号 = 出口序号×2 + 通道；空闲出口的记录删除后两个位置为 nil，编号对的起点记进 egressFree，新出口优先复用），
+	// egressFull 为令牌桶对某类选择不准入、登记了下一个令牌时刻的通道（与 rateFull 共用窗口释放计时器），
 	// egressThrottled 为限速大于 0 的通道（为空时出口门控整体关闭；门控只为它们算准入，不按出口总数，见 egress_rate.go），
-	// egressPopulated 为有账户的通道数（全部通道满桶短路用）；egressWindow 只给测试改小统计窗口。
+	// egressPopulated 为有账户的通道数（全部通道满桶短路用）；egressIdle 为两条通道都没有账户的出口记录（删除空闲记录只看它们，
+	// 不扫全部出口，见 pruneEgressLocked）；egressWindow 只给测试改小统计窗口。
 	// leaseAttempts 为 leaseCandidateLocked 的调用次数，只供测试核对满桶短路。均受 mu 保护
 	globalProxy     string
 	egresses        map[string]*egressRecord
 	egressLanes     []*egressRate
+	egressFree      []uint32
+	egressIdle      map[*egressRecord]struct{}
 	egressFull      map[*egressRate]int64
 	egressThrottled []*egressRate
 	egressPopulated int
@@ -730,8 +741,9 @@ type AccountLease struct {
 	// （是否写“已满”日志见 ClaimRateWindowNote），只在创建时写入
 	ratePending bool
 	rateFilled  bool
-	// egress 为取得租约时账户所在的出口通道（只在创建时写入，EgressKey、EgressLane 不加锁读取）；egressPending 为本租约在该通道的预占
-	// 还没被发送或释放抵掉，egressPrimary 为预占时是主用模型的选号，egressCharged 为预占时消耗了令牌（释放时退还）。后三者受账户池 mu 保护
+	// egress 为租约所在的出口通道：取得时账户所在的通道，冷启动的 Worker 另分端口后经 RebindEgress 改为账户当前的通道；
+	// egressPending 为本租约在该通道的预占还没被发送或释放抵掉，egressPrimary 为预占时是主用模型的选号，egressCharged 为预占时
+	// 消耗了令牌（释放或重挂时退还）。四者都受账户池 mu 保护（EgressKey、EgressLane 在锁内读）
 	egress        *egressRate
 	egressPending bool
 	egressPrimary bool
@@ -1023,10 +1035,17 @@ func (c AccountConfig) Validate() error {
 	return nil
 }
 
-// EffectiveProxy 返回账户固定代理或全局代理
+// EffectiveProxy 返回账户实际使用的上游代理：账户固定代理 > IP 池出口（绑定 URL 为空时沿用全局代理）> 全局代理。
+// Go 侧所有请求（RPC、WebChannel、上传、续签、验证、公共头）都只经这里取代理
 func (a *Account) EffectiveProxy(globalProxy string) string {
-	if a != nil && strings.TrimSpace(a.Config.Proxy) != "" {
-		return strings.TrimSpace(a.Config.Proxy)
+	if a == nil {
+		return strings.TrimSpace(globalProxy)
+	}
+	if proxy := strings.TrimSpace(a.Config.Proxy); proxy != "" {
+		return proxy
+	}
+	if binding := a.proxyBinding.Load(); binding != nil && binding.URL != "" {
+		return binding.URL
 	}
 	return strings.TrimSpace(globalProxy)
 }
@@ -3419,6 +3438,11 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 	}
 	if !account.LastUsed.IsZero() {
 		status.LastUsed = timePointer(account.LastUsed)
+	}
+	if strings.TrimSpace(account.Config.Proxy) == "" {
+		if binding := account.proxyBinding.Load(); binding != nil {
+			status.ProxySlot, status.ProxySlotActive = binding.Slot, binding.Active && binding.Slot != ""
+		}
 	}
 	return status
 }

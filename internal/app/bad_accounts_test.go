@@ -72,6 +72,59 @@ func TestBadAccountMemoryStreakAndPersistence(t *testing.T) {
 	}
 }
 
+// TestBadAccountPardon IP 池端口按规则 A 冷却时撤回坏号记忆（pardon）：清零连续次数（之后再有一次裸限流不标坏号）；
+// 窗口内标上的坏号清除并写盘，近期成功记录保留；窗口之前标上的坏号保留；没有记录的账号不报撤回
+func TestBadAccountPardon(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	path := filepath.Join(t.TempDir(), badAccountFileName)
+	now := time.Unix(2_000_000_000, 0)
+	memory := openBadAccountMemory(path, requests)
+	memory.now = func() time.Time { return now }
+	const window = 10 * time.Minute
+	memory.observe("old@example.com", "old", egressBare)
+	memory.observe("old@example.com", "old", egressBare)
+	now = now.Add(window + time.Minute)
+	memory.observe("fresh@example.com", "fresh", egressSuccess)
+	memory.observe("fresh@example.com", "fresh", egressBare)
+	memory.observe("fresh@example.com", "fresh", egressBare)
+	memory.observe("streak@example.com", "streak", egressBare)
+	if !memory.bad("old@example.com") || !memory.bad("fresh@example.com") || memory.bad("streak@example.com") {
+		t.Fatal("前提：old、fresh 已标坏号，streak 只有一次裸限流")
+	}
+	if memory.pardon("old@example.com", window) || !memory.bad("old@example.com") {
+		t.Fatal("窗口之前标上的坏号不应撤回")
+	}
+	if !memory.pardon("fresh@example.com", window) || memory.bad("fresh@example.com") {
+		t.Fatal("窗口内标上的坏号应撤回")
+	}
+	if memory.pardon("streak@example.com", window) || memory.pardon("none@example.com", window) || memory.pardon("", window) {
+		t.Fatal("不是坏号的账号不报撤回")
+	}
+	memory.observe("streak@example.com", "streak", egressBare)
+	memory.observe("fresh@example.com", "fresh", egressBare)
+	if memory.bad("streak@example.com") || memory.bad("fresh@example.com") {
+		t.Fatal("撤回后连续次数应清零：再有一次裸限流不标坏号")
+	}
+	memory.observe("old@example.com", "old", egressBare)
+	if ordered := memory.order([]string{"neutral@example.com", "fresh@example.com"}); ordered[0] != "fresh@example.com" {
+		t.Fatalf("撤回不动近期成功记录：%v", ordered)
+	}
+	if err := memory.close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := openBadAccountMemory(path, requests)
+	reopened.now = memory.now
+	if reopened.bad("fresh@example.com") || !reopened.bad("old@example.com") {
+		t.Fatal("撤回应写盘：重启后 fresh 不是坏号、old 仍是")
+	}
+	var nilMemory *badAccountMemory
+	if nilMemory.pardon("a@example.com", window) {
+		t.Fatal("nil 记忆不报撤回")
+	}
+}
+
 // TestBadAccountsSavedOnStop 停止服务时立即写出坏号记忆（不等 30 秒的合并写盘）：重建运行时先停旧服务、再建新一代（新一代此时读文件），
 // 最后才关闭旧一代，原先新一代读到的是旧数据
 func TestBadAccountsSavedOnStop(t *testing.T) {

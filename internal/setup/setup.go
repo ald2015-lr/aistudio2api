@@ -41,7 +41,12 @@ type setupOptions struct {
 	chromeRoot   string
 	profiles     setupStrings
 	emails       setupStrings
-	proxy        string
+	// proxy 为登录、导入与验证实际使用的出口：--proxy 的值，没传时为 .env 的 PROXY（IP 池开启时 Run 改用 IP 池出口）
+	proxy string
+	// accountProxy 为写进 account.json 的账户固定代理：只在显式传了 --proxy 时取值；没传时为空，账户跟随默认代理与 IP 池
+	// （原先把 .env 的 PROXY 写进账户，开启 IP 池后这些账户会悄悄绕过它）
+	accountProxy string
+	proxySet     bool
 	locale       string
 	localeSet    bool
 	timezone     string
@@ -61,6 +66,17 @@ func Run(ctx context.Context, cfg config.Config, args []string) error {
 	store := aistudio.NewAccountStore(cfg.AuthStates)
 	if options.storageState != "" {
 		return importStorageState(store, options)
+	}
+	if !options.proxySet && cfg.ProxyPool.Enabled() {
+		// 没传 --proxy 且 IP 池开启：登录与导入也用 IP 池出口（静态 IP 经端口锁与主进程互斥），PROXY 为空时不会从服务器真实 IP 登录
+		proxy, release, notice := setupPoolProxy(cfg.ProxyPool)
+		defer release()
+		if proxy != "" {
+			options.proxy = proxy
+		}
+		if notice != "" {
+			fmt.Fprintln(os.Stderr, notice)
+		}
 	}
 	if options.login {
 		driver, err := defaultSetupLoginDriver(ctx, cfg)
@@ -272,13 +288,12 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 		proxy:  strings.TrimSpace(cfg.Proxy),
 		locale: strings.TrimSpace(*locale), timezone: strings.TrimSpace(*timezone),
 	}
-	proxySet := false
 	flags.Visit(func(value *flag.Flag) {
 		switch value.Name {
 		case "locale":
 			options.localeSet = true
 		case "proxy":
-			proxySet = true
+			options.proxySet = true
 		}
 	})
 	chromeSelection := options.chromeRoot != "" || len(options.profiles) != 0 || len(options.emails) != 0
@@ -291,20 +306,21 @@ func parseSetupFlags(args []string, cfg config.Config) (setupOptions, error) {
 	if options.locale == "" || options.timezone == "" {
 		return setupOptions{}, fmt.Errorf("locale 和 timezone 不能为空")
 	}
-	if proxySet {
-		// 显式传了 --proxy：规范化成上游 URL（--proxy "" 表示直连），错误文案不含输入内容
+	if options.proxySet {
+		// 显式传了 --proxy：规范化成上游 URL（--proxy "" 表示直连），错误文案不含输入内容；同时写进账户（账户固定代理）
 		normalized, err := config.NormalizeProxy(*proxy)
 		if err != nil {
 			return setupOptions{}, err
 		}
 		options.proxy = normalized
+		options.accountProxy = normalized
 	}
 	return options, nil
 }
 
 func setupAccountConfig(label string, options setupOptions) aistudio.AccountConfig {
 	accountConfig := aistudio.DefaultAccountConfig(label)
-	accountConfig.Proxy = options.proxy
+	accountConfig.Proxy = options.accountProxy
 	accountConfig.Locale = options.locale
 	accountConfig.Timezone = options.timezone
 	return accountConfig

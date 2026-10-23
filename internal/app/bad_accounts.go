@@ -160,6 +160,33 @@ func (memory *badAccountMemory) observe(accountID string, label string, outcome 
 	}
 }
 
+// pardon 撤回账号因 IP 被拒记下的裸限流（IP 池端口按规则 A 冷却时调用，见 relaxProxyPort：端口换手后别的账号在同一端口上也被拒，
+// 被拒的是 IP 不是账号）：清零连续次数；坏号标记是最近 within 内（端口规则 A 的窗口）标上的就清除，更早标上的（证据来自这个窗口之前，
+// 不一定是这个 IP）保留。不记成功（预热与替补的“近期成功”优先不受影响），清除时照常排队写盘。返回是否清除了坏号标记
+func (memory *badAccountMemory) pardon(accountID string, within time.Duration) bool {
+	if memory == nil || accountID == "" {
+		return false
+	}
+	now := memory.clock()
+	memory.mu.Lock()
+	defer memory.mu.Unlock()
+	delete(memory.streaks, accountID)
+	entry, ok := memory.entries[accountID]
+	// 标上的时刻为 Until - badAccountHold（按秒取整，多留 1 秒）
+	if !ok || entry.Until <= now.Unix() || entry.Until-int64(badAccountHold/time.Second) < now.Add(-within).Unix()-1 {
+		return false
+	}
+	entry.Until = 0
+	if entry.Success == 0 {
+		delete(memory.entries, accountID)
+	} else {
+		memory.entries[accountID] = entry
+	}
+	memory.dirty = true
+	memory.scheduleSaveLocked()
+	return true
+}
+
 // bad 返回账号现在是否为坏号
 func (memory *badAccountMemory) bad(accountID string) bool {
 	if memory == nil {
