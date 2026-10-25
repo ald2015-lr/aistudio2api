@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AIStudio2API 一键诊断“Worker 起不来”：系统资源 → 状态接口（Worker、预热、IP 池、出口）→ 绕过程序直连测 IP 池端口 →
 # 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志 → 失败时的页面状态（启动失败与 Worker 重建日志末尾的“页面=…”快照）
-# → AI Studio 首次使用页（自动完成与未能完成的次数、原因与结构摘要样本）
+# → AI Studio 首次使用页（自动完成、跳过与未能完成的次数，失败停在哪一步、原因、“已做”与结构摘要样本）
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -163,12 +163,16 @@ page_total, page_heads, page_groups, page_samples, page_kinds = collections.Coun
 # 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
 page_dist = {}
 snapshot_failures = collections.Counter()
-# AI Studio 首次使用页（见 docs/logging.md）：Worker 启动时自动完成写“完成 AI Studio 首次使用页 | 勾选=N（标签；[补]标签） | 按钮=… | 耗时=…”
-# （括号里为各次勾选的标签，已打码截短，按放宽规则补勾的带“[补]”），账户验证、登录与添加时写“账户验证 | 完成 AI Studio 首次使用页 | …”
-# （账户登录、账户添加同理）；没能完成的错误以“AI Studio 首次使用页未能完成: <原因>”开头（启动失败、账户验证失败），末尾在页面快照之后
-# 另接“ | 结构={…}”（勾选框与按钮的结构摘要，已打码）；订阅网络事件之后才到首次使用页时原错误不变，末尾补“；已完成首次使用页”
-# （同一次就地完成另写了上面那行 INFO）、“；首次使用页已自行离开”（识别之后页面自己离开、什么都没点，不写 INFO）或“；首次使用页未能完成: <原因>”。
-# 同一次失败还会出现在“账号切换 | …\n原因: 获取账户 WAA preparer: …”（请求触发的冷启动）与“新账户自动处理出错…”里，只按 ONBOARD_FAIL_HEADS 计
+# AI Studio 首次使用页（见 docs/logging.md）：Worker 启动时自动完成写“完成 AI Studio 首次使用页 | 勾选=N（标签；[补]标签） | 按钮=… |
+# 已做=勾选:…；点击:…；跳过:… | 耗时=…”（括号里为各次勾选的标签，已打码截短，按放宽规则补勾的带“[补]”；已做为按顺序做过的每一步，
+# 跳过只在不涉及同意的步骤里点，如用途调查），账户验证、登录与添加时写“账户验证 | 完成 AI Studio 首次使用页 | …”（账户登录、账户添加同理）；
+# 没能完成的错误以“AI Studio 首次使用页未能完成: <原因>”开头（启动失败、账户验证失败），原因之后接“ | 已做=…”（这次做过的每一步，
+# 什么都没做时为“-”；次数用完的失败没有），再接页面快照与“ | 结构={…}”（勾选框与按钮的结构摘要，已打码；scope 为查找范围，cur 为当前一步
+# 所在的 ms- 组件（当前一步的勾选框、继续与跳过按钮、标题所在的组件），即停在多步向导的哪一步；parts 为范围里可见的 ms- 组件，可能含同时
+# 渲染的其他各步与常驻的卡片预览，旧版日志没有 cur 时退回按 parts 看）；订阅网络事件之后才到首次使用页时原错误不变，末尾补“；已完成首次使用页”
+# （同一次就地完成另写了上面那行 INFO）、“；首次使用页已自行离开”（识别之后页面自己离开、什么都没点，不写 INFO）或
+# “；首次使用页未能完成: <原因> | 已做=…”。同一次失败还会出现在“账号切换 | …\n原因: 获取账户 WAA preparer: …”（请求触发的冷启动）
+# 与“新账户自动处理出错…”里，只按 ONBOARD_FAIL_HEADS 计
 ONBOARD_DONE_RE = re.compile(r"^(?:(账户验证|账户登录|账户添加) \| )?完成 AI Studio 首次使用页(?: \||$)")
 ONBOARD_CHECKED_RE = re.compile(r"^(\d+)(?:（(.*)）)?$")
 ONBOARD_RELAXED = "[补]"
@@ -178,13 +182,45 @@ ONBOARD_INPLACE_DONE = "；已完成首次使用页"
 ONBOARD_INPLACE_LEFT = "；首次使用页已自行离开"
 ONBOARD_INPLACE_FAIL_RE = re.compile(r"；首次使用页未能完成(?:: ([^|\n]*))?")
 STRUCT_RE = re.compile(r" \| 结构=(\{.*?)(?=；本机代理中转：| \| |\n|$)")
+ONBOARD_PROGRESS_RE = re.compile(r" \| 已做=(.*?)(?=；本机代理中转：| \| |\n|$)")
+ONBOARD_CHECK_MARK, ONBOARD_CLICK_MARK, ONBOARD_SKIP_MARK = "勾选:", "点击:", "跳过:"
+STRUCT_SCOPE_RE = re.compile(r'"scope":"([^"]*)"')
+STRUCT_PARTS_RE = re.compile(r'"parts":\[([^\]]*)\]')
+STRUCT_CUR_RE = re.compile(r'"cur":\[([^\]]*)\]')
 onboard_done, onboard_checked, onboard_buttons, onboard_secs = collections.Counter(), collections.Counter(), collections.Counter(), []
 onboard_labels, onboard_relaxed_runs, onboard_relaxed_boxes = collections.Counter(), 0, 0
 onboard_fail_heads, onboard_fail_reasons, onboard_structures = collections.Counter(), collections.Counter(), []
 onboard_inplace_done, onboard_inplace_left = 0, 0
+onboard_skip_runs, onboard_skip_total, onboard_progress = 0, 0, collections.Counter()
+onboard_fail_steps, onboard_fail_parts, onboard_fail_done, onboard_fail_samples = collections.Counter(), collections.Counter(), collections.Counter(), []
 def strip_page(text):
-    """去掉页面快照与首次使用页的结构摘要（见 STRUCT_RE，汇总在最后一段），之后的本机代理中转说明与日志字段照常保留"""
-    return STRUCT_RE.sub("", PAGE_RE.sub("", text or ""))
+    """去掉页面快照、首次使用页的进度记录与结构摘要（见 ONBOARD_PROGRESS_RE、STRUCT_RE，汇总在最后一段），之后的本机代理中转说明与日志字段照常保留"""
+    return STRUCT_RE.sub("", ONBOARD_PROGRESS_RE.sub("", PAGE_RE.sub("", text or "")))
+def progress_items(progress):
+    """“已做”拆成各步（“-”为什么都没做，返回空列表）"""
+    return [item for item in (progress or "").split("；") if item and item != "-"]
+def onboard_step(structure):
+    """失败停在多步向导的哪一步：结构摘要的查找范围与当前一步所在的 ms- 组件（cur），写成“ms-onboarding: ms-intent-selection+…”；
+    旧版日志没有 cur 时退回按范围里可见的 ms- 组件（parts，可能含同时渲染的其他各步）写，并标上“（parts）”。返回（步骤, cur 组件列表）"""
+    if not structure:
+        return "（没有结构摘要）", []
+    scope = STRUCT_SCOPE_RE.search(structure)
+    name = scope.group(1) if scope else "?"
+    cur_match = STRUCT_CUR_RE.search(structure)
+    if cur_match:
+        cur = re.findall(r'"([^"]*)"', cur_match.group(1))
+        return (name + ": " + "+".join(cur) if cur else name), cur
+    parts_match = STRUCT_PARTS_RE.search(structure)
+    parts = re.findall(r'"([^"]*)"', parts_match.group(1)) if parts_match else []
+    return (name + ": " + "+".join(parts) + "（parts）" if parts else name), []
+def onboard_other_parts(structure, cur):
+    """范围里可见、不在 cur 里的 ms- 组件（parts，按原顺序），写进“已做”样本：cur 只剩共用页脚（ms-horizontal-stepper）时据此看停在哪一步；
+    没有 cur（旧版日志，步骤已按 parts 写）时为空"""
+    if not cur:
+        return []
+    parts_match = STRUCT_PARTS_RE.search(structure or "")
+    parts = re.findall(r'"([^"]*)"', parts_match.group(1)) if parts_match else []
+    return [part for part in parts if part not in cur]
 def start_error(msg):
     """启动失败的原错误（去掉页面快照、拼回快照之后的本机代理中转说明）"""
     return fields(strip_page(msg)).get("错误", "")
@@ -375,6 +411,13 @@ for p in paths:
                     onboard_relaxed_runs += 1
                     onboard_relaxed_boxes += relaxed
                 onboard_buttons[f.get("按钮", "?")] += 1
+                done_items = progress_items(f.get("已做"))
+                skips = sum(1 for item in done_items if item.startswith(ONBOARD_SKIP_MARK))
+                if skips:
+                    onboard_skip_runs += 1
+                    onboard_skip_total += skips
+                if f.get("已做"):
+                    onboard_progress[f["已做"][:200]] += 1
                 seconds = duration(f.get("耗时"))
                 if seconds is not None:
                     onboard_secs.append(seconds)
@@ -390,6 +433,7 @@ for p in paths:
                     reason = ((failed or inplace_failed).group(1) or "").split("；本机代理中转：", 1)[0].strip() or "-"
                     onboard_fail_reasons[DIGITS.sub("#", reason)[:120]] += 1
                     m = STRUCT_RE.search(msg)
+                    sample = ""
                     if m:
                         try:
                             _, end = json.JSONDecoder().raw_decode(m.group(1))
@@ -398,6 +442,28 @@ for p in paths:
                             sample = m.group(1)
                         if sample not in onboard_structures and len(onboard_structures) < 3:
                             onboard_structures.append(sample[:1000])
+                    step, parts = onboard_step(sample)
+                    onboard_fail_steps[step] += 1
+                    for part in parts:
+                        onboard_fail_parts[part] += 1
+                    other_parts = onboard_other_parts(sample, parts)
+                    pm = ONBOARD_PROGRESS_RE.search(msg)
+                    done_items = progress_items(pm.group(1)) if pm else []
+                    if not pm:
+                        onboard_fail_done["没有“已做”（程序版本早于进度记录，或次数用完、没有开始完成）"] += 1
+                    elif not done_items:
+                        onboard_fail_done["这次什么都没做（-）"] += 1
+                    else:
+                        onboard_fail_done["这次做过"] += 1
+                        for mark, text in ((ONBOARD_CHECK_MARK, "其中勾选过"), (ONBOARD_CLICK_MARK, "点击过继续"), (ONBOARD_SKIP_MARK, "跳过过")):
+                            if any(item.startswith(mark) for item in done_items):
+                                onboard_fail_done[text] += 1
+                    if pm and len(onboard_fail_samples) < 5:
+                        line = DIGITS.sub("#", reason)[:80] + " | 已做=" + pm.group(1).strip()[:300] + " | 停在 " + step
+                        if other_parts:
+                            line += "（另有 " + "、".join(other_parts[:4]) + "）"
+                        if line not in onboard_fail_samples:
+                            onboard_fail_samples.append(line)
                 elif ONBOARD_INPLACE_DONE in clean and head == "WAA Worker 启动失败":
                     onboard_inplace_done += 1
                 elif ONBOARD_INPLACE_LEFT in clean and head == "WAA Worker 启动失败":
@@ -491,6 +557,11 @@ else:
     if onboard_inplace_left:
         print(f"订阅网络事件之后识别出首次使用页、但页面随即自行离开（什么都没点，不计入自动完成）的 {onboard_inplace_left} 次")
     print(f"按放宽规则补勾（[补]：没有必选标记、标签含服务条款或年龄关键词）的 {onboard_relaxed_runs} 次，共 {onboard_relaxed_boxes} 项")
+    print(f"点过跳过（只在不涉及同意的步骤里点，如用途调查；不替账号选用途）的 {onboard_skip_runs} 次，共跳过 {onboard_skip_total} 步")
+    if onboard_progress:
+        print("自动完成时按顺序做过的步骤（已做，前 5 种；勾选:勾选框标签，点击:继续按钮，跳过:跳过按钮）：")
+        for item, n in onboard_progress.most_common(5):
+            print(f"  {n} 次：{item}")
     if onboard_labels:
         print("勾选过的标签（已打码截短，前 8 种；[补] 为放宽规则补勾的）：")
         for item, n in onboard_labels.most_common(8):
@@ -501,12 +572,30 @@ else:
         print("未能完成的原因（数字已替换为 #）：")
         for reason, count in onboard_fail_reasons.most_common(6):
             print(f"  {count} 次：{reason}")
+    if onboard_fail_steps:
+        print("未能完成时停在哪一步（结构摘要的查找范围: 当前一步所在的 ms- 组件 cur，即当前一步的勾选框、继续与跳过按钮、标题所在的组件，"
+              "如 ms-tos-disclaimer 为服务条款、ms-intent-selection 为用途调查；旧版日志没有 cur 时按 parts 写并标“（parts）”，"
+              "parts 可能含同时渲染的其他各步与常驻的卡片预览，以其中是否有 ms-tos-disclaimer、ms-intent-selection 为准）：")
+        for step, count in onboard_fail_steps.most_common(6):
+            print(f"  {count} 次：{step}")
+        if onboard_fail_parts:
+            print("  按当前一步的组件（cur）：" + " ".join(f"{part}×{n}" for part, n in onboard_fail_parts.most_common(8)))
+    if onboard_fail_done:
+        order = ["这次做过", "其中勾选过", "点击过继续", "跳过过", "这次什么都没做（-）", "没有“已做”（程序版本早于进度记录，或次数用完、没有开始完成）"]
+        print("未能完成前这次做过什么（已做；勾选过多半是服务条款那一步完成过）：" + "；".join(f"{key} {onboard_fail_done[key]}" for key in order if onboard_fail_done[key]))
+    if onboard_fail_samples:
+        print("未能完成时的“已做”样本（前 5 条，去重；原因 | 已做 | 停在哪一步，括号里为范围里另外可见、不在 cur 里的 ms- 组件）：")
+        for line in onboard_fail_samples:
+            print("  - " + line)
     if onboard_structures:
         print("未能完成时的结构摘要（前 3 条，去重；scope 为查找范围，bodyBoxes 为整页可见勾选框数，allBoxes 为整页全部勾选框数（含不可见的）；"
+              "cur 为当前一步所在的 ms- 组件（停在多步向导的哪一步）；parts 为范围里可见的 ms- 组件（可能含同时渲染的其他各步）；"
               "boxes 为勾选框：req 必选、on 已勾、dis 不可勾、by 必选依据、t 含服务条款或年龄关键词、o 含邮件通知类关键词、hid 勾选框自己不可见、"
-              "kind 类别、label 标签开头 40 字与结尾 15 字；buttons 为按钮：text 文字前 40 字、on 启用、skip 为不点的原因"
-              "（link 链接、area 勾选框标签开关与页头横幅里的、cookie Cookie 横幅、popup 菜单、neg 关闭返回拒绝与切换账号类、opt 订阅邮件类、"
-              "icon 只有图标认不出的）；links 为范围内的链接；controls 为范围内其他表单控件的数量与类别；outside 为范围外的按钮）：")
+              "intent 用途调查选项（ms-intent-selection 里、标签取自按钮自己的 button[role=checkbox]；其余勾选框标签认不出也按涉及同意处理，不点跳过）、"
+              "kind 类别、label 标签开头 40 字与结尾 15 字；buttons 为按钮（先列当前一步的，本身是勾选框的不列）：text 文字前 40 字、on 启用、off 不在当前一步、skip 为不点的原因"
+              "（link 链接、area 勾选框标签开关与页头横幅里的、cookie Cookie 横幅、popup 菜单、card 轮播与卡片预览里的、neg 关闭返回拒绝跳过与切换账号类"
+              "（跳过只在不涉及同意的步骤里另按跳过规则点，轮播与卡片预览里的跳过不点）、opt 订阅邮件类、icon 只有图标认不出的）；links 为范围内的链接；"
+              "controls 为范围内其他表单控件的数量与类别；outside 为范围外的按钮）：")
         for sample in onboard_structures:
             print("  - " + sample)
 PY

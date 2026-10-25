@@ -19,16 +19,19 @@ const fakeOnboardingURL = "https://aistudio.google.com/onboarding"
 const fakeOnboardedStorage = `{"origin":"https://aistudio.google.com","localStorage":[{"name":"onboarded","value":"1"}]}`
 
 // onboardingSite 为带首次使用页的假 AI Studio：第 n 次导航后是否落到首次使用页由 land 决定；停在首次使用页时一步式表达式
-// 先勾一个必选项、再点继续（点了即离开首次使用页），其余表达式按一切正常的官网页面回答。override 返回 true 时替换该表达式的回答
-// （在持有 mu 时调用，可以改 onboarding）。字段在假浏览器的协程里读写，测试读取前加锁
+// 先勾一个必选项、再点继续（点了即离开首次使用页；survey 为真时点了继续先到用途调查一步：继续禁用、报告可以跳过，带 Skip 时点跳过
+// 离开），其余表达式按一切正常的官网页面回答。override 返回 true 时替换该表达式的回答（在持有 mu 时调用，可以改 onboarding）。
+// 字段在假浏览器的协程里读写，测试读取前加锁
 type onboardingSite struct {
 	prompt      string
 	land        func(navigation int) bool
 	override    func(site *onboardingSite, expression string) (fakeEvaluate, bool)
 	variants    map[string]onboardingStepOptions
+	survey      bool
 	mu          sync.Mutex
 	onboarding  bool
 	checked     bool
+	surveying   bool
 	navigations int
 	detections  int
 	stepCalls   int
@@ -56,6 +59,14 @@ func (site *onboardingSite) evaluate(expression string) fakeEvaluate {
 		case !site.checked:
 			site.checked = true
 			return onboardingReply("checked", map[string]any{"label": "* 私は 18 歳以上です"})
+		case site.surveying && options.Skip:
+			site.onboarding = false
+			return onboardingReply("skipped", map[string]any{"button": "スキップ"})
+		case site.surveying:
+			return onboardingReply("waiting", map[string]any{"reason": "继续按钮未启用", "button": "続行", "skip": "スキップ"})
+		case site.survey:
+			site.surveying = true
+			return onboardingReply("clicked", map[string]any{"button": "続行"})
 		}
 		site.onboarding = false
 		return onboardingReply("clicked", map[string]any{"button": "続行"})
@@ -83,6 +94,7 @@ func (site *onboardingSite) command(method string, _ map[string]any) []map[strin
 		site.navigations++
 		site.onboarding = site.land(site.navigations)
 		site.checked = false
+		site.surveying = false
 	case "network.addIntercept":
 		header := func(name, value string) map[string]any {
 			return map[string]any{"name": name, "value": map[string]any{"type": "string", "value": value}}
@@ -182,6 +194,27 @@ func TestBootstrapOnboarding(t *testing.T) {
 		}
 		if loading != 2 || run.page.snapshots.Load() != 0 {
 			t.Fatalf("重新导航时应再报告一次载入 AI Studio，不应采集快照: stages=%v snapshots=%d", run.stages, run.page.snapshots.Load())
+		}
+	})
+	t.Run("从条款到用途调查再到离开", func(t *testing.T) {
+		// 多步向导：条款一步勾选、点继续，用途调查一步继续禁用，等页面稳定后点跳过，离开后重新导航、启动成功
+		site := newOnboardingSite(prompt, func(navigation int) bool { return navigation == 1 })
+		site.survey = true
+		run := runOnboardingBootstrap(t, site)
+		if run.err != nil {
+			t.Fatalf("走完多步向导后应启动成功: %v", run.err)
+		}
+		navigations, _, _ := site.counts()
+		if navigations != 2 || len(run.results) != 1 {
+			t.Fatalf("应完成一次首次使用并重新导航: navigations=%d results=%+v", navigations, run.results)
+		}
+		result := run.results[0]
+		if want := []string{"勾选:* 私は 18 歳以上です", "点击:続行", "跳过:スキップ"}; !slices.Equal(result.Steps, want) ||
+			result.Checked != 1 || result.Skipped != 1 || result.Button != "続行" || string(result.LocalStorage) != fakeOnboardedStorage {
+			t.Fatalf("完成结果应按顺序记下勾选、点击继续与跳过: %+v", result)
+		}
+		if countMethod(run.page, "session.subscribe") != 1 || countMethod(run.page, "network.addIntercept") != 1 {
+			t.Fatalf("订阅与拦截只应各一次: %v", run.page.commandMethods("script.evaluate"))
 		}
 	})
 	t.Run("填写提示词时被路由过去", func(t *testing.T) {
@@ -317,9 +350,10 @@ func TestBootstrapOnboarding(t *testing.T) {
 		if run.err != nil {
 			message = run.err.Error()
 		}
-		if !strings.HasPrefix(message, "提交官网提示词: 页面表达式异常: ") || !strings.Contains(message, "；首次使用页未能完成: 找不到可点的继续按钮 | 页面={") ||
+		if !strings.HasPrefix(message, "提交官网提示词: 页面表达式异常: ") ||
+			!strings.Contains(message, "；首次使用页未能完成: 找不到可点的继续按钮 | 已做=- | 页面={") ||
 			!strings.HasSuffix(message, "}]}") || !strings.Contains(message, OnboardingStructureMarker) {
-			t.Fatalf("就地完成失败时原错误前缀不变，补原因并依次接快照与结构摘要: %s", message)
+			t.Fatalf("就地完成失败时原错误前缀不变，补原因并依次接进度记录、快照与结构摘要: %s", message)
 		}
 		if len(run.results) != 0 {
 			t.Fatalf("没能完成时不应报告: %+v", run.results)

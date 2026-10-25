@@ -46,7 +46,7 @@ type Options struct {
 	// CacheAttached 在启动锁定到账户 HTTP 磁盘缓存目录、这次启动的浏览器将使用它时调用（在启动浏览器之前）。
 	// 同账户另一个 runtime 占用、改用临时 profile 内的缓存时不调用：这次启动失败与账户缓存无关，启动失败后的清理据此跳过
 	CacheAttached func()
-	// OnboardingCompleted 在启动时自动完成 AI Studio 首次使用页（勾选必选项、点继续）之后调用，结果带完成之后页面的 localStorage
+	// OnboardingCompleted 在启动时自动完成 AI Studio 首次使用页（勾选必选项、点继续，不涉及同意的步骤点跳过）之后调用，结果带完成之后页面的 localStorage
 	// （见 OnboardingResult.LocalStorage，供调用方写回）；页面自己离开首次使用页、没有勾选或点击时不调用。完成之后启动照常继续，
 	// 之后仍失败时沿用启动失败的错误
 	OnboardingCompleted func(OnboardingResult)

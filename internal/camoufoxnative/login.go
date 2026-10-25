@@ -34,7 +34,7 @@ type LoginOptions struct {
 	ProxyBypass    string
 	Timeout        time.Duration
 	Log            io.Writer
-	// OnboardingCompleted 在登录或验证时自动完成 AI Studio 首次使用页（勾选必选项、点继续）之后调用（在 Login、Verify 返回之前，
+	// OnboardingCompleted 在登录或验证时自动完成 AI Studio 首次使用页（勾选必选项、点继续，不涉及同意的步骤点跳过）之后调用（在 Login、Verify 返回之前，
 	// 之后仍失败也已调用）；页面自己离开首次使用页、没有勾选或点击时不调用
 	OnboardingCompleted func(OnboardingResult)
 }

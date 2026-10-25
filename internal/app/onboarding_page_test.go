@@ -11,8 +11,8 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
-// TestStartupOnboardingCompletedLog 启动时自动完成 AI Studio 首次使用页后写一行 INFO（勾选数与各次勾选的标签、按钮、耗时，
-// 没有点击按钮时按钮写 -，没有标签时不写括号），并把完成之后页面的 localStorage 写回认证文件（这次启动随后失败也写：
+// TestStartupOnboardingCompletedLog 启动时自动完成 AI Studio 首次使用页后写一行 INFO（勾选数与各次勾选的标签、按钮、按顺序做过的每一步、
+// 耗时，没有点击按钮时按钮写 -，没有标签时不写括号，没有进度记录时不写已做），并把完成之后页面的 localStorage 写回认证文件（这次启动随后失败也写：
 // 浏览器关闭后就没有机会了），解析失败只写警告；之后的启动失败照常记录
 func TestStartupOnboardingCompletedLog(t *testing.T) {
 	manager, pool, requests := partitionTestManager(t, []string{partitionNormalA}, nil, 1, 1, 0, 1)
@@ -22,7 +22,8 @@ func TestStartupOnboardingCompletedLog(t *testing.T) {
 			return nil, errors.New("启动参数缺少首次使用页回调")
 		}
 		options.OnboardingCompleted(camoufoxnative.OnboardingResult{
-			Checked: 2, Labels: []string{"* 私は 18 歳以上です", "[补]Google 利用規約に同意します"}, Button: "続行",
+			Checked: 2, Labels: []string{"* 私は 18 歳以上です", "[补]Google 利用規約に同意します"}, Button: "开始使用", Skipped: 1,
+			Steps:   []string{"勾选:* 私は 18 歳以上です", "勾选:[补]Google 利用規約に同意します", "点击:続行", "跳过:跳过", "点击:开始使用"},
 			Elapsed: 1500 * time.Millisecond, LocalStorage: []byte(onboarded),
 		})
 		options.OnboardingCompleted(camoufoxnative.OnboardingResult{Checked: 1, Elapsed: 2 * time.Second, LocalStorage: []byte("{")})
@@ -34,7 +35,8 @@ func TestStartupOnboardingCompletedLog(t *testing.T) {
 		t.Fatal("启动应失败")
 	}
 	want := []string{
-		"完成 AI Studio 首次使用页 | 勾选=2（* 私は 18 歳以上です；[补]Google 利用規約に同意します） | 按钮=続行 | 耗时=1.5s",
+		"完成 AI Studio 首次使用页 | 勾选=2（* 私は 18 歳以上です；[补]Google 利用規約に同意します） | 按钮=开始使用 | " +
+			"已做=勾选:* 私は 18 歳以上です；勾选:[补]Google 利用規約に同意します；点击:続行；跳过:跳过；点击:开始使用 | 耗时=1.5s",
 		"完成 AI Studio 首次使用页 | 勾选=1 | 按钮=- | 耗时=2s",
 	}
 	if got := levelLogs(requests, "INFO", "完成 AI Studio 首次使用页"); !slices.Equal(got, want) {
@@ -63,12 +65,13 @@ func TestVerifyOnboardingCompletedLog(t *testing.T) {
 	admin, _, accounts := enableTestAdmin(t, "verify-onboarding@example.com")
 	admin.login = &verifyTestLogin{
 		verification: aistudio.LoginVerification{Authenticated: true},
-		onboarding:   &camoufoxnative.OnboardingResult{Checked: 1, Labels: []string{"* 私は 18 歳以上です"}, Button: "続行", Elapsed: 1500 * time.Millisecond},
+		onboarding: &camoufoxnative.OnboardingResult{Checked: 1, Labels: []string{"* 私は 18 歳以上です"}, Button: "続行",
+			Steps: []string{"勾选:* 私は 18 歳以上です", "点击:続行"}, Elapsed: 1500 * time.Millisecond},
 	}
 	if _, err := admin.VerifyAccount(context.Background(), accounts[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"账户验证 | 完成 AI Studio 首次使用页 | 勾选=1（* 私は 18 歳以上です） | 按钮=続行 | 耗时=1.5s"}
+	want := []string{"账户验证 | 完成 AI Studio 首次使用页 | 勾选=1（* 私は 18 歳以上です） | 按钮=続行 | 已做=勾选:* 私は 18 歳以上です；点击:続行 | 耗时=1.5s"}
 	if got := levelLogs(admin.requests, "INFO", "完成 AI Studio 首次使用页"); !slices.Equal(got, want) {
 		t.Fatalf("验证时的首次使用页日志\n得到 %v\n期望 %v", got, want)
 	}

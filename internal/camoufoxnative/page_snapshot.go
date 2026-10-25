@@ -31,17 +31,21 @@ const (
 // PageSnapshotMarker 为页面类失败的错误里页面快照的开头：原错误之后接“ | 页面={…}”或“ | 页面=快照失败: <原因>”，快照本身只占一行、不含“ | ”
 const PageSnapshotMarker = " | 页面="
 
-// StripPageSnapshots 去掉文本每一行里从 PageSnapshotMarker 起到行尾的部分（页面快照，以及外层接在它后面的说明）。
-// 快照是页面上的文字（标题、弹层、正文），按文案判断错误类型时先去掉它，免得页面文字被当成上游错误
+// StripPageSnapshots 去掉文本每一行里从 PageSnapshotMarker 或首次使用页的进度记录（OnboardingProgressMarker，接在快照之前）
+// 起到行尾的部分（页面快照、进度记录，以及外层接在它们后面的说明）。快照与进度记录里是页面上的文字（标题、弹层、正文、按钮与勾选框标签），
+// 按文案判断错误类型时先去掉，免得页面文字被当成上游错误
 func StripPageSnapshots(text string) string {
-	if !strings.Contains(text, PageSnapshotMarker) {
+	if !strings.Contains(text, PageSnapshotMarker) && !strings.Contains(text, OnboardingProgressMarker) {
 		return text
 	}
 	lines := strings.Split(text, "\n")
 	for index, line := range lines {
-		if before, _, found := strings.Cut(line, PageSnapshotMarker); found {
-			lines[index] = before
+		for _, marker := range []string{OnboardingProgressMarker, PageSnapshotMarker} {
+			if before, _, found := strings.Cut(line, marker); found {
+				line = before
+			}
 		}
+		lines[index] = line
 	}
 	return strings.Join(lines, "\n")
 }

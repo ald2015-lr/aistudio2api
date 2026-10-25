@@ -201,13 +201,15 @@ func TestPageSnapshotURL(t *testing.T) {
 	}
 }
 
-// TestStripPageSnapshots 按文案判断错误时去掉每行的页面快照（连同同一行接在后面的说明），其他行不变
+// TestStripPageSnapshots 按文案判断错误时去掉每行的页面快照与首次使用页的进度记录（连同同一行接在后面的说明），其他行不变
 func TestStripPageSnapshots(t *testing.T) {
 	cases := map[string]string{
 		`官网 prompt 状态未同步 | 页面={"body":"The input token count exceeds"}`:                "官网 prompt 状态未同步",
 		"官网 WAA service 未暴露: x | 页面=快照失败: EOF；本机代理中转：上游 407":                           "官网 WAA service 未暴露: x",
 		"第一行 | 页面={\"a\":1}\nAI Studio GenerateContent 返回 HTTP 429: input token count": "第一行\nAI Studio GenerateContent 返回 HTTP 429: input token count",
 		"没有快照 | 端口=10001": "没有快照 | 端口=10001",
+		"AI Studio 首次使用页未能完成: 等待超时（继续按钮未启用） | 已做=点击:input token count exceeds | 页面={} | 结构={}": "AI Studio 首次使用页未能完成: 等待超时（继续按钮未启用）",
+		"提交官网提示词: x；首次使用页未能完成: 找不到可点的继续按钮 | 已做=-":                                              "提交官网提示词: x；首次使用页未能完成: 找不到可点的继续按钮",
 	}
 	for input, want := range cases {
 		if got := StripPageSnapshots(input); got != want {

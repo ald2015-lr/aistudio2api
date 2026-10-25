@@ -478,7 +478,7 @@ func (worker *Worker) finishOnboarding(ctx context.Context, options Options, bud
 // 页面不在首次使用页时与原来一样追加页面快照（识别与快照共用一个短期限，见 startupFailureDiagnosis）。在首次使用页时先采快照
 // （失败那一刻的首次使用页），再就地完成首次使用（账号以后能起；这里不重做 bootstrap，重做会重复订阅与拦截），照常返回失败：
 // 原错误文字不变，末尾补一句“；已完成首次使用页”（勾选或点击过）、“；首次使用页已自行离开”（识别之后页面自己离开了、什么都没点，
-// 也不写完成日志）或“；首次使用页未能完成: <原因>”，再接快照与结构摘要
+// 也不写完成日志）或“；首次使用页未能完成: <原因>”（再接进度记录“ | 已做=…”），再接快照与结构摘要
 func (worker *Worker) interceptedPageFailure(ctx context.Context, options Options, budget *onboardingBudget, err error) error {
 	client := worker.client
 	onboarding, _, suffix := client.startupFailureDiagnosis(ctx, worker.contextID, false)
@@ -489,7 +489,7 @@ func (worker *Worker) interceptedPageFailure(ctx context.Context, options Option
 		return fmt.Errorf("%w%s", err, suffix)
 	}
 	_, snapshot := client.pageDiagnosis(ctx, worker.contextID, false)
-	note, structure := "；已完成首次使用页", ""
+	note, progress, structure := "；已完成首次使用页", "", ""
 	result, finishErr := worker.finishOnboarding(ctx, options, budget)
 	switch {
 	case finishErr != nil:
@@ -497,12 +497,13 @@ func (worker *Worker) interceptedPageFailure(ctx context.Context, options Option
 		var failure *onboardingFailure
 		if errors.As(finishErr, &failure) {
 			note += ": " + failure.reason
+			progress = failure.progress
 			structure = failure.structure
 		}
 	case !result.acted():
 		note = "；首次使用页已自行离开"
 	}
-	return &onboardingInterrupted{err: err, text: err.Error() + note + snapshot + structure}
+	return &onboardingInterrupted{err: err, text: err.Error() + note + progress + snapshot + structure}
 }
 
 func installBootstrapRequestCapture(ctx context.Context, client *bidiClient, contextID string) error {

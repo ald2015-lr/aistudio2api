@@ -951,7 +951,7 @@ func (admin *runtimeAdmin) effectiveProxy(accountProxy string) string {
 	return strings.TrimSpace(admin.config.Proxy)
 }
 
-// onboardingLogger 返回登录、验证时自动完成 AI Studio 首次使用页的日志回调：写“<operation> | 完成 AI Studio 首次使用页 | 勾选=N（…） | 按钮=… | 耗时=…”
+// onboardingLogger 返回登录、验证时自动完成 AI Studio 首次使用页的日志回调：写“<operation> | 完成 AI Studio 首次使用页 | 勾选=N（…） | 按钮=… | 已做=… | 耗时=…”
 // （格式同 Worker 启动时的那一行，见 onboardingCompletedMessage）
 func (admin *runtimeAdmin) onboardingLogger(label string, operation string) func(camoufoxnative.OnboardingResult) {
 	return func(result camoufoxnative.OnboardingResult) {
