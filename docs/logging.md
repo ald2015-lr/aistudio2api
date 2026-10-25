@@ -759,3 +759,30 @@ ERROR service  请求账本清理失败 | 错误=<ERROR>
 6. 按开始时间排序的活动 `request`
 
 后续增量事件类型为 `status`、`models`、`accounts`、`log`、`cooldowns` 和 `request`。每个 SSE `data` 行是 `{"type":"<TYPE>","data":<DTO>}`，其中 `<DTO>` 是对应类型的事件对象；字段定义见 [protocol.md](protocol.md)。
+
+## 守护日志
+
+`./start.sh enable` 后 cron 每分钟执行一次 `./start.sh watchdog`（判定规则见 [README](../README.md#方式三linux-服务器后台运行startsh)），记录写在 `logs/watchdog.log`，与程序的 JSON 日志分开；超过 5MB 时改名为 `watchdog.log.1`（只保留一个）。进程正常、处于人为停止状态或锁被手动命令占着时不写任何内容。每条记录一行 `时间 [级别] 内容`，附加内容以 `    | ` 开头写在其后几行；`./start.sh status` 显示最近 3 条记录。
+
+| 记录 | 含义 |
+| --- | --- |
+| `[WARN] 进程不在运行：<原因>` | 原因为 `PID 文件里的进程 N 已不存在`（附 `被系统 OOM 结束`、`系统重启过（PID 文件早于本次开机）`，或 `（读不到内核日志，无法判断是否被 OOM 结束）`）、`PID 文件里的进程 N 已不是 aistudio2api（PID 已被其他程序复用）`、`PID 文件里的进程 N 是其他目录的 aistudio2api（PID 已被复用）`（工作目录不是本目录）、`没有 PID 文件`。其后附主日志里最近一次 start.sh 分隔行之后整段（即退出的这个进程的输出）的线索：第一行 `panic: `、`fatal error: `、`runtime: `、`SIGxxx: ` 或 `unexpected fault` 及其后 7 行（fatal error 打印全部 goroutine 栈时也不会丢；没有这类行时取最后一条 JSON 之后的开头 8 行），最后 20 行中的非 JSON 行，最后一条 `level=ERROR` 的时间与 `msg`、`error` 字段（各前 200 字，以 `：` 连接；启动失败时具体原因在 `error` 里），`这个进程在主日志里最后一条记录的时间`，以及推断的退出方式：`进程收到停止信号（SIGTERM 或 Ctrl+C）后退出…`（主日志里有“收到停止信号”：被打断的 restart、手动 kill 或其他程序），或 `主日志里没有崩溃输出：多半被 SIGKILL 直接结束…`（没有非 JSON 行，也不是“AIStudio2API 启动失败”） |
+| `[INFO] 已自动拉起（PID N，打开文件数上限 M，30 分钟内第 K 次）` | 拉起成功；主日志同时写分隔行 `===== 时间 start.sh watchdog 自动拉起：<原因> =====`。降频期间的拉起另注明 `降频中` |
+| `[WARN] 自动拉起失败：进程启动后立即退出（PID N，…）` | 下一轮的“进程不在运行”记录附有这次退出前的输出 |
+| `[INFO] 健康检查失败 第 N/5 次（PID，http://地址/health 原因）` | 原因为 `10 秒内无响应`、`连接被拒绝`、`返回错误状态码` 等；成功一次写 `健康检查恢复（…此前连续失败 N 次），计数清零`。上次检查已超过 150 秒（守护停用过、cron 中断）时旧计数作废，从第 1 次重新计 |
+| `[WARN] 判定卡死：健康检查连续 5 次失败（…），重启（PID N）` | 其后附 stop 的输出与这个进程的主日志线索，再是拉起结果。SIGTERM 后 `STOP_TIMEOUT` 秒内没有退出时发 SIGQUIT（`发送 SIGQUIT（goroutine 栈写进主日志…）`），Go 运行时把全部 goroutine 的栈写进主日志后退出；附加内容里是 `SIGQUIT 时共 N 个 goroutine，按等待原因与第一个非标准库函数计数（前 8 项）`，例如 `120  sync.Mutex.Lock  github.com/…/internal/app.(*runtimeManager).status`，完整的栈在主日志这个进程最后一段的 `SIGQUIT: quit` 之后；5 秒后仍未退出才强制结束 |
+| `[WARN] 旧进程 N 强制结束后仍未退出，本轮不拉起，下一轮再检查` | 卡死重启时 stop 之后旧进程还在，不拉起新进程，免得两个实例同时运行 |
+| `[INFO] 判定卡死（…），但守护处于降频中，暂不重启，最早 HH:MM:SS 重启（PID N）` | 降频期间每次推迟只记一条；失败计数停在阈值，不再继续累加 |
+| `[WARN] 找不到本目录的进程（<原因>），但监听地址 <地址> 上已有程序应答 /health，找不到它的 PID，不拉起…` | PID 文件丢失或程序经另一种路径启动；不拉起第二个实例，每小时最多记一次 |
+| `[INFO] 健康检查：PID N 还没有在 <地址> 应答过 /health，不做卡死判定` | 每个进程最多一次；可能是启动卡在开始监听之前（例如首次下载 Camoufox），或 `.env` 的 `LISTEN_ADDR` 与运行中的程序不一致。探测地址优先取运行中进程启动时环境里的 `LISTEN_ADDR` |
+| `[WARN] 连续崩溃，降低拉起频率：30 分钟内已自动拉起 5 次，…` | 之后每 10 分钟最多拉起一次，30 分钟内没有再自动拉起时恢复（`./start.sh status` 也不再显示降频）；`./start.sh start`、`restart` 清空计数 |
+| `[WARN] 运行中进程的环境里有这些配置不在 .env 里或与 .env 不同：…` | 卡死重启前检查，只列配置名，不写取值 |
+| `[WARN] 运行中进程的环境里这些变量与守护拉起时不同：…` | 同上，针对程序只从进程环境读取的 `CAMOUFOX_PATH`、`SHUTDOWN_GRACE`、语言、`TZ` 与代理变量：应写进 `run/watchdog.conf` |
+| 附加行 `[INFO] 进程环境里没有、按 …/run/watchdog.conf 补上：CAMOUFOX_PATH …` | 拉起记录前的附加内容：从 `run/watchdog.conf` 补上的变量（只列名字）；`按系统默认补上 LANG=…` 为语言变量都没有时按系统默认语言补上 |
+| `[WARN] 进程不在运行：…；没有可执行文件 …，守护不构建也不拉起` | 同样的情况每小时最多记一次 |
+| `[WARN] 未找到 flock 命令（util-linux），改用目录锁 …/run/start.lock.d…` | 只记一次；之后守护与 start/stop/restart 用目录锁互斥 |
+| `[WARN] 缺少 ps/pgrep（procps），无法判断进程是否在运行，守护不做任何动作…` | 每小时最多记一次；装上 procps 后恢复 |
+
+附加内容先打码再截短（每行最多 300 字）：邮箱只留前两位（`ac***@***`），`scheme://user:pass@`、`user:pass@host` 与 `host:port:user:pass` 中的账号密码（密码一直打码到这一段里最后一个 `@`，密码里有 `/`、`@`、`,` 也不会漏出）、`sk-` 与 `AIza` 开头的密钥、`Bearer`/`Basic` 凭据（含 `Proxy-Authorization`）、Google 登录 Cookie（`SAPISID`、`__Secure-*` 等）、查询参数里的 `key=`/`token=`，`password=`、`token=`、`x-goog-api-key:`、`x-api-key:` 一类键值，以及 `.admin-token`、`ADMIN_PASSWORD`、`PROXY_API_KEY` 的原值都替换为 `***`，规则与 `tools/report.sh` 一致。
+
+守护用到的文件都在 `run/`：`watchdog.conf`（可选，用户自己建，格式同 `.env`，程序不会改写：`WATCHDOG_HEALTH_FAILS`、`WATCHDOG_GRACE` 优先于 `.env`；`CAMOUFOX_PATH`、`SHUTDOWN_GRACE`、`LANG`/`LC_ALL`/`LC_MESSAGES`、`TZ`、`http_proxy` 等代理变量在拉起程序时进程环境里没有才补上）、`stopped`（人为停止标记，内容为时间与 `用户执行 stop`；`restart` 不写）、`start.lock`（start/stop/restart 与守护共用的锁；没有 flock 时改为目录 `start.lock.d`，里面的 `pid` 是持锁的 start.sh）、`watchdog.health`（PID、探测地址、是否应答过、连续失败次数、这次检查的时间）、`watchdog.launches`（30 分钟内每次自动拉起的时间）、`watchdog.throttle`（降频中）、`watchdog.deferred`（降频中推迟卡死重启的记录）、`watchdog.nobin`、`watchdog.orphan` 与 `watchdog.noprocps`（“没有可执行文件”“监听地址上已有程序”“缺少 ps/pgrep”每小时最多记一次）、`watchdog.noflock`（“未找到 flock”只记一次）。

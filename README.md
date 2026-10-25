@@ -82,7 +82,7 @@ copy .env.example .env
 
 已有 `aistudio2api.exe` 时脚本立即运行；源码目录缺少可执行文件时，脚本自动安装前端依赖并构建前端与 Go 程序。
 
-首次启动会自动下载当前平台的 Camoufox 到 `runtime/camoufox/`。也可以通过环境变量 `CAMOUFOX_PATH` 指定已有可执行文件。
+首次启动会自动下载当前平台的 Camoufox 到 `runtime/camoufox/`。也可以通过环境变量 `CAMOUFOX_PATH` 指定已有可执行文件（用 `start.sh` 开了守护时写进 `run/watchdog.conf`，cron 拉起的进程才有）。
 
 ### 方式二：Linux 与 macOS 源码构建
 
@@ -125,10 +125,21 @@ chmod +x start.sh
 ./start.sh status     # 进程、生成服务与账户状态
 ./start.sh log        # 跟踪日志 logs/aistudio2api.log
 ./start.sh build      # 重新构建，restart 后生效
-./start.sh enable     # 开机自启（crontab @reboot），disable 取消
+./start.sh enable     # 开机自启、每小时日志轮转与守护（写入 crontab），disable 取消
+./start.sh watchdog   # 守护检查一次（enable 后 cron 每分钟自动执行，平时不用手动运行）
 ```
 
 `AUTO_START` 默认为 `true`，进程启动后自动启动生成服务，无需在管理页面点击。
+
+**守护（崩溃或卡死后自动拉起）**：`./start.sh enable` 在当前用户的 crontab 写入三行（都带 `# aistudio2api-autostart` 标记，重复执行不会重复添加，`./start.sh disable` 一并去掉）：开机自启、每小时日志轮转，以及每分钟执行一次的 `./start.sh watchdog`。同一台机器上有多个部署目录时，`enable`、`disable` 只改执行本目录 `start.sh` 的那几行（按真实路径判断，经符号链接写入的也认得），其他目录的守护不受影响。重启要重新预热全部 Worker，代价高，守护按“宁可漏判也不误判”判定：
+
+- **进程不在**：记一条原因（`PID 文件里的进程 N 已不存在`，能读到 `dmesg` 或 `journalctl -k` 时注明是否被系统 OOM 结束，两处都读不到时注明无法判断；系统重启过、没有 PID 文件；PID 已被其他程序或另一个部署目录的实例复用——PID 文件里的进程要工作目录也是本目录才算本目录的），附上主日志里这个进程的崩溃线索（panic、fatal error 所在的开头几行，即使 fatal error 打印了几千行 goroutine 栈；最后 20 行里的非 JSON 行；最后一条 ERROR 的时间与 msg、error 字段各前 200 字，启动失败的具体原因在 error 里；这个进程最后一条记录的时间。高并发下最后一条 ERROR 常常是几小时前与退出无关的单个请求失败，要对照时间看），并推断退出方式：收到过停止信号的写明是被外部 SIGTERM/Ctrl+C 结束（被打断的 `restart`、手动 `kill` 或其他程序），既没有崩溃输出也不是启动失败的写明多半被 SIGKILL 直接结束（OOM、`kill -9`）。然后自动拉起，并在主日志写一行 `===== 时间 start.sh watchdog 自动拉起：原因 =====`。找不到本目录的进程、但监听地址上已有程序应答 `/health` 时（PID 文件丢失、经另一种路径启动）不拉起，只记一条（每小时最多一次），免得同时跑两个实例。守护不构建：没有可执行文件时只记日志、不拉起。
+- **进程在但卡死**：启动后 `WATCHDOG_GRACE`（默认 300）秒内不判定；之后每分钟请求一次 `/health`（不需要认证，10 秒超时），连续 `WATCHDOG_HEALTH_FAILS`（默认 5）次失败才重启，中间成功一次就清零，每次失败记一行 `健康检查失败 第 N/5 次`。只有这个进程在这个地址上应答过 `/health`（start 的就绪检查或守护的检查）之后失败才计数，监听地址对不上不会被当成卡死。“连续”指每分钟都失败：超过 150 秒没有检查（守护停用过、cron 中断）留下的旧计数作废，从头计。判定卡死后先发 SIGTERM，`STOP_TIMEOUT` 秒内没有退出就发 SIGQUIT：程序没有处理这个信号，Go 运行时把全部 goroutine 的栈写进主日志后退出，守护日志里附上按等待原因与第一个非标准库函数统计的 goroutine 个数，能直接看出卡在哪个锁或调用上；5 秒后仍在（例如进程被暂停）才强制结束。用户执行的 `./start.sh stop` 不发 SIGQUIT。重启时旧进程强制结束后仍未退出就不拉起新进程，下一轮再看。`WATCHDOG_HEALTH_FAILS=0` 关闭卡死检查。
+- **连续崩溃**：30 分钟内已自动拉起 5 次后改为每 10 分钟最多拉起一次，并写一条 `连续崩溃，降低拉起频率`（这期间判定卡死也推迟重启，记一条最早的重启时间）；30 分钟内没有再自动拉起时恢复，`./start.sh start` 或 `restart` 清空计数。
+- **人为停止**：`./start.sh stop` 写入标记 `run/stopped`，之后守护不拉起；`./start.sh start`（含 `restart`）成功拉起进程后删除标记。`restart` 与守护自己的重启都不写标记：`restart` 从停止到拉起一直持锁，守护插不进来，中途被打断（SSH 掉线、在“正在停止”时按 Ctrl+C）或拉起后立即退出时，交给守护按上面的规则拉起。开机自启那一行不看这个标记（与 systemd 的 enable 与 stop 相同）。
+- **不互相打架**：start、stop、restart 与守护共用锁 `run/start.lock`，手动命令等正在进行的自动拉起结束（最长 STOP_TIMEOUT+START_WAIT 秒），守护遇到手动命令正在执行就跳过本轮；程序本身不持有这个锁。没有 `flock` 命令（util-linux）时改用目录锁 `run/start.lock.d`（记持锁的 PID，持锁的 start.sh 被 `kill -9` 后留下的会自动清理）；没有 `ps`/`pgrep`（procps）时判断不了进程是否在运行，守护什么都不做，只每小时记一条提示。
+
+记录写在 `logs/watchdog.log`（超过 5MB 时轮转为 `.1`，格式见[运行日志](docs/logging.md#守护日志)），日志尾里的邮箱、代理账号密码、`sk-` 密钥、管理令牌与 `.env` 中的密码均已打码；`./start.sh status` 显示守护是否已开启、是否处于人为停止状态与最近 3 条记录。cron 直接执行 `start.sh`，它必须有执行权限：`enable` 时没有会自动 `chmod +x`，`status` 也会提示。cron 只读文件：在终端 `export` 的变量，守护与开机自启拉起的进程都看不到。`.env.example` 中的配置项写进 `.env`；程序只从进程环境读取、写进 `.env` 无效的 `CAMOUFOX_PATH`、`SHUTDOWN_GRACE`、`LANG`/`LC_ALL`/`LC_MESSAGES`（新加账户的默认语言）、`TZ` 与 `http_proxy`/`https_proxy`/`all_proxy`/`no_proxy`（Camoufox 下载与浏览器会继承）写进 `run/watchdog.conf`：start.sh 每次拉起程序（终端的 start、开机自启与守护）时，进程环境里没有的从这里补上，只传给程序；语言变量都没有时按系统默认语言（`/etc/default/locale` 或 `/etc/locale.conf`）补上 `LANG`，与登录 shell 一致。`enable` 时、以及开了守护后每次 `start`/`restart` 完成时，会列出运行中进程环境里有、但 cron 拉起时会不一样的变量名（只列名字，不显示取值）并说明该写进哪个文件。`WATCHDOG_HEALTH_FAILS`、`WATCHDOG_GRACE` 每次检查都重新读取，改后即生效，建议写在 `run/watchdog.conf`（格式同 `.env`，优先于 `.env`）：程序本身不认识这两项，管理页保存服务配置时会按程序的配置项重写 `.env`、去掉这两行（恢复默认值），`run/watchdog.conf` 不受影响；关闭卡死检查的 `WATCHDOG_HEALTH_FAILS=0` 尤其应写在这里。start 拉起程序前把打开文件数的软上限提到硬上限，从终端与从 cron 拉起时一致，守护的拉起记录里写有实际上限。
 
 Gemini 原生接口非流式响应：连续的正文与连续的思考各合并为一个 part（与 Gemini API 一致），不论各分片是否带思考签名；同一段里的多个签名（gemini-4 等模型给许多正文分片都带签名）只保留最后一个，正文或思考中途单独到达的签名同样挂到这个 part 上。输出开头的签名挂到随后第一个 part 上（该 part 合并后已带签名时前置签名单独成 part，正文不会因此拆开）；工具调用、媒体之后等无处可挂的签名（流式同样）以空思考 part `{"text":"","thought":true,"thoughtSignature":"..."}` 返回，回传时还原为纯签名。引用与搜索来源不打断正文合并。此前按上游增量或按签名逐段生成 part，new-api 用换行、SillyTavern 用空行拼接多个 part，会导致句子中间断行、数字被拆开、出现多余空行。Anthropic 与 Interactions 接口在正文进行中收到只带签名的分片时，先暂存到这段正文结束再输出 `redacted_thinking` 块或 thought 步骤，正文保持一个文本块或一个 `model_output` 步骤；随后是不带签名的工具调用时排在调用之后，回传时不会挂到该调用上。
 
@@ -152,7 +163,7 @@ Build 独有模型计算：Playground 目录按模型 ID 与别名建立索引�
 
 参数容错：`max_tokens` 超过模型上限时按上限发送，不再报错；`reasoning_effort` 兼容 `xhigh`、`max`（视为最高）与 `auto`（使用模型默认）；只支持思考预算的模型收到思考强度时换算为预算（low 1024、medium 8192、high 24576）；不支持调节思考的模型忽略思考参数。Playground 与 Build 两个通道一致。OpenAI 与 Gemini 的 penalty、logprobs、logit_bias 上游没有对应参数，直接忽略，不再返回 400（`n` 与 `candidateCount` 仍只接受 1），其余协议兼容见下文 [API 使用](#api-使用)。
 
-优雅退出：收到停止信号（`./start.sh stop/restart`）后先停止接收新请求，等进行中的请求完成再结束运行时，最多等待 SHUTDOWN_GRACE（默认 60 秒）；管理页实时事件流会主动断开，不拖住等待。此前运行时直接跟随退出信号，每次重启都会立即截断所有进行中的回复。start.sh 强制结束前的等待相应放宽到 90 秒（STOP_TIMEOUT）。
+优雅退出：收到停止信号（`./start.sh stop/restart`）后先停止接收新请求，等进行中的请求完成再结束运行时，最多等待 SHUTDOWN_GRACE（默认 60 秒，只认进程环境变量；用 `start.sh` 开了守护时写进 `run/watchdog.conf`）；管理页实时事件流会主动断开，不拖住等待。此前运行时直接跟随退出信号，每次重启都会立即截断所有进行中的回复。start.sh 强制结束前的等待相应放宽到 90 秒（STOP_TIMEOUT）。
 
 回复指纹与重复回复分析：请求日志记录回复正文的指纹（reply_hash，只用于比较是否相同，不保存内容）；`./start.sh diag` 会找出内容完全相同的回复并列出当时的 seed 与温度，判断是客户端固定 seed、温度为 0，还是请求根本没有到达本服务（中转站或客户端缓存）。
 
