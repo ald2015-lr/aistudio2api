@@ -783,6 +783,8 @@ OFFLINE=1 LOG_FILE=<log> LEDGER_DB=<ledger> DIAG_NOW=2026-10-22T08:00:00Z bash t
 
 **Workers do not start** (the sidebar keeps showing "starting" and the worker count stays at 0): run `bash tools/diag_start.sh`. It prints system resources, the live state of workers, prewarming, the IP pool and egresses, a direct test of 5 IP pool ports (first, middle, last; exit IP plus the status and time of opening AI Studio) that bypasses the program, and for the last 15 minutes (`LOG_MINUTES` to change) the worker starts, time to ready, failure reasons (with the failing ports) and proxy log lines. It is read-only and also writes the output to `logs/diag_start.txt`, with proxy passwords and account emails masked.
 
+When old accounts fail to start while new ones work, also run `bash tools/diag_profile.sh`: it splits the accounts by their start results in the last 60 minutes (`LOG_MINUTES` to change) into accounts that only failed and accounts that started, and compares the aistudio.google.com localStorage in `storage-state.json` (key names and value lengths only), the cookie count and file age, and the presence, size and age of the `camoufox-cache` directory. It is read-only, makes no network request and also writes the output to `logs/diag_profile.txt`.
+
 ### Egress rate limiting, catalog cache and "login required"
 
 When the pool has many accounts but still returns frequent 429s, the cause is usually not exhausted quota: either too many requests leave through the same egress IP and the upstream throttles it as a whole, or restarts, catalog syncs and false "login required" verdicts push usable accounts out. None of the following needs configuration; the thresholds are fixed.

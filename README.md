@@ -840,6 +840,8 @@ OFFLINE=1 LOG_FILE=<日志> LEDGER_DB=<账本> DIAG_NOW=2026-10-22T08:00:00Z bas
 
 **Worker 起不来**（侧栏“启动中”一直不变成就绪、Worker 长时间为 0）：运行 `bash tools/diag_start.sh`，依次输出系统资源、Worker 与预热、IP 池与出口的实时状态，绕过程序直连测 IP 池首中尾 5 个端口（出口 IP、打开 AI Studio 的状态与耗时），以及最近 15 分钟（`LOG_MINUTES` 可改）Worker 启动、就绪耗时、失败原因（按端口汇总）与代理日志。只读，结果同时写到 `logs/diag_start.txt`，代理密码与账号邮箱已打码。
 
+老账号起不来、新账号能跑时，再运行 `bash tools/diag_profile.sh`：按最近 60 分钟（`LOG_MINUTES` 可改）的启动结果把账号分成只失败的与成功过的两组，对比各组账户目录里 `storage-state.json` 的 aistudio.google.com localStorage（只列键名与值长度）、Cookie 数与文件时间，以及 `camoufox-cache` 缓存的有无、大小与时间。只读，不访问网络，结果同时写到 `logs/diag_profile.txt`。
+
 ### 出口限流、目录缓存与“需要登录”
 
 号池账号很多、却仍然频繁 429 时，多半不是账号额度用完，而是同一出口 IP 的请求太多被上游整体限流，或者重启、目录同步与“需要登录”误判把可用账号挤掉了。以下行为不需要配置，阈值是固定值。
