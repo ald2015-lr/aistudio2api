@@ -101,9 +101,19 @@ print(u.unquote(p.username or "") + ":" + u.unquote(p.password or "") if p.usern
 
   echo
   echo "==================== 最近 $LOG_MINUTES 分钟的 Worker 启动与代理日志 ===================="
-  python3 -I - "$APP_DIR/logs/aistudio2api.log" "$LOG_MINUTES" <<'PY'
+  cooldown_file=$(mktemp) || return
+  curl -sS --noproxy '*' -m 30 -H "X-Admin-Token: $T" "$A/api/cooldowns" > "$cooldown_file" 2>/dev/null
+  python3 -I - "$APP_DIR/logs/aistudio2api.log" "$LOG_MINUTES" "$cooldown_file" <<'PY'
 import collections, datetime, json, os, re, statistics, sys
-path, minutes = sys.argv[1], int(sys.argv[2])
+path, minutes, cooldown_path = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+denied = set()
+try:
+    with open(cooldown_path, encoding="utf-8") as f:
+        for item in json.load(f).get("cooldowns") or []:
+            if "无权限" in (item.get("reason") or "") or "403" in (item.get("reason") or ""):
+                denied.add(item.get("account_label") or item.get("account_id"))
+except Exception:
+    denied = None
 TIME_RE = re.compile(r'^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)$')
 def parse_time(value):
     m = TIME_RE.match((value or "").strip())
@@ -136,6 +146,9 @@ DIGITS = re.compile(r"\d+")
 heads, kinds, samples = collections.Counter(), collections.Counter(), {}
 fail_reasons, fail_ports, proxy_heads, ready_secs = collections.Counter(), collections.Counter(), collections.Counter(), []
 fail_lines = []
+last_step = {}
+fail_steps, fail_full, fail_accounts, ready_accounts = collections.Counter(), {}, set(), set()
+STEP_RE = re.compile(r"^WAA Worker 启动 \| (\d)/7 \| ([^|\n]+)")
 for p in paths:
     with open(p, "rb") as handle:
         size = os.path.getsize(p)
@@ -153,9 +166,20 @@ for p in paths:
             msg = str(event.get("msg", ""))
             head = msg.split("\n")[0].split(" | ")[0].strip()
             level = str(event.get("level", "")).upper()
+            source = str(event.get("source", ""))
+            step = STEP_RE.match(msg)
+            if step:
+                last_step[source] = f"{step.group(1)}/7 {step.group(2).strip()}"
             if head.startswith("WAA Worker") or head.startswith("Ultra Worker"):
                 heads[head] += 1
                 f = fields(msg)
+                if head == "WAA Worker 就绪":
+                    ready_accounts.add(source)
+                if head == "WAA Worker 启动失败":
+                    fail_accounts.add(source)
+                    fail_steps[last_step.get(source, "（没有步骤日志）")] += 1
+                    key = DIGITS.sub("#", f.get("错误", ""))[:120]
+                    fail_full.setdefault(key, f.get("错误", msg.split("\n")[0])[:900])
                 if "就绪" in head and f.get("耗时"):
                     seconds = duration(f["耗时"])
                     if seconds is not None:
@@ -183,6 +207,17 @@ if fail_reasons:
     print("启动失败原因（数字已替换为 #）：")
     for reason, count in fail_reasons.most_common(8):
         print(f"  {count} 次：{reason}")
+if fail_steps:
+    print("启动失败时停在哪一步（该账号最后一条启动步骤日志）：")
+    for step, count in fail_steps.most_common(8):
+        print(f"  {count} 次：{step}")
+if fail_full:
+    print("各类启动失败的完整原文（每类一条）：")
+    for key, text in list(fail_full.items())[:8]:
+        print("  - " + text.replace("\n", " / "))
+if denied is not None:
+    print(f"冷却列表里有 403 无权限冷却的账号 {len(denied)} 个；启动失败的账号 {len(fail_accounts)} 个，其中有 403 冷却的 {len(fail_accounts & denied)} 个；"
+          f"就绪的账号 {len(ready_accounts)} 个，其中有 403 冷却的 {len(ready_accounts & denied)} 个")
 if fail_ports:
     print("启动失败最多的端口：" + "，".join(f"{port}×{count}" for port, count in fail_ports.most_common(8)))
 if proxy_heads:
@@ -198,6 +233,7 @@ print(f"最近 {minutes} 分钟的警告与错误类型（前 15）：")
 for (level, head), count in kinds.most_common(15):
     print(f"  [{level}] {head}：{count} 次 | 示例：{samples[(level, head)].replace(chr(10), ' / ')[:220]}")
 PY
+  rm -f -- "$cooldown_file"
 }
 
 main 2>&1 | python3 -I -c '
