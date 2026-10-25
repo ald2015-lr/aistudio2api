@@ -262,6 +262,11 @@ func (worker *Worker) StorageLocalStorage(ctx context.Context) ([]byte, error) {
 	client := worker.client
 	contextID := worker.contextID
 	worker.mu.Unlock()
+	return client.exportAIStudioLocalStorage(ctx, contextID)
+}
+
+// exportAIStudioLocalStorage 导出页面当前 origin 的 localStorage（见 Worker.StorageLocalStorage）：只接受 AI Studio 的 origin，错误文案不含值
+func (client *bidiClient) exportAIStudioLocalStorage(ctx context.Context, contextID string) ([]byte, error) {
 	encoded, err := client.evaluateString(ctx, contextID, localStorageExportExpression)
 	if err != nil {
 		return nil, fmt.Errorf("导出浏览器 localStorage: %w", err)

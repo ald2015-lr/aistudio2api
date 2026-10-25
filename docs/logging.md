@@ -96,6 +96,8 @@ Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启�
 
 启动失败记录页面模型、耗时和原始错误；页面类失败的错误末尾另带失败那一刻的页面快照 `| 页面=…`（见[失败时的页面快照](#失败时的页面快照)）。
 
+页面停在 AI Studio 首次使用页时启动流程自动完成它，日志与失败文案见[AI Studio 首次使用页](#ai-studio-首次使用页)。
+
 Worker 启动完成、发布之前，服务把浏览器 Cookie 合并写回认证文件，并用浏览器里 `https://aistudio.google.com` 的 localStorage 替换认证文件里这个 origin 的 localStorage（其他 origin 保留；启动期间保存过新登录或续签时不写，认证文件被外部换成另一个登录、扫描还没载入时 Cookie 与 localStorage 都不写；键名与值合计超过 512 KB 时不写，见[协议文档](protocol.md)第 2 节）。写回 localStorage 失败只记一行警告，不影响启动；`错误` 只写原因与大小，不写 localStorage 的值：
 
 ```text
@@ -103,7 +105,7 @@ WARN  account@example.com  WAA Worker 启动后写回 localStorage 失败 | 错�
 WARN  account@example.com  WAA Worker 启动后写回 localStorage 失败 | 错误=导出浏览器 localStorage: 页面 origin 不是 AI Studio（https://accounts.google.com）
 ```
 
-账户浏览器缓存（`camoufox-cache/`）的自愈清理（见[开发文档](development.md#账户浏览器缓存)）写下面几行，`大小` 为清理前的 MB 数。启动失败属于页面状态类（`AI Studio 输入框未就绪`（只算页面停在 `https://aistudio.google.com/` 的）、`填写 bootstrap 提示词失败`、`等待官网 Run 按钮启用`、`提交官网提示词`、`官网 WAA service 未暴露`、`官网 GenerateContent 拦截事件超时`、`官网高层 snapshot 函数定位超时`）时，紧跟 `WAA Worker 启动失败` 写一行，`原因` 为匹配的错误前缀，同一账户 10 分钟内最多一行；失败的这次启动没有用上账户缓存（缓存锁被同账户另一个 runtime 占着，用的是临时 profile 内的缓存）、清理时缓存锁被另一个 runtime 或没能确认退出的浏览器持有、缓存是 12 小时内新建或清空过的时不清理、不写（部署前留下、没有 `.created` 的旧缓存第一次失败就清）。启动时缓存超过 3 天先清空，`原因=缓存超过 3 天`，写在 `3/7 | 启动 Camoufox` 之前。清理失败写 WARN；过期清理失败后 3 天内不再重试、不再写：校验没通过（例如 `camoufox-cache` 是符号链接，错误里有 `拒绝清理`）时什么都不删、照常使用这份缓存，只删了一部分时这次启动改用临时 profile 内的缓存。连续 20 个清理过缓存的账号下一次启动仍以页面状态类失败时（多半是官网整体改版，或失败原因不在缓存），写一行 `暂停启动失败后的浏览器缓存清理`，之后 1 小时内不再清理；清理过缓存的账号启动成功时连续计数归零：
+账户浏览器缓存（`camoufox-cache/`）的自愈清理（见[开发文档](development.md#账户浏览器缓存)）写下面几行，`大小` 为清理前的 MB 数。启动失败属于页面状态类（`AI Studio 输入框未就绪`（只算页面停在 `https://aistudio.google.com/` 的）、`填写 bootstrap 提示词失败`、`等待官网 Run 按钮启用`、`提交官网提示词`、`官网 WAA service 未暴露`、`官网 GenerateContent 拦截事件超时`、`官网高层 snapshot 函数定位超时`；首次使用页上的失败不算，见[AI Studio 首次使用页](#ai-studio-首次使用页)）时，紧跟 `WAA Worker 启动失败` 写一行，`原因` 为匹配的错误前缀，同一账户 10 分钟内最多一行；失败的这次启动没有用上账户缓存（缓存锁被同账户另一个 runtime 占着，用的是临时 profile 内的缓存）、清理时缓存锁被另一个 runtime 或没能确认退出的浏览器持有、缓存是 12 小时内新建或清空过的时不清理、不写（部署前留下、没有 `.created` 的旧缓存第一次失败就清）。启动时缓存超过 3 天先清空，`原因=缓存超过 3 天`，写在 `3/7 | 启动 Camoufox` 之前。清理失败写 WARN；过期清理失败后 3 天内不再重试、不再写：校验没通过（例如 `camoufox-cache` 是符号链接，错误里有 `拒绝清理`）时什么都不删、照常使用这份缓存，只删了一部分时这次启动改用临时 profile 内的缓存。连续 20 个清理过缓存的账号下一次启动仍以页面状态类失败时（多半是官网整体改版，或失败原因不在缓存），写一行 `暂停启动失败后的浏览器缓存清理`，之后 1 小时内不再清理；清理过缓存的账号启动成功时连续计数归零：
 
 ```text
 ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=2m4.512s | 错误=AI Studio 输入框未就绪 url=https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest: 等待页面条件超时: ...
@@ -160,6 +162,37 @@ ERROR  account@example.com  WAA Worker 停止失败 | PID=18240 | 耗时=10.002s
 | 浏览器 profile 目录删除重试 | 2 秒 | 每 100ms 重试，最终返回最后一次 `RemoveAll` 错误 |
 
 `Worker.Close` 的正常总体上界约为 10 秒，另加调度开销。关闭失败时 Worker、进程句柄、`runtime lease`（Worker 占用的账户租约）、热池记录和 generation（Worker 版本号）保持可重试；再次 Stop 会重跑关闭链。热替换中旧实例与 pending Worker 都关闭失败时，两份实例都占用容量槽。
+
+### AI Studio 首次使用页
+
+页面停在 AI Studio 首次使用页（`aistudio.google.com/onboarding`，新的服务条款与年满 18 岁确认，老账号常见；服务端直接落到，或输入框出现后 1～2 秒被页面路由过去）时，启动流程自动完成它：只勾必选项（标签带 `*`、标为必选的服务条款与年满 18 岁等），邮件订阅、调研邀请、通知等可选项不碰，再点继续按钮，然后重新导航对话页、从 `5/7` 重做到填好提示词（流程与上限见[开发文档](development.md#ai-studio-首次使用页)）。完成后写一行 INFO，之后照常写启动步骤；`勾选` 为勾选次数，括号里为各次勾选的标签（已打码，保留开头 20 字与结尾 9 字，以 `；` 分隔；按放宽规则补勾的、没有必选标记但标签含服务条款或年龄关键词的项带 `[补]`，见[开发文档](development.md#ai-studio-首次使用页)的“放宽”），`按钮` 为最后点击的继续按钮文字（已打码，前 40 字，没有点击时写 `-`），`耗时` 为从开始处理到离开首次使用页（不含离开之后为让官网发完保存请求再等的 2 秒）。同时把完成之后页面的 localStorage 写回认证文件（规则同启动完成后的写回；这次启动之后仍失败也写），写回失败只记一行警告 `完成 AI Studio 首次使用页后写回 localStorage 失败 | 错误=…`。账户验证（新账户自动验证、管理页验证）与登录、添加账户时遇到首次使用页同样自动完成，写同样的一行，前面带操作名；这两种情形不另写回 localStorage：登录导出的认证状态本身带着完成之后的值，验证不写回，之后 Worker 启动成功时照常写回：
+
+```text
+INFO   account@example.com  WAA Worker 启动 | 5/7 | 载入 AI Studio
+INFO   account@example.com  完成 AI Studio 首次使用页 | 勾选=2（Gemini API 追加利用規約に同意します *；* 私は 18 歳以上です） | 按钮=続行 | 耗时=3.214s
+INFO   account@example.com  WAA Worker 启动 | 5/7 | 载入 AI Studio
+INFO   account@example.com  WAA Worker 启动 | 6/7 | 定位 WAA 服务
+INFO   account@example.com  账户验证 | 完成 AI Studio 首次使用页 | 勾选=2（* 私は 18 歳以上です；[补]Google 利用規約に同意します） | 按钮=続行 | 耗时=2.871s
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=58.1s | 错误=AI Studio 首次使用页未能完成: 找不到可点的继续按钮 | 页面={"url":"aistudio.google.com/onboarding","title":"Welcome to AI Studio ¦ Google AI Studio",…} | 结构={"scope":"ms-onboarding","bodyBoxes":1,"allBoxes":1,"boxes":[{"req":true,"on":true,"by":"star","t":true,"kind":"input/mat-checkbox","label":"* 私は 18 歳以上です"}],"buttons":[{"text":"close_small","on":true,"skip":"neg"}],"links":["続行"],"outside":[{"text":"Get API key","on":true}]} | 端口=10001
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=31.7s | 错误=等待官网 Run 按钮启用: 等待页面条件超时: …；已完成首次使用页 | 页面={"url":"aistudio.google.com/onboarding",…} | 端口=10002
+ERROR  account@example.com  账户验证失败 | 耗时=1m2.4s | 错误=AI Studio 首次使用页未能完成: 已自动完成 2 次仍回到首次使用页 | 页面={…} | 结构={…}
+```
+
+没能完成时启动失败（以及新账户验证、管理页验证的 `账户验证失败`）的错误以 `AI Studio 首次使用页未能完成: <原因>` 开头，末尾依次接页面快照与结构摘要 ` | 结构={…}`；这类失败与浏览器缓存无关，不触发缓存自愈清理。原因：
+
+| 原因 | 含义 |
+| --- | --- |
+| `找不到可点的继续按钮` | 首次使用页已渲染、整页载入完成后，持续 10 秒找不到可点的继续按钮（作用域里只有关闭、返回、链接、订阅类按钮，或按钮都被排除；不到整页上找，Cookie 横幅不点），结构摘要列出看到的按钮与链接 |
+| `等待超时（<最后的状态>）` | 45 秒内没有离开首次使用页；括号里为最后一步的状态：`继续按钮未启用`（必选项都勾上了按钮仍禁用，已按服务条款与年龄关键词补勾过；结构摘要里看各勾选框的 `req`、`t`、`o` 与 `controls`，判断是没认出必选项、被邮件通知类关键词排除，还是被其他表单控件挡住）、`必选项不可勾选`（必选项是禁用的）、`首次使用页尚未渲染`（只有页面外壳，或整页一直没有载入完成）、`页面正在载入`、`等待上一次点击生效`、`点击继续后仍停在首次使用页`、`勾选后页面没有变化`、`页面正在跳转` |
+| `点击继续 5 次后仍停在首次使用页` | 每次完成最多点 5 次继续（多步引导每一步各一次），两次之间至少隔 3 秒 |
+| `勾选 12 次后仍有必选项未勾上` | 勾了仍显示未勾选（页面没有收到 change），不无限重试 |
+| `已自动完成 2 次仍回到首次使用页` | 每次启动（每次验证、登录）最多自动完成 2 次，完成后重新导航仍落到首次使用页时失败，防止来回跳转 |
+| `页面脚本失败: …`、`页面脚本返回值无效` | 一步式页面脚本抛错或返回值无法解析 |
+| `context deadline exceeded` | 初始化超时（`INIT_TIMEOUT`）或验证超时先到了 |
+
+结构摘要为单行 JSON，不超过 900 字符：`scope` 为查找范围（可见的 `ms-onboarding` 与 `ms-tos-disclaimer` 里含勾选框的那个，都不含时 `ms-onboarding` 优先，都没有时 `body`）；`bodyBoxes` 为整页可见勾选框数（比 `boxes` 多时有勾选框在范围之外）；`allBoxes` 为整页全部勾选框数（含不可见的，比 `bodyBoxes` 多时有勾选框没被当作可见）；`boxes` 为勾选框（最多 6 个）：`req` 是否判定为必选、`on` 是否已勾、`dis` 不可勾、`by` 必选依据（`required` 属性、`aria` 为 aria-required、`star` 为标签带 `*` 或“必須”字样、`marker` 为含必填标记元素、`ctx` 为容器文字带 `*`）、`t` 标签含服务条款或年龄关键词（放宽时会补勾）、`o` 标签含邮件、订阅、调研、通知类关键词（不按文字判定为必选、不补勾）、`hid` 勾选框自己不可见（原生 input 被隐藏，靠所在组件或 label 算可见）、`kind` 类别（`input` 或 `role` 加所在组件的标签名，如 `input/mat-checkbox`、`role/div`）、`label` 标签开头 40 字与结尾 15 字（中间以 `…` 省略，结尾的 `*` 不丢）；`buttons` 为看到的按钮（最多 8 个）：`text` 文字前 40 字（图标按钮取 aria-label）、`on` 是否启用、`skip` 为不点的原因（`link` 链接、`area` 勾选框、开关与标签里或页头导航与全局横幅里的、`cookie` Cookie 同意横幅里的、`popup` 菜单与展开类、`neg` 关闭返回取消拒绝跳过与切换账号类（含没有 aria-label 的图标按钮 `close_small`、`arrow_back`、`chevron_left` 等）、`opt` 订阅邮件调研通知与注册类、`icon` 认不出是什么的按钮（没有 aria-label、title，文字为空或只有图标））；`links` 为范围内可见链接的文字（最多 3 个，继续是链接样式时在这里）；`controls` 为范围内勾选框以外的可见表单控件（`n` 数量，`kinds` 类别，如 `input:date`、`mat-select`、`role:radio`）；`outside` 为范围之外可见的按钮（最多 3 个，格式同 `buttons`）。文字里的邮箱打码为前两位加 `***@***`，`|` 换成 `¦`；超长时先缩短标签（仍保留开头与结尾）与范围外的按钮、再减少链接与条目，`scope`、勾选框数、`controls` 的计数与各条目的标记一直保留。
+
+订阅网络事件、安装拦截之后（等 Run 按钮、提交、等 WAA service、等被拦截的请求、读取与移除请求捕获）的页面类失败发生时页面停在首次使用页（Run 按钮出现后才被路由过去），这次启动不重做（会重复订阅与拦截）：先采页面快照，就地完成首次使用页并写回完成之后的 localStorage（首次使用状态记在服务端时账号下次启动就能过，记在 localStorage 里时靠这次写回；写回没成功时会写上面那条警告），照常以原错误失败，原错误前缀不变，末尾补 `；已完成首次使用页`（勾选或点击过）；识别之后页面随即自己离开了首次使用页、什么都没点时补 `；首次使用页已自行离开`（不写 INFO）；没能完成时补 `；首次使用页未能完成: <原因>` 并在快照之后接结构摘要。就地完成同样写上面那行 `完成 AI Studio 首次使用页` INFO。这类失败同样不触发缓存自愈清理。运行中 Worker 准备 proof 时不处理首次使用页（`同步官网 prompt` 失败、Worker 重建，重建时由启动流程处理）。失败处判断是否停在首次使用页的那次页面读取与页面快照共用 4 秒上限，浏览器卡住时与原来只采快照一样很快失败。`bash tools/diag_start.sh` 最后一段按来源（Worker 启动、账户验证、账户登录、账户添加）统计自动完成次数（含就地完成；`；首次使用页已自行离开` 另计，不算完成）、按放宽规则补勾（`[补]`）的次数与勾选过的标签，按 `WAA Worker 启动失败` 与 `账户验证失败` 两类统计未能完成的次数（同一次失败另写的 `账号切换`、`新账户自动处理出错` 不重复计），并列出原因与结构摘要样本（前 3 条）。
 
 ### 失败时的页面快照
 

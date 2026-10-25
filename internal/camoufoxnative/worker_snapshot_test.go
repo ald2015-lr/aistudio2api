@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,20 +25,29 @@ const fakePageURL = "https://aistudio.google.com/prompts/new_chat?model=gemini-f
 
 // fakeEvaluate 为假页面对一条 script.evaluate 的回答：value 为页面返回值，exception 为页面抛错的文字；
 // closeConnection 为真时假浏览器直接断开连接（模拟浏览器崩溃），noReply 为真时不回答这条命令（模拟浏览器卡住）；
+// commandError 不为空时以这个错误码回答 BiDi 命令失败（如 "no such frame"：页面正在跳转，旧文档已销毁）；
 // received 不为空时假浏览器收到这条命令后先调用它（在假浏览器的协程里）
 type fakeEvaluate struct {
 	value           any
 	exception       string
 	closeConnection bool
 	noReply         bool
+	commandError    string
 	received        func()
 }
 
 // fakeBiDiPage 为测试用的假 Camoufox：WebSocket 上按 BiDi 协议回答命令，script.evaluate 交给 evaluate 回调；
-// 快照表达式回答构造时给定的 snapshot（newFakeBiDiPage 为 fakeSnapshot）并计数
+// 快照表达式回答构造时给定的 snapshot（newFakeBiDiPage 为 fakeSnapshot）并计数；收到的命令方法按顺序记在 methods
 type fakeBiDiPage struct {
 	client    *bidiClient
 	snapshots atomic.Int32
+	mu        sync.Mutex
+	methods   []string
+}
+
+// fakeBiDiHooks 为假 Camoufox 的可选钩子：command 在收到每条命令时调用（在假浏览器的协程里），返回的事件在回复之前先发出
+type fakeBiDiHooks struct {
+	command func(method string, params map[string]any) []map[string]any
 }
 
 func newFakeBiDiPage(t *testing.T, evaluate func(expression string) fakeEvaluate) *fakeBiDiPage {
@@ -46,6 +57,25 @@ func newFakeBiDiPage(t *testing.T, evaluate func(expression string) fakeEvaluate
 
 // newFakeBiDiPageWithSnapshot 同 newFakeBiDiPage，快照表达式改为回答 snapshot
 func newFakeBiDiPageWithSnapshot(t *testing.T, evaluate func(expression string) fakeEvaluate, snapshot fakeEvaluate) *fakeBiDiPage {
+	t.Helper()
+	return newFakeBiDiPageWithHooks(t, evaluate, snapshot, fakeBiDiHooks{})
+}
+
+// commandMethods 返回假浏览器收到的命令方法（按顺序），skip 里的方法不计
+func (page *fakeBiDiPage) commandMethods(skip ...string) []string {
+	page.mu.Lock()
+	defer page.mu.Unlock()
+	var methods []string
+	for _, method := range page.methods {
+		if !slices.Contains(skip, method) {
+			methods = append(methods, method)
+		}
+	}
+	return methods
+}
+
+// newFakeBiDiPageWithHooks 同 newFakeBiDiPageWithSnapshot，另带命令钩子（见 fakeBiDiHooks）
+func newFakeBiDiPageWithHooks(t *testing.T, evaluate func(expression string) fakeEvaluate, snapshot fakeEvaluate, hooks fakeBiDiHooks) *fakeBiDiPage {
 	t.Helper()
 	page := &fakeBiDiPage{}
 	upgrader := websocket.Upgrader{}
@@ -63,6 +93,16 @@ func newFakeBiDiPageWithSnapshot(t *testing.T, evaluate func(expression string) 
 			}
 			if err := connection.ReadJSON(&message); err != nil {
 				return
+			}
+			page.mu.Lock()
+			page.methods = append(page.methods, message.Method)
+			page.mu.Unlock()
+			if hooks.command != nil {
+				for _, event := range hooks.command(message.Method, message.Params) {
+					if err := connection.WriteJSON(event); err != nil {
+						return
+					}
+				}
 			}
 			result := map[string]any{}
 			switch message.Method {
@@ -86,6 +126,14 @@ func newFakeBiDiPageWithSnapshot(t *testing.T, evaluate func(expression string) 
 					return
 				}
 				if answer.noReply {
+					continue
+				}
+				if answer.commandError != "" {
+					if err := connection.WriteJSON(map[string]any{
+						"id": message.ID, "type": "error", "error": answer.commandError, "message": "Browsing context has been discarded",
+					}); err != nil {
+						return
+					}
 					continue
 				}
 				result = evaluateResult(answer)
@@ -214,6 +262,8 @@ func healthyBootstrapPage(expression string, prompt string) fakeEvaluate {
 	switch expression {
 	case "location.href":
 		return fakeEvaluate{value: fakePageURL}
+	case onboardingPageExpression:
+		return fakeEvaluate{value: false}
 	case dismissOverlaysExpression:
 		return fakeEvaluate{value: 0}
 	case snapshotHookExpression():

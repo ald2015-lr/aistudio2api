@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
 const (
@@ -108,13 +110,15 @@ type LoginMethod struct {
 	Interactive bool   `json:"interactive"`
 }
 
-// IsolatedLoginRequest 描述独立浏览器登录所需的稳定环境
+// IsolatedLoginRequest 描述独立浏览器登录所需的稳定环境。OnboardingCompleted 不为空时，登录或验证中自动完成 AI Studio 首次使用页
+// （勾选必选项、点继续）之后调用它（见 camoufoxnative.LoginOptions.OnboardingCompleted），供调用方写日志
 type IsolatedLoginRequest struct {
-	AccountID string
-	Directory string
-	Proxy     string
-	Locale    string
-	Timezone  string
+	AccountID           string
+	Directory           string
+	Proxy               string
+	Locale              string
+	Timezone            string
+	OnboardingCompleted func(camoufoxnative.OnboardingResult)
 }
 
 // IsolatedLoginResult 返回独立浏览器导出的认证状态

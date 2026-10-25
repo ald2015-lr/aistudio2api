@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1303,6 +1304,14 @@ func (manager *accountWorkerManager) startReservedWorker(
 	// 失败与账户缓存无关，不清理（否则那个 runtime 在 launch 返回前释放锁时，会清掉它一直正常使用的缓存）
 	var cacheAttached atomic.Bool
 	options.CacheAttached = func() { cacheAttached.Store(true) }
+	// 启动时自动完成了 AI Studio 首次使用页（只勾必选项、点继续）：写一行，之后的启动步骤照常；仍失败时沿用启动失败日志。
+	// 同时把完成之后页面的 localStorage 写回认证文件（首次使用状态可能记在 localStorage 里：完成之后这次启动仍失败时浏览器随即关闭，
+	// 启动成功后的写回轮不到它）。generation 为启动前读取的认证代际，期间保存过新登录或续签时不写（同 persistStartupLocalStorage）
+	onboardingGeneration := manager.pool.AuthGeneration(account.id)
+	options.OnboardingCompleted = func(result camoufoxnative.OnboardingResult) {
+		manager.requests.log(label, "INFO", onboardingCompletedMessage(result))
+		manager.persistOnboardingLocalStorage(account.id, label, onboardingGeneration, result.LocalStorage)
+	}
 	launch := manager.launch
 	if launch == nil {
 		launch = newWAAWorker
@@ -1454,6 +1463,21 @@ func workerStartupProgress(stage camoufoxnative.StartupStage) (int, string) {
 		return 7, "执行 WAA Bootstrap"
 	}
 	panic(fmt.Sprintf("未知 WAA Worker 启动阶段: %s", stage))
+}
+
+// onboardingCompletedMessage 为启动时自动完成 AI Studio 首次使用页的日志：勾选数与各次勾选的标签（已打码、截短，按放宽规则补勾的带“[补]”，
+// 写在括号里、以“；”分隔）、最后点击的按钮文字（已打码、截短，没有点击时写 -）与耗时
+func onboardingCompletedMessage(result camoufoxnative.OnboardingResult) string {
+	button := strings.TrimSpace(result.Button)
+	if button == "" {
+		button = "-"
+	}
+	checked := strconv.Itoa(result.Checked)
+	if len(result.Labels) > 0 {
+		checked += "（" + strings.Join(result.Labels, "；") + "）"
+	}
+	return fmt.Sprintf("完成 AI Studio 首次使用页 | 勾选=%s | 按钮=%s | 耗时=%s",
+		checked, button, result.Elapsed.Round(time.Millisecond))
 }
 
 // tryReserveVictim 在旧 Worker 尚未被其他替换选中时标记它，返回是否标记成功。

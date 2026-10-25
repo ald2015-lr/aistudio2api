@@ -263,6 +263,11 @@ func (client *bidiClient) pageDiagnosis(ctx context.Context, contextID string, w
 	}
 	diagnosisCtx, cancel := context.WithTimeout(context.Background(), pageSnapshotTimeout)
 	defer cancel()
+	return client.pageDiagnosisWithin(diagnosisCtx, contextID, withURL)
+}
+
+// pageDiagnosisWithin 同 pageDiagnosis，地址与快照用调用方给的诊断上下文（与同一处的其他诊断共用期限，见 startupFailureDiagnosis）
+func (client *bidiClient) pageDiagnosisWithin(diagnosisCtx context.Context, contextID string, withURL bool) (pageURL string, suffix string) {
 	if withURL {
 		pageURL, _ = client.evaluateString(diagnosisCtx, contextID, "location.href")
 	}

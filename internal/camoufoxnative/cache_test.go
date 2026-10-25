@@ -323,6 +323,33 @@ func TestPageStateFailure(t *testing.T) {
 	}
 }
 
+// TestPageStateFailureSkipsOnboarding 首次使用页上的失败不算页面状态类（清缓存没用）：没能完成首次使用页，
+// 以及订阅之后的页面类失败发生时页面停在首次使用页（原错误前缀照旧是页面状态类的），包装后同样识别
+func TestPageStateFailureSkipsOnboarding(t *testing.T) {
+	base := errors.New("等待页面条件超时")
+	failure := &onboardingFailure{reason: "找不到可点的继续按钮", snapshot: " | 页面={}"}
+	original := fmt.Errorf("等待官网 Run 按钮启用: %w", base)
+	interrupted := &onboardingInterrupted{err: original, text: original.Error() + "；已完成首次使用页"}
+	if !strings.HasPrefix(failure.Error(), OnboardingFailedPrefix+": ") {
+		t.Fatalf("文案前缀不对: %s", failure.Error())
+	}
+	for name, err := range map[string]error{
+		"未能完成":    failure,
+		"已就地完成":   interrupted,
+		"中转说明":    fmt.Errorf("%w；本机代理中转：连接上游超时", interrupted),
+		"Join":    errors.Join(failure, errors.New("释放账户浏览器缓存失败")),
+		"外层":      fmt.Errorf("WAA Worker 初始化: %w", interrupted),
+		"包着页面类原文": fmt.Errorf("%w", &onboardingFailure{reason: "x", cause: fmt.Errorf("官网 WAA service 未暴露: %w", base)}),
+	} {
+		if got, ok := PageStateFailure(err); ok {
+			t.Fatalf("%s: 首次使用页上的失败不应算页面状态类，匹配 %q", name, got)
+		}
+	}
+	if !errors.Is(interrupted, base) {
+		t.Fatal("就地完成后错误链应保留原错误")
+	}
+}
+
 // TestPageStateFailurePrefixesMatchBootstrap 前缀表里的每一项都要在启动代码的错误文案里出现：bootstrap 改了文案时提醒同步修改
 func TestPageStateFailurePrefixesMatchBootstrap(t *testing.T) {
 	var source strings.Builder

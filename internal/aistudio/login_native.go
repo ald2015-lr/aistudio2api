@@ -128,11 +128,12 @@ func (driver *NativeLoginDriver) relayOptions(request IsolatedLoginRequest, oper
 
 func (driver *NativeLoginDriver) options(request IsolatedLoginRequest) camoufoxnative.LoginOptions {
 	return camoufoxnative.LoginOptions{
-		ExecutablePath: driver.camoufox,
-		Directory:      request.Directory,
-		Locale:         request.Locale,
-		Timezone:       request.Timezone,
-		Proxy:          request.Proxy,
-		Timeout:        driver.timeout,
+		ExecutablePath:      driver.camoufox,
+		Directory:           request.Directory,
+		Locale:              request.Locale,
+		Timezone:            request.Timezone,
+		Proxy:               request.Proxy,
+		Timeout:             driver.timeout,
+		OnboardingCompleted: request.OnboardingCompleted,
 	}
 }

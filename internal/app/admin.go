@@ -269,6 +269,7 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	result, err := admin.login.Login(ctx, aistudio.IsolatedLoginRequest{
 		AccountID: "new", Directory: directory, Proxy: loginProxy,
 		Locale: accountConfig.Locale, Timezone: accountConfig.Timezone,
+		OnboardingCompleted: admin.onboardingLogger("auth", "账户添加"),
 	})
 	if err != nil {
 		admin.requests.log("auth", "ERROR", fmt.Sprintf(
@@ -617,7 +618,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 1/2 | 等待隔离登录")
 	loginProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindLogin, account.Config.Label, account.Config.Proxy)
 	defer poolLease.release()
-	result, err := admin.login.Login(ctx, admin.loginRequest(account, directory, loginProxy))
+	request := admin.loginRequest(account, directory, loginProxy)
+	request.OnboardingCompleted = admin.onboardingLogger(account.Config.Label, "账户登录")
+	result, err := admin.login.Login(ctx, request)
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"账户登录失败 | 耗时=%s | 错误=%s",
@@ -714,7 +717,9 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 	// 验证是完整的浏览器会话：同样占一个 IP 池出口（账户已有 Worker 时共用它的端口），返回时归还
 	verifyProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
 	defer poolLease.release()
-	verification, err := admin.login.Verify(ctx, admin.loginRequest(account, account.Directory, verifyProxy), account.StorageState)
+	request := admin.loginRequest(account, account.Directory, verifyProxy)
+	request.OnboardingCompleted = admin.onboardingLogger(account.Config.Label, "账户验证")
+	verification, err := admin.login.Verify(ctx, request, account.StorageState)
 	if err != nil {
 		admin.requests.log(account.Config.Label, "ERROR", fmt.Sprintf(
 			"账户验证失败 | 耗时=%s | 错误=%s",
@@ -944,6 +949,14 @@ func (admin *runtimeAdmin) effectiveProxy(accountProxy string) string {
 		return proxy
 	}
 	return strings.TrimSpace(admin.config.Proxy)
+}
+
+// onboardingLogger 返回登录、验证时自动完成 AI Studio 首次使用页的日志回调：写“<operation> | 完成 AI Studio 首次使用页 | 勾选=N（…） | 按钮=… | 耗时=…”
+// （格式同 Worker 启动时的那一行，见 onboardingCompletedMessage）
+func (admin *runtimeAdmin) onboardingLogger(label string, operation string) func(camoufoxnative.OnboardingResult) {
+	return func(result camoufoxnative.OnboardingResult) {
+		admin.requests.log(label, "INFO", operation+" | "+onboardingCompletedMessage(result))
+	}
 }
 
 // loginRequest 为已有账户的隔离登录或验证请求；proxy 为这次浏览器实际使用的出口（见 browserProxy）

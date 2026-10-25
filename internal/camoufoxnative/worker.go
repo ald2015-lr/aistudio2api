@@ -272,48 +272,24 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if err := client.installCookies(ctx, storage.Cookies); err != nil {
 		return err
 	}
-	options.reportStartup(StartupLoadingAIStudio)
 	target := aiStudioOrigin + "/prompts/new_chat?model=" + url.QueryEscape(options.Model)
 	if options.TemporaryChat {
 		target += "&temporary=true"
 	}
-	// 记下导航时刻：失败时快照的 since 与页面的 age 对照，看导航之后文档是否被替换过（刷新、跳转）
-	client.markNavigated()
-	if _, err := client.command(ctx, "browsingContext.navigate", map[string]any{
-		"context": contextID,
-		"url":     target,
-		"wait":    "interactive",
-	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
-		return fmt.Errorf("导航 AI Studio: %w", err)
-	}
-	if err := client.waitFor(ctx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
-		// 初始化 ctx 到期时 location.href 也取不到（url 曾因此为空）：地址与页面快照改用同一个独立的短上下文读取
-		pageURL, snapshot := client.pageDiagnosis(ctx, contextID, true)
-		return fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w%s", pageURL, err, snapshot)
-	}
-	pageURL, err := client.evaluateString(ctx, contextID, "location.href")
-	if err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
-	}
-	if strings.Contains(pageURL, "accounts.google.com") {
-		return fmt.Errorf("隔离登录态失效 url=%s", pageURL)
-	}
-	if err := dismissKnownOverlays(ctx, client, contextID); err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
-	}
-	options.reportStartup(StartupLocatingWAA)
-	snapshotKey, err := client.waitSnapshotFunction(ctx, contextID, 30*time.Second)
-	if err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
-	}
-	if err := installBootstrapRequestCapture(ctx, client, contextID); err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
-	}
-	options.reportStartup(StartupBootstrappingWAA)
-	filled, err := client.evaluateString(ctx, contextID, fillPromptExpression(options.BootstrapPrompt))
-	if err != nil || normalizePromptNewlines(filled) != normalizePromptNewlines(options.BootstrapPrompt) {
-		_, snapshot := client.pageDiagnosis(ctx, contextID, false)
-		return fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v%s", filled, err, snapshot)
+	// 从导航到填好提示词（session.subscribe 之前）只有页面 window 上的状态，停在首次使用页时完成首次使用、重新导航后整段重做是安全的。
+	// 等到页面就绪时就在首次使用页，或这一段任何一步失败时页面在首次使用页（输入框出现后 1～2 秒才被 SPA 路由过去），
+	// 都完成首次使用后从重新导航开始重做（两种情形 openPromptPage 都返回 errOnboardingPage）；每次启动最多完成 onboardingCompletionLimit 次，
+	// 之后仍回到首次使用页时以 OnboardingFailedPrefix 失败
+	var onboarding onboardingBudget
+	pageURL, snapshotKey, err := worker.openPromptPage(ctx, options, target)
+	for err != nil {
+		if !errors.Is(err, errOnboardingPage) {
+			return err
+		}
+		if _, err := worker.finishOnboarding(ctx, options, &onboarding); err != nil {
+			return err
+		}
+		pageURL, snapshotKey, err = worker.openPromptPage(ctx, options, target)
 	}
 	if _, err := client.command(ctx, "session.subscribe", map[string]any{
 		"events":   []string{"network.beforeRequestSent"},
@@ -338,19 +314,23 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if interceptID == "" {
 		return errors.New("GenerateContent 拦截 ID 无效")
 	}
-	// 页面类失败（等待页面条件、执行页面脚本）在原错误末尾追加页面快照（见 withPageSnapshot），网络拦截与订阅命令的失败不追加
+	// 页面类失败（等待页面条件、执行页面脚本）在原错误末尾追加页面快照（见 withPageSnapshot），网络拦截与订阅命令的失败不追加。
+	// 订阅与拦截之后不再重做（会重复订阅与拦截）：失败时页面停在首次使用页就就地完成、照常返回失败（见 interceptedPageFailure）
+	pageFailure := func(err error) error {
+		return worker.interceptedPageFailure(ctx, options, &onboarding, err)
+	}
 	if err := client.waitFor(ctx, contextID, runButtonEnabledExpression, 15*time.Second); err != nil {
-		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("等待官网 Run 按钮启用: %w", err))
+		return pageFailure(fmt.Errorf("等待官网 Run 按钮启用: %w", err))
 	}
 	if _, err := client.evaluate(ctx, contextID, submitPromptExpression); err != nil {
-		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("提交官网提示词: %w", err))
+		return pageFailure(fmt.Errorf("提交官网提示词: %w", err))
 	}
 	if err := client.waitFor(ctx, contextID, "Boolean(window.__aistudioWaaService)", 60*time.Second); err != nil {
-		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("官网 WAA service 未暴露: %w", err))
+		return pageFailure(fmt.Errorf("官网 WAA service 未暴露: %w", err))
 	}
 	requestID, err := client.waitBlockedGenerateRequest(ctx, contextID, 60*time.Second)
 	if err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
+		return pageFailure(err)
 	}
 	if _, err := client.command(ctx, "network.failRequest", map[string]any{"request": requestID}); err != nil {
 		return fmt.Errorf("终止 bootstrap GenerateContent: %w", err)
@@ -360,7 +340,7 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	}
 	actualModel, err := capturedBootstrapModel(ctx, client, contextID)
 	if err != nil {
-		return client.withPageSnapshot(ctx, contextID, err)
+		return pageFailure(err)
 	}
 	if actualModel != strings.TrimPrefix(options.Model, "models/") {
 		return fmt.Errorf("官网初始化页面模型不匹配 expected=%s actual=%s", options.Model, actualModel)
@@ -372,11 +352,11 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
   return true;
 })()`)
 	if err != nil {
-		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("移除 bootstrap 请求捕获: %w", err))
+		return pageFailure(fmt.Errorf("移除 bootstrap 请求捕获: %w", err))
 	}
 	if !restored {
 		// 捕获装在 window 上，页面中途刷新或跳转后就不在了，快照的 cap、hook 与 nav 可以印证
-		return client.withPageSnapshot(ctx, contextID, errors.New("bootstrap 请求捕获未安装"))
+		return pageFailure(errors.New("bootstrap 请求捕获未安装"))
 	}
 	headers := make(http.Header, len(publicHeaderNames))
 	for _, name := range publicHeaderNames {
@@ -409,6 +389,120 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 		Headers:     headers,
 	}
 	return nil
+}
+
+// openPromptPage 导航到 target，等页面就绪后定位 WAA 并填好 bootstrap 提示词（启动 5/7 到 7/7 填写提示词，session.subscribe 之前），
+// 返回页面地址与官网 snapshot 函数的键。等到页面就绪时停在首次使用页，或从等就绪起任何一步的页面类失败发生时页面在首次使用页，
+// 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；其余页面类失败与原来一样追加页面快照。
+// 失败处的识别与快照共用一个短期限（见 startupFailureDiagnosis），浏览器卡住时与原来一样最多多等 pageSnapshotTimeout
+func (worker *Worker) openPromptPage(ctx context.Context, options Options, target string) (string, string, error) {
+	client := worker.client
+	contextID := worker.contextID
+	// pageFailure 为页面类失败的收尾：在首次使用页时返回 errOnboardingPage，否则同 withPageSnapshot
+	pageFailure := func(err error) error {
+		onboarding, _, suffix := client.startupFailureDiagnosis(ctx, contextID, false)
+		if onboarding {
+			return errOnboardingPage
+		}
+		if suffix == "" {
+			return err
+		}
+		return fmt.Errorf("%w%s", err, suffix)
+	}
+	options.reportStartup(StartupLoadingAIStudio)
+	// 记下导航时刻：失败时快照的 since 与页面的 age 对照，看导航之后文档是否被替换过（刷新、跳转）
+	client.markNavigated()
+	if _, err := client.command(ctx, "browsingContext.navigate", map[string]any{
+		"context": contextID,
+		"url":     target,
+		"wait":    "interactive",
+	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+		return "", "", fmt.Errorf("导航 AI Studio: %w", err)
+	}
+	if err := client.waitFor(ctx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
+		// 初始化 ctx 到期时 location.href 也取不到（url 曾因此为空）：地址与页面快照改用同一个独立的短上下文读取
+		onboarding, pageURL, snapshot := client.startupFailureDiagnosis(ctx, contextID, true)
+		if onboarding {
+			return "", "", errOnboardingPage
+		}
+		return "", "", fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w%s", pageURL, err, snapshot)
+	}
+	pageURL, err := client.evaluateString(ctx, contextID, "location.href")
+	if err != nil {
+		return "", "", pageFailure(err)
+	}
+	if strings.Contains(pageURL, "accounts.google.com") {
+		return "", "", fmt.Errorf("隔离登录态失效 url=%s", pageURL)
+	}
+	if client.onboardingPage(ctx, contextID) {
+		return "", "", errOnboardingPage
+	}
+	if err := dismissKnownOverlays(ctx, client, contextID); err != nil {
+		return "", "", pageFailure(err)
+	}
+	options.reportStartup(StartupLocatingWAA)
+	snapshotKey, err := client.waitSnapshotFunction(ctx, contextID, 30*time.Second)
+	if err != nil {
+		return "", "", pageFailure(err)
+	}
+	if err := installBootstrapRequestCapture(ctx, client, contextID); err != nil {
+		return "", "", pageFailure(err)
+	}
+	options.reportStartup(StartupBootstrappingWAA)
+	filled, err := client.evaluateString(ctx, contextID, fillPromptExpression(options.BootstrapPrompt))
+	if err != nil || normalizePromptNewlines(filled) != normalizePromptNewlines(options.BootstrapPrompt) {
+		onboarding, _, snapshot := client.startupFailureDiagnosis(ctx, contextID, false)
+		if onboarding {
+			return "", "", errOnboardingPage
+		}
+		return "", "", fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v%s", filled, err, snapshot)
+	}
+	return pageURL, snapshotKey, nil
+}
+
+// finishOnboarding 自动完成首次使用页一次（受 budget 限制），勾选或点击过时导出完成后的 localStorage（见 OnboardingResult.LocalStorage）
+// 并调用 Options.OnboardingCompleted。返回这次的结果：页面自己离开首次使用页（什么都没点）时 acted 为假
+func (worker *Worker) finishOnboarding(ctx context.Context, options Options, budget *onboardingBudget) (OnboardingResult, error) {
+	result, err := budget.finish(ctx, worker.client, worker.contextID)
+	if err != nil {
+		return result, err
+	}
+	if result.acted() && options.OnboardingCompleted != nil {
+		result.LocalStorage = worker.client.onboardingLocalStorage(ctx, worker.contextID)
+		options.OnboardingCompleted(result)
+	}
+	return result, nil
+}
+
+// interceptedPageFailure 处理订阅网络事件与安装拦截之后（等 Run、提交、等 WAA service、等拦截请求、读取与移除捕获）的页面类失败：
+// 页面不在首次使用页时与原来一样追加页面快照（识别与快照共用一个短期限，见 startupFailureDiagnosis）。在首次使用页时先采快照
+// （失败那一刻的首次使用页），再就地完成首次使用（账号以后能起；这里不重做 bootstrap，重做会重复订阅与拦截），照常返回失败：
+// 原错误文字不变，末尾补一句“；已完成首次使用页”（勾选或点击过）、“；首次使用页已自行离开”（识别之后页面自己离开了、什么都没点，
+// 也不写完成日志）或“；首次使用页未能完成: <原因>”，再接快照与结构摘要
+func (worker *Worker) interceptedPageFailure(ctx context.Context, options Options, budget *onboardingBudget, err error) error {
+	client := worker.client
+	onboarding, _, suffix := client.startupFailureDiagnosis(ctx, worker.contextID, false)
+	if !onboarding {
+		if suffix == "" {
+			return err
+		}
+		return fmt.Errorf("%w%s", err, suffix)
+	}
+	_, snapshot := client.pageDiagnosis(ctx, worker.contextID, false)
+	note, structure := "；已完成首次使用页", ""
+	result, finishErr := worker.finishOnboarding(ctx, options, budget)
+	switch {
+	case finishErr != nil:
+		note = "；首次使用页未能完成"
+		var failure *onboardingFailure
+		if errors.As(finishErr, &failure) {
+			note += ": " + failure.reason
+			structure = failure.structure
+		}
+	case !result.acted():
+		note = "；首次使用页已自行离开"
+	}
+	return &onboardingInterrupted{err: err, text: err.Error() + note + snapshot + structure}
 }
 
 func installBootstrapRequestCapture(ctx context.Context, client *bidiClient, contextID string) error {

@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 )
@@ -39,6 +41,25 @@ func (manager *accountWorkerManager) persistStartupLocalStorage(accountID string
 	}
 	if _, err := manager.pool.MergeBrowserLocalStorage(accountID, generation, origin); err != nil {
 		manager.warnStartupLocalStorage(accountID, err)
+	}
+}
+
+// persistOnboardingLocalStorage 在 Worker 启动中自动完成 AI Studio 首次使用页之后，把页面当时的 localStorage（encoded，格式同
+// camoufoxnative.Worker.StorageLocalStorage）写回账户的认证文件（见 MergeBrowserLocalStorage）。generation 为启动前读取的认证代际；
+// 没有导出内容时不写。解析或写回失败只写一条警告（不含值），不影响启动；启动成功后 persistStartupLocalStorage 照常再写一次
+func (manager *accountWorkerManager) persistOnboardingLocalStorage(accountID string, label string, generation uint64, encoded []byte) {
+	if manager == nil || manager.pool == nil || len(encoded) == 0 {
+		return
+	}
+	var origin aistudio.StorageOrigin
+	err := json.Unmarshal(encoded, &origin)
+	if err != nil {
+		err = errors.New("解析浏览器 localStorage 失败")
+	} else {
+		_, err = manager.pool.MergeBrowserLocalStorage(accountID, generation, origin)
+	}
+	if err != nil && manager.requests != nil {
+		manager.requests.log(label, "WARN", "完成 AI Studio 首次使用页后写回 localStorage 失败 | 错误="+strings.TrimSpace(err.Error()))
 	}
 }
 

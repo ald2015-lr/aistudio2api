@@ -12,13 +12,16 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
 )
 
-// verifyTestLogin 为测试用隔离浏览器：验证返回固定结果并计数；onVerify 非空时在验证中（仍持有账户租约）调用
+// verifyTestLogin 为测试用隔离浏览器：验证返回固定结果并计数；onVerify 非空时在验证中（仍持有账户租约）调用；
+// onboarding 非空时在验证中自动完成了首次使用页（调用请求里的 OnboardingCompleted）
 type verifyTestLogin struct {
 	verification aistudio.LoginVerification
 	calls        atomic.Int32
 	onVerify     func()
+	onboarding   *camoufoxnative.OnboardingResult
 }
 
 func (login *verifyTestLogin) Login(context.Context, aistudio.IsolatedLoginRequest) (aistudio.IsolatedLoginResult, error) {
@@ -26,11 +29,14 @@ func (login *verifyTestLogin) Login(context.Context, aistudio.IsolatedLoginReque
 }
 
 func (login *verifyTestLogin) Verify(
-	context.Context, aistudio.IsolatedLoginRequest, aistudio.StorageState,
+	_ context.Context, request aistudio.IsolatedLoginRequest, _ aistudio.StorageState,
 ) (aistudio.LoginVerification, error) {
 	login.calls.Add(1)
 	if login.onVerify != nil {
 		login.onVerify()
+	}
+	if login.onboarding != nil && request.OnboardingCompleted != nil {
+		request.OnboardingCompleted(*login.onboarding)
 	}
 	verification := login.verification
 	verification.VerifiedAt = time.Now()

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # AIStudio2API 一键诊断“Worker 起不来”：系统资源 → 状态接口（Worker、预热、IP 池、出口）→ 绕过程序直连测 IP 池端口 →
 # 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志 → 失败时的页面状态（启动失败与 Worker 重建日志末尾的“页面=…”快照）
+# → AI Studio 首次使用页（自动完成与未能完成的次数、原因与结构摘要样本）
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -162,9 +163,28 @@ page_total, page_heads, page_groups, page_samples, page_kinds = collections.Coun
 # 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
 page_dist = {}
 snapshot_failures = collections.Counter()
+# AI Studio 首次使用页（见 docs/logging.md）：Worker 启动时自动完成写“完成 AI Studio 首次使用页 | 勾选=N（标签；[补]标签） | 按钮=… | 耗时=…”
+# （括号里为各次勾选的标签，已打码截短，按放宽规则补勾的带“[补]”），账户验证、登录与添加时写“账户验证 | 完成 AI Studio 首次使用页 | …”
+# （账户登录、账户添加同理）；没能完成的错误以“AI Studio 首次使用页未能完成: <原因>”开头（启动失败、账户验证失败），末尾在页面快照之后
+# 另接“ | 结构={…}”（勾选框与按钮的结构摘要，已打码）；订阅网络事件之后才到首次使用页时原错误不变，末尾补“；已完成首次使用页”
+# （同一次就地完成另写了上面那行 INFO）、“；首次使用页已自行离开”（识别之后页面自己离开、什么都没点，不写 INFO）或“；首次使用页未能完成: <原因>”。
+# 同一次失败还会出现在“账号切换 | …\n原因: 获取账户 WAA preparer: …”（请求触发的冷启动）与“新账户自动处理出错…”里，只按 ONBOARD_FAIL_HEADS 计
+ONBOARD_DONE_RE = re.compile(r"^(?:(账户验证|账户登录|账户添加) \| )?完成 AI Studio 首次使用页(?: \||$)")
+ONBOARD_CHECKED_RE = re.compile(r"^(\d+)(?:（(.*)）)?$")
+ONBOARD_RELAXED = "[补]"
+ONBOARD_FAIL_HEADS = ("WAA Worker 启动失败", "账户验证失败")
+ONBOARD_FAIL_RE = re.compile(r"AI Studio 首次使用页未能完成: ([^|\n]*)")
+ONBOARD_INPLACE_DONE = "；已完成首次使用页"
+ONBOARD_INPLACE_LEFT = "；首次使用页已自行离开"
+ONBOARD_INPLACE_FAIL_RE = re.compile(r"；首次使用页未能完成(?:: ([^|\n]*))?")
+STRUCT_RE = re.compile(r" \| 结构=(\{.*?)(?=；本机代理中转：| \| |\n|$)")
+onboard_done, onboard_checked, onboard_buttons, onboard_secs = collections.Counter(), collections.Counter(), collections.Counter(), []
+onboard_labels, onboard_relaxed_runs, onboard_relaxed_boxes = collections.Counter(), 0, 0
+onboard_fail_heads, onboard_fail_reasons, onboard_structures = collections.Counter(), collections.Counter(), []
+onboard_inplace_done, onboard_inplace_left = 0, 0
 def strip_page(text):
-    """去掉页面快照，快照之后的本机代理中转说明与日志字段照常保留"""
-    return PAGE_RE.sub("", text or "")
+    """去掉页面快照与首次使用页的结构摘要（见 STRUCT_RE，汇总在最后一段），之后的本机代理中转说明与日志字段照常保留"""
+    return STRUCT_RE.sub("", PAGE_RE.sub("", text or ""))
 def start_error(msg):
     """启动失败的原错误（去掉页面快照、拼回快照之后的本机代理中转说明）"""
     return fields(strip_page(msg)).get("错误", "")
@@ -341,6 +361,47 @@ for p in paths:
                         dist = page_dist.setdefault((key, reason), {label: collections.Counter() for label, _ in PAGE_DIST})
                         for label, value_of in PAGE_DIST:
                             dist[label][value_of(snap)] += 1
+            done = ONBOARD_DONE_RE.match(msg)
+            if done:
+                f = fields(msg)
+                onboard_done[done.group(1) or "Worker 启动"] += 1
+                checked = ONBOARD_CHECKED_RE.match(f.get("勾选", ""))
+                onboard_checked[checked.group(1) if checked else "?"] += 1
+                labels = [item for item in ((checked.group(2) or "").split("；") if checked else []) if item]
+                for item in labels:
+                    onboard_labels[item] += 1
+                relaxed = sum(1 for item in labels if item.startswith(ONBOARD_RELAXED))
+                if relaxed:
+                    onboard_relaxed_runs += 1
+                    onboard_relaxed_boxes += relaxed
+                onboard_buttons[f.get("按钮", "?")] += 1
+                seconds = duration(f.get("耗时"))
+                if seconds is not None:
+                    onboard_secs.append(seconds)
+            if "首次使用页" in msg and head in ONBOARD_FAIL_HEADS:
+                clean = strip_page(msg)
+                failed = ONBOARD_FAIL_RE.search(clean)
+                inplace_failed = None if failed else ONBOARD_INPLACE_FAIL_RE.search(clean)
+                if failed or inplace_failed:
+                    label = head
+                    if inplace_failed:
+                        label += "（订阅之后，就地完成失败）"
+                    onboard_fail_heads[label] += 1
+                    reason = ((failed or inplace_failed).group(1) or "").split("；本机代理中转：", 1)[0].strip() or "-"
+                    onboard_fail_reasons[DIGITS.sub("#", reason)[:120]] += 1
+                    m = STRUCT_RE.search(msg)
+                    if m:
+                        try:
+                            _, end = json.JSONDecoder().raw_decode(m.group(1))
+                            sample = m.group(1)[:end]
+                        except ValueError:
+                            sample = m.group(1)
+                        if sample not in onboard_structures and len(onboard_structures) < 3:
+                            onboard_structures.append(sample[:1000])
+                elif ONBOARD_INPLACE_DONE in clean and head == "WAA Worker 启动失败":
+                    onboard_inplace_done += 1
+                elif ONBOARD_INPLACE_LEFT in clean and head == "WAA Worker 启动失败":
+                    onboard_inplace_left += 1
             if head.startswith(("上游代理", "本机代理", "IP 池", "代理")):
                 status = fields(msg).get("状态", "")
                 proxy_heads[head + (f"（状态 {status}）" if status else "")] += 1
@@ -413,6 +474,41 @@ if snapshot_failures:
     print("快照本身失败的原因（数字已替换为 #）：")
     for reason, count in snapshot_failures.most_common(5):
         print(f"  {count} 次：{reason}")
+print()
+print(f"==================== AI Studio 首次使用页（最近 {minutes} 分钟）====================")
+onboard_failed = sum(onboard_fail_heads.values())
+onboard_done_total = sum(onboard_done.values())
+if not (onboard_done_total or onboard_failed or onboard_inplace_done or onboard_inplace_left):
+    print("这段时间没有首次使用页相关日志（没有遇到首次使用页，或程序版本早于自动完成首次使用页）")
+else:
+    sources = "、".join(f"{label} {n}" for label, n in onboard_done.most_common()) or "-"
+    checked = " ".join(f"{value}×{n}" for value, n in onboard_checked.most_common(4)) or "-"
+    buttons = " ".join(f"{value}×{n}" for value, n in onboard_buttons.most_common(4)) or "-"
+    median = f"，耗时中位 {statistics.median(onboard_secs):.1f}s" if onboard_secs else ""
+    print(f"自动完成 {onboard_done_total} 次（{sources}；勾选数：{checked}；按钮：{buttons}{median}）")
+    print(f"其中订阅网络事件之后才到首次使用页、就地完成的 {onboard_inplace_done} 次已计入上面的自动完成次数，不要相加"
+          "（这次启动照常失败，完成后的 localStorage 已写回，下次启动应能通过）")
+    if onboard_inplace_left:
+        print(f"订阅网络事件之后识别出首次使用页、但页面随即自行离开（什么都没点，不计入自动完成）的 {onboard_inplace_left} 次")
+    print(f"按放宽规则补勾（[补]：没有必选标记、标签含服务条款或年龄关键词）的 {onboard_relaxed_runs} 次，共 {onboard_relaxed_boxes} 项")
+    if onboard_labels:
+        print("勾选过的标签（已打码截短，前 8 种；[补] 为放宽规则补勾的）：")
+        for item, n in onboard_labels.most_common(8):
+            print(f"  {n} 次：{item}")
+    heads_text = "、".join(f"{label} {n}" for label, n in onboard_fail_heads.most_common()) or "-"
+    print(f"未能完成 {onboard_failed} 次（{heads_text}）")
+    if onboard_fail_reasons:
+        print("未能完成的原因（数字已替换为 #）：")
+        for reason, count in onboard_fail_reasons.most_common(6):
+            print(f"  {count} 次：{reason}")
+    if onboard_structures:
+        print("未能完成时的结构摘要（前 3 条，去重；scope 为查找范围，bodyBoxes 为整页可见勾选框数，allBoxes 为整页全部勾选框数（含不可见的）；"
+              "boxes 为勾选框：req 必选、on 已勾、dis 不可勾、by 必选依据、t 含服务条款或年龄关键词、o 含邮件通知类关键词、hid 勾选框自己不可见、"
+              "kind 类别、label 标签开头 40 字与结尾 15 字；buttons 为按钮：text 文字前 40 字、on 启用、skip 为不点的原因"
+              "（link 链接、area 勾选框标签开关与页头横幅里的、cookie Cookie 横幅、popup 菜单、neg 关闭返回拒绝与切换账号类、opt 订阅邮件类、"
+              "icon 只有图标认不出的）；links 为范围内的链接；controls 为范围内其他表单控件的数量与类别；outside 为范围外的按钮）：")
+        for sample in onboard_structures:
+            print("  - " + sample)
 PY
   rm -f -- "$cooldown_file"
 }

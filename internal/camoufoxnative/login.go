@@ -34,6 +34,9 @@ type LoginOptions struct {
 	ProxyBypass    string
 	Timeout        time.Duration
 	Log            io.Writer
+	// OnboardingCompleted 在登录或验证时自动完成 AI Studio 首次使用页（勾选必选项、点继续）之后调用（在 Login、Verify 返回之前，
+	// 之后仍失败也已调用）；页面自己离开首次使用页、没有勾选或点击时不调用
+	OnboardingCompleted func(OnboardingResult)
 }
 
 // LoginResult 返回隔离浏览器导出的 Playwright storage state
@@ -58,6 +61,8 @@ type loginSession struct {
 	connection *websocket.Conn
 	client     *bidiClient
 	contextID  string
+	// onboardingCompleted 为 LoginOptions.OnboardingCompleted
+	onboardingCompleted func(OnboardingResult)
 }
 
 // Login 启动可见隔离 Camoufox 并在 AI Studio 可用后导出认证状态
@@ -75,6 +80,7 @@ func Login(ctx context.Context, options LoginOptions) (result LoginResult, err e
 	defer func() {
 		err = errors.Join(err, session.Close())
 	}()
+	session.onboardingCompleted = options.OnboardingCompleted
 	origins := make(map[string]storageOrigin)
 	pageURL, err := session.waitLogin(loginCtx, origins)
 	if err != nil {
@@ -131,6 +137,7 @@ func Verify(ctx context.Context, options LoginOptions, storageStateJSON []byte) 
 	defer func() {
 		err = errors.Join(err, session.Close())
 	}()
+	session.onboardingCompleted = options.OnboardingCompleted
 	pageURL, authenticated, reason, err := session.waitVerification(verifyCtx)
 	if err != nil {
 		return LoginVerification{}, err
@@ -240,18 +247,48 @@ func startLoginSession(ctx context.Context, options LoginOptions, headless bool,
 	}); err != nil {
 		return nil, err
 	}
-	if _, err := session.client.command(ctx, "browsingContext.navigate", map[string]any{
-		"context": session.contextID,
-		"url":     aiStudioOrigin + "/prompts/new_chat",
-		"wait":    "interactive",
-	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
-		return nil, fmt.Errorf("导航 AI Studio: %w", err)
+	if err := session.navigateAIStudio(ctx); err != nil {
+		return nil, err
 	}
 	failed = false
 	return session, nil
 }
 
+// navigateAIStudio 导航到 AI Studio 对话页（打开登录与验证页面、完成首次使用页之后重新载入）
+func (session *loginSession) navigateAIStudio(ctx context.Context) error {
+	if _, err := session.client.command(ctx, "browsingContext.navigate", map[string]any{
+		"context": session.contextID,
+		"url":     aiStudioOrigin + "/prompts/new_chat",
+		"wait":    "interactive",
+	}); err != nil && !strings.Contains(err.Error(), "NS_ERROR_ABORT") {
+		return fmt.Errorf("导航 AI Studio: %w", err)
+	}
+	return nil
+}
+
+// atOnboarding 返回页面是否停在 AI Studio 首次使用页（只在地址是 AI Studio 时读取页面，识别用短期限，见 bidiClient.onboardingPage）
+func (session *loginSession) atOnboarding(ctx context.Context, pageURL string) bool {
+	return strings.HasPrefix(pageURL, aiStudioOrigin+"/") && session.client.onboardingPage(ctx, session.contextID)
+}
+
+// finishOnboarding 自动完成首次使用页一次（受 budget 限制），勾选或点击过时调用 onboardingCompleted
+func (session *loginSession) finishOnboarding(ctx context.Context, budget *onboardingBudget) error {
+	result, err := budget.finish(ctx, session.client, session.contextID)
+	if err != nil {
+		return err
+	}
+	if result.acted() && session.onboardingCompleted != nil {
+		session.onboardingCompleted(result)
+	}
+	return nil
+}
+
+// waitLogin 等用户在可见浏览器里登录、AI Studio 输入框就绪。登录是交互式的：停在首次使用页时同样自动完成
+// （只勾必选项，次数上限同启动），完成后重新载入对话页；自动完成失败或次数用完后不再点击，交给用户在浏览器里手动完成。
+// 每一轮都记下当前 origin 的 localStorage，导出的认证状态带着完成首次使用之后的值
 func (session *loginSession) waitLogin(ctx context.Context, origins map[string]storageOrigin) (string, error) {
+	var onboarding onboardingBudget
+	automatic := true
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
@@ -274,13 +311,27 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 		if readyErr == nil && ready && strings.HasPrefix(pageURL, aiStudioOrigin+"/") {
 			return pageURL, nil
 		}
+		if automatic && session.atOnboarding(ctx, pageURL) {
+			if err := session.finishOnboarding(ctx, &onboarding); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return "", ctxErr
+				}
+				automatic = false
+			} else if err := session.navigateAIStudio(ctx); err != nil {
+				return "", err
+			}
+			continue
+		}
 		if err := waitContext(ctx, 300*time.Millisecond); err != nil {
 			return "", err
 		}
 	}
 }
 
+// waitVerification 用已有登录态打开 AI Studio，等输入框就绪（已登录）或跳到登录页（已失效）。停在首次使用页时自动完成
+// （只勾必选项，次数上限同启动）并重新载入对话页，之后继续等输入框；没能完成时以 OnboardingFailedPrefix 失败（不是登录失效）
 func (session *loginSession) waitVerification(ctx context.Context) (string, bool, string, error) {
+	var onboarding onboardingBudget
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", false, "", err
@@ -304,6 +355,15 @@ func (session *loginSession) waitVerification(ctx context.Context) (string, bool
 		}
 		if err == nil && ready && strings.HasPrefix(pageURL, aiStudioOrigin+"/") {
 			return pageURL, true, "", nil
+		}
+		if session.atOnboarding(ctx, pageURL) {
+			if err := session.finishOnboarding(ctx, &onboarding); err != nil {
+				return "", false, "", err
+			}
+			if err := session.navigateAIStudio(ctx); err != nil {
+				return "", false, "", err
+			}
+			continue
 		}
 		if err := waitContext(ctx, 200*time.Millisecond); err != nil {
 			return "", false, "", err
