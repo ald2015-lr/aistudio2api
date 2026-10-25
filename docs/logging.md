@@ -94,7 +94,26 @@ INFO  account@example.com  WAA Worker 就绪 | 页面模型=gemini-flash-latest 
 
 Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启动 | 等待冷启动名额 | 类型=按需|预热 | 占用=N/M`：`M` 为该类型可用的名额，按需启动比预热多 1 个保留名额（见 `WARM_STARTUP_CONCURRENCY`）。预热等待名额超过单个预热任务的时限时按槽位已满处理，不记为账户预热失败。
 
-启动失败记录页面模型、耗时和原始错误；页面类失败的错误末尾另带失败那一刻的页面快照 `| 页面=…`（见[失败时的页面快照](#失败时的页面快照)）。按需容量事件说明当前热池动作：
+启动失败记录页面模型、耗时和原始错误；页面类失败的错误末尾另带失败那一刻的页面快照 `| 页面=…`（见[失败时的页面快照](#失败时的页面快照)）。
+
+Worker 启动完成、发布之前，服务把浏览器 Cookie 合并写回认证文件，并用浏览器里 `https://aistudio.google.com` 的 localStorage 替换认证文件里这个 origin 的 localStorage（其他 origin 保留；启动期间保存过新登录或续签时不写，认证文件被外部换成另一个登录、扫描还没载入时 Cookie 与 localStorage 都不写；键名与值合计超过 512 KB 时不写，见[协议文档](protocol.md)第 2 节）。写回 localStorage 失败只记一行警告，不影响启动；`错误` 只写原因与大小，不写 localStorage 的值：
+
+```text
+WARN  account@example.com  WAA Worker 启动后写回 localStorage 失败 | 错误=浏览器 localStorage 超过写回上限（origin=https://aistudio.google.com，大小=530123 字节，上限=524288 字节）
+WARN  account@example.com  WAA Worker 启动后写回 localStorage 失败 | 错误=导出浏览器 localStorage: 页面 origin 不是 AI Studio（https://accounts.google.com）
+```
+
+账户浏览器缓存（`camoufox-cache/`）的自愈清理（见[开发文档](development.md#账户浏览器缓存)）写下面几行，`大小` 为清理前的 MB 数。启动失败属于页面状态类（`AI Studio 输入框未就绪`（只算页面停在 `https://aistudio.google.com/` 的）、`填写 bootstrap 提示词失败`、`等待官网 Run 按钮启用`、`提交官网提示词`、`官网 WAA service 未暴露`、`官网 GenerateContent 拦截事件超时`、`官网高层 snapshot 函数定位超时`）时，紧跟 `WAA Worker 启动失败` 写一行，`原因` 为匹配的错误前缀，同一账户 10 分钟内最多一行；失败的这次启动没有用上账户缓存（缓存锁被同账户另一个 runtime 占着，用的是临时 profile 内的缓存）、清理时缓存锁被另一个 runtime 或没能确认退出的浏览器持有、缓存是 12 小时内新建或清空过的时不清理、不写（部署前留下、没有 `.created` 的旧缓存第一次失败就清）。启动时缓存超过 3 天先清空，`原因=缓存超过 3 天`，写在 `3/7 | 启动 Camoufox` 之前。清理失败写 WARN；过期清理失败后 3 天内不再重试、不再写：校验没通过（例如 `camoufox-cache` 是符号链接，错误里有 `拒绝清理`）时什么都不删、照常使用这份缓存，只删了一部分时这次启动改用临时 profile 内的缓存。连续 20 个清理过缓存的账号下一次启动仍以页面状态类失败时（多半是官网整体改版，或失败原因不在缓存），写一行 `暂停启动失败后的浏览器缓存清理`，之后 1 小时内不再清理；清理过缓存的账号启动成功时连续计数归零：
+
+```text
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=2m4.512s | 错误=AI Studio 输入框未就绪 url=https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest: 等待页面条件超时: ...
+INFO   account@example.com  清理账号浏览器缓存 | 原因=AI Studio 输入框未就绪 | 大小=58.1MB
+INFO   account@example.com  清理账号浏览器缓存 | 原因=缓存超过 3 天 | 大小=61.4MB
+WARN   account@example.com  清理账号浏览器缓存失败 | 原因=缓存超过 3 天 | 错误=清空账户浏览器缓存: ...
+WARN   service              暂停启动失败后的浏览器缓存清理 | 原因=连续 20 个清理过缓存的账号下一次启动仍失败 | 时长=1h0m0s
+```
+
+按需容量事件说明当前热池动作：
 
 | 事件 | 语义 |
 | --- | --- |
@@ -503,7 +522,7 @@ WARN  service  Ultra 主用模型额度不足，立即返回 429 | 原因=额度
 | `登录复核 \| 恢复=<N> \| 仍失效=<M> \| 跳过=<K> \| 下一轮=<d> \| 疑似排除=<a> \| 疑似确认=<b> \| 待复核疑似=<c> \| 浏览器判定失效不复核=<e>` | INFO | 每轮汇总（持久，没有任何结果时不写）：本轮定期队列做完时一条，期间疑似账户的结果累计到下一次轮次边界（每 15 分钟最多两条）；`跳过` 为账户忙、出口限流或复核出错；`浏览器判定失效不复核` 为本轮开始时因浏览器证据不复核的需要登录账户 |
 | `账户验证完成 \| 已认证=true\|false \| 耗时=<d> \| 接口复核=通过\|401\|出错\|跳过 \| 页面=<host+path 或 ->` | INFO | 管理验证的结论：浏览器已登录时用接口复核一次，401 时结论改为未认证；浏览器判定未登录时 `页面` 为跳转到的登录页（不含查询参数） |
 
-管理验证的接口返回带 `authenticated` 与 `verify_reason`：浏览器判定未登录时原因带跳转页，如 `AI Studio 登录已失效（跳转到 accounts.google.com/v3/signin/identifier）`（`speedbump`、`challenge`、`rejected` 等路径多为安全验证或风控）；浏览器已登录、接口复核 401 时为 `浏览器已登录，但接口认证失败：Cookie 可能已被 Google 作废，需要重新登录`，目录保留。验证不导出浏览器 Cookie（要改隔离浏览器的验证流程），这样的账号需要重新登录。Worker 启动完成后会立即把浏览器 Cookie 按 (name, domain, path) 合并写回认证文件，Go 通道随后用的是浏览器轮换过的 Cookie。状态接口 `accounts.auth_required_10m` 为最近 10 分钟新被标为需要登录的账户数，`auth_recheck` 为复核的计数。
+管理验证的接口返回带 `authenticated` 与 `verify_reason`：浏览器判定未登录时原因带跳转页，如 `AI Studio 登录已失效（跳转到 accounts.google.com/v3/signin/identifier）`（`speedbump`、`challenge`、`rejected` 等路径多为安全验证或风控）；浏览器已登录、接口复核 401 时为 `浏览器已登录，但接口认证失败：Cookie 可能已被 Google 作废，需要重新登录`，目录保留。验证不导出浏览器 Cookie（要改隔离浏览器的验证流程），这样的账号需要重新登录。Worker 启动完成后会立即把浏览器 Cookie 按 (name, domain, path) 合并写回认证文件，Go 通道随后用的是浏览器轮换过的 Cookie；AI Studio 页面的 localStorage 同时写回（见 [Worker 生命周期](#worker-生命周期)）。状态接口 `accounts.auth_required_10m` 为最近 10 分钟新被标为需要登录的账户数，`auth_recheck` 为复核的计数。
 
 ### 坏号与冷启动节奏
 

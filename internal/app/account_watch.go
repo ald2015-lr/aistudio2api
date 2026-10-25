@@ -363,7 +363,8 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 // （由 startLoginRefresh 载入，载入时清除登记与 403 冷却），以及本轮能否下结论。不在登记表里的账户不检查：
 //   - 磁盘上的内容与内存不同：本服务写回认证文件时同时更新内存，不同说明文件被外部更新了。同一登录会话里重新导出
 //     （在已登录的浏览器里同意政策后重新获取）时登录签名 Cookie 不变，只比较它发现不了，按说明重新上传后账户仍然列着、仍在冷却。
-//     内容比较不计 Google 定期轮换的 Cookie（见 storageStateDigest）：共用账户目录的其他进程回写它们不算重新上传
+//     内容比较不计 Google 定期轮换的 Cookie 与 AI Studio 的 localStorage（见 storageStateDigest）：共用账户目录的其他进程回写它们
+//     （轮换 Cookie 随请求回写，localStorage 在 Worker 启动成功后回写）不算重新上传
 //   - 磁盘与内存相同（第一次看到时也一样）：内存里就是本服务自己的登录状态，不算重新上传。登录签名与登记时记下的不同时
 //     （本服务自己写回时换掉了登录签名 Cookie；续签已在提交时更新，见 authRuntimeRefresher.renewed）只更新记下的登录签名，
 //     免得下次启动时被当作服务停止期间替换了认证文件。原先第一次看到时按重新上传清除：扫描第一次看到文件之前续签的账户

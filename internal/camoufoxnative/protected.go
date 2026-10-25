@@ -239,6 +239,46 @@ func (worker *Worker) StorageCookies(ctx context.Context) ([]byte, error) {
 	return json.Marshal(cookies)
 }
 
+// localStorageExportExpression 只读地导出当前页面 origin 的全部 localStorage（按键名排序）：
+// 用 key(i) 枚举，键名与 Storage 自带属性同名时也不会漏掉；不写入、不删除，不触发 storage 事件
+const localStorageExportExpression = `(() => {
+  const items = [];
+  for (let index = 0; index < localStorage.length; index++) {
+    const name = localStorage.key(index);
+    if (name !== null) items.push({name, value: localStorage.getItem(name) ?? ''});
+  }
+  items.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+  return JSON.stringify({origin: location.origin, localStorage: items});
+})()`
+
+// StorageLocalStorage 导出当前 AI Studio 页面 origin 的 localStorage（格式与 storage state 的一个 origin 相同），
+// 供 Worker 就绪后写回账户持久状态；页面当前不在 AI Studio 时返回错误。错误文案不含 localStorage 的值
+func (worker *Worker) StorageLocalStorage(ctx context.Context) ([]byte, error) {
+	worker.mu.Lock()
+	if worker.closed {
+		worker.mu.Unlock()
+		return nil, errors.New("Camoufox runtime 已关闭")
+	}
+	client := worker.client
+	contextID := worker.contextID
+	worker.mu.Unlock()
+	encoded, err := client.evaluateString(ctx, contextID, localStorageExportExpression)
+	if err != nil {
+		return nil, fmt.Errorf("导出浏览器 localStorage: %w", err)
+	}
+	var origin storageOrigin
+	if err := json.Unmarshal([]byte(encoded), &origin); err != nil {
+		return nil, errors.New("导出浏览器 localStorage: 页面返回的结果无法解析")
+	}
+	if origin.Origin != aiStudioOrigin {
+		return nil, fmt.Errorf("导出浏览器 localStorage: 页面 origin 不是 AI Studio（%s）", origin.Origin)
+	}
+	if origin.LocalStorage == nil {
+		origin.LocalStorage = []localStorageItem{}
+	}
+	return json.Marshal(origin)
+}
+
 type protectedResponseBody struct {
 	ctx       context.Context
 	cancel    context.CancelFunc

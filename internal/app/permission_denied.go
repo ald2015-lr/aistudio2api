@@ -597,10 +597,12 @@ var rotatingCookies = map[string]struct{}{
 	"SIDCC": {}, "__Secure-1PSIDCC": {}, "__Secure-3PSIDCC": {},
 }
 
-// storageStateDigest 返回登录状态内容（Cookie、本地存储与扩展字段）的摘要，不计 rotatingCookies。同一登录会话里重新导出认证文件时
-// 登录签名 Cookie 不变，只能按内容判断；本服务写回认证文件时同时更新内存，磁盘上的内容与内存不同才是外部更新。
-// 轮换 Cookie 不计入：多个进程共用一个账户目录时，另一个进程回写它们后磁盘与本进程内存不同，原先按重新上传处理，
-// 清除登记与 403 冷却、冷却档位从头计，每次回写都这样，列表在进程之间来回出现。只有轮换 Cookie 不同的重新导出因此发现不了
+// storageStateDigest 返回登录状态内容（Cookie、本地存储与扩展字段）的摘要，不计 rotatingCookies 与 aistudio.google.com 的 localStorage
+// （aistudio.BrowserLocalStorageOrigin）。同一登录会话里重新导出认证文件时登录签名 Cookie 不变，只能按内容判断；本服务写回认证文件时
+// 同时更新内存，磁盘上的内容与内存不同才是外部更新。这两项都是本服务自己会写回、在进程之间会变的内容，不计入：多个进程共用一个
+// 账户目录时，另一个进程回写它们后磁盘与本进程内存不同，原先按重新上传处理，清除登记与 403 冷却、冷却档位从头计，每次回写都这样，
+// 列表在进程之间来回出现。轮换 Cookie 由 MergeSetCookieHeaders 回写；AI Studio 的 localStorage 由 Worker 启动成功后回写
+// （MergeBrowserLocalStorage，部署后第一次启动几乎每个账号都会改，之后页面改值时也会改）。只有这两项不同的重新导出因此发现不了
 func storageStateDigest(state aistudio.StorageState) string {
 	cookies := make([]aistudio.StateCookie, 0, len(state.Cookies))
 	for _, cookie := range state.Cookies {
@@ -609,6 +611,13 @@ func storageStateDigest(state aistudio.StorageState) string {
 		}
 	}
 	state.Cookies = cookies
+	origins := make([]aistudio.StorageOrigin, 0, len(state.Origins))
+	for _, origin := range state.Origins {
+		if origin.Origin != aistudio.BrowserLocalStorageOrigin {
+			origins = append(origins, origin)
+		}
+	}
+	state.Origins = origins
 	data, err := json.Marshal(state)
 	if err != nil {
 		return ""

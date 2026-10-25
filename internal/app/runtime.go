@@ -219,6 +219,14 @@ type accountWorkerManager struct {
 	// warmFailures 记录预热失败的账户与时间，冷却期内不再反复尝试
 	warmFailMu   sync.Mutex
 	warmFailures map[string]time.Time
+	// 启动失败后清理浏览器缓存的状态（见 healBrowserCache），由 cacheHealMu 保护，map 第一次写入时创建：
+	// cacheHealedAt 为最近清理（或正在清理）的账户与时间，同一账户 10 分钟内最多清理一次；cacheHealPending 为清理过缓存、
+	// 还没有下一次启动结果的账户与清理时间；cacheHealMisses 为连续无效的清理数；cacheHealPausedUntil 为连续无效后暂停清理的截止时间
+	cacheHealMu          sync.Mutex
+	cacheHealedAt        map[string]time.Time
+	cacheHealPending     map[string]time.Time
+	cacheHealMisses      int
+	cacheHealPausedUntil time.Time
 	// warmIdleReason 与 warmIdleAt 用于预热等待原因的日志去重
 	warmIdleReason string
 	warmIdleAt     time.Time
@@ -1288,6 +1296,13 @@ func (manager *accountWorkerManager) startReservedWorker(
 		step, message := workerStartupProgress(stage)
 		manager.requests.log(label, "INFO", fmt.Sprintf("WAA Worker 启动 | %d/7 | %s", step, message))
 	}
+	options.CacheExpired = func(size int64, err error) {
+		manager.logBrowserCacheCleared(label, browserCacheExpiredReason(), size, err)
+	}
+	// 这次启动是否用上了账户 HTTP 缓存：同账户另一个 runtime 占着缓存锁时用的是临时 profile 内的缓存（纯 Go VM 不用浏览器缓存），
+	// 失败与账户缓存无关，不清理（否则那个 runtime 在 launch 返回前释放锁时，会清掉它一直正常使用的缓存）
+	var cacheAttached atomic.Bool
+	options.CacheAttached = func() { cacheAttached.Store(true) }
 	launch := manager.launch
 	if launch == nil {
 		launch = newWAAWorker
@@ -1322,8 +1337,13 @@ func (manager *accountWorkerManager) startReservedWorker(
 			"WAA Worker 启动失败 | 页面模型=%s | 耗时=%s | 错误=%s%s",
 			bootstrapModel, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(initErr.Error()), slot,
 		))
+		// launch 已返回：浏览器确认退出时账户缓存锁已释放；没能确认退出的浏览器仍持锁（camoufoxnative 保留到进程退出），清理会取不到锁而跳过
+		if cacheAttached.Load() {
+			manager.healBrowserCache(account.id, label, options.StorageStatePath, initErr)
+		}
 		return nil, &accountWorkerInitError{err: initErr}
 	}
+	manager.noteBrowserCacheHealed(account.id)
 	// 出口租约随浏览器确认关闭（NativeWorker.Close 成功，与本机中转释放同一时机）归还：发布、替换、丢弃都经 Close
 	poolLease.attach(worker)
 	return &accountWorkerPreparer{
@@ -1763,6 +1783,7 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 	worker, err := manager.startReservedWorker(ctx, accountID, model)
 	if err == nil {
 		manager.persistStartupCookies(accountID, generation, worker)
+		manager.persistStartupLocalStorage(accountID, generation, worker)
 	}
 	if err == nil || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(err) {
 		return worker, err
@@ -1791,6 +1812,7 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 	worker, err = manager.startReservedWorker(ctx, accountID, model)
 	if err == nil {
 		manager.persistStartupCookies(accountID, renewed, worker)
+		manager.persistStartupLocalStorage(accountID, renewed, worker)
 		return worker, nil
 	}
 	if aistudio.DefinitiveAuthenticationFailure(err) {

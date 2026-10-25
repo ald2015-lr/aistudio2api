@@ -138,7 +138,7 @@ HTTP route
 
 WebSocket 入口沿用相同分层：`internal/api` 解码公开协议，`internal/app` 绑定账户和运行状态，`internal/aistudio` 执行 WebChannel 与规范事件转换。公开适配器只消费规范请求与事件；账户文件、WAA 对象、原始数组和资源粘性由 `internal/aistudio` 与 `internal/app` 管理。
 
-Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务按 `WARM_WORKER_LIMIT` 与 `WARM_STARTUP_CONCURRENCY` 准备隔离、无头、长驻的账户 runtime，并在需要其他账户能力时替换最久未用的空闲 runtime。同时冷启动的 Camoufox 数受 `WARM_STARTUP_CONCURRENCY` 限制：预热与冷却轮换后的补齐最多占用该数，有请求在等的冷启动（请求现场启动与排队时的后台扩容）另有 1 个保留名额，排队时也先于预热放行；名额只覆盖浏览器启动本身，容量热更新后排队中的启动立即按新值放行。WAA proof 在账户调度锁外生成，执行前后各核对一次 Worker 未被替换或关闭，同账户的状态读取与取 Worker 不再排在 proof 之后。无头 runtime 的页面刷新帧率为每秒 1 帧。每个 runtime 使用关闭时删除的临时 profile，HTTP 磁盘缓存写入账户目录的 `camoufox-cache/`，同一账户重启时复用官网静态资源；同一账户同时存在的第二个 runtime 使用临时 profile 内的缓存。创建临时 profile 的进程在 profile 内持有锁文件，运行时装配时删除锁已释放的遗留 profile。Windows 上每个 Camoufox 进程树加入服务进程持有的 Job，服务进程退出时由系统一并结束。每个 runtime 在官网触发 GenerateContent 并于网络发送前拦截请求，以取得官方 WAA service 与动态请求头；后续业务正文由 Go 编码，在同步官网 prompt 状态并生成 fresh proof 后，通过同一固定指纹页面的原生 `fetch` 发送，响应流由 WebDriver BiDi 分块交回 Go。其他 MakerSuite、Drive 与媒体控制面请求继续使用账户固定出口的 Go HTTP transport。
+Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务按 `WARM_WORKER_LIMIT` 与 `WARM_STARTUP_CONCURRENCY` 准备隔离、无头、长驻的账户 runtime，并在需要其他账户能力时替换最久未用的空闲 runtime。同时冷启动的 Camoufox 数受 `WARM_STARTUP_CONCURRENCY` 限制：预热与冷却轮换后的补齐最多占用该数，有请求在等的冷启动（请求现场启动与排队时的后台扩容）另有 1 个保留名额，排队时也先于预热放行；名额只覆盖浏览器启动本身，容量热更新后排队中的启动立即按新值放行。WAA proof 在账户调度锁外生成，执行前后各核对一次 Worker 未被替换或关闭，同账户的状态读取与取 Worker 不再排在 proof 之后。无头 runtime 的页面刷新帧率为每秒 1 帧。每个 runtime 使用关闭时删除的临时 profile，HTTP 磁盘缓存写入账户目录的 `camoufox-cache/`，同一账户重启时复用官网静态资源；同一账户同时存在的第二个 runtime 使用临时 profile 内的缓存；缓存超过 3 天或页面状态类启动失败后清空，见[账户浏览器缓存](#账户浏览器缓存)。保存的 localStorage 只补页面里缺少的键，Worker 就绪后把 AI Studio 页面的 localStorage 写回 `storage-state.json`（详见[协议文档](protocol.md)第 2 节的 storage state 说明）。创建临时 profile 的进程在 profile 内持有锁文件，运行时装配时删除锁已释放的遗留 profile。Windows 上每个 Camoufox 进程树加入服务进程持有的 Job，服务进程退出时由系统一并结束。每个 runtime 在官网触发 GenerateContent 并于网络发送前拦截请求，以取得官方 WAA service 与动态请求头；后续业务正文由 Go 编码，在同步官网 prompt 状态并生成 fresh proof 后，通过同一固定指纹页面的原生 `fetch` 发送，响应流由 WebDriver BiDi 分块交回 Go。其他 MakerSuite、Drive 与媒体控制面请求继续使用账户固定出口的 Go HTTP transport。
 
 `WAA_BACKEND=go` 时不定位、不下载也不启动 Camoufox。每个账户 runtime 在服务进程内请求官网页面与 `GetLoggingContext` 得到公开请求头，调用 `Waa/Create` 取得 challenge，按 hash 下载并缓存解释器到 `auth/.waa-interpreters/`，在 `internal/waa` 的 goja 分叉与 Firefox 形状宿主中执行 program。受保护请求携带 Firefox 请求头与账户 Cookie，由账户固定出口的 Go HTTP transport 发送，响应 Cookie 写回账户状态。账户页的浏览器登录在首次使用时准备 Camoufox。完整链路、宿主、生命周期、数据文件与上游变化的定位方法见 [WAA 实现](waa.md)。
 
@@ -235,10 +235,10 @@ POST /api/control/start
 | 文件 | 内容 | 生命周期 |
 | --- | --- | --- |
 | `account.json` | label、enabled、proxy、locale、timezone | 创建或编辑账户时写入，`proxy` 保存规范化后的上游 URL（含账号密码明文，文件 0600），不存本机中转地址；外部手写的冒号写法读入时规范化（`readAccountConfig`，读时不回写，下次保存时写入规范值）；缺少 `enabled` 字段按启用读取。账户默认启用：启动与目录扫描导入时，`enabled` 为 `false` 但 `.disable-reasons.json` 中没有手动停用记录的账户在加入账户池之前改为启用并原子写回（16 个并行，只写一条汇总日志）；只有管理页或管理接口停用的保持停用。手动停用记录立即写入，目录移出账户池时保留；`.disable-reasons.json` 无法读取时没有记录的停用账户保持停用并补记为手动停用 |
-| `storage-state.json` | Cookie、localStorage 与可选 Chrome OAuth/DBSC 续签材料 | 合并 `Set-Cookie` 或认证续签后原子写回 |
+| `storage-state.json` | Cookie、localStorage 与可选 Chrome OAuth/DBSC 续签材料 | 合并 `Set-Cookie` 或认证续签后原子写回；Worker 启动完成后合并浏览器 Cookie，并用浏览器里 `https://aistudio.google.com` 的 localStorage 替换该 origin（其他 origin 保留，认证代际变化或文件已被外部换成另一个登录时不写，超过 512 KB 不写） |
 | `camoufox-fingerprint.json` | 账户固定的浏览器指纹、语言与时区 | 首次运行生成，空值、窗口几何、字体、语音与媒体设备按 Camoufox 官方启动器规则规范化；重新登录和 WAA runtime 继续复用 |
 | `runtime-state.json` | 权益等级、模型资格、冷却与资源账户绑定 | 权益同步、首次模型结果或资源变化后原子写回 |
-| `camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存，上限 256 MB | WAA runtime 运行期间独占写入，随账户目录删除 |
+| `camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存，上限 256 MB；`.lock` 为使用者持有的锁，`.created` 为创建时间 | WAA runtime 运行期间独占写入；超过 3 天在下次启动时清空，页面状态类启动失败后清空（12 小时内新建或清空过的不清），随账户目录删除 |
 
 `runtime-state.json` 的 `model_access` value 为 `{state,checked_at,reason?}`，成功状态为 `verified`；`cooldowns` value 为 `{until,reason?}`；`resources` value 保存 kind、name、mime、size、purpose、created_at 与可选 video 元数据。Drive file、Veo operation、视频产物和 Bidi 恢复 token 均保持创建账户粘性。Veo operation 额外保存公开 video object 的 model、seconds、size 与 UTC 创建时间，生成服务或进程重启后的轮询继续投影相同字段。
 
@@ -321,6 +321,22 @@ Worker 同样按账户当前所在的号池分为普通分区与 Ultra 分区（
 模型目录刷新为全部 enabled ready/busy 账户并发执行。同步报错或返回空目录的账户进入 generation 内的 pending ID 集合；每个非空结果立即更新公共目录、账户状态并在 RUNNING 期间预热更多 Worker。初次 fan-out（同时向全部符合条件的账户发出 `ListModels`）结束后，单个 30 秒 ticker（定时器）对可用的 pending 账户再次并发刷新。冷却中的任务保留到期再试；需要登录、停用、不可用或已删除的账户退出重试，重新登录后重新同步；管理页单个启用或批量启用的账户没有模型目录时，在后台按 16 个并发（两者共用）补同步，一批同步完合并应用一次目录；认证文件更新后启用的账户随即同步一次。失败日志记录账户与原因，恢复成功记录模型数量。`modelRevision` 跟踪账户和配置变化，生成服务开始接收请求前会确认已应用当前 revision。
 
 认证状态包含长期凭证和设备绑定材料，保存在本机受控目录。提交、Issue、CI 和普通日志使用脱敏材料，保留字段形状并替换 Cookie、token、proof、邮箱、账户 ID、提示词、响应正文和完整原始帧。
+
+### 账户浏览器缓存
+
+每个账户的 Camoufox HTTP 磁盘缓存在 `auth/<账户>/camoufox-cache/`（上限 256 MB），跨启动保留，同一账户重启时复用官网静态资源。使用它的 runtime 在浏览器运行期间持有目录内 `.lock` 的文件锁（与 `flock` 命令是同一种锁，`./start.sh clean-cache` 据此跳过正在使用的缓存）；同账户另一个 runtime 拿不到锁时使用临时 profile 内的缓存。浏览器关闭超时或出错、没能确认退出时（启动失败的清理、`Worker.Close`、报告 BiDi 端点之前的超时或取消），锁对象放进 `camoufoxnative` 包级的保留列表，进程确认退出后才释放：原先锁对象随 Worker 不再被引用，`gofrs/flock` 持有的文件带终结器，下一次 GC 就会释放 flock，这时浏览器可能还活着。Google 更新网页后，老账号缓存里的旧脚本与资源可能和新页面不配套，页面长不出输入框、Run 按钮或 WAA service，因此缓存按两种情况自愈清理：
+
+- **定期过期**：缓存目录里的 `.created` 记录这份缓存的创建时间（RFC 3339）。启动拿到锁之后读取：缺失、无法解析或晚于当前时间（时钟回拨）时补写——目录里除 `.lock`、`.created` 外没有内容（刚新建，或刚被 `./start.sh clean-cache` 清空）写当前时间；已有内容的年龄未知（多半是加入 `.created` 之前的版本留下的旧缓存），写回拨 12 小时的时间，第一次页面状态类启动失败就能清理（见下一条），3 天过期也从这时提前 12 小时算起。原先一律写当前时间：锁定在浏览器启动之前，这次启动失败时清理读到的是几分钟前刚补写的标记，部署前留下的旧缓存部署后 12 小时内都清不掉。超过 3 天时先清空再交给浏览器，写 `清理账号浏览器缓存 | 原因=缓存超过 3 天 | 大小=<MB>MB`。清空失败时写 `清理账号浏览器缓存失败 | 原因=缓存超过 3 天 | 错误=…`，并把 `.created` 改为当前时间，3 天后才再试（原先标记不变，之后每次启动都重试、都写警告）：删除前的校验没有通过（例如 `camoufox-cache` 是指向别的磁盘的符号链接）时什么都没删，照常把目录交给浏览器，与加入过期之前一致，这样的缓存不会按期清空；只删了一部分时释放锁，这次启动改用临时 profile 内的缓存，下次启动照常使用剩下的缓存。
+- **过期集中在重启时**：过期只在启动锁定时判断，部署后预热池在十几分钟内全部启动，各账户的 `.created` 几乎同时；距上次大批清空超过 3 天的服务重启，会让预热池在启动窗口里集中清空、冷加载一次。总量不变（这些缓存在各自下一次启动时本来就要清空），并发受启动名额（`WARM_STARTUP_CONCURRENCY`）限制；没有做限速或按账户抖动：两者都会让超过 3 天的缓存继续使用。
+- **启动失败后清理**：Worker 启动失败、错误属于页面状态类时（按错误文案前缀判断，集中在 `camoufoxnative.PageStateFailure`：`AI Studio 输入框未就绪`、`填写 bootstrap 提示词失败`（含提示词输入框不存在）、`等待官网 Run 按钮启用`、`提交官网提示词`（Run 按钮不存在或已禁用）、`官网 WAA service 未暴露`、`官网 GenerateContent 拦截事件超时`、`官网高层 snapshot 函数定位超时`），在 `WAA Worker 启动失败` 之后清空该账户的缓存，下次启动重新载入页面，写 `清理账号浏览器缓存 | 原因=<错误前缀> | 大小=<MB>MB`。`AI Studio 输入框未就绪` 只在页面停在 `https://aistudio.google.com/` 时算（错误里的 `url=`）：停在代理错误页（`about:neterror`）、Google sorry 页、登录页、地区不支持页或读不到 url 时与缓存无关。这时浏览器确认退出的缓存锁已释放；清理前重新取得缓存锁，取不到（同账户另一个 runtime 正在用，或上次的浏览器没能确认退出、锁仍被保留）时不清理。本机代理中转记到上游失败（错误带 `本机代理中转`）的不算页面问题。
+  - 只清理失败的这次启动确实用上的账户缓存：`camoufoxnative.Start` 拿到缓存锁时调用 `Options.CacheAttached`，`startReservedWorker` 据此决定是否清理。同账户另一个 runtime 占着锁时这次启动用的是临时 profile 内的缓存，失败与账户缓存无关；原先那个 runtime 在 launch 返回之前关闭、释放锁时，清理会拿到锁，清掉它一直正常使用的缓存。纯 Go VM 不用浏览器缓存，同样不清理。
+  - 拿到锁之后，`.created` 距今不到 12 小时（`camoufoxnative.AccountCacheClearMinAge`）的缓存不清理：最近新建或清空过的缓存不会是官网更新前留下的旧资源。原先只有内存里同账户 10 分钟的去重（重启后清零）：失败原因不在缓存的账号每 10 分钟就把上一次失败时刚下载的缓存删掉，下一次必然整页冷加载，出口慢时还会变成冷加载、超时、清空、再冷加载的循环。部署前留下的、没有 `.created` 的旧缓存在启动锁定时补写的是回拨 12 小时的时间（见上一条“定期过期”），第一次页面状态类失败就清理。`.created` 缺失、无法解析或晚于当前时间（启动锁定时没写成）时年龄未知，照常清理。
+  - 同一账户 10 分钟内最多清理一次（第二道防线）：清理成功或出错都计入，取不到锁或缓存太新不计入。
+  - 清理没有用时暂停：清理过缓存的账号下一次启动仍以页面状态类失败记一次无效（1 小时内的结果才算），启动成功时连续计数归零；连续 20 次无效（多半是官网整体改版，或失败原因不在缓存）时写 `暂停启动失败后的浏览器缓存清理`，1 小时内不再清理，免得轮到的每个账号都被清空、下一次都整页冷加载。
+
+清空在持有锁时进行，只处理恰好是认证文件所在账户目录下名为 `camoufox-cache` 的真实目录（`filepath.Clean` 后比较，账户目录不能是当前目录或根目录，缓存目录不能是符号链接），确认持有的正是这个目录的锁，删除目录内 `.lock` 以外的全部内容，再写入新的 `.created`。`.lock` 保留：它被持锁方打开着（Windows 上删不掉），删掉后同账户另一个 runtime 会在新建的同名文件上同时拿到锁；除锁文件外清空的目录与删除后重建等价。
+
+保存的 localStorage 只补页面里缺少的键，Worker 启动成功后写回 AI Studio 页面的 localStorage（见[协议文档](protocol.md)第 2 节）。这只保护“页面原地升级保存的设置再刷新”的情形，写回也只在启动成功后发生：如果旧格式的设置本身就让页面第一次载入就长不出输入框、Run 按钮，新旧代码结果一样，这些账号拿不到新格式，缓存清理对它们也无效。部署后用 `tools/diag_profile.sh` 判断：只失败组仍集中在老账号、它们 `aiStudioUserPreference` 的值长仍与成功组不同（例如仍没有 `selectedProject`）时就是这种情形，对这些账号重新登录（登录用全新的浏览器，导出页面新建的 localStorage）。没有自动丢弃保存的 localStorage 重试：缺少这些键时页面的默认值（自动保存、引导提示等）是否有副作用没法在这里确认。
 
 ### 429 治理：换号上限、出口限流、目录缓存与登录复核
 

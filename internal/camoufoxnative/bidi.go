@@ -284,8 +284,29 @@ func (client *bidiClient) installCookies(ctx context.Context, cookies []storageC
 	return nil
 }
 
-// installLocalStorage 在站点脚本前恢复各 origin 的 localStorage
+// installLocalStorage 在站点脚本前恢复各 origin 的 localStorage（写入规则见 localStoragePreloadFunction）
 func (client *bidiClient) installLocalStorage(ctx context.Context, contextID string, origins []storageOrigin) error {
+	function, err := localStoragePreloadFunction(origins)
+	if err != nil {
+		return err
+	}
+	_, err = client.command(ctx, "script.addPreloadScript", map[string]any{
+		"functionDeclaration": function,
+		"contexts":            []string{contextID},
+	})
+	if err != nil {
+		return fmt.Errorf("安装 localStorage preload: %w", err)
+	}
+	return nil
+}
+
+// localStoragePreloadFunction 返回恢复保存的 localStorage 的 preload 函数：只写入页面里还没有的键（getItem 为 null 时才 setItem）。
+// preload 在每次导航（包括页面自己刷新）时都会运行，原先无条件写入全部保存的键：网页原地升级设置格式并刷新后，又被写回登录当天的旧值。
+// 浏览器 profile 每次启动都是新建的，第一次载入时所有键都缺少，与原来一样全部写入。
+// 与 Playwright storageState（建上下文时每个 origin 只写一次）不同：之后每次导航仍会补上为 null 的键，网页删掉的键
+// （removeItem 或 clear 之后刷新）会被重新写入，只有原地覆盖同名键的升级能保留。不在 sessionStorage 之类的地方记标记让它只生效一次：
+// 页面脚本能看到多出来的存储项
+func localStoragePreloadFunction(origins []storageOrigin) (string, error) {
 	values := make(map[string]map[string]string, len(origins))
 	for _, origin := range origins {
 		items := make(map[string]string, len(origin.LocalStorage))
@@ -296,22 +317,16 @@ func (client *bidiClient) installLocalStorage(ctx context.Context, contextID str
 	}
 	encoded, err := json.Marshal(values)
 	if err != nil {
-		return err
+		return "", err
 	}
-	function := fmt.Sprintf(`() => {
+	return fmt.Sprintf(`() => {
   const all = %s;
   const current = all[location.origin];
   if (!current) return;
-  for (const [name, value] of Object.entries(current)) localStorage.setItem(name, value);
-}`, encoded)
-	_, err = client.command(ctx, "script.addPreloadScript", map[string]any{
-		"functionDeclaration": function,
-		"contexts":            []string{contextID},
-	})
-	if err != nil {
-		return fmt.Errorf("安装 localStorage preload: %w", err)
-	}
-	return nil
+  for (const [name, value] of Object.entries(current)) {
+    if (localStorage.getItem(name) === null) localStorage.setItem(name, value);
+  }
+}`, encoded), nil
 }
 
 // evaluate 在页面默认主世界执行表达式

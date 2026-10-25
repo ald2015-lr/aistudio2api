@@ -40,6 +40,12 @@ type Options struct {
 	ReadyTimeout     time.Duration
 	Log              io.Writer
 	StartupProgress  func(StartupStage)
+	// CacheExpired 在启动锁定账户 HTTP 磁盘缓存、发现缓存超过 AccountCacheMaxAge 并清空时调用：size 为清空前的字节数；
+	// err 非空表示清空失败：校验没有通过时什么都没删、照常使用这份缓存，只删了一部分时这次启动改用临时 profile 内的缓存
+	CacheExpired func(size int64, err error)
+	// CacheAttached 在启动锁定到账户 HTTP 磁盘缓存目录、这次启动的浏览器将使用它时调用（在启动浏览器之前）。
+	// 同账户另一个 runtime 占用、改用临时 profile 内的缓存时不调用：这次启动失败与账户缓存无关，启动失败后的清理据此跳过
+	CacheAttached func()
 }
 
 func (options Options) reportStartup(stage StartupStage) {

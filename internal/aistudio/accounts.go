@@ -2382,6 +2382,7 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 
 // MergeBrowserCookies 在没有请求租约的路径（Worker 启动完成）把浏览器 Cookie 合并进账户持久状态，返回是否写入：
 // generation 为启动前读取的认证代际，期间保存过新登录或续签（代际变化）时不写，免得旧浏览器会话的 Cookie 盖住新登录。
+// 磁盘上的认证文件已被外部换成另一个登录、扫描还没载入时同样不写（见 externalLoginReplaced）。
 // 浏览器 Cookie 与磁盘相同时不写文件。合并规则同 ReplaceCookies
 func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, cookies []StateCookie) (bool, error) {
 	if p == nil {
@@ -2408,6 +2409,9 @@ func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, c
 	if err != nil {
 		return false, err
 	}
+	if p.externalLoginReplaced(account, state) {
+		return false, nil
+	}
 	merged := mergeStateCookies(state.Cookies, cookies, time.Now())
 	if slices.EqualFunc(merged, state.Cookies, func(left, right StateCookie) bool { return left == right }) {
 		return false, nil
@@ -2420,6 +2424,112 @@ func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, c
 	account.StorageState = state
 	p.mu.Unlock()
 	return true, nil
+}
+
+// externalLoginReplaced 判断磁盘上的认证文件是否已被外部换成另一个登录（登录签名 Cookie 与内存不同），调用方持有 storageMu、
+// state 为刚读入的磁盘内容。认证代际只在扫描载入或管理端保存时推进：外部直接替换认证文件（重新上传）之后，扫描要等文件稳定
+// 再加一轮扫描间隔才载入，这期间完成的 Worker 启动代际检查仍然通过。原先照常写回并把内存改成磁盘内容：旧浏览器的 Cookie 盖住
+// 新登录的签名 Cookie、旧浏览器的 localStorage 盖住新登录的，内存与磁盘的登录签名又一致，扫描再也发现不了这次重新上传
+// （推进代际、清除 403 登记、恢复需要登录的账户等全部丢失）。是时记下账户（同 MergeSetCookieHeaders），由扫描载入
+func (p *AccountPool) externalLoginReplaced(account *Account, state StorageState) bool {
+	p.mu.Lock()
+	memory := account.StorageState
+	p.mu.Unlock()
+	if LoginIdentity(state) == LoginIdentity(memory) {
+		return false
+	}
+	externalLoginChanges.Store(account.ID, struct{}{})
+	return true
+}
+
+// BrowserLocalStorageOrigin 为 Worker 启动后写回 localStorage 的唯一 origin（见 MergeBrowserLocalStorage）
+const BrowserLocalStorageOrigin = aiStudioOrigin
+
+// BrowserLocalStorageLimit 为 Worker 启动后写回的单个 origin localStorage 的总大小上限（键名与值的字节数之和）
+const BrowserLocalStorageLimit = 512 << 10
+
+// ErrBrowserLocalStorageTooLarge 表示浏览器导出的 localStorage 超过 BrowserLocalStorageLimit，没有写回
+var ErrBrowserLocalStorageTooLarge = errors.New("浏览器 localStorage 超过写回上限")
+
+// MergeBrowserLocalStorage 在没有请求租约的路径（Worker 启动完成）把浏览器里 BrowserLocalStorageOrigin 的 localStorage 写回账户持久状态，
+// 返回是否写入：替换该 origin 的全部项（浏览器里的值以保存的值为起点、经网页自己写入与升级，是权威版本），其他 origin 原样保留；
+// 其他 origin 返回错误、不写。原先 localStorage 从不写回，老账号每次启动都带着登录当天的旧设置。generation 规则同 MergeBrowserCookies
+// （期间保存过新登录或续签时不写，磁盘上已被外部换成另一个登录时也不写）；浏览器没有导出任何项时不写（不凭一次空读删掉保存的值）；
+// 与磁盘相同时不写文件；总大小超过 BrowserLocalStorageLimit 时不写，返回 ErrBrowserLocalStorageTooLarge（文案只含大小，不含值）
+func (p *AccountPool) MergeBrowserLocalStorage(accountID string, generation uint64, origin StorageOrigin) (bool, error) {
+	if p == nil {
+		return false, ErrAccountNotFound
+	}
+	if len(origin.LocalStorage) == 0 {
+		return false, nil
+	}
+	if origin.Origin != BrowserLocalStorageOrigin {
+		return false, fmt.Errorf("只写回 %s 的 localStorage，收到 %s", BrowserLocalStorageOrigin, origin.Origin)
+	}
+	size := 0
+	for _, item := range origin.LocalStorage {
+		size += len(item.Name) + len(item.Value)
+	}
+	if size > BrowserLocalStorageLimit {
+		return false, fmt.Errorf("%w（origin=%s，大小=%d 字节，上限=%d 字节）", ErrBrowserLocalStorageTooLarge, origin.Origin, size, BrowserLocalStorageLimit)
+	}
+	p.mu.Lock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	p.mu.Unlock()
+	if account == nil {
+		return false, fmt.Errorf("%w: %s", ErrAccountNotFound, accountID)
+	}
+	account.storageMu.Lock()
+	defer account.storageMu.Unlock()
+	p.mu.Lock()
+	current := p.byID[account.ID] == account && account.authGeneration == generation
+	p.mu.Unlock()
+	if !current {
+		return false, nil
+	}
+	state, err := LoadStorageState(account.StoragePath)
+	if err != nil {
+		return false, err
+	}
+	if p.externalLoginReplaced(account, state) {
+		return false, nil
+	}
+	fresh := StorageOrigin{Origin: origin.Origin, LocalStorage: slices.Clone(origin.LocalStorage)}
+	merged := replaceStorageOrigin(state.Origins, fresh)
+	if slices.EqualFunc(merged, state.Origins, func(left, right StorageOrigin) bool {
+		return left.Origin == right.Origin && slices.Equal(left.LocalStorage, right.LocalStorage)
+	}) {
+		return false, nil
+	}
+	state.Origins = merged
+	if err := WriteStorageState(account.StoragePath, state); err != nil {
+		return false, err
+	}
+	p.mu.Lock()
+	account.StorageState = state
+	p.mu.Unlock()
+	return true, nil
+}
+
+// replaceStorageOrigin 用 fresh 替换同一 origin 的项：放在原来第一次出现的位置（重复的同 origin 项合并掉），没有时追加到末尾；
+// 其他 origin 保持原样与原顺序
+func replaceStorageOrigin(origins []StorageOrigin, fresh StorageOrigin) []StorageOrigin {
+	merged := make([]StorageOrigin, 0, len(origins)+1)
+	placed := false
+	for _, origin := range origins {
+		if origin.Origin != fresh.Origin {
+			merged = append(merged, origin)
+			continue
+		}
+		if !placed {
+			merged = append(merged, fresh)
+			placed = true
+		}
+	}
+	if !placed {
+		merged = append(merged, fresh)
+	}
+	return merged
 }
 
 // stateCookieKey 为 Cookie 的身份：同名 Cookie 在不同 domain、path 下是不同的 Cookie

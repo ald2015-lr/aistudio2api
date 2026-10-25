@@ -133,12 +133,37 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		}
 		return nil, "", err
 	case <-timer.C:
-		_ = process.Close()
-		return nil, "", fmt.Errorf("等待 Camoufox BiDi 端点超时: %s", timeout)
+		return nil, "", process.abortLaunch(fmt.Errorf("等待 Camoufox BiDi 端点超时: %s", timeout))
 	case <-ctx.Done():
-		_ = process.Close()
-		return nil, "", ctx.Err()
+		return nil, "", process.abortLaunch(ctx.Err())
 	}
+}
+
+// browserExitUnconfirmedError 为启动失败、关闭浏览器时没能确认进程退出的错误，文案与原错误相同：
+// 浏览器可能还在用账户缓存目录，调用方据 exited 保留缓存锁直到进程退出（见 retainAccountCacheUntilExit）
+type browserExitUnconfirmedError struct {
+	err    error
+	exited <-chan struct{}
+}
+
+func (unconfirmed *browserExitUnconfirmedError) Error() string { return unconfirmed.err.Error() }
+
+func (unconfirmed *browserExitUnconfirmedError) Unwrap() error { return unconfirmed.err }
+
+// abortLaunch 关闭报告 BiDi 端点之前就失败的浏览器并返回 cause；没能确认进程退出时包装成 browserExitUnconfirmedError
+func (process *browserProcess) abortLaunch(cause error) error {
+	if process.Close() == nil {
+		return cause
+	}
+	return &browserExitUnconfirmedError{err: cause, exited: process.exited()}
+}
+
+// exited 返回浏览器进程退出时关闭的通道
+func (process *browserProcess) exited() <-chan struct{} {
+	if process == nil {
+		return nil
+	}
+	return process.done
 }
 
 // Close 关闭 Camoufox 并删除隔离 profile

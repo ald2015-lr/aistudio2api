@@ -145,6 +145,8 @@ Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存�
 
 Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secure`、`sameSite` 与可选 `partitionKey` 原样持久化；`sameSite` 接受空值、`Lax`、`Strict` 或 `None`。origin 必须包含 scheme 与 host。请求 Cookie 过滤过期项与不匹配的 Secure/domain/path 条目，同名项按 path 长度降序发送；普通 HTTP 响应的 `Set-Cookie` 按 name、domain、path 替换或删除未分区项，同名分区项独立保留。浏览器恢复时，`partitionKey` 映射到 BiDi `storageKey.sourceOrigin`，空值使用默认分区。
 
+localStorage 由站点脚本之前运行的 preload 按 origin 恢复，只写入页面里还没有的键（`getItem` 为 `null` 时才 `setItem`）：每次启动的 Camoufox profile 都是新建的，第一次载入时保存的键全部写入；preload 在每次导航（含页面自己刷新）时都会运行，页面自己写入或原地升级过的值保留，不再被保存的旧值覆盖。这与 Playwright storageState（建上下文时每个 origin 只写一次）不同：之后每次导航仍会补上为 `null` 的键，页面删掉的键（`removeItem` 或 `clear` 之后刷新）会被重新写入；没有在 `sessionStorage` 等处记标记让它只生效一次，因为页面脚本能看到多出来的存储项。WAA Worker 启动完成、发布之前，服务用只读的 `script.evaluate` 读出当前 `https://aistudio.google.com` 页面的全部 localStorage，替换 `storage-state.json` 里这个 origin 的 `localStorage`（浏览器里的值以保存的值为起点、经页面升级，是权威版本），其他 origin 原样保留。写回与 Cookie 写回一样按认证代际判断，启动期间保存过新登录或续签时不写；认证文件被外部换成另一个登录（登录签名 Cookie 与内存不同）、扫描还没载入时 Cookie 与 localStorage 都不写，记下账户交给账户目录扫描载入；浏览器没有导出任何项、与磁盘相同时不写文件；键名与值合计超过 512 KB 时不写。多个进程共用账户目录时，403 无权限账户按认证文件内容判断是否重新上传，这个 origin 的 localStorage 与轮换 Cookie 一样不计入比较。写回只在启动成功后发生：如果保存的旧格式本身就让页面起不来，这些账号拿不到新格式，需要重新登录（登录用全新的浏览器，导出页面新建的 localStorage）。读取或写回失败只记一条 `WAA Worker 启动后写回 localStorage 失败` 警告，不影响启动；日志只写原因与大小，不写 localStorage 的值。纯 Go 后端没有浏览器页面，不写回。
+
 ### 账户持久状态
 
 | 文件 | 内容 |
@@ -153,7 +155,7 @@ Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secu
 | `auth/<Google 邮箱>/storage-state.json` | Cookie、localStorage 和可选 Chrome 续签材料 |
 | `auth/<Google 邮箱>/camoufox-fingerprint.json` | 账户固定的 navigator、屏幕、字体、语言、地区和时区配置 |
 | `auth/<Google 邮箱>/runtime-state.json` | 账户权益、实测模型资格、冷却与 Drive/Veo 资源绑定 |
-| `auth/<Google 邮箱>/camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存，运行中的 WAA Worker 独占 |
+| `auth/<Google 邮箱>/camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存（上限 256 MB），使用它的 WAA Worker 持有目录内 `.lock` 独占；`.created` 记录这份缓存的创建时间，超过 3 天的在下次启动拿到锁后先清空再用；页面状态类启动失败后清空（12 小时内新建或清空过的不清，同账户 10 分钟最多一次），见 [开发文档](development.md#账户浏览器缓存) |
 | `auth/.leases/<Google 邮箱>.lock` | 同一账户目录的跨进程占用锁 |
 | `auth/.leases/<Google 邮箱>.runtime.lock` | 每次 `runtime-state.json` 读取、合并与写回的短事务锁 |
 | `[用户缓存]/AIStudio2API/runtime-leases/<Google 邮箱>.lock` | 当前电脑上该邮箱的 WAA Worker 占用锁 |
@@ -1196,7 +1198,7 @@ Chrome 导入列表按 `Preferences.account_info` 中的 Gaia ID 与邮箱逐个
 
 `POST /api/accounts/bulk-delete` 一次请求删除一批账户，每个账户的效果与 `DELETE /api/accounts/{id}` 相同：从账户池移除并删除账户目录，清除它的 403 无权限记录、停用原因与新账户自动处理记录，关闭它的 Worker；每个账户仍写一条“账户已删除”，整批结束后只合并、推送一次账户与模型快照，并写一条汇总日志（见 [logging.md](logging.md)）。`account_ids` 去掉首尾空白、去重后按顺序处理：号池里已经没有的账户（已删除或从未载入）计入 `missing` 并清除它的 403 记录，不占单次名额；号池里还有的账户单次最多删除 500 个，其余计入 `remaining`。例如 600 个 ID 中前 100 个已经删除时返回 `deleted` 500、`missing` 100、`remaining` 0。原样再次提交同一列表即可继续：已经删掉的按 `missing` 处理，不占名额。同一账户被并发删除时同样按 `missing` 处理。账户 ID 按原样精确匹配（区分大小写，与 `DELETE /api/accounts/{id}` 相同），只差大小写的 ID 按 `missing` 处理，也只清除这个 ID 原样对应的 403 记录。正在处理请求的账户不在请求进行中删除：先不再接新请求，在整批共用的等待上限（约 10 秒）内等它空闲后删除；等不到的记为 `account_busy` 并撤销为删除做的准备，账户恢复正常调度。请求体没有账户时返回 400。管理页 403 无权限账户列表的“一键删除”按 500 个一批依次提交整个列表（包括折叠未显示的），两批之间可以停止；确认后先重新读取一次列表，每批提交前再对照，只提交确认时列出、提交时仍在列表里的账户（确认期间重新上传认证文件、已移出列表的账户不提交）。
 
-`GET /api/accounts/permission-denied` 列出的账户在认证文件更新时移出，同时解除它的 403 冷却与暂停：账户目录扫描发现登录签名 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`）变了，或者列出的账户磁盘上的 `storage-state.json` 与本进程内存中的登录状态不同（同一登录会话里重新导出时登录签名不变）；内容比较不计 Google 定期轮换的 `__Secure-1PSIDTS`、`__Secure-3PSIDTS`、`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`，只有这些不同的重新导出不算更新。本服务自己写回认证文件（回写 Cookie、续签）时同时更新内存，续签提交时还更新登记时记下的登录签名，都不算更新；服务停止期间换上的认证文件在启动时按登录签名对照。这套判断假定只有本进程写这个账户目录：多个进程共用一个 auth 目录时，另一个进程回写轮换 Cookie 不算更新，但它写进认证文件的其他变化（轮换 Cookie 之外的 Cookie、本地存储）在本进程看来与内存不同，仍按重新上传清除本进程的记录与 403 冷却；`.permission-denied.json` 也由各进程整份写出，不做合并。
+`GET /api/accounts/permission-denied` 列出的账户在认证文件更新时移出，同时解除它的 403 冷却与暂停：账户目录扫描发现登录签名 Cookie（`SAPISID`、`__Secure-1PAPISID`、`__Secure-3PAPISID`）变了，或者列出的账户磁盘上的 `storage-state.json` 与本进程内存中的登录状态不同（同一登录会话里重新导出时登录签名不变）；内容比较不计 Google 定期轮换的 `__Secure-1PSIDTS`、`__Secure-3PSIDTS`、`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`，也不计 `https://aistudio.google.com` 的 localStorage（Worker 启动成功后写回），只有这些不同的重新导出不算更新。本服务自己写回认证文件（回写 Cookie 与 localStorage、续签）时同时更新内存，续签提交时还更新登记时记下的登录签名，都不算更新；服务停止期间换上的认证文件在启动时按登录签名对照。这套判断假定只有本进程写这个账户目录：多个进程共用一个 auth 目录时，另一个进程回写轮换 Cookie 与 AI Studio 的 localStorage 不算更新，但它写进认证文件的其他变化（轮换 Cookie 之外的 Cookie、其他 origin 的本地存储）在本进程看来与内存不同，仍按重新上传清除本进程的记录与 403 冷却；`.permission-denied.json` 也由各进程整份写出，不做合并。
 
 `PUT /api/accounts/{id}` 的提交顺序固定为：校验不可变邮箱 ID，取得账户独占租约，创建未发布的新固定出口，关闭当前 Worker 并把新 Worker 配置标记为 `pending`（尚未发布），在模型目录写锁内原子写入 `account.json` 并更新账户池，随后发布 Worker 配置、替换固定出口、释放租约并重建模型缓存。`account.json` 写入是唯一持久提交点。提交前的出口创建、Worker 关闭或写入错误会丢弃这份待发布配置并保持旧配置；已经关闭的 Worker 由后续请求按旧配置重建。持久写入后，新配置、Worker 配置与固定出口共同成为已提交状态。租约释放错误保留该提交状态并返回原始 unlock 错误；释放成功后记录完成日志并同步模型缓存；账户由停用改为启用且没有模型目录时，在后台补一次目录同步。
 

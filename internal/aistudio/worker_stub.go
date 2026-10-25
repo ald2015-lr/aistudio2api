@@ -17,11 +17,12 @@ type stubRuntime struct {
 	hooks         StubWorkerHooks
 }
 
-// StubWorkerHooks 替换 stub Worker 的 proof 生成与 Cookie 导出，供其他包测试控制 WAA 准备的耗时与结果；
-// 为空的项保持默认行为（不生成 proof、不返回 Cookie）
+// StubWorkerHooks 替换 stub Worker 的 proof 生成、Cookie 与 localStorage 导出，供其他包测试控制 WAA 准备的耗时与结果；
+// 为空的项保持默认行为（不生成 proof、不返回 Cookie 与 localStorage）
 type StubWorkerHooks struct {
 	Proof          func(context.Context) (string, error)
 	StorageCookies func(context.Context) ([]byte, error)
+	LocalStorage   func(context.Context) ([]byte, error)
 }
 
 func (runtime *stubRuntime) Proof(ctx context.Context, _ string, _ string) (string, error) {
@@ -42,6 +43,13 @@ func (runtime *stubRuntime) SendProtected(context.Context, string, http.Header, 
 func (runtime *stubRuntime) StorageCookies(ctx context.Context) ([]byte, error) {
 	if runtime.hooks.StorageCookies != nil {
 		return runtime.hooks.StorageCookies(ctx)
+	}
+	return nil, nil
+}
+
+func (runtime *stubRuntime) StorageLocalStorage(ctx context.Context) ([]byte, error) {
+	if runtime.hooks.LocalStorage != nil {
+		return runtime.hooks.LocalStorage(ctx)
 	}
 	return nil, nil
 }

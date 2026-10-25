@@ -985,8 +985,8 @@ func TestPermissionDeniedRenewalKeepsListing(t *testing.T) {
 }
 
 // TestPermissionDeniedSharedDirectoryWriteBack 多个进程共用一个账户目录时，另一个进程回写 Google 轮换的 Cookie（__Secure-1PSIDTS、SIDCC 等）
-// 后磁盘与本进程内存不同。原先按重新上传处理：移出列表、解除 403 冷却、冷却档位从头计，另一个进程每回写一次就这样一次。
-// 轮换 Cookie 不计入内容比较；外部重新导出改了轮换 Cookie 之外的内容时仍按重新上传清除
+// 或 Worker 启动成功后写回 AI Studio 的 localStorage 后，磁盘与本进程内存不同。原先按重新上传处理：移出列表、解除 403 冷却、
+// 冷却档位从头计，另一个进程每回写一次就这样一次。这两项不计入内容比较；外部重新导出改了其他内容时仍按重新上传清除
 func TestPermissionDeniedSharedDirectoryWriteBack(t *testing.T) {
 	const listed = "listed@example.com"
 	admin, registry := deniedWatcherAdmin(t, []string{listed})
@@ -1043,6 +1043,32 @@ func TestPermissionDeniedSharedDirectoryWriteBack(t *testing.T) {
 		t.Fatalf("另一个进程回写轮换 Cookie 不应清除记录，日志 = %v", serviceLogMessages(admin.requests))
 	}
 
+	// 另一个进程的 Worker 启动成功后写回 AI Studio 的 localStorage：同样是本服务自己写回的内容，不算重新上传
+	written, err := other.MergeBrowserLocalStorage(listed, other.AuthGeneration(listed), aistudio.StorageOrigin{
+		Origin: aistudio.BrowserLocalStorageOrigin, LocalStorage: []aistudio.StorageItem{{Name: "aiStudioUserPreference", Value: "other-process"}},
+	})
+	if err != nil || !written {
+		t.Fatalf("另一个进程应写回 localStorage: written=%t err=%v", written, err)
+	}
+	disk, err = aistudio.LoadStorageState(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memory, _ := pool.StorageStateOf(listed); len(disk.Origins) == len(memory.Origins) {
+		t.Fatalf("另一个进程应把 localStorage 写进认证文件：磁盘 %d 个 origin，内存 %d 个", len(disk.Origins), len(memory.Origins))
+	}
+	settleAuthFile(t, pool, listed, base.Add(15*time.Second))
+	scanAndWait(t, watcher)
+	if _, ok := registry.identityOf(listed); !ok {
+		t.Fatalf("另一个进程写回 localStorage 不应当作重新上传：%+v", registry.list())
+	}
+	if _, _, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); !cooling {
+		t.Fatal("另一个进程写回 localStorage 后 403 冷却应保持")
+	}
+	if hasLogContaining(admin.requests, "清除 403 无权限记录与冷却") {
+		t.Fatalf("另一个进程写回 localStorage 不应清除记录，日志 = %v", serviceLogMessages(admin.requests))
+	}
+
 	// 外部在同一登录会话里重新导出：登录签名 Cookie 不变，轮换 Cookie 之外的 Cookie 也变了
 	if err := aistudio.WriteStorageState(
 		account.StoragePath, withCookie(withCookie(disk, "__Secure-1PSIDTS", "browser-reexport"), "NID", "browser-reexport"),
@@ -1056,5 +1082,49 @@ func TestPermissionDeniedSharedDirectoryWriteBack(t *testing.T) {
 	}
 	if _, reason, cooling := modelCooldownUntil(t, pool, listed, testRuntimeModel); cooling {
 		t.Fatalf("重新导出的认证文件应解除 403 冷却，仍有：%s", reason)
+	}
+}
+
+// TestStorageStateDigestIgnoresWrittenBack 摘要不计本服务自己写回的内容（轮换 Cookie、AI Studio 的 localStorage），
+// 其他 origin 的 localStorage 与其他 Cookie 仍计入；磁盘与内存只差 AI Studio 的 localStorage 时 403 账户不按重新上传载入
+func TestStorageStateDigestIgnoresWrittenBack(t *testing.T) {
+	const listed = "listed@example.com"
+	admin, _ := deniedWatcherAdmin(t, []string{listed})
+	memory, ok := admin.pool.StorageStateOf(listed)
+	if !ok {
+		t.Fatal("账户不存在")
+	}
+	withOrigin := func(state aistudio.StorageState, origin string, value string) aistudio.StorageState {
+		state.Origins = append(slices.Clone(state.Origins), aistudio.StorageOrigin{
+			Origin: origin, LocalStorage: []aistudio.StorageItem{{Name: "k", Value: value}},
+		})
+		return state
+	}
+	written := withOrigin(withCookie(memory, "SIDCC", "rotated"), aistudio.BrowserLocalStorageOrigin, "upgraded")
+	if storageStateDigest(written) != storageStateDigest(memory) {
+		t.Fatal("轮换 Cookie 与 AI Studio 的 localStorage 不应计入摘要")
+	}
+	if storageStateDigest(withOrigin(memory, "https://accounts.google.com", "changed")) == storageStateDigest(memory) {
+		t.Fatal("其他 origin 的 localStorage 应计入摘要")
+	}
+	if storageStateDigest(withCookie(memory, "NID", "changed")) == storageStateDigest(memory) {
+		t.Fatal("轮换 Cookie 之外的 Cookie 应计入摘要")
+	}
+	account, err := admin.pool.Account(listed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := aistudio.WriteStorageState(account.StoragePath, written); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	watcher := newTestAccountWatcher(admin)
+	summary := aistudio.AccountLoginSummary{ID: listed, StoragePath: account.StoragePath}
+	refresh, settled := watcher.deniedAuthUpdated(summary, written, authFileStat{modTime: info.ModTime(), size: info.Size()})
+	if refresh || !settled {
+		t.Fatalf("磁盘与内存只差 AI Studio 的 localStorage 时 deniedAuthUpdated = (%t, %t)，期望 (false, true)", refresh, settled)
 	}
 }

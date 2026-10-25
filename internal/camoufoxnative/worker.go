@@ -64,14 +64,23 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 	if err != nil {
 		return nil, err
 	}
-	cacheDirectory, cacheLock, err := lockAccountCache(options.StorageStatePath)
+	cacheDirectory, cacheLock, err := lockAccountCache(options.StorageStatePath, options.CacheExpired)
 	if err != nil {
 		return nil, err
+	}
+	if cacheDirectory != "" && options.CacheAttached != nil {
+		options.CacheAttached()
 	}
 	options.CacheDirectory = cacheDirectory
 	options.reportStartup(StartupLaunchingBrowser)
 	process, endpoint, err := launchBrowser(ctx, options, fingerprint)
 	if err != nil {
+		var unconfirmed *browserExitUnconfirmedError
+		if errors.As(err, &unconfirmed) {
+			// 浏览器没能确认退出：缓存锁保留到进程退出，清理与之后的锁定都拿不到锁
+			retainAccountCacheUntilExit(cacheLock, unconfirmed.exited)
+			return nil, err
+		}
 		return nil, errors.Join(err, releaseAccountCache(cacheLock))
 	}
 	worker := &Worker{process: process, cacheLock: cacheLock}
@@ -114,6 +123,9 @@ func (worker *Worker) abort() error {
 		_ = connection.Close()
 	}
 	if err := process.Close(); err != nil {
+		// 没能确认浏览器退出：Start 返回后这个 Worker 不再被引用，缓存锁交给 retainAccountCacheUntilExit 保留到进程退出，
+		// 启动失败后的清理与之后的锁定都拿不到锁
+		retainAccountCacheUntilExit(worker.cacheLock, process.exited())
 		return err
 	}
 	return releaseAccountCache(worker.cacheLock)
@@ -222,6 +234,8 @@ func (worker *Worker) Close() error {
 		_ = connection.Close()
 	}
 	if err := process.Close(); err != nil {
+		// 没能确认浏览器退出：缓存锁保留到进程退出（调用方之后可能不再引用这个 Worker）；关闭重试成功时照常释放
+		retainAccountCacheUntilExit(worker.cacheLock, process.exited())
 		return err
 	}
 	if err := releaseAccountCache(worker.cacheLock); err != nil {

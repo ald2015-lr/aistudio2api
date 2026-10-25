@@ -178,6 +178,32 @@ func (worker *NativeWorker) BrowserStorageState(ctx context.Context) (StorageSta
 	return state, nil
 }
 
+// localStorageExporter 为能导出页面 localStorage 的 runtime（Camoufox）；纯 Go runtime 没有浏览器页面
+type localStorageExporter interface {
+	StorageLocalStorage(context.Context) ([]byte, error)
+}
+
+// BrowserLocalStorage 返回账户 WAA runtime 当前 AI Studio 页面的 localStorage，第二个返回值为 runtime 是否导出了内容
+// （纯 Go runtime 没有浏览器页面，返回 false）。错误文案不含 localStorage 的值
+func (worker *NativeWorker) BrowserLocalStorage(ctx context.Context) (StorageOrigin, bool, error) {
+	exporter, ok := worker.runtime.(localStorageExporter)
+	if !ok {
+		return StorageOrigin{}, false, nil
+	}
+	encoded, err := exporter.StorageLocalStorage(ctx)
+	if err != nil {
+		return StorageOrigin{}, false, err
+	}
+	if len(encoded) == 0 {
+		return StorageOrigin{}, false, nil
+	}
+	var origin StorageOrigin
+	if err := json.Unmarshal(encoded, &origin); err != nil {
+		return StorageOrigin{}, false, errors.New("解析浏览器 localStorage 失败")
+	}
+	return origin, true, nil
+}
+
 // ProtocolHeaders 返回当前账户官网请求的动态公共头
 func (worker *NativeWorker) ProtocolHeaders(ctx context.Context, accountID string) (http.Header, error) {
 	if accountID != "" && accountID != worker.accountID {
