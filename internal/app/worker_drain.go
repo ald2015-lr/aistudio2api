@@ -47,7 +47,7 @@ const (
 	// 上万备用账号时不在锁内扫完全部
 	replacementScanBatch = 64
 	replacementScanLimit = 1024
-	// standbyPreferLimit 为请求路径挑备用账号时按热门与主用模型冷却重新排序的候选数上限（控制锁时间）
+	// standbyPreferLimit 为请求路径挑备用账号时按能服务的主用与热门模型重新排序的候选数上限（控制锁时间，见 standbyCapacity.preferred）
 	standbyPreferLimit = 64
 )
 
@@ -491,14 +491,15 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 
 // pickReplacement 在分区内挑一个替补账号：能服务 models 的空闲备用账号（按调度索引分类，见 replacementCandidates），
 // 去掉预热失败冷却中、正在启动、被其他进程占用与已有 Worker 的账号，并且对热门与主用模型（以及 models）都没有长时间冷却；
-// 按批核对，最多 replacementScanLimit 个，没有合适的返回空
+// 先按能服务的主用模型个数、其次热门模型个数、同分按近期成功排序，再按批核对，最多 replacementScanLimit 个，没有合适的返回空
 func (manager *accountWorkerManager) pickReplacement(ctx context.Context, partition aistudio.PoolScope, models []string, warm []string) string {
 	standby := manager.replacementCandidates(ctx, partition, models, warm)
 	if len(standby) == 0 {
 		return ""
 	}
-	// 坏号（连续裸限流）移出、近期成功过的账号排前（见 bad_accounts.go）
-	standby = manager.orderColdCandidates(standby)
+	// 与预热同一排序（见 rankColdCandidates）：近期成功过、对主用模型长时间冷却的账号（仍能服务登记的其他模型）整组排在前面时，
+	// 上千个这样的账号会用完下面的核对名额，能服务主用模型的账号轮不到；只看冷却键的核对也会选中目录里没有主用模型的近期成功账号
+	standby = manager.rankColdCandidates(partition, standby)
 	avoid := manager.deadSlotModelsFor(partition)
 	if len(models) > 0 {
 		avoid = append(slices.Clone(avoid), models...)

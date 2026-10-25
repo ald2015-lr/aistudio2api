@@ -16,8 +16,9 @@ import (
 // 换 10 个住宅 IP 后照样出现（nonip_deep_result R4）。逐级冷却只在内存、按（账号，模型）记，预热与替补排序不看历史结果，
 // 每遇到一个坏号都要白付一次冷启动加一次必败的尝试。这里按账号（不分模型）记：连续 badAccountStreak 次裸限流、期间没有成功，
 // 就在 badAccountHold 内移出预热、扩容（含按需提升）与替补的候选（还有其他候选时；全是坏号时照常用，免得小号池没有可启动的账号），
-// 并且预热与替补优先选近期成功过的账号。与出口判定解耦：不要求出口判定成立（多出口时每出口的判定门槛很难达到）；
-// 出口判定的“冷号首发被拒”不计已标坏号的账号，免得把坏号误判成出口限流。记录写进模型目录缓存同目录的 bad-accounts.json，重启后保留
+// 并且预热与替补在能服务主用（与热门）模型的前提下优先选近期成功过的账号。与出口判定解耦：不要求出口判定成立
+// （多出口时每出口的判定门槛很难达到）；出口判定的“冷号首发被拒”不计已标坏号的账号，免得把坏号误判成出口限流。
+// 记录写进模型目录缓存同目录的 bad-accounts.json，重启后保留
 
 const (
 	// badAccountStreak 为标坏号要求的连续裸限流次数（期间没有成功）
@@ -215,8 +216,10 @@ func (memory *badAccountMemory) count() int {
 	return total
 }
 
-// order 整理冷启动候选（预热、替补、扩容与按需提升）：还有不是坏号的候选时去掉坏号；再把 badAccountSuccessKeep 内成功过的账号
-// 稳定地移到最前（其余保持原顺序）。全是坏号时原样返回（小号池没有别的账号可启动）
+// order 整理预热与替补的冷启动候选：还有不是坏号的候选时去掉坏号；再把 badAccountSuccessKeep 内成功过的账号
+// 稳定地移到最前（其余保持原顺序）。全是坏号时原样返回（小号池没有别的账号可启动）。
+// 之后还要按能服务的主用模型个数、其次热门模型个数稳定排序，近期成功只在同分时优先（见 rankColdCandidates）；扩容与按需提升不用它，
+// 只去坏号（见 withoutBadAccounts）
 func (memory *badAccountMemory) order(accountIDs []string) []string {
 	if memory == nil || len(accountIDs) == 0 {
 		return accountIDs

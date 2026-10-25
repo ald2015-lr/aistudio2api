@@ -224,10 +224,10 @@ type standbyCapacity struct {
 	active   map[aistudio.PoolScope]int
 	cooling  map[aistudio.PoolScope]bool
 	idle     map[aistudio.PoolScope]bool
-	// serveable 为已核对过的备用账户能服务几个热门或主用模型（见 preferred），一次调度内每个账户最多核对一次；
-	// deadModels 为各分区判断死槽位用的模型，一次调度内第一次需要时取一次
-	serveable  map[string]int
-	deadModels map[aistudio.PoolScope][]string
+	// ranks 为已核对过的备用账户能服务几个主用模型与热门模型（见 preferred），一次调度内每个账户最多核对一次；
+	// rankModels 为各分区排序用的主用与热门模型列表（见 coldRankModelsFor），一次调度内第一次需要时取一次
+	ranks      map[string]coldRank
+	rankModels map[aistudio.PoolScope]coldRankModels
 }
 
 // standbyCapacity 按当前驻留的 Worker 创建分区容量判断
@@ -259,31 +259,34 @@ func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope 
 	return partitionOf(accountID, capacity.ultra)
 }
 
-// preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个按能服务的热门与主用模型个数从多到少排列（同数保持原顺序），
-// 第二段为其余候选，保持原顺序且不复制（备用账户可能有上万个）。为其他模型的请求启动的备用账号也优先选还能服务主用模型的，
-// 不直接启动一个服务不了主用模型的 Worker（目录里没有、权益不够或已长时间冷却，按候选集成员判断，见 aistudio.ServeableCounts）；
-// 只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），都服务不了时仍按原顺序使用。
+// preferred 返回按偏好排列的候选，分为两段：前 standbyPreferLimit 个与预热、替补同一口径（见 preferUncooled 与 compareColdRank）：
+// 按能服务的分区主用模型个数从多到少，同数再按热门模型（不含主用模型）个数，仍相同时保持原顺序；第二段为其余候选，
+// 保持原顺序且不复制（备用账户可能有上万个）。为其他模型的请求启动的备用账号也优先选还能服务主用模型的，
+// 不直接启动一个服务不了主用模型的 Worker（目录里没有、权益不够或冷却剩余不少于 coldRankMinRemaining，按候选集成员判断，
+// 见 aistudio.ServeableCounts）；原先按主用与热门合计个数、15 分钟阈值计分，对主用模型 403 冷却、能服务热门模型的账号
+// 与能服务主用模型、在热门模型上冷却的账号同分，按账号 ID 先启动前者。只核对前 standbyPreferLimit 个（控制账户池锁内的工作量），
+// 都服务不了时仍按原顺序使用。
 // 主用模型按候选账户所在的分区取（Ultra 分区按 Ultra 主用模型，见 primaryModelListFor）：不限号池的选号候选跨两个分区，
-// 前段按分区分组各核对一次（每个分区最多一次加锁，分区归属在调度内已缓存），不用两个列表的并集，免得普通号池的主用模型
+// 前段按分区分组各核对一次（每个分区每份非空列表最多一次加锁，分区归属在调度内已缓存），不用两个列表的并集，免得普通号池的主用模型
 // 左右 Ultra 备用账号的先后
 func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	if len(list) <= 1 {
 		return [2][]string{list, nil}
 	}
-	if capacity.deadModels == nil {
-		capacity.deadModels = make(map[aistudio.PoolScope][]string, len(workerPartitions))
+	if capacity.rankModels == nil {
+		capacity.rankModels = make(map[aistudio.PoolScope]coldRankModels, len(workerPartitions))
 		for _, partition := range workerPartitions {
-			capacity.deadModels[partition] = capacity.manager.deadSlotModelsFor(partition)
+			capacity.rankModels[partition] = capacity.manager.coldRankModelsFor(partition)
 		}
 	}
-	models := capacity.deadModels
-	if len(models[aistudio.PoolScopeNormal]) == 0 && len(models[aistudio.PoolScopeUltra]) == 0 {
+	models := capacity.rankModels
+	if models[aistudio.PoolScopeNormal].empty() && models[aistudio.PoolScopeUltra].empty() {
 		return [2][]string{list, nil}
 	}
 	head := list[:min(standbyPreferLimit, len(list))]
 	unknown := make(map[aistudio.PoolScope][]string, len(workerPartitions))
 	for _, accountID := range head {
-		if _, checked := capacity.serveable[accountID]; !checked {
+		if _, checked := capacity.ranks[accountID]; !checked {
 			partition := capacity.partition(accountID)
 			unknown[partition] = append(unknown[partition], accountID)
 		}
@@ -293,17 +296,14 @@ func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 		if len(accountIDs) == 0 {
 			continue
 		}
-		if capacity.serveable == nil {
-			capacity.serveable = make(map[string]int, len(head))
+		if capacity.ranks == nil {
+			capacity.ranks = make(map[string]coldRank, len(head))
 		}
-		counts := capacity.manager.pool.ServeableCounts(accountIDs, models[partition], rotationMinRemaining)
-		for _, accountID := range accountIDs {
-			capacity.serveable[accountID] = counts[accountID]
-		}
+		models[partition].rankInto(capacity.manager.pool, accountIDs, capacity.ranks)
 	}
 	ordered := slices.Clone(head)
 	slices.SortStableFunc(ordered, func(left string, right string) int {
-		return capacity.serveable[right] - capacity.serveable[left]
+		return compareColdRank(capacity.ranks[left], capacity.ranks[right])
 	})
 	return [2][]string{ordered, list[len(head):]}
 }
@@ -341,7 +341,7 @@ func (capacity *standbyCapacity) idleVictim(partition aistudio.PoolScope) bool {
 }
 
 // expandable 返回可以在后台扩容的备用账户：所在分区未满，或分区已满但有冷却中（剩余不少于 ShortCooldownMax）的空闲 Worker 可以替换；
-// 优先没有 Worker 的账户，其次优先没有在热门或主用模型上长时间冷却的账户（见 preferred）
+// 优先没有 Worker 的账户，其次按能服务的主用模型个数、再按热门模型个数从多到少（见 preferred）
 func (capacity *standbyCapacity) expandable(standby []string) string {
 	for _, candidates := range [][]string{capacity.manager.coldAccounts(standby), standby} {
 		for _, segment := range capacity.preferred(candidates) {
@@ -374,7 +374,7 @@ func (capacity *standbyCapacity) reclaimDead(ctx context.Context, standby []stri
 }
 
 // promotable 返回现场启动 Worker 的备用账户：所在分区未满时优先没有 Worker 的账户；
-// allowVictim 时（没有热候选）分区已满但同分区有可淘汰的空闲 Worker 也可以。同样优先没有在热门或主用模型上长时间冷却的账户
+// allowVictim 时（没有热候选）分区已满但同分区有可淘汰的空闲 Worker 也可以。同样按能服务的主用模型个数、再按热门模型个数从多到少（见 preferred）
 func (capacity *standbyCapacity) promotable(standby []string, allowVictim bool) string {
 	for _, candidates := range [][]string{capacity.manager.coldAccounts(standby), standby} {
 		for _, segment := range capacity.preferred(candidates) {

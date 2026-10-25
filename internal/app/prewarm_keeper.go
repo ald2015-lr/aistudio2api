@@ -147,6 +147,12 @@ const (
 	rotationInterval = 30 * time.Second
 	// rotationMinRemaining 冷却剩余不少于该时长才视为长时间不可用（排除一分钟内恢复的分钟限额）
 	rotationMinRemaining = 15 * time.Minute
+	// coldRankMinRemaining 为冷启动候选排序（预热与替补的 preferUncooled、请求路径挑备用账号的 preferred，见 coldRankModels）
+	// 判断能否服务的冷却阈值：剩余不少于它的冷却排在没有冷却的账户之后。
+	// 排序只是偏好、不排除候选，所以比 rotationMinRemaining 严：单模型 403 冷却（30 分钟、6 小时）进入最后 15 分钟时仍按
+	// rotationMinRemaining 算能服务，与能服务主用模型、从没用过的账户同分，近期成功过的反而排前；启动后冷却一到期，第一个主用模型
+	// 请求多半又是 403，重新冷却成死槽位再淘汰替补。分钟限额等短冷却（不到 aistudio.ShortCooldownMax）仍算能服务
+	coldRankMinRemaining = aistudio.ShortCooldownMax
 	// rotationMinShare 与 rotationMinAccounts：一个模型在预热池中长时间冷却的账户达到
 	// max(下限, 预热数×比例) 时才进行轮换，避免为少用的模型反复重启浏览器。
 	// 只约束按模型的冷却：全局冷却的账号对任何模型都是死槽位，由 sweepDeadWorkers 与冷却登记不设阈值地淘汰
@@ -168,21 +174,86 @@ func (manager *accountWorkerManager) hotModelList() []string {
 	return nil
 }
 
-// preferUncooled 把分区内的候选账户按能服务的热门与该分区主用模型个数从多到少排列（同数保持原顺序），预热时优先启动还能服务
-// 主用模型的账户；Ultra 分区按 Ultra 列表，普通分区按普通列表（见 primaryModelListFor）。
-// 能否服务按候选集成员判断（目录、权益、启用通道都支持且没有长时间冷却，见 aistudio.ServeableCounts）：只看冷却键会把目录里根本没有
-// 主用模型的账户当成“没冷却”排在前面。都服务不了时仍然保留原顺序，它们还能服务其他模型
+// preferUncooled 把分区内的候选账户按能服务的该分区主用模型个数从多到少排列，同数再按能服务的热门模型（不含主用模型）个数，
+// 仍相同时保持原顺序（稳定排序），预热时优先启动还能服务主用模型的账户；Ultra 分区按 Ultra 列表，普通分区按普通列表（见 primaryModelListFor）。
+// 主用模型先比、热门模型后比：两类合在一起按个数计分时，能服务主用模型、但在热门模型（如大量每日限额的 flash）上冷却的账户，
+// 与对主用模型 403 冷却、仍能服务热门模型的近期成功账户同分，后者排前，又启动了对主用模型冷却的账户。
+// 能否服务按候选集成员判断（目录、权益、启用通道都支持且冷却剩余不到 coldRankMinRemaining，见 aistudio.ServeableCounts）：只看冷却键会把
+// 目录里根本没有主用模型的账户当成“没冷却”排在前面。都服务不了时仍然保留原顺序，它们还能服务其他模型
 func (manager *accountWorkerManager) preferUncooled(partition aistudio.PoolScope, accountIDs []string) []string {
-	models := manager.deadSlotModelsFor(partition)
-	if len(models) == 0 || len(accountIDs) <= 1 {
+	if len(accountIDs) <= 1 {
 		return accountIDs
 	}
-	counts := manager.pool.ServeableCounts(accountIDs, models, rotationMinRemaining)
+	models := manager.coldRankModelsFor(partition)
+	if models.empty() {
+		return accountIDs
+	}
+	ranks := models.rankInto(manager.pool, accountIDs, make(map[string]coldRank, len(accountIDs)))
 	result := slices.Clone(accountIDs)
 	slices.SortStableFunc(result, func(left string, right string) int {
-		return counts[right] - counts[left]
+		return compareColdRank(ranks[left], ranks[right])
 	})
 	return result
+}
+
+// coldRankModels 为冷启动候选排序用的两份模型列表：分区主用模型，与去掉主用模型的热门模型。预热、替补（preferUncooled）与
+// 请求路径挑备用账号（standbyCapacity.preferred）共用，免得两边口径再分开：原先 preferred 按主用与热门合计个数、15 分钟阈值计分，
+// 同分时按账号 ID 先启动对主用模型冷却的账号
+type coldRankModels struct {
+	primary []string
+	hot     []string
+}
+
+// coldRank 为冷启动候选的排序分：能服务的分区主用模型个数与热门模型（不含主用模型）个数
+type coldRank struct {
+	primary int
+	hot     int
+}
+
+// coldRankModelsFor 返回分区的冷启动候选排序列表：Ultra 分区按 Ultra 主用模型，普通分区按普通列表（见 primaryModelListFor）
+func (manager *accountWorkerManager) coldRankModelsFor(partition aistudio.PoolScope) coldRankModels {
+	primary := manager.primaryModelListFor(partition)
+	hot := slices.DeleteFunc(slices.Clone(manager.hotModelList()), func(modelID string) bool {
+		return slices.Contains(primary, modelID)
+	})
+	return coldRankModels{primary: primary, hot: hot}
+}
+
+// empty 判断两份列表是否都为空（不用排序）
+func (models coldRankModels) empty() bool {
+	return len(models.primary) == 0 && len(models.hot) == 0
+}
+
+// rankInto 按候选集成员核对 accountIDs 能服务两份列表里各几个模型（冷却剩余不到 coldRankMinRemaining 的算能服务，
+// 见 aistudio.ServeableCounts），写进 ranks 并返回它；每份非空列表加锁一次，空列表不核对、计 0
+func (models coldRankModels) rankInto(pool *aistudio.AccountPool, accountIDs []string, ranks map[string]coldRank) map[string]coldRank {
+	var primary, hot map[string]int
+	if len(models.primary) > 0 {
+		primary = pool.ServeableCounts(accountIDs, models.primary, coldRankMinRemaining)
+	}
+	if len(models.hot) > 0 {
+		hot = pool.ServeableCounts(accountIDs, models.hot, coldRankMinRemaining)
+	}
+	for _, accountID := range accountIDs {
+		ranks[accountID] = coldRank{primary: primary[accountID], hot: hot[accountID]}
+	}
+	return ranks
+}
+
+// compareColdRank 为冷启动候选稳定排序的比较函数：能服务的主用模型多的在前，同数再比热门模型，仍相同时为 0（保持原顺序）
+func compareColdRank(left coldRank, right coldRank) int {
+	if diff := right.primary - left.primary; diff != 0 {
+		return diff
+	}
+	return right.hot - left.hot
+}
+
+// rankColdCandidates 整理预热与替补的冷启动候选：先去掉坏号、把近期成功过的账号整组排前（见 orderColdCandidates），
+// 再按能服务的分区主用模型个数、其次热门模型个数稳定排序（见 preferUncooled），近期成功只在同分时优先。两步不能反过来：近期成功过的账号
+// 多半正是用到冷却的（如对主用模型单模型 403 无权限、仍能服务其他模型），先按能否服务排序、再把近期成功的整组前移，
+// 它们会排在能服务主用模型、从没用过的账号前面，预热一直启动对主用模型冷却的账号
+func (manager *accountWorkerManager) rankColdCandidates(partition aistudio.PoolScope, accountIDs []string) []string {
+	return manager.preferUncooled(partition, manager.orderColdCandidates(accountIDs))
 }
 
 // sweepDeadWorkers 淘汰预热池中全局长时间冷却（每日限额冻结整个账号）的空闲 Worker。这样的 Worker 对任何模型都是死槽位，

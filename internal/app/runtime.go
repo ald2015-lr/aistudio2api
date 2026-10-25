@@ -2056,9 +2056,8 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			busy, standbyBusyErr = manager.runtimeAvailable(busy)
 			runtimeBusyErr = errors.Join(runtimeBusyErr, readyBusyErr, standbyBusyErr)
 			pendingBusy = pendingBusy || len(busy) > 0
-			ready = manager.preferUncooled(partition, ready)
-			// 坏号（连续裸限流）移出、近期成功过的账号排前（见 bad_accounts.go）
-			ready = manager.orderColdCandidates(ready)
+			// 坏号（连续裸限流）移出，能服务主用模型多的排前、其次看热门模型，同分时近期成功过的排前（见 rankColdCandidates）
+			ready = manager.rankColdCandidates(partition, ready)
 			// 疑似登录失效的账户（目录缓存记过需要登录、认证文件没变，见 catalog_sync.go）排在最后，预热先用没有嫌疑的账户
 			ready = manager.deferAuthSuspects(ready)
 			readyCount += len(ready)

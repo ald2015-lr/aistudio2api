@@ -170,6 +170,202 @@ func TestBadAccountsSkippedByPrewarm(t *testing.T) {
 	}
 }
 
+// forbidPrimary 像单模型 403 无权限一样，在 Playground 与 Build 两个通道上给账号的主用模型写入 6 小时冷却（原因带“无权限（模型）”前缀）；
+// 账号仍能服务其他模型
+func forbidPrimary(t *testing.T, env *drainEnv, accountID string) {
+	t.Helper()
+	coolBothChannels(t, env, accountID, drainProModel, forbiddenModelRepeatCooldown, forbiddenModelReasonPrefix+"The caller does not have permission")
+	if !env.pool.AccountLongCooling(accountID, drainProModel, rotationMinRemaining) || env.pool.AccountLongCooling(accountID, testRuntimeModel, rotationMinRemaining) {
+		t.Fatalf("%s 应只在主用模型上长时间冷却", accountID)
+	}
+}
+
+// coolBothChannels 在 Playground 与 Build 两个通道上给账号的 modelID 写入剩余 remaining 的冷却
+func coolBothChannels(t *testing.T, env *drainEnv, accountID string, modelID string, remaining time.Duration, reason string) {
+	t.Helper()
+	now := time.Now()
+	for _, scope := range []string{modelID, aistudio.ChannelCooldownScope(aistudio.ChannelBuild, modelID)} {
+		if err := env.pool.MarkCooldownIfGeneration(
+			accountID, scope, env.pool.ModelAccessGeneration(accountID), now, now.Add(remaining), reason,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// waitPrewarmDone 等预热这一轮结束并且驻留 Worker 达到 want 个（StartPrewarm 在第一个 Worker 就绪时就返回）
+func waitPrewarmDone(t *testing.T, manager *accountWorkerManager, want int) {
+	t.Helper()
+	if !waitUntil(10*time.Second, func() bool { return !manager.fillActive.Load() && len(manager.WarmAccountIDs()) >= want }) {
+		t.Fatalf("预热没有在期限内补到 %d 个，驻留 Worker = %v", want, sortedWarm(manager))
+	}
+}
+
+// TestPrewarmPrefersPrimaryOverRecentSuccess 预热先启动能服务主用模型的账号：近期成功过、但对主用模型单模型 403 冷却（两个通道都冷却，
+// 仍能服务其他模型）的 A、B 不再整组排在从没成功过、能服务主用模型的 X、Y 前面。原先先按能否服务排序、再把近期成功的整组前移，
+// 线上 2500 个这样的账号让预热一直启动对主用模型冷却的账号，476 个能服务主用模型的就绪账号一直没有启动
+func TestPrewarmPrefersPrimaryOverRecentSuccess(t *testing.T) {
+	accounts := []string{"order-a@example.com", "order-b@example.com", "order-x@example.com", "order-y@example.com"}
+	env := newDrainEnv(t, accounts, 2, 4)
+	memory := openBadAccountMemory("", env.requests)
+	env.manager.badAccounts.Store(memory)
+	for _, accountID := range accounts[:2] {
+		memory.observe(accountID, "", egressSuccess)
+		forbidPrimary(t, env, accountID)
+	}
+	want := []string{accounts[2], accounts[3], accounts[0], accounts[1]}
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, accounts); !slices.Equal(got, want) {
+		t.Fatalf("冷启动候选排序 = %v，期望 %v：能服务主用模型的 X、Y 在前，近期成功过、对主用模型冷却的 A、B 在后", got, want)
+	}
+	if err := <-env.manager.StartPrewarm(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitPrewarmDone(t, env.manager, 2)
+	if warm := sortedWarm(env.manager); !slices.Equal(warm, accounts[2:]) {
+		t.Fatalf("预热应启动能服务主用模型的 X、Y，驻留 Worker = %v", warm)
+	}
+}
+
+// TestColdCandidatesRecentFirstAmongServeable 都能服务主用模型时近期成功过的账号仍排前、坏号仍移出；对主用模型冷却的账号排在能服务的之后，
+// 它们之间同样是近期成功过的在前。预热按这个顺序启动
+func TestColdCandidatesRecentFirstAmongServeable(t *testing.T) {
+	const (
+		bad      = "order-bad@example.com"
+		coolOld  = "order-cool-n@example.com"
+		coolNew  = "order-cool-r@example.com"
+		neutral  = "order-neutral@example.com"
+		recently = "order-recent@example.com"
+	)
+	accounts := []string{bad, coolOld, coolNew, neutral, recently}
+	env := newDrainEnv(t, accounts, 1, 5)
+	memory := openBadAccountMemory("", env.requests)
+	env.manager.badAccounts.Store(memory)
+	memory.observe(bad, "", egressBare)
+	memory.observe(bad, "", egressBare)
+	memory.observe(coolNew, "", egressSuccess)
+	memory.observe(recently, "", egressSuccess)
+	forbidPrimary(t, env, coolOld)
+	forbidPrimary(t, env, coolNew)
+	want := []string{recently, neutral, coolNew, coolOld}
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, accounts); !slices.Equal(got, want) {
+		t.Fatalf("冷启动候选排序 = %v，期望 %v", got, want)
+	}
+	if err := <-env.manager.StartPrewarm(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitPrewarmDone(t, env.manager, 1)
+	if warm := sortedWarm(env.manager); !slices.Equal(warm, []string{recently}) {
+		t.Fatalf("预热应启动近期成功过、能服务主用模型的账号，驻留 Worker = %v", warm)
+	}
+}
+
+// TestColdCandidatesPrimaryBeforeHot 主用模型先比、热门模型后比：热门模型里有主用模型以外的模型（如大量每日限额的 flash）时，
+// 能服务主用模型、但在热门模型上冷却的 X 排在近期成功过、对主用模型 403 冷却、仍能服务热门模型的 R 前面（两类合在一起按个数计分时
+// X、R 同分，近期成功的 R 排前，预热启动的是对主用模型冷却的 R）；主用模型个数相同时再按热门模型个数，近期成功只在两者都相同时优先
+func TestColdCandidatesPrimaryBeforeHot(t *testing.T) {
+	const (
+		forbidden = "order-hot-r@example.com"
+		hotCooled = "order-hot-x@example.com"
+		capable   = "order-hot-y@example.com"
+	)
+	accounts := []string{forbidden, hotCooled, capable}
+	env := newDrainEnv(t, accounts, 2, 3)
+	env.manager.setHotModels([]string{testRuntimeModel})
+	memory := openBadAccountMemory("", env.requests)
+	env.manager.badAccounts.Store(memory)
+	memory.observe(forbidden, "", egressSuccess)
+	forbidPrimary(t, env, forbidden)
+	coolBothChannels(t, env, hotCooled, testRuntimeModel, 2*time.Hour, "每日限额")
+	counts := env.pool.ServeableCounts(accounts, env.manager.deadSlotModelsFor(aistudio.PoolScopeNormal), rotationMinRemaining)
+	if counts[forbidden] != 1 || counts[hotCooled] != 1 || counts[capable] != 2 {
+		t.Fatalf("主用与热门合计个数 = %v，期望 R、X 同为 1、Y 为 2（这个用例要覆盖合计同分的情形）", counts)
+	}
+	want := []string{capable, hotCooled, forbidden}
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, accounts); !slices.Equal(got, want) {
+		t.Fatalf("冷启动候选排序 = %v，期望 %v：能服务主用模型的排在只能服务热门模型的近期成功账号前面", got, want)
+	}
+	// X 也近期成功过：主用模型个数与 Y 相同，热门模型少一个，仍排在 Y 后面
+	memory.observe(hotCooled, "", egressSuccess)
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, accounts); !slices.Equal(got, want) {
+		t.Fatalf("冷启动候选排序 = %v，期望 %v：近期成功只在主用与热门模型个数都相同时优先", got, want)
+	}
+	if err := <-env.manager.StartPrewarm(env.ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitPrewarmDone(t, env.manager, 2)
+	if warm := sortedWarm(env.manager); !slices.Equal(warm, []string{hotCooled, capable}) {
+		t.Fatalf("预热应启动能服务主用模型的 X、Y，驻留 Worker = %v", warm)
+	}
+}
+
+// TestColdCandidatesShortForbiddenAfterUncooled 排序按 coldRankMinRemaining（2 分钟）判断能否服务：对主用模型的 403 冷却只剩 10 分钟的
+// 近期成功账号 R 排在从没成功过、没有冷却的 X 后面（按 15 分钟算时 R 能服务、与 X 同分，近期成功的 R 排前，冷却一到期多半又是 403）；
+// 剩余不到 2 分钟的短冷却（分钟限额）仍算能服务，近期成功的 S 照样排前。替补同一排序，S 成了坏号后选 X，不选 R
+func TestColdCandidatesShortForbiddenAfterUncooled(t *testing.T) {
+	const (
+		forbidden = "order-short-r@example.com"
+		minute    = "order-short-s@example.com"
+		fresh     = "order-short-x@example.com"
+	)
+	accounts := []string{forbidden, minute, fresh}
+	env := newDrainEnv(t, accounts, 1, 3)
+	memory := openBadAccountMemory("", env.requests)
+	env.manager.badAccounts.Store(memory)
+	memory.observe(forbidden, "", egressSuccess)
+	memory.observe(minute, "", egressSuccess)
+	coolBothChannels(t, env, forbidden, drainProModel, 10*time.Minute, forbiddenModelReasonPrefix+"The caller does not have permission")
+	coolBothChannels(t, env, minute, drainProModel, time.Minute, aistudio.MinuteQuotaKind+": per minute")
+	if env.pool.AccountLongCooling(forbidden, drainProModel, rotationMinRemaining) {
+		t.Fatalf("%s 的冷却只剩 10 分钟，按 15 分钟不算长时间冷却（这个用例要覆盖这个窗口）", forbidden)
+	}
+	want := []string{minute, fresh, forbidden}
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, accounts); !slices.Equal(got, want) {
+		t.Fatalf("冷启动候选排序 = %v，期望 %v", got, want)
+	}
+	models := []string{testRuntimeModel}
+	if got := env.manager.pickReplacement(env.ctx, aistudio.PoolScopeNormal, models, env.manager.WarmAccountIDs()); got != minute {
+		t.Fatalf("替补应选近期成功过、只有短冷却的 %s，实际 %q", minute, got)
+	}
+	memory.observe(minute, "", egressBare)
+	memory.observe(minute, "", egressBare)
+	if got := env.manager.pickReplacement(env.ctx, aistudio.PoolScopeNormal, models, env.manager.WarmAccountIDs()); got != fresh {
+		t.Fatalf("替补应选没有冷却的 %s，不选主用模型 403 冷却还剩 10 分钟的近期成功账号，实际 %q", fresh, got)
+	}
+}
+
+// TestReplacementPrefersPrimaryOverRecentSuccess 替补（登记的是其他模型，候选里有对主用模型冷却的账号）与预热同一排序：
+// 能服务主用模型的账号先于近期成功过、对主用模型 403 冷却的账号与目录里没有主用模型的近期成功账号（只看冷却键时它“没冷却”，
+// 原先会被选中）；能服务主用模型的账号之间近期成功过的在前，它成了坏号后换成另一个能服务主用模型的
+func TestReplacementPrefersPrimaryOverRecentSuccess(t *testing.T) {
+	const (
+		noPrimary = "order-n@example.com"
+		forbidden = "order-r@example.com"
+		fresh     = "order-x@example.com"
+		recently  = "order-y@example.com"
+	)
+	env := newDrainEnv(t, []string{noPrimary, forbidden, fresh, recently}, 1, 4)
+	if err := env.pool.SetCatalog(noPrimary, aistudio.BenefitTierFree, []aistudio.Model{
+		{ID: testRuntimeModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	forbidPrimary(t, env, forbidden)
+	memory := openBadAccountMemory("", env.requests)
+	env.manager.badAccounts.Store(memory)
+	for _, accountID := range []string{noPrimary, forbidden, recently} {
+		memory.observe(accountID, "", egressSuccess)
+	}
+	models := []string{testRuntimeModel}
+	if got := env.manager.pickReplacement(env.ctx, aistudio.PoolScopeNormal, models, env.manager.WarmAccountIDs()); got != recently {
+		t.Fatalf("替补应选近期成功过、能服务主用模型的 %s，实际 %q", recently, got)
+	}
+	memory.observe(recently, "", egressBare)
+	memory.observe(recently, "", egressBare)
+	if got := env.manager.pickReplacement(env.ctx, aistudio.PoolScopeNormal, models, env.manager.WarmAccountIDs()); got != fresh {
+		t.Fatalf("近期成功的账号成了坏号后替补应选能服务主用模型的 %s，实际 %q", fresh, got)
+	}
+}
+
 // TestEgressFreshRejectsExcludeBadAccounts 出口判定的“冷号首发被拒”不计已标坏号的账号
 func TestEgressFreshRejectsExcludeBadAccounts(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

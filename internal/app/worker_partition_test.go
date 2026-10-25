@@ -297,6 +297,76 @@ func TestStandbyCapacityPerPartition(t *testing.T) {
 	}
 }
 
+// TestStandbyPreferredPrimaryBeforeHot 请求路径为其他模型挑备用账号（后台扩容与现场启动，见 preferred）与预热、替补同一口径：
+// 先比能服务的主用模型个数、再比热门模型（不含主用模型）个数，冷却剩余不少于 coldRankMinRemaining（2 分钟）就算不能服务。
+// A（ID 最小）对主用模型 403 冷却 6 小时、能服务热门模型，B 在热门模型上每日限额冷却 2 小时、能服务主用模型，C 对主用模型的 403 冷却
+// 只剩 10 分钟；原先按主用与热门合计个数、15 分钟阈值计分，C 合计 2 个排第一，A、B 同为 1 个按 ID 先 A，启动的都是对主用模型冷却的账号
+func TestStandbyPreferredPrimaryBeforeHot(t *testing.T) {
+	const (
+		forbidden = "prefer-a@example.com"
+		hotCooled = "prefer-b@example.com"
+		expiring  = "prefer-c@example.com"
+		warm      = "prefer-w@example.com"
+		requested = "prefer-other-model"
+	)
+	accounts := []string{forbidden, hotCooled, expiring, warm}
+	env := newDrainEnv(t, accounts, 1, 4)
+	catalog := []aistudio.Model{
+		{ID: testRuntimeModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+		{ID: drainProModel, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+		{ID: requested, Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}},
+	}
+	for _, accountID := range accounts {
+		if err := env.pool.SetCatalog(accountID, aistudio.BenefitTierFree, catalog); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.manager.setHotModels([]string{testRuntimeModel})
+	env.promote(t, warm)
+	forbidPrimary(t, env, forbidden)
+	coolBothChannels(t, env, hotCooled, testRuntimeModel, 2*time.Hour, "每日限额")
+	coolBothChannels(t, env, expiring, drainProModel, 10*time.Minute, forbiddenModelReasonPrefix+"The caller does not have permission")
+	selection := aistudio.AccountSelection{ModelID: requested, Method: "generateContent"}
+	groups, err := env.pool.ClassifyCandidates(env.ctx, selection, env.manager.ReadyWarmAccountIDs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(groups.StandbyReady, accounts[:3]) {
+		t.Fatalf("备用账号应按 ID 排列: %v", groups.StandbyReady)
+	}
+	combined := env.pool.ServeableCounts(groups.StandbyReady, env.manager.deadSlotModelsFor(aistudio.PoolScopeNormal), rotationMinRemaining)
+	if combined[forbidden] != 1 || combined[hotCooled] != 1 || combined[expiring] != 2 {
+		t.Fatalf("主用与热门合计个数（15 分钟阈值）= %v，期望 A、B 同为 1、C 为 2（这个用例要覆盖合计同分与 15 分钟窗口）", combined)
+	}
+	want := []string{hotCooled, forbidden, expiring}
+	capacity := env.manager.standbyCapacity(env.manager.WarmAccountIDs(), requested)
+	if got := capacity.preferred(groups.StandbyReady)[0]; !slices.Equal(got, want) {
+		t.Fatalf("备用账号排序 = %v，期望 %v：能服务主用模型的 B 在前，对主用模型冷却的 A、C 在后", got, want)
+	}
+	if got := env.manager.rankColdCandidates(aistudio.PoolScopeNormal, groups.StandbyReady); !slices.Equal(got, want) {
+		t.Fatalf("预热与替补的排序 = %v，应与备用账号排序同为 %v", got, want)
+	}
+	if got := capacity.expandable(groups.StandbyReady); got != hotCooled {
+		t.Fatalf("后台扩容应选能服务主用模型的 %s，实际 %q", hotCooled, got)
+	}
+	if got := capacity.promotable(groups.StandbyReady, false); got != hotCooled {
+		t.Fatalf("现场启动应选能服务主用模型的 %s，实际 %q", hotCooled, got)
+	}
+	// 端到端：唯一的热 Worker 被占满，其他模型的请求启动的是 B
+	releaseFirst := holdLease(t, env.pool, warm)
+	defer releaseFirst()
+	releaseSecond := holdLease(t, env.pool, warm)
+	defer releaseSecond()
+	lease, err := env.service.acquireWarmLease(env.ctx, selection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.Account().ID != hotCooled || slices.Contains(env.manager.WarmAccountIDs(), forbidden) || slices.Contains(env.manager.WarmAccountIDs(), expiring) {
+		t.Fatalf("应启动 %s，实际租约 %s，驻留 Worker = %v", hotCooled, lease.Account().ID, sortedWarm(env.manager))
+	}
+}
+
 // TestUltraRequestWaitsForUltraCapacity Ultra 请求在 Ultra 分区已满且没有空闲 Worker 时排队，不淘汰空闲的普通 Worker；
 // 同分区的 Worker 空闲后被唤醒，在 Ultra 分区内替换完成调度
 func TestUltraRequestWaitsForUltraCapacity(t *testing.T) {
