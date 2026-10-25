@@ -273,6 +273,16 @@ def load_json(path):
 
 
 # ---------- 错误分类 ----------
+# Worker 页面类失败的错误末尾带页面快照“ | 页面={…}”或“ | 页面=快照失败: …”（camoufoxnative.PageSnapshotMarker，见 docs/logging.md）：
+# 快照只占一行、不含“ | ”，之后可能还接着本机代理中转的说明（“；本机代理中转：…”）。快照里是页面上的文字与数字（如 "age":1429），
+# 按子串给错误分类前先去掉，免得被当成 429、403、超时等
+PAGE_SNAPSHOT_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\n|$)")
+
+
+def strip_page(text):
+    return PAGE_SNAPSHOT_RE.sub("", text or "")
+
+
 Q_MIN, Q_DAY, Q_BARE, Q_RES, Q_INPUT, Q_QUOTA, Q_OTHER = (
     "分钟限额", "每日限额", "裸 Quota exceeded", "Resource exhausted", "输入超长（不是额度）", "其他额度文案", "其他 429")
 BUILD_METHODS = ("ProxyStreamedCall", "ProxyUnaryCall")
@@ -328,7 +338,7 @@ DRIVE_TOKEN_401_RE = re.compile(r"GenerateAccessToken 返回 HTTP (?:401|\d+、�
 
 
 def attempt_class(error):
-    error = error or ""
+    error = strip_page(error)
     lower = error.lower()
     if "账户已进入冷却" in error:
         return "发出前已冷却（没有发到上游）"
@@ -355,7 +365,7 @@ def attempt_class(error):
 
 def row_class(row):
     # 请求最终结果的分类（成功返回 None）
-    state, status, error = row["state"], row["status"] or 0, row["error"] or ""
+    state, status, error = row["state"], row["status"] or 0, strip_page(row["error"])
     if state in SUCCESS:
         return None
     if state == "cancelled" or status == 499:

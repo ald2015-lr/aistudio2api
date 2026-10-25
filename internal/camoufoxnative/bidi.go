@@ -20,6 +20,9 @@ type bidiClient struct {
 	connection *websocket.Conn
 	// writeMu 保证同一时刻只有一个写入者（gorilla/websocket 不支持并发写）
 	writeMu sync.Mutex
+	// navigatedAt 为 Worker 发出导航 AI Studio 命令的时刻（UnixNano，0 为还没导航）；
+	// 页面快照据此写 since，与页面的 age 对照判断导航之后文档是否被替换过（见 page_snapshot.go）
+	navigatedAt atomic.Int64
 	// mu 保护下面的等待表与后台读取协程写入的观测字段
 	mu                       sync.Mutex
 	nextID                   int

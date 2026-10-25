@@ -94,7 +94,7 @@ INFO  account@example.com  WAA Worker 就绪 | 页面模型=gemini-flash-latest 
 
 Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启动 | 等待冷启动名额 | 类型=按需|预热 | 占用=N/M`：`M` 为该类型可用的名额，按需启动比预热多 1 个保留名额（见 `WARM_STARTUP_CONCURRENCY`）。预热等待名额超过单个预热任务的时限时按槽位已满处理，不记为账户预热失败。
 
-启动失败记录页面模型、耗时和原始错误。按需容量事件说明当前热池动作：
+启动失败记录页面模型、耗时和原始错误；页面类失败的错误末尾另带失败那一刻的页面快照 `| 页面=…`（见[失败时的页面快照](#失败时的页面快照)）。按需容量事件说明当前热池动作：
 
 | 事件 | 语义 |
 | --- | --- |
@@ -141,6 +141,58 @@ ERROR  account@example.com  WAA Worker 停止失败 | PID=18240 | 耗时=10.002s
 | 浏览器 profile 目录删除重试 | 2 秒 | 每 100ms 重试，最终返回最后一次 `RemoveAll` 错误 |
 
 `Worker.Close` 的正常总体上界约为 10 秒，另加调度开销。关闭失败时 Worker、进程句柄、`runtime lease`（Worker 占用的账户租约）、热池记录和 generation（Worker 版本号）保持可重试；再次 Stop 会重跑关闭链。热替换中旧实例与 pending Worker 都关闭失败时，两份实例都占用容量槽。
+
+### 失败时的页面快照
+
+Worker 启动与运行中准备 proof 时的页面类失败，在原错误末尾追加一段失败那一刻的页面快照 ` | 页面={…}`。原错误的前缀与文字逐字不变（按前缀匹配的应用层判断与 `tools/diag_*.sh` 照常工作），错误链也不变；按文案判断错误类型的地方（应用层的输入超限判断、`tools/diag_*.sh` 的失败分类）先去掉快照，页面上的文字与数字不参与判断。快照是错误文字的一部分，原错误写到哪里快照就跟到哪里：`WAA Worker 启动失败` 行里在 `| 端口=…` 之前，本机代理中转的说明（`；本机代理中转：…`，接在整条错误之后）接在快照之后；`WAA Worker 重建` 与 `账号切换` 在下一行 `原因:` 的末尾。请求时间线的原因按 300 字节截断，页面类失败的原错误本身多已超过这个长度，时间线里通常看不到快照，以运行日志的 `WAA Worker 启动失败`、`WAA Worker 重建`、`账号切换` 行为准。追加快照的失败：
+
+- 启动 `5/7`：`AI Studio 输入框未就绪 url=…`（`url=` 为完整的 `location.href`，初始化超时时也能取到，不再为空）、读取页面地址与处理启动弹层失败
+- 启动 `6/7`：定位官网 snapshot 函数超时、安装 bootstrap 请求捕获失败
+- 启动 `7/7`：`填写 bootstrap 提示词失败`、`等待官网 Run 按钮启用`、`提交官网提示词`、`官网 WAA service 未暴露`、`官网 GenerateContent 拦截事件超时`（等待被拦截的 GenerateContent）、`官网 bootstrap 请求正文未捕获` 等读取或移除请求捕获的失败
+- 运行中：`同步官网 prompt`、`官网 prompt 状态未同步`、`生成 fresh WAA proof`、`fresh WAA proof 前缀无效`（外层为 `准备 fresh WAA proof: …`，Live（bidi）通道为 `准备 bidi setup fresh WAA proof: …` 或 `准备 bidi fresh WAA proof: …`）
+
+快照只读：在页面里执行一次只读取 DOM 的脚本，不点击、不写值、不导航，只在失败时执行。启动时失败处的 ctx 可能已经过期（初始化超时），快照另用一个 4 秒的独立上下文；调用方已取消（停止服务、客户端断开）时不采集。运行中准备 proof 时快照受请求约束：上下文从请求派生，期限截在请求期限之前 200 毫秒（最多 4 秒），请求剩余不足 0.5 秒时不采集，快照期间请求被取消时立即结束、原样返回原错误。快照不会把请求拖过期限：调用方按请求是否已到期区分“请求自己结束”与“Worker 失败”，拖过期限会让坏页面的 Worker 被当成请求到期、不重建。网络拦截、订阅等 BiDi 命令的失败与代理、浏览器启动的失败不带快照。快照本身失败（浏览器已断开、4 秒内没有回应等）时写 ` | 页面=快照失败: <简短原因>`，原错误照常保留。
+
+下面几条为示意：
+
+```text
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=2m0.012s | 错误=AI Studio 输入框未就绪 url=https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest: context deadline exceeded | 页面={"url":"aistudio.google.com/prompts/new_chat?model=gemini-flash-latest","title":"Google AI Studio","ready":"complete","vis":"visible","age":116,"since":118,"nav":"navigate","box":[1,0],"input":[1,0],"textareas":0,"run":[1,0,0],"waa":false,"hook":false,"cap":false,"overlays":["dialog: Welcome to the new AI Studio Signed in as ac***@*** Get started"],"ms":["ms-g1-welcome-dialog","ms-app","ms-navbar","ms-nav-item","ms-prompt-input-wrapper","ms-prompt-box"],"body":"Welcome to the new AI Studio"} | 端口=10001
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=2m31.4s | 错误=AI Studio 输入框未就绪 url=https://aistudio.google.com/prompts/new_chat?model=gemini-flash-latest: context deadline exceeded | 页面={"url":"aistudio.google.com/prompts/new_chat?model=gemini-flash-latest","title":"Google AI Studio","ready":"complete","vis":"visible","age":14,"since":119,"nav":"navigate","box":[0,0],"input":[0,0],"textareas":0,"run":[0,0,0],"waa":false,"hook":false,"cap":false,"ms":["ms-app"],"body":"Loading"} | 端口=10003
+WARN   account@example.com  WAA Worker 重建 | 模型=gemini-flash-latest | 重放当前请求
+原因: 准备 fresh WAA proof: 同步官网 prompt: 页面表达式异常: {…Error: 提示词输入框不存在…} | 页面={"url":"aistudio.google.com/prompts/new_chat?model=gemini-flash-latest","title":"Google AI Studio","ready":"complete","vis":"visible","age":7,"since":3605,"nav":"reload","box":[0,0],"input":[0,0],"textareas":0,"run":[0,0,0],"waa":false,"hook":false,"cap":false,"ms":["ms-app"],"body":"Loading"}
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=48.2s | 错误=填写 bootstrap 提示词失败 value="" err=页面表达式异常: {…Error: 提示词输入框不存在…} | 页面={"url":"aistudio.google.com/prompts/new_chat?model=gemini-flash-latest","title":"Google AI Studio","ready":"complete","vis":"visible","age":21,"since":23,"nav":"navigate","box":[0,0],"input":[0,0],"textareas":0,"ta":["div@ms-prompt-editor: Type something"],"run":[0,0,0],"waa":false,"hook":true,"cap":true,"ms":["ms-prompt-editor","ms-prompt-input-wrapper","ms-app","ms-send-button","ms-navbar"]} | 端口=10002
+ERROR  account@example.com  WAA Worker 启动失败 | 页面模型=gemini-flash-latest | 耗时=12.4s | 错误=官网 WAA service 未暴露: BiDi 连接已断开: EOF | 页面=快照失败: BiDi 连接已断开: EOF
+```
+
+- 第一条停在 `5/7`：输入框在 DOM 里（`box`、`input` 总数为 1）但被页面隐藏了（可见数为 0），同时有一个欢迎弹层，`ms` 最前面的 `ms-g1-welcome-dialog` 是弹层里的组件。可见数不看遮挡（见下表 `input`），这里不能读成“弹层挡住了输入框”：被弹层盖住的输入框仍算可见，就绪检查也会通过；输入框被隐藏与弹层同时出现是否有因果，要结合 `ms`、`overlays` 判断（例如页面切到了新的引导状态）。`since` 只比 `age` 多 2 秒，导航之后文档没有被替换过：页面载入一次后输入框一直没出现。还没到 `6/7`，`hook`、`cap` 为 `false` 是正常的。
+- 第二条也停在 `5/7`，但 `since` 比 `age` 多 105 秒：程序导航约 105 秒后文档被替换过（刷新或跳转），当前文档才载入 14 秒，输入框还没出来。`nav` 仍是 `navigate`：`location.replace`、`location.assign`、给 `location.href` 赋值与 meta refresh 都记为 `navigate`，只有 `location.reload()` 记为 `reload`，判断中途刷新看 `since` 与 `age` 之差，不看 `nav`。“耗时”从开始启动算起，含等冷启动名额、启动浏览器、连接 BiDi 的时间，不能拿来和 `age` 比。
+- 第三条：Worker 早已就绪（`since` 3605 秒），页面却是整页刷新（`nav` 为 `reload`）后 7 秒，`hook` 为 `false`：`6/7` 写在 window 上的标记与 Bootstrap 取得的 WAA service（`waa`）都随刷新丢了。
+- 第四条停在 `7/7`：`hook`、`cap` 仍为 `true`，`since` 与 `age` 只差 2 秒，页面没有重载；`ms-prompt-box` 不见了，可见的输入框是 `ms-prompt-editor` 里的 `div`（`ta`），Run 按钮也不在 `ms-run-button` 里（按文字找到的按钮在 `ms-send-button`）：多为官网改版。
+
+| 字段 | 含义 |
+| --- | --- |
+| `url` | 页面地址，只保留 host、path 与查询参数里的 `model`（其余参数与 `#` 之后都去掉）；没有 host 的地址写 `about:blank` 这样的 scheme 加内容 |
+| `title` | `document.title` 去掉多余空白后的前 120 字 |
+| `ready` | `document.readyState`：`loading`、`interactive`、`complete` |
+| `vis` | `document.visibilityState`：`visible`、`hidden` |
+| `age` | 当前文档载入至今的秒数（`performance.now()`，从这份文档的导航开始算）：页面刷新或跳转后从 0 重新算，与 `since` 对照判断导航之后文档是否被替换过 |
+| `since` | 程序发出导航 AI Studio 命令（`5/7` 开头）至今的秒数，由程序记录、不取自页面；运行中准备 proof 时同样从启动时的这次导航算起，登录等其他页面没有这一项。导航之后文档没被替换时 `since` 只比 `age` 多 0–2 秒（命令往返与取整）；多出几秒以上说明导航之后文档被替换过（刷新、`location.replace`/`assign` 跳转、meta refresh 等），替换发生在导航后约 `since − age` 秒，与 `nav` 无关 |
+| `nav` | 当前文档的载入方式（`performance.getEntriesByType('navigation')[0].type`）：`navigate`（打开或跳转，含 `location.replace`/`assign`、给 `location.href` 赋值与 meta refresh）、`reload`（`location.reload()` 或浏览器刷新）、`back_forward` |
+| `box` | `ms-prompt-box` 的 `[总数, 可见数]`，可见的判断同 `input` |
+| `input` | `ms-prompt-box textarea`（启动与 proof 写入的提示词输入框）的 `[总数, 可见数]`：可见数为 0 即“提示词输入框不存在”，大于 1 即“匹配多个可见目标”。可见按 `checkVisibility` 判断（与就绪检查相同）：元素或祖先为 `display:none`、`visibility:hidden` 或处在 `content-visibility:hidden` 里时算不可见；不看透明度，也不看是否被别的元素盖住，被弹层盖住的输入框仍算可见（就绪检查也会通过，不会停在 `5/7`）。可见数为 0 是页面自己把输入框隐藏了，同时出现的弹层只说明它也在，不说明是它挡住了输入框 |
+| `textareas` | 页面上所有可见 `textarea` 的个数：`input` 为 0 而这里不为 0，多为界面改版、输入框换了位置 |
+| `ta` | 可见的文本输入框（`textarea`、`contenteditable`、`role=textbox`），最多 3 个，每个写成 `标签名@最近的 ms- 祖先: placeholder 或 aria-label 的前 40 字`（没有 `ms-` 祖先写 `-`）：`input` 为 0 时看输入框换到了哪个组件 |
+| `run` | `ms-run-button button`（官网 Run 按钮）的 `[总数, 可见数, 可见且启用数]` |
+| `waa` | `window.__aistudioWaaService` 是否存在：`7/7` 提交 bootstrap 提示词之后才出现，此前为 `false` 是正常的；运行中变成 `false` 说明页面已经刷新，Bootstrap 取得的 WAA service 随之丢失 |
+| `hook` | `window.__aistudioWaaSnapshotKey` 是否存在：`6/7` 定位官网 snapshot 函数时写在 window 上，整页重载后消失。`7/7` 失败与运行中为 `false` 即 `6/7` 之后页面整页重载过；`6/7` 之前为 `false` 是正常的 |
+| `cap` | `6/7` 安装的 bootstrap 请求捕获（`window.__aistudioRestoreBootstrapCapture`）是否还在：`7/7` 失败时为 `false` 即页面重载过；Bootstrap 完成时移除，运行中为 `false` 是正常的 |
+| `overlays` | 可见的 `[role=dialog]`、`[role=alertdialog]`、`mat-dialog-container`、`.cdk-overlay-container` 里的文字，每条以 `dialog:`、`alertdialog:`、`mat-dialog:`、`cdk-overlay:` 开头，去掉多余空白、各取前 160 字，同一元素与相同文字只记一次，最多 6 条。没有文字的弹层也记一条：写 `(无文字)`，只含 iframe 时写 `(无文字, iframe)`；`.cdk-overlay-container` 常驻且平时为空，只在有遮罩（`.cdk-overlay-backdrop-showing`）时写 `(遮罩)` |
+| `ms` | 页面上可见的、以 `ms-` 开头的自定义元素标签名，去重后最多 20 个，按优先级收集：先是可见输入框（同 `ta`）与 Run 按钮（`ms-run-button button`，没有时找文字或 aria-label 以 Run 开头的可见按钮）往上最近的 3 个 `ms-` 祖先，再是弹层里的组件（最多 6 个），最后按文档顺序补足。出现没见过的标签多为官网改版 |
+| `alerts` | 弹层之外可见的提示条里的文字：`[role=alert]`、`[role=status]`、`aria-live` 为 `assertive` 或 `polite` 的区域与 `mat-error`，去掉多余空白、各取前 100 字，去重，最多 2 条；弹层里的提示已记在 `overlays`，不重复记。页面主区域里的错误条、加载失败提示多在这里 |
+| `body` | `document.body.innerText` 去掉多余空白后的前 200 字（多是侧栏导航文字，超长时最先缩短） |
+| `err` | 采集失败的单项与原因（如 `textareas: …`），最多 4 条；每项单独采集，一项失败不影响其他项 |
+
+快照为单行 JSON，总长度不超过 800 字符：超出时依次缩短、清空 `body`，再缩短 `alerts`（只留 1 条、60 字）、`ms`（只保留前面的优先段）、`overlays`、`ta` 与 `title`，计数、`url`、`age`、`since`、`nav`、`waa`、`hook`、`cap` 一直保留，仍超出时按字符截断并以 `…` 结尾。文本里的邮箱一律打码为前两位加 `***@***`（如 `ac***@***`）：页面里先打码再截短（截断点落在邮箱中间也不会留下本地部分），截短处以 `…` 结尾，写日志前再打码一次（截断在域名里、以 `…` 结尾的残缺地址同样打码）；`|` 换成 `¦`（日志字段以 ` | ` 分隔），值为空的字段省略。`bash tools/diag_start.sh` 的“失败时的页面状态”一段按快照分组汇总这些失败（启动失败、`WAA Worker 重建`，以及原因为 `准备 fresh WAA proof: …`、`准备 bidi setup fresh WAA proof: …` 或 `准备 bidi fresh WAA proof: …` 的 `账号切换`：运行中准备 proof 失败后没等到 Worker 关闭就换号时只记这一行）。分组键（路径、标题、输入框可见数、Run 按钮可见数、弹层文字）相同的失败根因可能不同（改版、中途刷新、一直没加载出来），每组另列组内 `nav`、`hook`、`ready`、“导航后换过文档”（`since` 比 `age` 多 5 秒以上）与“输入组件”（`ta` 第一项所在的 `ms-` 组件）的分布，再按失败原因（前 3 种）各列该原因的分布与最近一条完整快照；失败原因里页面表达式异常折叠成报错正文（如 `Error: 提示词输入框不存在`），见 [README](../README.md#号池繁忙-429-与连续限流) 的“Worker 起不来”。
 
 ## 本机代理中转
 

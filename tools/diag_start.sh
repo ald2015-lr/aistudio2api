@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # AIStudio2API 一键诊断“Worker 起不来”：系统资源 → 状态接口（Worker、预热、IP 池、出口）→ 绕过程序直连测 IP 池端口 →
-# 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志
+# 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志 → 失败时的页面状态（启动失败与 Worker 重建日志末尾的“页面=…”快照）
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -149,6 +149,137 @@ fail_lines = []
 last_step = {}
 fail_steps, fail_full, fail_accounts, ready_accounts = collections.Counter(), {}, set(), set()
 STEP_RE = re.compile(r"^WAA Worker 启动 \| (\d)/7 \| ([^|\n]+)")
+# 失败时的页面状态：页面类失败的错误末尾带“ | 页面={…}”或“ | 页面=快照失败: <原因>”（见 docs/logging.md）。
+# 快照里的“|”已换成“¦”、换行已转义，只占一行、不含“ | ”；快照之后可能还接着本机代理中转的说明（“；本机代理中转：…”，
+# 接在整条错误之后）与日志字段（“ | 端口=…”）。超长被硬截断时 JSON 不完整，只按正则取分组与分布用的几个字段
+PAGE_MARK = " | 页面="
+PAGE_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\n|$)")
+# 启动失败、Worker 重建，以及运行中准备 proof 失败后没等到 Worker 关闭就换号的“账号切换”（同一次失败只记其中一种）
+PAGE_HEADS = ("WAA Worker 启动失败", "WAA Worker 重建", "账号切换")
+# 账号切换里运行中准备 proof 的失败：普通请求为“准备 fresh WAA proof: …”，Live（bidi）通道为“准备 bidi setup fresh WAA proof: …”与“准备 bidi fresh WAA proof: …”
+PROOF_REASON = re.compile(r"准备 (?:bidi (?:setup )?)?fresh WAA proof")
+page_total, page_heads, page_groups, page_samples, page_kinds = collections.Counter(), collections.Counter(), collections.Counter(), {}, {}
+# 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
+page_dist = {}
+snapshot_failures = collections.Counter()
+def strip_page(text):
+    """去掉页面快照，快照之后的本机代理中转说明与日志字段照常保留"""
+    return PAGE_RE.sub("", text or "")
+def start_error(msg):
+    """启动失败的原错误（去掉页面快照、拼回快照之后的本机代理中转说明）"""
+    return fields(strip_page(msg)).get("错误", "")
+def page_reason(head, clean):
+    """失败原因（已去掉页面快照）：启动失败取“错误=”字段，重建与账号切换取下一行“原因: ”之后"""
+    if head == "WAA Worker 启动失败":
+        return fields(clean).get("错误", clean.split("\n")[0]).strip()
+    return clean.split("\n原因: ", 1)[-1].strip()
+EXCEPTION_MARK = "页面表达式异常: "
+def collapse_exception(reason):
+    """页面表达式异常的 JSON（键按字母序，报错正文 text 排在最后）折叠成报错正文：截短后也看得到“提示词输入框不存在”等原因"""
+    pos = 0
+    while True:
+        at = reason.find(EXCEPTION_MARK, pos)
+        if at < 0:
+            return reason
+        start = at + len(EXCEPTION_MARK)
+        rest, text, end = reason[start:], None, 0
+        try:
+            details, end = json.JSONDecoder().raw_decode(rest)
+            if isinstance(details, dict) and isinstance(details.get("exceptionDetails"), dict):
+                text = details["exceptionDetails"].get("text")
+        except ValueError:
+            m = re.search(r'"text":"((?:[^"\\]|\\.)*)"', rest)
+            if m:
+                try:
+                    text = json.loads('"' + m.group(1) + '"')
+                except ValueError:
+                    text = m.group(1)
+                end = len(rest)
+        if not text:
+            pos = start
+            continue
+        reason = reason[:start] + str(text) + rest[end:]
+        pos = start + len(str(text))
+def loose_string(text, key):
+    m = re.search('"' + key + r'":("(?:[^"\\]|\\.)*")', text)
+    try:
+        return json.loads(m.group(1)) if m else None
+    except ValueError:
+        return None
+def page_snapshot(value):
+    """返回（快照字段, 快照原文）；“快照失败: …”返回 (None, value)"""
+    if not value.startswith("{"):
+        return None, value
+    try:
+        snap, end = json.JSONDecoder().raw_decode(value)
+        if isinstance(snap, dict):
+            return snap, value[:end]
+    except ValueError:
+        pass
+    snap = {key: loose_string(value, key) for key in ("url", "title", "ready", "nav")}
+    for key in ("input", "run"):
+        m = re.search('"' + key + r'":\[([\d,]*)\]', value)
+        if m:
+            snap[key] = [int(x) for x in m.group(1).split(",") if x]
+    for key in ("age", "since"):
+        m = re.search('"' + key + r'":(\d+)', value)
+        if m:
+            snap[key] = int(m.group(1))
+    m = re.search(r'"hook":(true|false)', value)
+    if m:
+        snap["hook"] = m.group(1) == "true"
+    m = re.search(r'"ta":\["((?:[^"\\]|\\.)*)', value)
+    if m:
+        snap["ta"] = [m.group(1)]
+    # 截断多半落在弹层或正文里：第一条弹层文字可能没有结尾的引号
+    m = re.search(r'"overlays":\["((?:[^"\\]|\\.)*)', value)
+    if m:
+        try:
+            snap["overlays"] = [json.loads('"' + m.group(1) + '"')]
+        except ValueError:
+            snap["overlays"] = [m.group(1)]
+    return snap, value
+def page_count(snap, key):
+    value = snap.get(key)
+    return str(value[1]) if isinstance(value, list) and len(value) > 1 else "?"
+def page_replaced(snap):
+    """导航之后文档是否被替换过（刷新、replace/assign 跳转、meta refresh）：since（程序导航至今）比 age（当前文档载入至今）多 5 秒以上为“是”"""
+    age, since = snap.get("age"), snap.get("since")
+    if not isinstance(age, int) or not isinstance(since, int):
+        return "-"
+    return "是" if since - age > 5 else "否"
+def page_component(snap):
+    """第一个可见文本输入框所在的组件（ta 首项“@”之后、“:”之前）"""
+    editors = snap.get("ta")
+    if not isinstance(editors, list) or not editors:
+        return "-"
+    return str(editors[0]).split("@", 1)[-1].split(":", 1)[0].strip() or "-"
+def page_flag(snap, key):
+    value = snap.get(key)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value) if value else "-"
+PAGE_DIST = (
+    ("nav", lambda snap: page_flag(snap, "nav")),
+    ("hook", lambda snap: page_flag(snap, "hook")),
+    ("ready", lambda snap: page_flag(snap, "ready")),
+    ("导航后换过文档", page_replaced),
+    ("输入组件", page_component),
+)
+def format_dist(dists):
+    """把若干份分布合起来，写成“nav: navigate×3 reload×2；hook: …”"""
+    parts = []
+    for label, _ in PAGE_DIST:
+        total = collections.Counter()
+        for dist in dists:
+            total.update(dist[label])
+        parts.append(label + ": " + " ".join(f"{value}×{n}" for value, n in total.most_common(4)))
+    return "；".join(parts)
+def page_key(snap):
+    overlays = snap.get("overlays")
+    overlay = str(overlays[0])[:40] if isinstance(overlays, list) and overlays else "-"
+    path = str(snap.get("url") or "-").split("?", 1)[0]
+    return (path, str(snap.get("title") or "-")[:60], page_count(snap, "input"), page_count(snap, "run"), overlay)
 for p in paths:
     with open(p, "rb") as handle:
         size = os.path.getsize(p)
@@ -175,26 +306,47 @@ for p in paths:
                 f = fields(msg)
                 if head == "WAA Worker 就绪":
                     ready_accounts.add(source)
+                # 原错误另带页面快照时，“错误=”字段之外还要拼回快照之后的本机代理中转说明（start_error）；页面快照见最后一段
+                error = start_error(msg) if f.get("错误") else ""
                 if head == "WAA Worker 启动失败":
                     fail_accounts.add(source)
                     fail_steps[last_step.get(source, "（没有步骤日志）")] += 1
-                    key = DIGITS.sub("#", f.get("错误", ""))[:120]
-                    fail_full.setdefault(key, f.get("错误", msg.split("\n")[0])[:900])
+                    key = DIGITS.sub("#", collapse_exception(error))[:120]
+                    fail_full.setdefault(key, (error or msg.split("\n")[0])[:900])
                 if "就绪" in head and f.get("耗时"):
                     seconds = duration(f["耗时"])
                     if seconds is not None:
                         ready_secs.append(seconds)
                 if "失败" in head:
-                    fail_reasons[DIGITS.sub("#", f.get("错误", msg.split("\n")[0]))[:170]] += 1
+                    fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
                     if f.get("端口"):
                         fail_ports[f["端口"]] += 1
-                    fail_lines.append(f"{moment.astimezone():%H:%M:%S} {msg.replace(chr(10), ' / ')[:400]}")
+                    fail_lines.append(f"{moment.astimezone():%H:%M:%S} {strip_page(msg).replace(chr(10), ' / ')[:400]}")
+            # 账号切换只收运行中准备 proof 的失败：“获取账户 WAA preparer: …”是冷启动失败，同一次失败已记在“WAA Worker 启动失败”
+            if head in PAGE_HEADS and (head != "账号切换" or PROOF_REASON.match(page_reason(head, msg))):
+                page_total[head] += 1
+                m = PAGE_RE.search(msg)
+                if m:
+                    reason = DIGITS.sub("#", collapse_exception(page_reason(head, strip_page(msg))).replace(chr(10), " / "))[:160]
+                    value = m.group(0)[len(PAGE_MARK):].strip()
+                    snap, text = page_snapshot(value)
+                    if snap is None:
+                        snapshot_failures[DIGITS.sub("#", value)[:120]] += 1
+                    else:
+                        key = page_key(snap)
+                        page_heads[head] += 1
+                        page_groups[key] += 1
+                        page_samples[(key, reason)] = text
+                        page_kinds.setdefault(key, collections.Counter())[reason] += 1
+                        dist = page_dist.setdefault((key, reason), {label: collections.Counter() for label, _ in PAGE_DIST})
+                        for label, value_of in PAGE_DIST:
+                            dist[label][value_of(snap)] += 1
             if head.startswith(("上游代理", "本机代理", "IP 池", "代理")):
                 status = fields(msg).get("状态", "")
                 proxy_heads[head + (f"（状态 {status}）" if status else "")] += 1
             if level in ("WARN", "WARNING", "ERROR"):
                 kinds[(level, head)] += 1
-                samples.setdefault((level, head), msg)
+                samples.setdefault((level, head), strip_page(msg))
 print("Worker 相关日志：")
 for head, count in heads.most_common(20):
     print(f"  {head}：{count}")
@@ -225,13 +377,42 @@ if proxy_heads:
     for head, count in proxy_heads.most_common(12):
         print(f"  {head}：{count}")
 if fail_lines:
-    print("最近 5 条启动失败原文：")
+    print("最近 5 条启动失败原文（页面快照见最后一段）：")
     for line in fail_lines[-5:]:
         print("  " + line)
 print()
 print(f"最近 {minutes} 分钟的警告与错误类型（前 15）：")
 for (level, head), count in kinds.most_common(15):
     print(f"  [{level}] {head}：{count} 次 | 示例：{samples[(level, head)].replace(chr(10), ' / ')[:220]}")
+print()
+print(f"==================== 失败时的页面状态（最近 {minutes} 分钟）====================")
+with_snapshot, failed_snapshot = sum(page_groups.values()), sum(snapshot_failures.values())
+print(f"启动失败 {page_total['WAA Worker 启动失败']} 条、Worker 重建 {page_total['WAA Worker 重建']} 条、"
+      f"准备 proof 失败后换号（账号切换）{page_total['账号切换']} 条；"
+      f"带页面快照的 {with_snapshot} 条（启动失败 {page_heads['WAA Worker 启动失败']}、重建 {page_heads['WAA Worker 重建']}、"
+      f"账号切换 {page_heads['账号切换']}），"
+      f"快照本身失败 {failed_snapshot} 条，没有“页面=”的 {sum(page_total.values()) - with_snapshot - failed_snapshot} 条")
+print("  没有“页面=”的：程序版本早于页面快照，不是页面类失败（代理、浏览器启动、BiDi 连接、登录态失效等），或请求已取消、剩余时间不够采集")
+if page_groups:
+    print("按（路径、标题、输入框可见数、Run 按钮可见数、弹层文字前 40 字）分组，前 6 组；每组附组内分布，再按失败原因（前 3 种）"
+          "各附该原因的分布与最近一条完整快照。分布里“导航后换过文档”为 since 比 age 多 5 秒以上（刷新、跳转），-为快照没有 since；"
+          "“输入组件”为第一个可见文本输入框所在的 ms- 组件：")
+    for index, (key, count) in enumerate(page_groups.most_common(6), 1):
+        path, title, inputs, runs, overlay = key
+        print(f"  [{index}] {count} 次：路径={path} | 标题={title} | 输入框可见={inputs} | Run 可见={runs} | 弹层={overlay}")
+        print("      分布：" + format_dist([page_dist[(key, reason)] for reason in page_kinds[key]]))
+        reasons = page_kinds[key].most_common(3)
+        for reason, n in reasons:
+            print(f"      {n} 次：{reason}")
+            print("        分布：" + format_dist([page_dist[(key, reason)]]))
+            print(f"        快照：{page_samples[(key, reason)]}")
+        rest = count - sum(n for _, n in reasons)
+        if rest:
+            print(f"      另有 {rest} 次为其余 {len(page_kinds[key]) - len(reasons)} 种原因")
+if snapshot_failures:
+    print("快照本身失败的原因（数字已替换为 #）：")
+    for reason, count in snapshot_failures.most_common(5):
+        print(f"  {count} 次：{reason}")
 PY
   rm -f -- "$cooldown_file"
 }

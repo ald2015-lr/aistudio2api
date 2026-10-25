@@ -356,9 +356,19 @@ def service_cut(error):
     }
 
 
+# Worker 页面类失败的错误末尾带页面快照“ | 页面={…}”或“ | 页面=快照失败: …”（camoufoxnative.PageSnapshotMarker，见 docs/logging.md）：
+# 快照只占一行、不含“ | ”，之后可能还接着本机代理中转的说明（“；本机代理中转：…”）。快照里是页面上的文字与数字（如 "age":1429），
+# 按子串给错误分类前先去掉，免得被当成 429、403、超时等
+PAGE_SNAPSHOT_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\n|$)")
+
+
+def strip_page(text):
+    return PAGE_SNAPSHOT_RE.sub("", text or "")
+
+
 # ---------- 结束原因分类（文案均已在代码里核实，见每条注释） ----------
 def end_class(row):
-    state, status, error = row["state"], row["status"], row["error"]
+    state, status, error = row["state"], row["status"], strip_page(row["error"])
     low = error.lower()
     if state in SUCCESS:
         return ("达到输出上限（limited）" if state == "limited" else "完成"), "ok"
@@ -426,7 +436,7 @@ def end_class(row):
 
 
 def attempt_class(error):
-    error = error or ""
+    error = strip_page(error)
     lower = error.lower()
     if "账户已进入冷却" in error:
         return "发出前已冷却（没有发到上游）"

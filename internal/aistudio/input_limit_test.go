@@ -3,6 +3,7 @@ package aistudio
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"slices"
@@ -73,6 +74,27 @@ func TestInputTokenCapError(t *testing.T) {
 	}
 	if InputTokenCapError(nil) {
 		t.Fatal("nil 不应识别为账号上限")
+	}
+}
+
+// TestInputTokenLimitIgnoresPageSnapshot Worker 页面类失败末尾的页面快照是页面上的文字，即使官网提示条正好写着输入超限，
+// 也不判为输入超限；快照之外的上游错误照常识别（含 errors.Join 的另一行）
+func TestInputTokenLimitIgnoresPageSnapshot(t *testing.T) {
+	snapshot := ` | 页面={"url":"aistudio.google.com/prompts/new_chat?model=gemini-flash-latest","input":[1,1],` +
+		`"overlays":["cdk-overlay: The input token count exceeds the maximum number of tokens allowed 131072"],` +
+		`"body":"The input token count (2000000) exceeds the maximum number of tokens allowed (1048576)."}`
+	for _, err := range []error{
+		fmt.Errorf("准备 fresh WAA proof: %w", errors.New("官网 prompt 状态未同步"+snapshot)),
+		errors.New("AI Studio 输入框未就绪 url=x: context deadline exceeded" + snapshot + "；本机代理中转：上游 407"),
+	} {
+		if InputTokenLimitError(err) || InputTokenCapError(err) {
+			t.Fatalf("页面快照里的文字不应判为输入超限: %v", err)
+		}
+	}
+	upstream := &RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: "The input token count exceeds the maximum number of tokens allowed 131072"}
+	joined := errors.Join(errors.New("官网 prompt 状态未同步"+snapshot), upstream)
+	if !InputTokenLimitError(joined) || !InputTokenCapError(joined) {
+		t.Fatalf("快照之外的上游输入超限仍应识别: %v", joined)
 	}
 }
 

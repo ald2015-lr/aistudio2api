@@ -143,13 +143,13 @@ func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (
 	for {
 		value, err := worker.client.evaluateString(ctx, worker.contextID, fillPromptExpression(prompt))
 		if err != nil {
-			return "", fmt.Errorf("同步官网 prompt: %w", err)
+			return "", worker.proofPageFailure(ctx, fmt.Errorf("同步官网 prompt: %w", err))
 		}
 		if normalizePromptNewlines(value) == normalizePromptNewlines(prompt) {
 			break
 		}
 		if time.Now().After(deadline) {
-			return "", errors.New("官网 prompt 状态未同步")
+			return "", worker.proofPageFailure(ctx, errors.New("官网 prompt 状态未同步"))
 		}
 		if err := waitContext(ctx, 100*time.Millisecond); err != nil {
 			return "", err
@@ -157,12 +157,18 @@ func (worker *Worker) Proof(ctx context.Context, digest string, prompt string) (
 	}
 	proof, err := worker.client.evaluateString(ctx, worker.contextID, takeProofExpression(digest))
 	if err != nil {
-		return "", fmt.Errorf("生成 fresh WAA proof: %w", err)
+		return "", worker.proofPageFailure(ctx, fmt.Errorf("生成 fresh WAA proof: %w", err))
 	}
 	if !strings.HasPrefix(proof, "!") {
-		return "", errors.New("fresh WAA proof 前缀无效")
+		return "", worker.proofPageFailure(ctx, errors.New("fresh WAA proof 前缀无效"))
 	}
 	return proof, nil
+}
+
+// proofPageFailure 为运行中 Worker 准备 proof 时的页面脚本失败追加页面快照（只在失败时多一次 evaluate）；
+// 快照受请求 ctx 约束（见 withRequestPageSnapshot）：请求已取消或到期时原样返回，不再占着 mu 多等快照
+func (worker *Worker) proofPageFailure(ctx context.Context, err error) error {
+	return worker.client.withRequestPageSnapshot(ctx, worker.contextID, err)
 }
 
 // Broken 返回浏览器控制连接断开的原因（浏览器进程退出或连接异常）；连接正常时返回 nil
@@ -257,6 +263,8 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if options.TemporaryChat {
 		target += "&temporary=true"
 	}
+	// 记下导航时刻：失败时快照的 since 与页面的 age 对照，看导航之后文档是否被替换过（刷新、跳转）
+	client.markNavigated()
 	if _, err := client.command(ctx, "browsingContext.navigate", map[string]any{
 		"context": contextID,
 		"url":     target,
@@ -265,31 +273,33 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 		return fmt.Errorf("导航 AI Studio: %w", err)
 	}
 	if err := client.waitFor(ctx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
-		pageURL, _ := client.evaluateString(ctx, contextID, "location.href")
-		return fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w", pageURL, err)
+		// 初始化 ctx 到期时 location.href 也取不到（url 曾因此为空）：地址与页面快照改用同一个独立的短上下文读取
+		pageURL, snapshot := client.pageDiagnosis(ctx, contextID, true)
+		return fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w%s", pageURL, err, snapshot)
 	}
 	pageURL, err := client.evaluateString(ctx, contextID, "location.href")
 	if err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	if strings.Contains(pageURL, "accounts.google.com") {
 		return fmt.Errorf("隔离登录态失效 url=%s", pageURL)
 	}
 	if err := dismissKnownOverlays(ctx, client, contextID); err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	options.reportStartup(StartupLocatingWAA)
 	snapshotKey, err := client.waitSnapshotFunction(ctx, contextID, 30*time.Second)
 	if err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	if err := installBootstrapRequestCapture(ctx, client, contextID); err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	options.reportStartup(StartupBootstrappingWAA)
 	filled, err := client.evaluateString(ctx, contextID, fillPromptExpression(options.BootstrapPrompt))
 	if err != nil || normalizePromptNewlines(filled) != normalizePromptNewlines(options.BootstrapPrompt) {
-		return fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v", filled, err)
+		_, snapshot := client.pageDiagnosis(ctx, contextID, false)
+		return fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v%s", filled, err, snapshot)
 	}
 	if _, err := client.command(ctx, "session.subscribe", map[string]any{
 		"events":   []string{"network.beforeRequestSent"},
@@ -314,18 +324,19 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	if interceptID == "" {
 		return errors.New("GenerateContent 拦截 ID 无效")
 	}
+	// 页面类失败（等待页面条件、执行页面脚本）在原错误末尾追加页面快照（见 withPageSnapshot），网络拦截与订阅命令的失败不追加
 	if err := client.waitFor(ctx, contextID, runButtonEnabledExpression, 15*time.Second); err != nil {
-		return fmt.Errorf("等待官网 Run 按钮启用: %w", err)
+		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("等待官网 Run 按钮启用: %w", err))
 	}
 	if _, err := client.evaluate(ctx, contextID, submitPromptExpression); err != nil {
-		return fmt.Errorf("提交官网提示词: %w", err)
+		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("提交官网提示词: %w", err))
 	}
 	if err := client.waitFor(ctx, contextID, "Boolean(window.__aistudioWaaService)", 60*time.Second); err != nil {
-		return fmt.Errorf("官网 WAA service 未暴露: %w", err)
+		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("官网 WAA service 未暴露: %w", err))
 	}
 	requestID, err := client.waitBlockedGenerateRequest(ctx, contextID, 60*time.Second)
 	if err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	if _, err := client.command(ctx, "network.failRequest", map[string]any{"request": requestID}); err != nil {
 		return fmt.Errorf("终止 bootstrap GenerateContent: %w", err)
@@ -335,7 +346,7 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	}
 	actualModel, err := capturedBootstrapModel(ctx, client, contextID)
 	if err != nil {
-		return err
+		return client.withPageSnapshot(ctx, contextID, err)
 	}
 	if actualModel != strings.TrimPrefix(options.Model, "models/") {
 		return fmt.Errorf("官网初始化页面模型不匹配 expected=%s actual=%s", options.Model, actualModel)
@@ -347,10 +358,11 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
   return true;
 })()`)
 	if err != nil {
-		return fmt.Errorf("移除 bootstrap 请求捕获: %w", err)
+		return client.withPageSnapshot(ctx, contextID, fmt.Errorf("移除 bootstrap 请求捕获: %w", err))
 	}
 	if !restored {
-		return errors.New("bootstrap 请求捕获未安装")
+		// 捕获装在 window 上，页面中途刷新或跳转后就不在了，快照的 cap、hook 与 nav 可以印证
+		return client.withPageSnapshot(ctx, contextID, errors.New("bootstrap 请求捕获未安装"))
 	}
 	headers := make(http.Header, len(publicHeaderNames))
 	for _, name := range publicHeaderNames {

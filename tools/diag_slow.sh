@@ -255,6 +255,14 @@ def pct(values, p):
 def fmt(v):
     return "  -  " if v is None else f"{v:5.1f}s"
 
+# Worker 页面类失败的错误末尾带页面快照“ | 页面={…}”或“ | 页面=快照失败: …”（camoufoxnative.PageSnapshotMarker，见 docs/logging.md）：
+# 快照只占一行、不含“ | ”，之后可能还接着本机代理中转的说明（“；本机代理中转：…”）。快照里是页面上的文字与数字（如 "age":1429），
+# 按子串给错误分类前先去掉，免得被当成 429、403、超时等
+PAGE_SNAPSHOT_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\n|$)")
+
+def strip_page(text):
+    return PAGE_SNAPSHOT_RE.sub("", text or "")
+
 entries = []
 for line in sys.stdin:
     line = line.strip()
@@ -299,7 +307,7 @@ for e in entries:
     elif event == "request.finished" and rid:
         finished[rid] = e
     elif msg.startswith("账号切换"):
-        reason = msg.split("原因:", 1)[-1].strip() if "原因:" in msg else msg
+        reason = strip_page(msg.split("原因:", 1)[-1].strip() if "原因:" in msg else msg)
         key = ("429 限流/额度" if "429" in reason else "403 无权限" if "403" in reason else
                "超时" if ("deadline" in reason or "超时" in reason) else "浏览器连接断开" if ("BiDi" in reason or "closed network" in reason) else
                "Worker 初始化失败" if "初始化" in reason else "其他")
@@ -371,7 +379,7 @@ if blocked:
     print("    被上游中止的原因：" + "，".join(f"{k} {v}" for k, v in reasons.most_common(5))
           + "（SAFETY/PROHIBITED_CONTENT 为安全审核拦截）")
 def error_summary(text):
-    text = re.sub(r"\(qos=[^)]*\)|\[original: [^\]]*\]", "", text or "")
+    text = re.sub(r"\(qos=[^)]*\)|\[original: [^\]]*\]", "", strip_page(text))
     text = text.split("\n")[0]
     text = re.split(r"协议错误码 \d+:|错误码 \d+:", text)[-1]
     return re.sub(r"\d+", "N", text).strip(" :;，。")[:70] or "(无详情)"
@@ -379,7 +387,7 @@ def error_summary(text):
 failed = [r for r in rows if r["state"] == "failed"]
 if failed:
     def reason(r):
-        text, status = r["error"] or "", r["status"] or 0
+        text, status = strip_page(r["error"]), r["status"] or 0
         if "Requests ending with a model turn" in text: return "以模型消息结尾（已在新版修复）"
         if "function call turn" in text or "function response turn" in text: return "工具调用历史格式"
         if "超过模型上限" in text or "max output" in text: return "输出长度超上限（已在新版修复）"

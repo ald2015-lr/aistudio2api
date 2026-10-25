@@ -1,6 +1,10 @@
 package aistudio
 
-import "strings"
+import (
+	"strings"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+)
 
 // InputTokenLimitError 判断上游错误是否为"输入 token 超过上限"（提示词过长）。
 //
@@ -13,7 +17,7 @@ func InputTokenLimitError(err error) bool {
 	if err == nil {
 		return false
 	}
-	message := strings.ToLower(err.Error())
+	message := inputLimitMessage(err)
 	if strings.Contains(message, "input token count") && strings.Contains(message, "exceed") {
 		return true
 	}
@@ -27,7 +31,14 @@ func InputTokenCapError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "input token count exceeds the maximum number of tokens allowed")
+	return strings.Contains(inputLimitMessage(err), "input token count exceeds the maximum number of tokens allowed")
+}
+
+// inputLimitMessage 返回按文案判断输入超限用的错误文字（小写）。Worker 页面类失败（准备 proof、启动）的错误末尾带页面快照，
+// 快照里是页面上的文字（官网弹层、提示条可能正好写着输入超限），先去掉（见 camoufoxnative.StripPageSnapshots），
+// 免得页面失败被当成输入超限：按 400 结束或改走 Build、不重建 Worker
+func inputLimitMessage(err error) string {
+	return strings.ToLower(camoufoxnative.StripPageSnapshots(err.Error()))
 }
 
 // benefitTierRank 按账号输入上限大致由低到高给权益排序：Free < Plus < Pro < Ultra（未知权益按 Free）
