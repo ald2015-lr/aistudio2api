@@ -31,6 +31,8 @@ type anthropicRequest struct {
 	} `json:"output_config"`
 	// OutputFormat 为结构化输出的 beta 写法，与 output_config.format 同时出现时以后者为准
 	OutputFormat *anthropicOutputFormat `json:"output_format"`
+	// VideoConfig 为 Omni 视频设置扩展字段，与 OpenAI Chat 的顶层 video_config 相同，见 omni_video.go
+	VideoConfig *videoConfigRequest `json:"video_config"`
 }
 
 // anthropicOutputFormat 为 output_config.format 与 output_format 的结构化输出格式
@@ -106,7 +108,11 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(generateRequest.Contents)
-	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
+	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
+	if err != nil {
+		writeAnthropicInvalid(w, err)
+		return
+	}
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
@@ -242,6 +248,7 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		TopK:            request.TopK,
 		MaxOutputTokens: request.MaxTokens,
 		StopSequences:   normalizeStopSequences(request.StopSequences),
+		VideoConfig:     request.VideoConfig.videoConfig(),
 	}
 	if request.Thinking != nil && request.Thinking.Type == "enabled" {
 		config.ThinkingBudget = request.Thinking.BudgetTokens

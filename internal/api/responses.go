@@ -30,6 +30,8 @@ type responsesRequest struct {
 	Truncation         string            `json:"truncation"`
 	Metadata           map[string]string `json:"metadata"`
 	Store              *bool             `json:"store"`
+	// VideoConfig 为 Omni 视频设置扩展字段，与 OpenAI Chat 的顶层 video_config 相同，见 omni_video.go
+	VideoConfig *videoConfigRequest `json:"video_config"`
 }
 
 type responsesTool struct {
@@ -165,7 +167,11 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		instructions = append(instructions, inlineInstructions...)
 		generateRequest.System = strings.Join(instructions, "\n")
 	}
-	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
+	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
+	if err != nil {
+		writeOpenAIInvalid(w, err)
+		return
+	}
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
@@ -263,6 +269,7 @@ func (request responsesRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		Temperature:     request.Temperature,
 		TopP:            request.TopP,
 		MaxOutputTokens: request.MaxOutputTokens,
+		VideoConfig:     request.VideoConfig.videoConfig(),
 	}
 	if len(request.Reasoning) > 0 && string(request.Reasoning) != "null" {
 		var reasoning struct {

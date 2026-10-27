@@ -22,7 +22,9 @@ import (
 //	-nothinking 模型照常思考，但不返回思维链
 //	-online     开启 Google 搜索
 //
-// 目录里本身就以等级结尾的模型 ID（例如 xxx-low）不再强制最高思考，按 ID 里的等级设置
+// 目录里本身就以等级结尾的模型 ID（例如 xxx-low）不再强制最高思考，按 ID 里的等级设置。
+// 能输出视频的 Omni 模型另有视频后缀（-16x9、-720p、-8s、-i2v 等，见 omni_video.go），可与思考等级、-nothinking 组合，
+// 例如 gemini-omni-1.1-flash-9x16-720p-8s-low；Omni 不带等级后缀时沿用模型默认等级，不强制最高
 const (
 	suffixMinThinking = "-128"
 	suffixHideThought = "-nothinking"
@@ -41,12 +43,14 @@ var thinkingLevelSuffixes = []struct {
 	{"-high", "high"},
 }
 
-// modelAlias 表示从模型名解析出的后缀；level 为名称指定的思考等级（minimal、low、medium、high），空串表示没有指定
+// modelAlias 表示从模型名解析出的后缀；level 为名称指定的思考等级（minimal、low、medium、high），空串表示没有指定；
+// video 为 Omni 视频后缀指定的视频设置，没有视频后缀时为零值
 type modelAlias struct {
 	base        string
 	level       string
 	hideThought bool
 	online      bool
+	video       aistudio.VideoConfig
 }
 
 // trailingThinkingLevel 返回名称末尾的思考等级后缀（-minimal、-low、-medium、-high）对应的等级，没有时返回空串
@@ -67,8 +71,11 @@ type aliasVariant struct {
 }
 
 // stripModelSuffix 从 alias.base 末尾剥离一个已知后缀并记到 alias 上，没有可剥离的后缀时返回 false。
-// 思考等级后缀出现多个时以最靠后的为准（先剥离的先记）
-func stripModelSuffix(alias *modelAlias) bool {
+// 思考等级后缀出现多个时以最靠后的为准（先剥离的先记）；video 为 true 时也剥离 Omni 视频后缀
+func stripModelSuffix(alias *modelAlias, video bool) bool {
+	if video && stripVideoSuffix(alias) {
+		return true
+	}
 	lower := strings.ToLower(alias.base)
 	setLevel := func(level string) {
 		if alias.level == "" {
@@ -99,7 +106,7 @@ func stripModelSuffix(alias *modelAlias) bool {
 // parseModelAlias 从名称末尾依次剥离全部已知后缀
 func parseModelAlias(name string) modelAlias {
 	alias := modelAlias{base: strings.TrimSpace(name)}
-	for stripModelSuffix(&alias) {
+	for stripModelSuffix(&alias, false) {
 	}
 	return alias
 }
@@ -108,10 +115,36 @@ func parseModelAlias(name string) modelAlias {
 // 剥到第一个目录里有的名称为止（目录 ID 本身以 -low、-online 之类结尾时不会被多剥一层）。
 // 目录 ID 以思考等级结尾（例如 xxx-low）且后缀没有另外指定等级时按 ID 里的等级设置，不强制最高思考
 func resolveModelAlias(models []aistudio.Model, name string) (aistudio.Model, modelAlias, bool) {
+	return resolveModelAliasWith(models, name, false)
+}
+
+// resolveRequestModel 解析请求里的模型名：先按原有后缀解析（与原先完全相同）；解析不到时再连同 Omni 视频后缀解析，
+// 结果只接受能输出视频的 Omni 模型，其他模型名带 -720p、-8s 之类的字样时与原先一样保持原名（由上游返回原有错误）
+func resolveRequestModel(models []aistudio.Model, name string) (aistudio.Model, modelAlias, bool) {
+	if model, alias, ok := resolveModelAlias(models, name); ok {
+		return model, alias, true
+	}
+	model, alias, ok := resolveModelAliasWith(models, name, true)
+	if !ok || !aistudio.OmniVideoModel(model) {
+		return aistudio.Model{}, alias, false
+	}
+	return model, alias, true
+}
+
+// resolveModelAliasWith 与 resolveModelAlias 相同，video 为 true 时剥离后缀也包括 Omni 视频后缀，并且没有同名的目录 ID 时
+// 也按能输出视频的 Omni 模型的目录别名（capability_options.aliases，如 veo-3.1-fast-generate-preview）查找，alias.base 为该别名
+func resolveModelAliasWith(models []aistudio.Model, name string, video bool) (aistudio.Model, modelAlias, bool) {
 	byID := func(id string) (aistudio.Model, bool) {
 		for _, model := range models {
 			if model.ID == id {
 				return model, true
+			}
+		}
+		if video {
+			for _, model := range models {
+				if aistudio.OmniVideoModel(model) && slices.Contains(model.CapabilityOptions["aliases"], id) {
+					return model, true
+				}
 			}
 		}
 		return aistudio.Model{}, false
@@ -128,7 +161,7 @@ func resolveModelAlias(models []aistudio.Model, name string) (aistudio.Model, mo
 			}
 			return model, alias, true
 		}
-		if !stripModelSuffix(&alias) || alias.base == "" {
+		if !stripModelSuffix(&alias, video) || alias.base == "" {
 			return aistudio.Model{}, alias, false
 		}
 	}
@@ -324,23 +357,30 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 	}()
 }
 
-// applyModelAlias 解析模型后缀并改写请求：换成目录模型名，按后缀设置思考强度与联网搜索。
+// applyModelAlias 解析模型后缀并改写请求：换成目录模型名，按后缀设置思考强度与联网搜索；能输出视频的 Omni 模型另按视频后缀与
+// 模型目录整理视频设置（见 applyOmniVideoAlias），视频设置不成立时返回参数错误。
 // 返回是否需要隐藏思维链。未知模型保持原样，由上游返回原有错误。
-func (s *server) applyModelAlias(ctx context.Context, request *aistudio.GenerateRequest) bool {
+func (s *server) applyModelAlias(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
 	models, err := s.aliasCatalog(ctx)
 	if err != nil {
-		return false
+		return false, nil
 	}
-	model, alias, ok := resolveModelAlias(models, request.Model)
-	if !ok || !isTextChatModel(model) {
-		return false
+	model, alias, ok := resolveRequestModel(models, request.Model)
+	if !ok {
+		return false, nil
+	}
+	if aistudio.OmniVideoModel(model) {
+		return applyOmniVideoAlias(request, model, alias)
+	}
+	if !isTextChatModel(model) {
+		return false, nil
 	}
 	request.Model = model.ID
 	applyThinkingAlias(&request.Config, model, alias.level)
 	if alias.online && model.Capabilities["google_search"] && request.Tools.ToolConfig.Mode != "none" {
 		request.Tools.Google = appendUnique(request.Tools.Google, "google_search")
 	}
-	return alias.hideThought && modelThinks(model)
+	return alias.hideThought && modelThinks(model), nil
 }
 
 // responseModel 返回响应里报告的模型名（OpenAI、Anthropic、Responses 的 model，Gemini 的 modelVersion，Interactions 的 model），
@@ -358,7 +398,7 @@ func (s *server) resolveModelName(ctx context.Context, name string) string {
 	if err != nil {
 		return name
 	}
-	if model, _, ok := resolveModelAlias(models, name); ok {
+	if model, _, ok := resolveRequestModel(models, name); ok {
 		return model.ID
 	}
 	return name
@@ -423,7 +463,7 @@ func lookupPublicModel(models []aistudio.Model, name string) (aistudio.Model, bo
 			}
 		}
 	}
-	if model, alias, ok := resolveModelAlias(models, name); ok && alias.base != name && isTextChatModel(model) {
+	if model, alias, ok := resolveRequestModel(models, name); ok && alias.base != name && (isTextChatModel(model) || aistudio.OmniVideoModel(model)) {
 		model.ID = name
 		return model, true
 	}

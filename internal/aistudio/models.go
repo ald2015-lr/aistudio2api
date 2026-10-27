@@ -51,6 +51,18 @@ var imageResolutions = map[int64]string{1: "1K", 2: "2K", 3: "4K", 4: "512"}
 var videoDurations = map[int64]string{1: "5", 2: "6", 3: "7", 4: "8", 5: "4"}
 var videoResolutions = map[int64]string{1: "720p", 2: "1080p", 3: "4k", 4: "368p", 5: "360p"}
 
+// videoFrameRates 为视频能力 field 71 子索引 11 的帧率编号（Omni 只有 1，即官网灰色不可选的 24fps）
+var videoFrameRates = map[int64]string{1: "24fps"}
+
+// videoTasks 为模型目录 field 85 的视频任务编号（官网 Advanced 的 Video task），名称取 Interactions API video_config.task
+var videoTasks = map[int64]string{1: "text_to_video", 2: "image_to_video", 3: "reference_to_video", 4: "edit", 5: "extend"}
+
+// videoInputs 为视频能力 field 71 子索引 7 中的输入方式编号，4 为起始帧与尾帧，5 为参考图
+var videoInputs = map[int64]string{4: "frames", 5: "reference_images"}
+
+// videoDurationRangeNames 为视频能力 field 71 子索引 10（时长滑块）各项的名称，依次为下限、上限、步长与默认值
+var videoDurationRangeNames = []string{"min", "max", "step", "default"}
+
 // GenerationDefaults 保存 ListModels 返回的生成默认值
 type GenerationDefaults struct {
 	MaxOutputTokens      int64
@@ -68,6 +80,9 @@ type GenerationDefaults struct {
 	OutputResolution bool
 	// InteractionStream 表示官网经 CreateInteractionStream 生成的模型
 	InteractionStream bool
+	// VideoResolution 为视频输出分辨率选项（video_output_resolutions）的第一项，即官网 Omni 的默认分辨率；
+	// Interaction 视频输出格式没有指定分辨率时使用
+	VideoResolution string
 }
 
 type modelEntry struct {
@@ -212,6 +227,9 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 	if err != nil {
 		return modelEntry{}, err
 	}
+	if resolutions := options["video_output_resolutions"]; len(resolutions) > 0 {
+		defaults.VideoResolution = resolutions[0]
+	}
 	return modelEntry{model: model, defaults: defaults}, nil
 }
 
@@ -257,8 +275,25 @@ func decodeCapabilityOptions(row []json.RawMessage, path string, evidence json.R
 		if err != nil {
 			return nil, err
 		}
+		// 子索引 7 含编号 3（分辨率可选）而子索引 9 没有列出分辨率时，官网提供 720p、1080p、4k（与上游 Mag1cFall/AIStudio2API 相同）
+		if len(resolutions) == 0 && len(lenientMappedCodes(rawAt(video, 7), map[int64]string{3: "resolution"})) > 0 {
+			resolutions = []string{"720p", "1080p", "4k"}
+		}
 		appendOption(options, "video_output_resolutions", resolutions)
+		// 以下几项来自 Omni 的视频能力：取值不是预期的整数数组时只省略该项，不让整个模型目录解析失败
+		appendOption(options, "video_inputs", lenientMappedCodes(rawAt(video, 7), videoInputs))
+		// 子索引 10 为时长滑块的下限、上限、步长与默认值（秒），记为 min=、max=、step=、default=
+		durationRange := lenientMappedCodes(rawAt(video, 10), nil)
+		if len(durationRange) > len(videoDurationRangeNames) {
+			durationRange = durationRange[:len(videoDurationRangeNames)]
+		}
+		for index := range durationRange {
+			durationRange[index] = videoDurationRangeNames[index] + "=" + durationRange[index]
+		}
+		appendOption(options, "video_duration_range", durationRange)
+		appendOption(options, "video_frame_rates", lenientMappedCodes(rawAt(video, 11), videoFrameRates))
 	}
+	appendOption(options, "video_tasks", lenientMappedCodes(rawAt(row, 84), videoTasks))
 	if len(options) == 0 {
 		return nil, nil
 	}
@@ -597,11 +632,23 @@ func decodeMappedCodes(raw json.RawMessage, path string, evidence json.RawMessag
 		if err != nil {
 			return nil, withMethod(err, "ListModels")
 		}
-		if value, exists := mapping[code]; exists {
+		if mapping == nil {
+			values = append(values, strconv.FormatInt(code, 10))
+		} else if value, exists := mapping[code]; exists {
 			values = append(values, value)
 		}
 	}
 	return values, nil
+}
+
+// lenientMappedCodes 与 decodeMappedCodes 相同（mapping 为 nil 时原样记下数字），但取值不是整数数组时返回 nil，不报协议错误：
+// 用于官网后来加的可选目录项，形状变化时只少显示一项
+func lenientMappedCodes(raw json.RawMessage, mapping map[int64]string) []string {
+	values, err := decodeMappedCodes(raw, "$", raw, mapping)
+	if err != nil {
+		return nil
+	}
+	return values
 }
 
 func appendOption(options map[string][]string, key string, values []string) {

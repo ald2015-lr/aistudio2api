@@ -52,7 +52,11 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	}
 	current := cloneResponseContents(contents[start:])
 	generate.Contents = contents
-	hideThought := s.prepareGenerate(r.Context(), &generate)
+	hideThought, err := s.prepareGenerate(r.Context(), &generate)
+	if err != nil {
+		writeGeminiInvalid(w, err)
+		return
+	}
 	// 交互资源的 model 报告去掉后缀的目录模型名（见 responseModel）
 	model := responseModel(generate)
 	generate.Stream = request.Stream

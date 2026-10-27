@@ -150,9 +150,9 @@ func hasFunctionCall(content aistudio.Content) bool {
 	return false
 }
 
-// prepareGenerate 在发往上游前整理请求：先修正对话历史分轮，再解析模型名后缀。
-// 返回是否需要隐藏思维链
-func (s *server) prepareGenerate(ctx context.Context, request *aistudio.GenerateRequest) bool {
+// prepareGenerate 在发往上游前整理请求：先修正对话历史分轮，再解析模型名后缀（Omni 模型另整理视频设置）。
+// 返回是否需要隐藏思维链；Omni 视频设置不成立（例如非第一轮指定视频任务、帧率不是 24fps）时返回参数错误，调用方在选号前按 400 返回
+func (s *server) prepareGenerate(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
 	if count := len(request.Contents); count > 0 && request.Contents[count-1].Role == aistudio.RoleAssistant &&
 		!hasFunctionCall(request.Contents[count-1]) {
 		aistudio.TraceFromContext(ctx).Note("客户端最后一条是模型消息（预填充）：已在末尾补一条请模型从这里接着写的用户消息")

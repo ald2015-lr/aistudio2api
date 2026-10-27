@@ -4271,6 +4271,10 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 			service.requests.logRequestProgress(request.ID, "service", "WARN", "安全设置已跳过无法识别的条目 | "+strings.Join(skipped, "；"))
 		}
 	}
+	// 协议层整理请求时留下的说明（Omni 模型忽略的 stop sequences、按模型选项调整的视频时长等）逐条写进该请求的管理日志
+	for _, note := range request.Notes {
+		service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+	}
 	trace.AddParameters("发往上游（seed 与随机后缀处理后）", request)
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
@@ -4722,6 +4726,12 @@ func (service *trackedService) generateWithRetry(
 			case aistudio.RequestPhaseStreaming:
 				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "上游已返回响应头")
 			}
+		})
+		// 生成服务按本次账户的目录再整理请求时留下的说明（视频时长按该账户的范围调整、协议层没有处理到的 Interaction 模型忽略的
+		// stop sequences 等）写进该请求的管理日志，来源为本次账户
+		noteRequestID, noteSource := request.ID, accountLabel
+		attemptCtx = aistudio.ContextWithRequestNoteObserver(attemptCtx, func(note string) {
+			service.requests.logRequestProgress(noteRequestID, noteSource, "WARN", note)
 		})
 		// 降级判定的输入字数按本次尝试实际发送的内容（工具约束提示、附带的 Schema、截断之后）校准
 		if gate := diag.guard(); gate != nil {

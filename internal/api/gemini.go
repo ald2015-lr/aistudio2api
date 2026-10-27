@@ -151,8 +151,10 @@ type geminiGenerationConfig struct {
 	ResponseMIMEType    string                     `json:"responseMimeType"`
 	ResponseSchema      json.RawMessage            `json:"responseSchema"`
 	ResponseJSONSchema  json.RawMessage            `json:"responseJsonSchema"`
+	ResponseFormat      geminiResponseFormats      `json:"responseFormat"`
 	ResponseModalities  []string                   `json:"responseModalities"`
 	ImageConfig         *geminiImageConfig         `json:"imageConfig"`
+	VideoConfig         *geminiVideoConfig         `json:"videoConfig"`
 	SpeechConfig        *geminiSpeechConfig        `json:"speechConfig"`
 	TranscriptionConfig *geminiTranscriptionConfig `json:"transcriptionConfig"`
 	Seed                *int64                     `json:"seed"`
@@ -177,6 +179,103 @@ type geminiTranscriptionConfig struct {
 type geminiImageConfig struct {
 	AspectRatio string `json:"aspectRatio"`
 	ImageSize   string `json:"imageSize"`
+}
+
+// geminiVideoConfig 为 generationConfig.videoConfig 扩展字段：task 取 Interactions API video_config.task 的取值，
+// 其余几项与 responseFormat.video 相同，同时出现时以这里为准；帧率另接受官方 Gemini SDK 视频配置的字段名 fps
+type geminiVideoConfig struct {
+	Task            string         `json:"task"`
+	AspectRatio     string         `json:"aspectRatio"`
+	DurationSeconds videoSeconds   `json:"durationSeconds"`
+	Duration        videoSeconds   `json:"duration"`
+	Resolution      string         `json:"resolution"`
+	FrameRate       videoFrameRate `json:"frameRate"`
+	FPS             videoFrameRate `json:"fps"`
+}
+
+// videoConfig 返回规范视频设置，全部未设置时为 nil；durationSeconds 与 duration 同时出现时以 durationSeconds 为准，
+// frameRate 与 fps 同时出现时以 frameRate 为准
+func (config *geminiVideoConfig) videoConfig() *aistudio.VideoConfig {
+	if config == nil {
+		return nil
+	}
+	seconds := config.DurationSeconds
+	if !seconds.set {
+		seconds = config.Duration
+	}
+	return compactVideoConfig(aistudio.VideoConfig{
+		AspectRatio: geminiResponseFormatValue(config.AspectRatio), DurationSeconds: seconds.seconds,
+		Resolution: config.Resolution, FrameRate: firstFrameRate(config.FrameRate, config.FPS), Task: config.Task,
+	})
+}
+
+// geminiResponseFormat 为 generationConfig.responseFormat 的一项输出格式
+type geminiResponseFormat struct {
+	Text *struct {
+		MIMEType string          `json:"mimeType"`
+		Schema   json.RawMessage `json:"schema"`
+	} `json:"text"`
+	Image *geminiImageConfig `json:"image"`
+	Video *struct {
+		AspectRatio string         `json:"aspectRatio"`
+		Duration    videoSeconds   `json:"duration"`
+		Resolution  string         `json:"resolution"`
+		FrameRate   videoFrameRate `json:"frameRate"`
+		FPS         videoFrameRate `json:"fps"`
+	} `json:"video"`
+}
+
+// geminiResponseFormats 为 generationConfig.responseFormat：REST 写法为单个对象，SDK 写法为数组
+type geminiResponseFormats []geminiResponseFormat
+
+// UnmarshalJSON 按单个对象或数组读取 responseFormat，null 为未设置
+func (formats *geminiResponseFormats) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	switch {
+	case len(trimmed) == 0 || string(trimmed) == "null":
+		*formats = nil
+		return nil
+	case trimmed[0] == '{':
+		var format geminiResponseFormat
+		if err := json.Unmarshal(trimmed, &format); err != nil {
+			return err
+		}
+		*formats = geminiResponseFormats{format}
+		return nil
+	}
+	return json.Unmarshal(trimmed, (*[]geminiResponseFormat)(formats))
+}
+
+// geminiResponseFormatValues 为 responseFormat 枚举名对应的上游取值
+var geminiResponseFormatValues = map[string]string{
+	"APPLICATION_JSON":                "application/json",
+	"TEXT_PLAIN":                      "text/plain",
+	"ASPECT_RATIO_ONE_BY_ONE":         "1:1",
+	"ASPECT_RATIO_TWO_BY_THREE":       "2:3",
+	"ASPECT_RATIO_THREE_BY_TWO":       "3:2",
+	"ASPECT_RATIO_THREE_BY_FOUR":      "3:4",
+	"ASPECT_RATIO_FOUR_BY_THREE":      "4:3",
+	"ASPECT_RATIO_FOUR_BY_FIVE":       "4:5",
+	"ASPECT_RATIO_FIVE_BY_FOUR":       "5:4",
+	"ASPECT_RATIO_NINE_BY_SIXTEEN":    "9:16",
+	"ASPECT_RATIO_SIXTEEN_BY_NINE":    "16:9",
+	"ASPECT_RATIO_TWENTY_ONE_BY_NINE": "21:9",
+	"ASPECT_RATIO_ONE_BY_EIGHT":       "1:8",
+	"ASPECT_RATIO_EIGHT_BY_ONE":       "8:1",
+	"ASPECT_RATIO_ONE_BY_FOUR":        "1:4",
+	"ASPECT_RATIO_FOUR_BY_ONE":        "4:1",
+	"IMAGE_SIZE_FIVE_TWELVE":          "512",
+	"IMAGE_SIZE_ONE_K":                "1K",
+	"IMAGE_SIZE_TWO_K":                "2K",
+	"IMAGE_SIZE_FOUR_K":               "4K",
+}
+
+// geminiResponseFormatValue 把 responseFormat 枚举名换成上游取值，其他值原样返回
+func geminiResponseFormatValue(value string) string {
+	if mapped, ok := geminiResponseFormatValues[strings.TrimSpace(value)]; ok {
+		return mapped
+	}
+	return value
 }
 
 type geminiVoiceConfig struct {
@@ -424,6 +523,27 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	if geminiRawObjectPresent(request.GenerationConfig.ResponseJSONSchema) {
 		config.ResponseSchema = request.GenerationConfig.ResponseJSONSchema
 	}
+	// responseFormat 为新写法的输出格式：文本的 MIME 与 Schema、图片的宽高比与尺寸、Omni 视频的宽高比、时长与分辨率
+	for _, format := range request.GenerationConfig.ResponseFormat {
+		if text := format.Text; text != nil {
+			if text.MIMEType != "" {
+				config.ResponseMIMEType = geminiResponseFormatValue(text.MIMEType)
+			}
+			if geminiRawObjectPresent(text.Schema) {
+				config.ResponseSchema = text.Schema
+			}
+		}
+		if image := format.Image; image != nil {
+			config.ImageConfig = &aistudio.ImageConfig{AspectRatio: geminiResponseFormatValue(image.AspectRatio), ImageSize: geminiResponseFormatValue(image.ImageSize)}
+		}
+		if video := format.Video; video != nil {
+			config.VideoConfig = overlayVideoConfig(config.VideoConfig, &aistudio.VideoConfig{
+				AspectRatio: geminiResponseFormatValue(video.AspectRatio), DurationSeconds: video.Duration.seconds,
+				Resolution: video.Resolution, FrameRate: firstFrameRate(video.FrameRate, video.FPS),
+			})
+		}
+	}
+	config.VideoConfig = overlayVideoConfig(config.VideoConfig, request.GenerationConfig.VideoConfig.videoConfig())
 	if request.GenerationConfig.ThinkingConfig != nil {
 		thinking := request.GenerationConfig.ThinkingConfig
 		// thinkingBudget=-1 是 Gemini API 的“动态思考”，按未设置处理，使用模型默认强度。
@@ -859,7 +979,11 @@ func (s *server) handleGeminiCountTokens(w http.ResponseWriter, r *http.Request,
 }
 
 func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, stream bool) {
-	hideThought := s.prepareGenerate(r.Context(), &request)
+	hideThought, err := s.prepareGenerate(r.Context(), &request)
+	if err != nil {
+		writeGeminiInvalid(w, err)
+		return
+	}
 	request.Stream = stream
 	events, err := s.generate(r.Context(), request)
 	if err != nil {
@@ -1484,7 +1608,8 @@ func camelizeKeys(value any) any {
 		result := make(map[string]any, len(typed))
 		for key, item := range typed {
 			name := snakeToCamel(key)
-			if name == "responseSchema" || name == "responseJsonSchema" {
+			// responseFormat.text.schema 同样是用户定义的 Schema，原样保留
+			if name == "responseSchema" || name == "responseJsonSchema" || name == "schema" {
 				result[name] = item
 				continue
 			}

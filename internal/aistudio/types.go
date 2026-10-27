@@ -197,6 +197,18 @@ type ImageConfig struct {
 	ImageSize   string `json:"image_size,omitempty"`
 }
 
+// VideoConfig 表示 Omni 视频输出设置，对应官网 Run settings 的 Aspect ratio、Video duration、Resolution、Frame rate 与 Video task；
+// 空值与 0 表示未设置，使用模型默认值（宽高比不带即官网 Auto，分辨率取模型目录的默认分辨率）
+type VideoConfig struct {
+	AspectRatio     string `json:"aspect_ratio,omitempty"`
+	DurationSeconds int64  `json:"duration_seconds,omitempty"`
+	Resolution      string `json:"resolution,omitempty"`
+	// FrameRate 为客户端要求的帧率（每秒帧数），只用于校验：官网只有 24fps 且不可选，请求里不发送
+	FrameRate float64 `json:"frame_rate,omitempty"`
+	// Task 取 Interactions API video_config.task 的取值：text_to_video、image_to_video、reference_to_video、edit、extend
+	Task string `json:"task,omitempty"`
+}
+
 // SafetySetting 表示一个安全类别的拦截阈值，取 Gemini API 枚举名
 type SafetySetting struct {
 	Category  string `json:"category"`
@@ -237,6 +249,7 @@ type GenerationConfig struct {
 	ResponseSchema      json.RawMessage      `json:"response_schema,omitempty"`
 	ResponseModalities  []ResponseModality   `json:"response_modalities,omitempty"`
 	ImageConfig         *ImageConfig         `json:"image_config,omitempty"`
+	VideoConfig         *VideoConfig         `json:"video_config,omitempty"`
 	SpeechConfig        *SpeechConfig        `json:"speech_config,omitempty"`
 	TranscriptionConfig *TranscriptionConfig `json:"transcription_config,omitempty"`
 	ReasoningEffort     string               `json:"reasoning_effort,omitempty"`
@@ -267,6 +280,9 @@ type GenerateRequest struct {
 	Stream bool `json:"-"`
 	// Truncate 在输入超过模型上下文窗口时按权威计数删除最早的完整对话轮次（Responses truncation=auto）
 	Truncate bool `json:"-"`
+	// Notes 为协议层整理请求时留下的说明（例如 Omni 模型忽略的 stop sequences、按模型范围调整的视频时长），
+	// 生成服务在选号前逐条写进该请求的管理日志
+	Notes []string `json:"-"`
 }
 
 // TokenCountRequest 表示计数请求

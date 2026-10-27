@@ -201,3 +201,36 @@ func TestStartGenerateSkipsUnknownSafetySettings(t *testing.T) {
 	}
 	t.Fatalf("没有记录跳过安全设置的 WARN: %+v", requests.logs)
 }
+
+// TestStartGenerateLogsRequestNotes 协议层整理请求时留下的说明（如 Omni 模型忽略的 stop sequences、按范围调整的视频时长）在选号前逐条写进该请求的管理日志
+func TestStartGenerateLogsRequestNotes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	requests := newRequestRegistry(ctx)
+	service := &trackedService{
+		lifecycle: ctx, pool: aistudio.NewAccountPool(nil, 1), requests: requests,
+		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
+	}
+	notes := []string{aistudio.InteractionStopSequencesNote(1), "视频时长 30 秒不是模型可选的时长（4–15 秒、步长 1），按最接近的 15 秒发送"}
+	request := aistudio.GenerateRequest{
+		ID: "req-notes", Model: "gemini-omni-1.1-flash", Notes: notes,
+		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
+	}
+	var stopped *serviceStoppedError
+	if _, _, err := service.startGenerate(ctx, request); !errors.As(err, &stopped) {
+		t.Fatalf("err = %v，期望通过参数校验后返回服务已停止", err)
+	}
+	requests.mu.Lock()
+	defer requests.mu.Unlock()
+	found := 0
+	for _, entry := range requests.logs {
+		for _, note := range notes {
+			if entry.Level == "WARN" && entry.Message == note && entry.Request != nil && entry.Request.ID == "req-notes" {
+				found++
+			}
+		}
+	}
+	if found != len(notes) {
+		t.Fatalf("请求日志应逐条记下说明: %+v", requests.logs)
+	}
+}

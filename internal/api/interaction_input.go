@@ -30,10 +30,12 @@ type interactionRequest struct {
 		ThinkingSummaries string          `json:"thinking_summaries"`
 		Speech            json.RawMessage `json:"speech_config"`
 		ToolChoice        json.RawMessage `json:"tool_choice"`
+		// Video 为 Omni 视频设置：task 与官方 video_config.task 相同，另接受与 response_format 视频格式相同的几项（以这里为准）
+		Video *videoConfigRequest `json:"video_config"`
 	} `json:"generation_config"`
 }
 
-// interactionFormat 表示文本、图片与音频的返回配置
+// interactionFormat 表示文本、图片、音频与视频的返回配置
 type interactionFormat struct {
 	Type        string          `json:"type"`
 	MIME        string          `json:"mime_type"`
@@ -43,6 +45,11 @@ type interactionFormat struct {
 	Delivery    string          `json:"delivery"`
 	AspectRatio string          `json:"aspect_ratio"`
 	ImageSize   string          `json:"image_size"`
+	// Duration、Resolution 与 FrameRate 为视频格式（type=video）的时长（"8s" 或秒数）、分辨率与帧率（也接受 fps，以 frame_rate 为准）
+	Duration   videoSeconds   `json:"duration"`
+	Resolution string         `json:"resolution"`
+	FrameRate  videoFrameRate `json:"frame_rate"`
+	FPS        videoFrameRate `json:"fps"`
 }
 
 // interactionInput 表示输入内容块或执行步骤
@@ -149,10 +156,20 @@ func (request interactionRequest) toGenerateRequest(id string) (aistudio.Generat
 			}
 			generate.Config.ResponseModalities = append(generate.Config.ResponseModalities, aistudio.ResponseModalityImage)
 			generate.Config.ImageConfig = &aistudio.ImageConfig{AspectRatio: format.AspectRatio, ImageSize: format.ImageSize}
+		case "video":
+			// Omni 视频输出格式：输出模态由模型决定，这里只取宽高比、时长、分辨率与帧率
+			if format.MIME != "" && format.MIME != "video/mp4" {
+				return generate, fmt.Errorf("video mime_type must be video/mp4")
+			}
+			generate.Config.VideoConfig = overlayVideoConfig(generate.Config.VideoConfig, &aistudio.VideoConfig{
+				AspectRatio: format.AspectRatio, DurationSeconds: format.Duration.seconds,
+				Resolution: format.Resolution, FrameRate: firstFrameRate(format.FrameRate, format.FPS),
+			})
 		default:
 			return generate, fmt.Errorf("unsupported response_format type %q", format.Type)
 		}
 	}
+	generate.Config.VideoConfig = overlayVideoConfig(generate.Config.VideoConfig, generation.Video.videoConfig())
 	tools := append([]responsesTool(nil), request.Tools...)
 	for i := range tools {
 		switch tools[i].Type {

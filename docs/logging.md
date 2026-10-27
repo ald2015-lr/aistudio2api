@@ -409,6 +409,22 @@ WARN  service  IP 池检查完成 | 出口=http://isp.decodo.com | 端口=200 | 
 WARN  account@example.com  上游结束说明 | 结束原因=malformed_function_call | 说明=<上游说明>
 ```
 
+Omni 视频模型的请求在协议层整理时，每条说明在选号前写一条进度（WARN，来源 `service`）；发送前按所选账户的目录再整理时留下的新说明（协议层所用的合并目录与所选账户的目录不一致，例如别名目录缓存还没刷新；或协议层没有整理到的请求，例如启动期间别名目录取不到、目录没有列出视频选项的 Interaction 模型）同样写一条进度（WARN，来源为该账户，换号重试时每个账户各记各的）。两种都进入排查记录的 `timeline`，不影响响应（规则见 [protocol.md](protocol.md#omni-视频设置与模型名后缀)）：
+
+| 消息 | 含义 |
+| --- | --- |
+| `未确认 CreateInteractionStream 的停止序列字段，已忽略 <N> 个停止序列` | 请求带了 stop sequences（OpenAI `stop`、Anthropic `stop_sequences`、Gemini `stopSequences` 等）：官网 Run settings 有 Add stop sequence，但没有 CreateInteractionStream 停止序列字段的现场证据，不猜字段号，也不在本地匹配，已清空，不再整次返回参数错误 |
+| `视频时长 <N> 秒不是模型可选的时长（<MIN>–<MAX> 秒、步长 <STEP>），按最接近的 <M> 秒发送` | 时长超出模型目录 `video_duration_range` 的范围或不在步长上 |
+| `视频宽高比 <值> 不是模型选项，按最接近的 <16:9 或 9:16> 发送` | 宽高比不是 16:9、9:16 |
+| `视频分辨率 <值> 不是模型选项，按最接近的 <分辨率> 发送` | 分辨率不在模型目录 `video_output_resolutions` 中（如 `2160p`、`1440p`）；目录的 `368p` 与请求的 `360p` 都按 `360p` 发送，不记这一行 |
+| `视频任务 edit 不带输出格式，宽高比、时长与分辨率不发送` | 编辑任务同时设置了宽高比、时长或分辨率（编辑请求与官网一样不带输出格式） |
+
+```text
+WARN  service  未确认 CreateInteractionStream 的停止序列字段，已忽略 1 个停止序列
+WARN  service  视频时长 30 秒不是模型可选的时长（4–15 秒、步长 1），按最接近的 15 秒发送
+WARN  account@example.com  视频时长 15 秒不是模型可选的时长（4–8 秒、步长 1），按最接近的 8 秒发送
+```
+
 上游拒绝当前输入（prompt feedback）并给出拦截说明（`blockReasonMessage`）时，`request.error` 在原因后附上这段说明，例如 `AI Studio 拒绝当前输入: prohibited_content: <上游说明>`；没有说明时只有原因。客户端收到的错误消息仍按原因生成官方措辞，不含这段说明。
 
 控制台每行是一条独立 JSON 事件，请求数据与中文摘要分离：

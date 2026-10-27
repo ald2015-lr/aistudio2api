@@ -33,6 +33,8 @@ type chatRequest struct {
 	Reasoning           json.RawMessage   `json:"reasoning"`
 	Seed                *int64            `json:"seed"`
 	WebSearchOptions    json.RawMessage   `json:"web_search_options"`
+	// VideoConfig 为 Omni 视频设置扩展字段（OpenAI SDK 的 extra_body 会合并到顶层），见 omni_video.go
+	VideoConfig *videoConfigRequest `json:"video_config"`
 }
 
 type chatStreamOptions struct {
@@ -170,7 +172,11 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.thoughtSignatures.Restore(generateRequest.Contents)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(generateRequest.Contents)
-	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
+	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
+	if err != nil {
+		writeOpenAIInvalid(w, err)
+		return
+	}
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
@@ -669,6 +675,7 @@ func (request chatRequest) generationConfig() (aistudio.GenerationConfig, error)
 		TopP:            request.TopP,
 		ReasoningEffort: request.ReasoningEffort,
 		Seed:            request.Seed,
+		VideoConfig:     request.VideoConfig.videoConfig(),
 	}
 	if request.MaxCompletionTokens != nil {
 		config.MaxOutputTokens = request.MaxCompletionTokens

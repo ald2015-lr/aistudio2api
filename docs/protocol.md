@@ -312,9 +312,21 @@ field 1 是 `request_key`，field 2 是 `botguard_response`。正确 proof、损
 | 视频时长 | `1=5s`、`2=6s`、`3=7s`、`4=8s`、`5=4s` |
 | 视频分辨率 | `1=720p`、`2=1080p`、`3=4k`、`4=368p`、`5=360p` |
 
-Veo field 71 的宽高比、时长和分辨率分别位于子索引 `4`、`5`、`9`。TTS field 67 是 repeated voice row，每行索引 `0` 为 voice name。thinking field 72 的默认 level 位于子索引 `5`。
+Veo field 71 的宽高比、时长和分辨率分别位于子索引 `4`、`5`、`9`；子索引 `7` 含 `3` 而子索引 `9` 没有列出分辨率时，`video_output_resolutions` 取官网提供的 `720p`、`1080p`、`4k`（与上游 Mag1cFall/AIStudio2API 相同）；子索引 `7` 含 `4` 时模型接受起始帧与尾帧，含 `5` 时接受参考图，公开为 `video_inputs` 的 `frames` 与 `reference_images`。Omni 的 field 71 子索引 `10` 为时长滑块的下限、上限、步长与默认值（秒），公开为 `video_duration_range` 的 `min=`、`max=`、`step=`、`default=` 四项；子索引 `11` 为帧率，`1` 公开为 `24fps`；field 85 为视频任务，`1`–`5` 公开为 `text_to_video`、`image_to_video`、`reference_to_video`、`edit`、`extend`。这四项（`video_inputs`、`video_duration_range`、`video_frame_rates`、`video_tasks`）取值不是整数数组时只省略该项，不让整个目录解析失败；每个账户原始目录里 `video_output_resolutions` 的第一项为该账户 Omni 的默认分辨率。TTS field 67 是 repeated voice row，每行索引 `0` 为 voice name。thinking field 72 的默认 level 位于子索引 `5`。
 
-field 57 alias 可以是 `["models/<ALIAS>"]`，也可以是 repeated row；row 形状时取每行索引 `0` 并移除 `models/` 前缀。公开 `capability_options` 的键全集为 `aliases`、`voices`、`image_aspect_ratios`、`image_output_resolutions`、`video_aspect_ratios`、`video_durations_seconds` 和 `video_output_resolutions`；没有值的键省略。
+field 57 alias 可以是 `["models/<ALIAS>"]`，也可以是 repeated row；row 形状时取每行索引 `0` 并移除 `models/` 前缀。公开 `capability_options` 的键全集为 `aliases`、`voices`、`image_aspect_ratios`、`image_output_resolutions`、`video_aspect_ratios`、`video_durations_seconds`、`video_output_resolutions`、`video_inputs`、`video_duration_range`、`video_frame_rates` 和 `video_tasks`；没有值的键省略。公开的目录（`/v1/models`、`/v1beta/models` 与管理页模型详情）是各账户目录的合并结果，只有一个账户时也一样：每个键的取值按字符串排序去重，不代表上游顺序。Omni 的默认分辨率取所选账户原始目录 `video_output_resolutions` 的第一项（官网一般为 `360p`），在公开列表里看不出。`video_duration_range` 合并后同名项可能出现多次，使用时按数值取各账户都能接受的范围：下限取最大值、上限取最小值、步长取最大值，默认值取落在范围内的最大一个（都不在范围内时换成范围内最接近的）；范围为空时协议层不调整时长，交给发送前按所选账户的目录调整。Omni 的公开目录示例：
+
+```json
+"capability_options": {
+  "video_aspect_ratios": ["16:9", "9:16"],
+  "video_output_resolutions": ["1080p", "360p", "4k", "720p"],
+  "video_duration_range": ["default=10", "max=15", "min=4", "step=1"],
+  "video_frame_rates": ["24fps"],
+  "video_tasks": ["edit", "extend", "image_to_video", "reference_to_video", "text_to_video"]
+}
+```
+
+示例中的时长范围为示意，以实时目录为准。
 
 ### CountTokens
 
@@ -941,11 +953,13 @@ OpenAI 文件入口接收 `multipart/form-data` 的 `file` 与 `purpose`，单�
 | interaction 索引 | 内容 |
 | ---: | --- |
 | 6 | system instruction |
-| 17 | `["models/<MODEL_ID>", [null,null,null,null,null,<THINKING_LEVEL>,1,<MAX_OUTPUT_TOKENS>]]`，历史中没有模型输出时配置索引 24 为 `[]` |
+| 17 | `["models/<MODEL_ID>", [null,null,null,null,null,<THINKING_LEVEL>,1,<MAX_OUTPUT_TOKENS>]]`，历史中没有模型输出时配置索引 24（GenerationConfig field 25）为 `[]`，设置视频任务时为 `[<TASK>]`（`1`–`5` 依次为 text_to_video、image_to_video、reference_to_video、edit、extend）；有模型输出时配置只到索引 7，不能设置视频任务 |
 | 26 | `[[<STEP>...]]`，用户 step 为 `[[<CONTENT>...]]`，模型 step 为 `[null,[<CONTENT>...]]`；文本 content 为 `[[<TEXT>]]`，Drive 附件 content 为 `[null×8,["<DRIVE_FILE_ID>"]]` |
-| 53 | 视频输出配置 `[[[null,null,null,[null,null,null,null,null,1]]]]` |
+| 53 | 输出格式（field 54）`[[[null,null,null,[null,null,null,<ASPECT>,[<SECONDS>],<RESOLUTION>]]]]`：宽高比 `1` 为 16:9、`2` 为 9:16，未设置（官网 Auto）时为 null；时长未设置时为 null；分辨率 `1`–`4` 为 360p、720p、1080p、4k，未设置时取所选账户目录 `video_output_resolutions` 的第一项（`368p` 按 `360p`；目录没有时为 `1`，即官网默认 360p）；任务为 `edit` 时没有输出格式，interaction 只到索引 26 |
 
-thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件；内联附件先上传到所选账户的 Drive，再以 file ID 引用，文件 ID 不参与 binding。模型 step 只带文本：assistant 消息里的附件（客户端回传的生成图片、本服务恢复的图片链接、`previous_interaction_id` 续接历史里模型生成的视频，与 user 附件一样先上传 Drive）连同一句说明“以下是上文模型回复里的图片或视频：”移到紧随其后的 user step 最前面，以 assistant 消息结尾时单独成一条 user step；只有附件的 assistant 消息整条省略，说明文字参与 binding。例如先用图片模型出图，再在同一对话里换成 Omni 让它“动起来”时，Omni 能看到这张图。账户没有 Drive 授权（附件仍是 inline data）时与 user 附件一样返回 400，assistant 消息里的外部地址附件同样返回 400，不静默丢弃；原先 assistant 消息里带附件的请求一律返回 400。音频附件由上游以 code 3 `Audio input modality is not enabled for this model` 拒绝，映射为 HTTP 400；函数、工具与 stop sequences 返回参数错误，temperature、topP、topK 与 seed 不发送。
+thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件；内联附件先上传到所选账户的 Drive，再以 file ID 引用，文件 ID 不参与 binding。模型 step 只带文本：assistant 消息里的附件（客户端回传的生成图片、本服务恢复的图片链接、`previous_interaction_id` 续接历史里模型生成的视频，与 user 附件一样先上传 Drive）连同一句说明“以下是上文模型回复里的图片或视频：”移到紧随其后的 user step 最前面，以 assistant 消息结尾时单独成一条 user step；只有附件的 assistant 消息整条省略，说明文字参与 binding。例如先用图片模型出图，再在同一对话里换成 Omni 让它“动起来”时，Omni 能看到这张图。账户没有 Drive 授权（附件仍是 inline data）时与 user 附件一样返回 400，assistant 消息里的外部地址附件同样返回 400，不静默丢弃；原先 assistant 消息里带附件的请求一律返回 400。音频附件由上游以 code 3 `Audio input modality is not enabled for this model` 拒绝，映射为 HTTP 400；函数与工具返回参数错误，temperature、topP、topK 与 seed 不发送。stop sequences 不发送也不在本地匹配：没有 CreateInteractionStream 停止序列字段的现场证据，不猜字段号（官网 Run settings 有 Add stop sequence，上游 Mag1cFall/AIStudio2API 同样不发送，改为与 GenerateContent 一样在本地匹配正文；本服务 GenerateContent 的 stop sequences 也只在本地匹配，但 Omni 的回复主要是视频，在本地按正文截断会连带切掉视频，所以不匹配）。协议层对能输出视频的 Omni 模型清空并在该请求的管理日志记一行 `未确认 CreateInteractionStream 的停止序列字段，已忽略 <N> 个停止序列`；协议层没有处理到的请求（启动期间别名目录取不到、目录没有列出视频选项的 Interaction 模型）在发送前补记同一行（原先整次请求返回参数错误）。
+
+视频设置（官网 Run settings 的 Aspect ratio、Video duration、Resolution、Frame rate 与 Advanced 的 Video task）的公开写法见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀)。协议层按合并目录整理并留下请求日志说明，发送前再按所选账户的目录整理一次（合并目录的时长范围已取各账户的交集，一般不会再改；别名目录缓存还没刷新或协议层没有整理到时可能不同），这一次留下的新说明（协议层没有记过的）以该账户为来源写进同一请求的管理日志；视频任务是否可用以合并目录为准，所选账户目录没有列出时照发，由上游判断（不按单个账户返回 400，免得另一个账户能完成的请求直接失败）；编码时宽高比与分辨率取最接近的上游枚举，在上游能编码的取值上与上游 Mag1cFall/AIStudio2API 的 `interactionVideoFormat` 一致；有两处不同：所选账户目录的默认分辨率为空或为 `368p` 时本服务发 `1`（官网默认 360p），上游不带；另外本服务多接受 `auto`、`ASPECT_RATIO_UNSPECIFIED`、`16x9`、`VIDEO_RESOLUTION_` 与 `VIDEO_TASK_` 前缀、`unspecified` 等写法，上游会报错。帧率只校验不发送（官网只有 24fps 且不可选）。
 
 响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 5 为视频 `[1,"<BASE64 MP4>"]`、field 6 为思考摘要，分别映射为 text、`video/mp4` 媒体与 reasoning 事件；索引 19 的最终 interaction 状态 `3` 产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9）与 `stop` 终态，状态 `4`、`5` 返回错误。事件列表后的 google.rpc 状态按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
 
@@ -1402,7 +1416,7 @@ Bidi setup 成功使用 lease（本次会话持有的账户租约）的 `checked
 | --- | --- |
 | OpenAI | `GET /v1/models` 返回 OpenAI model list |
 | Anthropic | `GET /v1/models` 携带 `Anthropic-Version` 时返回 Anthropic model list |
-| 单模型查询 | `GET /v1/models/{model}` 按正式 ID、`models/` 前缀、目录别名或后缀别名查找，携带 `Anthropic-Version` 时返回 Anthropic model 对象；不存在时 OpenAI 返回 404 `model_not_found`，Anthropic 返回 404 `not_found_error`。`GET /v1beta/models/{model}` 规则相同，返回 Gemini 格式 |
+| 单模型查询 | `GET /v1/models/{model}` 按正式 ID、`models/` 前缀、目录别名或后缀别名（含 Omni 视频后缀组合）查找，携带 `Anthropic-Version` 时返回 Anthropic model 对象；不存在时 OpenAI 返回 404 `model_not_found`，Anthropic 返回 404 `not_found_error`。`GET /v1beta/models/{model}` 规则相同，返回 Gemini 格式 |
 | Gemini | 模型名称使用 `models/<ID>` |
 | 多账户同模型 | generation methods 与能力选项取并集 |
 | 多账户 token limit | 输入和输出上限分别取正数最小值 |
@@ -1543,6 +1557,31 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Anthropic thinking type | `disabled` 按最低思考强度（minimal）生成，不返回思考正文（保留思考签名），优先于 `output_config.effort`；未知 type 返回 `400 invalid_request_error` |
 | Anthropic 结构化输出 | `output_config.format` 与 beta 写法 `output_format` 为 `{type:"json_schema",schema}`，两者同时出现时以 `output_config.format` 为准；映射为与 OpenAI `response_format` 相同的 JSON 模式与 response schema（Playground 无法编码的 Schema 同样降级，仍按 JSON 输出）；`schema` 为 `null` 或省略时只保留 JSON 模式；其他 `type` 返回 `400 invalid_request_error` |
 
+### Omni 视频设置与模型名后缀
+
+能输出视频的 Omni 模型（目录带 Interaction 配置 field 79，且列出 `video_output_resolutions`、`video_duration_range` 或 `video_tasks`，如 `gemini-omni-1.1-flash`）接受下列视频设置；其他模型忽略这些字段，也不解析视频后缀。
+
+| 协议 | 写法 |
+| --- | --- |
+| Gemini GenerateContent | `generationConfig.responseFormat`（单个对象或数组）的 `video:{aspectRatio,duration,resolution,frameRate,fps}`；扩展字段 `generationConfig.videoConfig:{task,aspectRatio,durationSeconds,duration,resolution,frameRate,fps}`，同一项以 `videoConfig` 为准；整个 `generation_config` 用 snake_case 时同样接受 |
+| OpenAI Chat Completions、OpenAI Responses、Anthropic Messages | 顶层 `video_config:{aspect_ratio,duration_seconds,duration,resolution,frame_rate,fps,task}`（OpenAI SDK 的 `extra_body` 会合并到顶层）；`duration_seconds` 与 `duration` 同时出现时以前者为准 |
+| Gemini Interactions | `response_format` 的 `{type:"video",aspect_ratio,duration,resolution,frame_rate,fps,mime_type?:"video/mp4"}` 与 `generation_config.video_config:{task,aspect_ratio,duration_seconds,duration,resolution,frame_rate,fps}`，同一项以 `video_config` 为准 |
+| 模型名后缀 | `-16x9`、`-9x16`（宽高比），`-360p`、`-720p`、`-1080p`、`-4k`（分辨率），`-<N>s`（时长，1–3 位数字，如 `-8s`），`-t2v`、`-i2v`、`-r2v`、`-edit`、`-extend`（任务）；优先于以上参数；目录 ID 与 Omni 的目录别名都可以带 |
+
+取值与整理规则：
+
+| 项 | 规则 |
+| --- | --- |
+| 宽高比 | `auto`、`ASPECT_RATIO_UNSPECIFIED`、空或省略时不指定（官网 Auto）；`16:9`、`9:16`、`16x9` 与 Gemini 枚举名 `ASPECT_RATIO_SIXTEEN_BY_NINE` 等；其他比例按比值对数换成模型选项（`video_aspect_ratios` 与上游枚举的交集）中最接近的，距离相同取较大值（`1:1` → `16:9`），管理日志记 `视频宽高比 4:3 不是模型选项，按最接近的 16:9 发送`；无法解析时 400 |
+| 分辨率 | `360p`、`720p`、`1080p`、`4k`，不区分大小写，接受 `VIDEO_RESOLUTION_` / `RESOLUTION_` 前缀；模型选项先换成像素高度最接近的上游取值（目录的 `368p` 即 `360p`，请求 `360p` 或 `368p` 都按 `360p` 发送、不记说明）；其他高度（`2160p`、`1440p`）换成模型选项中最接近的并记一行说明；省略、`auto` 或 `VIDEO_RESOLUTION_UNSPECIFIED` 时由编码取所选账户的默认分辨率；无法解析时 400 |
+| 时长 | JSON 数字或 `"8s"`、`"8"` 字符串，四舍五入为整秒；负数或无法解析时 400；省略或 0 时不带，由上游按模型默认（与上游 `interactionVideoFormat` 一致；上游试用页的时长滑块停在目录默认值时同样不发送）；超出 `video_duration_range` 的范围或不在步长上（从下限起算）时换成范围内最接近的合法秒数（距离相同取较大值，超过上限时退一个步长），不返回 400，管理日志记 `视频时长 30 秒不是模型可选的时长（4–15 秒、步长 1），按最接近的 15 秒发送`；目录只有 `video_durations_seconds` 时取其中最接近的 |
+| 帧率 | 数字或 `"24fps"`，各协议都接受 `frame_rate`（`frameRate`）与 `fps` 两种字段名，同时出现时以前者为准；只校验，不发送：不在 `video_frame_rates`（目录没有时为 `24fps`）中时 400 `video frame_rate 30 is not supported; this model only supports 24fps` |
+| 任务 | `text_to_video`、`image_to_video`、`reference_to_video`、`edit`、`extend`，不区分大小写，接受 `VIDEO_TASK_` 前缀；`unspecified`、`auto`、`VIDEO_TASK_UNSPECIFIED` 与省略相同（官网 Unspecified）；其他值 400；合并目录的 `video_tasks` 没有列出时 400（所选账户的目录没有列出时照发，见 [Omni Interaction](#omni-interaction)）；对话里已有会编码为模型 step 的模型消息时 400 `Video task is only supported on the first turn of a conversation`（与官网提示一致；只有附件或只有思考的模型消息不算）；`image_to_video`、`reference_to_video` 需要至少一张图片、`edit`、`extend` 需要至少一段视频（模型消息里会移到用户 step 的附件同样计入，类型不明的文件引用两种都算），缺少时 400 `video task edit requires an input video`；`edit` 的请求不带输出格式，同时设置了宽高比、时长或分辨率时记一行 `视频任务 edit 不带输出格式，宽高比、时长与分辨率不发送` |
+
+错误在选号前返回（OpenAI、Responses 为 OpenAI 格式，Anthropic 为 Anthropic 格式，Gemini 与 Interactions 为 Gemini 格式），说明为英文原文；整理说明写进该请求的管理日志（WARN，`来源=service`），不影响响应。
+
+模型名后缀可与 `-low`、`-high`、`-minimal`、`-medium`、`-128`、`-nothinking` 组合，顺序不限、不分大小写，同一项出现多次时以最靠后的为准，例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`。解析先按原有后缀进行（与原先完全相同）；解析不到时再连同视频后缀解析，且结果必须是能输出视频的 Omni 模型，其他模型名带 `-720p`、`-8s` 等字样时保持原名，目录 ID 本身带这类字样时按目录 ID。视频后缀也可以加在 Omni 的目录别名（`capability_options.aliases`）后面，别名与某个目录 ID 同名时按该 ID；按别名调用时请求与响应里的模型名为去掉后缀的别名，调度前再换成目录 ID。Omni 的思考等级后缀优先于请求参数，不带等级后缀时沿用请求参数与模型默认等级（不像文本模型那样设为最高）；`-online` 对 Omni 不生效。响应里的模型名为去掉后缀的目录模型名。`/v1/models` 不展开这些组合，单模型查询能查到。
+
 ### OpenAI Chat Completions
 
 `POST /v1/chat/completions` 请求字段：
@@ -1568,6 +1607,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | `reasoning_effort` | thinking effort |
 | `reasoning.effort` | nested thinking effort；与顶层字段映射到同一配置 |
 | `seed` | 64 位整数 |
+| `video_config` | Omni 视频设置扩展字段，见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀) |
 
 message 字段为 `role`、`content`、可选 `name`、`tool_call_id`、`tool_calls`。assistant tool call：
 
@@ -1659,6 +1699,7 @@ Chat SSE 顺序：
 | `truncation` | 省略、`disabled` 或 `auto`（见上文） |
 | `metadata` | string-to-string object |
 | `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
+| `video_config` | Omni 视频设置扩展字段，与 Chat 相同 |
 
 input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
 
@@ -1779,6 +1820,7 @@ web search 发生时，search call item 排在 message 前；无 grounding query
 | `thinking` | `{type:"enabled",budget_tokens:<INT>}` 或 `{type:"adaptive"}` |
 | `output_config` | `{effort:"...",format:{type:"json_schema",schema}}`；`format` 为结构化输出（见上文生成参数映射） |
 | `output_format` | 结构化输出的 beta 写法 `{type:"json_schema",schema}`；与 `output_config.format` 同时出现时以后者为准 |
+| `video_config` | Omni 视频设置扩展字段，与 Chat 相同，见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀) |
 
 message content 可以是 string 或 block 数组：
 
@@ -1880,14 +1922,14 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 | 字段 | 映射 |
 | --- | --- |
-| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-low`、`-medium`、`-high`、`-minimal`、`-128`、`-nothinking`、`-online` 后缀与其他入口一样解析，交互资源的 `model` 报告请求的原名 |
+| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-low`、`-medium`、`-high`、`-minimal`、`-128`、`-nothinking`、`-online` 后缀与 Omni 的视频后缀与其他入口一样解析，交互资源的 `model` 报告去掉后缀的模型名 |
 | `input` | 字符串、单个内容块、内容块数组或步骤数组；内容类型为 `text`、`image`、`audio`、`video`、`document`。没有输入、续接历史和系统指令时选号前返回 400，只有系统指令时按用户消息生成 |
 | 媒体内容 | `mime_type` 与 `data`（Base64）或 `uri` 二选一，复用 Gemini 文件与内联媒体解析 |
 | 输入步骤 | `user_input`、`model_output`、`thought`、`function_call`、`function_result`；`function_call` 必须带 `id`，函数结果通过 `call_id` 匹配历史调用并补齐名称，对不上任何调用时返回 400；`thought.signature` 挂到随后的模型内容或函数调用上，连续多个签名各自保留 |
 | 函数结果媒体 | `function_result.result` 中以 Base64 内嵌的 `image`、`audio`、`document`（`data` 与 `mime_type`）以及其他协议的图片、文件写法先取出作为真正的媒体发送，原位置换成文字说明 |
 | `system_instruction` | 当前请求的系统指令 |
-| `generation_config` | `temperature`、`top_p`、`top_k`、`max_output_tokens`、`seed`、`stop_sequences`、`thinking_level`、`thinking_summaries`（`auto` 或 `none`）、`speech_config`、`tool_choice` |
-| `response_format` | 单对象或数组；文本使用 `{type:"text",mime_type:"application/json",schema:{...}}` 请求结构化输出；图片使用 `{type:"image",aspect_ratio?,image_size?}`；音频使用 `{type:"audio",mime_type?:"audio/wav|audio/l16"}` |
+| `generation_config` | `temperature`、`top_p`、`top_k`、`max_output_tokens`、`seed`、`stop_sequences`、`thinking_level`、`thinking_summaries`（`auto` 或 `none`）、`speech_config`、`tool_choice`、`video_config`（Omni 视频任务与设置） |
+| `response_format` | 单对象或数组；文本使用 `{type:"text",mime_type:"application/json",schema:{...}}` 请求结构化输出；图片使用 `{type:"image",aspect_ratio?,image_size?}`；音频使用 `{type:"audio",mime_type?:"audio/wav|audio/l16"}`；Omni 视频使用 `{type:"video",aspect_ratio?,duration?,resolution?,frame_rate?,fps?}`，见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀) |
 | 语音配置 | `speech_config:[{voice}]`；多说话人使用 `{speakers:[{speaker,voice}],mode?}`，`mode` 为 `verbatim` 或 `conversational` |
 | 语音文本 | 文本块 `annotations` 中的 `{type:"speech_metadata",speaker?,style?}` 保留说话人与风格 |
 | 函数与工具 | `tools:[{type:"function",name,description?,parameters?}]`；另接受 `google_search`、`url_context`、`code_execution`、`google_maps`；`tool_choice` 为 `auto` 或 `none` |
@@ -1938,9 +1980,10 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | media | `mediaResolution`（或 `media_resolution`）：`MEDIA_RESOLUTION_LOW`、`MEDIA_RESOLUTION_MEDIUM`、`MEDIA_RESOLUTION_HIGH`，不区分大小写；其他值在选号前返回 400 |
 | output limits | `candidateCount`、`maxOutputTokens`、`stopSequences` |
 | log probabilities | `responseLogprobs`、`logprobs` 接受任意值并忽略 |
-| structured output | `responseMimeType`、`responseSchema`、`responseJsonSchema` |
+| structured output | `responseMimeType`、`responseSchema`、`responseJsonSchema`；`responseFormat` 的 `text:{mimeType,schema}` 与之等价（`APPLICATION_JSON`、`TEXT_PLAIN` 换成 MIME） |
 | modalities | `responseModalities` |
-| image | `imageConfig:{aspectRatio,imageSize}` |
+| image | `imageConfig:{aspectRatio,imageSize}`；`responseFormat` 的 `image:{aspectRatio,imageSize}` 与之等价（`ASPECT_RATIO_*`、`IMAGE_SIZE_*` 枚举名换成取值） |
+| video | Omni：`responseFormat` 的 `video:{aspectRatio,duration,resolution,frameRate,fps}` 与扩展字段 `videoConfig:{task,aspectRatio,durationSeconds,resolution,frameRate,fps}`，见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀)；`responseFormat` 可以是单个对象或数组，`null` 为未设置 |
 | thinking | `thinkingConfig:{thinkingBudget,thinkingLevel,includeThoughts}`；`thinkingBudget:-1`（动态思考）按未设置处理，使用模型默认强度；`includeThoughts:false` 照常思考但不返回思考正文（保留签名），未设置时返回思考 |
 | transcription | `transcriptionConfig:{languageCodes,customVocabulary,wordTimestamps,speakerLabels,smartTranscription}` |
 | speech | `speechConfig` |

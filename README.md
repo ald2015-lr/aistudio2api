@@ -40,7 +40,7 @@
 - **原生流式响应**: 实时输出正文、思考摘要、函数调用、Google 工具、媒体和 usage
 - **TTS 语音生成**: 支持 Gemini TTS 模型的单/多说话人音频生成
 - **图片生成**: 支持 Nano Banana 图片生成
-- **视频生成**: 支持 Veo 视频生成和图片转视频；Gemini Omni 通过四套生成接口接收文本、图片与视频输入，输出文本与 MP4 视频
+- **视频生成**: 支持 Veo 视频生成和图片转视频；Gemini Omni 通过四套生成接口接收文本、图片与视频输入，输出文本与 MP4 视频，支持官网的宽高比、时长、分辨率与视频任务设置（也可写在模型名后缀里）
 - **YouTube 输入**: 粘贴视频 URL 即可作为外部视频附件读取
 - **智能模型切换**: 从 AI Studio 实时发现模型并按 `model` 字段路由
 - **Google 工具**: 支持 Search、Image Search、URL Context、Code Execution 和 Maps
@@ -293,7 +293,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | `-nothinking` | 模型照常思考，但不返回思维链（保留多轮工具调用需要的思考签名） |
 | `-online` | 开启 Google 搜索（模型支持时） |
 
-模型列表为每个可调节思考的文本模型列出 `-low`、`-medium`、`-128` 等别名；目录里的模型 ID 本身以等级结尾时（例如 `xxx-low`）按 ID 里的等级设置，不再强制最高思考。
+模型列表为每个可调节思考的文本模型列出 `-low`、`-medium`、`-128` 等别名；目录里的模型 ID 本身以等级结尾时（例如 `xxx-low`）按 ID 里的等级设置，不再强制最高思考。Gemini Omni 另有宽高比、分辨率、时长与视频任务后缀（例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`），见 [Omni 视频参数](#omni-视频参数)。
 
 响应里的模型名（OpenAI、Anthropic、Responses、Interactions 的 `model`，Gemini 的 `modelVersion`）是请求的模型名去掉上述后缀：请求 `gemini-3.1-pro-preview`、`gemini-3.1-pro-preview-128`、`gemini-3.1-pro-preview-low` 都返回 `gemini-3.1-pro-preview`；目录里没有的名称按请求原样返回。带 `models/` 前缀的名称（如 `models/gemini-3.1-pro-preview-low`）先去掉前缀再解析，各协议一致。不返回上游报告的实际服务模型版本：它只出现在 OpenAI、Responses 与 Anthropic 非流式响应的 `provider_model` 字段里；实际服务的模型与请求的不是同一系列时，管理日志另记 `served_model`。
 
@@ -504,6 +504,65 @@ curl http://127.0.0.1:2048/v1/videos \
 ```
 
 创建操作后通过 `GET /v1/videos/{id}` 查询状态，通过 `GET /v1/videos/{id}/content` 下载结果。
+
+### Omni 视频参数
+
+Gemini Omni（如 `gemini-omni-1.1-flash`，经官网 CreateInteractionStream 生成）支持官网 Run settings 的全部选项，取值与官网一致，可选范围以实时模型目录为准（`/v1/models` 的 `capability_options`、管理页“模型”的详情：`video_aspect_ratios`、`video_output_resolutions`、`video_duration_range`、`video_frame_rates`、`video_tasks`；这里是各账户目录的合并结果，取值按字符串排序，不代表官网顺序）：
+
+| 官网选项 | 取值 | 说明 |
+| --- | --- | --- |
+| System instructions | 各协议的系统提示 | 与其他模型相同 |
+| Aspect ratio | `auto`（默认）、`16:9`、`9:16` | `auto`、`ASPECT_RATIO_UNSPECIFIED` 或不传时不指定；其他比例换成最接近的（`4:3` → `16:9`） |
+| Video duration | 秒数，范围见 `video_duration_range`（如 `min=4`、`max=15`、`step=1`、`default=10`） | 写成 `8` 或 `"8s"`；不传时不带，由上游按模型默认（上游试用页的滑块停在默认值时同样不发送）；超出范围或不在步长上时换成范围内最接近的合法值（不报错，请求日志记一行）；多个账户的范围不同时取各账户都能接受的范围 |
+| Resolution | `360p`、`720p`、`1080p`、`4k` | 不传时取所选账户目录里的默认分辨率（官网默认，一般为 360p；`/v1/models` 的列表是排序后的，第一项不一定是默认）；`2160p` 等写法换成最接近的，目录里的 `368p` 按 `360p` 发送 |
+| Frame rate | 只有 `24fps` | 官网灰色不可选；传 `24`、`"24fps"` 或不传都可以（字段名 `frame_rate`、`frameRate` 或 `fps`），其他值返回 400 |
+| Thinking level | `high`、`low` | 与其他模型的思考参数相同（`reasoning_effort`、`thinkingConfig.thinkingLevel`、Interactions `thinking_level`），或用 `-high`、`-low` 后缀 |
+| Add stop sequence | — | 未确认 CreateInteractionStream 的停止序列字段，不发送、也不在本地匹配：忽略并在请求日志记一行 `未确认 CreateInteractionStream 的停止序列字段，已忽略 N 个停止序列`（原先整次请求返回 400） |
+| Output length | 最大 65536 | `max_tokens` 等，超过模型上限时按上限发送 |
+| Video task | `text_to_video`、`image_to_video`、`reference_to_video`、`edit`、`extend`；不传或 `unspecified` 为官网的 Unspecified | **只能在对话第一轮使用**：对话里已有模型回复时返回 400 `Video task is only supported on the first turn of a conversation`（与官网提示一致）；`image_to_video`、`reference_to_video` 需要至少一张图片，`edit`、`extend` 需要至少一段视频，缺少时返回 400；`edit` 时不发送宽高比、时长与分辨率 |
+
+各协议的写法（同一项同时出现时，模型名后缀 > 后一种写法 > 前一种写法）：
+
+| 协议 | 写法 |
+| --- | --- |
+| OpenAI Chat Completions、Responses | 顶层 `video_config: {aspect_ratio, duration_seconds（也接受 duration）, resolution, frame_rate（也接受 fps）, task}`；OpenAI SDK 放在 `extra_body` |
+| Anthropic Messages | 顶层 `video_config`，与 Chat 相同 |
+| Gemini 原生接口 | `generationConfig.responseFormat: {video: {aspectRatio, duration, resolution, frameRate（也接受 fps）}}`（单个对象或数组），扩展字段 `generationConfig.videoConfig: {task, aspectRatio, durationSeconds, resolution, frameRate（也接受 fps）}`；`generation_config` 等 snake_case 写法同样接受 |
+| Gemini Interactions | `response_format: {type: "video", aspect_ratio, duration, resolution, frame_rate（也接受 fps）}`，`generation_config.video_config: {task, aspect_ratio, duration_seconds, resolution, frame_rate}` |
+
+```bash
+curl http://127.0.0.1:2048/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-omni-1.1-flash",
+    "messages": [{"role": "user", "content": "雨夜街头，一只橘猫走过霓虹灯下的水洼"}],
+    "video_config": {"aspect_ratio": "9:16", "duration_seconds": 8, "resolution": "720p"}
+  }'
+```
+
+new-api 等中转（例如 Gemini 类型渠道把 OpenAI 请求转成 Gemini 格式）不会转发这些扩展字段，这时把设置写进模型名后缀：
+
+| 后缀 | 效果 |
+| --- | --- |
+| `-16x9`、`-9x16` | 宽高比 |
+| `-360p`、`-720p`、`-1080p`、`-4k` | 分辨率 |
+| `-<N>s`，如 `-8s`、`-10s` | 时长（秒），超出范围时换成最接近的合法值 |
+| `-t2v`、`-i2v`、`-r2v`、`-edit`、`-extend` | 视频任务（文字、图片、参考图生成视频，编辑，延长） |
+| `-high`、`-low`（`-minimal`、`-medium`、`-128` 换成最接近的等级）、`-nothinking` | 思考等级、不返回思维链 |
+
+后缀可组合、顺序不限、不分大小写，同一项写了多次以最后一个为准，优先于请求里的参数，例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`、`gemini-omni-1.1-flash-low-4k-16x9`。只对能输出视频的 Omni 模型生效（目录 ID 与目录别名都可以带后缀，例如别名 `veo-3.1-fast-generate-preview-9x16`，响应报告去掉后缀的别名；别名与某个目录 ID 同名时按该 ID），其他模型名带这些字样时不受影响；Omni 不带等级后缀时沿用模型默认等级（不像文本模型那样设为最高）。响应里的模型名为去掉后缀的 `gemini-omni-1.1-flash`。`/v1/models` 不列出这些组合，`GET /v1/models/<名称>` 能查到。
+
+new-api 里在渠道的“模型”中填对外名称，在“模型重定向”中映射到带后缀的名称，例如：
+
+```json
+{
+  "omni-竖屏": "gemini-omni-1.1-flash-9x16-720p-8s",
+  "omni-横屏-1080p": "gemini-omni-1.1-flash-16x9-1080p-10s-low",
+  "omni-图生视频": "gemini-omni-1.1-flash-i2v-9x16"
+}
+```
+
+带任务后缀的名称（`-t2v`、`-i2v` 等）只适合单轮生成：多轮对话的第二轮起会因“视频任务只能在第一轮使用”返回 400，日常对话的映射不要带任务后缀（不指定任务时由模型按输入决定）。经 new-api 转发生成的视频还需要设置 `MEDIA_OUTPUT=url`，见下节。
 
 ### 生成视频与媒体链接（Omni）
 

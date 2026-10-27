@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -25,10 +26,9 @@ var interactionStatusHTTP = map[int64]int{
 }
 
 // EncodeCreateInteractionStreamRequest 编码官网 CreateInteractionStream 请求并返回参与 WAA 绑定的文本内容
+// stop sequences 不发送：没有 CreateInteractionStream 停止序列字段的现场证据（上游 Mag1cFall/AIStudio2API 同样不发送，只在本地匹配正文），
+// 不猜字段号；协议层或 generateInteraction 已清空并在该请求的管理日志记一行（原先整次请求返回参数错误）
 func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults GenerationDefaults) ([]byte, []Content, error) {
-	if len(request.Config.StopSequences) > 0 {
-		return nil, nil, fmt.Errorf("Interaction 模型不支持 stop sequences")
-	}
 	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents)
 	if err != nil {
 		return nil, nil, err
@@ -48,7 +48,16 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	if maxOutput <= 0 {
 		return nil, nil, fmt.Errorf("模型目录缺少有效 output token limit")
 	}
-	// GenerationConfig：field 6 thinking level、field 7 thinking summaries、field 8 max output tokens
+	video, task, err := interactionVideoFormat(request.Config.VideoConfig, defaults.VideoResolution)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 视频任务只能在第一轮使用（官网 Video task 的提示），协议层已按同一规则返回 400，这里兜底
+	if task != 0 && hasModelTurn {
+		return nil, nil, errors.New(videoTaskFirstTurnMessage)
+	}
+	// GenerationConfig：field 6 thinking level、field 7 thinking summaries、field 8 max output tokens；
+	// 历史中没有模型输出时 field 25 为视频任务，未指定任务时为 []
 	config := make([]any, 8)
 	config[5] = level
 	config[6] = int64(1)
@@ -56,6 +65,9 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	if !hasModelTurn {
 		config = append(config, make([]any, 17)...)
 		config[24] = []any{}
+		if task != 0 {
+			config[24] = []any{task}
+		}
 	}
 	interaction := make([]any, 54)
 	if system := strings.TrimSpace(request.System); system != "" {
@@ -63,8 +75,12 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	}
 	interaction[17] = []any{wireModelName(request.Model), config}
 	interaction[26] = []any{steps}
-	// field 54 视频输出配置：官网默认输出分辨率枚举 1
-	interaction[53] = []any{[]any{[]any{nil, nil, nil, []any{nil, nil, nil, nil, nil, int64(1)}}}}
+	// field 54 输出格式：视频格式 field 4 宽高比、field 5 时长、field 6 分辨率；编辑任务不带输出格式，interaction 只到 field 27
+	if task == interactionVideoTasks["edit"] {
+		interaction = interaction[:27]
+	} else {
+		interaction[53] = []any{[]any{[]any{nil, nil, nil, video}}}
+	}
 	body, err := json.Marshal([]any{int64(1), int64(1), nil, interaction, nil, int64(1)})
 	if err != nil {
 		return nil, nil, fmt.Errorf("编码 CreateInteractionStream: %w", err)
@@ -204,6 +220,26 @@ func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaul
 
 // generateInteraction 经 CreateInteractionStream 生成并映射为规范事件
 func (c *Client) generateInteraction(ctx context.Context, request GenerateRequest, entry modelEntry) (<-chan Event, error) {
+	// 视频设置按实际调用的账户目录再整理一次：协议层按合并目录整理过并记下说明（时长范围取各账户的交集），这里通常不会再改；
+	// 协议层没有整理（例如启动期间别名目录取不到）或合并目录与所选账户的目录不一致（例如别名目录缓存还没刷新）时，
+	// 这一次留下的新说明经 ReportRequestNote 写进该请求的管理日志。
+	// 任务是否可用以协议层的合并目录为准，这里不按单个账户的 video_tasks 拒绝（拒绝会直接返回 400，不会换号）
+	video, notes, err := normalizeVideoConfig(request.Config.VideoConfig, entry.model, request.Contents, false)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
+	}
+	for _, note := range notes {
+		if !slices.Contains(request.Notes, note) {
+			ReportRequestNote(ctx, note)
+		}
+	}
+	request.Config.VideoConfig = video
+	// 协议层对能输出视频的 Omni 模型已清空 stop sequences 并记过说明；协议层没有处理到的请求（目录没有列出视频选项的 Interaction 模型、
+	// 别名目录取不到等）在这里补记
+	if count := len(request.Config.StopSequences); count > 0 {
+		ReportRequestNote(ctx, InteractionStopSequencesNote(count))
+		request.Config.StopSequences = nil
+	}
 	body, binding, err := EncodeCreateInteractionStreamRequest(request, entry.defaults)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)

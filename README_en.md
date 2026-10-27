@@ -40,7 +40,7 @@
 - **Native Streaming**: Text, reasoning summaries, function calls, Google tools, media, and usage
 - **TTS Speech Generation**: Gemini TTS models for single-speaker and multi-speaker audio
 - **Image Generation**: Nano Banana image generation
-- **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs
+- **Video Generation**: Veo video generation and image-to-video; Gemini Omni accepts text, image, and video input and returns text and MP4 video through the four generation APIs, with the website's aspect ratio, duration, resolution, and video task settings (also as model name suffixes)
 - **YouTube Input**: Paste a video URL to attach and read the external video
 - **Smart Model Switching**: Discover models from AI Studio and route through the `model` field
 - **Google Tools**: Search, Image Search, URL Context, Code Execution, and Maps
@@ -242,7 +242,7 @@ Text chat models accept name suffixes, combinable in any order (for example `gem
 | `-nothinking` | The model still thinks but the thought text is not returned (thought signatures are kept) |
 | `-online` | Enables Google Search when the model supports it |
 
-A catalog model ID that already ends in a level (for example `xxx-low`) uses that level instead of being forced to the highest.
+A catalog model ID that already ends in a level (for example `xxx-low`) uses that level instead of being forced to the highest. Gemini Omni also accepts aspect ratio, resolution, duration and video task suffixes (for example `gemini-omni-1.1-flash-9x16-720p-8s-low`); see [Omni Video Parameters](#omni-video-parameters).
 
 The model name in responses (`model` for OpenAI, Anthropic, Responses and Interactions; `modelVersion` for Gemini) is the requested name with these suffixes removed: requests for `gemini-3.1-pro-preview`, `gemini-3.1-pro-preview-128` and `gemini-3.1-pro-preview-low` all return `gemini-3.1-pro-preview`; names not in the catalog are returned as requested. Names with a `models/` prefix (such as `models/gemini-3.1-pro-preview-low`) are resolved after removing the prefix, the same in every protocol. The upstream-reported serving model version is not returned there; it only appears in the `provider_model` field of OpenAI, Responses and non-streaming Anthropic responses, and the admin log records `served_model` when the serving model belongs to a different family than the requested one.
 
@@ -453,6 +453,65 @@ curl http://127.0.0.1:2048/v1/videos \
 ```
 
 After creating the operation, poll `GET /v1/videos/{id}` and download the result from `GET /v1/videos/{id}/content`.
+
+### Omni Video Parameters
+
+Gemini Omni (such as `gemini-omni-1.1-flash`, generated through the website's CreateInteractionStream) supports every option in the AI Studio Run settings with the same values; the available choices come from the live model catalog (`capability_options` in `/v1/models` and the model details in the admin Models page: `video_aspect_ratios`, `video_output_resolutions`, `video_duration_range`, `video_frame_rates`, `video_tasks`; these merge the catalogs of all accounts and list the values in string order, not in the website's order):
+
+| AI Studio option | Values | Notes |
+| --- | --- | --- |
+| System instructions | the system prompt of each protocol | same as other models |
+| Aspect ratio | `auto` (default), `16:9`, `9:16` | `auto`, `ASPECT_RATIO_UNSPECIFIED` or omitted sends no aspect ratio; other ratios use the closest one (`4:3` → `16:9`) |
+| Video duration | seconds within `video_duration_range` (for example `min=4`, `max=15`, `step=1`, `default=10`) | `8` or `"8s"`; omitted means not sent, so upstream uses the model default (the upstream playground also leaves it out while the slider sits on the default); out-of-range or off-step values become the closest valid value (no error, one line in the request log); when accounts list different ranges, the range every account accepts is used |
+| Resolution | `360p`, `720p`, `1080p`, `4k` | omitted uses the default resolution in the selected account's catalog (the website default, usually 360p; the list in `/v1/models` is sorted, so its first entry is not necessarily the default); values such as `2160p` use the closest one, and a catalog `368p` is sent as `360p` |
+| Frame rate | `24fps` only | greyed out on the website; send `24`, `"24fps"` or nothing (field `frame_rate`, `frameRate` or `fps`), any other value returns 400 |
+| Thinking level | `high`, `low` | the usual thinking parameters (`reasoning_effort`, `thinkingConfig.thinkingLevel`, Interactions `thinking_level`) or the `-high`, `-low` suffixes |
+| Add stop sequence | — | no confirmed CreateInteractionStream stop sequence field, so they are neither sent nor matched locally: ignored and noted in the request log (the whole request used to return 400) |
+| Output length | up to 65536 | `max_tokens` and similar; larger values are sent as the model limit |
+| Video task | `text_to_video`, `image_to_video`, `reference_to_video`, `edit`, `extend`; omitted or `unspecified` means Unspecified | **first turn only**: once the conversation has a model reply, the request returns 400 `Video task is only supported on the first turn of a conversation` (the website's hint); `image_to_video` and `reference_to_video` need at least one image, `edit` and `extend` need at least one video, otherwise 400; `edit` sends no aspect ratio, duration or resolution |
+
+Per protocol (when the same option appears more than once: model name suffix > the second form > the first form):
+
+| Protocol | Fields |
+| --- | --- |
+| OpenAI Chat Completions, Responses | top-level `video_config: {aspect_ratio, duration_seconds (or duration), resolution, frame_rate (or fps), task}`; with the OpenAI SDK put it in `extra_body` |
+| Anthropic Messages | top-level `video_config`, same as Chat |
+| Native Gemini API | `generationConfig.responseFormat: {video: {aspectRatio, duration, resolution, frameRate (or fps)}}` (one object or an array) and the extension `generationConfig.videoConfig: {task, aspectRatio, durationSeconds, resolution, frameRate (or fps)}`; snake_case such as `generation_config` also works |
+| Gemini Interactions | `response_format: {type: "video", aspect_ratio, duration, resolution, frame_rate (or fps)}` and `generation_config.video_config: {task, aspect_ratio, duration_seconds, resolution, frame_rate}` |
+
+```bash
+curl http://127.0.0.1:2048/v1/chat/completions \
+  -H "Authorization: Bearer $PROXY_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemini-omni-1.1-flash",
+    "messages": [{"role": "user", "content": "An orange cat walks through neon puddles on a rainy street"}],
+    "video_config": {"aspect_ratio": "9:16", "duration_seconds": 8, "resolution": "720p"}
+  }'
+```
+
+Relays such as new-api (for example a Gemini channel that converts OpenAI requests to Gemini) do not forward these extension fields; put the settings in the model name instead:
+
+| Suffix | Effect |
+| --- | --- |
+| `-16x9`, `-9x16` | aspect ratio |
+| `-360p`, `-720p`, `-1080p`, `-4k` | resolution |
+| `-<N>s`, such as `-8s`, `-10s` | duration in seconds; out-of-range values become the closest valid value |
+| `-t2v`, `-i2v`, `-r2v`, `-edit`, `-extend` | video task (text, image or reference images to video, edit, extend) |
+| `-high`, `-low` (`-minimal`, `-medium`, `-128` map to the closest level), `-nothinking` | thinking level, hide the thought text |
+
+Suffixes combine in any order and are case-insensitive; when the same option appears more than once the last one wins, and suffixes override request parameters, for example `gemini-omni-1.1-flash-9x16-720p-8s-low` or `gemini-omni-1.1-flash-low-4k-16x9`. They only apply to Omni models that output video (on the catalog ID or a catalog alias, such as `veo-3.1-fast-generate-preview-9x16`; responses then report the alias without the suffixes; an alias that equals another catalog ID resolves to that ID); other model names containing these words are unaffected. Without a level suffix Omni keeps the model default level (text models are set to the highest). Responses report the model as `gemini-omni-1.1-flash` without the suffixes. `/v1/models` does not list these combinations, but `GET /v1/models/<name>` finds them.
+
+In new-api, add the public names to the channel's Models and map them in Model Mapping (模型重定向), for example:
+
+```json
+{
+  "omni-portrait": "gemini-omni-1.1-flash-9x16-720p-8s",
+  "omni-landscape-1080p": "gemini-omni-1.1-flash-16x9-1080p-10s-low",
+  "omni-image-to-video": "gemini-omni-1.1-flash-i2v-9x16"
+}
+```
+
+Names with a task suffix (`-t2v`, `-i2v`, …) suit single-turn generation only: from the second turn of a conversation they return 400 because a video task is first-turn only, so keep task suffixes out of mappings used for chat (without a task the model decides from the input). Videos relayed through new-api also need `MEDIA_OUTPUT=url`; see the next section.
 
 ### Generated Video and Media Links (Omni)
 
