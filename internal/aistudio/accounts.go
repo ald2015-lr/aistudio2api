@@ -433,6 +433,7 @@ var accountStateLabels = map[AccountState]string{
 	AccountAuthRequired: "需要重新登录",
 	AccountUnavailable:  "不可用",
 	AccountDisabled:     "已停用",
+	AccountOrgDisabled:  "所属组织已停用 AI Studio",
 }
 
 // AccountConfig 表示账户目录中的固定最小配置
@@ -553,6 +554,10 @@ type Account struct {
 	// proxyBinding 为 IP 池推送的出口（原子替换，见 proxy_binding.go）：装配前由 SetProxyBinding 直接写，进入账户池后只经
 	// AccountPool.SetProxyBindings / UpdateProxyBindings 在 p.mu 内写；nil 表示没有绑定
 	proxyBinding atomic.Pointer[ProxyBinding]
+	// orgDisabled 为账号所属组织停用了 AI Studio 的标记，orgDisabledReason 为它的说明（见 org_disabled.go）：对外状态与调度按
+	// schedulingState 读取，底层状态 State 照常写入、不被覆盖；受账户池 mu 保护
+	orgDisabled       bool
+	orgDisabledReason string
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -577,6 +582,9 @@ type AccountStatus struct {
 	// 状态缓存与账户列表事件不随 Worker 启停刷新，只作兜底，实时端口看状态接口的 proxy_pool.assignments
 	ProxySlot       string `json:"proxy_slot,omitempty"`
 	ProxySlotActive bool   `json:"proxy_slot_active,omitempty"`
+	// OrgDisabled 表示账户带着组织停用的标记（见 org_disabled.go），不区分是否启用：停用账户的 State 仍为 disabled，
+	// 管理页靠它看出停用账户所属组织停用了 AI Studio
+	OrgDisabled bool `json:"org_disabled,omitempty"`
 }
 
 // AccountSelection 描述账户调度所需的能力或粘性条件
@@ -721,6 +729,8 @@ type AccountPool struct {
 	leaseAttempts   int
 	// authGate 为租约路径上上游 401 的处理决定（见 auth_gate.go）：为空时一次 401 直接标为需要登录（原行为，测试构造的账户池）
 	authGate atomic.Pointer[AuthFailureGate]
+	// orgDisabledReporter 为 aistudio 内部识别出账号所属组织停用了 AI Studio 时的回调（见 org_disabled.go）；为空时只写账户池的标记
+	orgDisabledReporter atomic.Pointer[OrgDisabledReporter]
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -1864,21 +1874,21 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	selection.ModelID = strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	var reasons []string
 	for _, account := range p.accounts {
-		if account == nil || account.Config.Enabled && account.State == AccountReady || !p.inPoolLocked(selection.Pool, account) {
+		if account == nil || account.Config.Enabled && account.schedulingState() == AccountReady || !p.inPoolLocked(selection.Pool, account) {
 			continue
 		}
 		if selection.ModelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) {
 			continue
 		}
-		label, ok := accountStateLabels[account.State]
+		label, ok := accountStateLabels[account.schedulingState()]
 		if !ok {
-			label = string(account.State)
+			label = string(account.schedulingState())
 		}
 		if !account.Config.Enabled {
 			label = accountStateLabels[AccountDisabled]
 		}
 		reason := account.ID + " " + label
-		if message := strings.TrimSpace(account.stateMessage); message != "" {
+		if message := strings.TrimSpace(account.stateMessageLocked()); message != "" {
 			reason += "（" + message + "）"
 		}
 		reasons = append(reasons, reason)
@@ -3437,7 +3447,7 @@ func (p *AccountPool) Status() []AccountStatus {
 // （见 accountCoolingLocked）。原先只看全局冷却：每日限额按模型与通道记录，账户在主用模型上两个通道都冷却到次日时
 // 状态页仍显示就绪、冷却计数为 0，上万条冷却被摘要掩盖
 func (p *AccountPool) accountStateLocked(account *Account, now time.Time) AccountState {
-	state := account.State
+	state := account.schedulingState()
 	if !account.Config.Enabled {
 		state = AccountDisabled
 	} else if state == AccountReady &&
@@ -3544,7 +3554,8 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 		BenefitTierKnown: account.runtime.CatalogFingerprint != "",
 		Pool:             p.poolOfTierLocked(account.BenefitTier).String(),
 		Cooldowns:        cloneCooldowns(account.runtime.Cooldowns),
-		Message:          account.stateMessage,
+		Message:          account.stateMessageLocked(),
+		OrgDisabled:      account.orgDisabled,
 	}
 	if !account.LastUsed.IsZero() {
 		status.LastUsed = timePointer(account.LastUsed)
@@ -3701,7 +3712,7 @@ func (p *AccountPool) classifyAccountBruteLocked(
 	now time.Time,
 	egress egressGate,
 ) {
-	if account == nil || !account.Config.Enabled || account.State != AccountReady {
+	if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady {
 		return
 	}
 	// 每个账户只判断一次各通道是否支持，结果同时用于资格与冷却判断
@@ -3750,7 +3761,7 @@ func (p *AccountPool) tryAcquireAttemptLocked(
 	var earliest time.Time
 	for _, candidate := range p.channelCandidatesLocked(indices, selection) {
 		account := p.accounts[candidate.index]
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady {
 			continue
 		}
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, candidate.channel, selection) {
@@ -3891,7 +3902,7 @@ func (p *AccountPool) tryAcquireIndexedLocked(
 	}
 	try := func(position int, channel Channel) (*AccountLease, error) {
 		account := p.accounts[position]
-		if account == nil || !account.Config.Enabled || account.State != AccountReady || exclusion.has(position) {
+		if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady || exclusion.has(position) {
 			return nil, nil
 		}
 		if selection.ModelID != "" && !p.channelSupportsLocked(account, channel, selection) {
@@ -4718,7 +4729,7 @@ func (p *AccountPool) refreshSelectionRuntimes(ctx context.Context, selection Ac
 	requestedAccountID := strings.TrimSpace(selection.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	supports := func(account *Account) bool {
-		if account == nil || !account.Config.Enabled || account.State != AccountReady || !p.inPoolLocked(selection.Pool, account) {
+		if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady || !p.inPoolLocked(selection.Pool, account) {
 			return false
 		}
 		if modelID == "" {

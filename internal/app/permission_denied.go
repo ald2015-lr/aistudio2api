@@ -516,6 +516,8 @@ func (service *trackedService) forgetPermissionDenied(accountID string, source s
 	if service == nil {
 		return
 	}
+	// 新的认证文件同样可能是组织重新开放了 AI Studio 之后（或换了号）重新获取的：一并清除组织停用状态（见 org_disabled.go）
+	service.forgetOrgDisabled(accountID, source)
 	models := service.permissionDenied.clearAccount(accountID)
 	service.forbidden.forgetAccount(accountID)
 	cooldowns := 0

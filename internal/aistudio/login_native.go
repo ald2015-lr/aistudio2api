@@ -107,6 +107,7 @@ func (driver *NativeLoginDriver) Verify(ctx context.Context, request IsolatedLog
 		VerifiedAt:    verification.VerifiedAt,
 		Reason:        verification.Reason,
 		PageURL:       VerificationPagePath(verification.PageURL),
+		OrgDisabled:   verification.OrgDisabled,
 	}, nil
 }
 

@@ -393,21 +393,26 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 
 // openPromptPage 导航到 target，等页面就绪后定位 WAA 并填好 bootstrap 提示词（启动 5/7 到 7/7 填写提示词，session.subscribe 之前），
 // 返回页面地址与官网 snapshot 函数的键。等到页面就绪时停在首次使用页，或从等就绪起任何一步的页面类失败发生时页面在首次使用页，
-// 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；其余页面类失败与原来一样追加页面快照。
-// 失败处的识别与快照共用一个短期限（见 startupFailureDiagnosis），浏览器卡住时与原来一样最多多等 pageSnapshotTimeout
+// 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；停在组织停用页（access.workspace.google.com）时
+// 立即以 ServiceNotAllowedError 失败（等就绪时立刻结束等待，不再等满 120 秒），失败处读到的地址或快照在这一页时同样如此；
+// 其余页面类失败与原来一样追加页面快照。失败处的识别与快照共用一个短期限（见 startupFailureDiagnosis），浏览器卡住时与原来一样
+// 最多多等 pageSnapshotTimeout
 func (worker *Worker) openPromptPage(ctx context.Context, options Options, target string) (string, string, error) {
 	client := worker.client
 	contextID := worker.contextID
-	// pageFailure 为页面类失败的收尾：在首次使用页时返回 errOnboardingPage，否则同 withPageSnapshot
+	// pageFailure 为页面类失败的收尾：在首次使用页时返回 errOnboardingPage，在组织停用页时返回 ServiceNotAllowedError，否则同 withPageSnapshot
 	pageFailure := func(err error) error {
-		onboarding, _, suffix := client.startupFailureDiagnosis(ctx, contextID, false)
-		if onboarding {
+		diagnosis := client.startupFailureDiagnosis(ctx, contextID, false)
+		if diagnosis.onboarding {
 			return errOnboardingPage
 		}
-		if suffix == "" {
+		if blocked := diagnosis.serviceNotAllowed(); blocked != nil {
+			return blocked
+		}
+		if diagnosis.suffix == "" {
 			return err
 		}
-		return fmt.Errorf("%w%s", err, suffix)
+		return fmt.Errorf("%w%s", err, diagnosis.suffix)
 	}
 	options.reportStartup(StartupLoadingAIStudio)
 	// 记下导航时刻：失败时快照的 since 与页面的 age 对照，看导航之后文档是否被替换过（刷新、跳转）
@@ -421,15 +426,22 @@ func (worker *Worker) openPromptPage(ctx context.Context, options Options, targe
 	}
 	if err := client.waitFor(ctx, contextID, workerPageReadyExpression, 120*time.Second); err != nil {
 		// 初始化 ctx 到期时 location.href 也取不到（url 曾因此为空）：地址与页面快照改用同一个独立的短上下文读取
-		onboarding, pageURL, snapshot := client.startupFailureDiagnosis(ctx, contextID, true)
-		if onboarding {
+		diagnosis := client.startupFailureDiagnosis(ctx, contextID, true)
+		if diagnosis.onboarding {
 			return "", "", errOnboardingPage
 		}
-		return "", "", fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w%s", pageURL, err, snapshot)
+		if blocked := diagnosis.serviceNotAllowed(); blocked != nil {
+			return "", "", blocked
+		}
+		return "", "", fmt.Errorf("AI Studio 输入框未就绪 url=%s: %w%s", diagnosis.pageURL, err, diagnosis.suffix)
 	}
 	pageURL, err := client.evaluateString(ctx, contextID, "location.href")
 	if err != nil {
 		return "", "", pageFailure(err)
+	}
+	// 组织停用页的地址里带回跳地址（continue=https://aistudio.google.com/…），先于登录页判断
+	if isServiceNotAllowedURL(pageURL) {
+		return "", "", client.serviceNotAllowed(ctx, contextID, pageURL)
 	}
 	if strings.Contains(pageURL, "accounts.google.com") {
 		return "", "", fmt.Errorf("隔离登录态失效 url=%s", pageURL)
@@ -451,11 +463,14 @@ func (worker *Worker) openPromptPage(ctx context.Context, options Options, targe
 	options.reportStartup(StartupBootstrappingWAA)
 	filled, err := client.evaluateString(ctx, contextID, fillPromptExpression(options.BootstrapPrompt))
 	if err != nil || normalizePromptNewlines(filled) != normalizePromptNewlines(options.BootstrapPrompt) {
-		onboarding, _, snapshot := client.startupFailureDiagnosis(ctx, contextID, false)
-		if onboarding {
+		diagnosis := client.startupFailureDiagnosis(ctx, contextID, false)
+		if diagnosis.onboarding {
 			return "", "", errOnboardingPage
 		}
-		return "", "", fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v%s", filled, err, snapshot)
+		if blocked := diagnosis.serviceNotAllowed(); blocked != nil {
+			return "", "", blocked
+		}
+		return "", "", fmt.Errorf("填写 bootstrap 提示词失败 value=%q err=%v%s", filled, err, diagnosis.suffix)
 	}
 	return pageURL, snapshotKey, nil
 }
@@ -481,17 +496,24 @@ func (worker *Worker) finishOnboarding(ctx context.Context, options Options, bud
 // 也不写完成日志）或“；首次使用页未能完成: <原因>”（再接进度记录“ | 已做=…”），再接快照与结构摘要
 func (worker *Worker) interceptedPageFailure(ctx context.Context, options Options, budget *onboardingBudget, err error) error {
 	client := worker.client
-	onboarding, _, suffix := client.startupFailureDiagnosis(ctx, worker.contextID, false)
-	if !onboarding {
-		if suffix == "" {
+	diagnosis := client.startupFailureDiagnosis(ctx, worker.contextID, false)
+	if !diagnosis.onboarding {
+		// 失败时页面已被跳到组织停用页：原因是账号所属组织停用了 AI Studio，按 ServiceNotAllowedError 返回（附同一份快照）
+		if blocked := diagnosis.serviceNotAllowed(); blocked != nil {
+			return blocked
+		}
+		if diagnosis.suffix == "" {
 			return err
 		}
-		return fmt.Errorf("%w%s", err, suffix)
+		return fmt.Errorf("%w%s", err, diagnosis.suffix)
 	}
 	_, snapshot := client.pageDiagnosis(ctx, worker.contextID, false)
 	note, progress, structure := "；已完成首次使用页", "", ""
 	result, finishErr := worker.finishOnboarding(ctx, options, budget)
 	switch {
+	case errors.Is(finishErr, ErrServiceNotAllowed):
+		// 完成首次使用途中被跳到组织停用页：原因是账号所属组织停用了 AI Studio
+		return finishErr
 	case finishErr != nil:
 		note = "；首次使用页未能完成"
 		var failure *onboardingFailure

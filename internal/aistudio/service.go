@@ -523,6 +523,11 @@ func (s *PooledService) markRetryableFailure(lease *AccountLease, modelAccessSco
 		_, markErr := lease.MarkAuthenticationFailure(err)
 		return markErr
 	}
+	if OrgDisabledFailure(err) {
+		// 账号所属组织停用了 AI Studio：账户级，记组织停用（不写冷却，冷却到期后仍然 403），换号后不再调度它
+		s.pool.ReportOrgDisabled(accountID, OrgDisabledFromRequest, err)
+		return nil
+	}
 	if driveUnavailableError(err) {
 		// Drive 不可用不写冷却：记忆在换 token 的地方已经记下（见 drive_memory.go）。生成与计数本身不换 Drive token，这里只是兜底
 		return nil
@@ -557,25 +562,30 @@ func (s *PooledService) ProbeLogin(ctx context.Context, lease *AccountLease) err
 	return err
 }
 
+// catalogFailure 处理目录同步（权益或模型列表）的失败：登录失效标需要登录；上游返回 “AI Studio app is disabled” 时记组织停用
+// （账户级，见 org_disabled.go，由 app 层的回调登记、写日志并改为长间隔复查），原错误照常返回
+func (s *PooledService) catalogFailure(lease *AccountLease, err error) error {
+	switch {
+	case DefinitiveAuthenticationFailure(err):
+		_, markErr := lease.MarkAuthenticationFailure(err)
+		return errors.Join(err, markErr)
+	case OrgDisabledFailure(err):
+		s.pool.ReportOrgDisabled(lease.Account().ID, OrgDisabledFromCatalog, err)
+	}
+	return err
+}
+
 // modelsForLease 在租约内刷新账户的权益与目录；clearCooldown 为真时成功后清账号的全局冷却（管理操作、请求路径的现拉），
 // 后台刷新传假（见 TryRefreshAccountModels）
 func (s *PooledService) modelsForLease(ctx context.Context, lease *AccountLease, clearCooldown bool) ([]Model, error) {
 	account := lease.Account()
 	tier, err := s.client.BenefitTierForAccount(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
-		if DefinitiveAuthenticationFailure(err) {
-			_, markErr := lease.MarkAuthenticationFailure(err)
-			err = errors.Join(err, markErr)
-		}
-		return nil, err
+		return nil, s.catalogFailure(lease, err)
 	}
 	catalog, err := s.client.loadModels(ContextWithAccountLease(ctx, lease), account.ID)
 	if err != nil {
-		if DefinitiveAuthenticationFailure(err) {
-			_, markErr := lease.MarkAuthenticationFailure(err)
-			err = errors.Join(err, markErr)
-		}
-		return nil, err
+		return nil, s.catalogFailure(lease, err)
 	}
 	models := cloneModels(catalog.models)
 	err = lease.MarkAuthenticationValid()

@@ -333,9 +333,10 @@ const pageInputNotReadyPrefix = "AI Studio 输入框未就绪"
 // 上层可能再包装（本机代理中转的说明追加在原文之后，errors.Join 也保留原文）。等待输入框超时只在页面确实停在 AI Studio
 // （url=https://aistudio.google.com/…）时算：停在代理错误页（about:neterror）、Google sorry 页、登录页、地区不支持页，
 // 或读不到 url 时与缓存无关，清掉只会让下次启动多一次整页冷加载。首次使用页上的失败（没能自动完成首次使用页，
-// 或订阅网络事件之后的失败发生时页面停在首次使用页）也与缓存无关，不算
+// 或订阅网络事件之后的失败发生时页面停在首次使用页）与组织停用页（ServiceNotAllowedError，账号所属组织停用了 AI Studio）
+// 也与缓存无关，不算
 func PageStateFailure(err error) (string, bool) {
-	if onboardingRelated(err) {
+	if onboardingRelated(err) || errors.Is(err, ErrServiceNotAllowed) {
 		return "", false
 	}
 	pending := []error{err}

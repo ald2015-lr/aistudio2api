@@ -219,7 +219,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 func adminAccountCounts(counts aistudio.AccountStateCounts) api.AdminAccountCounts {
 	return api.AdminAccountCounts{
 		Total: counts.Total, Ready: counts.Ready, Busy: counts.Busy,
-		Cooldown: counts.Cooldown, AuthRequired: counts.AuthRequired,
+		Cooldown: counts.Cooldown, AuthRequired: counts.AuthRequired, OrgDisabled: counts.OrgDisabled,
 	}
 }
 
@@ -584,6 +584,7 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 	accountID := removed.ID
 	admin.service.removeAccountModelRetry(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
+	admin.service.orgDisabled.clearAccount(accountID)
 	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
 		return removed, err
 	}
@@ -626,7 +627,14 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 			"账户登录失败 | 耗时=%s | 错误=%s",
 			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
 		))
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
+		// 登录后页面被跳到组织停用页：可见浏览器里登录的不一定是这个账户（落到这一页时还读不到登录邮箱），先在租约内用账户已保存的
+		// 认证文件复核接口，也返回 app is disabled 才进入组织停用状态（见 org_disabled.go）
+		confirmed := aistudio.OrgDisabledFailure(err) && admin.loginOrgDisabledConfirmed(ctx, lease)
+		releaseErr := lease.Release()
+		if confirmed {
+			admin.service.enterOrgDisabled(account.ID, account.Config.Label, aistudio.OrgDisabledFromLogin, err)
+		}
+		return api.AdminAccount{}, errors.Join(err, releaseErr)
 	}
 	if !strings.EqualFold(strings.TrimSpace(result.Email), account.ID) {
 		return api.AdminAccount{}, errors.Join(
@@ -671,6 +679,33 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	return admin.account(account.ID)
 }
 
+// loginOrgDisabledConfirmed 在浏览器登录落到组织停用页后，用账户已保存的认证文件经 Go HTTP 复核一次 GetAiStudioBenefitTier
+// （ProbeLogin，不续签、不改账户状态），返回是否确认是这个账户所属组织停用了 AI Studio：只有接口同样返回 app is disabled 才确认。
+// 管理员对账户 A 点“重新登录”却在可见浏览器里登录了被组织停用的 B 时，A 自己的认证文件复核通过（或 401、出错），不把 A 标为组织停用；
+// 不确认时写一行警告，账户状态不变。服务不支持复核时同样不确认
+func (admin *runtimeAdmin) loginOrgDisabledConfirmed(ctx context.Context, lease *aistudio.AccountLease) bool {
+	label := lease.Account().Config.Label
+	outcome := "跳过"
+	if prober, ok := admin.service.service.(loginProber); ok {
+		probeCtx, cancel := context.WithTimeout(ctx, authRecheckTimeout)
+		probeErr := prober.ProbeLogin(probeCtx, lease)
+		cancel()
+		switch {
+		case aistudio.OrgDisabledFailure(probeErr):
+			return true
+		case probeErr == nil:
+			outcome = "通过"
+		case aistudio.DefinitiveAuthenticationFailure(probeErr):
+			outcome = "401"
+		default:
+			outcome = "出错"
+		}
+	}
+	admin.requests.log(label, "WARN", "账户登录 | 登录后停在组织停用页，但已保存的认证文件接口复核没有返回 app is disabled"+
+		"（可能在浏览器里登录了别的账号），账户状态不变 | 接口复核="+outcome)
+	return false
+}
+
 // VerifyAccount 验证账户登录并返回账户的管理视图，带上验证结论（authenticated）与原因：前端按它计“有效 / 登录失效 / 出错”，
 // 不再把 HTTP 200 一律算成功（原先批量验证显示“成功 44 失败 0”，结果却是 44 个登录已失效）
 func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
@@ -688,6 +723,10 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 	authenticated := !failed
 	account.Authenticated = &authenticated
 	account.VerifyReason = reason
+	if verification.OrgDisabled {
+		// 停用账户的状态始终是 disabled：前端按 org_disabled 提示组织停用、批量验证单独计数，不当成登录失效
+		account.OrgDisabled = true
+	}
 	return account, nil
 }
 
@@ -741,6 +780,12 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 				apiCheck = "401"
 				verification.Authenticated = false
 				verification.Reason = verifyAPIRejectedReason
+			case aistudio.OrgDisabledFailure(probeErr):
+				// 浏览器停在 AI Studio，接口却返回 “AI Studio app is disabled”：同样是账号所属组织停用了 AI Studio
+				apiCheck = "组织停用"
+				verification.Authenticated = false
+				verification.OrgDisabled = true
+				verification.Reason = aistudio.OrgDisabledReason
 			default:
 				// 上游 429、连接失败等不能说明登录失效：按浏览器的结论处理，随后的目录同步照常
 				apiCheck = "出错"
@@ -752,11 +797,24 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 	if reason == "" {
 		reason = verifyLoginExpiredReason
 	}
-	if !verification.Authenticated && verification.PageURL != "" && apiCheck != "401" {
+	if !verification.Authenticated && verification.PageURL != "" && apiCheck != "401" && !verification.OrgDisabled {
 		reason += "（跳转到 " + verification.PageURL + "）"
 	}
 	if !verification.Authenticated {
 		verification.Reason = reason
+	}
+	if verification.OrgDisabled {
+		// 账号所属组织停用了 AI Studio（页面停在组织停用页，或接口返回 app is disabled）：不是登录失效，不标需要登录，
+		// 释放账户后进入组织停用状态（见 org_disabled.go）
+		if err := lease.Release(); err != nil {
+			return aistudio.LoginVerification{}, err
+		}
+		admin.service.enterOrgDisabled(account.ID, account.Config.Label, aistudio.OrgDisabledFromVerify, errors.New(reason))
+		admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
+			"账户验证完成 | 已认证=false | 耗时=%s | 接口复核=%s | 页面=%s | 原因=%s",
+			time.Since(startedAt).Round(time.Millisecond), apiCheck, orDash(verification.PageURL), aistudio.OrgDisabledReason,
+		))
+		return verification, nil
 	}
 	err = admin.service.changeModels(func() error {
 		if verification.Authenticated {
@@ -772,6 +830,13 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 	})
 	if err != nil {
 		return aistudio.LoginVerification{}, errors.Join(err, lease.Release())
+	}
+	if verification.Authenticated && apiCheck == "通过" {
+		// 浏览器停在 AI Studio 输入框，接口复核（GetAiStudioBenefitTier，组织停用时正是它返回 app is disabled）也通过：组织已重新开放
+		// AI Studio，清除组织停用状态、立即恢复调度（没有这个状态时什么都不做）。原先只靠随后的目录同步成功才清除，同步遇到上游 429、
+		// 网络错误时提示验证通过，账户却仍是组织停用、要等约一天后的复查。在租约内清除：改回常规的目录任务这时取不到空闲账户、
+		// 按忙碌推后，由下面的同步刷新目录；接口复核出错（不能下结论）时保持原状
+		admin.service.forgetOrgDisabled(account.ID, "验证通过")
 	}
 	if err := lease.Release(); err != nil {
 		return aistudio.LoginVerification{}, err
@@ -972,8 +1037,11 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 	copy(models, status.Models)
 	message := status.Message
 	if !status.Enabled {
-		// 停用账户显示停用原因与时间
+		// 停用账户显示停用原因与时间；所属组织停用了 AI Studio 时接上这个原因（新账户自动处理验证未通过的停用原因里已经带着时不重复）
 		message = accountDisableNotes.message(status.ID)
+		if status.OrgDisabled && !strings.Contains(message, aistudio.OrgDisabledReason) {
+			message += "；" + aistudio.OrgDisabledReason
+		}
 	}
 	return api.AdminAccount{
 		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
@@ -981,6 +1049,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		Models: models, BenefitTier: status.BenefitTier, Message: message,
 		BenefitTierKnown: status.BenefitTierKnown, Pool: status.Pool,
 		ProxyPoolSlot: status.ProxySlot, ProxyPoolActive: status.ProxySlotActive,
+		OrgDisabled: status.OrgDisabled,
 	}
 }
 

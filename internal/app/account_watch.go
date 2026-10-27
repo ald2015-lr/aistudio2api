@@ -287,9 +287,9 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 		stat := authFileStat{modTime: info.ModTime(), size: info.Size()}
 		previous, seen := watcher.authFiles[summary.ID]
 		if !seen {
-			// 第一次看到的认证文件只记作基准、不读取内容（启动时可能有上万个账户）。403 无权限账户例外：载入账户池之后、
-			// 第一次扫描之前被替换的文件（例如重启生成服务时正好在等待文件稳定），只记作基准就再也发现不了
-			if _, listed := watcher.admin.service.permissionDeniedIdentity(summary.ID); listed {
+			// 第一次看到的认证文件只记作基准、不读取内容（启动时可能有上万个账户）。403 无权限账户与组织停用账户例外：
+			// 载入账户池之后、第一次扫描之前被替换的文件（例如重启生成服务时正好在等待文件稳定），只记作基准就再也发现不了
+			if watcher.admin.service.watchedLogin(summary.ID) {
 				if now.Sub(stat.modTime) < accountSettleTime {
 					// 仍在写入，下一轮再看
 					continue
@@ -375,8 +375,8 @@ func (watcher *accountWatcher) detectLoginUpdates(summaries []aistudio.AccountLo
 func (watcher *accountWatcher) deniedAuthUpdated(
 	summary aistudio.AccountLoginSummary, disk aistudio.StorageState, stat authFileStat,
 ) (bool, bool) {
-	stored, listed := watcher.admin.service.permissionDeniedIdentity(summary.ID)
-	if !listed {
+	// 组织停用账户（见 org_disabled.go）同样按文件内容判断：在组织重新开放后同一会话里重新导出的认证文件，登录签名 Cookie 不变
+	if !watcher.admin.service.watchedLogin(summary.ID) {
 		return false, true
 	}
 	memory, ok := watcher.admin.pool.StorageStateOf(summary.ID)
@@ -390,9 +390,8 @@ func (watcher *accountWatcher) deniedAuthUpdated(
 	if identity != aistudio.LoginIdentity(memory) || storageStateDigest(disk) != storageStateDigest(memory) {
 		return true, true
 	}
-	if stored != "" && identity != stored {
-		watcher.admin.service.permissionDenied.setIdentity(summary.ID, identity)
-	}
+	// 登录签名与登记时记下的不同（本服务自己写回时换掉了登录签名 Cookie）：两张登记表各自更新（没有登记或相同时不动）
+	watcher.admin.service.noteLoginIdentity(summary.ID, identity)
 	return false, true
 }
 
@@ -622,6 +621,7 @@ func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	// （DeleteAccount）或管理员启用时清除
 	accountDisableNotes.clearAutomatic(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
+	admin.service.orgDisabled.clearAccount(accountID)
 	return errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID))
 }
 

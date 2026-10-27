@@ -622,7 +622,7 @@ func (recheck *authRecheck) execute(ctx context.Context, task authRecheckTask) {
 var errAuthRecheckBusy = errors.New("账户忙，推后复核")
 
 // finishSuspect 处理疑似账户的复核结果：通过则清掉疑似冷却；仍是 401 则标需要登录（经认证代际核对）、释放驻留 Worker、
-// 写“账号需要登录”；出错或账户忙时推后，几次都没有结论就不再复核、不标记
+// 写“账号需要登录”；返回 app is disabled 则移出疑似、进入组织停用状态；出错或账户忙时推后，几次都没有结论就不再复核、不标记
 func (recheck *authRecheck) finishSuspect(suspect *authSuspect, generation uint64, startedAt time.Time, probeErr error) {
 	service := recheck.service
 	accountID := suspect.accountID
@@ -677,6 +677,19 @@ func (recheck *authRecheck) finishSuspect(suspect *authSuspect, generation uint6
 			service.workers.confirmAuthRequiredWith(accountID, label, suspect.source, suspect.cause, "复核=仍失效")
 			service.publishModelAccess()
 		}
+	case aistudio.OrgDisabledFailure(probeErr):
+		// 复核返回 “AI Studio app is disabled”：会话本身有效（不是登录失效），账号所属组织停用了 AI Studio。移出疑似记录、解除疑似冷却，
+		// 进入组织停用状态（不再参与调度，见 org_disabled.go）；原先落进下面的出错分支，反复复核几次后写“复核未完成”才放弃
+		recheck.mu.Lock()
+		recheck.running--
+		delete(recheck.suspects, accountID)
+		recheck.mu.Unlock()
+		if _, err := service.pool.ClearCooldownsMatching(accountID, func(_ string, cooldown aistudio.CooldownState) bool {
+			return strings.HasPrefix(cooldown.Reason, authSuspectReasonPrefix)
+		}); err != nil {
+			service.requests.log(label, "WARN", "疑似登录失效冷却清除失败 | 错误="+err.Error())
+		}
+		service.enterOrgDisabled(accountID, label, aistudio.OrgDisabledFromRecheck, probeErr)
 	case errors.Is(probeErr, errAuthRecheckBusy):
 		// 账户有进行中的请求（长流）：不算一次复核，稍后再试
 		recheck.mu.Lock()
@@ -716,7 +729,7 @@ func (recheck *authRecheck) recordLocked(accountID string) *authRecheckRecord {
 }
 
 // finishPeriodic 处理需要登录账户的定期复核结果：通过则恢复（已在租约内写回有效）、清掉目录缓存的需要登录记录并放回目录同步队列，
-// 写“登录复核恢复”；仍是 401 则按账户退避；出错或账户忙记为跳过
+// 写“登录复核恢复”；仍是 401 则按账户退避；返回 app is disabled 则进入组织停用状态；出错或账户忙记为跳过
 func (recheck *authRecheck) finishPeriodic(accountID string, startedAt time.Time, valid bool, probeErr error) {
 	service := recheck.service
 	now := recheck.clock()
@@ -750,6 +763,13 @@ func (recheck *authRecheck) finishPeriodic(accountID string, startedAt time.Time
 		recheck.addLocked(now, func(bucket *authRecheckBucket) { bucket.stillInvalid++ },
 			func(stats *authRecheckRoundStats) { stats.stillInvalid++ })
 		recheck.mu.Unlock()
+	case aistudio.OrgDisabledFailure(probeErr):
+		// 复核返回 “AI Studio app is disabled”：账号所属组织停用了 AI Studio。进入组织停用状态，移出定期复核（AuthRequiredAccountIDs
+		// 不再取它，记录清掉：状态清除后从头复核），不计入“跳过”；底层状态不改（同管理验证），组织重新开放后照常按需要登录复核。
+		// 原先落进下面的跳过分支，下次复核时间不前移，每轮都排在最前面再探测一次
+		delete(recheck.records, accountID)
+		recheck.mu.Unlock()
+		service.enterOrgDisabled(accountID, label, aistudio.OrgDisabledFromRecheck, probeErr)
 	default:
 		recheck.skipLocked(accountID, now)
 		recheck.mu.Unlock()

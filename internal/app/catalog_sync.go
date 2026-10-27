@@ -19,7 +19,10 @@ import (
 // 与失败账户每 30 秒全量重试：
 //   - 速率：常规 2 并发、两次开始至少间隔 1 秒；没有缓存时（首次升级、缓存损坏）填充期 4 并发、间隔 500 毫秒；
 //   - 上游 429（及连不上代理）全局暂停 30 秒起指数增长到 30 分钟，连续 10 次成功后清零；出口限流时该出口上的账户推后；
-//   - 其他失败按账户退避 1 分钟起到 6 小时；需要登录的账户移出队列。
+//   - 其他失败按账户退避 1 分钟起到 6 小时；需要登录的账户移出队列；
+//   - 所属组织停用了 AI Studio 的账户（见 org_disabled.go）不再按失败重试，只做长间隔复查（24 小时 ±10%），复查不再返回
+//     “AI Studio app is disabled” 即清除状态、恢复调度；复查遇到其他失败按退避顺延（1 分钟起到 24 小时，401 直接顺延一个间隔），
+//     状态清除（认证文件更新、管理员清除）后任务改回常规优先级、立即同步。
 //
 // 管理操作（验证、登录、导入、批量启用）照旧立即同步（syncNow 与 refreshAccountModelCatalog），不受暂停与速率限制
 
@@ -27,11 +30,12 @@ import (
 type catalogPriority uint8
 
 const (
-	catalogPriorityMissing   catalogPriority = iota // 启用、就绪、没有目录
-	catalogPriorityStale                            // 恢复时指纹不一致（或 Build 目录没有恢复）
-	catalogPriorityAuthProbe                        // 疑似登录失效（缓存记过需要登录、认证文件没变）
-	catalogPriorityRetry                            // 失败后按账户退避
-	catalogPriorityExpired                          // 上次成功同步 + TTL×U(0.9,1.1) 已到
+	catalogPriorityMissing    catalogPriority = iota // 启用、就绪、没有目录
+	catalogPriorityStale                             // 恢复时指纹不一致（或 Build 目录没有恢复）
+	catalogPriorityAuthProbe                         // 疑似登录失效（缓存记过需要登录、认证文件没变）
+	catalogPriorityRetry                             // 失败后按账户退避
+	catalogPriorityExpired                           // 上次成功同步 + TTL×U(0.9,1.1) 已到
+	catalogPriorityOrgRecheck                        // 所属组织停用了 AI Studio：长间隔复查（见 org_disabled.go）
 	catalogPriorityCount
 )
 
@@ -162,9 +166,9 @@ func (stats *catalogSyncStats) hour(now time.Time) catalogStatBucket {
 	return total
 }
 
-// catalogStatusCounts 为状态与日志用的任务计数
+// catalogStatusCounts 为状态与日志用的任务计数；orgRecheck 为等待长间隔复查的组织停用账户
 type catalogStatusCounts struct {
-	missing, stale, probe, retry, expired, queued int
+	missing, stale, probe, retry, expired, queued, orgRecheck int
 }
 
 // catalogSyncer 为模型目录的后台调度器；方法全部 nil 安全（测试直接构造的服务没有调度器）
@@ -431,6 +435,11 @@ func (syncer *catalogSyncer) reconcile(now time.Time) {
 				droppedSuspect = true
 			}
 		}
+		if orgRecheckable(status) {
+			// 所属组织停用了 AI Studio：只排长间隔复查（时间取登记表，重启后照旧），不按缺失、过期或失败重试
+			syncer.orgRecheckLocked(status.ID, now)
+			continue
+		}
 		if !catalogEligible(status) {
 			continue
 		}
@@ -470,6 +479,8 @@ func (syncer *catalogSyncer) countsLocked(now time.Time) catalogStatusCounts {
 			if due {
 				counts.expired++
 			}
+		case catalogPriorityOrgRecheck:
+			counts.orgRecheck++
 		}
 		if due && !task.running {
 			counts.queued++
@@ -754,7 +765,19 @@ func (syncer *catalogSyncer) dispatch(ctx context.Context, tasks *sync.WaitGroup
 
 		// 锁外核对账户状态与出口：不可同步的移出，出口限流的推后，都不占开始间隔
 		status, exists := syncer.service.pool.StatusOf(task.accountID)
-		if !exists || !catalogEligible(status) {
+		if exists && orgRecheckable(status) && (task.priority != catalogPriorityOrgRecheck || now.Before(syncer.service.orgDisabledCheckAt(task.accountID))) {
+			// 组织停用的账户只在复查时间到了才同步：其他优先级的任务（进入前排下的）改排长间隔复查
+			syncer.mu.Lock()
+			syncer.running--
+			task.running = false
+			if syncer.tasks[task.accountID] == task {
+				syncer.orgRecheckLocked(task.accountID, now)
+			}
+			syncer.roundDoneLocked(task.accountID, false, false, nil)
+			syncer.mu.Unlock()
+			continue
+		}
+		if !exists || !catalogEligible(status) && !orgRecheckable(status) {
 			syncer.mu.Lock()
 			syncer.running--
 			task.running = false
@@ -959,6 +982,14 @@ func (syncer *catalogSyncer) afterRefresh(ctx context.Context, accountID string,
 		syncer.mu.Unlock()
 		return
 	}
+	orgDisabled := !busy && syncer.service.pool.OrgDisabled(accountID)
+	if err == nil && orgDisabled {
+		// 组织停用的账户复查（或管理操作的同步）成功：上游不再返回 “AI Studio app is disabled”，清除状态、恢复调度（锁外，先于记结果；
+		// 目录任务随后由 succeededLocked 按成功排下次刷新，不再另行改排）
+		syncer.mu.Unlock()
+		syncer.service.clearOrgDisabled(accountID, "复查通过")
+		syncer.mu.Lock()
+	}
 	switch {
 	case busy:
 		syncer.stats.add(now, func(bucket *catalogStatBucket) { bucket.busy++ })
@@ -967,8 +998,14 @@ func (syncer *catalogSyncer) afterRefresh(ctx context.Context, accountID string,
 		syncer.mu.Unlock()
 	case err == nil:
 		syncer.succeededLocked(accountID, models, snapshot, snapshotOK, now, background)
+	case orgDisabled && !aistudio.OrgDisabledFailure(err) && !aistudio.CatalogRateLimited(err):
+		// 组织停用的账户遇到其他失败（5xx、网络、空目录、401 等）：仍是组织停用，复查按退避顺延，不按缺失或失败每分钟重试；
+		// 上游 429 照常全局暂停（任务保持长间隔复查，暂停结束后再查）
+		syncer.orgRecheckFailedLocked(accountID, err, now)
 	case aistudio.DefinitiveAuthenticationFailure(err):
 		syncer.authRequiredLocked(accountID, err, now)
+	case aistudio.OrgDisabledFailure(err):
+		syncer.orgDisabledLocked(accountID, err, now)
 	case aistudio.CatalogRateLimited(err):
 		syncer.rateLimitedLocked(accountID, err, now)
 	case errors.Is(err, aistudio.ErrEmptyModelCatalog):
@@ -1069,6 +1106,133 @@ func (syncer *catalogSyncer) authRequiredLocked(accountID string, err error, now
 	}
 	syncer.service.noteAuthRequired(accountID, label, authFromCatalog, err)
 	syncer.service.publishModelAccess()
+}
+
+// orgDisabledLocked 处理“AI Studio app is disabled”（账号所属组织停用了 AI Studio）：不按失败退避、不写“模型目录同步失败”，
+// 改排长间隔复查（时间取登记表）。aistudio 已经回调进入组织停用状态（见 aistudio.OrgDisabledReporter），没有回调时在这里补上。
+// 调用方持有 syncer.mu，返回前释放
+func (syncer *catalogSyncer) orgDisabledLocked(accountID string, err error, now time.Time) {
+	syncer.stats.add(now, func(bucket *catalogStatBucket) { bucket.failed++ })
+	marked := syncer.service.pool.OrgDisabled(accountID)
+	syncer.orgRecheckLocked(accountID, now)
+	syncer.roundDoneLocked(accountID, false, false, err)
+	syncer.mu.Unlock()
+	if !marked {
+		syncer.service.enterOrgDisabled(accountID, syncer.service.accountLabel(accountID), aistudio.OrgDisabledFromCatalog, err)
+	}
+}
+
+// orgRecheckLocked 把账户的任务排为长间隔复查：时间取登记表（重启后照旧），没有登记时为 now + orgDisabledRecheck；
+// 连续没有结论的次数同样取登记表（复查退避据此计算）。账户没有任务时新建。已经按长间隔复查排着的任务只往后顺延、不提前，
+// 也不清零失败次数：原先每分钟对照账户池时都把任务改回登记表里已经过去的复查时间、失败次数清零，复查遇到其他失败后
+// 退避永远停在第一档，变成每分钟重试。调用方持有 syncer.mu
+func (syncer *catalogSyncer) orgRecheckLocked(accountID string, now time.Time) {
+	checkAt, failures := syncer.service.orgDisabledRecheck(accountID)
+	task := syncer.taskLocked(accountID)
+	if task.priority == catalogPriorityOrgRecheck && (task.index >= 0 || task.running) {
+		due := laterOf(task.due, checkAt)
+		if due.Equal(task.due) {
+			return
+		}
+		syncer.scheduleLocked(task, catalogPriorityOrgRecheck, due)
+		return
+	}
+	if checkAt.IsZero() {
+		checkAt = now.Add(orgDisabledRecheck)
+	}
+	task.failures = failures
+	syncer.scheduleLocked(task, catalogPriorityOrgRecheck, checkAt)
+}
+
+// orgRecheckFailedLocked 处理组织停用账户的目录同步遇到的其他结果（5xx、网络、代理不通、空目录、401 等，既不是 app is disabled
+// 也不是成功）：仍是组织停用，任务保持长间隔复查。已到期的复查按连续没有结论的次数指数退避（1m×2^(f-1)，±20%，上限 orgDisabledRecheck），
+// 登录失效（401）直接顺延一个完整的复查间隔（会话失效时组织重新开放也查不出来，要等认证文件更新）；顺延后的时间与次数写回登记表
+// （重启后照旧）。复查时间还没到的同步（管理操作、进入状态前开始的同步）不改复查时间。同账户只在 f=1、2、4、8… 时写一行
+// “组织停用账户复查未完成，顺延”（不写“模型目录同步失败”）。调用方持有 syncer.mu，返回前释放
+func (syncer *catalogSyncer) orgRecheckFailedLocked(accountID string, err error, now time.Time) {
+	empty := errors.Is(err, aistudio.ErrEmptyModelCatalog)
+	syncer.stats.add(now, func(bucket *catalogStatBucket) {
+		if empty {
+			bucket.empty++
+		} else {
+			bucket.failed++
+		}
+	})
+	syncer.roundDoneLocked(accountID, false, false, err)
+	checkAt, failures := syncer.service.orgDisabledRecheck(accountID)
+	if checkAt.After(now) {
+		syncer.orgRecheckLocked(accountID, now)
+		syncer.mu.Unlock()
+		return
+	}
+	task := syncer.taskLocked(accountID)
+	failures = max(failures, task.failures) + 1
+	due := now.Add(syncer.orgRecheckDelay(failures))
+	if aistudio.DefinitiveAuthenticationFailure(err) {
+		due = syncer.service.orgDisabled.nextCheck(now)
+	}
+	// 锁顺序 syncer.mu → 登记表（orgRecheckLocked 同样在 syncer.mu 内读登记表）
+	due = syncer.service.orgDisabled.postpone(accountID, due, failures)
+	task.failures = failures
+	syncer.scheduleLocked(task, catalogPriorityOrgRecheck, due)
+	syncer.mu.Unlock()
+	if failures&(failures-1) == 0 {
+		syncer.service.requests.log(accountID, "WARN", fmt.Sprintf(
+			"组织停用账户复查未完成，顺延 | 错误=%s | 下次复查=%s | 连续失败=%d",
+			orgDisabledCauseSummary(err), due.UTC().Format(time.RFC3339), failures,
+		))
+	}
+}
+
+// orgRecheckDelay 返回组织停用账户第 failures 次复查没有结论之后的退避：1m×2^(f-1)，±20%，上限 orgDisabledRecheck
+func (syncer *catalogSyncer) orgRecheckDelay(failures int) time.Duration {
+	delay := catalogRetryBase << min(max(failures-1, 0), 16)
+	return min(time.Duration(float64(delay)*syncer.jitter(0.2)), orgDisabledRecheck)
+}
+
+// orgCleared 在账户的组织停用状态清除后调用（认证文件更新、管理员清除，见 forgetOrgDisabled）：长间隔复查的任务改回常规优先级
+// （按 classifyLocked：没有目录为缺失，有目录按缓存记的失败或过期；过期按失败待重试排，与 requeue 相同），立即到期并唤醒调度器，
+// 没有目录的账户随即同步、恢复为模型候选；仍是组织停用时这次同步重新进入。任务已按常规排着或没有任务时不动（对照账户池时按常规补上）。
+// 不用 requeue：它沿用原优先级，长间隔复查是最低一档。syncer 为 nil 时不处理
+func (syncer *catalogSyncer) orgCleared(accountID string) {
+	if syncer == nil {
+		return
+	}
+	status, exists := syncer.service.pool.StatusOf(accountID)
+	now := syncer.clock()
+	syncer.mu.Lock()
+	task := syncer.tasks[accountID]
+	if !exists || task == nil || task.priority != catalogPriorityOrgRecheck {
+		syncer.mu.Unlock()
+		return
+	}
+	priority, _, _ := syncer.classifyLocked(accountID, len(status.Models) > 0, now)
+	if priority == catalogPriorityExpired {
+		priority = catalogPriorityRetry
+	}
+	task.failures = 0
+	syncer.scheduleLocked(task, priority, now)
+	syncer.mu.Unlock()
+	syncer.kick()
+}
+
+// noteOrgDisabled 记录账户进入组织停用状态（见 enterOrgDisabled）：任务改排到 due 的长间隔复查，不再每分钟重试；
+// 疑似失效的记录随之移出（组织停用不是登录失效）。syncer 为 nil 时不处理
+func (syncer *catalogSyncer) noteOrgDisabled(accountID string, due time.Time) {
+	if syncer == nil {
+		return
+	}
+	syncer.mu.Lock()
+	defer syncer.mu.Unlock()
+	syncer.dropSuspectLocked(accountID)
+	task := syncer.taskLocked(accountID)
+	task.failures = 0
+	syncer.scheduleLocked(task, catalogPriorityOrgRecheck, due)
+}
+
+// orgRecheckable 判断账户是所属组织停用了 AI Studio 的启用账户（只做长间隔复查）
+func orgRecheckable(status aistudio.AccountStatus) bool {
+	return status.Enabled && status.State == aistudio.AccountOrgDisabled
 }
 
 // rateLimitedLocked 处理上游 429：全局暂停 30s×2^k（±20%，上限 30 分钟），失败账户放回原优先级、不记个人失败。

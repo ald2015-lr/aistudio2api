@@ -29,11 +29,14 @@ const (
 	unschedulableUnavailable  = aistudio.UnschedulableUnavailable
 	unschedulableNoCatalog    = aistudio.UnschedulableNoCatalog
 	unschedulableOther        = aistudio.UnschedulableNotReady
+	// unschedulableOrgDisabled 为账号所属组织停用了 AI Studio（见 org_disabled.go）
+	unschedulableOrgDisabled = aistudio.UnschedulableOrgDisabled
 )
 
 // unschedulableReasonOrder 为补登记日志里各原因的顺序
 var unschedulableReasonOrder = []string{
-	unschedulableAuthRequired, unschedulableDisabled, unschedulableUnavailable, unschedulableNoCatalog, unschedulableOther,
+	unschedulableAuthRequired, unschedulableOrgDisabled, unschedulableDisabled, unschedulableUnavailable, unschedulableNoCatalog,
+	unschedulableOther,
 }
 
 const (

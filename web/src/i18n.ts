@@ -77,7 +77,13 @@ const zhCN = {
   'accounts.loginComplete': '账户登录完成',
   'accounts.verified': '账户验证通过',
   'accounts.verifyInvalid': '登录已失效：{reason}',
+  'accounts.verifyOrgDisabled':
+    '验证未通过：账号所属组织已停用 AI Studio（不是登录失效，重新登录也没用；已停止调度）',
+  'accounts.verifyOrgDisabledReason':
+    '账号所属组织已停用 AI Studio（不是登录失效，重新登录也没用）',
   'accounts.verifyResult': '验证完成：有效 {ok}，失效 {invalid}，出错 {failed}',
+  'accounts.verifyResultOrgDisabled':
+    '验证完成：有效 {ok}，失效 {invalid}，组织停用 {org}，出错 {failed}',
   'accounts.saved': '账户已保存',
   'accounts.deleted': '账户已删除',
   'accounts.importComplete': '已导入 {count} 个账户',
@@ -305,6 +311,7 @@ const zhCN = {
   'state.auth_required': '需要登录',
   'state.unavailable': '不可用',
   'state.disabled': '已停用',
+  'state.org_disabled': '组织已停用',
   'state.queued': '排队',
   'state.running': '运行中',
   'state.completed': '已完成',
@@ -348,6 +355,8 @@ const zhCN = {
   'accounts.progressInvalid': '登录失效 {count}',
   'accounts.progressErrored': '出错 {count}',
   'accounts.progressInvalidList': '登录失效明细（{count}）',
+  'accounts.progressOrgDisabled': '组织停用 {count}',
+  'accounts.progressNotPassedList': '未通过明细（{count}）',
   'accounts.progressActive': '处理中：{names}',
   'accounts.progressStop': '停止',
   'accounts.progressStopped': '已停止',
@@ -393,6 +402,23 @@ const zhCN = {
   'accounts.permissionDeniedDeleteSkipped':
     '；{count} 个在确认后已不在列表里（例如重新上传了认证文件），没有删除',
   'accounts.permissionDeniedShowAll': '展开全部 {count} 个',
+  'accounts.orgDisabledTitle': '组织已停用 AI Studio 的账户',
+  'accounts.orgDisabledHint':
+    '（账号所属组织关闭了 AI Studio，重新登录也没用；已停止调度，换号或等组织重新开放）',
+  'accounts.orgDisabledHelp':
+    '载入 AI Studio 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或接口返回 HTTP 403 “AI Studio app is disabled” 的账户（Google Workspace 账号所属组织或 Google 为它关闭了 AI Studio）。这些账户不再参与预热、替补、扩容与选号，驻留 Worker 空闲即关；模型目录每 24 小时复查一次，不再返回 app is disabled 时自动恢复。认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录）或点“恢复调度”也会立即恢复，仍被停用时会重新列出。',
+  'accounts.orgDisabledSource': '来源',
+  'accounts.orgDisabledNextCheck': '下次复查',
+  'accounts.orgDisabledClear': '恢复调度',
+  'accounts.orgDisabledClearConfirm':
+    '清除全部 {count} 个账户的组织停用状态、立即恢复调度？仍被组织停用的账户再次启动或同步时会重新列出（启动时立即失败，不再干等）。',
+  'accounts.orgDisabledCleared': '已恢复 {count} 个账户的调度',
+  'accounts.orgDisabledSourceStartup': '启动',
+  'accounts.orgDisabledSourceCatalog': '模型目录',
+  'accounts.orgDisabledSourceVerify': '验证',
+  'accounts.orgDisabledSourceLogin': '登录',
+  'accounts.orgDisabledSourceRequest': '请求',
+  'accounts.orgDisabledSourceRecheck': '登录复核',
   'models.allChannels': '全部通道',
   'models.pricingAll': '免费与付费',
   'models.pricingFree': '仅免费',
@@ -937,7 +963,13 @@ const en: Record<TranslationKey, string> = {
   'accounts.loginComplete': 'Account login complete',
   'accounts.verified': 'Account verified',
   'accounts.verifyInvalid': 'Login expired: {reason}',
+  'accounts.verifyOrgDisabled':
+    'Verification failed: the organization that manages this account has turned AI Studio off (not an expired login, signing in again does not help; scheduling has stopped)',
+  'accounts.verifyOrgDisabledReason':
+    'The organization that manages this account has turned AI Studio off (not an expired login, signing in again does not help)',
   'accounts.verifyResult': 'Verification finished: {ok} valid, {invalid} invalid, {failed} failed',
+  'accounts.verifyResultOrgDisabled':
+    'Verification finished: {ok} valid, {invalid} invalid, {org} disabled by organization, {failed} failed',
   'accounts.saved': 'Account saved',
   'accounts.deleted': 'Account deleted',
   'accounts.importComplete': 'Imported {count} accounts',
@@ -1170,6 +1202,7 @@ const en: Record<TranslationKey, string> = {
   'state.auth_required': 'Login required',
   'state.unavailable': 'Unavailable',
   'state.disabled': 'Disabled',
+  'state.org_disabled': 'Disabled by org',
   'state.queued': 'Queued',
   'state.running': 'Running',
   'state.completed': 'Completed',
@@ -1214,6 +1247,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.progressInvalid': '{count} login expired',
   'accounts.progressErrored': '{count} failed',
   'accounts.progressInvalidList': 'Expired logins ({count})',
+  'accounts.progressOrgDisabled': '{count} disabled by organization',
+  'accounts.progressNotPassedList': 'Not passed ({count})',
   'accounts.progressActive': 'Working on: {names}',
   'accounts.progressStop': 'Stop',
   'accounts.progressStopped': 'Stopped',
@@ -1263,6 +1298,23 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedDeleteSkipped':
     '; {count} were no longer listed after confirming (for example, the auth file was uploaded again) and were not deleted',
   'accounts.permissionDeniedShowAll': 'Show all {count}',
+  'accounts.orgDisabledTitle': 'Accounts with AI Studio disabled by their organization',
+  'accounts.orgDisabledHint':
+    '(the organization that manages the account has turned AI Studio off; signing in again does not help. Scheduling has stopped: replace the account or wait for the organization to re-enable it)',
+  'accounts.orgDisabledHelp':
+    'Accounts whose AI Studio page is redirected to the ServiceNotAllowed page on access.workspace.google.com, or whose RPCs return HTTP 403 "AI Studio app is disabled" (the Google Workspace organization or Google has turned AI Studio off for them). They no longer take part in prewarm, replacement, scale-out or account selection, and their resident Workers are closed once idle. The model catalog is rechecked every 24 hours and the account is restored as soon as it no longer returns "app is disabled". Updating the auth file (uploading a new storage-state.json, a browser login or importing the directory again) or clicking "Resume scheduling" also restores it at once; it is listed again if it is still disabled.',
+  'accounts.orgDisabledSource': 'Source',
+  'accounts.orgDisabledNextCheck': 'Next recheck',
+  'accounts.orgDisabledClear': 'Resume scheduling',
+  'accounts.orgDisabledClearConfirm':
+    'Clear the organization-disabled state of all {count} accounts and resume scheduling now? An account that is still disabled is listed again the next time it starts or syncs (startup fails at once instead of waiting).',
+  'accounts.orgDisabledCleared': 'Resumed scheduling for {count} accounts',
+  'accounts.orgDisabledSourceStartup': 'Startup',
+  'accounts.orgDisabledSourceCatalog': 'Model catalog',
+  'accounts.orgDisabledSourceVerify': 'Verify',
+  'accounts.orgDisabledSourceLogin': 'Login',
+  'accounts.orgDisabledSourceRequest': 'Request',
+  'accounts.orgDisabledSourceRecheck': 'Login recheck',
   'models.allChannels': 'All channels',
   'models.pricingAll': 'Free & paid',
   'models.pricingFree': 'Free only',

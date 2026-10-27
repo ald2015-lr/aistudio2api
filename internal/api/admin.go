@@ -322,6 +322,8 @@ type AdminAccountCounts struct {
 	// AuthRequired10m 为最近 10 分钟新被标为需要登录的账户数（“账号需要登录”日志的条数，同账号 1 分钟最多一条）；
 	// 只在全部账户的计数里填写，持续增长说明运行期 401 在累积
 	AuthRequired10m int `json:"auth_required_10m,omitempty"`
+	// OrgDisabled 为所属组织停用了 AI Studio 的启用账户数（状态 org_disabled，不参与任何调度，见 AdminOrgDisabled）
+	OrgDisabled int `json:"org_disabled"`
 }
 
 // AdminAccount 表示管理端账户摘要
@@ -352,6 +354,9 @@ type AdminAccount struct {
 	// ProxyPoolPinned 表示 IP 池开启、账户代理与当前生效的默认代理（PROXY）规范值相同，因此不使用 IP 池；与状态接口的
 	// proxy_pool.pinned_default、“改为跟随默认代理”同一份判断
 	ProxyPoolPinned bool `json:"proxy_pool_pinned,omitempty"`
+	// OrgDisabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户的 state 仍为 disabled、
+	// message 接上这个原因；验证接口的返回在验证遇到组织停用时同样为 true，前端据此提示组织停用而不是登录失效
+	OrgDisabled bool `json:"org_disabled,omitempty"`
 }
 
 // AccountInput 表示已有账户配置
@@ -484,10 +489,34 @@ type AdminPermissionDeniedModel struct {
 	Message  string    `json:"message,omitempty"`
 }
 
-// PermissionDeniedClearInput 表示要清除记录的账户；All 为真时清除全部
+// PermissionDeniedClearInput 表示要清除记录的账户；All 为真时清除全部（组织停用账户的清除接口共用）
 type PermissionDeniedClearInput struct {
 	AccountIDs []string `json:"account_ids"`
 	All        bool     `json:"all"`
+}
+
+// AdminOrgDisabled 表示一个所属组织停用了 AI Studio 的账户（Google Workspace 账号的组织或 Google 关闭了这项服务）：载入 AI Studio
+// 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或 RPC 返回 HTTP 403 “AI Studio app is disabled”。重新登录也没用，
+// 账户不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复。Source 为第一次进入的来源（启动、模型目录、验证、登录、请求、
+// 登录复核：疑似登录失效或需要登录账户的复核请求返回 app is disabled），LastSource 为最近一次；CheckAt 为下一次长间隔复查的时间；
+// Message 为最近一次的原文（已打码、截短）
+type AdminOrgDisabled struct {
+	ID         string    `json:"id"`
+	Label      string    `json:"label"`
+	Source     string    `json:"source"`
+	LastSource string    `json:"last_source"`
+	Count      int       `json:"count"`
+	FirstAt    time.Time `json:"first_at"`
+	LastAt     time.Time `json:"last_at"`
+	CheckAt    time.Time `json:"check_at"`
+	Message    string    `json:"message,omitempty"`
+}
+
+// OrgDisabledService 为管理服务可选实现的组织停用账户能力：实现时 /api/accounts/permission-denied 的返回另带 org_disabled 列表，
+// /api/accounts/org-disabled/clear 清除状态；没有实现时列表省略、清除接口返回 404（旧的管理服务与测试替身不受影响）
+type OrgDisabledService interface {
+	OrgDisabled(context.Context) ([]AdminOrgDisabled, error)
+	ClearOrgDisabled(context.Context, PermissionDeniedClearInput) (int, error)
 }
 
 // AdminRequest 表示活动请求摘要
@@ -536,6 +565,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
 	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)
+	mux.HandleFunc("POST /api/accounts/org-disabled/clear", s.handleClearOrgDisabled)
 	mux.HandleFunc("GET /api/requests", s.handleRequests)
 	mux.HandleFunc("POST /api/requests/{id}/cancel", s.handleCancelRequest)
 	mux.HandleFunc("GET /api/events", s.handleAdminEvents)
@@ -717,13 +747,47 @@ func (s *server) handleCooldowns(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string][]AdminCooldown{"cooldowns": cooldowns})
 }
 
+// handlePermissionDenied 返回 403 无权限账户列表（accounts，格式不变）；管理服务实现了 OrgDisabledService 时另带
+// 所属组织停用了 AI Studio 的账户（org_disabled，没有时为空数组），旧前端只读 accounts，不受影响
 func (s *server) handlePermissionDenied(w http.ResponseWriter, r *http.Request) {
 	accounts, err := s.config.Admin.PermissionDenied(r.Context())
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string][]AdminPermissionDenied{"accounts": accounts})
+	body := map[string]any{"accounts": accounts}
+	if orgDisabled, ok := s.config.Admin.(OrgDisabledService); ok {
+		entries, err := orgDisabled.OrgDisabled(r.Context())
+		if err != nil {
+			writeAdminUpstreamError(w, err)
+			return
+		}
+		if entries == nil {
+			entries = []AdminOrgDisabled{}
+		}
+		body["org_disabled"] = entries
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// handleClearOrgDisabled 清除组织停用账户的状态（立即恢复调度），返回清除数；请求体同 403 无权限的清除接口
+func (s *server) handleClearOrgDisabled(w http.ResponseWriter, r *http.Request) {
+	orgDisabled, ok := s.config.Admin.(OrgDisabledService)
+	if !ok {
+		writeAdminError(w, http.StatusNotFound, "not_found", "不支持组织停用账户")
+		return
+	}
+	var input PermissionDeniedClearInput
+	if err := decodeJSON(r, &input); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	cleared, err := orgDisabled.ClearOrgDisabled(r.Context(), input)
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"cleared": cleared})
 }
 
 func (s *server) handleClearPermissionDenied(w http.ResponseWriter, r *http.Request) {

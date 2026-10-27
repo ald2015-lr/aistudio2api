@@ -2,6 +2,8 @@
 # AIStudio2API 一键诊断“Worker 起不来”：系统资源 → 状态接口（Worker、预热、IP 池、出口）→ 绕过程序直连测 IP 池端口 →
 # 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志 → 失败时的页面状态（启动失败与 Worker 重建日志末尾的“页面=…”快照）
 # → AI Studio 首次使用页（自动完成、跳过与未能完成的次数，失败停在哪一步、原因、“已做”与结构摘要样本）
+# 组织停用 AI Studio 的账户（Google Workspace 账号所属组织关闭了 AI Studio，载入时跳到 access.workspace.google.com）：状态段显示
+# 现在的账户数，启动失败原因里单独归类（新旧两种文案），并统计“账号所属组织已停用 AI Studio，停止调度”的来源
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -58,6 +60,12 @@ except Exception as err:
 w = d.get("workers", {})
 p = w.get("prewarm", {})
 print(f"运行 {d.get('running')}；Worker 就绪 {w.get('warm')} / 目标 {w.get('target')} / 峰值 {w.get('max')}，启动中 {w.get('starting')}，占用槽位 {w.get('occupied')}，死槽位 {w.get('dead')}")
+a = d.get("accounts") or {}
+if a:
+    # org_disabled 为所属组织停用了 AI Studio、已停止调度的账户；程序版本早于组织停用识别时没有这个字段，显示为 -
+    org = a.get("org_disabled")
+    print(f"账户：共 {a.get('total')}，就绪 {a.get('ready')}，忙碌 {a.get('busy')}，冷却 {a.get('cooldown')}，需要登录 {a.get('auth_required')}，"
+          f"组织已停用 AI Studio {'-' if org is None else org}")
 print(f"预热：进行中 {p.get('active')}，在途 {p.get('inflight')}，本轮已启动 {p.get('launched')}，本轮已 {p.get('round_seconds')} 秒，原因 {p.get('reason') or '-'}")
 u = d.get("ultra_workers") or {}
 if u:
@@ -159,6 +167,18 @@ PAGE_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\n|$)")
 PAGE_HEADS = ("WAA Worker 启动失败", "WAA Worker 重建", "账号切换")
 # 账号切换里运行中准备 proof 的失败：普通请求为“准备 fresh WAA proof: …”，Live（bidi）通道为“准备 bidi setup fresh WAA proof: …”与“准备 bidi fresh WAA proof: …”
 PROOF_REASON = re.compile(r"准备 (?:bidi (?:setup )?)?fresh WAA proof")
+# 组织停用 AI Studio（Google Workspace 账号所属组织关闭了 AI Studio）：新版文案以 ORG_PREFIX 开头（页面停在 access.workspace.google.com，
+# 立即失败）；旧版程序在这一页干等到超时，文案为“AI Studio 输入框未就绪 url=https://access.workspace.google.com/…: context deadline exceeded”。
+# 启动失败原因里两种都归到 ORG_LABEL；“账号所属组织已停用 AI Studio，停止调度 | 来源=…”为新版进入组织停用状态的日志（同一账户只写一行）
+ORG_PREFIX = "AI Studio 已被账号所属组织停用"
+ORG_HOST = "access.workspace.google.com"
+ORG_LABEL = "组织停用 AI Studio（页面停在 access.workspace.google.com）"
+ORG_ENTER = "账号所属组织已停用 AI Studio，停止调度"
+def org_disabled_error(error):
+    """启动失败的原错误是否为组织停用（新版文案，或旧版停在 access.workspace.google.com 的“输入框未就绪”）"""
+    return ORG_PREFIX in (error or "") or ORG_HOST in (error or "")
+org_fail_new, org_fail_old, org_fail_accounts = 0, 0, set()
+org_enter_sources, org_enter_accounts, org_catalog_failed = collections.Counter(), set(), 0
 page_total, page_heads, page_groups, page_samples, page_kinds = collections.Counter(), collections.Counter(), collections.Counter(), {}, {}
 # 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
 page_dist = {}
@@ -374,7 +394,17 @@ for p in paths:
                     if seconds is not None:
                         ready_secs.append(seconds)
                 if "失败" in head:
-                    fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
+                    if org_disabled_error(error):
+                        # 组织停用单独归类（后台扩容、替补等其他失败日志带同一错误时注明是哪一种）；启动失败另按新旧文案计数、账号去重
+                        fail_reasons[ORG_LABEL + ("" if head == "WAA Worker 启动失败" else f"（{head}）")] += 1
+                        if head == "WAA Worker 启动失败":
+                            org_fail_accounts.add(source)
+                            if ORG_PREFIX in error:
+                                org_fail_new += 1
+                            else:
+                                org_fail_old += 1
+                    else:
+                        fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
                     if f.get("端口"):
                         fail_ports[f["端口"]] += 1
                     fail_lines.append(f"{moment.astimezone():%H:%M:%S} {strip_page(msg).replace(chr(10), ' / ')[:400]}")
@@ -468,6 +498,12 @@ for p in paths:
                     onboard_inplace_done += 1
                 elif ONBOARD_INPLACE_LEFT in clean and head == "WAA Worker 启动失败":
                     onboard_inplace_left += 1
+            if head == ORG_ENTER:
+                org_enter_sources[fields(msg).get("来源", "?")] += 1
+                org_enter_accounts.add(source)
+            elif head == "模型目录同步失败" and "app is disabled" in msg.lower():
+                # 旧版程序：组织停用的账户每分钟重试一次目录同步
+                org_catalog_failed += 1
             if head.startswith(("上游代理", "本机代理", "IP 池", "代理")):
                 status = fields(msg).get("状态", "")
                 proxy_heads[head + (f"（状态 {status}）" if status else "")] += 1
@@ -494,6 +530,12 @@ if fail_full:
     print("各类启动失败的完整原文（每类一条）：")
     for key, text in list(fail_full.items())[:8]:
         print("  - " + text.replace("\n", " / "))
+if org_fail_new or org_fail_old or org_enter_sources or org_catalog_failed:
+    sources = "、".join(f"{label} {n}" for label, n in org_enter_sources.most_common()) or "-"
+    print(f"组织停用 AI Studio：启动失败 {org_fail_new + org_fail_old} 次（新版立即失败 {org_fail_new}、旧版干等到超时 {org_fail_old}），"
+          f"涉及 {len(org_fail_accounts)} 个账号；新进入组织停用状态的 {len(org_enter_accounts)} 个（来源：{sources}）；"
+          f"模型目录同步因 app is disabled 失败 {org_catalog_failed} 次（新版不再按失败重试，只每 24 小时复查）")
+    print("  这些账号所属组织关闭了 AI Studio，重新登录也没用：管理页“组织已停用 AI Studio 的账户”可复制邮箱、一键删除或恢复调度")
 if denied is not None:
     print(f"冷却列表里有 403 无权限冷却的账号 {len(denied)} 个；启动失败的账号 {len(fail_accounts)} 个，其中有 403 冷却的 {len(fail_accounts & denied)} 个；"
           f"就绪的账号 {len(ready_accounts)} 个，其中有 403 冷却的 {len(ready_accounts & denied)} 个")

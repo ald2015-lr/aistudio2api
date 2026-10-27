@@ -48,12 +48,14 @@ type LoginResult struct {
 	DriveError       string
 }
 
-// LoginVerification 返回已有登录态的页面验证结果
+// LoginVerification 返回已有登录态的页面验证结果。OrgDisabled 为页面被跳到组织停用页（access.workspace.google.com）：
+// 账号所属组织停用了 AI Studio，Authenticated 为假、Reason 为 ServiceNotAllowedPrefix，不是登录失效
 type LoginVerification struct {
 	Authenticated bool
 	PageURL       string
 	VerifiedAt    time.Time
 	Reason        string
+	OrgDisabled   bool
 }
 
 type loginSession struct {
@@ -138,16 +140,12 @@ func Verify(ctx context.Context, options LoginOptions, storageStateJSON []byte) 
 		err = errors.Join(err, session.Close())
 	}()
 	session.onboardingCompleted = options.OnboardingCompleted
-	pageURL, authenticated, reason, err := session.waitVerification(verifyCtx)
+	verification, err = session.waitVerification(verifyCtx)
 	if err != nil {
 		return LoginVerification{}, err
 	}
-	return LoginVerification{
-		Authenticated: authenticated,
-		PageURL:       pageURL,
-		VerifiedAt:    time.Now().UTC(),
-		Reason:        reason,
-	}, nil
+	verification.VerifiedAt = time.Now().UTC()
+	return verification, nil
 }
 
 // errorText 返回错误文本，nil 返回空字符串
@@ -285,6 +283,7 @@ func (session *loginSession) finishOnboarding(ctx context.Context, budget *onboa
 
 // waitLogin 等用户在可见浏览器里登录、AI Studio 输入框就绪。登录是交互式的：停在首次使用页时同样自动完成
 // （只勾必选项，次数上限同启动），完成后重新载入对话页；自动完成失败或次数用完后不再点击，交给用户在浏览器里手动完成。
+// 页面被跳到组织停用页（access.workspace.google.com）时立即以 ServiceNotAllowedError 结束（原因为 ServiceNotAllowedPrefix）。
 // 每一轮都记下当前 origin 的 localStorage，导出的认证状态带着完成首次使用之后的值
 func (session *loginSession) waitLogin(ctx context.Context, origins map[string]storageOrigin) (string, error) {
 	var onboarding onboardingBudget
@@ -303,6 +302,10 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 			}
 			continue
 		}
+		// 账号所属组织停用了 AI Studio：登录本身成功了，但这个账号用不了 AI Studio，立即结束并报告原因（等下去也不会出现输入框）
+		if isServiceNotAllowedURL(pageURL) {
+			return "", session.client.serviceNotAllowed(ctx, session.contextID, pageURL)
+		}
 		session.captureCurrentOrigin(ctx, pageURL, origins)
 		ready, readyErr := session.client.evaluateBool(ctx, session.contextID, promptReadyExpression)
 		if readyErr != nil && !retryablePageEvaluation(readyErr) {
@@ -315,6 +318,9 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 			if err := session.finishOnboarding(ctx, &onboarding); err != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return "", ctxErr
+				}
+				if errors.Is(err, ErrServiceNotAllowed) {
+					return "", err
 				}
 				automatic = false
 			} else if err := session.navigateAIStudio(ctx); err != nil {
@@ -329,44 +335,56 @@ func (session *loginSession) waitLogin(ctx context.Context, origins map[string]s
 }
 
 // waitVerification 用已有登录态打开 AI Studio，等输入框就绪（已登录）或跳到登录页（已失效）。停在首次使用页时自动完成
-// （只勾必选项，次数上限同启动）并重新载入对话页，之后继续等输入框；没能完成时以 OnboardingFailedPrefix 失败（不是登录失效）
-func (session *loginSession) waitVerification(ctx context.Context) (string, bool, string, error) {
+// （只勾必选项，次数上限同启动）并重新载入对话页，之后继续等输入框；没能完成时以 OnboardingFailedPrefix 失败（不是登录失效）。
+// 页面被跳到组织停用页（access.workspace.google.com，完成首次使用途中被跳过去也一样）时立即返回未通过、OrgDisabled 为真，
+// 原因为 ServiceNotAllowedPrefix，不等到验证超时（原先要等满 5 分钟），也不是登录失效。返回值的 VerifiedAt 由调用方填写
+func (session *loginSession) waitVerification(ctx context.Context) (LoginVerification, error) {
 	var onboarding onboardingBudget
+	orgDisabled := func(pageURL string) LoginVerification {
+		return LoginVerification{PageURL: pageURL, Reason: ServiceNotAllowedPrefix, OrgDisabled: true}
+	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return "", false, "", err
+			return LoginVerification{}, err
 		}
 		pageURL, err := session.client.evaluateString(ctx, session.contextID, "location.href")
 		if err != nil {
 			if !retryablePageEvaluation(err) {
-				return "", false, "", fmt.Errorf("读取隔离验证页面: %w", err)
+				return LoginVerification{}, fmt.Errorf("读取隔离验证页面: %w", err)
 			}
 			if err := waitContext(ctx, 200*time.Millisecond); err != nil {
-				return "", false, "", err
+				return LoginVerification{}, err
 			}
 			continue
 		}
+		if isServiceNotAllowedURL(pageURL) {
+			return orgDisabled(pageURL), nil
+		}
 		if isGoogleLoginURL(pageURL) {
-			return pageURL, false, "AI Studio 登录已失效", nil
+			return LoginVerification{PageURL: pageURL, Reason: "AI Studio 登录已失效"}, nil
 		}
 		ready, err := session.client.evaluateBool(ctx, session.contextID, promptReadyExpression)
 		if err != nil && !retryablePageEvaluation(err) {
-			return "", false, "", fmt.Errorf("检查隔离验证页面: %w", err)
+			return LoginVerification{}, fmt.Errorf("检查隔离验证页面: %w", err)
 		}
 		if err == nil && ready && strings.HasPrefix(pageURL, aiStudioOrigin+"/") {
-			return pageURL, true, "", nil
+			return LoginVerification{PageURL: pageURL, Authenticated: true}, nil
 		}
 		if session.atOnboarding(ctx, pageURL) {
 			if err := session.finishOnboarding(ctx, &onboarding); err != nil {
-				return "", false, "", err
+				var blocked *ServiceNotAllowedError
+				if errors.As(err, &blocked) {
+					return orgDisabled("https://" + blocked.URL), nil
+				}
+				return LoginVerification{}, err
 			}
 			if err := session.navigateAIStudio(ctx); err != nil {
-				return "", false, "", err
+				return LoginVerification{}, err
 			}
 			continue
 		}
 		if err := waitContext(ctx, 200*time.Millisecond); err != nil {
-			return "", false, "", err
+			return LoginVerification{}, err
 		}
 	}
 }

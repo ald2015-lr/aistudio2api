@@ -258,10 +258,11 @@ func forbiddenCooldown(_ string, cooldown aistudio.CooldownState) bool {
 		strings.HasSuffix(cooldown.Reason, forbiddenPauseReasonSuffix)
 }
 
-// isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）
+// isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）。“AI Studio app is disabled”（账号所属组织停用了 AI Studio，
+// 见 org_disabled.go）是账户级的，不算：不写单模型冷却、不计多模型连续 403，也不登记为 403 无权限账户
 func isPermissionDenied(err error) bool {
 	var rpcError *aistudio.RPCError
-	if !errors.As(err, &rpcError) {
+	if !errors.As(err, &rpcError) || aistudio.OrgDisabledFailure(err) {
 		return false
 	}
 	return rpcError.StatusCode == http.StatusForbidden && (rpcError.Code == 7 || rpcError.Code == 0)

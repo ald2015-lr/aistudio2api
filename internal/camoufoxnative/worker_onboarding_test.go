@@ -447,7 +447,8 @@ func TestWaitVerificationOnboarding(t *testing.T) {
 		}}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		pageURL, authenticated, reason, err := session.waitVerification(ctx)
+		verification, err := session.waitVerification(ctx)
+		pageURL, authenticated, reason := verification.PageURL, verification.Authenticated, verification.Reason
 		if len(results) != 1 || results[0].Checked != 1 || results[0].Button != "続行" {
 			t.Fatalf("完成后应报告一次（供验证日志）: %+v", results)
 		}
@@ -465,7 +466,8 @@ func TestWaitVerificationOnboarding(t *testing.T) {
 		session := &loginSession{client: page.client, contextID: "ctx-1"}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, authenticated, _, err := session.waitVerification(ctx)
+		verification, err := session.waitVerification(ctx)
+		authenticated := verification.Authenticated
 		if err == nil || authenticated || !strings.HasPrefix(err.Error(), OnboardingFailedPrefix+": 已自动完成 2 次仍回到首次使用页") {
 			t.Fatalf("超过上限应以固定前缀失败: %t %v", authenticated, err)
 		}

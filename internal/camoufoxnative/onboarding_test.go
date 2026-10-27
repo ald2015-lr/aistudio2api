@@ -658,7 +658,12 @@ const results = {};
   mount(h('body', {}, h('ms-onboarding', {}, h('input', {type: 'checkbox'}))), '/onboarding');
   location.hostname = 'example.com';
   const otherSite = evaluate('detect');
-  results.F = {chatPage, disclaimerOnly, tourOnly, otherSite};
+  // 组织停用页（access.workspace.google.com 的 ServiceNotAllowed）：就绪条件立刻成立（不再等满 120 秒），不算首次使用页，一步式表达式返回 left
+  mount(h('body', {}, h('div', {}, 'Admin We are sorry, but you do not have access to AI Studio.')), '/ServiceNotAllowed');
+  location.hostname = 'access.workspace.google.com';
+  location.href = 'https://access.workspace.google.com/ServiceNotAllowed?application=1&continue=https://aistudio.google.com/prompts/new_chat';
+  const serviceNotAllowed = {detect: evaluate('detect'), ready: evaluate('ready'), step: run('step')};
+  results.F = {chatPage, disclaimerOnly, tourOnly, otherSite, serviceNotAllowed};
 }
 // IS：用途调查一步（中文与英文界面，照线上结构，见 surveyStep）：作用域外有“Skip to main content”、全局横幅与（英文界面）Cookie 横幅
 // “Agree”，作用域里“跳过”前面另有一个“跳到主要内容”/“Skip to main content”。没有必选项与条款、年龄勾选框，不涉及同意：不带 skip 时
@@ -1148,10 +1153,17 @@ func TestOnboardingStepExpressionInNode(t *testing.T) {
 			Step          onboardingStepReply
 		}
 		DisclaimerOnly, TourOnly, OtherSite bool
+		ServiceNotAllowed                   struct {
+			Detect, Ready bool
+			Step          onboardingStepReply
+		}
 	}
 	scenario("F", &f)
 	if f.ChatPage.Detect || !f.ChatPage.Ready || f.ChatPage.Step.State != "left" {
 		t.Fatalf("F：对话页（输入框可见）不算首次使用页，一步式表达式返回 left: %+v", f.ChatPage)
+	}
+	if f.ServiceNotAllowed.Detect || !f.ServiceNotAllowed.Ready || f.ServiceNotAllowed.Step.State != "left" {
+		t.Fatalf("F：组织停用页应立刻满足就绪条件、不算首次使用页: %+v", f.ServiceNotAllowed)
 	}
 	if !f.DisclaimerOnly || f.TourOnly || f.OtherSite {
 		t.Fatalf("F：识别 disclaimer=%t tour=%t other=%t，期望 true false false", f.DisclaimerOnly, f.TourOnly, f.OtherSite)

@@ -356,6 +356,18 @@ Worker 同样按账户当前所在的号池分为普通分区与 Ultra 分区（
 - **缓存自愈**：首次使用页上的失败（`onboardingFailure`，以及失败时页面停在首次使用页的 `onboardingInterrupted`）与浏览器缓存无关，`PageStateFailure` 不算页面状态类，不清缓存。
 - **限制**：真实 DOM 结构只有失败时的快照与结构摘要，规则按常见的 Angular Material 结构、线上用途调查一步的结构与多语言文字写成；用途调查之后几步的按钮文字未知（结尾页按继续类关键词找），结尾页的按钮是链接样式（`a[href]`）时同样不点、以 `找不到可点的继续按钮` 失败，结构摘要的 `parts`、`links` 与 `已做` 可据此补规则；页面要求滚动到底才启用按钮、继续是链接样式（`a[href]`，不点链接）、必选项没有任何必选标记且标签不含服务条款与年龄关键词、或服务条款项的标签恰好含邮件通知类关键词时完成不了，以 `等待超时（继续按钮未启用）` 或 `找不到可点的继续按钮` 失败，结构摘要（`by`、`skip`、`links`、`bodyBoxes`）可据此补规则。保存的 localStorage 只补缺：页面完成首次使用时删掉某个保存过的键再要求首次使用，重新导航会被补回旧值，这时完成 2 次后失败（完成时的写回替换整个 origin，下次启动起不再补回这个键）。
 
+### 组织停用 AI Studio 的账户
+
+Google Workspace 账号所属组织（或 Google）关闭了 AI Studio 时，载入 AI Studio 被跳到 `access.workspace.google.com`（ServiceNotAllowed 等页），RPC（`GetAiStudioBenefitTier`、`ListModels`、`GenerateContent` 等）返回 HTTP 403、协议错误码 7（或没有协议错误码）、文案含 `AI Studio app is disabled`。两者都满足 `errors.Is(err, aistudio.ErrOrgDisabled)`（与 `camoufoxnative.ErrServiceNotAllowed` 是同一个哨兵）；单模型 403（`The caller does not have permission`）不算，仍按单模型冷却与 403 无权限账户处理，组织停用也不算登录失效。
+
+- 识别：Worker 启动的就绪条件遇到 `location.hostname === 'access.workspace.google.com'` 立即成立，bootstrap 读到这个地址（以及填写提示词、首次使用页处理、订阅网络事件之后的失败处地址或页面快照在这一页）时以 `camoufoxnative.ServiceNotAllowedError` 失败，文案 `AI Studio 已被账号所属组织停用 url=<host+path>[ | 页面=…]`，不再等满 120 秒或 `INIT_TIMEOUT`；`PageStateFailure` 不算它（不清浏览器缓存）。隔离验证（`waitVerification`）遇到时立即返回未通过、`OrgDisabled=true`、原因 `AI Studio 已被账号所属组织停用`（不等 5 分钟）；交互式登录（`waitLogin`）遇到时以同一错误结束。
+- 进入：启动（`startAuthenticatedWorker`，续签后的第二次启动同样识别）、模型目录（aistudio 的目录同步；启动与 aistudio 内部识别都经 `AccountPool.ReportOrgDisabled` 交给 `newTrackedService` 用 `SetOrgDisabledReporter` 挂上的回调，`newRuntime` 的装配由 `TestOrgDisabledRuntimeWiring` 覆盖）、验证（管理验证与新账户自动处理）、登录（管理页对已有账户浏览器登录落到组织停用页，且用账户已保存的认证文件复核 `ProbeLogin` 同样返回 app is disabled；落到这一页时还读不到登录邮箱，可见浏览器里登录的可能是别的账号，复核通过、401 或出错时只报告登录失败、写一行警告，账户状态不变）、请求（生成请求；CountTokens、上传、视频等 aistudio 自己处理的失败同样回调）与登录复核（疑似登录失效与需要登录账户的定期复核，`ProbeLogin` 返回 app is disabled：移出疑似、解除疑似冷却、移出定期复核，底层状态不改）都进入同一状态：账户池记标记（`AccountPool.MarkOrgDisabled`），对外状态为 `org_disabled`、`message` 为固定文案；登记表记下第一次与最近一次的来源、时间、次数、打码截短的原文与登录签名指纹；驻留 Worker 登记释放（空闲即关，忙碌等请求结束；不再给它新租约，正在输出的请求不中断），启动中的 Worker 启动完成后不发布、立即关闭，排队等冷启动名额的启动拿到名额后立即让出（不申请出口、不启动浏览器）；同一账户只写一行 `账号所属组织已停用 AI Studio，停止调度`。
+- 调度：标记不覆盖底层状态（就绪、需要登录等照常写入），候选索引、选号与状态推导按 `org_disabled` 处理：不固定账户与指定账户的选号、候选分类（预热、替补、按需扩容、现场启动）、可接替与备用统计、换号上限的可调度计数都不算它，新账户自动处理直接记为跳过，登录复核的定期复核（`AuthRequiredAccountIDs`）不取它；管理操作（验证、登录、删除、目录复查）仍能取得独占租约。停用账户仍显示为 `disabled`、不计入 `org_disabled`。
+- 模型目录：不再按失败重试（原先每分钟一次），只排长间隔复查（`catalogPriorityOrgRecheck`，24 小时 ×U(0.9,1.1)，时间记在登记表、重启后照旧）；复查仍返回 app is disabled 时顺延，成功时清除状态。复查遇到其他失败（5xx、网络、代理不通、空目录、401 等，上游 429 照常全局暂停）时仍是组织停用，`orgRecheckFailedLocked` 按连续没有结论的次数从 1 分钟起翻倍顺延（±20%，上限 24 小时），401 直接顺延一个完整的复查间隔，顺延后的时间与次数（`recheck_failures`）写回登记表；已排着的复查只往后顺延、不提前，失败次数不清零（原先每分钟对照账户池时把任务改回已经过去的复查时间、次数清零，退避停在第一档）。复查时间还没到的同步（管理操作）不改复查时间。状态清除（认证文件更新、管理员清除）后 `orgCleared` 把任务改回常规优先级（按 `classifyLocked`：没有目录为缺失）、立即到期，原先任务仍按 24 小时后的复查排着，没有目录的账户约一天都不是任何模型的候选。
+- 持久化：账户目录下的 `.org-disabled.json`（几秒合并、原子写、生成服务关闭时立即写出，同一进程内同一目录共用一份）；启动时在载入账户池后对照：登录签名与登记时不同（服务停止期间替换了认证文件）的清除，目录已删除的清除记录，其余恢复标记。
+- 清除：认证文件更新（外部替换、重新导入、浏览器登录、新增账户，以及服务停止期间替换，识别方式与 403 无权限账户相同：登录签名变了，或列出的账户磁盘内容与内存不同；本服务自己续签与写回只更新记下的签名）、管理员清除（`POST /api/accounts/org-disabled/clear`）、管理验证通过（浏览器停在 AI Studio 输入框且接口复核通过，在随后的目录同步之前清除：同步遇到上游 429 等失败时不再提示验证通过却仍是组织停用；接口复核出错时不清除）、长间隔复查通过。清除后底层状态原样恢复，立即重新参与调度，模型目录立即按常规同步一次（仍是组织停用时重新进入）；删除账户或目录消失时记录随之清除。
+- 接口：`AdminAccountCounts.org_disabled` 为组织停用的启用账户数；`AdminAccount.org_disabled` 为账户池的标记（不区分是否启用，停用账户的 `state` 仍为 `disabled`、`message` 接上原因），验证接口在验证遇到组织停用时同样带上，前端据此提示组织停用、批量验证单独计数，不按 `state` 判断；`GET /api/accounts/permission-denied` 另带 `org_disabled`（`AdminOrgDisabled` 列表：`id`、`label`、`source`、`last_source`、`count`、`first_at`、`last_at`、`check_at`、`message`，按最近一次从新到旧；管理服务没有实现时省略）；`POST /api/accounts/org-disabled/clear` 请求体同 403 清除接口，返回 `{"cleared":N}`。
+
 ### 429 治理：换号上限、出口限流、目录缓存与登录复核
 
 线上单出口直连、1.2 万账号时出现过“无缘无故 429”：额度类 429 换号没有上限、号池级保护从不触发、逐级冷却把驻留 Worker 盖成死槽位再淘汰冷启动、每次重启全量同步模型目录、需要登录的驻留 Worker 一直占着槽位、一次 401 就判死且永不恢复。现在的设计：
@@ -622,7 +634,7 @@ Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不�
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
-| 403 无权限账户 | `GET /api/accounts/permission-denied`、`POST /api/accounts/permission-denied/clear` |
+| 403 无权限账户与组织停用账户 | `GET /api/accounts/permission-denied`（另带 `org_disabled`）、`POST /api/accounts/permission-denied/clear`、`POST /api/accounts/org-disabled/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 
 `/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。`authMiddleware` 经 `requestAPIKeyMatches` 逐个比较 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`Api-Key` 与 `Authorization: Bearer`（`bearerToken`），每个来源都按常量时间比较，任一相同即放行并标记访问日志已通过校验；不再只取优先级最高的一个来源。

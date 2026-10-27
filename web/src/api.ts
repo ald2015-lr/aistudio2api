@@ -16,6 +16,7 @@ import type {
   PlaygroundMedia,
   Cooldown,
   FollowDefaultProxyResult,
+  OrgDisabledAccount,
   PermissionDeniedAccount,
   ProxyPoolConfig,
   ProxyTestResult,
@@ -51,8 +52,16 @@ interface RequestsResponse {
   requests: RequestSummary[]
 }
 
+// PermissionDeniedResponse 为 403 无权限账户列表；org_disabled 为所属组织停用了 AI Studio 的账户（旧版服务没有这个字段）
 interface PermissionDeniedResponse {
-  accounts: PermissionDeniedAccount[]
+  accounts: PermissionDeniedAccount[] | null
+  org_disabled?: OrgDisabledAccount[] | null
+}
+
+// AccountProblemLists 为账户页上方单独列出的两类账户
+export interface AccountProblemLists {
+  permissionDenied: PermissionDeniedAccount[]
+  orgDisabled: OrgDisabledAccount[]
 }
 
 interface PermissionDeniedClearResponse {
@@ -231,9 +240,20 @@ export const api = {
   models: async () => (await requestJSON<ModelsResponse>('/api/models')).models,
   cooldowns: async () => (await requestJSON<CooldownsResponse>('/api/cooldowns')).cooldowns,
   permissionDenied: async () =>
-    (await requestJSON<PermissionDeniedResponse>('/api/accounts/permission-denied')).accounts,
+    (await requestJSON<PermissionDeniedResponse>('/api/accounts/permission-denied')).accounts ?? [],
+  // accountProblemLists 一次读取 403 无权限账户与所属组织停用了 AI Studio 的账户（同一个接口）
+  accountProblemLists: async (): Promise<AccountProblemLists> => {
+    const body = await requestJSON<PermissionDeniedResponse>('/api/accounts/permission-denied')
+    return { permissionDenied: body.accounts ?? [], orgDisabled: body.org_disabled ?? [] }
+  },
   clearPermissionDenied: (input: { account_ids?: string[]; all?: boolean }) =>
     requestJSON<PermissionDeniedClearResponse>('/api/accounts/permission-denied/clear', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  // clearOrgDisabled 清除组织停用账户的状态：立即恢复调度（仍是组织停用时会重新列出）
+  clearOrgDisabled: (input: { account_ids?: string[]; all?: boolean }) =>
+    requestJSON<PermissionDeniedClearResponse>('/api/accounts/org-disabled/clear', {
       method: 'POST',
       body: JSON.stringify(input),
     }),

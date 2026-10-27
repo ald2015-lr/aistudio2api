@@ -22,6 +22,7 @@ import type {
   AccountState,
   ChromeImportProfile,
   Cooldown,
+  OrgDisabledAccount,
   PermissionDeniedAccount,
   ProxyPoolAssignment,
   ProxyPoolStatus,
@@ -176,15 +177,59 @@ const visiblePermissionDenied = computed(() =>
     : permissionDenied.value.slice(0, PERMISSION_DENIED_COLLAPSED),
 )
 
-// loadPermissionDenied 读取 403 无权限账户列表；失败时保留上一次的列表（旧版服务没有这个接口时不显示）
+// 所属组织停用了 AI Studio 的账户（与 403 无权限账户同一个接口读取、同一节奏刷新；旧版服务没有时为空、不显示）
+const orgDisabled = ref<OrgDisabledAccount[]>([])
+const showAllOrgDisabled = ref(false)
+const orgDisabledClearing = ref(false)
+const orgDisabledDeleting = ref(false)
+
+const visibleOrgDisabled = computed(() =>
+  showAllOrgDisabled.value
+    ? orgDisabled.value
+    : orgDisabled.value.slice(0, PERMISSION_DENIED_COLLAPSED),
+)
+
+// orgDisabledSourceKeys 为服务端来源（启动、模型目录、验证、登录、请求、登录复核）的界面文案；不认识的来源原样显示
+const orgDisabledSourceKeys: Record<string, TranslationKey> = {
+  启动: 'accounts.orgDisabledSourceStartup',
+  模型目录: 'accounts.orgDisabledSourceCatalog',
+  验证: 'accounts.orgDisabledSourceVerify',
+  登录: 'accounts.orgDisabledSourceLogin',
+  请求: 'accounts.orgDisabledSourceRequest',
+  登录复核: 'accounts.orgDisabledSourceRecheck',
+}
+
+function orgDisabledSource(source: string): string {
+  const key = orgDisabledSourceKeys[source]
+  return key === undefined ? source : t(key)
+}
+
+// orgDisabledSources 为来源一栏：第一次进入的来源，最近一次不同时接在后面
+function orgDisabledSources(account: OrgDisabledAccount): string {
+  const first = orgDisabledSource(account.source)
+  if (account.last_source === '' || account.last_source === account.source) return first
+  return `${first} → ${orgDisabledSource(account.last_source)}`
+}
+
+// applyProblemLists 写入一次读取的两份列表
+function applyProblemLists(lists: {
+  permissionDenied: PermissionDeniedAccount[]
+  orgDisabled: OrgDisabledAccount[]
+}): void {
+  permissionDenied.value = lists.permissionDenied
+  orgDisabled.value = lists.orgDisabled
+  if (orgDisabled.value.length <= PERMISSION_DENIED_COLLAPSED) showAllOrgDisabled.value = false
+}
+
+// loadPermissionDenied 读取 403 无权限账户与组织停用账户列表；失败时保留上一次的列表（旧版服务没有这个接口时不显示）
 async function loadPermissionDenied(): Promise<void> {
   if (permissionDeniedLoading) return
   permissionDeniedLoading = true
   permissionDeniedLoadedAt = Date.now()
   const version = permissionDeniedVersion
   try {
-    const accounts = await api.permissionDenied()
-    if (version === permissionDeniedVersion) permissionDenied.value = accounts
+    const lists = await api.accountProblemLists()
+    if (version === permissionDeniedVersion) applyProblemLists(lists)
   } catch {
     // 保留上一次的列表
   } finally {
@@ -242,15 +287,25 @@ function formatDateTime(value: string): string {
 
 // downloadPermissionDenied 下载 403 无权限账户的邮箱列表（txt，每行一个，与复制的内容相同）
 function downloadPermissionDenied(): void {
-  if (permissionDenied.value.length === 0) return
-  const text = `${permissionDenied.value.map((account) => account.label).join('\n')}\n`
+  downloadEmails(permissionDenied.value, 'permission-denied-accounts')
+}
+
+// downloadOrgDisabled 下载组织停用账户的邮箱列表（txt，每行一个）
+function downloadOrgDisabled(): void {
+  downloadEmails(orgDisabled.value, 'org-disabled-accounts')
+}
+
+// downloadEmails 把账户邮箱下载为 txt（每行一个），文件名为 prefix 加时间
+function downloadEmails(accounts: readonly { label: string }[], prefix: string): void {
+  if (accounts.length === 0) return
+  const text = `${accounts.map((account) => account.label).join('\n')}\n`
   const url = URL.createObjectURL(new Blob([text], { type: 'text/plain;charset=utf-8' }))
   const now = new Date()
   const pad = (value: number) => String(value).padStart(2, '0')
   const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
   const link = document.createElement('a')
   link.href = url
-  link.download = `permission-denied-accounts-${stamp}.txt`
+  link.download = `${prefix}-${stamp}.txt`
   document.body.appendChild(link)
   link.click()
   link.remove()
@@ -277,6 +332,32 @@ async function clearPermissionDenied(): Promise<void> {
     actionError(error)
   } finally {
     permissionDeniedClearing.value = false
+  }
+}
+
+// clearOrgDisabled 清除全部组织停用账户的状态，立即恢复调度（仍被组织停用的账户再次启动或同步时重新列出）
+async function clearOrgDisabled(): Promise<void> {
+  const count = orgDisabled.value.length
+  if (count === 0) return
+  if (
+    !(await confirmAction(
+      tf('accounts.orgDisabledClearConfirm', { count }),
+      t('accounts.orgDisabledClear'),
+    ))
+  )
+    return
+  orgDisabledClearing.value = true
+  try {
+    const result = await api.clearOrgDisabled({ all: true })
+    permissionDeniedVersion += 1
+    orgDisabled.value = []
+    showAllOrgDisabled.value = false
+    emit('notice', tf('accounts.orgDisabledCleared', { count: result.cleared }), 'success')
+    emit('refresh')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    orgDisabledClearing.value = false
   }
 }
 
@@ -314,6 +395,7 @@ const stateKeys: Record<AccountState, TranslationKey> = {
   auth_required: 'state.auth_required',
   unavailable: 'state.unavailable',
   disabled: 'state.disabled',
+  org_disabled: 'state.org_disabled',
 }
 
 const stateDotClass: Record<AccountState, string> = {
@@ -323,6 +405,7 @@ const stateDotClass: Record<AccountState, string> = {
   auth_required: 'bg-red-500',
   unavailable: 'bg-red-500',
   disabled: 'bg-gray-600',
+  org_disabled: 'bg-orange-500',
 }
 
 const stateTextClass: Record<AccountState, string> = {
@@ -332,6 +415,7 @@ const stateTextClass: Record<AccountState, string> = {
   auth_required: 'text-red-400',
   unavailable: 'text-red-400',
   disabled: 'text-gray-500',
+  org_disabled: 'text-orange-400',
 }
 
 function messageOf(error: unknown): string {
@@ -477,7 +561,17 @@ async function toggleAccount(account: Account): Promise<void> {
   }
 }
 
-// runAccountAction 执行登录或会话验证：验证按返回的 authenticated 提示“有效”或“登录已失效”（HTTP 200 只表示验证做完了）
+// verifiedOrgDisabled 判断验证未通过是否因为账号所属组织停用了 AI Studio：停用账户的状态始终是 disabled，
+// 按服务端的 org_disabled 判断（兼容只返回 state 为 org_disabled 的旧服务）
+function verifiedOrgDisabled(verified: Account): boolean {
+  return (
+    verified.authenticated === false &&
+    (verified.org_disabled === true || verified.state === 'org_disabled')
+  )
+}
+
+// runAccountAction 执行登录或会话验证：验证按返回的 authenticated 提示“有效”或“登录已失效”（HTTP 200 只表示验证做完了）；
+// 未通过且所属组织停用了 AI Studio 时（见 verifiedOrgDisabled）提示组织停用（不是登录失效，重新登录也没用）
 async function runAccountAction(account: Account, action: 'login' | 'verify'): Promise<void> {
   pendingAction.value = `${action}:${account.id}`
   try {
@@ -489,7 +583,9 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
     }
     const verified = await api.verifyAccount(account.id)
     emit('refresh')
-    if (verified.authenticated === false) {
+    if (verifiedOrgDisabled(verified)) {
+      emit('notice', t('accounts.verifyOrgDisabled'), 'error')
+    } else if (verified.authenticated === false) {
       emit(
         'notice',
         tf('accounts.verifyInvalid', { reason: verified.verify_reason || verified.message || '-' }),
@@ -534,16 +630,18 @@ const filterStates: AccountState[] = [
   'busy',
   'cooldown',
   'auth_required',
+  'org_disabled',
   'unavailable',
   'disabled',
 ]
 const stateOrder: Record<AccountState, number> = {
   auth_required: 0,
-  unavailable: 1,
-  cooldown: 2,
-  busy: 3,
-  ready: 4,
-  disabled: 5,
+  org_disabled: 1,
+  unavailable: 2,
+  cooldown: 3,
+  busy: 4,
+  ready: 5,
+  disabled: 6,
 }
 const sortOptions: { value: SortKey; label: TranslationKey }[] = [
   { value: 'default', label: 'accounts.sortDefault' },
@@ -710,6 +808,7 @@ const stateCounts = computed(() => {
     auth_required: 0,
     unavailable: 0,
     disabled: 0,
+    org_disabled: 0,
   }
   for (const account of props.accounts) counts[account.state] += 1
   return counts
@@ -852,6 +951,13 @@ const bulkLabel = computed(() => (bulk.action === '' ? '' : t(bulkActionKeys[bul
 const bulkPercent = computed(() =>
   bulk.total === 0 ? 0 : Math.round((bulk.done / bulk.total) * 100),
 )
+// bulkOrgDisabled 为批量验证里账号所属组织停用了 AI Studio 的账户数（计在未通过里，与登录失效分开显示），
+// bulkExpired 为其余的登录失效数；有组织停用的账户时明细标题改为“未通过明细”
+const bulkOrgDisabled = computed(() => bulk.invalid.filter((entry) => entry.orgDisabled).length)
+const bulkExpired = computed(() => bulk.invalid.length - bulkOrgDisabled.value)
+const bulkInvalidListKey = computed<TranslationKey>(() =>
+  bulkOrgDisabled.value > 0 ? 'accounts.progressNotPassedList' : 'accounts.progressInvalidList',
+)
 const busy = computed(() => bulk.running || pendingAction.value !== '')
 
 const disabledAccounts = computed(() => props.accounts.filter((account) => !account.enabled))
@@ -886,17 +992,17 @@ async function startBulk(
   finishBulk(action)
 }
 
-// finishBulk 批量任务结束后刷新数据并给出汇总通知：批量验证按“有效 / 登录失效 / 出错”三项汇总
+// finishBulk 批量任务结束后刷新数据并给出汇总通知：批量验证按“有效 / 登录失效 / 出错”三项汇总，有组织停用的账户时另列一项
 function finishBulk(action: BulkAction): void {
   emit('refresh')
   if (action === 'verify') {
+    const org = bulkOrgDisabled.value
+    const counts = { ok: bulk.succeeded, invalid: bulkExpired.value, failed: bulk.failures.length }
     emit(
       'notice',
-      tf('accounts.verifyResult', {
-        ok: bulk.succeeded,
-        invalid: bulk.invalid.length,
-        failed: bulk.failures.length,
-      }),
+      org > 0
+        ? tf('accounts.verifyResultOrgDisabled', { ...counts, org })
+        : tf('accounts.verifyResult', counts),
       bulk.failures.length === 0 && bulk.invalid.length === 0 ? 'success' : 'error',
     )
     return
@@ -958,34 +1064,59 @@ const PERMISSION_DENIED_DELETE_FAILURES_SHOWN = 3
 
 const permissionDeniedDeleting = ref(false)
 
-// readPermissionDeniedNow 立即重新读取 403 无权限账户列表（不受 15 秒刷新间隔限制）；读取失败时保留当前列表
+// ListedKind 为一键删除针对的列表：403 无权限账户或组织停用账户
+type ListedKind = 'permissionDenied' | 'orgDisabled'
+
+// listedAccounts 返回该列表当前的账户
+function listedAccounts(kind: ListedKind): readonly BulkTarget[] {
+  return kind === 'permissionDenied' ? permissionDenied.value : orgDisabled.value
+}
+
+// readPermissionDeniedNow 立即重新读取 403 无权限账户与组织停用账户列表（不受 15 秒刷新间隔限制）；读取失败时保留当前列表
 async function readPermissionDeniedNow(): Promise<void> {
   try {
-    const accounts = await api.permissionDenied()
+    const lists = await api.accountProblemLists()
     // 之前发出、之后才返回的读取结果不再覆盖这次读取
     permissionDeniedVersion += 1
-    permissionDenied.value = accounts
+    applyProblemLists(lists)
     permissionDeniedLoadedAt = Date.now()
   } catch {
     // 保留当前列表
   }
 }
 
-// stillPermissionDenied 返回仍在当前 403 无权限账户列表里的账户（账户 ID 按原样对照，与服务端一致）
-function stillPermissionDenied<T extends BulkTarget>(accounts: readonly T[]): T[] {
-  const listed = new Set(permissionDenied.value.map((account) => account.id))
+// stillListed 返回仍在该列表里的账户（账户 ID 按原样对照，与服务端一致）
+function stillListed<T extends BulkTarget>(kind: ListedKind, accounts: readonly T[]): T[] {
+  const listed = new Set(listedAccounts(kind).map((account) => account.id))
   return accounts.filter((account) => listed.has(account.id))
 }
 
-// deletePermissionDenied 一键删除 403 无权限账户：删除完整列表（包括折叠未显示的）中的账户及其认证目录，
-// 与单个“删除”效果相同，服务端同时清除它们的 403 记录。按 500 个一批调用批量删除接口，进度与失败明细显示在
-// 批量进度面板；正在处理请求的账户由服务端等它空闲后删除，等不到的列为失败。完成后刷新 403 列表与账户列表。
+// deletePermissionDenied 一键删除 403 无权限账户（见 deleteListed）
+async function deletePermissionDenied(): Promise<void> {
+  await deleteListed('permissionDenied')
+}
+
+// deleteOrgDisabled 一键删除组织停用账户（见 deleteListed）：这些账户重新登录也没用，只能换号
+async function deleteOrgDisabled(): Promise<void> {
+  await deleteListed('orgDisabled')
+}
+
+// deleteListed 一键删除列表里的账户：删除完整列表（包括折叠未显示的）中的账户及其认证目录，
+// 与单个“删除”效果相同，服务端同时清除它们的 403 与组织停用记录。按 500 个一批调用批量删除接口，进度与失败明细显示在
+// 批量进度面板；正在处理请求的账户由服务端等它空闲后删除，等不到的列为失败。完成后刷新列表与账户列表。
 // 确认框打开期间列表可能已经变化：重新上传了认证文件的账户会被服务端移出列表，这时再删除就会连同新的认证文件一起删掉。
 // 所以确认后先重新读取一次列表，每批提交前再与当前列表对照，只删除确认时列出、提交时仍在列表里的账户；
 // 确认后才列出的账户没有经过确认，也不删除
-async function deletePermissionDenied(): Promise<void> {
-  const confirmed = permissionDenied.value.map(({ id, label }) => ({ id, label }))
-  if (busy.value || permissionDeniedDeleting.value || confirmed.length === 0) return
+async function deleteListed(kind: ListedKind): Promise<void> {
+  const deleting = kind === 'permissionDenied' ? permissionDeniedDeleting : orgDisabledDeleting
+  const confirmed = listedAccounts(kind).map(({ id, label }) => ({ id, label }))
+  if (
+    busy.value ||
+    permissionDeniedDeleting.value ||
+    orgDisabledDeleting.value ||
+    confirmed.length === 0
+  )
+    return
   if (
     !(await confirmAction(
       tf('accounts.permissionDeniedDeleteConfirm', { count: confirmed.length }),
@@ -993,22 +1124,22 @@ async function deletePermissionDenied(): Promise<void> {
     ))
   )
     return
-  if (busy.value || permissionDeniedDeleting.value) return
-  permissionDeniedDeleting.value = true
+  if (busy.value || permissionDeniedDeleting.value || orgDisabledDeleting.value) return
+  deleting.value = true
   // skipped 为确认后已移出列表、没有删除的账户数
   const totals = { deleted: 0, missing: 0, remaining: 0, skipped: 0 }
-  // removed 为已删除或号池里已经没有的账户，服务端已清除它们的 403 记录
+  // removed 为已删除或号池里已经没有的账户，服务端已清除它们的记录
   const removed = new Set<string>()
   let failures: BulkFailure[] = []
   try {
     await readPermissionDeniedNow()
-    const targets = stillPermissionDenied(confirmed)
+    const targets = stillListed(kind, confirmed)
     totals.skipped = confirmed.length - targets.length
     if (targets.length > 0) {
       bulkPanelOpen.value = true
       await runChunkedBulk(bulk, 'delete', targets, PERMISSION_DENIED_DELETE_CHUNK, async (chunk) => {
         // 前面几批删除期间列表可能又刷新过
-        const listed = stillPermissionDenied(chunk)
+        const listed = stillListed(kind, chunk)
         totals.skipped += chunk.length - listed.length
         if (listed.length === 0) return { succeeded: 0, failures: [] }
         const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
@@ -1039,13 +1170,17 @@ async function deletePermissionDenied(): Promise<void> {
       failures = bulk.failures
     }
   } finally {
-    permissionDeniedDeleting.value = false
+    deleting.value = false
   }
   // 删除前发出、删除后才返回的读取结果不再覆盖列表；先移除已删除的账户，再重新读取
   permissionDeniedVersion += 1
   permissionDenied.value = permissionDenied.value.filter((account) => !removed.has(account.id))
+  orgDisabled.value = orgDisabled.value.filter((account) => !removed.has(account.id))
   if (permissionDenied.value.length <= PERMISSION_DENIED_COLLAPSED) {
     showAllPermissionDenied.value = false
+  }
+  if (orgDisabled.value.length <= PERMISSION_DENIED_COLLAPSED) {
+    showAllOrgDisabled.value = false
   }
   void loadPermissionDenied()
   emit('refresh')
@@ -1092,6 +1227,9 @@ async function startVerify(): Promise<void> {
   }
   await startBulk('verify', targets, verifyConcurrency.value, async (account) => {
     const verified = await api.verifyAccount(account.id)
+    if (verifiedOrgDisabled(verified)) {
+      return { invalid: true, orgDisabled: true, message: t('accounts.verifyOrgDisabledReason') }
+    }
     if (verified.authenticated === false) {
       return { invalid: true, message: verified.verify_reason || verified.message || '-' }
     }
@@ -1320,6 +1458,121 @@ function closeBulkPanel(): void {
         </button>
       </div>
 
+      <!-- 组织已停用 AI Studio 的账户：Google Workspace 账号所属组织关闭了 AI Studio，已停止调度；24 小时复查、认证文件更新或恢复调度后解除 -->
+      <div
+        v-if="orgDisabled.length > 0"
+        class="rounded-lg border border-orange-500/30 bg-orange-500/5 p-3 text-sm"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span
+              v-tooltip="t('accounts.orgDisabledHelp')"
+              class="font-bold text-orange-300"
+              tabindex="0"
+            >
+              {{ t('accounts.orgDisabledTitle') }}
+            </span>
+            <span class="text-gray-300">{{ t('accounts.orgDisabledHint') }}</span>
+            <span class="font-mono text-orange-300">
+              {{ tf('accounts.permissionDeniedCount', { count: orgDisabled.length }) }}
+            </span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm"
+              type="button"
+              @click="copyEmails(orgDisabled.map((account) => account.label))"
+            >
+              {{ t('accounts.copyAllEmails') }}
+            </button>
+            <button class="btn btn-sm" type="button" @click="downloadOrgDisabled">
+              {{ t('accounts.permissionDeniedDownload') }}
+            </button>
+            <button
+              class="btn btn-sm"
+              type="button"
+              :disabled="orgDisabledClearing || orgDisabledDeleting"
+              :aria-busy="orgDisabledClearing"
+              @click="clearOrgDisabled"
+            >
+              {{ t('accounts.orgDisabledClear') }}
+            </button>
+            <button
+              v-tooltip="t('accounts.permissionDeniedDeleteHelp')"
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="
+                busy ||
+                orgDisabledDeleting ||
+                permissionDeniedDeleting ||
+                orgDisabledClearing ||
+                orgDisabled.length === 0
+              "
+              :aria-busy="orgDisabledDeleting"
+              @click="deleteOrgDisabled"
+            >
+              {{
+                orgDisabledDeleting
+                  ? tf('accounts.progress', {
+                      action: t('common.delete'),
+                      done: bulk.done,
+                      total: bulk.total,
+                    })
+                  : t('accounts.permissionDeniedDelete')
+              }}
+            </button>
+          </div>
+        </div>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full text-xs">
+            <thead>
+              <tr class="text-left text-gray-500">
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.orgDisabledSource') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedLast') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.orgDisabledNextCheck') }}</th>
+                <th class="py-1 text-right font-normal">
+                  {{ t('accounts.permissionDeniedTimes') }}
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="account in visibleOrgDisabled"
+                :key="account.id"
+                class="border-t border-[#30363d]"
+              >
+                <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
+                <td class="max-w-md py-1 pr-3">
+                  <div class="cell-truncate text-gray-300" :title="account.message ?? ''">
+                    {{ orgDisabledSources(account) }}
+                  </div>
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ formatDateTime(account.last_at) }}
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{ formatDateTime(account.check_at) }}
+                </td>
+                <td class="py-1 text-right font-mono text-orange-300">{{ account.count }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <button
+          v-if="orgDisabled.length > PERMISSION_DENIED_COLLAPSED"
+          class="mt-2 text-xs text-blue-400 hover:underline"
+          type="button"
+          @click="showAllOrgDisabled = !showAllOrgDisabled"
+        >
+          {{
+            showAllOrgDisabled
+              ? t('accounts.cooldownShowLess')
+              : tf('accounts.permissionDeniedShowAll', { count: orgDisabled.length })
+          }}
+        </button>
+      </div>
+
       <!-- 模型冷却概况：按模型统计冷却中的账号与恢复倒计时 -->
       <div v-if="cooldownSummary.entries > 0" class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-sm">
         <div class="flex flex-wrap items-baseline gap-x-4 gap-y-1">
@@ -1402,8 +1655,11 @@ function closeBulkPanel(): void {
               <span class="text-xs text-green-400">
                 {{ tf('accounts.progressValid', { count: bulk.succeeded }) }}
               </span>
-              <span class="text-xs" :class="bulk.invalid.length > 0 ? 'text-yellow-400' : 'text-gray-500'">
-                {{ tf('accounts.progressInvalid', { count: bulk.invalid.length }) }}
+              <span class="text-xs" :class="bulkExpired > 0 ? 'text-yellow-400' : 'text-gray-500'">
+                {{ tf('accounts.progressInvalid', { count: bulkExpired }) }}
+              </span>
+              <span v-if="bulkOrgDisabled > 0" class="text-xs text-yellow-400">
+                {{ tf('accounts.progressOrgDisabled', { count: bulkOrgDisabled }) }}
               </span>
               <span class="text-xs" :class="bulk.failures.length > 0 ? 'text-red-400' : 'text-gray-500'">
                 {{ tf('accounts.progressErrored', { count: bulk.failures.length }) }}
@@ -1455,7 +1711,7 @@ function closeBulkPanel(): void {
         </p>
         <details v-if="bulk.invalid.length > 0" class="mt-2 text-xs">
           <summary class="cursor-pointer text-yellow-400">
-            {{ tf('accounts.progressInvalidList', { count: bulk.invalid.length }) }}
+            {{ tf(bulkInvalidListKey, { count: bulk.invalid.length }) }}
             <button
               class="btn btn-sm ml-2"
               type="button"

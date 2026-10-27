@@ -422,7 +422,7 @@ func (p *AccountPool) fileUploadAccountIDs(scope PoolScope) []string {
 	indices, _ := p.selectionIndicesLocked(AccountSelection{Pool: scope})
 	for _, index := range indices {
 		account := p.accounts[index]
-		if account == nil || !account.Config.Enabled || account.State != AccountReady {
+		if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady {
 			continue
 		}
 		if account.active < p.perAccountConcurrency {

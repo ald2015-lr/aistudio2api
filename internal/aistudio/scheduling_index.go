@@ -211,7 +211,7 @@ func (p *AccountPool) derivedStatesLocked(now time.Time) *schedulingIndex {
 func (index *schedulingIndex) syncAccount(p *AccountPool, account *Account) {
 	position := account.position
 	index.enabled[position] = account.Config.Enabled
-	index.state[position] = account.State
+	index.state[position] = account.schedulingState()
 	index.tier[position] = account.BenefitTier
 	index.globalUntil[position] = cooldownNanos(account.runtime.Cooldowns[globalCooldownKey])
 	index.coolUntil[position] = p.accountCoolingUntilLocked(account)
@@ -365,7 +365,7 @@ func (p *AccountPool) rebuildCandidateSetLocked(set *candidateSet, now time.Time
 // 冷却按每个支持通道取全局与通道作用域中较晚的期限，账户的恢复时间为各通道中最早的（见 accountChannelsCooldown），
 // 期限只在冷却表变化时改变，是否已到期由调度时的时刻决定
 func (p *AccountPool) candidateStateLocked(set *candidateSet, account *Account) int64 {
-	if account == nil || !account.Config.Enabled || account.State != AccountReady || !p.inPoolLocked(set.key.pool, account) {
+	if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady || !p.inPoolLocked(set.key.pool, account) {
 		return 0
 	}
 	var supportedBuffer [4]Channel
@@ -838,7 +838,7 @@ func (p *AccountPool) verifySchedulingIndexLocked() error {
 				account.ID, index.blocked[position], index.active[position], index.draining[position],
 				accountBlocked(account), account.active, account.draining)
 		}
-		if index.enabled[position] != account.Config.Enabled || index.state[position] != account.State ||
+		if index.enabled[position] != account.Config.Enabled || index.state[position] != account.schedulingState() ||
 			index.tier[position] != account.BenefitTier ||
 			index.globalUntil[position] != cooldownNanos(account.runtime.Cooldowns[globalCooldownKey]) ||
 			index.coolUntil[position] != p.accountCoolingUntilLocked(account) {

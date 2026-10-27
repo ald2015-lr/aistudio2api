@@ -241,9 +241,9 @@ func (p *AccountPool) refreshSelectionRuntimesThrottled(ctx context.Context, sel
 	return p.refreshSelectionRuntimes(ctx, selection)
 }
 
-// AccountStateCounts 为各状态的账户数量
+// AccountStateCounts 为各状态的账户数量；OrgDisabled 为所属组织停用了 AI Studio 的启用账户（见 org_disabled.go）
 type AccountStateCounts struct {
-	Total, Ready, Busy, Cooldown, AuthRequired int
+	Total, Ready, Busy, Cooldown, AuthRequired, OrgDisabled int
 }
 
 // StateCounts 一次加锁统计各状态账户数，不构建完整状态。
@@ -290,6 +290,8 @@ func (counts *AccountStateCounts) add(state AccountState) {
 		counts.Cooldown++
 	case AccountAuthRequired:
 		counts.AuthRequired++
+	case AccountOrgDisabled:
+		counts.OrgDisabled++
 	}
 }
 
@@ -388,7 +390,8 @@ type WarmWorkerState struct {
 	Unservable bool
 }
 
-// 账户不可调度的原因（WarmWorkerState.Unschedulable、UnschedulableSet），调度层写进“WAA Worker 释放 | 原因=”
+// 账户不可调度的原因（WarmWorkerState.Unschedulable、UnschedulableSet），调度层写进“WAA Worker 释放 | 原因=”；
+// 所属组织停用了 AI Studio 的原因为 UnschedulableOrgDisabled（见 org_disabled.go）
 const (
 	UnschedulableDisabled     = "已停用"
 	UnschedulableAuthRequired = "需要登录"
@@ -404,6 +407,8 @@ func unschedulableReasonLocked(account *Account) string {
 	switch {
 	case !account.Config.Enabled:
 		return UnschedulableDisabled
+	case account.orgDisabled:
+		return UnschedulableOrgDisabled
 	case account.State == AccountAuthRequired:
 		return UnschedulableAuthRequired
 	case account.State == AccountUnavailable:

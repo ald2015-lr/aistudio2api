@@ -54,7 +54,8 @@ func TakeExternalLoginChanges() []string {
 	return ids
 }
 
-// AccountLoginSummary 为账户目录扫描需要的轻量状态；不统计模型目录，开销远小于 Status
+// AccountLoginSummary 为账户目录扫描需要的轻量状态；不统计模型目录，开销远小于 Status。所属组织停用了 AI Studio 的账户
+// State 为底层状态（认证文件更新时按它决定是否完整重新载入，见 app 的 applyLoginUpdate），OrgDisabled 为真
 type AccountLoginSummary struct {
 	ID          string
 	Enabled     bool
@@ -63,6 +64,8 @@ type AccountLoginSummary struct {
 	Directory   string
 	// FilesMissing 表示账户曾因文件缺失被标为不可用（例如整体替换账户目录期间被访问）
 	FilesMissing bool
+	// OrgDisabled 表示账户带着组织停用的标记（见 org_disabled.go）
+	OrgDisabled bool
 }
 
 // LoginSummaries 一次加锁返回全部账户的轻量状态
@@ -75,10 +78,15 @@ func (p *AccountPool) LoginSummaries() []AccountLoginSummary {
 		if account == nil {
 			continue
 		}
+		state := p.accountStateLocked(account, now)
+		if state == AccountOrgDisabled {
+			state = account.State
+		}
 		summaries = append(summaries, AccountLoginSummary{
-			ID: account.ID, Enabled: account.Config.Enabled, State: p.accountStateLocked(account, now),
+			ID: account.ID, Enabled: account.Config.Enabled, State: state,
 			StoragePath: account.StoragePath, Directory: account.Directory,
 			FilesMissing: account.State == AccountUnavailable && account.stateMessage == ErrAccountNotFound.Error(),
+			OrgDisabled:  account.orgDisabled,
 		})
 	}
 	return summaries

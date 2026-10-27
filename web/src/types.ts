@@ -9,8 +9,9 @@ export type TabID =
   | 'settings'
   | 'playground'
 
+// org_disabled 为账号所属组织停用了 AI Studio（不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复）
 export type AccountState =
-  'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled'
+  'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled' | 'org_disabled'
 
 export interface Account {
   id: string
@@ -39,6 +40,9 @@ export interface Account {
   proxy_pool_active?: boolean
   // proxy_pool_pinned 表示 IP 池开启、账户代理与当前生效的默认代理相同，因此不使用 IP 池（服务端判断，与 pinned_default 一致）
   proxy_pool_pinned?: boolean
+  // org_disabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户仍为 disabled、
+  // message 接上原因；验证接口的返回在验证遇到组织停用时同样为 true
+  org_disabled?: boolean
 }
 
 // AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
@@ -78,6 +82,8 @@ export interface AccountCounters {
   auth_required: number
   // auth_required_10m 为最近 10 分钟新被标为需要登录的账户数（只在全部账户的计数里有），持续增长说明运行期 401 在累积
   auth_required_10m?: number
+  // org_disabled 为所属组织停用了 AI Studio 的启用账户数（旧版服务没有这个字段）
+  org_disabled?: number
 }
 
 // OnboardingPolicy 为新账户自动处理设置
@@ -521,6 +527,21 @@ export interface PermissionDeniedAccount {
   count: number
   first_at: string
   last_at: string
+}
+
+// OrgDisabledAccount 为所属组织停用了 AI Studio 的账户（Google Workspace 账号的组织关闭了这项服务，重新登录也没用）：
+// source 为第一次进入的来源（启动、模型目录、验证、登录、请求、登录复核），last_source 为最近一次；check_at 为下一次长间隔复查的时间；
+// message 为最近一次的原文（服务端已打码、截短）
+export interface OrgDisabledAccount {
+  id: string
+  label: string
+  source: string
+  last_source: string
+  count: number
+  first_at: string
+  last_at: string
+  check_at: string
+  message?: string
 }
 
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'

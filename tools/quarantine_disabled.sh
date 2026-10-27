@@ -13,6 +13,8 @@
 # 时截回、停止，不移动这一个；RESTORE 只删除确认移回的记录。
 # 移动时持有该目录 camoufox-cache/.lock 的锁（浏览器使用缓存期间一直持有），被占用的本次跳过；想一次全部移走：
 # ./start.sh stop，再 APPLY=1 bash tools/quarantine_disabled.sh，再 ./start.sh start。
+# 程序加入“组织停用 AI Studio 的账号：快速失败、停止调度、管理页列出”之后会自动识别并停止调度这类账户（启动时立即失败，
+# 管理页“组织已停用 AI Studio 的账户”可复制邮箱、一键删除），一般不再需要本脚本；旧版本或要把目录移出账户目录时仍可使用。
 #
 # 用法（放在程序目录的 tools/ 下运行，或用 APP_DIR 指定程序目录）：
 #   bash tools/quarantine_disabled.sh                            只列出（默认统计最近 360 分钟的日志；SHOW_ALL=1 列出全部名单）

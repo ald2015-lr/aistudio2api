@@ -137,6 +137,9 @@ type LoginVerification struct {
 	// PageURL 为验证结束时隔离浏览器所在页面的 host+path（不含查询参数与片段，查询参数里有账号与回跳地址）：
 	// 判定登录已失效时用来区分普通登录页（会话失效）与安全验证、风控页（challenge、speedbump、rejected 等）
 	PageURL string `json:"page_url,omitempty"`
+	// OrgDisabled 为页面被跳到组织停用页（access.workspace.google.com）：账号所属组织停用了 AI Studio，Authenticated 为假、
+	// Reason 为 OrgDisabledReason，不是登录失效（见 org_disabled.go）
+	OrgDisabled bool `json:"org_disabled,omitempty"`
 }
 
 // IsolatedLoginDriver 定义独立浏览器登录与验证合同

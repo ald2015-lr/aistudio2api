@@ -536,6 +536,22 @@ func (manager *runtimeManager) ClearPermissionDenied(ctx context.Context, input 
 	return manager.generation().admin.ClearPermissionDenied(ctx, input)
 }
 
+// OrgDisabled 返回当前生成服务的组织停用账户列表（见 org_disabled.go）；生成服务的管理实现不支持时为空
+func (manager *runtimeManager) OrgDisabled(ctx context.Context) ([]api.AdminOrgDisabled, error) {
+	if admin, ok := manager.generation().admin.(api.OrgDisabledService); ok {
+		return admin.OrgDisabled(ctx)
+	}
+	return nil, nil
+}
+
+// ClearOrgDisabled 清除当前生成服务的组织停用账户的状态，立即恢复调度
+func (manager *runtimeManager) ClearOrgDisabled(ctx context.Context, input api.PermissionDeniedClearInput) (int, error) {
+	if admin, ok := manager.generation().admin.(api.OrgDisabledService); ok {
+		return admin.ClearOrgDisabled(ctx, input)
+	}
+	return 0, nil
+}
+
 // Requests 返回进程级活动请求
 func (manager *runtimeManager) Requests(ctx context.Context) ([]api.AdminRequest, error) {
 	return manager.generation().admin.Requests(ctx)

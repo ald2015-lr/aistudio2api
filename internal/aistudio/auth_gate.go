@@ -67,7 +67,8 @@ func (l *AccountLease) markAuthenticationRequiredWritten(reason string, checkedA
 	return l.pool.markAuthenticationLocked(l.account, authGeneration, true, reason, checkedAt), nil
 }
 
-// AuthRequiredAccountIDs 返回启用、需要登录的账户（按账户池顺序），一次加锁：登录复核每轮只取它们，不构建全部账户的状态
+// AuthRequiredAccountIDs 返回启用、需要登录的账户（按账户池顺序），一次加锁：登录复核每轮只取它们，不构建全部账户的状态。
+// 带组织停用标记的账户（见 org_disabled.go）不算：底层状态可能仍是需要登录，但复核通过也不能调度，每轮都取出来只会挤掉真正要复核的账户
 func (p *AccountPool) AuthRequiredAccountIDs() []string {
 	if p == nil {
 		return nil
@@ -76,7 +77,7 @@ func (p *AccountPool) AuthRequiredAccountIDs() []string {
 	defer p.mu.Unlock()
 	var accountIDs []string
 	for _, account := range p.accounts {
-		if account != nil && account.Config.Enabled && account.State == AccountAuthRequired {
+		if account != nil && account.Config.Enabled && account.State == AccountAuthRequired && !account.orgDisabled {
 			accountIDs = append(accountIDs, account.ID)
 		}
 	}

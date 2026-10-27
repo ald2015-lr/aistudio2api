@@ -131,10 +131,13 @@ func newRuntime(
 	refresher.publish = service.publishModelAccess
 	service.quota = newQuotaSharing(store.PrimaryDirectory(), requests)
 	service.permissionDenied = openPermissionDeniedRegistry(store.PrimaryDirectory(), requests)
-	// 续签换掉登录签名 Cookie 时在提交处更新登记记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
-	refresher.renewed = service.permissionDenied.setIdentity
+	// 组织停用 AI Studio 的账户（见 org_disabled.go）：登记表跨重启保留，载入账户池后恢复标记，重启后仍不参与调度
+	service.orgDisabled = openOrgDisabledRegistry(store.PrimaryDirectory(), requests)
+	// 续签换掉登录签名 Cookie 时在提交处更新两张登记表记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
+	refresher.renewed = service.noteLoginIdentity
 	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
 	service.reconcilePermissionDenied()
+	service.reconcileOrgDisabled()
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -169,8 +172,9 @@ func newRuntime(
 		proxyPool.flush()
 		transport.CloseIdleConnections()
 		headers.Close()
-		// 403 无权限账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
+		// 403 无权限账户与组织停用账户的登记平时几秒后合并写入，关闭时立即写入，进程退出也不丢最后几秒的变化
 		service.permissionDenied.flush()
+		service.orgDisabled.flush()
 		// 模型目录缓存平时最多每 30 秒写一次，停止服务时调度器退出前已写过；这里兜底（没有变化时是空操作）
 		if flushErr := catalogCache.close(); flushErr != nil {
 			requests.log("service", "WARN", "模型目录缓存写入失败 | 错误="+flushErr.Error())
@@ -1287,6 +1291,16 @@ func (manager *accountWorkerManager) startReservedWorker(
 		account.startupMu.Unlock()
 		return nil, err
 	}
+	if manager.pool.OrgDisabled(account.id) {
+		// 排队等名额期间（线上最长十几分钟）账户被确认所属组织停用了 AI Studio（模型目录、请求等其他路径）：名额立即让出，
+		// 不申请出口、不启动浏览器
+		releaseSlot()
+		if ownsLease {
+			_ = runtimeLease.Release()
+		}
+		account.startupMu.Unlock()
+		return nil, &accountWorkerInitError{err: errWorkerOrgDisabled}
+	}
 	// 名额到手后才申请 IP 池出口：排队等名额的启动不占端口。只改这次启动的局部参数，accountWorker.config 不变
 	poolLease := manager.workerProxyLease(account.id, label, ownProxy, &options)
 	manager.requests.log(label, "INFO", "WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型="+bootstrapModel)
@@ -1807,12 +1821,20 @@ func aboveResidentText(above bool) string {
 // 预热与后台扩容没有租约，也不为此另取普通租约（会更新 LastUsed、把账户显示为忙碌，干扰 idleWarmVictimFor
 // 与预热轮换选号）：账户保存了续签材料时留给带租约的按需启动恢复，没有续签材料时按启动前的认证代际标为需要登录
 func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Context, accountID string, model string) (*accountWorkerPreparer, error) {
+	if manager.pool.OrgDisabled(accountID) {
+		// 所属组织停用了 AI Studio 的账户不再启动浏览器（调度本来就不会挑它，这里兜底：不占启动名额、不等页面）
+		return nil, &accountWorkerInitError{err: errWorkerOrgDisabled}
+	}
 	generation := manager.pool.AuthGeneration(accountID)
 	startedAt := time.Now()
-	worker, err := manager.startReservedWorker(ctx, accountID, model)
+	worker, err := manager.startOrgCheckedWorker(ctx, accountID, model)
 	if err == nil {
 		manager.persistStartupCookies(accountID, generation, worker)
 		manager.persistStartupLocalStorage(accountID, generation, worker)
+	}
+	if err != nil && aistudio.OrgDisabledFailure(err) {
+		// 组织停用（页面停在组织停用页、已立即失败，或启动期间被其他路径确认）：不是登录失效，不续签、不标需要登录
+		return nil, err
 	}
 	if err == nil || ctx.Err() != nil || !aistudio.DefinitiveAuthenticationFailure(err) {
 		return worker, err
@@ -1838,7 +1860,8 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 		return nil, &accountWorkerInitError{err: recoverErr, authHandled: true}
 	}
 	renewed := manager.pool.AuthGeneration(accountID)
-	worker, err = manager.startReservedWorker(ctx, accountID, model)
+	// 续签后的第二次启动同样识别组织停用（续签后才落到组织停用页的账户这次就进入状态，不等下次启动）
+	worker, err = manager.startOrgCheckedWorker(ctx, accountID, model)
 	if err == nil {
 		manager.persistStartupCookies(accountID, renewed, worker)
 		manager.persistStartupLocalStorage(accountID, renewed, worker)
@@ -1848,6 +1871,27 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 		err = manager.refresher.markAuthenticationRequired(recoverCtx, err)
 	}
 	return nil, &accountWorkerInitError{err: err, authHandled: true}
+}
+
+// errWorkerOrgDisabled 与 errWorkerOrgDisabledDuringStart 为账户已处于组织停用状态时不启动、不发布 Worker 的错误
+// （满足 aistudio.OrgDisabledFailure）：账户已在这个状态，不再登记、不累计次数
+var (
+	errWorkerOrgDisabled            = fmt.Errorf("%w，不启动 Worker", aistudio.ErrOrgDisabled)
+	errWorkerOrgDisabledDuringStart = fmt.Errorf("%w，刚启动的 Worker 不发布（启动期间确认）", aistudio.ErrOrgDisabled)
+)
+
+// startOrgCheckedWorker 启动 Worker 并处理组织停用：启动期间账户被其他路径确认所属组织停用了 AI Studio 时，刚启动的 Worker
+// 不发布、立即关闭让出槽位；页面停在组织停用页（已立即失败，不再等满 INIT_TIMEOUT）时进入组织停用状态，不再被预热、替补、
+// 扩容挑中（账户已在这个状态时返回的是 errWorkerOrgDisabled，不再登记）
+func (manager *accountWorkerManager) startOrgCheckedWorker(ctx context.Context, accountID string, model string) (*accountWorkerPreparer, error) {
+	worker, err := manager.startReservedWorker(ctx, accountID, model)
+	if err == nil && manager.pool.OrgDisabled(accountID) {
+		return nil, errors.Join(&accountWorkerInitError{err: errWorkerOrgDisabledDuringStart}, discardAccountWorker(worker))
+	}
+	if err != nil && ctx.Err() == nil && aistudio.OrgDisabledFailure(err) && !errors.Is(err, errWorkerOrgDisabled) {
+		manager.confirmOrgDisabled(accountID, err)
+	}
+	return worker, err
 }
 
 // startupCookieTimeout 为 Worker 启动完成后导出浏览器 Cookie 的上限
@@ -1874,6 +1918,16 @@ func (manager *accountWorkerManager) persistStartupCookies(accountID string, gen
 	if _, err := manager.pool.MergeBrowserCookies(accountID, generation, state.Cookies); err != nil && manager.requests != nil {
 		manager.requests.log(accountID, "WARN", "WAA Worker 启动后写回 Cookie 失败 | 错误="+err.Error())
 	}
+}
+
+// confirmOrgDisabled 在 Worker 启动确认账号所属组织停用了 AI Studio 后调用：经账户池的组织停用回调（newTrackedService 挂上的
+// 生成服务回调，与 aistudio 内部识别共用一处接线）进入组织停用状态（登记、持久化、写日志、目录改为长间隔复查，见 enterOrgDisabled）；
+// 没有挂上回调时只写账户池的标记
+func (manager *accountWorkerManager) confirmOrgDisabled(accountID string, cause error) {
+	if manager == nil || manager.pool == nil {
+		return
+	}
+	manager.pool.ReportOrgDisabled(accountID, aistudio.OrgDisabledFromStartup, cause)
 }
 
 // markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录
@@ -2572,6 +2626,8 @@ type trackedService struct {
 	rateLimitLadder []time.Duration
 	// permissionDenied 为 403 无权限账户的登记表（见 permission_denied.go），保存在账户目录，跨重启保留；为空时不登记
 	permissionDenied *permissionDeniedRegistry
+	// orgDisabled 为组织停用 AI Studio 的账户的登记表（见 org_disabled.go），保存在账户目录，跨重启保留；为空时只写账户池的标记
+	orgDisabled *orgDisabledRegistry
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
 	quota *quotaSharing
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
@@ -2666,6 +2722,9 @@ func newTrackedService(
 		note := authRequiredHook(tracked.noteAuthRequired)
 		workers.authRequired.Store(&note)
 	}
+	// aistudio 内部识别出组织停用（目录同步、CountTokens、上传、视频等）与 Worker 启动时页面停在组织停用页（confirmOrgDisabled）
+	// 都经这个回调进入组织停用状态（见 org_disabled.go）
+	pool.SetOrgDisabledReporter(tracked.reportOrgDisabled)
 	tracked.setRequestTimeout(timeout)
 	return tracked
 }
@@ -4908,6 +4967,13 @@ func (service *trackedService) generateWithRetry(
 		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理；号池级 403 见下文
 		modelDenied := isPermissionDenied(attemptErr) && resourceID == "" && generated && requestCtx.Err() == nil &&
 			!authFailure && !waaRuntimeFailed
+		// orgDisabled：上游返回 “AI Studio app is disabled”（账号所属组织停用了 AI Studio，见 org_disabled.go）。账户级，与单模型 403 分开：
+		// 租约释放后进入组织停用状态（不再参与任何调度，驻留 Worker 登记释放）；本请求按已冷却换号（不计连续失败上限、不退避），
+		// 只受每请求换号硬上限约束
+		orgDisabled := aistudio.OrgDisabledFailure(attemptErr) && requestCtx.Err() == nil && !authFailure
+		if orgDisabled {
+			cooled = true
+		}
 		// 号池级 403：号池内多个账号对该模型连续 403、这段时间又没有任何成功，多半是 proof、请求形态等号池一侧的问题，不是账号没有
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
 		if modelDenied && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
@@ -5009,6 +5075,9 @@ func (service *trackedService) generateWithRetry(
 			workerFailed || waaRuntimeFailed, resetWait,
 		)
 		lease = nil
+		if orgDisabled {
+			service.enterOrgDisabled(request.AccountID, accountLabel, aistudio.OrgDisabledFromRequest, attemptErr)
+		}
 		if authMarked {
 			// 账号已需要登录：统一写“账号需要登录”，它的驻留 Worker 登记释放（空闲即关，忙碌等请求结束），槽位由预热补上
 			service.noteAuthRequired(request.AccountID, accountLabel, authFromGeneration, err)

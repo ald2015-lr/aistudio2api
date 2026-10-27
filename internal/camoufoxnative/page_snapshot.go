@@ -262,21 +262,35 @@ func (client *bidiClient) sinceNavigated() *int64 {
 // withURL 时先读 location.href，地址与快照共用同一个从 context.Background 派生的短上下文（失败处的 ctx 可能已经过期）。
 // 调用方已取消（停止服务、客户端断开）时不读取、返回空串：这不是页面问题，调用方也不会记录这次失败
 func (client *bidiClient) pageDiagnosis(ctx context.Context, contextID string, withURL bool) (pageURL string, suffix string) {
+	pageURL, suffix, _ = client.pageDiagnosisBlocked(ctx, contextID, withURL)
+	return pageURL, suffix
+}
+
+// pageDiagnosisBlocked 同 pageDiagnosis，另返回页面停在组织停用页时的地址（见 pageDiagnosisWithin 的 blocked）
+func (client *bidiClient) pageDiagnosisBlocked(ctx context.Context, contextID string, withURL bool) (pageURL string, suffix string, blocked string) {
 	if errors.Is(ctx.Err(), context.Canceled) {
-		return "", ""
+		return "", "", ""
 	}
 	diagnosisCtx, cancel := context.WithTimeout(context.Background(), pageSnapshotTimeout)
 	defer cancel()
 	return client.pageDiagnosisWithin(diagnosisCtx, contextID, withURL)
 }
 
-// pageDiagnosisWithin 同 pageDiagnosis，地址与快照用调用方给的诊断上下文（与同一处的其他诊断共用期限，见 startupFailureDiagnosis）
-func (client *bidiClient) pageDiagnosisWithin(diagnosisCtx context.Context, contextID string, withURL bool) (pageURL string, suffix string) {
+// pageDiagnosisWithin 同 pageDiagnosis，地址与快照用调用方给的诊断上下文（与同一处的其他诊断共用期限，见 startupFailureDiagnosis）。
+// blocked 为页面停在组织停用页（access.workspace.google.com，见 ServiceNotAllowedError）时的地址，取自读到的地址或快照里的 href，
+// 不多做 evaluate；不在时为空
+func (client *bidiClient) pageDiagnosisWithin(diagnosisCtx context.Context, contextID string, withURL bool) (pageURL string, suffix string, blocked string) {
 	if withURL {
 		pageURL, _ = client.evaluateString(diagnosisCtx, contextID, "location.href")
 	}
 	raw, err := client.evaluateString(diagnosisCtx, contextID, pageSnapshotExpression)
-	return pageURL, formatPageSnapshot(raw, err, client.sinceNavigated())
+	switch {
+	case isServiceNotAllowedURL(pageURL):
+		blocked = pageURL
+	case err == nil:
+		blocked = snapshotServiceNotAllowed(raw)
+	}
+	return pageURL, formatPageSnapshot(raw, err, client.sinceNavigated()), blocked
 }
 
 // withPageSnapshot 在页面类失败的原错误末尾追加“ | 页面=…”；原错误的文字与错误链（errors.Is/As）不变，
