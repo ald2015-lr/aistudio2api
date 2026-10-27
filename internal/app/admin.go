@@ -1211,6 +1211,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	} else if ultraPrimaryQueueWait > requestTimeout {
 		ultraPrimaryQueueWait = requestTimeout
 	}
+	// 媒体设置：旧版页面保存时不带这些字段，沿用现值；期限与大小按文本解析，写进 .env 与返回给页面的都是规范写法
+	media, err := mediaSettingsFromInput(saved.Media, value)
+	if err != nil {
+		return api.RuntimeConfig{}, invalidConfigError(err)
+	}
 	// 默认代理先规范化：写进 .env 的与返回给页面的都是规范值，页面同步回表单后不再显示未保存，也不误报需要重启
 	proxy, err := config.NormalizeProxy(value.Proxy)
 	if err != nil {
@@ -1247,6 +1252,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		RequestBodyLog:         requestBodyLog,
 		AdminPassword:          adminPassword,
 		DowngradeGuard:         downgradeGuard,
+		Media:                  media,
 	}
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
@@ -1924,6 +1930,7 @@ func buildVersion() string {
 }
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
+	media := cfg.Media.Normalized()
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
@@ -1953,7 +1960,38 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraPrimaryModels:     &ultraPrimaryModels,
 		UltraPrimaryQueueWait:  cfg.UltraPrimaryQueueWait.String(),
 		ProxyPool:              proxyPoolToAPI(cfg.ProxyPool),
+		MediaOutput:            media.Output,
+		MediaBaseURL:           &media.BaseURL,
+		MediaRetention:         config.FormatMediaRetention(media.Retention),
+		MediaMaxSize:           config.FormatMediaSize(media.MaxBytes),
 	}
+}
+
+// mediaSettingsFromInput 合并页面提交的媒体设置：没有提交的字段沿用 current；输出方式不区分大小写，服务地址去掉首尾空白与末尾的 /
+func mediaSettingsFromInput(current config.MediaSettings, value api.RuntimeConfig) (config.MediaSettings, error) {
+	media := current
+	if output := strings.TrimSpace(value.MediaOutput); output != "" {
+		media.Output = strings.ToLower(output)
+	}
+	if value.MediaBaseURL != nil {
+		media.BaseURL = *value.MediaBaseURL
+	}
+	if retention := strings.TrimSpace(value.MediaRetention); retention != "" {
+		parsed, err := config.ParseMediaRetention(retention)
+		if err != nil {
+			return config.MediaSettings{}, err
+		}
+		media.Retention = parsed
+	}
+	if size := strings.TrimSpace(value.MediaMaxSize); size != "" {
+		parsed, err := config.ParseMediaSize(size)
+		if err != nil {
+			return config.MediaSettings{}, err
+		}
+		media.MaxBytes = parsed
+	}
+	media = media.Normalized()
+	return media, media.Validate()
 }
 
 var _ api.AdminService = (*runtimeAdmin)(nil)

@@ -238,6 +238,25 @@ const zhCN = {
   'pool.normal': '普通号池',
   'pool.ultraHelp': '经 /ultra 前缀进入，只用 Ultra 号池的账户',
   'models.channels': '通道',
+  'settings.mediaTitle': '生成媒体输出',
+  'settings.mediaHelp':
+    'Chat Completions、Messages 与 Gemini 原生接口（generateContent、streamGenerateContent，含 /ultra 前缀）回复里的图片、视频与音频的输出方式；Responses、Interactions、Live 等其他接口不受影响。修改后立即生效。',
+  'settings.mediaOutput': '输出方式',
+  'settings.mediaOutputInline': '内联 data URI / inlineData（默认）',
+  'settings.mediaOutputURL': '本服务链接（保存到 runtime/media/）',
+  'settings.mediaOutputHelp':
+    '经 new-api 等中转使用、或生成视频时选“本服务链接”：中转把 Gemini 回复转成 OpenAI 格式时会丢掉视频与音频，几 MB 的 data URI 也很难用。链接模式下媒体按内容保存，正文写成 Markdown 链接（图片 ![image](…)、视频 [video](…)、音频 [audio](…)），Gemini 原生接口另附 fileData。/media/ 链接不校验 API 密钥，拿到链接的人都能打开。',
+  'settings.mediaBaseURL': '媒体链接地址',
+  'settings.mediaBaseURLHelp':
+    '链接使用的服务地址，填用户能访问到的公网地址，例如 https://ai.example.com（可带路径前缀）；经 new-api、nginx 等转发时必须填写，并让反向代理放行 /media/。留空时按每个请求访问的地址（X-Forwarded-Proto、X-Forwarded-Host 或 Host），经中转时多半是内网地址，用户打不开。',
+  'settings.mediaRetention': '保存期限',
+  'settings.mediaMaxSize': '总量上限',
+  'settings.mediaCleanupHelp':
+    '后台每小时清理一次 runtime/media/：删除超过保存期限的文件（例如 7d、72h；0 表示不清理，不为 0 时至少 1 小时），总量超过上限时从最旧的文件开始删除（例如 20GB、500MB；0 表示不限，不为 0 时至少 100MB；最近 10 分钟内生成的不删）。只删除以内容哈希命名的媒体文件，删除后对应链接返回 404。',
+  'settings.invalidMediaBaseURL':
+    '媒体链接地址必须是 http 或 https 地址，不能带账号密码、查询参数或片段',
+  'settings.invalidMediaRetention': '媒体保存期限必须是 0 或不少于 1 小时，例如 7d、72h',
+  'settings.invalidMediaMaxSize': '媒体总量上限必须是 0 或不小于 100MB，例如 20GB、500MB',
   'settings.temporaryChat': 'WAA 预热使用临时对话',
   'settings.ignoreClientSeed': '忽略客户端传入的 seed',
   'settings.ignoreClientSeedHelp':
@@ -1125,6 +1144,27 @@ const en: Record<TranslationKey, string> = {
   'pool.normal': 'Normal pool',
   'pool.ultraHelp': 'Sent through the /ultra prefix and served only by Ultra-pool accounts',
   'models.channels': 'Channels',
+  'settings.mediaTitle': 'Generated media output',
+  'settings.mediaHelp':
+    'How images, video and audio appear in replies from Chat Completions, Messages and the native Gemini API (generateContent, streamGenerateContent, including the /ultra prefix). Responses, Interactions, Live and other APIs are unchanged. Changes apply immediately.',
+  'settings.mediaOutput': 'Output',
+  'settings.mediaOutputInline': 'Inline data URI / inlineData (default)',
+  'settings.mediaOutputURL': 'Link to this service (saved under runtime/media/)',
+  'settings.mediaOutputHelp':
+    'Choose links when clients go through new-api or similar gateways, or when generating video: those gateways drop video and audio when converting Gemini replies to the OpenAI format, and data URIs of several MB are hard to use. In link mode media is saved by content and the reply carries a Markdown link (image ![image](…), video [video](…), audio [audio](…)); the native Gemini API also adds a fileData part. /media/ links do not check the API key, so anyone with a link can open it.',
+  'settings.mediaBaseURL': 'Media link address',
+  'settings.mediaBaseURLHelp':
+    'Service address used in links. Enter the public address users can reach, such as https://ai.example.com (a path prefix is allowed). It is required behind new-api, nginx and other proxies, and the reverse proxy must pass /media/ through. When empty, the address of each request is used (X-Forwarded-Proto, X-Forwarded-Host or Host), which behind a gateway is usually an internal address users cannot open.',
+  'settings.mediaRetention': 'Retention',
+  'settings.mediaMaxSize': 'Total size limit',
+  'settings.mediaCleanupHelp':
+    'runtime/media/ is cleaned every hour: files older than the retention are deleted (such as 7d or 72h; 0 keeps them, otherwise at least 1 hour), and when the total exceeds the limit the oldest files go first (such as 20GB or 500MB; 0 means no limit, otherwise at least 100MB; files from the last 10 minutes are kept). Only media files named by content hash are deleted; their links then return 404.',
+  'settings.invalidMediaBaseURL':
+    'Media link address must be an http or https address without credentials, query or fragment',
+  'settings.invalidMediaRetention':
+    'Media retention must be 0 or at least 1 hour, such as 7d or 72h',
+  'settings.invalidMediaMaxSize':
+    'Media size limit must be 0 or at least 100MB, such as 20GB or 500MB',
   'settings.temporaryChat': 'Use temporary chat for WAA prewarming',
   'settings.ignoreClientSeed': 'Ignore seed sent by clients',
   'settings.ignoreClientSeedHelp':

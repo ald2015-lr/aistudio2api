@@ -188,7 +188,7 @@ func TestAnthropicBlocksDeferSignaturesInText(t *testing.T) {
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-2"},
 		{Kind: aistudio.EventText, Text: "的"},
 		{Kind: aistudio.EventToolCall, ToolCall: &call, ThoughtSignature: "sig-call"},
-	}})
+	}}, mediaOutput{})
 	var shape []string
 	for _, block := range blocks {
 		shape = append(shape, block.Type+":"+block.Text+block.Data)
@@ -245,7 +245,7 @@ func TestAnthropicDeferredSignatureSkipsUnsignedCall(t *testing.T) {
 		{Kind: aistudio.EventText, Text: " checking"},
 		{Kind: aistudio.EventToolCall, ToolCall: &aistudio.FunctionCall{ID: "c2", Name: "lookup", Arguments: json.RawMessage(`{}`)}},
 	}
-	blocks := anthropicBlocks(generationResult{events: events})
+	blocks := anthropicBlocks(generationResult{events: events}, mediaOutput{})
 	var shape []string
 	for _, block := range blocks {
 		shape = append(shape, block.Type+":"+block.Text+block.Data+block.ID)

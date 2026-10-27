@@ -92,6 +92,7 @@ internal/camoufoxnative/ 原生 WebDriver BiDi、WAA bootstrap 与隔离登录
 internal/waa/            纯 Go WAA：BotGuard VM、Firefox 形状宿主与 goja 分叉
 internal/chromeauth/     Windows Chrome OAuth/DBSC 发现、导入和续签
 internal/config/         全局配置的读取、校验、代理规范化和原子写回
+internal/mediastore/     生成媒体按内容保存（MEDIA_OUTPUT=url）与按期限、总量清理
 internal/proxyrelay/     带账号密码的代理的本机中转（只给 Camoufox 用）
 internal/webui/          嵌入并提供 Vue 构建产物
 web/                     Vue 3、TypeScript、Vite 和 Tailwind CSS 源码
@@ -99,6 +100,7 @@ docs/                    开发流程与私有协议说明
 auth/                    每账户配置、认证状态和可恢复运行状态
 runtime/camoufox/        Release 使用的 Camoufox 运行时
 runtime/requests.db      用量账本（SQLite，纯 Go 驱动），保留 90 天
+runtime/media/           MEDIA_OUTPUT=url 时按内容命名保存的生成媒体，由 /media/ 提供，按 MEDIA_RETENTION 与 MEDIA_MAX_SIZE 清理
 internal/requestdb/      用量账本的写入、汇总与查询
 ```
 
@@ -176,11 +178,26 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `ULTRA_PRIMARY_QUEUE_WAIT` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同（整个请求共用一份、按墙钟计；`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`，未配置时取 `10s` 与 `REQUEST_TIMEOUT` 中较小者，保存时写具体值），可热更新 | `10s` |
 | `WAA_BACKEND` | WAA 后端 `camoufox` 或 `go` | `camoufox` |
 | `TEMPORARY_CHAT` | WAA 预热页是否使用临时对话 | `false` |
+| `MEDIA_OUTPUT` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 内联 data URI / `inlineData`，`url` 保存到 `runtime/media/` 并输出本服务 `/media/<文件名>` 链接（见下文“生成媒体目录”）；进程级设置，保存后立即生效 | `inline` |
+| `MEDIA_BASE_URL` | 媒体链接的服务地址，`http` 或 `https`，可带路径前缀，不能带账号密码、查询参数、片段、空白或括号，保存时去掉末尾的 `/`；留空时按请求的 `X-Forwarded-Proto`（只认 http/https）、`X-Forwarded-Host` 或 `Host` 生成，主机含不能写进链接的字符时链接为 `/media/` 开头的相对地址；可热更新 | 空 |
+| `MEDIA_RETENTION` | 媒体文件保存期限：Go 时长写法或整数天数加 `d`，`0` 不按时间清理，不为 0 时至少 1 小时，保存时写成 `7d`、`36h`、`90m` 这样的规范写法；可热更新 | `7d` |
+| `MEDIA_MAX_SIZE` | 媒体目录总量上限：整数加 `B`/`KB`/`MB`/`GB`/`TB`（不区分大小写，按 1024 进位），不写单位按字节，`0` 不限，不为 0 时至少 100MB，保存时写成能整除的最大单位；可热更新 | `20GB` |
 | `AUTO_START` | 管理进程启动后自动启动生成服务。生成服务期望运行却停在 STOPPED（启动失败或意外停止）时由监督协程自动重新启动：一般失败按 5 秒起、上限 1 分钟退避，没有可用账户时上限 5 分钟；手动停止后不再自动启动 | `true` |
 | `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值，修改后重启程序生效 | `false` |
 | `ADMIN_PASSWORD` | 远程管理密码；非空时非回环请求经 HTTP Basic 认证后可访问管理页面与 `/api/`，同一 IP 10 分钟内错 10 次封禁 15 分钟；管理进程重启后生效 | 空 |
 
 `LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT`、`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`，两个主用模型排队上限都不超过 `REQUEST_TIMEOUT`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`，`ACCOUNT_RPM_LIMIT` 为 `0..1000` 的整数（超出时报 `ACCOUNT_RPM_LIMIT 必须是 0 到 1000 的整数`）。管理页面保存时没有带四个 Ultra 字段、`account_rpm_limit`、`stream_playground_models`、`primary_models`、`primary_queue_wait`、`ultra_primary_models` 或 `ultra_primary_queue_wait`（旧版页面）则沿用 `.env` 中的现值（省略排队上限而把 `request_timeout` 调到现值以下时按 `request_timeout` 封顶）；`stream_playground_models`、`primary_models` 与 `ultra_primary_models` 为空数组表示清空，排队上限为 `0s` 表示不排队。保存的配置 JSON 缺少 `ultra_primary_models`（旧版数据）时取默认列表，显式的空数组为关闭；缺少 `ultra_include_pro` 时按关闭处理；缺少 `account_rpm_limit` 时取默认值 10，显式的 `0` 为关闭。全局代理与账户代理的写法和规范化规则见 `config.NormalizeProxy` 与下文[代理写法与规范化](#代理写法与规范化)。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
+
+管理页面保存时没有带 `media_output`、`media_base_url`、`media_retention` 或 `media_max_size`（旧版页面）则沿用现值，`media_base_url` 为空串表示清空；保存的配置 JSON 缺少 `media` 对象时取默认设置。
+
+### 生成媒体目录
+
+`MEDIA_OUTPUT=url` 时 `internal/api/media_output.go` 的 `mediaOutput` 把带内容的生成媒体交给 `internal/mediastore` 保存，正文改为本服务链接；`inline`（默认）时输出与原先逐字节相同。设置是进程级的：`runtimeManager.media`（`atomic.Pointer`）在启动、`applyLiveFields`（先于是否需要重建生成服务的判断，与 `ULTRA_EXCLUSIVE` 相同）与 `startService` 时更新，公开 API 每个请求经 `api.Config.MediaLinks` 读取一次，进行中的请求按开始时的设置输出；保存后不提示需要重启（`liveFieldsEqual` 与 `sameDataConfig` 都比较 `Media`）。设置变化时写一行“媒体输出设置已更新并立即生效”，保存期限或总量上限变化时立即清理一次。
+
+- 命名与写入：文件名为内容 SHA-256 的 64 位小写十六进制加按 MIME 确定的扩展名（`png`、`jpg`、`webp`、`gif`、`mp4`、`webm`、`mov`、`mp3`、`wav`、`ogg`、`m4a`、`aac`、`flac`，其余为 `bin`）。PCM（`audio/L16`）先包装成 WAV：非流式按原规则合并连续、不带签名的分片，流式由 `joinStreamAudio` 把这样的分片攒到下一个其他事件（至少有结束事件）再输出一次。写入先建同目录的临时文件 `.<文件名>.<随机数>.tmp` 再 `rename`，并发生成同一内容时读取方只会看到不存在或完整的文件；同名文件已存在且大小一致时不再写，只把修改时间改为现在，重新计算保存期限。保存失败时这一个媒体改为内联输出，原因写进请求日志的错误字段，请求照常成功。
+- 提供：`/media/` 挂在公开 API 处理链之外（`app.rootHandler` 与 `api.NewHandler` 都单独注册），不校验 API key、不写请求日志；只接受 GET 与 HEAD（其余 405），名字必须符合上面的格式（路径穿越、子路径、大写哈希、未知扩展名一律 404），只打开普通文件（`Lstat` 后打开，再以打开的文件 `SameFile` 核对，符号链接与目录当作不存在）；`Content-Type` 按扩展名给出（`bin` 为 `application/octet-stream` 加 `Content-Disposition: attachment`），带 `X-Content-Type-Options: nosniff`、`ETag`（内容哈希）、`Cache-Control: public, max-age=31536000, immutable`，由 `http.ServeContent` 处理 Range、If-None-Match 与 HEAD。不是 url 模式（或没有 `MediaLinks`）时一律 404，切回 inline 后已有链接立即失效、文件留到清理。
+- 清理：`mediastore.Cleaner` 由 `runCommand` 随运行时生命周期启动，启动时清理一次，之后每小时一次，`Kick` 立即再清理一次。每次读取当前的 `MEDIA_RETENTION` 与 `MEDIA_MAX_SIZE`：先删修改时间早于期限的文件，总量仍超过上限时按修改时间从旧到新删除（最近 10 分钟内修改过的不删），并删除一小时前留下的临时文件；只处理目录第一层、名字符合格式的普通文件（`DirEntry.Type()` 与删除前的 `Lstat` 两次确认，不跟随符号链接、不进子目录），删除前按最新的修改时间再判断一次，避免删掉刚被重新生成的文件。真正删了文件时写一行“媒体目录已清理”汇总（各类数量、释放与剩余大小）；读取目录或删除失败时写 WARN，同一错误不重复写。
+- 回传恢复：`restoreMediaLinks` 在 Chat Completions、Messages（含 `count_tokens`）与 Gemini 原生接口（含 `countTokens`）解析请求后执行，不区分是否为 url 模式。assistant 文本里的 `![…](…/media/<哈希>.png|jpg|webp|gif)` 拆成文本与内联图片；用户消息里的 `fileData`、`image_url` 等外部地址指向已保存的媒体时改为内联媒体；assistant 消息里的 `fileData` 只恢复图片（同一条消息里同一文件的文本链接不再重复恢复），视频与音频不恢复（模型不需要把自己生成的几 MB 视频再当输入），同一条消息里已有文本链接时去掉 `fileData`、签名单独保留，没有时改为文本链接；文件已清理时 `fileData` 改为文本链接，其余保持原样。Interaction 模型（`encodeInteractionSteps`）的模型 step 只带文本：assistant 消息里恢复出的图片（以及 inline 模式回传的 data URI 图片）与用户附件一样由 runtime 上传 Drive，编码时连同说明文字移到紧随其后的 user step 最前面（`interactionModelMediaIntro`，参与 binding），以 assistant 消息结尾时单独成一条 user step；没有 Drive 授权仍是 inline data 时与用户附件一样返回 400，外部地址同样返回 400，不静默丢弃。同一文件一次请求只恢复一处（`mediaRestorer` 先从最新的消息往前选定引用，同一条消息里 `fileData` 与外部地址先于文本链接，再按选定结果改写），其余引用不恢复：文本链接保持文本，`fileData` 与外部地址去掉或改为文本链接；恢复的总量不超过 `maxRestoredMediaBytes`（64MB），按剩余额度读文件（大于剩余额度的文件不读），超出时较早的引用不恢复，外部地址保持原样由上游读取。
 
 `GET /api/config` 与 `PUT /api/config` 同时暴露保存值和当前生效值：
 
@@ -623,6 +640,7 @@ Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不�
 | Anthropic | `POST /v1/messages`、`POST /v1/messages/count_tokens` |
 | Gemini | `GET /v1beta/models`、`GET /v1beta/models/{model}`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:countTokens`、`:predictLongRunning`、`GET /v1beta/operations/{id}` |
 | Realtime | `GET /v1/live`、`GET /v1/robotics/stream` |
+| 生成媒体 | `GET /media/<文件名>`（`MEDIA_OUTPUT=url` 时；不校验 API key，见上文“生成媒体目录”） |
 
 管理端路由：
 

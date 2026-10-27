@@ -646,6 +646,13 @@ export interface ServiceConfig {
   downgrade_guard: DowngradeGuardConfig
   // proxy_pool 为 IP 池设置；旧版服务端不返回，此时设置页不显示 IP 池分组，保存时也不提交（服务端沿用现值）
   proxy_pool?: ProxyPoolConfig
+  // media_output 为生成媒体的输出方式：inline 内联 data URI（Gemini 原生接口为 inlineData），url 保存到 runtime/media/ 并以本服务
+  // /media/<文件名> 链接引用；media_base_url 为链接使用的服务地址（为空时按请求地址）；media_retention 为保存期限（7d、72h，0 不清理），
+  // media_max_size 为媒体目录总量上限（20GB、500MB，0 不限）。服务端总是返回这几个字段，保存后立即生效
+  media_output: 'inline' | 'url'
+  media_base_url: string
+  media_retention: string
+  media_max_size: string
 }
 
 // ProxyTestProbe 为“测试代理”一条路径的结果：成功时 ip 为出口 IP，失败时 error 为说明（不含账号密码）

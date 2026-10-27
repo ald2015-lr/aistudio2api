@@ -19,7 +19,7 @@ func TestGeminiOutputParts_MergeTextAndReasoning(t *testing.T) {
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig_abc123"},
 		{Kind: aistudio.EventText, Text: "Hello "},
 		{Kind: aistudio.EventText, Text: "world!"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{
 		{"text": "I think therefore I am.", "thought": true, "thoughtSignature": "sig_abc123"},
 		{"text": "Hello world!"},
@@ -35,7 +35,7 @@ func TestGeminiOutputParts_TextOnly(t *testing.T) {
 		{Kind: aistudio.EventText, Text: "Chunk 1 "},
 		{Kind: aistudio.EventText, Text: "Chunk 2 "},
 		{Kind: aistudio.EventText, Text: "Chunk 3"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{{"text": "Chunk 1 Chunk 2 Chunk 3"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
@@ -48,7 +48,7 @@ func TestGeminiOutputParts_LeadingThoughtSignature(t *testing.T) {
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig_pre"},
 		{Kind: aistudio.EventReasoning, Text: "Thinking step."},
 		{Kind: aistudio.EventText, Text: "Final text."},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{
 		{"text": "Thinking step.", "thought": true, "thoughtSignature": "sig_pre"},
 		{"text": "Final text."},
@@ -104,7 +104,7 @@ func TestGeminiOutputParts_LeadingSignatureTargets(t *testing.T) {
 		parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 			{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-a"},
 			test.event,
-		}})
+		}}, mediaOutput{})
 		if !reflect.DeepEqual(parts, test.want) {
 			t.Fatalf("%s: 前置签名 %+v，期望 %+v", test.name, parts, test.want)
 		}
@@ -115,7 +115,7 @@ func TestGeminiOutputParts_LeadingSignatureTargets(t *testing.T) {
 func TestGeminiOutputParts_StandaloneThoughtSignatureFallback(t *testing.T) {
 	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig_only"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{{"text": "", "thought": true, "thoughtSignature": "sig_only"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("独立签名 %+v，期望 %+v", parts, want)
@@ -129,7 +129,7 @@ func TestGeminiOutputParts_WithToolCall(t *testing.T) {
 		{Kind: aistudio.EventReasoning, Text: "Need weather for Tokyo."},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig_call"},
 		{Kind: aistudio.EventToolCall, ToolCall: &call},
-	}})
+	}}, mediaOutput{})
 	if len(parts) != 2 {
 		t.Fatalf("期望 2 个 part，得到 %d: %+v", len(parts), parts)
 	}
@@ -148,7 +148,7 @@ func TestGeminiOutputParts_SignedDeltasMerge(t *testing.T) {
 		parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 			{Kind: kind, Text: "first", ThoughtSignature: "sig-a"},
 			{Kind: kind, Text: "second", ThoughtSignature: "sig-b"},
-		}})
+		}}, mediaOutput{})
 		if len(parts) != 1 || parts[0]["text"] != "firstsecond" || parts[0]["thoughtSignature"] != "sig-b" {
 			t.Fatalf("kind=%s: 带签名的增量 %+v", kind, parts)
 		}
@@ -162,7 +162,7 @@ func TestGeminiOutputParts_SignedPartMerging(t *testing.T) {
 		{Kind: aistudio.EventText, Text: "b", ThoughtSignature: "sig-b"},
 		{Kind: aistudio.EventText, Text: "c"},
 		{Kind: aistudio.EventText, Text: "d", ThoughtSignature: "sig-d"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{{"text": "abcd", "thoughtSignature": "sig-d"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
@@ -213,7 +213,7 @@ func TestGeminiOutputParts_EveryChunkSigned(t *testing.T) {
 			return events
 		}},
 	} {
-		parts := geminiOutputParts(generationResult{events: test.events()})
+		parts := geminiOutputParts(generationResult{events: test.events()}, mediaOutput{})
 		var texts []string
 		for _, part := range parts {
 			if part["thought"] == true {
@@ -243,7 +243,7 @@ func TestGeminiOutputParts_CitationKeepsMerging(t *testing.T) {
 		{Kind: aistudio.EventText, Text: "月"},
 		{Kind: aistudio.EventUsage, Usage: &aistudio.Usage{TotalTokens: 1}},
 		{Kind: aistudio.EventFinish, FinishReason: "stop"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{{"text": "六月"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("合并结果 %+v，期望 %+v", parts, want)
@@ -258,7 +258,7 @@ func TestGeminiOutputParts_PartBreaksMerging(t *testing.T) {
 		{Kind: aistudio.EventToolCall, ToolCall: &call},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-after-call"},
 		{Kind: aistudio.EventText, Text: "after"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{
 		{"text": "before"},
 		{"functionCall": map[string]any{"id": "call_1", "name": "lookup", "args": json.RawMessage(`{}`)}},
@@ -331,7 +331,7 @@ func TestGeminiOutputParts_LeadingSignatureKeepsMerging(t *testing.T) {
 			want: []map[string]any{{"text": "Hello world!", "thoughtSignature": "sig-a"}},
 		},
 	} {
-		parts := geminiOutputParts(generationResult{events: test.events})
+		parts := geminiOutputParts(generationResult{events: test.events}, mediaOutput{})
 		if !reflect.DeepEqual(parts, test.want) {
 			t.Fatalf("%s: 前置签名 %+v，期望 %+v", test.name, parts, test.want)
 		}
@@ -344,7 +344,7 @@ func TestGeminiOutputParts_PendingSignature(t *testing.T) {
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-a"},
 		{Kind: aistudio.EventReasoning, Text: "reason", ThoughtSignature: "sig-b"},
 		{Kind: aistudio.EventText, Text: "answer"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{
 		{"text": "", "thought": true, "thoughtSignature": "sig-a"},
 		{"text": "reason", "thought": true, "thoughtSignature": "sig-b"},
@@ -360,7 +360,7 @@ func TestGeminiOutputParts_TrailingSignatures(t *testing.T) {
 	parts := geminiOutputParts(generationResult{events: []aistudio.Event{
 		{Kind: aistudio.EventText, Text: "answer", ThoughtSignature: "sig-a"},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{{"text": "answer", "thoughtSignature": "sig-b"}}
 	if !reflect.DeepEqual(parts, want) {
 		t.Fatalf("尾部签名 %+v，期望 %+v", parts, want)
@@ -374,7 +374,7 @@ func TestGeminiOutputParts_LeadingSignatures(t *testing.T) {
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-c"},
 		{Kind: aistudio.EventText, Text: "answer"},
-	}})
+	}}, mediaOutput{})
 	want := []map[string]any{
 		{"text": "", "thought": true, "thoughtSignature": "sig-a"},
 		{"text": "", "thought": true, "thoughtSignature": "sig-b"},
@@ -394,7 +394,7 @@ func TestGeminiOutputParts_SignedAudio(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	parts := geminiOutputParts(result)
+	parts := geminiOutputParts(result, mediaOutput{})
 	if len(parts) != 2 || parts[0]["thoughtSignature"] != "audio-a" || parts[1]["thoughtSignature"] != "audio-b" {
 		t.Fatalf("带签名的音频 %+v", parts)
 	}
@@ -499,7 +499,7 @@ func TestGeminiSignaturePartRoundTrip(t *testing.T) {
 	output := geminiOutputParts(generationResult{events: []aistudio.Event{
 		{Kind: aistudio.EventThoughtSignature, ThoughtSignature: "sig-b"},
 		{Kind: aistudio.EventText, Text: "answer", ThoughtSignature: "sig-a"},
-	}})
+	}}, mediaOutput{})
 	raw, err := json.Marshal(output)
 	if err != nil {
 		t.Fatal(err)

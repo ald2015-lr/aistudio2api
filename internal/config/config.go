@@ -85,6 +85,10 @@ var configKeys = [...]string{
 	"DOWNGRADE_MEMORY_MINUTES",
 	"DOWNGRADE_REJECT_STATUS",
 	"WAA_BACKEND",
+	"MEDIA_OUTPUT",
+	"MEDIA_BASE_URL",
+	"MEDIA_RETENTION",
+	"MEDIA_MAX_SIZE",
 	"AUTO_START",
 	"REQUEST_BODY_LOG",
 	"ADMIN_PASSWORD",
@@ -161,7 +165,9 @@ type Config struct {
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
-	AutoStart      bool           `json:"auto_start"`
+	// Media 为生成媒体的输出与保存设置（MEDIA_*，见 MediaSettings），保存后立即生效
+	Media     MediaSettings `json:"media"`
+	AutoStart bool          `json:"auto_start"`
 	// RequestBodyLog 为真时用量账本同时保存公开 API POST 请求与响应的截断正文（明文保存在本机，默认关闭）
 	RequestBodyLog bool   `json:"request_body_log"`
 	AdminPassword  string `json:"-"`
@@ -206,6 +212,7 @@ func Default() Config {
 		RepeatPromptNonce:      true,
 		MinOutputTokens:        defaultMinOutputTokens,
 		DowngradeGuard:         DefaultDowngradeGuard(),
+		Media:                  DefaultMediaSettings(),
 		AutoStart:              true,
 	}
 }
@@ -377,6 +384,9 @@ func Load(path string) (Config, error) {
 	if value, ok := values["WAA_BACKEND"]; ok {
 		cfg.WAABackend = strings.ToLower(strings.TrimSpace(value))
 	}
+	if err := loadMediaSettings(values, &cfg.Media); err != nil {
+		return Config{}, err
+	}
 	if value, ok := values["AUTO_START"]; ok && strings.TrimSpace(value) != "" {
 		cfg.AutoStart, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -440,6 +450,9 @@ func (c Config) Save(path string) error {
 		values[key] = value
 	}
 	for key, value := range c.ProxyPool.envValues() {
+		values[key] = value
+	}
+	for key, value := range c.Media.envValues() {
 		values[key] = value
 	}
 
@@ -539,6 +552,9 @@ func (c Config) Validate() error {
 	if err := c.ProxyPool.Validate(); err != nil {
 		return err
 	}
+	if err := c.Media.Validate(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -592,36 +608,37 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		ultraPrimaryModels = []string{}
 	}
 	type payload struct {
-		AuthStates             string         `json:"auth_states"`
-		ListenAddr             string         `json:"listen_addr"`
-		ProxyAPIKey            string         `json:"proxy_api_key"`
-		Proxy                  string         `json:"proxy"`
-		ProxyPool              ProxyPool      `json:"proxy_pool"`
-		InitTimeout            string         `json:"init_timeout"`
-		RequestTimeout         string         `json:"request_timeout"`
-		FirstEventTimeout      string         `json:"first_event_timeout"`
-		WarmWorkerLimit        int            `json:"warm_worker_limit"`
-		MaxActiveWorkers       int            `json:"max_active_workers"`
-		UltraExclusive         bool           `json:"ultra_exclusive"`
-		UltraIncludePro        bool           `json:"ultra_include_pro"`
-		UltraWarmWorkerLimit   int            `json:"ultra_warm_worker_limit"`
-		UltraMaxActiveWorkers  int            `json:"ultra_max_active_workers"`
-		WarmStartupConcurrency int            `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int            `json:"per_account_concurrency"`
-		AccountRPMLimit        int            `json:"account_rpm_limit"`
-		RoutingStrategy        string         `json:"routing_strategy"`
-		UpstreamChannels       []string       `json:"upstream_channels"`
-		StreamPlaygroundModels []string       `json:"stream_playground_models"`
-		PrimaryModels          []string       `json:"primary_models"`
-		PrimaryQueueWait       string         `json:"primary_queue_wait"`
-		UltraPrimaryModels     []string       `json:"ultra_primary_models"`
-		UltraPrimaryQueueWait  string         `json:"ultra_primary_queue_wait"`
-		TemporaryChat          bool           `json:"temporary_chat"`
-		IgnoreClientSeed       bool           `json:"ignore_client_seed"`
-		RepeatPromptNonce      bool           `json:"repeat_prompt_nonce"`
-		MinOutputTokens        int            `json:"min_output_tokens"`
-		DowngradeGuard         DowngradeGuard `json:"downgrade_guard"`
-		WAABackend             string         `json:"waa_backend"`
+		AuthStates             string            `json:"auth_states"`
+		ListenAddr             string            `json:"listen_addr"`
+		ProxyAPIKey            string            `json:"proxy_api_key"`
+		Proxy                  string            `json:"proxy"`
+		ProxyPool              ProxyPool         `json:"proxy_pool"`
+		InitTimeout            string            `json:"init_timeout"`
+		RequestTimeout         string            `json:"request_timeout"`
+		FirstEventTimeout      string            `json:"first_event_timeout"`
+		WarmWorkerLimit        int               `json:"warm_worker_limit"`
+		MaxActiveWorkers       int               `json:"max_active_workers"`
+		UltraExclusive         bool              `json:"ultra_exclusive"`
+		UltraIncludePro        bool              `json:"ultra_include_pro"`
+		UltraWarmWorkerLimit   int               `json:"ultra_warm_worker_limit"`
+		UltraMaxActiveWorkers  int               `json:"ultra_max_active_workers"`
+		WarmStartupConcurrency int               `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int               `json:"per_account_concurrency"`
+		AccountRPMLimit        int               `json:"account_rpm_limit"`
+		RoutingStrategy        string            `json:"routing_strategy"`
+		UpstreamChannels       []string          `json:"upstream_channels"`
+		StreamPlaygroundModels []string          `json:"stream_playground_models"`
+		PrimaryModels          []string          `json:"primary_models"`
+		PrimaryQueueWait       string            `json:"primary_queue_wait"`
+		UltraPrimaryModels     []string          `json:"ultra_primary_models"`
+		UltraPrimaryQueueWait  string            `json:"ultra_primary_queue_wait"`
+		TemporaryChat          bool              `json:"temporary_chat"`
+		IgnoreClientSeed       bool              `json:"ignore_client_seed"`
+		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
+		MinOutputTokens        int               `json:"min_output_tokens"`
+		DowngradeGuard         DowngradeGuard    `json:"downgrade_guard"`
+		WAABackend             string            `json:"waa_backend"`
+		Media                  mediaSettingsJSON `json:"media"`
 	}
 	return json.Marshal(payload{
 		AuthStates:             c.AuthStates,
@@ -654,42 +671,44 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MinOutputTokens:        c.MinOutputTokens,
 		DowngradeGuard:         c.DowngradeGuard,
 		WAABackend:             c.WAABackend,
+		Media:                  c.Media.toJSON(),
 	})
 }
 
 // UnmarshalJSON 从管理接口使用的文本时长解析配置
 func (c *Config) UnmarshalJSON(data []byte) error {
 	type payload struct {
-		AuthStates             string          `json:"auth_states"`
-		ListenAddr             string          `json:"listen_addr"`
-		ProxyAPIKey            string          `json:"proxy_api_key"`
-		Proxy                  string          `json:"proxy"`
-		ProxyPool              *ProxyPool      `json:"proxy_pool"`
-		InitTimeout            string          `json:"init_timeout"`
-		RequestTimeout         string          `json:"request_timeout"`
-		FirstEventTimeout      string          `json:"first_event_timeout"`
-		WarmWorkerLimit        int             `json:"warm_worker_limit"`
-		MaxActiveWorkers       int             `json:"max_active_workers"`
-		UltraExclusive         *bool           `json:"ultra_exclusive"`
-		UltraIncludePro        *bool           `json:"ultra_include_pro"`
-		UltraWarmWorkerLimit   *int            `json:"ultra_warm_worker_limit"`
-		UltraMaxActiveWorkers  *int            `json:"ultra_max_active_workers"`
-		WarmStartupConcurrency int             `json:"warm_startup_concurrency"`
-		PerAccountConcurrency  int             `json:"per_account_concurrency"`
-		AccountRPMLimit        *int            `json:"account_rpm_limit"`
-		RoutingStrategy        string          `json:"routing_strategy"`
-		UpstreamChannels       []string        `json:"upstream_channels"`
-		StreamPlaygroundModels []string        `json:"stream_playground_models"`
-		PrimaryModels          []string        `json:"primary_models"`
-		PrimaryQueueWait       string          `json:"primary_queue_wait"`
-		UltraPrimaryModels     *[]string       `json:"ultra_primary_models"`
-		UltraPrimaryQueueWait  string          `json:"ultra_primary_queue_wait"`
-		TemporaryChat          bool            `json:"temporary_chat"`
-		IgnoreClientSeed       bool            `json:"ignore_client_seed"`
-		RepeatPromptNonce      *bool           `json:"repeat_prompt_nonce"`
-		MinOutputTokens        *int            `json:"min_output_tokens"`
-		DowngradeGuard         *DowngradeGuard `json:"downgrade_guard"`
-		WAABackend             string          `json:"waa_backend"`
+		AuthStates             string             `json:"auth_states"`
+		ListenAddr             string             `json:"listen_addr"`
+		ProxyAPIKey            string             `json:"proxy_api_key"`
+		Proxy                  string             `json:"proxy"`
+		ProxyPool              *ProxyPool         `json:"proxy_pool"`
+		InitTimeout            string             `json:"init_timeout"`
+		RequestTimeout         string             `json:"request_timeout"`
+		FirstEventTimeout      string             `json:"first_event_timeout"`
+		WarmWorkerLimit        int                `json:"warm_worker_limit"`
+		MaxActiveWorkers       int                `json:"max_active_workers"`
+		UltraExclusive         *bool              `json:"ultra_exclusive"`
+		UltraIncludePro        *bool              `json:"ultra_include_pro"`
+		UltraWarmWorkerLimit   *int               `json:"ultra_warm_worker_limit"`
+		UltraMaxActiveWorkers  *int               `json:"ultra_max_active_workers"`
+		WarmStartupConcurrency int                `json:"warm_startup_concurrency"`
+		PerAccountConcurrency  int                `json:"per_account_concurrency"`
+		AccountRPMLimit        *int               `json:"account_rpm_limit"`
+		RoutingStrategy        string             `json:"routing_strategy"`
+		UpstreamChannels       []string           `json:"upstream_channels"`
+		StreamPlaygroundModels []string           `json:"stream_playground_models"`
+		PrimaryModels          []string           `json:"primary_models"`
+		PrimaryQueueWait       string             `json:"primary_queue_wait"`
+		UltraPrimaryModels     *[]string          `json:"ultra_primary_models"`
+		UltraPrimaryQueueWait  string             `json:"ultra_primary_queue_wait"`
+		TemporaryChat          bool               `json:"temporary_chat"`
+		IgnoreClientSeed       bool               `json:"ignore_client_seed"`
+		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
+		MinOutputTokens        *int               `json:"min_output_tokens"`
+		DowngradeGuard         *DowngradeGuard    `json:"downgrade_guard"`
+		WAABackend             string             `json:"waa_backend"`
+		Media                  *mediaSettingsJSON `json:"media"`
 	}
 	var value payload
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -728,6 +747,11 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	// 媒体设置：旧版数据没有该字段时按默认值处理
+	media, err := mediaSettingsOrDefault(value.Media)
+	if err != nil {
+		return err
+	}
 	parsed := Config{
 		AuthStates:             strings.TrimSpace(value.AuthStates),
 		ListenAddr:             strings.TrimSpace(value.ListenAddr),
@@ -759,6 +783,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		MinOutputTokens:        intOrDefault(value.MinOutputTokens, defaultMinOutputTokens),
 		DowngradeGuard:         downgradeGuardOrDefault(value.DowngradeGuard),
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
+		Media:                  media,
 	}
 	if err := parsed.Validate(); err != nil {
 		return err

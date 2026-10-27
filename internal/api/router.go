@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
+	"github.com/Mag1cFall/AIStudio2API/internal/mediastore"
 )
 
 // Config 定义公开 API 服务配置
@@ -26,6 +27,11 @@ type Config struct {
 	Ledger RequestLedger
 	// UltraExclusive 每次请求读取当前的 ULTRA_EXCLUSIVE：为真时普通路径只用普通号池，为假时不限号池；为 nil 时按独占
 	UltraExclusive func() bool
+	// MediaDir 为生成媒体的保存目录（MEDIA_OUTPUT=url 时保存、/media/ 路由读取、回传的本服务媒体链接从这里恢复）；为空时不启用这些功能
+	MediaDir string
+	// MediaLinks 每次请求读取媒体输出设置：是否以本服务链接输出生成的媒体，与链接使用的服务地址（MEDIA_BASE_URL，为空时按请求地址）；
+	// 为 nil 时按 inline
+	MediaLinks func() (enabled bool, base string)
 }
 
 type server struct {
@@ -38,6 +44,8 @@ type server struct {
 	aliasCaches [3]aliasCatalogCache
 	// traces 保存 /trace/ 排查路由的请求记录
 	traces *traceStore
+	// mediaStore 为生成媒体的保存目录（见 media_output.go），没有配置 MediaDir 时为 nil
+	mediaStore *mediastore.Store
 }
 
 var idSequence atomic.Uint64
@@ -45,6 +53,9 @@ var idSequence atomic.Uint64
 // NewHandler 创建公开 API 路由
 func NewHandler(service aistudio.Service, config Config) http.Handler {
 	s := &server{service: service, config: config, responseStates: newResponseStateStore(), thoughtSignatures: newThoughtSignatureStore(), traces: newTraceStore(config.TraceDir)}
+	if config.MediaDir != "" {
+		s.mediaStore = mediastore.New(config.MediaDir)
+	}
 	public := http.NewServeMux()
 	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)
 	public.HandleFunc("GET /v1/models/{model...}", s.handleOpenAIModel)
@@ -88,6 +99,10 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 
 	root := http.NewServeMux()
 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
+	// 生成媒体的链接不校验 API Key（见 handleMedia），不经过公开 API 的处理链
+	if s.mediaStore != nil {
+		root.HandleFunc("/media/", s.handleMedia)
+	}
 	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文
 	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey,
 		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, public)))))

@@ -75,6 +75,8 @@ func runCommand(args []string) error {
 		return err
 	}
 	ledger := openRequestLedger(manager, filepath.Join("runtime", "requests.db"), cfg.RequestBodyLog)
+	// 媒体目录按保存期限与总量上限定期清理，随运行时生命周期结束
+	go manager.mediaCleaner.Run(lifecycle)
 	serveErr := runServer(ctx, cfg, options, manager)
 	cancelLifecycle()
 	// 账本最后关闭：关闭前写完已排队的记录
@@ -200,6 +202,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
 		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
 		Ledger: manager.requestLedger(), UltraExclusive: manager.activeUltraExclusive,
+		MediaDir: mediaDir, MediaLinks: manager.mediaLinks,
 	})
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")
@@ -281,7 +284,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 }
 
 // rootHandler 将公开 API 与内嵌管理端挂载到同一服务；/trace/ 与 /ultra/ 和 /v1 一样交给公开 API（只校验 API key），
-// 不经过管理页面的令牌校验
+// 不经过管理页面的令牌校验；/media/ 为生成媒体的链接（不校验 API key，见 api.handleMedia）
 func rootHandler(apiHandler http.Handler, adminPassword string, adminToken string) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/health", apiHandler)
@@ -290,6 +293,7 @@ func rootHandler(apiHandler http.Handler, adminPassword string, adminToken strin
 	root.Handle("/v1beta/", apiHandler)
 	root.Handle("/trace/", apiHandler)
 	root.Handle("/ultra/", apiHandler)
+	root.Handle("/media/", apiHandler)
 	root.Handle("/", api.AdminPageMiddleware(adminPassword, adminToken, webui.Handler()))
 	return securityHeaders(root)
 }

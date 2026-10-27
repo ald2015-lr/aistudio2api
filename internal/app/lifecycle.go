@@ -13,6 +13,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
+	"github.com/Mag1cFall/AIStudio2API/internal/mediastore"
 	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 	"github.com/Mag1cFall/AIStudio2API/internal/requestdb"
 )
@@ -95,6 +96,11 @@ type runtimeManager struct {
 	// proxyPool 为进程级 IP 池（见 proxy_pool.go）：端口占用对应进程里活着的浏览器，与生成服务实例无关，重建生成服务时交给新实例；
 	// 测试直接构造的管理器为 nil（方法对 nil 安全）
 	proxyPool *proxyPool
+	// media 为生效的媒体设置（MEDIA_*，见 media.go）：与 ultraExclusive 一样是进程级设置，保存配置后立即生效，
+	// 启动生成服务时按新读取的配置同步；为 nil 时按默认设置
+	media atomic.Pointer[config.MediaSettings]
+	// mediaCleaner 定期清理媒体目录，由 runCommand 启动；测试直接构造的管理器为 nil（Kick 对 nil 安全）
+	mediaCleaner *mediastore.Cleaner
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。
@@ -122,6 +128,9 @@ func newRuntimeManager(
 		return buildRuntimeGeneration(launchCtx, parentLifecycle, cfg, requests, manager.proxyPool)
 	}
 	manager.ultraExclusive.Store(cfg.UltraExclusive)
+	media := cfg.Media.Normalized()
+	manager.media.Store(&media)
+	manager.mediaCleaner = newMediaCleaner(manager)
 	generation, err := manager.factory(launchCtx, ctx, cfg, requests)
 	if err != nil {
 		return nil, err
@@ -227,8 +236,9 @@ func (manager *runtimeManager) startService(ctx context.Context, user bool) (api
 	current = manager.current
 	manager.current = next
 	manager.mu.Unlock()
-	// 独占设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
+	// 独占设置与媒体设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
 	manager.applyUltraExclusive(cfg.UltraExclusive)
+	manager.applyMediaSettings(cfg.Media)
 
 	current.cancelLifecycle()
 	status, startErr := next.admin.StartService(launchCtx)
@@ -646,6 +656,12 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
 	}
+	// 媒体设置：提交时省略（旧版页面）的字段按生效值比较，期限与大小按含义比较
+	media, err := mediaSettingsFromInput(active.Media, value)
+	if err != nil {
+		return false
+	}
+	saved.Media = media
 	// IP 池：提交时省略（旧版页面）按生效值比较；地址按规范值比较，写法不同但上游相同时不误报
 	if value.ProxyPool != nil {
 		poolSettings, err := config.NormalizeProxyPool(proxyPoolFromAPI(*value.ProxyPool))
@@ -698,7 +714,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
-		saved.ProxyPool.Equal(active.ProxyPool)
+		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

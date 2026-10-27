@@ -945,7 +945,7 @@ OpenAI 文件入口接收 `multipart/form-data` 的 `file` 与 `purpose`，单�
 | 26 | `[[<STEP>...]]`，用户 step 为 `[[<CONTENT>...]]`，模型 step 为 `[null,[<CONTENT>...]]`；文本 content 为 `[[<TEXT>]]`，Drive 附件 content 为 `[null×8,["<DRIVE_FILE_ID>"]]` |
 | 53 | 视频输出配置 `[[[null,null,null,[null,null,null,null,null,1]]]]` |
 
-thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件；内联附件先上传到所选账户的 Drive，再以 file ID 引用，文件 ID 不参与 binding。音频附件由上游以 code 3 `Audio input modality is not enabled for this model` 拒绝，映射为 HTTP 400；函数、工具与 stop sequences 返回参数错误，temperature、topP、topK 与 seed 不发送。
+thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件；内联附件先上传到所选账户的 Drive，再以 file ID 引用，文件 ID 不参与 binding。模型 step 只带文本：assistant 消息里的附件（客户端回传的生成图片、本服务恢复的图片链接、`previous_interaction_id` 续接历史里模型生成的视频，与 user 附件一样先上传 Drive）连同一句说明“以下是上文模型回复里的图片或视频：”移到紧随其后的 user step 最前面，以 assistant 消息结尾时单独成一条 user step；只有附件的 assistant 消息整条省略，说明文字参与 binding。例如先用图片模型出图，再在同一对话里换成 Omni 让它“动起来”时，Omni 能看到这张图。账户没有 Drive 授权（附件仍是 inline data）时与 user 附件一样返回 400，assistant 消息里的外部地址附件同样返回 400，不静默丢弃；原先 assistant 消息里带附件的请求一律返回 400。音频附件由上游以 code 3 `Audio input modality is not enabled for this model` 拒绝，映射为 HTTP 400；函数、工具与 stop sequences 返回参数错误，temperature、topP、topK 与 seed 不发送。
 
 响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 5 为视频 `[1,"<BASE64 MP4>"]`、field 6 为思考摘要，分别映射为 text、`video/mp4` 媒体与 reasoning 事件；索引 19 的最终 interaction 状态 `3` 产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9）与 `stop` 终态，状态 `4`、`5` 返回错误。事件列表后的 google.rpc 状态按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
 
@@ -1842,7 +1842,7 @@ server tool 的 `cache_control`、`defer_loading` 等只影响 Anthropic 自身�
 
 content 输出 block 为 `text`、`thinking`、`redacted_thinking`、`tool_use`、`server_tool_use` 或 `web_search_tool_result`。stop reason 为 `end_turn`、`tool_use`、`stop_sequence`、`max_tokens`、`pause_turn` 或 `refusal`。`POST /v1/messages/count_tokens` 接受同一 message/system/tools 输入并返回 `{"input_tokens":<INT>}`；它提供独立计数估算，PDF 等媒体请求的最终用量以生成响应 `usage.input_tokens` 为准。
 
-Anthropic 响应中的媒体编码为 text block 中的 Markdown data URL，代码编码为 fenced text。Google Search 的每个去重查询生成一组 `server_tool_use` 和 `web_search_tool_result`，结果按 URL 去重，来源集合覆盖本次搜索的全部查询。`usage.server_tool_use.web_search_requests` 记录上游报告的去重查询数，`web_fetch_requests` 为 `0`。URL Context 等其余引用在末尾追加 `Sources:` Markdown 列表。
+Anthropic 响应中的媒体编码为 text block 中的 Markdown：`MEDIA_OUTPUT=inline` 时为 data URL，`url` 时为本服务链接（见下文“生成媒体链接”），代码编码为 fenced text。Google Search 的每个去重查询生成一组 `server_tool_use` 和 `web_search_tool_result`，结果按 URL 去重，来源集合覆盖本次搜索的全部查询。`usage.server_tool_use.web_search_requests` 记录上游报告的去重查询数，`web_fetch_requests` 为 `0`。URL Context 等其余引用在末尾追加 `Sources:` Markdown 列表。
 
 搜索来源的 `encrypted_content` 由本服务生成，保存上游返回的 URL、标题与可用摘要。客户端在下一轮消息中回传搜索块时，`server_tool_use` 与对应的 `web_search_tool_result` 合并为一个文本块 `Web search: <query>`，后面逐条列出结果的标题与 URL；摘要只从本服务用当前 `PROXY_API_KEY` 签发、且 URL 与结果一致的来源中恢复。以下情况都按文本保留，不返回 400：更换 API key 后或会话从别的 Claude 渠道切过来、`encrypted_content` 解不开（只保留标题与 URL）；调用与结果缺少对应的一半（只有结果时以 `Web search results:` 开头）；结果为 `error_code` 失败对象（写成 `Web search failed: <error_code>`）。`content` 既不是结果数组也不是带 `error_code` 的对象时仍返回 `invalid_request_error`。该字段用于本服务的多轮会话，和 Anthropic 服务的来源令牌分别使用。
 
@@ -1928,7 +1928,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | executable code | `executableCode:{language,code}` |
 | code result | `codeExecutionResult:{outcome,output,error}` |
 
-`fileData` 省略 `mimeType` 时（官方 Files API 的 `fileUri` 自带类型）按 `displayName` 的扩展名推断，推断不出再按 `fileUri` 路径（URL 取 path，不含查询参数）的扩展名推断，仍推断不出时留空；本服务上传的文件按文件 ID 发送，不依赖这里的类型，YouTube 等外部媒体 URL 按外部媒体处理。缺少 `fileUri` 时返回 400。
+`fileData.fileUri` 指向本服务 `/media/<文件名>` 且文件仍保存着时，用户消息里的恢复为内联媒体，模型消息里的只恢复图片（见下文“生成媒体链接”），不按已上传文件查找。`fileData` 省略 `mimeType` 时（官方 Files API 的 `fileUri` 自带类型）按 `displayName` 的扩展名推断，推断不出再按 `fileUri` 路径（URL 取 path，不含查询参数）的扩展名推断，仍推断不出时留空；本服务上传的文件按文件 ID 发送，不依赖这里的类型，YouTube 等外部媒体 URL 按外部媒体处理。缺少 `fileUri` 时返回 400。
 
 `generationConfig` 全字段：
 
@@ -2285,12 +2285,46 @@ Responses 的 `web_search_call` 由实际 grounding query 触发。搜索发生�
 | function result | tool message | function_call_output | tool_result | functionResponse Part |
 | code execution | 可读 Markdown | code_interpreter item | text block | executableCode/result Part |
 | grounding/citation | annotations | output annotations | text sources | groundingMetadata |
-| media | data URL/媒体端点 | output content | content block | inlineData Part |
+| media | data URL、`/media/` 链接或媒体端点 | output content | content block | inlineData Part；url 模式为链接文本 Part 加 fileData Part |
 | usage | prompt/completion/total | input/output/total | input/output | prompt/candidates/thoughts/total |
 
-Responses 媒体使用 image generation item；Anthropic 媒体使用 text block 中的 data URL Markdown。Anthropic 来源在 text block 末尾使用 `Sources:` Markdown 列表。
+Responses 媒体使用 image generation item；Anthropic 媒体使用 text block 中的 Markdown（data URL 或 `/media/` 链接）。Anthropic 来源在 text block 末尾使用 `Sources:` Markdown 列表。
 
 OpenAI Chat 使用 Markdown data URL 承载生成图片；客户端把 assistant `message.content` 回传下一轮时，适配器将其中的图片恢复为 inline data Part，保留图片多轮上下文。图片 Base64 支持标准与 URL-safe 字母表、可选填充及 CR/LF 换行；图片前后的文本保持原顺序。
+
+**生成媒体链接（MEDIA_OUTPUT=url）**
+
+`MEDIA_OUTPUT` 只作用于 Chat Completions、Messages 与 Gemini 原生接口（`generateContent`、`streamGenerateContent`，含 `/ultra` 前缀）；Responses、Interactions、Live、`/v1/images/generations`、`/v1/audio/speech` 与视频接口的输出不变。默认 `inline` 时输出与原先逐字节相同。`url` 时带内容的媒体按内容 SHA-256 命名保存（PCM `audio/L16` 包装成 `audio/wav`；流式时连续、不带签名的 PCM 分片合并到下一个其他事件之前输出一次），正文改为 `<base>/media/<64 位十六进制>.<扩展名>`：`base` 为 `MEDIA_BASE_URL`，为空时取请求的 `X-Forwarded-Proto`（只认 http、https）与 `X-Forwarded-Host` 或 `Host`，主机含不能写进链接的字符时为空（链接为相对地址）。链接文字图片为 `image`、视频 `video`、音频 `audio`，其他 `file`。保存失败时该媒体按 inline 输出，请求照常成功。只有地址没有内容的媒体（上游返回的 URL）与原先一样输出。
+
+OpenAI Chat（非流式 `message.content`，流式 `delta.content`，与 inline 一样在前面正文没有以换行结尾时先补一个换行）：
+
+```json
+{"choices":[{"message":{"role":"assistant","reasoning_content":"…","content":"视频已生成：\n[video](https://ai.example.com/media/3d29…a370d0.mp4)"}}]}
+```
+
+```text
+data: {"choices":[{"index":0,"delta":{"content":"\n[video](https://ai.example.com/media/3d29…a370d0.mp4)"},"finish_reason":null}],…}
+```
+
+Anthropic Messages：每个媒体另起一个 text block（与 inline 相同），流式为该 block 的一个 `text_delta`：
+
+```json
+{"content":[{"type":"text","text":"视频已生成："},{"type":"text","text":"[video](https://ai.example.com/media/3d29…a370d0.mp4)"}]}
+```
+
+Gemini：每个媒体输出两个 Part，先是链接文本（前面的正文没有以换行结尾时先补一个换行，末尾总带一个换行），再是 `fileData`；流式时两者在同一块里，文本在前。媒体事件的签名放在 `fileData` 上（inline 时在 `inlineData` 上）。new-api 等把 Gemini 回复转成 OpenAI 格式的中转只保留文本、思考与图片 `inlineData`，文本链接能带给用户，`fileData` 被当作空文本；原生 SDK 从 `fileData.fileUri` 取地址：
+
+```json
+{"candidates":[{"content":{"role":"model","parts":[
+  {"text":"视频已生成："},
+  {"text":"\n[video](https://ai.example.com/media/3d29…a370d0.mp4)\n"},
+  {"fileData":{"mimeType":"video/mp4","fileUri":"https://ai.example.com/media/3d29…a370d0.mp4"}}
+]},"index":0}]}
+```
+
+`GET`/`HEAD /media/<文件名>` 不校验 API key：文件名必须为 64 位小写十六进制加 `png`、`jpg`、`webp`、`gif`、`mp4`、`webm`、`mov`、`mp3`、`wav`、`ogg`、`m4a`、`aac`、`flac` 或 `bin`，只提供媒体目录第一层的普通文件；`Content-Type` 按扩展名（`bin` 为 `application/octet-stream` 并带 `Content-Disposition: attachment`），支持 Range 与 `If-None-Match`，`ETag` 为内容哈希，`Cache-Control: public, max-age=31536000, immutable`，`X-Content-Type-Options: nosniff`。名字不合法、文件不存在或已清理、不是 url 模式时返回 404，其他方法返回 405。
+
+回传恢复（不区分是否为 url 模式）：Chat、Messages 与 Gemini 的 assistant 文本里指向本服务的 Markdown 图片（`![…](…/media/<哈希>.png|jpg|webp|gif)`，绝对或相对地址）恢复为 inline data Part，前后文本保持原顺序，视频与音频链接保持文本；用户消息的 `image_url`、`fileData` 等外部地址指向已保存的媒体时恢复为 inline data Part（含视频）；模型消息的 `fileData` 只恢复图片，视频与音频在同一条消息里已有文本链接时去掉（签名单独保留），没有时改为文本链接；文件已清理时图片链接保持原样，`fileData` 改为文本链接。同一文件一次请求只恢复一处：从最新的消息往前选，同一条消息里 `fileData` 与外部地址先于文本链接，其余引用不恢复（文本链接保持文本，`fileData` 与外部地址按上面的规则去掉或改为文本链接）；一次请求恢复的内容合计不超过 64MB，超出时较早的引用不恢复（文本链接保持文本，`fileData` 改为文本链接，外部地址保持原样）。
 
 用户文本中的 `youtu.be/<ID>`、`youtube.com/watch?v=<ID>`、`/shorts/<ID>`、`/live/<ID>` 和 `/embed/<ID>` 会转换为 `video/*` 外部媒体 part，并从用户 text part 中移除；重复 URL 合并为一个附件。OpenAI `video_url`/`input_video`、Anthropic URL source 与 Gemini `fileData.fileUri` 使用相同的外部媒体编码。
 

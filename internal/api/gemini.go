@@ -333,6 +333,8 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 		writeGeminiInvalid(w, err)
 		return
 	}
+	// 回传历史里本服务的媒体链接与 fileData 恢复为媒体输入（见 restoreMediaLinks）
+	s.restoreMediaLinks(generateRequest.Contents)
 	switch method {
 	case "countTokens":
 		s.handleGeminiCountTokens(w, r, generateRequest)
@@ -878,12 +880,12 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, buildGeminiResponse(request, result))
+	writeJSON(w, http.StatusOK, buildGeminiResponse(request, result, s.mediaOutputFor(r)))
 }
 
-func buildGeminiResponse(request aistudio.GenerateRequest, result generationResult) map[string]any {
+func buildGeminiResponse(request aistudio.GenerateRequest, result generationResult, media mediaOutput) map[string]any {
 	candidate := map[string]any{
-		"content": map[string]any{"role": "model", "parts": geminiOutputParts(result)},
+		"content": map[string]any{"role": "model", "parts": geminiOutputParts(result, media)},
 		"index":   0,
 	}
 	setGeminiFinish(candidate, result.finishReason, result.events)
@@ -909,9 +911,12 @@ func buildGeminiResponse(request aistudio.GenerateRequest, result generationResu
 // 导致句子中间断行、数字被拆开、出现多余空行。
 // 合并不看签名：gemini-4 等模型给许多正文分片都带签名（可能每片不同，也可能重复同一个），按签名拆开时
 // 一段连续正文会变成几十个 part。同一段里的多个签名只保留最后一个，不再拆段，
-// 也不把多余签名另放成空思考 part：每片一个签名时会多出几十个空思考 part，客户端的思考内容会多出空行或被清空
-func geminiOutputParts(result generationResult) []map[string]any {
+// 也不把多余签名另放成空思考 part：每片一个签名时会多出几十个空思考 part，客户端的思考内容会多出空行或被清空。
+// 链接模式下媒体写成链接文本与 fileData 两个 part（见 mediaOutput.geminiParts）
+func geminiOutputParts(result generationResult, media mediaOutput) []map[string]any {
 	parts := make([]map[string]any, 0)
+	// textOpen 记录前面的正文没有以换行结尾，随后的媒体链接先换行
+	textOpen := false
 	// merging 记录最后一个 part 可以继续追加的文本类型："text"、"thought" 或空（不可追加）
 	merging := ""
 	// leading 记录第一个 part 是否为输出开头单独到达的签名（如不返回正文的思考留下的签名），它属于随后的内容，
@@ -939,6 +944,9 @@ func geminiOutputParts(result generationResult) []map[string]any {
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
+			if event.Text != "" {
+				textOpen = !strings.HasSuffix(event.Text, "\n")
+			}
 			if event.Transcript != nil {
 				// 带说话人元数据的转写文本保持独立
 				appendPart(geminiTextPart(event), event.ThoughtSignature)
@@ -980,7 +988,12 @@ func geminiOutputParts(result generationResult) []map[string]any {
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
-				if len(event.Media.Data) > 0 {
+				if linked := media.geminiParts(*event.Media, event.ThoughtSignature, textOpen); linked != nil {
+					for _, part := range linked {
+						appendPart(part, "")
+					}
+					textOpen = false
+				} else if len(event.Media.Data) > 0 {
 					appendPart(map[string]any{"inlineData": map[string]any{
 						"mimeType": event.Media.MIME, "data": base64.StdEncoding.EncodeToString(event.Media.Data),
 					}}, event.ThoughtSignature)
@@ -1281,10 +1294,16 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		return
 	}
 	defer chunks.close()
-	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
+	media := s.mediaOutputFor(r)
+	// textOpen 记录已输出的正文没有以换行结尾，随后的媒体链接先换行
+	textOpen := false
+	result, err := consumeStreamEvents(r.Context(), events, media.joinStreamAudio(func(event aistudio.Event) error {
 		response := map[string]any{"responseId": request.ID, "modelVersion": responseModel(request)}
 		switch event.Kind {
 		case aistudio.EventText:
+			if event.Text != "" {
+				textOpen = !strings.HasSuffix(event.Text, "\n")
+			}
 			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(geminiTextPart(event), event.ThoughtSignature))}
 		case aistudio.EventReasoning:
 			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(map[string]any{"text": event.Text, "thought": true}, event.ThoughtSignature))}
@@ -1327,6 +1346,14 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			if event.Media == nil {
 				return nil
 			}
+			// 链接文本与 fileData 放在同一块里，文本在前：只读每块第一个 part 文本的中转也能拿到链接
+			if linked := media.geminiParts(*event.Media, event.ThoughtSignature, textOpen); linked != nil {
+				textOpen = false
+				response["candidates"] = []any{map[string]any{
+					"index": 0, "content": map[string]any{"role": "model", "parts": []any{linked[0], linked[1]}},
+				}}
+				return chunks.chunk(response)
+			}
 			var part map[string]any
 			if len(event.Media.Data) > 0 {
 				part = map[string]any{"inlineData": map[string]any{
@@ -1349,7 +1376,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			return nil
 		}
 		return chunks.chunk(response)
-	}, chunks.heartbeat)
+	}), chunks.heartbeat)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = chunks.chunk(geminiStreamError(w, err))

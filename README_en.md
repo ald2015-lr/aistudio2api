@@ -319,6 +319,7 @@ Main endpoints:
 | Video | `POST /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content` |
 | Gemini Video | `POST /v1beta/models/{model}:predictLongRunning`, `GET /v1beta/operations/{id}` |
 | Live (including live translation and live transcription) / Robotics | `GET /v1/live`, `GET /v1/robotics/stream` |
+| Generated media links | `GET /media/<file>` (with `MEDIA_OUTPUT=url`; no API key check, see [Generated Video and Media Links](#generated-video-and-media-links-omni)) |
 
 All four generation APIs can enable Search, Image Search, URL Context, Code Execution, and Maps through their protocol fields. Request and event formats for Files, Transcribe, Live, and Robotics are documented in the [Google AI Studio protocol specification](docs/protocol.md).
 
@@ -453,6 +454,37 @@ curl http://127.0.0.1:2048/v1/videos \
 
 After creating the operation, poll `GET /v1/videos/{id}` and download the result from `GET /v1/videos/{id}/content`.
 
+### Generated Video and Media Links (Omni)
+
+Gemini Omni (such as `gemini-omni-1.1-flash`) returns MP4 video (several MB, signed with Google C2PA) directly in Chat Completions, Messages, and the native Gemini API, and image and music models return images and audio in the reply the same way. The default `MEDIA_OUTPUT=inline` keeps the original behavior: Chat Completions and Messages carry a Markdown `[media](data:video/mp4;base64,…)`, and the native Gemini API returns `inlineData`.
+
+Behind new-api (and similar One API style gateways), converting a Gemini reply to the OpenAI format keeps only text, thoughts, and `image/*` `inlineData`; `video/mp4` and audio are dropped, so users see only the reasoning and an empty answer. Data URIs of several MB are hard to use in other clients as well. In that case set, in the console under Service config → Generated media output (or in `.env`):
+
+```bash
+MEDIA_OUTPUT=url
+# The public address users can reach; behind new-api or nginx the request host is usually internal
+MEDIA_BASE_URL=https://ai.example.com
+```
+
+Changes apply immediately without a restart. Generated media is saved under `runtime/media/`, named by its content (SHA-256), one copy per content, and the reply links to this service instead:
+
+- Chat Completions and Messages: images `![image](https://ai.example.com/media/<64-hex hash>.png)`, video `[video](…/media/<hash>.mp4)`, audio `[audio](…/media/<hash>.wav)` (PCM audio is joined and wrapped as WAV)
+- Native Gemini API (`generateContent`, `streamGenerateContent`, including the `/ultra` prefix): each media item becomes two parts, first the link text `{"text":"\n[video](https://ai.example.com/media/<hash>.mp4)\n"}` (gateways that convert text carry the link to users), then `{"fileData":{"mimeType":"video/mp4","fileUri":"https://ai.example.com/media/<hash>.mp4"}}` (native SDKs read the address here; new-api treats it as empty text without errors)
+
+`GET /media/<file>` does not check the API key, so anyone with a link can open it (file names are content hashes and cannot be enumerated). It is read-only, supports Range requests (seeking in video), and sends a one-year cache header; outside url mode it always returns 404. The reverse proxy must pass `/media/` through, for example in nginx:
+
+```nginx
+location /media/ {
+    proxy_pass http://127.0.0.1:2048;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+With `MEDIA_BASE_URL` empty, links use the address of each request (`X-Forwarded-Proto`, `X-Forwarded-Host`, or `Host`), which only suits clients that reach this service directly. Media files are cleaned every hour according to `MEDIA_RETENTION` (default 7 days) and `MEDIA_MAX_SIZE` (default 20GB); links to deleted files return 404.
+
+When clients send replies with links back as history, image links to this service in assistant text are restored as image input (the same as data URIs in inline mode, so image editing keeps working), while video and audio links stay text; `image_url` and `fileData` in user messages that point to saved media are restored as inline media. Each file is restored at most once per request (newer messages first), up to 64MB in total; older references beyond that stay links. When the conversation continues with an Interaction model such as Omni (for example, generate an image first, then ask Omni to animate it), images in model messages are uploaded to the account's Drive like user attachments and placed at the front of the following user message, so the model sees the image; accounts without Drive authorization return 400, the same as for user attachments. url mode applies only to Chat Completions, Messages, and the native Gemini API; Responses, Interactions, Live, and the image, speech, and video endpoints are unchanged.
+
 ## Models
 
 The model catalog follows AI Studio updates; clients read the current values from `/v1/models` or `/v1beta/models`. The table below is a catalog-shape example; runtime results are authoritative for model IDs, limits, and methods:
@@ -551,6 +583,10 @@ cp .env.example .env
 | `ULTRA_PRIMARY_QUEUE_WAIT` | `10s` | Queue limit for Ultra primary models, with the same rules as `PRIMARY_QUEUE_WAIT`: shared by the whole request, `0` never queues, cannot exceed `REQUEST_TIMEOUT` (when unset it is the smaller of 10s and `REQUEST_TIMEOUT`) |
 | `WAA_BACKEND` | `camoufox` | `camoufox` runs WAA in a Camoufox page; `go` runs WAA inside the service process and neither downloads nor starts Camoufox |
 | `TEMPORARY_CHAT` | `false` | Use Temporary Chat for the WAA prewarm page |
+| `MEDIA_OUTPUT` | `inline` | How generated media appears in replies from Chat Completions, Messages, and the native Gemini API: `inline` embeds it as before (data URI / `inlineData`); `url` saves it under `runtime/media/` by content and links to `/media/<file>` on this service (the native Gemini API gets link text plus `fileData`); that path does not check the API key. Use `url` behind new-api and similar gateways or when generating video, see [Generated Video and Media Links](#generated-video-and-media-links-omni). Applies immediately |
+| `MEDIA_BASE_URL` | empty | Service address used in media links, such as `https://ai.example.com` (a path prefix is allowed; no credentials or query). Behind new-api, nginx, and other proxies it must be the public address users can reach, and the reverse proxy must pass `/media/` through. Empty uses `X-Forwarded-Proto`, `X-Forwarded-Host`, or `Host` of each request. Applies immediately |
+| `MEDIA_RETENTION` | `7d` | How long media files are kept (such as `7d` or `72h`), by modification time, cleaned every hour; `0` keeps them, otherwise at least 1 hour. Applies immediately |
+| `MEDIA_MAX_SIZE` | `20GB` | Total size limit of `runtime/media/` (such as `20GB` or `500MB`, base 1024); above it the oldest files are deleted first, files from the last 10 minutes are kept; `0` means no limit, otherwise at least 100MB. Only media files named by content hash are deleted. Applies immediately |
 | `AUTO_START` | `true` | Start the generation service automatically when the management process starts, retrying transient failures from 5 seconds up to 1 minute apart; `false` keeps it `STOPPED` until started from the management page |
 | `REQUEST_BODY_LOG` | `false` | Also store public API POST request and response bodies in the usage ledger (each truncated to 64 KiB, newest 1000 kept), viewable in the request details of the Usage page; bodies are stored in plain text on this machine. Takes effect after restarting the program |
 | `ADMIN_PASSWORD` | empty | When set, the management page can also be opened with HTTP Basic authentication (any username, this value as password); 10 failures within 10 minutes block the IP for 15 minutes. Without it, only the admin token works. The management page and `/api/` always require the admin token stored in `.admin-token`: open the `http://127.0.0.1:2048/?admin_token=<token>` address printed in the startup log once and the browser remembers the login; scripts send it in the `X-Admin-Token` header. Use HTTPS, since plain HTTP sends the token and password in clear text |

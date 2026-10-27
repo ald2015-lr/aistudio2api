@@ -104,6 +104,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicInvalid(w, err)
 		return
 	}
+	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
+	s.restoreMediaLinks(generateRequest.Contents)
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
@@ -127,6 +129,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			w: w, id: messageID, model: request.Model,
 			inputTokens: inputTokens,
 			searchKey:   s.config.currentAPIKey(),
+			media:       s.mediaOutputFor(r),
 		}
 		if err := writer.start(); err != nil {
 			return
@@ -149,7 +152,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
-	writeJSON(w, http.StatusOK, buildAnthropicResponse(messageID, request.Model, result, s.config.currentAPIKey()))
+	writeJSON(w, http.StatusOK, buildAnthropicResponse(messageID, request.Model, result, s.config.currentAPIKey(), s.mediaOutputFor(r)))
 }
 
 func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
@@ -171,6 +174,7 @@ func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicInvalid(w, err)
 		return
 	}
+	s.restoreMediaLinks(generateRequest.Contents)
 	// 与生成请求一样整理对话轮次（包括把工具结果中的图片移到之后的用户消息），计数与实际发送的内容一致
 	contents, _ := normalizeTurns(generateRequest.Contents)
 	count, err := s.service.CountTokens(r.Context(), aistudio.TokenCountRequest{
@@ -741,7 +745,7 @@ func anthropicToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 	return config, nil
 }
 
-func buildAnthropicResponse(id string, model string, result generationResult, searchKey string) map[string]any {
+func buildAnthropicResponse(id string, model string, result generationResult, searchKey string, media mediaOutput) map[string]any {
 	stopReason, stopSequence := anthropicStop(result.finishReason, len(result.toolCalls) > 0, result.stopSequence)
 	searchBlocks, searchCount := anthropicSearchBlocks(result.events, searchKey)
 	if searchCount > 0 {
@@ -752,7 +756,7 @@ func buildAnthropicResponse(id string, model string, result generationResult, se
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
-		"content":       append(anthropicBlocks(result), searchBlocks...),
+		"content":       append(anthropicBlocks(result, media), searchBlocks...),
 		"stop_reason":   stopReason,
 		"stop_sequence": stopSequence,
 	}
@@ -776,7 +780,7 @@ func buildAnthropicResponse(id string, model string, result generationResult, se
 	return response
 }
 
-func anthropicBlocks(result generationResult) []anthropicContentBlock {
+func anthropicBlocks(result generationResult, media mediaOutput) []anthropicContentBlock {
 	blocks := make([]anthropicContentBlock, 0)
 	// pending 暂存正文块打开时单独到达的签名，正文块结束后再作为 redacted_thinking 输出，见 deferredSignatures
 	var pending deferredSignatures
@@ -842,7 +846,7 @@ func anthropicBlocks(result generationResult) []anthropicContentBlock {
 			}
 		case aistudio.EventMedia:
 			if event.Media != nil {
-				openText(renderMediaMarkdown(*event.Media))
+				openText(media.markdown(*event.Media))
 			}
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
@@ -925,10 +929,12 @@ type anthropicStreamWriter struct {
 	searchKey         string
 	// pendingSignatures 暂存正文块打开时单独到达的签名，正文块关闭后再输出 redacted_thinking
 	pendingSignatures deferredSignatures
+	// media 为生成媒体的输出方式（data URI 或本服务链接）
+	media mediaOutput
 }
 
 func (s *server) streamAnthropic(r *http.Request, writer *anthropicStreamWriter, events <-chan aistudio.Event) {
-	result, err := consumeStreamEvents(r.Context(), events, writer.live, writer.heartbeat)
+	result, err := consumeStreamEvents(r.Context(), events, writer.media.joinStreamAudio(writer.live), writer.heartbeat)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = writer.error(err)
@@ -1032,7 +1038,7 @@ func (writer *anthropicStreamWriter) live(event aistudio.Event) error {
 		}
 		return writer.emit("content_block_delta", map[string]any{
 			"type": "content_block_delta", "index": writer.blockIndex,
-			"delta": map[string]any{"type": "text_delta", "text": renderMediaMarkdown(*event.Media)},
+			"delta": map[string]any{"type": "text_delta", "text": writer.media.markdown(*event.Media)},
 		})
 	case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 		rendered := renderCodeExecution(event)

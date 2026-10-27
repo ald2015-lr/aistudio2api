@@ -69,6 +69,10 @@ type EditableKey =
   | 'min_output_tokens'
   | 'downgrade_guard'
   | 'proxy_pool'
+  | 'media_output'
+  | 'media_base_url'
+  | 'media_retention'
+  | 'media_max_size'
 
 const EDITABLE_KEYS: readonly EditableKey[] = [
   'auth_states',
@@ -101,15 +105,23 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'min_output_tokens',
   'downgrade_guard',
   'proxy_pool',
+  'media_output',
+  'media_base_url',
+  'media_retention',
+  'media_max_size',
 ]
 // 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存；
-// IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交
+// IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交；
+// 媒体链接地址、保存期限与总量上限输入到一半时不合法（例如期限只写了 7、地址只写了 https://），同样失焦时保存
 const BLUR_KEYS: readonly EditableKey[] = [
   'auth_states',
   'listen_addr',
   'proxy_api_key',
   'proxy',
   'proxy_pool',
+  'media_base_url',
+  'media_retention',
+  'media_max_size',
 ]
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
@@ -156,6 +168,25 @@ const DEFAULT_API_KEY = 'sk-onechat-fun-fun'
 const APPLY_DELAY_SECONDS = 5
 const AUTO_APPLY_KEY = 'aistudio2api_settings_auto_apply'
 const DURATION_PATTERN = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/
+// MEDIA_* 的下限与服务端一致：保存期限不为 0 时至少 1 小时，总量上限不为 0 时至少 100MB
+const MIN_MEDIA_RETENTION_MS = 3_600_000
+const MIN_MEDIA_MAX_BYTES = 100 * 1024 * 1024
+const MEDIA_SIZE_UNITS: Record<string, number> = {
+  '': 1,
+  b: 1,
+  k: 1024,
+  kb: 1024,
+  kib: 1024,
+  m: 1024 ** 2,
+  mb: 1024 ** 2,
+  mib: 1024 ** 2,
+  g: 1024 ** 3,
+  gb: 1024 ** 3,
+  gib: 1024 ** 3,
+  t: 1024 ** 4,
+  tb: 1024 ** 4,
+  tib: 1024 ** 4,
+}
 
 const { t, tf } = useI18n()
 const revealKey = ref(false)
@@ -199,6 +230,10 @@ const form = reactive<ServiceConfig>({
   repeat_prompt_nonce: true,
   min_output_tokens: 60000,
   downgrade_guard: defaultDowngradeGuard(),
+  media_output: 'inline',
+  media_base_url: '',
+  media_retention: '7d',
+  media_max_size: '20GB',
 })
 
 const upstreamChannelOptions: UpstreamChannel[] = ['playground', 'build']
@@ -345,6 +380,40 @@ function durationMillis(value: string): number {
   return matched !== '' && matched === value.trim() ? total : Number.NaN
 }
 
+// mediaRetentionMillis 与服务端 ParseMediaRetention 一致：Go 时长写法或整数天数加 d（7d），单独的 0 表示不清理；无法解析时返回 NaN
+function mediaRetentionMillis(value: string): number {
+  const text = value.trim().toLowerCase()
+  const days = /^(\d+)d$/.exec(text)
+  if (days !== null) return Number(days[1]) * 86_400_000
+  return durationMillis(text)
+}
+
+// mediaSizeBytes 与服务端 ParseMediaSize 一致：整数加单位（B、KB、MB、GB、TB，按 1024 进位），不写单位按字节；无法解析时返回 NaN
+function mediaSizeBytes(value: string): number {
+  const match = /^(\d+)\s*([a-z]*)$/.exec(value.trim().toLowerCase())
+  if (match === null) return Number.NaN
+  const unit = MEDIA_SIZE_UNITS[match[2]!]
+  return unit === undefined ? Number.NaN : Number(match[1]) * unit
+}
+
+// isMediaBaseURL 与服务端一致：空值，或不带账号密码、查询参数与片段的 http/https 地址（可带路径前缀）
+function isMediaBaseURL(value: string): boolean {
+  const text = value.trim()
+  if (text === '') return true
+  if (/[\s()<>"'`\\?#]/.test(text)) return false
+  try {
+    const parsed = new URL(text)
+    return (
+      (parsed.protocol === 'http:' || parsed.protocol === 'https:') &&
+      parsed.host !== '' &&
+      parsed.username === '' &&
+      parsed.password === ''
+    )
+  } catch {
+    return false
+  }
+}
+
 function isListenAddress(value: string): boolean {
   const match = /^(\[[^\]]+\]|[^:]*):(\d{1,5})$/.exec(value)
   if (match === null) return false
@@ -442,6 +511,15 @@ function validate(value: ServiceConfig): string {
   }
   if (!isPositiveInteger(value.ultra_max_active_workers) || value.ultra_max_active_workers < ultraWarm) {
     return t('settings.invalidUltraMaxWorkers')
+  }
+  if (!isMediaBaseURL(value.media_base_url)) return t('settings.invalidMediaBaseURL')
+  const retention = mediaRetentionMillis(value.media_retention)
+  if (Number.isNaN(retention) || (retention > 0 && retention < MIN_MEDIA_RETENTION_MS)) {
+    return t('settings.invalidMediaRetention')
+  }
+  const maxSize = mediaSizeBytes(value.media_max_size)
+  if (Number.isNaN(maxSize) || (maxSize > 0 && maxSize < MIN_MEDIA_MAX_BYTES)) {
+    return t('settings.invalidMediaMaxSize')
   }
   return ''
 }
@@ -585,6 +663,25 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
       if (form[key] !== saved[key] && durationMillis(form[key]) === durationMillis(saved[key])) {
         form[key] = saved[key]
       }
+    }
+    // 媒体设置同样由服务端写成规范形式（168h 保存为 7d、20gb 保存为 20GB、地址去掉末尾的 /），含义相同时表单同步显示
+    if (
+      form.media_retention !== saved.media_retention &&
+      mediaRetentionMillis(form.media_retention) === mediaRetentionMillis(saved.media_retention)
+    ) {
+      form.media_retention = saved.media_retention
+    }
+    if (
+      form.media_max_size !== saved.media_max_size &&
+      mediaSizeBytes(form.media_max_size) === mediaSizeBytes(saved.media_max_size)
+    ) {
+      form.media_max_size = saved.media_max_size
+    }
+    if (
+      form.media_base_url !== saved.media_base_url &&
+      form.media_base_url.trim().replace(/\/+$/, '') === saved.media_base_url
+    ) {
+      form.media_base_url = saved.media_base_url
     }
     // 两个主用模型排队上限在旧版服务端可能没有返回，只在两边都有值时同步
     for (const key of ['primary_queue_wait', 'ultra_primary_queue_wait'] as const) {
@@ -746,6 +843,16 @@ watch(
     const base = savedConfig.value
     if (base === null || value === snapshot(base, AUTO_KEYS)) return
     scheduleSave()
+  },
+)
+
+// 输出方式切回 inline 时媒体链接地址框随之隐藏：地址还是没能保存的不合法输入时恢复为已保存的值，
+// 否则看不见、改不了的地址错误会拦住这次切换和之后的每次保存
+watch(
+  () => form.media_output,
+  (value) => {
+    if (value !== 'inline' || isMediaBaseURL(form.media_base_url)) return
+    form.media_base_url = savedConfig.value?.media_base_url ?? ''
   },
 )
 
@@ -1106,6 +1213,70 @@ onBeforeUnmount(() => {
         </UiSelect>
         <span class="mt-2 block text-xs text-gray-500">{{ t('settings.waaBackendHelp') }}</span>
       </label>
+
+      <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <legend class="sr-only">{{ t('settings.mediaTitle') }}</legend>
+        <span class="mb-1 block text-sm font-medium text-gray-300">{{
+          t('settings.mediaTitle')
+        }}</span>
+        <p class="mb-4 text-xs leading-5 text-gray-500">{{ t('settings.mediaHelp') }}</p>
+        <label class="block">
+          <span class="mb-1 block text-sm font-medium text-gray-400">{{
+            t('settings.mediaOutput')
+          }}</span>
+          <UiSelect
+            v-model="form.media_output"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          >
+            <option value="inline">{{ t('settings.mediaOutputInline') }}</option>
+            <option value="url">{{ t('settings.mediaOutputURL') }}</option>
+          </UiSelect>
+          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaOutputHelp') }}</span>
+        </label>
+        <label v-if="form.media_output === 'url'" class="mt-4 block">
+          <span class="mb-1 block text-sm font-medium text-gray-400">{{
+            t('settings.mediaBaseURL')
+          }}</span>
+          <input
+            v-model.trim="form.media_base_url"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            placeholder="https://ai.example.com"
+            autocomplete="off"
+            spellcheck="false"
+            @change="commitBlurField"
+          />
+          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaBaseURLHelp') }}</span>
+        </label>
+        <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.mediaRetention')
+            }}</span>
+            <input
+              v-model.trim="form.media_retention"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              placeholder="7d"
+              autocomplete="off"
+              spellcheck="false"
+              @change="commitBlurField"
+            />
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.mediaMaxSize')
+            }}</span>
+            <input
+              v-model.trim="form.media_max_size"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              placeholder="20GB"
+              autocomplete="off"
+              spellcheck="false"
+              @change="commitBlurField"
+            />
+          </label>
+        </div>
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaCleanupHelp') }}</span>
+      </fieldset>
 
       <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.upstreamChannels') }}</legend>

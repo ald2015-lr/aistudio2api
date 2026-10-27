@@ -153,7 +153,8 @@ func (service *trackedService) prewarmIfRunning() {
 
 // requiresRebuild 判断配置差异是否只能通过重建生成服务生效：
 // 账户目录、默认代理、WAA 后端与上游通道决定了运行时的装配方式，其余字段都可热更新
-// （包括单账户每分钟上限 ACCOUNT_RPM_LIMIT：applyLiveFields 经 SetAccountRateLimit 立即生效，不在这里比较）
+// （包括单账户每分钟上限 ACCOUNT_RPM_LIMIT：applyLiveFields 经 SetAccountRateLimit 立即生效，不在这里比较；
+// 媒体设置 MEDIA_* 与 ULTRA_EXCLUSIVE 一样是进程级设置，applyLiveFields 先于这里的判断经 applyMediaSettings 应用）
 func requiresRebuild(saved config.Config, active config.Config) bool {
 	return saved.AuthStates != active.AuthStates || saved.Proxy != active.Proxy ||
 		saved.WAABackend != active.WAABackend || !slices.Equal(saved.UpstreamChannels, active.UpstreamChannels)
@@ -175,7 +176,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
-		saved.ProxyPool.Equal(active.ProxyPool)
+		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 
 // applyLiveConfig 读取已保存配置，把可热更新的字段直接应用到当前生成服务，不中断任何请求
@@ -216,8 +217,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		return nil, saved, false
 	}
 	manager.overrides.Apply(&saved)
-	// 独占设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
+	// 独占设置与媒体设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
 	manager.applyUltraExclusive(saved.UltraExclusive)
+	manager.applyMediaSettings(saved.Media)
 
 	manager.mu.Lock()
 	generation := manager.current

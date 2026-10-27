@@ -72,14 +72,52 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	return body, binding, nil
 }
 
-// encodeInteractionSteps 把规范消息编码为 Interaction input steps，用户为 step field 1、模型为 field 2
+// interactionModelMediaIntro 放在从模型消息移到用户 step 的附件之前的说明
+const interactionModelMediaIntro = "以下是上文模型回复里的图片或视频："
+
+// interactionModelMedia 为模型消息里待移到随后用户 step 的附件；index 为它所在的 contents 下标，报错时指明位置
+type interactionModelMedia struct {
+	index int
+	part  Part
+}
+
+// encodeInteractionSteps 把规范消息编码为 Interaction input steps，用户为 step field 1、模型为 field 2。
+// 模型 step 只带文本：模型消息里的附件（客户端回传的生成图片、本服务恢复的图片链接、续接历史里模型生成的视频，上传后为 Drive 引用）连同一句说明
+// 移到紧随其后的用户 step 最前面（与 api.normalizeTurns 移动工具结果图片的做法一致），以模型消息结尾时单独成一条用户 step；
+// 只有附件的模型消息整条省略。移过去的附件按用户附件编码：没有 Drive 授权、仍是 inline data 时与用户附件一样返回需要 Drive 授权的错误，
+// 外部地址不接受，不静默丢掉
 func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
-	steps := make([]any, 0, len(contents))
-	binding := make([]Content, 0, len(contents))
+	steps := make([]any, 0, len(contents)+1)
+	binding := make([]Content, 0, len(contents)+1)
 	hasModelTurn := false
+	var pendingMedia []interactionModelMedia
+	// flushMedia 编码待移动的模型附件，返回放在用户 step 最前面的 part 与参与 binding 的说明文字（文件 ID 不参与 binding）
+	flushMedia := func() ([]any, []Part, error) {
+		if len(pendingMedia) == 0 {
+			return nil, nil, nil
+		}
+		parts := []any{[]any{[]any{interactionModelMediaIntro}}}
+		for _, media := range pendingMedia {
+			encoded, err := encodeInteractionAttachment(media.index, media.part, RoleUser)
+			if err != nil {
+				return nil, nil, err
+			}
+			parts = append(parts, encoded)
+		}
+		pendingMedia = nil
+		return parts, []Part{{Text: interactionModelMediaIntro}}, nil
+	}
 	for index, content := range contents {
 		parts := make([]any, 0, len(content.Parts))
 		texts := make([]Part, 0, len(content.Parts))
+		if content.Role == RoleUser {
+			media, intro, err := flushMedia()
+			if err != nil {
+				return nil, nil, false, err
+			}
+			parts = append(parts, media...)
+			texts = append(texts, intro...)
+		}
 		for _, part := range content.Parts {
 			switch {
 			case part.Thought || part.Text == "" && part.ThoughtSignature != "" && part.InlineData == nil && part.File == nil:
@@ -87,13 +125,14 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 			case part.Text != "" && part.InlineData == nil && part.File == nil && part.FunctionCall == nil && part.FunctionResult == nil:
 				parts = append(parts, []any{[]any{part.Text}})
 				texts = append(texts, Part{Text: part.Text})
-			case part.File != nil && strings.TrimSpace(part.File.ID) != "" && part.Text == "" && content.Role == RoleUser:
-				// Content field 9 为 Drive 文件引用
-				parts = append(parts, []any{nil, nil, nil, nil, nil, nil, nil, nil, []any{strings.TrimSpace(part.File.ID)}})
-			case part.InlineData != nil:
-				return nil, nil, false, fmt.Errorf("Interaction 模型的 contents[%d] 附件需要账户 Drive 授权", index)
+			case content.Role == RoleAssistant && (part.InlineData != nil || part.File != nil || part.ExternalMedia != nil):
+				pendingMedia = append(pendingMedia, interactionModelMedia{index: index, part: part})
 			default:
-				return nil, nil, false, fmt.Errorf("Interaction 模型的 contents[%d] 只接受文本与用户附件 part", index)
+				encoded, err := encodeInteractionAttachment(index, part, content.Role)
+				if err != nil {
+					return nil, nil, false, err
+				}
+				parts = append(parts, encoded)
 			}
 		}
 		if len(parts) == 0 {
@@ -110,10 +149,32 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		}
 		binding = append(binding, Content{Role: content.Role, Parts: texts})
 	}
+	media, intro, err := flushMedia()
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(media) > 0 {
+		steps = append(steps, []any{[]any{media}})
+		binding = append(binding, Content{Role: RoleUser, Parts: intro})
+	}
 	if len(steps) == 0 {
 		return nil, nil, false, fmt.Errorf("%w: CreateInteractionStream contents 不能为空", ErrInvalidArgument)
 	}
 	return steps, binding, hasModelTurn, nil
+}
+
+// encodeInteractionAttachment 编码 step 里的附件 part：用户的 Drive 文件引用为 Content field 9；仍是 inline data（账户没有 Drive 授权）
+// 时返回需要 Drive 授权的错误；其他 part 不接受
+func encodeInteractionAttachment(index int, part Part, role Role) ([]any, error) {
+	switch {
+	case part.File != nil && strings.TrimSpace(part.File.ID) != "" && part.Text == "" && role == RoleUser:
+		// Content field 9 为 Drive 文件引用
+		return []any{nil, nil, nil, nil, nil, nil, nil, nil, []any{strings.TrimSpace(part.File.ID)}}, nil
+	case part.InlineData != nil:
+		return nil, fmt.Errorf("Interaction 模型的 contents[%d] 附件需要账户 Drive 授权", index)
+	default:
+		return nil, fmt.Errorf("Interaction 模型的 contents[%d] 只接受文本与用户附件 part", index)
+	}
 }
 
 // interactionThinkingLevel 按请求的思考强度或预算选择模型支持的 Interaction thinking level

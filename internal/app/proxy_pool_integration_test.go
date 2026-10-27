@@ -705,6 +705,9 @@ func mutateConfigField(t *testing.T, cfg *config.Config, name string) {
 	case "DowngradeGuard":
 		cfg.DowngradeGuard.Enabled = !cfg.DowngradeGuard.Enabled
 		return
+	case "Media":
+		cfg.Media.Output = config.MediaOutputURL
+		return
 	}
 	field := reflectValueOf(cfg).FieldByName(name)
 	switch field.Kind() {

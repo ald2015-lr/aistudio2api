@@ -370,6 +370,7 @@ providers:
 | 视频 | `POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content` |
 | Gemini 视频 | `POST /v1beta/models/{model}:predictLongRunning`、`GET /v1beta/operations/{id}` |
 | Live（含实时翻译与实时转录）/ Robotics | `GET /v1/live`、`GET /v1/robotics/stream` |
+| 生成媒体链接 | `GET /media/<文件名>`（`MEDIA_OUTPUT=url` 时，不校验 API key，见[生成视频与媒体链接](#生成视频与媒体链接omni)） |
 
 四套生成接口均可按各自协议字段启用 Search、Image Search、URL Context、Code Execution 和 Maps。Files、Transcribe、Live、Robotics 的请求与事件格式见 [Google AI Studio 协议规范](docs/protocol.md)。
 
@@ -504,6 +505,37 @@ curl http://127.0.0.1:2048/v1/videos \
 
 创建操作后通过 `GET /v1/videos/{id}` 查询状态，通过 `GET /v1/videos/{id}/content` 下载结果。
 
+### 生成视频与媒体链接（Omni）
+
+Gemini Omni（如 `gemini-omni-1.1-flash`）在 Chat Completions、Messages 与 Gemini 原生接口里直接返回 MP4（几 MB，带 Google C2PA 签名），图片模型与音乐模型同样在回复里返回图片与音频。默认 `MEDIA_OUTPUT=inline` 与原先一样内联：Chat Completions 与 Messages 写成 `[media](data:video/mp4;base64,…)` 的 Markdown，Gemini 原生接口为 `inlineData`。
+
+经 new-api（One API 一类的中转）使用时，中转把 Gemini 回复转成 OpenAI 格式时只保留文本、思考与 `image/*` 的 `inlineData`，`video/mp4` 与音频会被丢掉，用户只看到思考、正文为空；几 MB 的 data URI 在其他客户端里也很难用。这时在管理页“服务配置 → 生成媒体输出”里（或 `.env`）设置：
+
+```bash
+MEDIA_OUTPUT=url
+# 填用户能访问到的公网地址：经 new-api、nginx 转发时请求里的主机多半是内网地址
+MEDIA_BASE_URL=https://ai.example.com
+```
+
+保存后立即生效，不用重启。生成的媒体按内容（SHA-256）命名保存到 `runtime/media/`，同一内容只存一份，正文改为本服务的链接：
+
+- Chat Completions 与 Messages：图片 `![image](https://ai.example.com/media/<64 位哈希>.png)`，视频 `[video](…/media/<哈希>.mp4)`，音频 `[audio](…/media/<哈希>.wav)`（PCM 音频合并后包装成 WAV）
+- Gemini 原生接口（`generateContent`、`streamGenerateContent`，含 `/ultra` 前缀）：每个媒体输出两个 part，先是链接文本 `{"text":"\n[video](https://ai.example.com/media/<哈希>.mp4)\n"}`（new-api 等按文本转换，能把链接带给用户），再是 `{"fileData":{"mimeType":"video/mp4","fileUri":"https://ai.example.com/media/<哈希>.mp4"}}`（原生 SDK 从这里取地址；new-api 把它当作空文本，不会报错）
+
+`GET /media/<文件名>` 不校验 API key，拿到链接的人都能打开（文件名是内容哈希，无法枚举），只读、支持 Range（视频可拖动进度）与一年的缓存头；不是 url 模式时一律 404。反向代理要放行 `/media/`，例如 nginx：
+
+```nginx
+location /media/ {
+    proxy_pass http://127.0.0.1:2048;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+`MEDIA_BASE_URL` 留空时按每个请求访问的地址生成链接（`X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`），只适合客户端直接访问本服务的场景。媒体文件按 `MEDIA_RETENTION`（默认 7 天）与 `MEDIA_MAX_SIZE`（默认 20GB）在后台每小时清理一次，过期或超出总量的文件删除后链接返回 404。
+
+客户端把带链接的回复作为历史回传时：assistant 正文里的本服务图片链接恢复为图片输入（与 inline 模式回传 data URI 时一样，可以继续改图），视频、音频链接保持文本；用户消息里指向本服务媒体的 `image_url`、`fileData` 恢复为内联媒体。同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB，超出时较早的引用保持链接。换成 Omni 等 Interaction 模型继续对话时（例如先出图，再让 Omni “让它动起来”），模型消息里的图片与用户附件一样先上传到账户的 Drive，再放到随后的用户消息最前面发给模型，模型能看到这张图；账户没有 Drive 授权时与用户附件一样返回 400。url 模式只作用于 Chat Completions、Messages 与 Gemini 原生接口，Responses、Interactions、Live 以及图片、语音、视频接口的输出不变。
+
 ## 模型
 
 模型目录会随 AI Studio 更新，客户端从 `/v1/models` 或 `/v1beta/models` 读取当前值。下表保留目录结构示例，模型 ID、限制和方法以运行时结果为准：
@@ -602,6 +634,10 @@ cp .env.example .env
 | `ULTRA_PRIMARY_QUEUE_WAIT` | `10s` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同：整个请求共用一份，`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
+| `MEDIA_OUTPUT` | `inline` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 与原先一样内联（data URI / `inlineData`）；`url` 按内容保存到 `runtime/media/`，正文改为本服务 `/media/<文件名>` 的链接（Gemini 原生接口为链接文本加 `fileData`），该路径不校验 API key。经 new-api 等中转使用、或生成视频时设为 `url`，见[生成视频与媒体链接](#生成视频与媒体链接omni)。保存后立即生效 |
+| `MEDIA_BASE_URL` | 空 | 媒体链接使用的服务地址，例如 `https://ai.example.com`（可带路径前缀，不能带账号密码、查询参数）；经 new-api、nginx 等转发时必须填用户能访问到的公网地址，并让反向代理放行 `/media/`。留空时按每个请求的 `X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`。保存后立即生效 |
+| `MEDIA_RETENTION` | `7d` | 媒体文件的保存期限（如 `7d`、`72h`），按文件修改时间计算，后台每小时清理；`0` 不按时间清理，不为 0 时至少 1 小时。保存后立即生效 |
+| `MEDIA_MAX_SIZE` | `20GB` | `runtime/media/` 的总量上限（如 `20GB`、`500MB`，按 1024 进位），超过时从最旧的文件开始删除，最近 10 分钟内生成的不删；`0` 不限，不为 0 时至少 100MB。只删除以内容哈希命名的媒体文件。保存后立即生效 |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
 | `REQUEST_BODY_LOG` | `false` | 用量账本同时保存公开 API POST 请求与响应的正文（各截断到 64 KiB，只保留最近 1000 条），在用量页的请求详情中查看；正文以明文保存在本机，修改后重启程序生效 |
 | `ADMIN_PASSWORD` | 空 | 设置后除管理令牌外也可以用密码打开管理页面，浏览器弹出登录框（用户名随意，密码为此值）；同一 IP 10 分钟内错 10 次封禁 15 分钟；留空时只能用管理令牌（`.admin-token`）登录。纯 HTTP 下令牌与密码均为明文传输，建议配合 HTTPS |

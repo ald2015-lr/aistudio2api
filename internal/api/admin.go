@@ -440,6 +440,13 @@ type RuntimeConfig struct {
 	UltraPrimaryQueueWait string    `json:"ultra_primary_queue_wait,omitempty"`
 	// ProxyPool 为 IP 池设置（PROXY_POOL_*，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	ProxyPool *ProxyPoolConfig `json:"proxy_pool,omitempty"`
+	// MediaOutput、MediaBaseURL、MediaRetention、MediaMaxSize 为生成媒体的输出与保存设置（MEDIA_OUTPUT、MEDIA_BASE_URL、
+	// MEDIA_RETENTION、MEDIA_MAX_SIZE，保存后立即生效），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值。
+	// 期限与大小为文本（7d、72h、20GB，0 表示不清理或不限）；服务地址可以清空，所以用指针区分缺省
+	MediaOutput    string  `json:"media_output,omitempty"`
+	MediaBaseURL   *string `json:"media_base_url,omitempty"`
+	MediaRetention string  `json:"media_retention,omitempty"`
+	MediaMaxSize   string  `json:"media_max_size,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

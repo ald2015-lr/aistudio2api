@@ -168,6 +168,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.thoughtSignatures.Restore(generateRequest.Contents)
+	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
+	s.restoreMediaLinks(generateRequest.Contents)
 	hideThought := s.prepareGenerate(r.Context(), &generateRequest)
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
@@ -194,7 +196,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.thoughtSignatures.Remember(result.toolCalls)
-	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, result))
+	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, result, s.mediaOutputFor(r)))
 }
 
 func (request chatRequest) toGenerateRequest(id string) (aistudio.GenerateRequest, error) {
@@ -742,8 +744,8 @@ func normalizeStopSequences(values []string) []string {
 	return normalized
 }
 
-func buildChatCompletion(id string, created int64, model string, result generationResult) map[string]any {
-	rendered := renderedContent(result.events)
+func buildChatCompletion(id string, created int64, model string, result generationResult, media mediaOutput) map[string]any {
+	rendered := renderedContent(result.events, media)
 	content := any(rendered)
 	if rendered == "" && len(result.toolCalls) > 0 {
 		content = nil
@@ -794,7 +796,8 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 	toolIndex := 0
 	hasContent := false
 	contentEndsWithNewline := false
-	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
+	media := s.mediaOutputFor(r)
+	result, err := consumeStreamEvents(r.Context(), events, media.joinStreamAudio(func(event aistudio.Event) error {
 		switch event.Kind {
 		case aistudio.EventText:
 			hasContent = hasContent || event.Text != ""
@@ -827,7 +830,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			if event.Media == nil {
 				return nil
 			}
-			content := renderMediaMarkdown(*event.Media)
+			content := media.markdown(*event.Media)
 			if hasContent && !contentEndsWithNewline {
 				content = "\n" + content
 			}
@@ -848,7 +851,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			return writeChatChunk(w, id, created, request.Model, map[string]any{"content": content}, nil, request.StreamOptions.IncludeUsage)
 		}
 		return nil
-	}, func() error { return writeSSEHeartbeat(w) })
+	}), func() error { return writeSSEHeartbeat(w) })
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = writeSSE(w, "", openAIStreamError(w, err))
@@ -972,7 +975,8 @@ func openAIUsage(usage *aistudio.Usage) map[string]any {
 	}
 }
 
-func renderedContent(events []aistudio.Event) string {
+// renderedContent 返回 Chat 消息正文：正文原样拼接，媒体按 media 渲染为 Markdown（data URI 或本服务链接），代码执行渲染为代码块
+func renderedContent(events []aistudio.Event, media mediaOutput) string {
 	var content strings.Builder
 	for _, event := range events {
 		switch event.Kind {
@@ -985,7 +989,7 @@ func renderedContent(events []aistudio.Event) string {
 			if content.Len() > 0 && !strings.HasSuffix(content.String(), "\n") {
 				content.WriteByte('\n')
 			}
-			content.WriteString(renderMediaMarkdown(*event.Media))
+			content.WriteString(media.markdown(*event.Media))
 		case aistudio.EventExecutableCode, aistudio.EventCodeExecutionResult:
 			rendered := renderCodeExecution(event)
 			if rendered == "" {
