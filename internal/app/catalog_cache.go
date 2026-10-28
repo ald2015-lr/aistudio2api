@@ -337,27 +337,27 @@ func (cache *catalogCache) restore(pool *aistudio.AccountPool, client catalogPri
 			AccountID: accountID, Tier: aistudio.BenefitTier(entry.Tier), Playground: loaded.models,
 			EmptyCount: entry.Empties, EmptySince: unixTime(entry.EmptySince),
 		}
-		if buildEnabled {
-			if entry.BuildSynced && entry.Build != "" {
-				build := builds[entry.Build]
-				if build == nil {
-					_, models, older, err := cache.readBlob(entry.Build, catalogBlobBuild)
-					build = &loadedBuild{models: models, err: err, older: older}
-					if err != nil && !older {
-						cache.removeBadBlob(entry.Build, catalogBlobBuild)
-					}
-					builds[entry.Build] = build
+		// Build 目录不论 Build 通道是否启用都恢复：没有启用时账户池不使用它，运行中经 UPSTREAM_CHANNELS 热更新启用 Build 后
+		// 立即可用（见 applyUpstreamChannels），同步时也照旧写回缓存，不丢掉。只有启用了 Build 时没有恢复的账户才排进后台同步
+		if entry.BuildSynced && entry.Build != "" {
+			build := builds[entry.Build]
+			if build == nil {
+				_, models, older, err := cache.readBlob(entry.Build, catalogBlobBuild)
+				build = &loadedBuild{models: models, err: err, older: older}
+				if err != nil && !older {
+					cache.removeBadBlob(entry.Build, catalogBlobBuild)
 				}
-				if build.err == nil {
-					item.Build, item.BuildSynced = build.models, true
-				}
-			} else if entry.BuildSynced {
-				// Build 目录同步过且为空
-				item.Build, item.BuildSynced = []aistudio.Model{}, true
+				builds[entry.Build] = build
 			}
-			if !item.BuildSynced {
-				buildMissing[accountID] = struct{}{}
+			if build.err == nil {
+				item.Build, item.BuildSynced = build.models, true
 			}
+		} else if entry.BuildSynced {
+			// Build 目录同步过且为空
+			item.Build, item.BuildSynced = []aistudio.Model{}, true
+		}
+		if buildEnabled && !item.BuildSynced {
+			buildMissing[accountID] = struct{}{}
 		}
 		items = append(items, item)
 		datas[accountID] = loaded.data

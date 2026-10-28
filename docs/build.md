@@ -28,7 +28,8 @@ Build 应用运行在 `*.scf.usercontent.goog` 的 blob 沙箱 iframe 中。宿�
 
 - 默认值为 `playground,build`；逗号分隔，去除空白并转小写；至少一个，不能重复，其他值在配置校验时报错
 - 列表顺序即同一账户内的通道顺序
-- 配置来源为 `.env`、管理页面设置中的“上游通道”（至少保留一个，保存为 `playground,build` 顺序）或 `PUT /api/config` 的 `upstream_channels`；保存值在下一次启动生成服务时生效
+- 配置来源为 `.env`、管理页面设置中的“上游通道”（至少保留一个，保存为 `playground,build` 顺序）或 `PUT /api/config` 的 `upstream_channels`；保存后立即生效，不需要重启生成服务（候选索引按新的通道顺序重建；运行中新启用 Build 时，没有 Build 目录的账户由后台目录同步补齐）
+- 官网停用经 Build 代理的生成（`PROXY_GENERATION_DISABLED`）时不必改这个配置：服务自动暂停 Build、生成改走 Playground，并定期试探恢复，见 [协议规范](protocol.md) 的“Build 代理”一节
 
 通道在以下位置显示：
 

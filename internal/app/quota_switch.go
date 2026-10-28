@@ -171,9 +171,11 @@ func egressOtherOutcome(requestCtx context.Context, generated, coolingDown, bare
 }
 
 // egressCountsOther 判断失败是否计入出口的“其他失败”（5xx、首事件超时、带指标的每日或分钟限额、403、404 等）：
-// 输入超限、参数错误、上游 400（内容、安全审核类）、请求取消与本地 Worker 替换与出口无关，不计
+// 输入超限、参数错误、上游 400（内容、安全审核类）、官网停用 Build 通道的生成（PROXY_GENERATION_DISABLED）、请求取消与
+// 本地 Worker 替换与出口无关，不计
 func egressCountsOther(err error) bool {
 	if err == nil || inputTokenLimitError(err) || errors.Is(err, aistudio.ErrInvalidArgument) ||
+		aistudio.BuildGenerationDisabledFailure(err) ||
 		errors.Is(err, context.Canceled) || errors.Is(err, errAccountWorkerReplaced) {
 		return false
 	}

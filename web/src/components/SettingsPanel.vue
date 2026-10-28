@@ -6,10 +6,12 @@ import {
   DEFAULT_PROXY_POOL_PORT_END,
   DEFAULT_PROXY_POOL_PORT_START,
   cloneProxyPool,
+  formatClock,
   proxyPoolProblem,
   proxyPoolProblemKey,
 } from '@/proxyPool'
 import type {
+  BuildChannelStatus,
   DowngradeGuardConfig,
   Model,
   ProxyPoolConfig,
@@ -31,6 +33,8 @@ const props = defineProps<{
   models: Model[]
   // proxyPoolStatus 为状态接口的 IP 池实时状态（没有开启或旧版服务端时为 null）
   proxyPoolStatus: ProxyPoolStatus | null
+  // buildChannelStatus 为状态接口的 Build 通道生成暂停状态（没有启用 Build、服务未运行或旧版服务端时为 null）
+  buildChannelStatus?: BuildChannelStatus | null
 }>()
 
 const emit = defineEmits<{
@@ -188,7 +192,7 @@ const MEDIA_SIZE_UNITS: Record<string, number> = {
   tib: 1024 ** 4,
 }
 
-const { t, tf } = useI18n()
+const { t, tf, locale } = useI18n()
 const revealKey = ref(false)
 const saving = ref(false)
 const saveError = ref('')
@@ -337,6 +341,37 @@ const statusClass = computed(() => {
   if (saveError.value !== '') return 'text-red-400'
   if (saving.value || dirty.value || props.config?.service_restart_required) return 'text-yellow-400'
   return 'text-green-400'
+})
+
+// buildChannelText 为“上游通道”旁的 Build 通道状态：全局暂停时写开始与下次试探时间，只有部分账号暂停时写账号数（另有暂停到期、
+// 等待试探的账号时一并写出），只有等待试探的账号时写等待试探，正常时写正常；没有启用 Build 或服务未运行时不显示
+const buildChannelText = computed(() => {
+  const status = props.buildChannelStatus
+  if (!status) return ''
+  if (status.paused) {
+    const text = tf('settings.buildChannelPaused', {
+      since: formatClock(status.since, locale.value) || '-',
+      next: formatClock(status.next_probe, locale.value) || '-',
+    })
+    return status.probing ? text + t('settings.buildChannelProbing') : text
+  }
+  const awaiting = status.awaiting_probe ?? 0
+  if (status.paused_accounts > 0) {
+    const text = tf('settings.buildChannelAccountsPaused', { count: status.paused_accounts })
+    return awaiting > 0 ? text + tf('settings.buildChannelAwaitingMore', { count: awaiting }) : text
+  }
+  if (awaiting > 0) {
+    return tf('settings.buildChannelAwaiting', { count: awaiting })
+  }
+  return t('settings.buildChannelNormal')
+})
+
+// buildChannelWarn 为 Build 通道有暂停（全局、按账号或等待试探）时用提示色
+const buildChannelWarn = computed(() => {
+  const status = props.buildChannelStatus
+  return (
+    !!status && (status.paused || status.paused_accounts > 0 || (status.awaiting_probe ?? 0) > 0)
+  )
 })
 
 // toggleUpstreamChannel 切换通道并保持配置顺序，至少保留一个通道
@@ -1304,6 +1339,12 @@ onBeforeUnmount(() => {
         <span class="mt-2 block text-xs text-gray-500">{{
           t('settings.upstreamChannelsHelp')
         }}</span>
+        <span
+          v-if="buildChannelText"
+          class="mt-1 block text-xs"
+          :class="buildChannelWarn ? 'text-yellow-400' : 'text-gray-400'"
+          >{{ buildChannelText }}</span
+        >
       </fieldset>
 
       <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">

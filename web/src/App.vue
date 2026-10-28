@@ -978,6 +978,7 @@ onUnmounted(() => {
           :running="serviceState === 'running' || serviceState === 'launching'"
           :models="models"
           :proxy-pool-status="status?.proxy_pool ?? null"
+          :build-channel-status="status?.build_channel ?? null"
           @saved="config = $event"
           @notice="showNotice"
         />

@@ -328,7 +328,9 @@ func (p *AccountPool) Labels(accountIDs []string) map[string]string {
 // longCoolingLocked 判断账户在该模型上是否长时间不可用：全局冷却，或所有启用通道都在冷却，
 // 且剩余时间不少于 minRemaining（排除一分钟内就恢复的分钟限额）；modelID 为空时只看全局冷却。调用方持有 p.mu。
 // 这是 Worker 淘汰与轮换的口径（针对指定模型、不看通道是否支持该模型、有剩余时间门槛）；状态页与状态摘要的 cooldown
-// 另按 accountCoolingLocked 判断（任一模型、只看账户可用的通道、不设门槛），两者有意不同
+// 另按 accountCoolingLocked 判断（任一模型、只看账户可用的通道、不设门槛），两者有意不同。
+// Build 生成暂停（全局或该账户，官网停用了 Build 通道的生成，见 build_pause.go）期间 Build 视同没有启用（buildGenerationOpenLocked）：
+// 生成只走 Playground，Playground 长时间冷却的账户与只启用 Playground 时一样算死槽位，及时淘汰、轮换
 func (p *AccountPool) longCoolingLocked(account *Account, modelID string, now time.Time, minRemaining time.Duration) bool {
 	if longCooldownActive(account, globalCooldownKey, now, minRemaining) {
 		return true
@@ -337,7 +339,7 @@ func (p *AccountPool) longCoolingLocked(account *Account, modelID string, now ti
 		return false
 	}
 	playground := !p.channelEnabledLocked(ChannelPlayground) || longCooldownActive(account, modelID, now, minRemaining)
-	build := !p.channelEnabledLocked(ChannelBuild) ||
+	build := !p.buildGenerationOpenLocked(account) ||
 		longCooldownActive(account, ChannelCooldownScope(ChannelBuild, modelID), now, minRemaining)
 	return playground && build
 }

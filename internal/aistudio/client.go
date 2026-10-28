@@ -195,6 +195,22 @@ const rpcDetailTypePrefix = "type.googleapis.com/"
 // 时长为 Go 的 time.ParseDuration 格式；“Retry with an alternative Gemini model” 不匹配
 var retryInMessagePattern = regexp.MustCompile(`(?i)\bretry in ((?:\d+(?:\.\d+)?(?:h|ms|us|µs|ns|m|s))+)`)
 
+var (
+	// 上游消息里的内部标记，例如 "[original: beyond::dependency::INVALID_ARGUMENT] ..."、"generic::failed_precondition: ..." 与 "(qos=CRITICAL_PLUS)"
+	upstreamOriginalTag = regexp.MustCompile(`\[(?i:original)[^\]]*\]\s*`)
+	upstreamQoSTag      = regexp.MustCompile(`\s*\((?i:qos)=[^)]*\)`)
+	upstreamGenericTag  = regexp.MustCompile(`\b(?:generic|beyond)::[A-Za-z_:]+:\s*`)
+)
+
+// CleanUpstreamMessage 去掉上游消息里的内部标记，只保留谷歌官方原文：API 层对外返回上游文案，与按文案开头识别的错误
+// （Build 代理的 PROXY_GENERATION_DISABLED，见 build_pause.go）共用，两边看到的是同一段原文
+func CleanUpstreamMessage(message string) string {
+	message = upstreamOriginalTag.ReplaceAllString(message, "")
+	message = upstreamQoSTag.ReplaceAllString(message, "")
+	message = upstreamGenericTag.ReplaceAllString(message, "")
+	return strings.TrimSpace(message)
+}
+
 // Error 返回结构化上游错误
 func (e *RPCError) Error() string {
 	if e.Code != 0 {

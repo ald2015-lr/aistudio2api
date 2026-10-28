@@ -50,9 +50,17 @@ func (e *RPCError) orgDisabled() bool {
 		strings.Contains(strings.ToLower(e.Message), orgDisabledMessage)
 }
 
-// Is 让组织停用的上游错误满足 errors.Is(err, ErrOrgDisabled)
+// Is 让组织停用的上游错误满足 errors.Is(err, ErrOrgDisabled)，官网停用 Build 生成的上游错误满足
+// errors.Is(err, ErrBuildGenerationDisabled)（见 build_pause.go）
 func (e *RPCError) Is(target error) bool {
-	return target == ErrOrgDisabled && e.orgDisabled()
+	switch target {
+	case ErrOrgDisabled:
+		return e.orgDisabled()
+	case ErrBuildGenerationDisabled:
+		return e.buildGenerationDisabled()
+	default:
+		return false
+	}
 }
 
 // OrgDisabledFailure 判断错误是否说明账号所属组织停用了 AI Studio（页面跳到组织停用页，或上游 RPC 返回 “AI Studio app is disabled”）

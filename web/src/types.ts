@@ -334,6 +334,21 @@ export interface ServiceStatus {
   bad_accounts?: number
   // proxy_pool 为 IP 池的实时状态：IP 池开启，或关闭后仍有浏览器在用旧出口时才有；旧版服务端不返回
   proxy_pool?: ProxyPoolStatus
+  // build_channel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时）：服务运行且启用了 Build 时才有；旧版服务端不返回
+  build_channel?: BuildChannelStatus
+}
+
+// BuildChannelStatus 为 Build 通道生成的暂停状态：Build 代理返回 PROXY_GENERATION_DISABLED 时先按账号暂停，短时间内 3 个账号都遇到即
+// 全局暂停（paused，生成改走 Playground），之后定期放行一个真实请求试探（since、next_probe 只在全局暂停时有，probing 为试探进行中），
+// 成功即解除；paused_accounts 为按账号暂停中的账号数，awaiting_probe 为按账号暂停已到期、等待试探的账号数（没有时省略）；
+// 全局暂停时 paused_accounts 为遇到过的账号数，awaiting_probe 为 0。进程内状态，服务重启后从头判定
+export interface BuildChannelStatus {
+  paused: boolean
+  since?: string
+  next_probe?: string
+  probing?: boolean
+  paused_accounts: number
+  awaiting_probe?: number
 }
 
 // ProxyPoolMode 为 IP 池模式：off 关闭（没有自己代理的账户用默认代理），static 静态 IP（端口段里每个浏览器独占一个端口），

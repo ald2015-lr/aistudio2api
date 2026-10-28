@@ -4,6 +4,7 @@
 # → AI Studio 首次使用页（自动完成、跳过与未能完成的次数，失败停在哪一步、原因、“已做”与结构摘要样本）
 # 组织停用 AI Studio 的账户（Google Workspace 账号所属组织关闭了 AI Studio，载入时跳到 access.workspace.google.com）：状态段显示
 # 现在的账户数，启动失败原因里单独归类（新旧两种文案），并统计“账号所属组织已停用 AI Studio，停止调度”的来源
+# 官网停用 Build 通道的生成（PROXY_GENERATION_DISABLED）：状态段显示 Build 通道是否全局暂停、开始与下次试探时间、暂停中与等待试探的账号数
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -85,6 +86,22 @@ if pool:
 s = d.get("egress_summary")
 if s:
     print(f"出口：共 {s.get('total')}，正常 {s.get('normal')}，判定限流 {s.get('limited')}，已撤销 {s.get('rejected')}")
+# build_channel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时）；没有启用 Build、服务未运行或程序版本较旧时没有这个字段
+b = d.get("build_channel")
+if not isinstance(b, dict):
+    print("Build 通道：-（没有启用 Build、服务未运行或程序版本较旧）")
+elif b.get("paused"):
+    # 全局暂停时所有账号都不走 Build，paused_accounts 为遇到过 PROXY_GENERATION_DISABLED 的账号数
+    probing = "（试探中）" if b.get("probing") else ""
+    print(f"Build 通道：官网停用了生成（PROXY_GENERATION_DISABLED），全局暂停，生成改走 Playground；开始 {b.get('since') or '-'}，"
+          f"下次试探 {b.get('next_probe') or '-'}{probing}，遇到过的账号 {b.get('paused_accounts')}")
+elif b.get("paused_accounts"):
+    awaiting = f"；另有 {b.get('awaiting_probe')} 个账号暂停已到期，等待试探" if b.get("awaiting_probe") else ""
+    print(f"Build 通道：{b.get('paused_accounts')} 个账号暂停（官网对它们停用了 Build 生成，改走 Playground），其余照常{awaiting}")
+elif b.get("awaiting_probe"):
+    print(f"Build 通道：{b.get('awaiting_probe')} 个账号的暂停已到期，等待试探（它们在 Build 上的下一次请求成功即恢复）")
+else:
+    print("Build 通道：正常")
 PY
   rm -f -- "$status_file"
 

@@ -215,7 +215,16 @@ const zhCN = {
     'Camoufox 在后台浏览器页面中运行 WAA；纯 Go 在服务进程内运行 WAA，不下载也不启动 Camoufox。登录账户始终需要浏览器。切换后重启生成服务生效。',
   'settings.upstreamChannels': '上游通道',
   'settings.upstreamChannelsHelp':
-    'Playground 与 Build 是同一账户的两份独立额度，同时启用时按账户与通道组合调度，一个通道冷却后由另一个通道继续；至少启用一个。',
+    'Playground 与 Build 是同一账户的两份独立额度，同时启用时按账户与通道组合调度，一个通道冷却后由另一个通道继续；至少启用一个。官网停用 Build 通道的生成（PROXY_GENERATION_DISABLED）时自动暂停 Build、改走 Playground，并定期试探恢复。修改后立即生效。',
+  'settings.buildChannelNormal': 'Build 通道生成：正常',
+  'settings.buildChannelPaused':
+    'Build 通道生成：官网已停用（PROXY_GENERATION_DISABLED），已暂停，生成改走 Playground | 开始 {since} | 下次试探 {next}',
+  'settings.buildChannelProbing': '（试探中）',
+  'settings.buildChannelAccountsPaused':
+    'Build 通道生成：{count} 个账号暂停（官网对它们停用了 Build 生成，改走 Playground），其余账号照常',
+  'settings.buildChannelAwaitingMore': '；另有 {count} 个账号暂停已到期，等待试探',
+  'settings.buildChannelAwaiting':
+    'Build 通道生成：{count} 个账号的暂停已到期，等待试探（它们在 Build 上的下一次请求成功即恢复，再遇到就再暂停）',
   'settings.streamPlaygroundModels': '流式优先 Playground 的模型',
   'settings.streamPlaygroundModelsHelp':
     '需要订阅权益的模型在 Build 通道只能一次性返回整段回复，流式输出会在最后一次性出现。列表中的模型的流式请求先用 Playground（逐块返回）；Playground 账号都在忙时立即改用 Build，不排队等待 Playground。逗号分隔的模型 ID；留空时 Playground 与 Build 照常轮询（默认）。非流式请求不受影响，降级判定拦截的模型按降级判定处理。修改后立即生效。',
@@ -1121,7 +1130,17 @@ const en: Record<TranslationKey, string> = {
     'Camoufox runs WAA in a background browser page. Pure Go runs WAA inside the service process and neither downloads nor starts Camoufox. Account login always needs a browser. Restart the generation service to apply a change.',
   'settings.upstreamChannels': 'Upstream channels',
   'settings.upstreamChannelsHelp':
-    'Playground and Build are two independent quotas of the same account. With both enabled, requests are scheduled per account and channel, and the other channel continues when one cools down. Enable at least one.',
+    'Playground and Build are two independent quotas of the same account. With both enabled, requests are scheduled per account and channel, and the other channel continues when one cools down. Enable at least one. When AI Studio disables generation through the Build channel (PROXY_GENERATION_DISABLED), Build is paused automatically, generation uses Playground, and recovery is probed periodically. Changes apply immediately.',
+  'settings.buildChannelNormal': 'Build generation: normal',
+  'settings.buildChannelPaused':
+    'Build generation: disabled by AI Studio (PROXY_GENERATION_DISABLED), paused; generation uses Playground | since {since} | next probe {next}',
+  'settings.buildChannelProbing': ' (probing)',
+  'settings.buildChannelAccountsPaused':
+    'Build generation: {count} account(s) paused (AI Studio disabled Build generation for them; they use Playground), other accounts as usual',
+  'settings.buildChannelAwaitingMore':
+    '; the pause of {count} more account(s) has expired, awaiting a probe',
+  'settings.buildChannelAwaiting':
+    'Build generation: the pause of {count} account(s) has expired, awaiting a probe (their next request on Build clears it on success or pauses them again)',
   'settings.streamPlaygroundModels': 'Models that stream via Playground first',
   'settings.streamPlaygroundModelsHelp':
     'Models that need a subscription return the whole reply at once on the Build channel, so streamed output appears all at once at the end. Streaming requests for the listed models use Playground first (streamed chunk by chunk) and switch to Build immediately when every Playground account is busy, without waiting for Playground. Comma-separated model IDs; leave empty to let Playground and Build rotate as usual (default). Non-streaming requests are not affected, and models covered by the downgrade guard follow the downgrade guard. Changes apply immediately.',

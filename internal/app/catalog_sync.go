@@ -903,6 +903,33 @@ func (syncer *catalogSyncer) noteAuthRequired(accountID string, at time.Time) {
 	syncer.cache.noteAuthRequired(accountID, at, modTime)
 }
 
+// buildChannelEnabled 在运行中新启用 Build 通道后（UPSTREAM_CHANNELS 热更新，见 applyUpstreamChannels）把还没有 Build 目录的账户
+// 排进后台同步：与启动时 Build 目录没有恢复相同，记为“恢复时不一致”、立即到期，受同样的速率与暂停约束。只调整按过期排着的任务
+// （缺失、失败待重试、疑似失效与组织停用复查的任务照原优先级，它们同步时同样会读 Build 目录）；还没有任务的账户由对照账户池补任务时按此归类。
+// syncer 为 nil 时不处理
+func (syncer *catalogSyncer) buildChannelEnabled() {
+	if syncer == nil || syncer.service == nil {
+		return
+	}
+	missing := syncer.service.pool.AccountsWithoutBuildCatalog()
+	if len(missing) == 0 {
+		return
+	}
+	now := syncer.clock()
+	syncer.mu.Lock()
+	for _, accountID := range missing {
+		syncer.stale[accountID] = struct{}{}
+		if task := syncer.tasks[accountID]; task != nil && task.priority == catalogPriorityExpired {
+			syncer.scheduleLocked(task, catalogPriorityStale, now)
+		}
+	}
+	syncer.mu.Unlock()
+	syncer.kick()
+	if syncer.service.requests != nil {
+		syncer.service.requests.log("service", "INFO", fmt.Sprintf("已启用 Build 通道，后台补齐 Build 模型目录 | 账户=%d", len(missing)))
+	}
+}
+
 // requeue 把账户放回后台同步队列、立即到期（登录复核恢复了需要登录的账户：它在需要登录期间已被移出队列）；
 // syncer 为 nil 时不处理
 func (syncer *catalogSyncer) requeue(accountID string) {

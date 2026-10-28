@@ -179,11 +179,16 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	var egressSummary *api.AdminEgressSummary
 	// 登录复核（见 auth_recheck.go）：疑似登录失效与需要登录账户的复核，服务没有运行时不显示
 	var authRecheck *api.AdminAuthRecheck
+	// Build 通道生成的暂停状态（见 build_pause.go）：启用了 Build 通道时才显示
+	var buildChannel *api.AdminBuildChannel
 	if running {
 		primarySupply = admin.workers.primarySupplyStatus()
 		catalogSync = admin.service.catalogSync.status()
 		egress, egressSummary = admin.service.egress.adminStatus()
 		authRecheck = admin.service.authRecheck.status()
+		if admin.pool.BuildEnabled() {
+			buildChannel = admin.service.buildPauses().status()
+		}
 	}
 	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
 	counts.AuthRequired10m = admin.service.authMarks.count(time.Now(), authRecentWindow)
@@ -212,6 +217,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		AuthRecheck:   authRecheck,
 		BadAccounts:   admin.workers.badAccountMemory().count(),
 		ProxyPool:     admin.ipPool().status(),
+		BuildChannel:  buildChannel,
 	}, nil
 }
 
@@ -568,7 +574,7 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 type accountRemover func(deleteDirectory func(*aistudio.Account) error) (*aistudio.Account, error)
 
 // removeAccount 删除账户，单个删除（DeleteAccount）与批量删除（DeleteAccounts）共用：remove 移出号池时关闭账户的 Worker 并删除
-// 认证目录，之后清除模型目录重试、403 无权限记录、Worker 与固定出口、停用原因，写“账户已删除”日志。
+// 认证目录，之后清除模型目录重试、403 无权限记录、Build 生成的按账号暂停记录、Worker 与固定出口、停用原因，写“账户已删除”日志。
 // 不刷新、不推送模型快照，也不移除新账户自动处理记录，由调用方处理（批量删除整批只做一次）。
 // 移出号池失败时返回的账户为 nil、错误为 remove 的原始错误；移出后清理失败时返回账户与错误，不清除停用原因、不写日志（与原先一致）
 func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Account, error) {
@@ -585,6 +591,8 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 	admin.service.removeAccountModelRetry(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
 	admin.service.orgDisabled.clearAccount(accountID)
+	// Build 生成的按账号暂停记录随账户删除：不再一直显示等待试探，重新上传的同 ID 账户从头判定
+	admin.service.buildPauses().forget(accountID)
 	if err := errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID)); err != nil {
 		return removed, err
 	}

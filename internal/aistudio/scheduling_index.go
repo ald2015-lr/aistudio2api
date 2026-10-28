@@ -51,6 +51,7 @@ type selectionKey struct {
 	playgroundOnly  bool
 	buildOnly       bool
 	playgroundFirst bool
+	buildProbe      bool
 }
 
 func selectionKeyOf(selection AccountSelection) selectionKey {
@@ -58,6 +59,7 @@ func selectionKeyOf(selection AccountSelection) selectionKey {
 		modelID: strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/"), accessScope: selection.ModelAccessScope,
 		method: selection.Method, capability: selection.Capability, pool: selection.Pool,
 		playgroundOnly: selection.PlaygroundOnly, buildOnly: selection.BuildOnly, playgroundFirst: selection.PlaygroundFirst,
+		buildProbe: selection.BuildProbe,
 	}
 }
 
@@ -66,6 +68,7 @@ func (key selectionKey) selection() AccountSelection {
 	return AccountSelection{
 		ModelID: key.modelID, ModelAccessScope: key.accessScope, Method: key.method, Capability: key.capability, Pool: key.pool,
 		PlaygroundOnly: key.playgroundOnly, BuildOnly: key.buildOnly, PlaygroundFirst: key.playgroundFirst,
+		BuildProbe: key.buildProbe,
 	}
 }
 

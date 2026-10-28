@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
@@ -152,12 +154,12 @@ func (service *trackedService) prewarmIfRunning() {
 }
 
 // requiresRebuild 判断配置差异是否只能通过重建生成服务生效：
-// 账户目录、默认代理、WAA 后端与上游通道决定了运行时的装配方式，其余字段都可热更新
+// 账户目录、默认代理与 WAA 后端决定了运行时的装配方式，其余字段都可热更新
 // （包括单账户每分钟上限 ACCOUNT_RPM_LIMIT：applyLiveFields 经 SetAccountRateLimit 立即生效，不在这里比较；
-// 媒体设置 MEDIA_* 与 ULTRA_EXCLUSIVE 一样是进程级设置，applyLiveFields 先于这里的判断经 applyMediaSettings 应用）
+// 媒体设置 MEDIA_* 与 ULTRA_EXCLUSIVE 一样是进程级设置，applyLiveFields 先于这里的判断经 applyMediaSettings 应用；
+// 上游通道 UPSTREAM_CHANNELS 经 SetUpstreamChannels 立即生效，候选索引按新的通道顺序重建，见 applyUpstreamChannels）
 func requiresRebuild(saved config.Config, active config.Config) bool {
-	return saved.AuthStates != active.AuthStates || saved.Proxy != active.Proxy ||
-		saved.WAABackend != active.WAABackend || !slices.Equal(saved.UpstreamChannels, active.UpstreamChannels)
+	return saved.AuthStates != active.AuthStates || saved.Proxy != active.Proxy || saved.WAABackend != active.WAABackend
 }
 
 // liveFieldsEqual 判断可热更新的字段是否一致
@@ -170,7 +172,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
-		saved.RoutingStrategy == active.RoutingStrategy && saved.TemporaryChat == active.TemporaryChat &&
+		saved.RoutingStrategy == active.RoutingStrategy && slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
+		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
@@ -186,10 +189,10 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | IP 池=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | IP 池=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
 		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
-		saved.RoutingStrategy, saved.RequestTimeout, saved.FirstEventTimeout,
+		saved.RoutingStrategy, strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 		saved.ProxyPool.Summary(),
@@ -236,6 +239,8 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	// 单账户每分钟上限：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同；调大或关闭时唤醒排队的请求
 	admin.pool.SetAccountRateLimit(saved.AccountRPMLimit)
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
+	// 上游通道：锁顺序 manager.mu 再到账户池锁，与 SetRoutingStrategy 相同；新启用 Build 时解锁后补 Build 目录
+	buildAdded := applyUpstreamChannels(admin.pool, generation.config.UpstreamChannels, saved.UpstreamChannels)
 	// 先更新两个分区的容量再改号池成员：同一次保存调大 ULTRA_* 峰值时，并入的 Pro Worker 按新上限计数
 	admin.workers.applyLiveSettings(saved)
 	// ULTRA_INCLUDE_PRO 热切换：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同。只在账户池里改成员规则，
@@ -259,5 +264,21 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		// 解锁后的步骤都从当前状态重新推导（成员、开关、独占设置），不依赖上面捕获的 saved
 		admin.workers.poolRuleChanged(manager.activeUltraExclusive())
 	}
+	if buildAdded {
+		admin.service.catalogSync.buildChannelEnabled()
+	}
 	return admin, saved, true
+}
+
+// applyUpstreamChannels 热更新上游通道（UPSTREAM_CHANNELS）：通道顺序决定每个候选集的通道与冷却键，SetUpstreamChannels 会让候选索引
+// 整个重建，之后的选号立即按新顺序，进行中的请求不受影响（已取得的 Build 租约照常发送，见 validateLeaseSelection）。返回是否新启用了 Build：
+// 启动时没有启用 Build 的账户池里只有写盘缓存恢复的 Build 目录（见 catalogCache.restore），没有缓存的账户要由后台同步补上
+// （catalogSyncer.buildChannelEnabled），补上之前这些账户只走 Playground
+func applyUpstreamChannels(pool *aistudio.AccountPool, previous []string, next []string) bool {
+	if slices.Equal(previous, next) {
+		return false
+	}
+	pool.SetUpstreamChannels(upstreamChannels(next))
+	build := string(aistudio.ChannelBuild)
+	return !slices.Contains(previous, build) && slices.Contains(next, build)
 }

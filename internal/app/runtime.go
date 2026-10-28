@@ -2628,6 +2628,10 @@ type trackedService struct {
 	permissionDenied *permissionDeniedRegistry
 	// orgDisabled 为组织停用 AI Studio 的账户的登记表（见 org_disabled.go），保存在账户目录，跨重启保留；为空时只写账户池的标记
 	orgDisabled *orgDisabledRegistry
+	// buildPause 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成，见 build_pause.go），进程内、不持久化；
+	// 经 buildPauses 读取（测试直接构造的实例在第一次使用时建立）
+	buildPause     *buildPauseTracker
+	buildPauseOnce sync.Once
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
 	quota *quotaSharing
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
@@ -2711,6 +2715,7 @@ func newTrackedService(
 		forbidden: newForbiddenTracker(), rateLimits: newRateLimitGuard(),
 	}
 	tracked.catalogSync = newCatalogSyncer(tracked)
+	tracked.buildPause = newBuildPauseTracker(pool, requests)
 	// 冷却淘汰成功后立即补齐预热，不等 keepWarm 的下一个周期；是否在运行由 prewarmIfRunning 判断。
 	// 替补只在生成服务运行时启动，排空超时按请求超时与总时长上限计算（见 worker_drain.go）
 	if workers != nil {
@@ -4387,6 +4392,17 @@ func (service *trackedService) generateWithRetry(
 	var inputLimitErr error
 	var tierRetryAccountIDs []string
 	immediateRetry, tierRetried := false, false
+	// buildDisabledErr 为本请求在 Build 上遇到的 PROXY_GENERATION_DISABLED（官网停用了 Build 通道的生成，见 build_pause.go）：
+	// 之后只能经 Build 处理（输入超过 Playground 上限、只能经 Build 调用的模型）却没有可用的 Build 账号时，按 Build 不可用的清楚错误结束，
+	// 不把这个 400 原文交给客户端
+	var buildDisabledErr error
+	// playgroundCapErr 为改走 Build 时（buildOnly 置为真）Playground 返回的账号输入上限错误：之后的尝试在 Build 上以其他原因失败时
+	// inputLimitErr 会被清空，而 Build 暂停后按“输入超过 Playground 上限”结束（400）时仍要写出上限数值，判断与取上限都用它，不清空
+	var playgroundCapErr error
+	// preferPlaygroundAfterBuild：本请求已在 Build 上遇到 PROXY_GENERATION_DISABLED，之后的尝试每个账号先 Playground（只调整顺序，
+	// Playground 接不了的模型仍可用其他账号的 Build），不在其他账号的 Build 上再白试一次
+	preferPlaygroundAfterBuild := false
+	pauses := service.buildPauses()
 	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
 	authFailures := 0
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
@@ -4479,6 +4495,9 @@ func (service *trackedService) generateWithRetry(
 		if diag.guard() != nil && !selection.BuildOnly && !selection.PlaygroundOnly {
 			selection.PlaygroundFirst = true
 		}
+		if preferPlaygroundAfterBuild && !selection.BuildOnly && !selection.PlaygroundOnly {
+			selection.PreferPlayground = true
+		}
 		// 换号重试排除已尝试过的账户（通常只有几个）：选号留在候选索引的快路径上，与同模型的请求同队排队；
 		// 原先把"全部启用账户减去已尝试的"作为限定列表，3 万多个账户时每次复查候选都在账户池锁内建表排序几十毫秒
 		if (unbound || fileBound) && len(attempted) > 0 {
@@ -4502,14 +4521,53 @@ func (service *trackedService) generateWithRetry(
 		}
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
+		// retrySelection 为不带试探的选择条件：同账号换通道等判断按它进行（试探只是这一次选号临时改走 Build）
+		retrySelection := selection
+		// Build 生成全局暂停中、到了试探时间（见 build_pause.go）：这次选号先取一个已启动 Worker、现在就能用的 Build 账号作为试探
+		// （只走 Build、忽略暂停；不等待，也不在请求路径上冷启动 Worker，没有热的 Build Worker 时最多发起一次后台扩容）；
+		// 取不到就按原条件选号。连续 buildProbeQueueAfter 次都取不到时（号池持续饱和，空出的槽位马上被排队的请求取走），之后的试探
+		// 改为排队等已启动 Worker 的 Build 租约，最多 probeQueueWait（主用模型不超过排队预算剩余的一半；输入超限后只接受立即可用
+		// 账号的再试不排队），等不到同样按原条件选号（按请求到达的先后排回原来的位置）。不固定账号、不限定 Playground（文件、语音），
+		// 不是 Worker 重建后的重放或更高权益账号的再试，且号池里有账号的 Build 能生成该模型才能试探；其中优先不限定通道的请求：降级判定的 Playground 优先（Build 上按估算加
+		// CountTokens 判定）与流式优先 Playground 的模型（Build 上只能一次性返回）只在试探到期超过 buildProbeRelax 仍没有别的请求
+		// 可试时才拿来试探，否则以这类流量为主的服务在官网恢复 Build 后也一直不会解除暂停
+		probeAttempt := false
+		probeAllowed := unbound && !recoveringAccount && selection.AllowedAccountIDs == nil && !selection.PlaygroundOnly &&
+			pauses.probeDue() && service.pool.BuildServesModel(modelID, scope)
+		probePreferred := probeAllowed && !selection.PlaygroundFirst && !service.streamPrefersPlayground(request, selection)
+		if claimed, queued := pauses.claimProbe(probePreferred, probeAllowed); claimed {
+			probe := selection
+			probe.BuildOnly, probe.BuildProbe = true, true
+			probe.PlaygroundFirst, probe.PreferPlayground = false, false
+			if wait := probeQueueWait(budget); queued && !useImmediate && wait > 0 {
+				probeCtx, cancelProbe := context.WithTimeout(withoutColdStart(selectCtx), wait)
+				nextLease, acquireErr = service.acquireWarmLease(probeCtx, probe)
+				cancelProbe()
+			} else {
+				nextLease, acquireErr = service.acquireWarmLeaseNow(withoutColdStart(selectCtx), probe, nil)
+			}
+			if acquireErr == nil {
+				probeAttempt, selection = true, probe
+				trace.Note("Build 生成暂停中，这次请求作为试探改走 Build")
+				service.requests.logRequestProgress(request.ID, "service", "INFO", "Build 生成暂停中，这次请求作为试探改走 Build")
+			} else {
+				pauses.probeUnresolved(true)
+				if requestCtx.Err() == nil {
+					trace.Note("Build 试探没有取得 Build 账号（" + acquireErr.Error() + "），按原条件选号")
+					nextLease, acquireErr = nil, nil
+				}
+			}
+		}
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		// 输入超限后的再试只接受现在就能取得的账号，不排队
-		if useImmediate {
+		switch {
+		case nextLease != nil || acquireErr != nil:
+		case useImmediate:
 			nextLease, acquireErr = service.acquireWarmLeaseNow(selectCtx, selection, nil)
-		} else if service.streamPrefersPlayground(request, selection) {
+		case service.streamPrefersPlayground(request, selection):
 			nextLease, acquireErr = service.acquireStreamPlaygroundLease(selectCtx, request.ID, selection)
-		} else {
+		default:
 			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
 		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && (playgroundUnavailable(acquireErr) || noWarmWorker(acquireErr)) {
@@ -4539,11 +4597,21 @@ func (service *trackedService) generateWithRetry(
 		}
 		if acquireErr != nil {
 			trace.Note("获取账号失败: " + acquireErr.Error())
-			if inputLimitErr != nil {
+			// buildOffEnd：改走 Build 的尝试（输入超过 Playground 上限）没有可用账号是因为官网停用了 Build 通道的生成：选号因 Build 暂停
+			// 没有候选（中间在 Build 上以其他原因失败、inputLimitErr 已清空时同样如此），或输入超限后的不等待再试没有账号而本请求已在
+			// Build 上遇到 PROXY_GENERATION_DISABLED。按输入超限结束，写明上限（取自 playgroundCapErr）与原因
+			var buildUnavailable *aistudio.BuildGenerationUnavailableError
+			buildOffEnd := selection.BuildOnly && playgroundCapErr != nil &&
+				(errors.As(acquireErr, &buildUnavailable) || inputLimitErr != nil && buildDisabledErr != nil)
+			if inputLimitErr != nil || buildOffEnd {
 				// 输入超限后的再试（改走 Build、改用更高权益账号）没有立即可用的账号：按输入超限的原错误结束（对外 400），
 				// 不排队等冷却或 Worker，也不把它换成全部冷却、号池繁忙等限流错误
 				service.requests.logRequestProgress(request.ID, "service", "WARN", "输入超限后的再试没有立即可用的账号，按 400 返回 | 原因="+progressReason(acquireErr))
 				err = inputLimitErr
+				if buildOffEnd {
+					// 改走 Build 的再试没有可用账号是因为官网停用了 Build 通道的生成：说明输入超过 Playground 上限、Build 已停用
+					err = buildInputLimitUnavailable(modelID, playgroundCapErr, joinBuildCause(buildDisabledErr, acquireErr))
+				}
 				break
 			}
 			var capacityBusy *aistudio.CapacityBusyError
@@ -4842,6 +4910,10 @@ func (service *trackedService) generateWithRetry(
 			service.authRecheck.noteSuccess(request.AccountID)
 			service.workers.badAccountMemory().observe(request.AccountID, accountLabel, egressSuccess)
 			service.permissionDenied.succeeded(request.AccountID, modelID, lease.Channel())
+			if lease.Channel() == aistudio.ChannelBuild {
+				// Build 生成暂停中的试探成功，或暂停过的账号在 Build 上成功：解除暂停（见 build_pause.go）；没有暂停记录时不加锁
+				pauses.succeeded(request.AccountID, accountLabel, probeAttempt)
+			}
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
 			finishAttempt = cancelAttempt
@@ -4865,7 +4937,46 @@ func (service *trackedService) generateWithRetry(
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
 		localWorkerFailure := (workerFailed || workerReplaced) && requestCtx.Err() == nil
 		retryable := retryableGenerateAccountError(requestCtx, err) || localWorkerFailure
-		if !inputTokenLimitError(err) {
+		// buildDisabled：Build 代理返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成，见 build_pause.go）。与请求本身、
+		// 账号额度都无关：不冷却、不计连续失败上限、不退避；记进 Build 暂停（该账号不再走 Build，短时间内 3 个账号即全局暂停），
+		// 本请求立即改走 Playground：同账号的 Playground 可用时在同账号重试，否则按原规则换号。错误在首事件之前，流式请求同样无缝重试。
+		// 只能经 Build 处理的请求（输入超过 Playground 上限）换其他账号的 Build 再试，全局暂停后按 Build 不可用的清楚错误结束
+		buildDisabled := generated && lease.Channel() == aistudio.ChannelBuild && requestCtx.Err() == nil &&
+			aistudio.BuildGenerationDisabledFailure(attemptErr)
+		if buildDisabled {
+			buildDisabledErr = attemptErr
+			globalPaused := pauses.disabled(request.AccountID, accountLabel, probeAttempt)
+			retryable = true
+			switch {
+			case buildOnly && globalPaused:
+				// 输入超过 Playground 上限、官网已停用 Build 通道的生成：换成写明上限与原因的 400（Build 不可用），交给下面的输入超限处理：
+				// 号池里有更高权益的账号时改用它们再试一次（它们的 Playground 上限可能更高），否则按这个 400 结束
+				retryable = false
+				err = buildInputLimitUnavailable(modelID, playgroundCapErr, err)
+			case buildOnly:
+				// 输入超过 Playground 上限、只能走 Build：换其他账号的 Build 再试，只接受现在就能取得的账号
+				immediateRetry = true
+				trace.Note("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），换账号的 Build 再试")
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN",
+					"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），输入超过 Playground 上限，换账号的 Build 再试")
+			default:
+				preferPlaygroundAfterBuild = true
+				same := "否"
+				if service.pool.AccountChannelAvailable(request.AccountID, channelFallback(retrySelection)) {
+					// 该账号的 Build 已暂停，换通道的判断只剩 Playground：可用时在同账号重试，不占换号次数
+					delete(attempted, request.AccountID)
+					maxAttempts++
+					same = "是"
+				}
+				trace.Note("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试")
+				service.requests.logRequestProgress(request.ID, accountLabel, "INFO",
+					"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 | 同账号="+same)
+			}
+		} else if probeAttempt {
+			// 试探请求以其他原因失败（额度、超时等）：说明不了 Build 是否恢复，稍后再放行下一次试探；这次请求照常换号
+			pauses.probeUnresolved(false)
+		}
+		if !inputTokenLimitError(err) && !(buildDisabled && buildOnly) {
 			inputLimitErr = nil
 		}
 		recoverWorker := false
@@ -4921,7 +5032,7 @@ func (service *trackedService) generateWithRetry(
 				err = errors.Join(err, stateErr)
 				retryable = false
 			} else if !cooldown.Global && !verdict.Limited &&
-				service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
+				service.pool.AccountChannelAvailable(request.AccountID, channelFallback(retrySelection)) {
 				// 出口限流时同账号换通道同样经被限的出口，不再探测
 				delete(attempted, request.AccountID)
 				maxAttempts++
@@ -5013,7 +5124,7 @@ func (service *trackedService) generateWithRetry(
 					"账号冷却 | 类型=无权限 | 范围=%s | 恢复=%s | 档位=%d",
 					cooldownScope, until.Format(time.RFC3339), level,
 				))
-				if service.pool.AccountChannelAvailable(request.AccountID, channelFallback(selection)) {
+				if service.pool.AccountChannelAvailable(request.AccountID, channelFallback(retrySelection)) {
 					delete(attempted, request.AccountID)
 					maxAttempts++
 				}
@@ -5035,9 +5146,16 @@ func (service *trackedService) generateWithRetry(
 					}
 				}
 			}
+			// buildRemedy：Playground 的账号输入上限可以改走 Build 再试；buildBlocked：官网停用了 Build 通道的生成、Build 生成全局暂停中
+			// 且没到试探时间（见 build_pause.go），改走 Build 也只会遇到 PROXY_GENERATION_DISABLED
+			buildRemedy := capError && !buildOnly && !selection.PlaygroundOnly && lease.Channel() == aistudio.ChannelPlayground &&
+				service.pool.BuildEnabled()
+			buildBlocked := buildRemedy && service.pool.BuildGenerationPaused() && !pauses.probeDue()
+			var buildUnavailable *aistudio.BuildGenerationUnavailableError
 			switch {
-			case capError && !buildOnly && !selection.PlaygroundOnly && lease.Channel() == aistudio.ChannelPlayground && service.pool.BuildEnabled():
+			case buildRemedy && !buildBlocked:
 				buildOnly, switchedToBuild, retryable, immediateRetry = true, true, true, true
+				playgroundCapErr = err
 				delete(attempted, request.AccountID)
 				maxAttempts++
 				trace.Note("Playground 返回输入 token 超过账号上限，改用 Build 通道再试一次")
@@ -5050,6 +5168,16 @@ func (service *trackedService) generateWithRetry(
 				trace.Note(fmt.Sprintf("输入 token 超过账号上限，改用更高权益的账号再试一次 | 候选=%d", len(higherTier)))
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 					"输入超过本账号上限，改用更高权益的账号再试一次 | 候选=%d | 原因=%s", len(higherTier), progressReason(err)))
+			case buildBlocked || errors.As(err, &buildUnavailable):
+				// 输入超过 Playground 上限，官网已停用 Build 通道的生成（Build 全局暂停中，或改走 Build 时刚遇到）：没有能处理更长输入的通道，
+				// 按 400 返回并说明上限与原因，不把 PROXY_GENERATION_DISABLED 原文交给客户端
+				retryable = false
+				if buildBlocked {
+					err = buildInputLimitUnavailable(modelID, err, nil)
+				}
+				trace.Note("输入超过 Playground 上限，官网已停用 Build 通道的生成，无法改走 Build，按 400 返回")
+				service.requests.logRequestProgress(request.ID, accountLabel, "WARN",
+					"输入超过 Playground 上限，官网已停用 Build 通道的生成（PROXY_GENERATION_DISABLED），无法改走 Build，按 400 返回")
 			default:
 				retryable = false
 				trace.Note("输入 token 超过模型上限（提示词过长），不换号、不冷却，按 400 返回")
@@ -5058,7 +5186,7 @@ func (service *trackedService) generateWithRetry(
 		}
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
-		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure
+		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled
 		// 最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
 		exhaustReason, exhausted := quota.exhaustedReason()
 		quotaExhausted := quotaFailure && exhausted
@@ -5186,6 +5314,10 @@ func (service *trackedService) generateWithRetry(
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "WAA Worker 重建，重放当前请求 | 原因="+progressReason(err))
 			continue
 		}
+		if buildDisabled {
+			// 改走 Playground（或换账号的 Build）的进度上面已写；运行日志只在进入暂停时写一行（见 build_pause.go），不逐个请求写换号
+			continue
+		}
 		switchMessage := fmt.Sprintf(
 			"账号切换 | 模型=%s\n原因: %s",
 			modelID, strings.TrimSpace(err.Error()),
@@ -5201,6 +5333,12 @@ func (service *trackedService) generateWithRetry(
 	if err == nil && (lease == nil || source == nil) {
 		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents
 		err = aistudio.PoolNotReadyIn(scope, fmt.Sprintf("模型 %s 换号结束时没有可用账号", modelID), nil)
+	}
+	if aistudio.BuildGenerationDisabledFailure(err) {
+		// 换号结束时最后的错误仍是 Build 的 PROXY_GENERATION_DISABLED（换号次数用完、只剩 Build 能接等）：按 Build 不可用的清楚错误返回，
+		// 不把这个 400 原文交给客户端
+		err = service.buildUnavailableAtEnd(modelID, buildOnly, playgroundCapErr, err)
+		service.requests.logRequestProgress(request.ID, "service", "WARN", "官网停用了 Build 通道的生成，没有其他通道能接这个请求 | 原因="+progressReason(err))
 	}
 	// 首事件前期限到期：错误标明是本服务自己的期限（与上游的“协议错误码 4”、上游断流区分开），仍满足 context.DeadlineExceeded（对外 504）
 	if cut, ok := phase.startDeadlineError(err, startCutWhere); ok {

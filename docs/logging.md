@@ -152,7 +152,7 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 
 不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`，换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回去等待，写 `换号次数已用完，回到原账号等待 Worker 恢复后重放` 或 `已连续 5 次失败，回到原账号等待 Worker 恢复后重放`。这次失败计入连续失败上限后就到上限的请求不再换号，直接等原账户关闭完成。换号后的选号在排队（其他账户都忙）时原账户关闭完成，写 `换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号`：不再排除原账户，按原来的排队位置重新选号，不固定到原账户（关闭后它没有 Worker，要冷启动并占一个 Worker 槽位），原账户与其他账户哪个先能用就用哪个。回到原账户等待时请求超时或被取消，错误为 `回到原账号等待 <DURATION> 后请求超时（最后原因=WAA Worker 恢复，上次失败=...）: context deadline exceeded`（取消时为 `请求已取消`），对外仍是 504 或取消的官方措辞；经生成服务以首事件前期限结束时，`request.error` 前面另加 `本服务首事件前期限 <DURATION> 到期: `（见[流式等待](#流式等待)）。
 
-按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
+按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`策略=<ROUTING_STRATEGY>` 之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
 
 保存服务配置使 `ULTRA_INCLUDE_PRO` 实际切换时（热更新；同一次保存还改了需要重建生成服务的字段时随重建生效，不写这几行），`service` 依次记录下面几行。数值都在切换之后读取当前状态：`并入` 为账户池当前的开关，`Ultra 号池账户` 为当前属于 Ultra 号池的账户数，两个分区的 Worker 数为驻留与正在启动的 Worker 之和，`/` 后为 `ULTRA_MAX_ACTIVE_WORKERS` 与 `MAX_ACTIVE_WORKERS`。已运行的 Worker 不重启，只改按新分区计数：
 
@@ -183,6 +183,28 @@ ERROR  account@example.com  WAA Worker 停止失败 | PID=18240 | 耗时=10.002s
 | 浏览器 profile 目录删除重试 | 2 秒 | 每 100ms 重试，最终返回最后一次 `RemoveAll` 错误 |
 
 `Worker.Close` 的正常总体上界约为 10 秒，另加调度开销。关闭失败时 Worker、进程句柄、`runtime lease`（Worker 占用的账户租约）、热池记录和 generation（Worker 版本号）保持可重试；再次 Stop 会重跑关闭链。热替换中旧实例与 pending Worker 都关闭失败时，两份实例都占用容量槽。
+
+### 官网停用 Build 通道的生成
+
+官网关闭了经 Build 应用代理的生成时，Build 代理调用（`ProxyStreamedCall`、需要订阅权益的模型走的 `ProxyUnaryCall`）返回 `HTTP 400、协议错误码 3: PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`（或 `… generateContent is not supported`），可能是错误响应，也可能是流尾状态。只认 Build 代理调用、文案以 `PROXY_GENERATION_DISABLED` 开头（区分大小写，其后为冒号、空白或结束；先去掉 `[original: …]`、`generic::…:`、`beyond::…:` 与 `(qos=…)` 等上游内部标记，与对外返回上游文案时的清洗相同）的错误（`errors.Is(err, aistudio.ErrBuildGenerationDisabled)`），与普通 400（包括回显了客户端同名字段的参数错误）、额度 429、403 和组织停用分开。生成请求遇到时立即改走 Playground，账号随即暂停 Build，10 分钟内 3 个不同账号遇到即全局暂停（规则见[开发文档](development.md)与 README“官网停用 Build 通道的生成”）。运行日志只在状态变化时写，同一状态不重复写；这些行走独立队列，控制台队列满时也不丢：
+
+| 日志 | 级别 | 含义 |
+| --- | --- | --- |
+| `官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED），暂停 Build，生成改走 Playground \| 下次试探=<RFC3339> \| 范围=该账号` | WARN | 写在账号名下：该账号第一次遇到，之后不经 Build 接生成请求（Playground 照常）。`下次试探` 为到期时间（30 分钟加最多 3 分钟随机），到期后它在 Build 上的下一次真实请求就是试探；试探仍遇到时顺延，不再写这一行。到期后又过 30 分钟仍没有它的 Build 结果（账号被停用、需要登录，或之后都没再经 Build）、或账号被删除、目录被移走时不再记着它（不写日志），之后再遇到按第一次写 |
+| `官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED），暂停 Build，生成改走 Playground \| 下次试探=<RFC3339> \| 范围=全部账号 \| 触发=10 分钟内 <N> 个账号` | WARN | 写在 `service` 名下：进入全局暂停，所有账号都不再走 Build（选号里 Build 视为未启用）。触发全局暂停的那个账号不再另写按账号的一行；之后每到 `下次试探` 放行一个真实请求走 Build，试探失败只顺延（不写日志），请求照常换到 Playground |
+| `Build 通道的生成已恢复，解除暂停 \| 范围=全部账号\|该账号 \| 试探账号=<账号> \| 暂停时长=<DURATION> \| 解除账号=<N>` | INFO | 试探成功（全局暂停中的试探，或暂停过的账号在 Build 上成功）：解除全局与全部账号的暂停 |
+
+请求时间线（请求进度）另有这些行，不进运行日志、也不再逐个请求写 `账号切换`：
+
+| 进度 | 级别 | 含义 |
+| --- | --- | --- |
+| `Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 \| 同账号=是\|否` | INFO | 当次请求改走 Playground：`是` 为在同账号的 Playground 重试（不占换号次数），`否` 为换号；之后的尝试每个账号先 Playground。不计连续失败上限、不退避、不冷却 |
+| `Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），输入超过 Playground 上限，换账号的 Build 再试` | WARN | 输入超过 Playground 上限、只能走 Build 的请求还没有全局暂停：换另一个账号的 Build 再试（只取现在就能取得的账号） |
+| `输入超过 Playground 上限，官网已停用 Build 通道的生成（PROXY_GENERATION_DISABLED），无法改走 Build，按 400 返回` | WARN | 没有能处理更长输入的通道（全局暂停中且没到试探时间，或改走 Build 时刚遇到），按 400 返回并写明上限；号池里有更高权益的账号时先照常改用它们再试一次 |
+| `Build 生成暂停中，这次请求作为试探改走 Build` | INFO | 这次请求被放行作为全局暂停中的试探（只取已启动 Worker、现在就能用的 Build 账号，不在请求路径上冷启动；取不到就按原条件选号、一分钟后再放行。连续 3 次取不到时号池多半持续饱和，之后的试探排队等 Build 账号，最多 5 秒，主用模型不超过排队上限剩余的一半，等不到同样按原条件选号；所以负载一直很高时官网恢复后也只多几分钟就解除，而不是等负载降下来）。只放行 Build 能调用其模型的生成请求，优先不固定账号、不限定通道的（含输入超过 Playground 上限、改走 Build 的再试）；降级判定与流式优先 Playground 的请求在试探到期超过 5 分钟后才放行 |
+| `官网停用了 Build 通道的生成，没有其他通道能接这个请求 \| 原因=…` | WARN | 换号结束时最后的错误仍是 PROXY_GENERATION_DISABLED（只剩 Build 能接、换号次数用完等）：按 Build 不可用的说明返回（只能经 Build 调用的模型与 Playground 接不了的请求 503，输入超过 Playground 上限 400），不把原文交给客户端 |
+
+只能经 Build 调用的模型（号池里没有账户能经 Playground 调用，如 `gemini-4-argon`）在全局暂停中不发上游请求，选号直接返回 503（`request.error` 为 `模型 <模型> 只能经 Build 通道调用，官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED），暂时无法处理`）；Playground 能调用的模型只是 Playground 账号被换号排除或额度用完时照常按额度不足（429）等原来的错误结束。暂停期间 Worker 的死槽位判定、冷却淘汰登记、预热轮换与账户的冷却状态同样把暂停的 Build 当作不可用：Playground 额度用完的账号按 `WAA Worker 补登记淘汰` 等原有日志淘汰、轮换，账户显示冷却（只启用 Build 时不这样算）。暂停状态只在进程内，服务重启（含重建生成服务）后从头判定。当前状态见 `GET /api/status` 的 `build_channel`（`paused`、只在全局暂停时输出的 `since` 与 `next_probe`、`probing`、`paused_accounts`、按账号暂停已到期而等待试探的 `awaiting_probe`；全局暂停时所有账号都不走 Build、各账号也不单独试探，`paused_accounts` 为遇到过的账号数，`awaiting_probe` 为 0），`bash tools/diag_start.sh` 状态段写一行 `Build 通道：…`（正常、按账号暂停、等待试探，或全局暂停及遇到过的账号数）。
 
 ### AI Studio 首次使用页
 

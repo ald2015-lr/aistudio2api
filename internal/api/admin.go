@@ -68,6 +68,23 @@ type AdminStatus struct {
 	BadAccounts int `json:"bad_accounts,omitempty"`
 	// ProxyPool 为 IP 池的实时状态（见 AdminProxyPool）：关闭且没有浏览器在用旧出口时省略
 	ProxyPool *AdminProxyPool `json:"proxy_pool,omitempty"`
+	// BuildChannel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时，见 AdminBuildChannel）：服务运行且启用了 Build 通道时才有
+	BuildChannel *AdminBuildChannel `json:"build_channel,omitempty"`
+}
+
+// AdminBuildChannel 表示 Build 通道生成的暂停状态：Build 代理调用返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成）时
+// 先按账号暂停，短时间内 3 个不同账号都遇到即全局暂停（所有账号都不再走 Build，生成改走 Playground），之后定期放行一个真实请求试探，
+// 试探成功即解除。Paused 为全局暂停，Since 为开始时间，NextProbe 为下次试探时间（两者只在全局暂停时输出），Probing 为试探进行中，
+// PausedAccounts 为按账号暂停中的账号数（到期等待试探的不算），AwaitingProbe 为按账号暂停已到期、等它在 Build 上的下一次结果
+// （试探）的账号数（没有时省略）；全局暂停时所有账号都不走 Build、各账号也不单独试探，PausedAccounts 为遇到过的全部账号数
+// （含各自暂停已到期的），AwaitingProbe 为 0。进程内状态，服务重启后从头判定
+type AdminBuildChannel struct {
+	Paused         bool      `json:"paused"`
+	Since          time.Time `json:"since,omitzero"`
+	NextProbe      time.Time `json:"next_probe,omitzero"`
+	Probing        bool      `json:"probing,omitempty"`
+	PausedAccounts int       `json:"paused_accounts"`
+	AwaitingProbe  int       `json:"awaiting_probe,omitempty"`
 }
 
 // AdminAuthRecheck 表示登录复核：上游 401 先记疑似登录失效、写短冷却并用磁盘 Cookie 复核，仍是 401 才标需要登录；

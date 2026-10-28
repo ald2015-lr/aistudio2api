@@ -27,7 +27,7 @@
 
 ## 核心能力
 
-- **双额度通道**: 每个账户同时拥有 Playground 与 Build 应用代理两份独立额度，`UPSTREAM_CHANNELS` 可单独或同时启用；一个通道触发限额后，同一账户由另一个通道继续
+- **双额度通道**: 每个账户同时拥有 Playground 与 Build 应用代理两份独立额度，`UPSTREAM_CHANNELS` 可单独或同时启用（保存后立即生效）；一个通道触发限额后，同一账户由另一个通道继续；官网停用 Build 通道的生成时自动暂停 Build、改走 Playground，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成)
 - **多账户高并发**: 识别 Free、Pro、Ultra 与 Plus 权益，按实时模型目录在账户间轮询或优先复用
 - **Ultra 独立号池**: Ultra 账户经 `/ultra` 前缀单独调用（如 `http://127.0.0.1:2048/ultra/v1`），默认独占，Worker 常驻与峰值数单独设置；可选让 Pro 账户一起并入（`ULTRA_INCLUDE_PRO`），组成付费号池
 - **两种 WAA 后端**: 默认由 Camoufox 持有官方 WAA 生命周期；设置 `WAA_BACKEND=go` 后由纯 Go 生成官方 proof，运行时不下载、不启动浏览器
@@ -685,7 +685,7 @@ cp .env.example .env
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数；受每分钟次数上限（`ACCOUNT_RPM_LIMIT`）约束，不宜调高 |
 | `ACCOUNT_RPM_LIMIT` | `10` | 单账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型与两个通道共用），满了就换号、热 Worker 都满时扩容；只统计本服务，429 冷却仍兜底；`0` 关闭；保存后立即生效 |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
-| `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一 |
+| `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一；保存后立即生效，不需要重启。官网停用 Build 通道的生成时不必改它，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成) |
 | `STREAM_PLAYGROUND_MODELS` | 空 | 流式请求优先走 Playground 的模型，逗号分隔。需要订阅权益的模型在 Build 通道只能一次性返回整段回复；列表中的模型的流式请求先用 Playground 逐块输出，Playground 账号都在忙时立即改用 Build，不排队等待 Playground。留空时 Playground 与 Build 照常轮询；非流式请求不受影响。管理页“服务配置”会列出目录中需要订阅权益、可经 Playground 调用的模型，保存后立即生效 |
 | `PRIMARY_MODELS` | 空 | 普通号池的主用模型，逗号分隔，只作用于普通路径（不带 `/ultra` 前缀）。列表中的模型的请求最多等 `PRIMARY_QUEUE_WAIT` 空闲的账号或 Worker，超过即返回 429 并带 `Retry-After`，由客户端稍后重试，不再排队到 `REQUEST_TIMEOUT`；留空时所有模型照常排队。候选全部冷却仍按原规则处理。管理页“服务配置”可修改，保存后立即生效（见[主用模型](#主用模型)） |
 | `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限，整个请求共用一份：从第一次选号起按实际经过的时间计，失败后换号重试的尝试（如 403、额度 429）与换号退避都算在内，不再每次换号重新计时；请求自己现场冷启动的浏览器启动时间不计（最多 `INIT_TIMEOUT`）；上限到了之后只接受立即可用的账号，否则返回 429；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
@@ -1041,6 +1041,8 @@ OFFLINE=1 LOG_FILE=<日志> LEDGER_DB=<账本> DIAG_NOW=2026-10-22T08:00:00Z bas
 | 输入被安全策略拦截 | 400 | 如 `Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)` |
 | 模型不存在或没有账号能提供 | 404 | `models/<模型> is not found for API version v1beta, …` |
 | 号池全部冷却、上游限流、主用模型排队超限、Ultra 主用模型额度不足、租到的账号在请求发出前进入冷却又不能再换号 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数），主用模型排队超限、Ultra 主用模型额度不足（见[主用模型](#主用模型)）与租到的账号在请求发出前进入冷却（距拦下它的冷却恢复的秒数）时同样附 `Retry-After`；`Retry-After` 在建议间隔上随机往后加 0 到 3 秒（建议间隔不到 5 秒不加） |
+| 输入超过 Playground 的输入上限、而官网停用了 Build 通道的生成（无法改走 Build，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成)） | 400 | `The input token count exceeds the maximum number of tokens allowed (131072) on the AI Studio Playground channel, and longer inputs cannot be processed because AI Studio has disabled generation through the Build channel.`；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头，客户端可以压缩上下文后重试 |
+| 只能经 Build 调用的模型（Build 目录有、Playground 目录没有，如 `gemini-4-argon`）在官网停用 Build 通道的生成期间 | 503 | `Model <模型> is only available through the AI Studio Build channel, and AI Studio has disabled generation through the Build channel. Please try again later or use another model.` |
 | 号池内部的账号认证（需要重新登录）、停用、占用、权限、目录问题，号池为空，服务未就绪或重启中 | 503 | `The service is currently unavailable.` |
 | 上游过载 | 503 | `The model is overloaded. Please try again later.` |
 | 超时 | 504 | `Deadline expired before operation could complete.` |
@@ -1052,9 +1054,22 @@ OFFLINE=1 LOG_FILE=<日志> LEDGER_DB=<账本> DIAG_NOW=2026-10-22T08:00:00Z bas
 
 ### 上游降级与输入上限
 
-Build 通道响应的每一块都带 `modelVersion`：前面的内容块沿用请求的模型名，最后一块（含最终用量）报告实际服务的模型。实测有的对话请求 `gemini-3.1-pro-preview`，最后一块标明为 `3.1-flash-lite-preview-03-2026`，同时出字速度约为 Pro 的两倍。发现这种情况时写一条警告，管理日志里记 `served_model`，`./start.sh diag` 统计降级比例；Playground 通道的响应里没有模型名，只能按出字速度推测。Playground 对部分账号的输入长度另有上限（如 131072 token），返回这个错误时自动改走 Build 通道再试一次，仍超限且号池里有更高权益的账号时再用它们试一次；两次再试都只用现在就能取得的账号，不排队等待。仍然超限或没有立即可用的账号时按 400 返回给客户端，文案与安全拦截相同（`Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)`），不向客户端暴露账号上限；上游有时把它按 429 返回，但它与账号无关：不按额度冷却账号，也不再换号。带具体计数的模型本身上限（如 `(2000000) exceeds … (1048576)`）任何账号都放不下，直接按 400 返回谷歌原文，不重试。
+Build 通道响应的每一块都带 `modelVersion`：前面的内容块沿用请求的模型名，最后一块（含最终用量）报告实际服务的模型。实测有的对话请求 `gemini-3.1-pro-preview`，最后一块标明为 `3.1-flash-lite-preview-03-2026`，同时出字速度约为 Pro 的两倍。发现这种情况时写一条警告，管理日志里记 `served_model`，`./start.sh diag` 统计降级比例；Playground 通道的响应里没有模型名，只能按出字速度推测。Playground 对部分账号的输入长度另有上限（如 131072 token），返回这个错误时自动改走 Build 通道再试一次（官网停用 Build 通道的生成期间不再改走 Build，按 400 返回并写明上限与原因，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成)），仍超限且号池里有更高权益的账号时再用它们试一次；两次再试都只用现在就能取得的账号，不排队等待。仍然超限或没有立即可用的账号时按 400 返回给客户端，文案与安全拦截相同（`Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)`），不向客户端暴露账号上限；上游有时把它按 429 返回，但它与账号无关：不按额度冷却账号，也不再换号。带具体计数的模型本身上限（如 `(2000000) exceeds … (1048576)`）任何账号都放不下，直接按 400 返回谷歌原文，不重试。
 
 测试某段对话是否被降级：`python3 tools/test_downgrade.py --key 你的APIKey [--trace] [--request 请求体或排查记录.json]`，逐次报告首字、出字速度和上游标明的模型，并用普通提示词做对照。
+
+### 官网停用 Build 通道的生成
+
+官网关闭了经 Build 应用代理的生成：Build 代理调用返回 HTTP 400 `PROXY_GENERATION_DISABLED: streamGenerateContent is not supported`（需要订阅权益的模型走单次代理调用，为 `… generateContent is not supported`），流式与非流式都关了，Playground 不受影响。原先这个 400 被当成请求本身的错误直接返回客户端；现在自动处理，不需要改配置：
+
+- **当次请求**：生成请求在 Build 上遇到它时不返回客户端，立即改走 Playground（同账号的 Playground 可用时在同账号重试，否则换号，之后的尝试每个账号先 Playground），不计入连续失败上限、不退避、不冷却任何额度；错误发生在首个事件之前，流式请求同样无缝重试
+- **暂停 Build**：遇到的账号暂停 Build（只走 Playground）；10 分钟内 3 个不同账号都遇到即全局暂停，所有账号的生成都改走 Playground（选号里 Build 视为未启用）。暂停期间 Worker 的死槽位判定、轮换与账户的冷却状态同样把暂停的 Build 当作不可用：Playground 额度用完的账号与只启用 Playground 时一样显示冷却、及时轮换（只启用 Build 时不这样算）
+- **试探恢复**：全局暂停后约每 30 分钟（另加最多 3 分钟随机）放行一个真实请求走 Build 试探，失败时这次请求照常换到 Playground，用户无感知；成功即解除全局与各账号的暂停。试探只用已启动 Worker、现在就能用的 Build 账号，不在请求路径上冷启动浏览器；取不到时这次请求照常选号，1 分钟后再放行。连续 3 次都取不到（号池持续饱和，空出的槽位马上被排队的请求取走）时，之后的试探改为排队等已启动 Worker 的 Build 账号，最多 5 秒（主用模型不超过排队上限剩余的一半），等不到就照常选号、按到达先后排回原来的位置；所以官网恢复后一般 30~38 分钟内自动解除，号池长时间满载时也只多几分钟，不会等到负载降下来。只拿 Build 能调用其模型的生成请求试探，优先不固定账号、不限定通道的请求（包括输入超过 Playground 上限、要改走 Build 的请求）；降级判定的模型（默认 `gemini-3.1-pro-preview`）与流式优先 Playground 的模型（`STREAM_PLAYGROUND_MODELS`）的请求在到期超过 5 分钟仍没有别的请求时也会放行，以这类流量为主的服务同样能自动恢复；固定账号、带文件或语音的请求不拿来试探。按账号的暂停同样约 30 分钟后到期，到期后该账号在 Build 上的下一次请求就是试探；到期后又过 30 分钟仍没有它的 Build 结果（账号被停用、需要登录，或之后都没再经 Build）就不再记着它，删除或移走的账号随即不再记着
+- **依赖 Build 的请求**：输入超过 Playground 上限（如 131072 token）、要改走 Build 的请求在 Build 暂停时直接返回 400，写明上限与“官网已停用 Build 通道的生成”；只能经 Build 调用的模型（号池里没有账户能经 Playground 调用，如 Ultra 号池的 `gemini-4-argon`）返回 503 并说明原因，不再无限换号（错误格式见[错误响应格式](#错误响应格式)）。Playground 能调用的模型不会这样返回：Playground 账号额度用完、只剩 Build 目录有该模型的账号时照常按额度不足返回 429。客户端不会再收到 `PROXY_GENERATION_DISABLED` 原文
+- **识别**：只认 Build 代理调用返回、文案以 `PROXY_GENERATION_DISABLED` 开头（区分大小写）的错误，开头带上游内部标记（`[original: …]`、`generic::…:` 等，对外返回时本来就会去掉）时先去掉再判断；参数错误的 400 回显了客户端请求里同名的字段时照旧按请求本身的错误返回
+- **查看**：运行日志只在进入暂停（WARN `官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED），暂停 Build，生成改走 Playground | 下次试探=… | 范围=…`）与恢复（INFO `Build 通道的生成已恢复，解除暂停`）时各写一行，同一状态不重复写；`GET /api/status` 的 `build_channel`、管理页“服务配置 → 上游通道”下方与 `bash tools/diag_start.sh` 的状态段显示是否全局暂停、开始时间、下次试探时间、暂停中的账号数，以及按账号暂停已到期、等待试探的账号数（全局暂停时所有账号都不走 Build，暂停中的账号数为遇到过的账号数，不再单列等待试探）
+- **不持久化**：暂停状态只在进程内，服务重启（含重建生成服务）后从头判定，最多再有几个请求在 Build 上遇到这个错误，都会无缝改走 Playground；这比把可能早已恢复的暂停状态带过重启更稳妥
+- 也可以在“服务配置 → 上游通道”去掉 Build（或改 `UPSTREAM_CHANNELS=playground`），保存后立即生效、不需要重启；以后重新勾选 Build 同样立即生效，启动时就缓存过的 Build 模型目录立即可用，没有缓存的账户由后台目录同步逐个补齐（补齐前这些账户只走 Playground）
 
 ### 拒绝被降级的回复（降级判定）
 

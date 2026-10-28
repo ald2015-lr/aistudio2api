@@ -515,6 +515,8 @@ type Account struct {
 	stateMessage          string
 	initializedAt         time.Time
 	buildModels           []Model
+	// buildPaused 为该账户的 Build 生成暂停（官网对它返回 PROXY_GENERATION_DISABLED，见 build_pause.go），受账户池 mu 保护
+	buildPaused bool
 	// emptyCatalogs 与 emptyCatalogSince 为 ListModels 连续返回空列表的次数与第一次为空的时间（见 noteCatalogListing），
 	// 由目录写盘缓存保存并在恢复时带回；受账户池 mu 保护
 	emptyCatalogs     int
@@ -614,6 +616,9 @@ type AccountSelection struct {
 	// EgressPriority 为主用模型的生成选号：出口令牌桶受限时优先取得令牌（见 egress_rate.go）。
 	// 只影响出口准入，不进候选集的键（selectionKeyOf），也不进调度等待队列的键（见 app/dispatch.go）
 	EgressPriority bool
+	// BuildProbe 为 Build 生成暂停期间仍按 Build 可用选号（见 build_pause.go）：暂停后定期放行的试探请求，
+	// 以及只看目录、不看暂停的判断（模型列表）
+	BuildProbe bool
 }
 
 const preferredBootstrapModelID = "gemini-flash-latest"
@@ -668,7 +673,11 @@ type AccountPool struct {
 	lastPicked            map[string]string
 	lastPickedChannel     map[string]Channel
 	channels              []Channel
-	changed               chan struct{}
+	// channelsNoBuild 为 channels 去掉 Build 后的顺序（Build 生成全局暂停时的生成通道），buildPaused 为 Build 生成全局暂停
+	// （见 build_pause.go）；均受 mu 保护
+	channelsNoBuild []Channel
+	buildPaused     bool
+	changed         chan struct{}
 	// selectionRefreshAt 记录各模型最近一次从磁盘刷新运行态的时间，用于限频
 	selectionRefreshMu sync.Mutex
 	selectionRefreshAt map[string]time.Time
@@ -1898,6 +1907,11 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	}
 	if !p.hasAccountLocked(selection.Pool) {
 		return p.emptyPoolErrorLocked(selection.Pool)
+	}
+	// 没有候选只是因为 Build 生成暂停（官网停用了 Build 通道的生成，见 build_pause.go）：只能经 Build 处理的请求说明是 Build 暂停，
+	// 不按“没有账户支持”（对外 404 模型不存在）返回；错误同时满足 ErrNoEligibleAccount，换号重试照原规则处理
+	if p.buildPauseBlocksLocked(selection) {
+		return p.buildUnavailableErrorLocked(selection)
 	}
 	return ErrNoEligibleAccount
 }
@@ -3477,8 +3491,9 @@ func (p *AccountPool) accountCoolingLocked(account *Account, now time.Time) bool
 }
 
 // accountModelCoolingLocked 判断账户在模型上的每个可用通道是否都在冷却：Playground 要求通道启用、目录含该模型且权益允许，
-// 冷却键为模型 ID；Build 要求通道启用且 Build 目录支持，冷却键为 build:<模型>。没有可用通道时按不冷却处理
-// （目录已不含该模型，冷却记录不再影响调度）；只有一个通道冷却、另一个通道还能用时同样不算冷却；调用方持有 p.mu
+// 冷却键为模型 ID；Build 要求通道启用、没有 Build 生成暂停（全局或该账户，见 buildGenerationOpenLocked）且 Build 目录支持，
+// 冷却键为 build:<模型>。没有可用通道时按不冷却处理（目录已不含该模型，冷却记录不再影响调度）；只有一个通道冷却、另一个通道
+// 还能用时同样不算冷却；调用方持有 p.mu
 func (p *AccountPool) accountModelCoolingLocked(account *Account, modelID string, now time.Time) bool {
 	usable := false
 	if p.channelEnabledLocked(ChannelPlayground) {
@@ -3489,7 +3504,7 @@ func (p *AccountPool) accountModelCoolingLocked(account *Account, modelID string
 			}
 		}
 	}
-	if p.channelEnabledLocked(ChannelBuild) && p.buildSupportsModelLocked(account, modelID) {
+	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) {
 		usable = true
 		if _, active := accountCooldown(account, ChannelCooldownScope(ChannelBuild, modelID), now); !active {
 			return false
@@ -3525,7 +3540,7 @@ func (p *AccountPool) accountModelCoolingUntilLocked(account *Account, modelID s
 			}
 		}
 	}
-	if p.channelEnabledLocked(ChannelBuild) && p.buildSupportsModelLocked(account, modelID) {
+	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) {
 		channelUntil := cooldownNanos(account.runtime.Cooldowns[ChannelCooldownScope(ChannelBuild, modelID)])
 		if channelUntil <= 0 {
 			return 0

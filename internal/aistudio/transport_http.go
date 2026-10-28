@@ -349,7 +349,9 @@ func validateLeaseSelection(lease *AccountLease, selection AccountSelection) err
 	}
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if lease.Channel() == ChannelBuild {
-		if modelID != "" && !lease.pool.channelSupportsLocked(account, ChannelBuild, selection) {
+		// 只核对 Build 目录：租约取得时 Build 可用即可，之后开始的 Build 生成暂停（见 build_pause.go）与热更新去掉 Build 通道
+		// 都不让已在发送的请求失败
+		if modelID != "" && !lease.pool.buildCatalogSupportsLocked(account, selection) {
 			return fmt.Errorf("context 租约账户 %s 的 Build 通道不支持模型 %s", account.ID, modelID)
 		}
 		return nil

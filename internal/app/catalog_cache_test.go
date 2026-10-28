@@ -687,3 +687,41 @@ func TestCatalogCacheEntryGCSticks(t *testing.T) {
 		t.Fatal("仍在本池的账户应保留")
 	}
 }
+
+// TestCatalogCacheRestoresBuildWhenDisabled 启动时没有启用 Build 也恢复缓存里的 Build 目录（账户池不使用它），运行中经 UPSTREAM_CHANNELS
+// 热更新启用 Build 后立即可用；没有启用 Build 时缺 Build 目录的账户不排进后台同步
+func TestCatalogCacheRestoresBuildWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	root, dir := t.TempDir(), filepath.Join(t.TempDir(), "model-catalogs")
+	const accountID = "pro@example.com"
+	catalogTestAccounts(t, root, accountID)
+	requests := newRequestRegistry(ctx)
+	first := newCatalogGeneration(t, root, &catalogRPCTransport{
+		listModels: catalogTestRaw(t, catalogTestRow("alpha", 0.7)), tier: "[1]",
+	})
+	if _, err := first.pooled.RefreshAccountModels(ctx, accountID); err != nil {
+		t.Fatal(err)
+	}
+	build := []aistudio.Model{{ID: "build-only", Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}}}
+	if err := first.pool.SetBuildCatalog(accountID, build); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _ := first.pooled.CatalogSnapshot(accountID)
+	cache := openCatalogCache(dir, requests)
+	cache.put(accountID, snapshot, time.Now())
+	if err := cache.flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := newCatalogGeneration(t, root, nil)
+	summary := openCatalogCache(dir, requests).restore(second.pool, second.client, false)
+	if summary.FromDisk != 1 || len(summary.Stale) != 0 {
+		t.Fatalf("恢复结果 %+v", summary)
+	}
+	if restored, ok := second.pool.BuildCatalogOf(accountID); !ok || !reflect.DeepEqual(restored, build) {
+		t.Fatalf("没有启用 Build 时也应恢复 Build 目录，得到 %+v", restored)
+	}
+	if missing := second.pool.AccountsWithoutBuildCatalog(); len(missing) != 0 {
+		t.Fatalf("恢复后没有 Build 目录的账户 = %v", missing)
+	}
+}

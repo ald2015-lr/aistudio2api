@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +32,8 @@ const (
 	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
 	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
 	officialUltraUnavailableMessage = "The service is currently unavailable: no account in the Ultra pool is ready."
+	// officialBuildDisabledMessage 用于官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED）、又没有其他通道接下请求的兜底（没有官方原文）
+	officialBuildDisabledMessage = "The service is currently unavailable: AI Studio has disabled generation through the Build channel. Please try again later."
 )
 
 // 错误类别：决定 OpenAI 的 code/param 与 Anthropic 的错误类型、措辞
@@ -71,13 +72,6 @@ var blockReasonDescriptions = map[string]string{
 	"IMAGE_SAFETY":       "Candidates blocked due to unsafe image generation content.",
 }
 
-var (
-	// 上游消息里的内部标记，例如 "[original: beyond::dependency::INVALID_ARGUMENT] ..." 与 "(qos=CRITICAL_PLUS)"
-	upstreamOriginalTag = regexp.MustCompile(`\[(?i:original)[^\]]*\]\s*`)
-	upstreamQoSTag      = regexp.MustCompile(`\s*\((?i:qos)=[^)]*\)`)
-	upstreamGenericTag  = regexp.MustCompile(`\b(?:generic|beyond)::[A-Za-z_:]+:\s*`)
-)
-
 // publicErrorFor 把内部错误映射为官方格式的客户端错误。
 // 号池内部问题（账号认证、权限、目录、未就绪、重启中）一律按服务不可用返回：
 // 401/403 透传给 new-api 等中转会让它自动禁用整个渠道，而这些问题与客户端的密钥无关
@@ -100,6 +94,21 @@ func publicErrorFor(err error, model string) publicError {
 	}
 	if errors.Is(err, context.Canceled) {
 		return unavailablePublicError()
+	}
+	// 官网停用了 Build 通道的生成，而请求只能经 Build 处理：输入超过 Playground 上限按输入过长返回 400（写明上限，客户端可以压缩上下文），
+	// 只能经 Build 调用的模型与 Playground 接不了的请求按 503 返回；PROXY_GENERATION_DISABLED 原文只写管理日志
+	var buildUnavailable *aistudio.BuildGenerationUnavailableError
+	if errors.As(err, &buildUnavailable) {
+		if buildUnavailable.HTTPStatus() == http.StatusBadRequest {
+			return publicError{
+				Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT", Message: buildUnavailable.PublicMessage(), Kind: publicKindContextLength,
+			}
+		}
+		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: buildUnavailable.PublicMessage()}
+	}
+	// 兜底：Build 的 PROXY_GENERATION_DISABLED（400）不按请求本身的参数错误透给客户端
+	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
+		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialBuildDisabledMessage}
 	}
 	// 上游回复违反了客户端要求的工具约束：按网关错误返回，客户端与中转可以重试
 	var contract *aistudio.ToolContractError
@@ -314,12 +323,9 @@ func upstreamMessageOr(rpcError *aistudio.RPCError, fallback string) string {
 	return message
 }
 
-// cleanUpstreamMessage 去掉上游消息里的内部标记，只保留谷歌官方原文
+// cleanUpstreamMessage 去掉上游消息里的内部标记，只保留谷歌官方原文（与 aistudio 包按文案开头识别错误时的清洗相同）
 func cleanUpstreamMessage(message string) string {
-	message = upstreamOriginalTag.ReplaceAllString(message, "")
-	message = upstreamQoSTag.ReplaceAllString(message, "")
-	message = upstreamGenericTag.ReplaceAllString(message, "")
-	return strings.TrimSpace(message)
+	return aistudio.CleanUpstreamMessage(message)
 }
 
 func isContextLengthMessage(message string) bool {

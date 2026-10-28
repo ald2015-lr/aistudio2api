@@ -37,6 +37,12 @@ func (p *AccountPool) SetUpstreamChannels(channels []Channel) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.channels = append([]Channel(nil), channels...)
+	p.channelsNoBuild = nil
+	for _, channel := range p.enabledChannelsLocked() {
+		if channel != ChannelBuild {
+			p.channelsNoBuild = append(p.channelsNoBuild, channel)
+		}
+	}
 	// 通道顺序决定每个候选集的通道与冷却键，整个候选索引重建
 	p.eligibilityVersion++
 	p.invalidateSchedulingLocked()
@@ -56,6 +62,19 @@ func (p *AccountPool) SetBuildCatalog(accountID string, models []Model) error {
 	p.accountChangedLocked(account)
 	p.notifyLocked()
 	return nil
+}
+
+// AccountsWithoutBuildCatalog 返回还没有 Build 目录（没有同步过，也没有从写盘缓存恢复）的启用账户，按账户顺序
+func (p *AccountPool) AccountsWithoutBuildCatalog() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var ids []string
+	for _, account := range p.accounts {
+		if account != nil && account.Config.Enabled && account.buildModels == nil {
+			ids = append(ids, account.ID)
+		}
+	}
+	return ids
 }
 
 // BuildEnabled 返回 Build 通道是否启用
@@ -106,19 +125,24 @@ func generationChannelSelection(selection AccountSelection) bool {
 		strings.TrimSpace(selection.Capability) == "" && !selection.PlaygroundOnly
 }
 
-// selectionChannelsLocked 返回选择可使用的通道顺序；非生成请求只使用 Playground RPC
+// selectionChannelsLocked 返回选择可使用的通道顺序；非生成请求只使用 Playground RPC。
+// Build 生成全局暂停时（见 build_pause.go）生成请求把 Build 当作没有启用，试探请求（BuildProbe）除外
 func (p *AccountPool) selectionChannelsLocked(selection AccountSelection) []Channel {
 	if !generationChannelSelection(selection) {
 		return []Channel{ChannelPlayground}
 	}
+	buildOpen := p.channelEnabledLocked(ChannelBuild) && (selection.BuildProbe || !p.buildPaused)
 	if selection.BuildOnly {
-		if p.channelEnabledLocked(ChannelBuild) {
+		if buildOpen {
 			return []Channel{ChannelBuild}
 		}
 		return nil
 	}
 	if selection.PlaygroundFirst && p.channelEnabledLocked(ChannelPlayground) {
 		return []Channel{ChannelPlayground}
+	}
+	if !buildOpen && p.channelEnabledLocked(ChannelBuild) {
+		return p.channelsNoBuild
 	}
 	return p.enabledChannelsLocked()
 }
@@ -135,11 +159,18 @@ func (p *AccountPool) channelSupportsLocked(account *Account, channel Channel, s
 		}
 		return accountSupportsSelection(account, selection)
 	case ChannelBuild:
+		// Build 生成暂停（全局或该账户，见 build_pause.go）时不经 Build 接生成请求，试探请求除外
 		return generationChannelSelection(selection) && p.channelEnabledLocked(ChannelBuild) &&
-			p.buildSupportsModelLocked(account, selection.ModelID)
+			!p.buildPauseActiveLocked(account, selection) && p.buildSupportsModelLocked(account, selection.ModelID)
 	default:
 		return false
 	}
+}
+
+// buildCatalogSupportsLocked 判断账户的 Build 目录支持这个生成选择，不看 Build 通道是否启用、是否暂停：
+// 已经取得的 Build 租约发送前的校验用它（见 validateLeaseSelection）
+func (p *AccountPool) buildCatalogSupportsLocked(account *Account, selection AccountSelection) bool {
+	return generationChannelSelection(selection) && p.buildSupportsModelLocked(account, selection.ModelID)
 }
 
 // accountSupportsAnyChannelLocked 判断账户至少有一个通道支持选择
@@ -344,7 +375,8 @@ func (p *AccountPool) hasBuildModelLocked(modelID string, method string, scope P
 // modelChannelsInLocked 返回号池内至少一个启用账户可以调用模型的通道。结果按目录版本记忆（见 pool_catalog_cache.go）：
 // 目录列表每个模型都要算一次，没有账户支持的模型（如 Ultra 号池列普通目录）要扫完全部账户
 func (p *AccountPool) modelChannelsInLocked(model Model, scope PoolScope) []string {
-	selection := AccountSelection{ModelID: model.ID}
+	// 模型列表只看目录与通道配置，不看 Build 生成暂停：暂停期间只能经 Build 调用的模型仍然列出，请求时给出清楚的错误
+	selection := AccountSelection{ModelID: model.ID, BuildProbe: true}
 	if hasMethod(model, "generateContent") {
 		selection.Method = "generateContent"
 	}

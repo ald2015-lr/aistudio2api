@@ -103,6 +103,15 @@ func statusFromError(err error) int {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return http.StatusGatewayTimeout
 	}
+	// 官网停用了 Build 通道的生成：只能经 Build 处理的请求按它自己的状态码（输入超过 Playground 上限 400，其余 503），
+	// Build 的 PROXY_GENERATION_DISABLED 原样落到这里时按 503，不按请求本身的 400（与 publicErrorFor 一致）
+	var buildUnavailable *aistudio.BuildGenerationUnavailableError
+	if errors.As(err, &buildUnavailable) {
+		return buildUnavailable.HTTPStatus()
+	}
+	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
+		return http.StatusServiceUnavailable
+	}
 	// 号池暂时不可调度（503）与全部冷却（429，经 HTTPStatus）都是服务端原因；
 	// 其余 ErrNoEligibleAccount 表示没有账户能处理该请求，属于请求本身的原因
 	var notReady *aistudio.AccountsNotReadyError

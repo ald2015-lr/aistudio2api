@@ -622,6 +622,8 @@ func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	accountDisableNotes.clearAutomatic(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
 	admin.service.orgDisabled.clearAccount(accountID)
+	// Build 生成的按账号暂停记录随账户移出删除：目录放回后加入的是新的账户（没有暂停标记），从头判定
+	admin.service.buildPauses().forget(accountID)
 	return errors.Join(admin.workers.Remove(accountID), admin.headers.Remove(accountID))
 }
 
