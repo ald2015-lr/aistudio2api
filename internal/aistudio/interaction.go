@@ -15,6 +15,10 @@ import (
 // interactionThinkingLevels 把 GenerateContent thinking level 换算为 Interaction 枚举
 var interactionThinkingLevels = map[int64]int64{4: 1, 1: 2, 2: 3, 3: 4}
 
+// interactionImageMIME 表示 Interaction 图片内容的 MIME 枚举：1 为 image/png（与上游 Mag1cFall/AIStudio2API 相同）；官网发送图片输入时
+// 同一个 Content field 2 以 1 表示 PNG、2 表示 JPEG（见 interaction_image.go），输出带 2 时按 JPEG 解码
+var interactionImageMIME = map[int64]string{interactionPNGEnum: "image/png", interactionJPEGEnum: "image/jpeg"}
+
 // interactionVideoMIME 表示 Interaction 视频内容的 MIME 枚举
 var interactionVideoMIME = map[int64]string{1: "video/mp4"}
 
@@ -97,17 +101,18 @@ type interactionModelMedia struct {
 	part  Part
 }
 
-// encodeInteractionSteps 把规范消息编码为 Interaction input steps，用户为 step field 1、模型为 field 2。
-// 模型 step 只带文本：模型消息里的附件（客户端回传的生成图片、本服务恢复的图片链接、续接历史里模型生成的视频，上传后为 Drive 引用）连同一句说明
+// encodeInteractionSteps 把规范消息编码为 Interaction input steps，用户为 step field 1、模型为 field 2；part 按客户端给的顺序编码。
+// 模型 step 只带文本：模型消息里的附件（客户端回传的生成图片、本服务恢复的图片与视频链接、续接历史里模型生成的视频）连同一句说明
 // 移到紧随其后的用户 step 最前面（与 api.normalizeTurns 移动工具结果图片的做法一致），以模型消息结尾时单独成一条用户 step；
-// 只有附件的模型消息整条省略。移过去的附件按用户附件编码：没有 Drive 授权、仍是 inline data 时与用户附件一样返回需要 Drive 授权的错误，
-// 外部地址不接受，不静默丢掉
+// 只有附件的模型消息整条省略。移过去的附件按用户附件编码：PNG、JPEG 图片内联（与官网相同），视频等上传后为 Drive 引用；没有 Drive 授权、
+// 仍是 inline data 的视频与不能内联的图片与用户附件一样返回需要 Drive 授权的错误，外部地址不接受，不静默丢掉。错误说明为英文，按参数
+// 错误原样返回客户端（app 层在发送前已把这类请求交给有 Drive 授权的账号，外部地址在选号前按 400 返回，这里只是兜底）
 func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
 	steps := make([]any, 0, len(contents)+1)
 	binding := make([]Content, 0, len(contents)+1)
 	hasModelTurn := false
 	var pendingMedia []interactionModelMedia
-	// flushMedia 编码待移动的模型附件，返回放在用户 step 最前面的 part 与参与 binding 的说明文字（文件 ID 不参与 binding）
+	// flushMedia 编码待移动的模型附件，返回放在用户 step 最前面的 part 与参与 binding 的说明文字（图片数据与文件 ID 不参与 binding）
 	flushMedia := func() ([]any, []Part, error) {
 		if len(pendingMedia) == 0 {
 			return nil, nil, nil
@@ -161,7 +166,7 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 			steps = append(steps, []any{nil, []any{parts}})
 			hasModelTurn = true
 		default:
-			return nil, nil, false, fmt.Errorf("Interaction 模型不接受 %s 消息", content.Role)
+			return nil, nil, false, fmt.Errorf("contents[%d]: this model does not accept %s messages", index, content.Role)
 		}
 		binding = append(binding, Content{Role: content.Role, Parts: texts})
 	}
@@ -174,22 +179,30 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		binding = append(binding, Content{Role: RoleUser, Parts: intro})
 	}
 	if len(steps) == 0 {
-		return nil, nil, false, fmt.Errorf("%w: CreateInteractionStream contents 不能为空", ErrInvalidArgument)
+		return nil, nil, false, fmt.Errorf("%w: contents must not be empty", ErrInvalidArgument)
 	}
 	return steps, binding, hasModelTurn, nil
 }
 
-// encodeInteractionAttachment 编码 step 里的附件 part：用户的 Drive 文件引用为 Content field 9；仍是 inline data（账户没有 Drive 授权）
-// 时返回需要 Drive 授权的错误；其他 part 不接受
+// encodeInteractionAttachment 编码 step 里的附件 part：PNG、JPEG 图片按官网内联为 Content field 2 [MIME 枚举, Base64]（PNG 为 1、JPEG 为 2，
+// 原文件字节；GIF 已在 app 层转成 PNG，见 PrepareInteractionImages），用户的 Drive 文件引用为 Content field 9；其余 inline data（视频、
+// 其他文件、不能内联的图片，账户没有 Drive 授权时仍是 inline data）返回需要 Drive 授权的错误；外部地址与其他 part 不接受。
+// 错误说明为英文（原样返回客户端）
 func encodeInteractionAttachment(index int, part Part, role Role) ([]any, error) {
 	switch {
+	case InteractionInlineImage(part):
+		// Content field 2 为图片：[MIME 枚举, Base64]
+		enum, _ := interactionImageEnum(part.InlineData)
+		return []any{nil, []any{enum, base64.StdEncoding.EncodeToString(part.InlineData.Data)}}, nil
 	case part.File != nil && strings.TrimSpace(part.File.ID) != "" && part.Text == "" && role == RoleUser:
 		// Content field 9 为 Drive 文件引用
 		return []any{nil, nil, nil, nil, nil, nil, nil, nil, []any{strings.TrimSpace(part.File.ID)}}, nil
 	case part.InlineData != nil:
-		return nil, fmt.Errorf("Interaction 模型的 contents[%d] 附件需要账户 Drive 授权", index)
+		return nil, errors.New(interactionDriveMediaMessage(index, part.InlineData))
+	case part.ExternalMedia != nil:
+		return nil, errors.New(interactionExternalMediaMessage(index))
 	default:
-		return nil, fmt.Errorf("Interaction 模型的 contents[%d] 只接受文本与用户附件 part", index)
+		return nil, fmt.Errorf("contents[%d]: this model only accepts text, image and video parts; this part type is not supported", index)
 	}
 }
 
@@ -423,7 +436,8 @@ func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error) (bool, 
 	return true, emit(Event{Kind: EventFinish, FinishReason: "stop"})
 }
 
-// decodeInteractionDelta 解码 content delta：field 1 文本、field 5 视频、field 6 思考摘要、field 7 思考签名
+// decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 5 视频、field 6 思考摘要、field 7 思考签名、field 10 引用
+// （图片与引用按上游 Mag1cFall/AIStudio2API 的解码移植：图片作为媒体输出，引用为正文起止位置与来源网址）
 func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 	delta, err := rawArray(raw, "$delta", raw)
 	if err != nil || len(delta) < 2 {
@@ -450,28 +464,16 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 			if err := emit(Event{Kind: EventText, Text: decoded}); err != nil {
 				return err
 			}
-		case 4:
-			video, err := rawArray(value, "$delta[1][4]", raw)
-			if err != nil || len(video) < 2 {
-				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][4]", Detail: "视频 delta 无效", Raw: cloneRaw(raw)}
+		case 1, 4:
+			mimes, kind := interactionImageMIME, "图片"
+			if index == 4 {
+				mimes, kind = interactionVideoMIME, "视频"
 			}
-			code, err := rawInt64(video[0], "$delta[1][4][0]", raw)
+			media, err := decodeInteractionMedia(value, index, mimes, kind, raw)
 			if err != nil {
-				return withMethod(err, "CreateInteractionStream")
+				return err
 			}
-			mimeType, ok := interactionVideoMIME[code]
-			if !ok {
-				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][4][0]", Detail: fmt.Sprintf("未识别的视频 MIME 枚举 %d", code), Raw: cloneRaw(raw)}
-			}
-			encoded, err := rawString(video[1], "$delta[1][4][1]", raw)
-			if err != nil {
-				return withMethod(err, "CreateInteractionStream")
-			}
-			data, err := base64.StdEncoding.DecodeString(encoded)
-			if err != nil {
-				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][4][1]", Detail: "视频数据不是 Base64", Raw: cloneRaw(raw)}
-			}
-			if err := emit(Event{Kind: EventMedia, Media: &Media{MIME: mimeType, Data: data}}); err != nil {
+			if err := emit(Event{Kind: EventMedia, Media: media}); err != nil {
 				return err
 			}
 		case 5:
@@ -482,8 +484,75 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 				}
 			}
 		case 6:
+		case 9:
+			if err := decodeInteractionCitations(value, raw, emit); err != nil {
+				return err
+			}
 		default:
 			return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: fmt.Sprintf("$delta[1][%d]", index), Detail: "未识别的 content delta 字段", Raw: cloneRaw(raw)}
+		}
+	}
+	return nil
+}
+
+// decodeInteractionMedia 解码图片（field 2）或视频（field 5）content：MIME 枚举与 Base64 数据；kind 为写进协议证据的媒体名称
+func decodeInteractionMedia(value json.RawMessage, index int, mimes map[int64]string, kind string, raw json.RawMessage) (*Media, error) {
+	path := fmt.Sprintf("$delta[1][%d]", index)
+	media, err := rawArray(value, path, raw)
+	if err != nil || len(media) < 2 {
+		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path, Detail: kind + " delta 无效", Raw: cloneRaw(raw)}
+	}
+	code, err := rawInt64(media[0], path+"[0]", raw)
+	if err != nil {
+		return nil, withMethod(err, "CreateInteractionStream")
+	}
+	mimeType, ok := mimes[code]
+	if !ok {
+		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[0]", Detail: fmt.Sprintf("未识别的%s MIME 枚举 %d", kind, code), Raw: cloneRaw(raw)}
+	}
+	encoded, err := rawString(media[1], path+"[1]", raw)
+	if err != nil {
+		return nil, withMethod(err, "CreateInteractionStream")
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[1]", Detail: kind + "数据不是 Base64", Raw: cloneRaw(raw)}
+	}
+	return &Media{MIME: mimeType, Data: data}, nil
+}
+
+// decodeInteractionCitations 解码 content field 10 的引用（按上游的解码移植）：分组里的每项依次为正文中引用标记的起止字符位置与
+// field 4 的来源网址，按来源输出引用事件（各协议与 Playground 的引用一样写进 annotations、citationMetadata 等）
+func decodeInteractionCitations(value json.RawMessage, raw json.RawMessage, emit func(Event) error) error {
+	groups, err := rawArray(value, "$delta[1][9]", raw)
+	if err != nil {
+		return withMethod(err, "CreateInteractionStream")
+	}
+	for _, group := range groups {
+		items, err := rawArray(group, "$delta[1][9][]", raw)
+		if err != nil {
+			return withMethod(err, "CreateInteractionStream")
+		}
+		for _, item := range items {
+			fields, err := rawArray(item, "$delta[1][9][][]", raw)
+			if err != nil || len(fields) < 4 {
+				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][9][][]", Detail: "引用字段不足", Raw: cloneRaw(raw)}
+			}
+			start, err := optionalIntField(fields, 0, "$delta[1][9][][]", raw)
+			if err != nil {
+				return withMethod(err, "CreateInteractionStream")
+			}
+			end, err := optionalIntField(fields, 1, "$delta[1][9][][]", raw)
+			if err != nil {
+				return withMethod(err, "CreateInteractionStream")
+			}
+			urls := interactionStrings(fields[3])
+			if len(urls) == 0 {
+				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][9][][3]", Detail: "引用缺少网址", Raw: cloneRaw(raw)}
+			}
+			if err := emit(Event{Kind: EventCitation, Citation: &Citation{URL: urls[0], Start: int(start), End: int(end)}}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

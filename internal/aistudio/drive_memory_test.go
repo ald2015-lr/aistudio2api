@@ -186,7 +186,7 @@ func TestDriveUnavailableError(t *testing.T) {
 }
 
 // TestInlineMediaDriveUnavailableKeepsInline 内联附件换 token 返回 401 / Code 16（线上原文与 unauthorized_client 两种）：
-// 返回改写前的 inline data Part、没有错误、不建临时文件，账户没有任何冷却、不标需要登录，并记住 Drive 不可用（有效期 6 小时）
+// 返回改写前的 inline data Part、没有错误、不建临时文件，账户没有任何冷却、不标需要登录，并记住 Drive 不可用（有效期 driveUnavailableTTL，24 小时）
 func TestInlineMediaDriveUnavailableKeepsInline(t *testing.T) {
 	for _, message := range []string{driveMissingCredential, "OAuth error: unauthorized_client."} {
 		t.Run(message[:12], func(t *testing.T) {
@@ -298,8 +298,9 @@ func TestInlineMediaDriveMemory(t *testing.T) {
 	expectInline("ForgetDriveUnavailable 之后", 7)
 }
 
-// TestDriveMemoryAccountIdentity 账户删除后以同一 ID 重新添加是另一个对象（认证代际从 0 重新计）：不沿用旧对象的记录；
-// 代际不同、过期的记录同样不算，并被清掉
+// TestDriveMemoryAccountIdentity 账户删除后以同一 ID 重新添加是另一个对象（认证代际从 0 重新计）：不沿用旧对象的记录，也不删它
+// （分不出哪个是现在的账户）；记录比快照新（读快照之后重新登录、另一个请求按新代际记下）时不命中、不删；记录比快照旧、过期的记录
+// 不命中并被清掉；旧代际的结果不覆盖新代际的记录
 func TestDriveMemoryAccountIdentity(t *testing.T) {
 	var memory driveMemory
 	now := time.Now()
@@ -312,12 +313,26 @@ func TestDriveMemoryAccountIdentity(t *testing.T) {
 	if memory.unavailable(readded, 0, now) {
 		t.Fatal("重新添加的账户对象不应沿用旧记录")
 	}
-	if memory.count() != 0 {
-		t.Fatal("对不上的记录应被清掉")
+	if memory.count() != 1 || !memory.unavailable(original, 0, now) {
+		t.Fatal("账户对象不同时不应删掉记录（可能是持旧对象的一方）")
+	}
+	memory.remember(original, 4, now)
+	if memory.unavailable(original, 3, now) || memory.count() != 1 {
+		t.Fatal("持旧快照（代际 3）不应命中，也不应删掉代际 4 的记录")
+	}
+	if !memory.unavailable(original, 4, now) {
+		t.Fatal("代际 4 的记录应保留")
 	}
 	memory.remember(original, 3, now)
-	if memory.unavailable(original, 4, now) || memory.count() != 0 {
-		t.Fatal("认证代际变化后不应命中")
+	if !memory.unavailable(original, 4, now) {
+		t.Fatal("代际 3 的结果不应覆盖代际 4 的记录")
+	}
+	memory.rememberAvailable(original, 3, now)
+	if got := memory.states([]driveSnapshot{{account: original, generation: 4}}, now)[0]; got != DriveStateUnavailable {
+		t.Fatalf("代际 3 的可用结果不应顶掉代际 4 的不可用记录，实际 %s", got)
+	}
+	if memory.unavailable(original, 5, now) || memory.count() != 0 {
+		t.Fatal("认证代际变化（记录比快照旧）后不应命中，并清掉记录")
 	}
 	memory.remember(original, 3, now)
 	if memory.unavailable(original, 3, now.Add(driveUnavailableTTL)) || memory.count() != 0 {

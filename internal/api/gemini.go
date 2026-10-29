@@ -433,7 +433,7 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 回传历史里本服务的媒体链接与 fileData 恢复为媒体输入（见 restoreMediaLinks）
-	s.restoreMediaLinks(generateRequest.Contents)
+	s.restoreMediaLinks(r.Context(), &generateRequest)
 	switch method {
 	case "countTokens":
 		s.handleGeminiCountTokens(w, r, generateRequest)
@@ -723,9 +723,8 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			if err != nil {
 				return nil, false, fmt.Errorf("inlineData.data: %w", err)
 			}
-			mimeType, data := normalizeImagePayload(mime, data)
 			parts = append(parts, aistudio.Part{
-				InlineData:       &aistudio.Blob{MIME: mimeType, Data: data},
+				InlineData:       normalizedImageBlob(mime, data),
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case file != nil:

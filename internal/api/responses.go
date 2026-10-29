@@ -102,6 +102,7 @@ func (store *responseStateStore) Store(id string, state responseState) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	state.Contents = cloneResponseContents(state.Contents)
+	dropSourceGIF(state.Contents)
 	state.InlineInstructions = append([]string(nil), state.InlineInstructions...)
 	store.states[id] = state
 	store.order = append(store.order, id)
@@ -124,6 +125,23 @@ func (store *responseStateStore) evictOldest() {
 		store.states[childID] = child
 	}
 	delete(store.states, id)
+}
+
+// dropSourceGIF 去掉协议层把 GIF 转成 PNG 时留下的原 GIF（Blob.SourceGIF，只用于本次请求计 Interaction 模型的转换额度）：
+// 续接状态最多 256 个、只按个数淘汰，动图原文件往往远大于首帧 PNG，留着会让每个状态多常驻一份完整动图（所有模型都一样）；
+// 续接历史里的这张 PNG 早已转好，按普通 PNG 内联，不再计入转换额度、也不换回 GIF。contents 须是已复制的 Part 切片：
+// 复制 Blob 再替换，本次请求持有的 Blob 不变
+func dropSourceGIF(contents []aistudio.Content) {
+	for _, content := range contents {
+		for index, part := range content.Parts {
+			if part.InlineData == nil || part.InlineData.SourceGIF == nil {
+				continue
+			}
+			blob := *part.InlineData
+			blob.SourceGIF = nil
+			content.Parts[index].InlineData = &blob
+		}
+	}
 }
 
 func cloneResponseContents(contents []aistudio.Content) []aistudio.Content {

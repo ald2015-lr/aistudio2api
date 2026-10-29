@@ -468,8 +468,7 @@ func functionResultMediaPart(raw json.RawMessage) (aistudio.Part, bool, error) {
 		if err != nil {
 			return aistudio.Part{}, false, fmt.Errorf("工具结果中的图片: %w", err)
 		}
-		mimeType, data = normalizeImagePayload(mimeType, data)
-		return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, true, nil
+		return aistudio.Part{InlineData: normalizedImageBlob(mimeType, data)}, true, nil
 	case "document":
 		// Interactions document 内容块直接带 data 与 mime_type
 		if block.Source == nil && block.Data != "" && block.MimeType != "" {
@@ -514,7 +513,7 @@ func inlineToolMedia(encoded string, mimeType string) (aistudio.Part, bool, erro
 		return aistudio.Part{}, false, fmt.Errorf("工具结果中的文件: %w", err)
 	}
 	if strings.HasPrefix(mimeType, "image/") {
-		mimeType, data = normalizeImagePayload(mimeType, data)
+		return aistudio.Part{InlineData: normalizedImageBlob(mimeType, data)}, true, nil
 	}
 	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, true, nil
 }

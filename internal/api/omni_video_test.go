@@ -273,8 +273,8 @@ func TestOmniVideoOfficialCapture(t *testing.T) {
 	}
 }
 
-// TestOmniVideoProtocolErrors 视频设置不成立时在选号前返回 400 与清楚的英文说明：帧率不是 24fps、非第一轮指定任务（与官网提示一致）、
-// 任务缺少需要的输入、时长写法不对、未知任务
+// TestOmniVideoProtocolErrors 视频设置不成立时在选号前返回 400 与清楚的英文说明：帧率不是 24fps、非第一轮在请求字段里显式指定任务
+// （与官网提示一致，同时带后缀任务时也是）、任务缺少需要的输入、时长写法不对、未知任务
 func TestOmniVideoProtocolErrors(t *testing.T) {
 	for _, test := range []struct {
 		name string
@@ -284,7 +284,8 @@ func TestOmniVideoProtocolErrors(t *testing.T) {
 	}{
 		{name: "帧率 30", path: "/v1/chat/completions", body: `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":"hi"}],"video_config":{"frame_rate":30}}`, want: "only supports 24fps"},
 		{name: "非第一轮任务", path: "/v1/chat/completions", body: `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":"做个视频"},{"role":"assistant","content":"好的"},{"role":"user","content":"再来"}],"video_config":{"task":"text_to_video"}}`, want: "Video task is only supported on the first turn of a conversation"},
-		{name: "后缀任务非第一轮", path: "/v1beta/models/gemini-omni-1.1-flash-t2v:generateContent", body: `{"contents":[{"role":"user","parts":[{"text":"a"}]},{"role":"model","parts":[{"text":"b"}]},{"role":"user","parts":[{"text":"c"}]}]}`, want: "first turn"},
+		{name: "显式任务加后缀任务非第一轮", path: "/v1/chat/completions", body: `{"model":"gemini-omni-1.1-flash-edit","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}],"video_config":{"task":"extend"}}`, want: "first turn"},
+		{name: "Gemini 显式任务非第一轮", path: "/v1beta/models/gemini-omni-1.1-flash:generateContent", body: `{"contents":[{"role":"user","parts":[{"text":"a"}]},{"role":"model","parts":[{"text":"b"}]},{"role":"user","parts":[{"text":"c"}]}],"generationConfig":{"videoConfig":{"task":"text_to_video"}}}`, want: "first turn"},
 		{name: "编辑任务没有视频", path: "/v1/messages", body: `{"model":"gemini-omni-1.1-flash-edit","max_tokens":16,"messages":[{"role":"user","content":"改一下"}]}`, want: "requires an input video"},
 		{name: "图片任务没有图片", path: "/v1/responses", body: `{"model":"gemini-omni-1.1-flash","input":"动起来","video_config":{"task":"image_to_video"}}`, want: "requires an input image"},
 		{name: "时长写法", path: "/v1/chat/completions", body: `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":"hi"}],"video_config":{"duration":"eight"}}`, want: "video duration"},
@@ -295,7 +296,6 @@ func TestOmniVideoProtocolErrors(t *testing.T) {
 		{name: "Gemini responseFormat.video.fps 30", path: "/v1beta/models/gemini-omni-1.1-flash:generateContent", body: `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generation_config":{"response_format":{"video":{"fps":"30fps"}}}}`, want: "only supports 24fps"},
 		{name: "Interactions response_format.fps 30", path: "/v1beta/interactions", body: `{"model":"gemini-omni-1.1-flash","input":"hi","response_format":{"type":"video","fps":30}}`, want: "only supports 24fps"},
 		{name: "Responses video_config.fps 25", path: "/v1/responses", body: `{"model":"gemini-omni-1.1-flash","input":"hi","video_config":{"fps":25}}`, want: "only supports 24fps"},
-		{name: "目录别名的后缀任务非第一轮", path: "/v1/chat/completions", body: `{"model":"omni-video-latest-t2v","messages":[{"role":"user","content":"a"},{"role":"assistant","content":"b"},{"role":"user","content":"c"}]}`, want: "first turn"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			handler, service := omniHandler(t)
@@ -312,6 +312,140 @@ func TestOmniVideoProtocolErrors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOmniSuffixVideoTaskMultiTurn 任务只来自模型名后缀（new-api 静态映射的 -edit、-extend、-t2v、-i2v）时：第一轮照常发送任务；
+// 对话已有模型回复时忽略任务（不 400）、按未指定任务发送，其余后缀照常生效，并在该请求的管理日志记一行说明；目录别名带后缀同样如此
+func TestOmniSuffixVideoTaskMultiTurn(t *testing.T) {
+	multi := func(model string) string {
+		return `{"model":"` + model + `","messages":[{"role":"user","content":"做个海边视频"},{"role":"assistant","content":"[video](https://ai.example.com/media/` +
+			strings.Repeat("a", 64) + `.mp4)"},{"role":"user","content":"把天空换成晚霞"}]}`
+	}
+	geminiMulti := `{"contents":[{"role":"user","parts":[{"text":"a"}]},{"role":"model","parts":[{"text":"b"}]},{"role":"user","parts":[{"text":"c"}]}]}`
+	for _, test := range []struct {
+		name string
+		path string
+		body string
+		task string
+		want aistudio.VideoConfig
+	}{
+		{name: "Chat -edit 多轮", path: "/v1/chat/completions", body: multi("gemini-omni-1.1-flash-edit"), task: "edit"},
+		{name: "Chat -extend-9x16 多轮", path: "/v1/chat/completions", body: multi("gemini-omni-1.1-flash-extend-9x16"), task: "extend", want: aistudio.VideoConfig{AspectRatio: "9:16"}},
+		{name: "Gemini -t2v 多轮", path: "/v1beta/models/gemini-omni-1.1-flash-t2v:generateContent", body: geminiMulti, task: "text_to_video"},
+		{name: "目录别名 -i2v 多轮", path: "/v1/chat/completions", body: multi("omni-video-latest-i2v"), task: "image_to_video"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, service := omniHandler(t)
+			recorder := postJSON(t, handler, test.path, test.body, nil)
+			if recorder.Code != http.StatusOK || service.last == nil {
+				t.Fatalf("多轮对话里后缀指定的任务应忽略而不是 400: %d %s", recorder.Code, recorder.Body.String())
+			}
+			got := aistudio.VideoConfig{}
+			if service.last.Config.VideoConfig != nil {
+				got = *service.last.Config.VideoConfig
+			}
+			if got != test.want {
+				t.Fatalf("视频设置 = %+v，期望 %+v（任务忽略，其余后缀照常）", got, test.want)
+			}
+			if !slices.Contains(service.last.Notes, videoTaskSuffixIgnoredNote(test.task)) {
+				t.Fatalf("应在请求日志记下忽略任务的说明: %q", service.last.Notes)
+			}
+		})
+	}
+	// 第一轮：后缀任务照常发送，不留说明
+	handler, service := omniHandler(t)
+	recorder := postJSON(t, handler, "/v1beta/models/gemini-omni-1.1-flash-t2v:generateContent", `{"contents":[{"role":"user","parts":[{"text":"a"}]}]}`, nil)
+	if recorder.Code != http.StatusOK || service.last == nil || service.last.Config.VideoConfig == nil || service.last.Config.VideoConfig.Task != "text_to_video" {
+		t.Fatalf("第一轮的后缀任务应照常发送: %d %s %+v", recorder.Code, recorder.Body.String(), service.last)
+	}
+	for _, note := range service.last.Notes {
+		if strings.Contains(note, "视频任务") {
+			t.Fatalf("第一轮不应留下忽略任务的说明: %q", note)
+		}
+	}
+}
+
+// TestOmniVideoTaskRestoredLinkTurn 上一轮回复只有本服务的视频链接（Chat Completions 与 Messages 的 url 模式输出 "[video](…)"，
+// 不带前后换行）、文件还在、恢复为视频时，对话仍按多轮判断：后缀任务被忽略并记说明，请求字段里显式写的任务返回官网提示的 400。
+// 交给生成服务的请求（视频已恢复）与换回链接文本后的请求都能按真实编码发送，结果不随能否恢复、是否换回链接文本变化
+func TestOmniVideoTaskRestoredLinkTurn(t *testing.T) {
+	handler, service, store := omniMediaHandler(t)
+	videoName, err := store.Save(testVideo, "video/mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := "[video](https://ai.example.com/media/" + videoName + ")"
+	chat := func(model string, extra string) string {
+		return `{"model":"` + model + `","messages":[{"role":"user","content":"做个海边视频"},{"role":"assistant","content":"` + link +
+			`"},{"role":"user","content":"把天空换成晚霞"}]` + extra + `}`
+	}
+	gemini := `{"contents":[{"role":"user","parts":[{"text":"做个海边视频"}]},{"role":"model","parts":[{"text":"` + link +
+		`"}]},{"role":"user","parts":[{"text":"把它改成夜景"}]}]}`
+	var omni aistudio.Model
+	for _, model := range omniAliasModels() {
+		if model.ID == "gemini-omni-1.1-flash" {
+			omni = model
+		}
+	}
+	defaults := aistudio.GenerationDefaults{
+		MaxOutputTokens: 65536, Thinking: true, ThinkingLevel: true, DefaultThinkingLevel: 3,
+		ThinkingLevels: []int64{1, 3}, InteractionStream: true, VideoResolution: "360p",
+	}
+	for _, test := range []struct{ name, path, body, task string }{
+		{name: "Chat -edit", path: "/v1/chat/completions", body: chat("gemini-omni-1.1-flash-edit", ""), task: "edit"},
+		{name: "Chat -extend", path: "/v1/chat/completions", body: chat("gemini-omni-1.1-flash-extend", ""), task: "extend"},
+		{name: "Gemini -edit", path: "/v1beta/models/gemini-omni-1.1-flash-edit:generateContent", body: gemini, task: "edit"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service.last = nil
+			recorder := postJSON(t, handler, test.path, test.body, nil)
+			if recorder.Code != http.StatusOK || service.last == nil {
+				t.Fatalf("状态 %d: %s", recorder.Code, recorder.Body.String())
+			}
+			last := *service.last
+			restored := false
+			for _, part := range last.Contents[1].Parts {
+				restored = restored || part.InlineData != nil && part.RestoredLink && part.RestoredText == link
+			}
+			if !restored {
+				t.Fatalf("上一轮的视频应恢复为媒体: %+v", last.Contents[1].Parts)
+			}
+			if last.Config.VideoConfig != nil && last.Config.VideoConfig.Task != "" {
+				t.Fatalf("多轮对话里后缀任务应忽略，实际 %+v", last.Config.VideoConfig)
+			}
+			if !slices.Contains(last.Notes, videoTaskSuffixIgnoredNote(test.task)) {
+				t.Fatalf("应在请求日志记下忽略任务的说明: %q", last.Notes)
+			}
+			// 生成层：视频已恢复（上传后为 Drive 文件）与换回链接文本两种内容都能按真实编码发送
+			uploaded := slices.Clone(last.Contents)
+			uploaded[1].Parts = slices.Clone(uploaded[1].Parts)
+			for index := range uploaded[1].Parts {
+				if part := &uploaded[1].Parts[index]; part.InlineData != nil {
+					part.File, part.InlineData = &aistudio.FileRef{ID: "drive-restored", MIME: part.InlineData.MIME}, nil
+				}
+			}
+			linked := slices.Clone(last.Contents)
+			linked[1] = aistudio.Content{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{Text: link}}}
+			for name, contents := range map[string][]aistudio.Content{"恢复": uploaded, "换回链接": linked} {
+				request := last
+				request.Contents = contents
+				if _, _, err := aistudio.NormalizeVideoConfig(request.Config.VideoConfig, omni, contents); err != nil {
+					t.Fatalf("%s：%v", name, err)
+				}
+				if _, _, err := aistudio.EncodeCreateInteractionStreamRequest(request, defaults); err != nil {
+					t.Fatalf("%s：%v", name, err)
+				}
+			}
+		})
+	}
+	t.Run("显式任务 400", func(t *testing.T) {
+		service.last = nil
+		recorder := postJSON(t, handler, "/v1/chat/completions", chat("gemini-omni-1.1-flash", `,"video_config":{"task":"edit"}`), nil)
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "Video task is only supported on the first turn of a conversation") ||
+			service.last != nil {
+			t.Fatalf("显式任务在多轮对话里应返回官网提示的 400: %d %s", recorder.Code, recorder.Body.String())
+		}
+	})
 }
 
 // TestOmniVideoOtherModelsUnaffected 其他模型不受视频设置与视频后缀影响：文本模型的 stop sequences 照常保留（本地匹配），不留说明；

@@ -5,11 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	"image/gif"
-	"image/png"
 	"mime"
 	"net/http"
 	"strconv"
@@ -298,36 +293,22 @@ func decodeBase64Flexible(s string) ([]byte, error) {
 	return encoding.DecodeString(s)
 }
 
-// maxGIFCanvasPixels 为 GIF 转 PNG 时允许的逻辑画布像素上限（4096×4096，约 64MB RGBA）。
-// GIF 头部声明的画布尺寸不受文件大小约束：35 字节的文件就能声明 65535×65535，按画布分配会耗尽内存
-const maxGIFCanvasPixels = 4096 * 4096
-
-// normalizeImagePayload 将 GIF 首帧按逻辑画布转换为 PNG 图片；画布超过上限时原样返回，由上游处理
+// normalizeImagePayload 将 GIF 首帧按逻辑画布转换为 PNG 图片（见 aistudio.GIFFirstFramePNG：保留帧位置与透明背景，画布超过
+// 4096×4096 时不解码）；不能转换时原样返回，由上游处理
 func normalizeImagePayload(mimeType string, data []byte) (string, []byte) {
+	blob := normalizedImageBlob(mimeType, data)
+	return blob.MIME, blob.Data
+}
+
+// normalizedImageBlob 返回按 normalizeImagePayload 整理后的内联附件：GIF 转成 PNG 时在 SourceGIF 留下原 GIF（不序列化），
+// Interaction 模型据此把这张 PNG 计入单次请求的 GIF 转换额度，超出时换回原 GIF 上传 Drive（见 aistudio.PrepareInteractionImages）；
+// 其他模型只用 MIME 与 Data，与原先相同；存入续接状态时去掉 SourceGIF（见 dropSourceGIF），不多常驻一份原 GIF
+func normalizedImageBlob(mimeType string, data []byte) *aistudio.Blob {
 	lowerMIME := strings.ToLower(strings.TrimSpace(mimeType))
 	if lowerMIME == "image/gif" || (len(data) >= 3 && string(data[:3]) == "GIF") {
-		// 先只读头部检查画布尺寸，再解码帧：解码器按帧尺寸分配，帧又必须落在画布内
-		config, err := gif.DecodeConfig(bytes.NewReader(data))
-		if err != nil || config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxGIFCanvasPixels {
-			return mimeType, data
-		}
-		if img, err := gif.Decode(bytes.NewReader(data)); err == nil {
-			canvas := image.NewNRGBA(image.Rect(0, 0, config.Width, config.Height))
-			transparent := false
-			for _, entry := range img.(*image.Paletted).Palette {
-				_, _, _, alpha := entry.RGBA()
-				transparent = transparent || alpha == 0
-			}
-			// GIF 背景色来自全局色表，透明首帧保留透明画布
-			if palette, ok := config.ColorModel.(color.Palette); ok && !transparent && int(data[11]) < len(palette) {
-				draw.Draw(canvas, canvas.Bounds(), image.NewUniform(palette[data[11]]), image.Point{}, draw.Src)
-			}
-			draw.Draw(canvas, img.Bounds(), img, img.Bounds().Min, draw.Over)
-			var buf bytes.Buffer
-			if err := png.Encode(&buf, canvas); err == nil {
-				return "image/png", buf.Bytes()
-			}
+		if converted, ok := aistudio.GIFFirstFramePNG(data); ok {
+			return &aistudio.Blob{MIME: "image/png", Data: converted, SourceGIF: data}
 		}
 	}
-	return mimeType, data
+	return &aistudio.Blob{MIME: mimeType, Data: data}
 }

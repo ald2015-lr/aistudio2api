@@ -235,7 +235,11 @@ func videoDurationSuffix(token string) int64 {
 // applyOmniVideoAlias 处理能输出视频的 Omni 模型：换成去掉后缀的模型名（目录 ID，或按目录别名调用时的别名，调度前再换成目录 ID）；
 // 名称里的思考等级后缀优先于请求参数（不带时沿用模型默认等级，不像文本模型那样强制最高）；视频后缀优先于请求里的视频设置，
 // 再按模型目录整理（见 aistudio.NormalizeVideoConfig），说明写进请求日志；没有确认 CreateInteractionStream 的停止序列字段，
-// stop sequences 清空并记一行请求日志（见 aistudio.InteractionStopSequencesNote）。返回是否隐藏思维链，视频设置不成立时返回参数错误
+// stop sequences 清空并记一行请求日志（见 aistudio.InteractionStopSequencesNote）。返回是否隐藏思维链，视频设置不成立时返回参数错误。
+// 视频任务只能在对话第一轮使用（官网 Video task 的提示）：任务只来自模型名后缀（-edit、-extend、-i2v 等，new-api 的静态模型映射
+// 只能这样传）而对话已有模型轮次时忽略任务、按未指定任务发送并记一行请求日志，多轮对话里也能用同一个映射名继续；请求字段里显式写了
+// 任务时照旧返回 400（与官网提示一致）。是否多轮按客户端回传的对话判断：上一轮回复只有本服务的视频链接、已恢复为视频时同样算模型轮次
+// （见 aistudio.InteractionHasModelTurn），结果不随文件能否恢复、发送时是否换回链接文本变化
 func applyOmniVideoAlias(request *aistudio.GenerateRequest, model aistudio.Model, alias modelAlias) (bool, error) {
 	request.Model = alias.base
 	if alias.level != "" {
@@ -246,11 +250,22 @@ func applyOmniVideoAlias(request *aistudio.GenerateRequest, model aistudio.Model
 		request.Notes = append(request.Notes, aistudio.InteractionStopSequencesNote(count))
 		request.Config.StopSequences = nil
 	}
-	video, notes, err := aistudio.NormalizeVideoConfig(overlayVideoConfig(request.Config.VideoConfig, &alias.video), model, request.Contents)
+	suffixVideo := alias.video
+	if task := aistudio.VideoTaskName(suffixVideo.Task); task != "" && aistudio.InteractionHasModelTurn(request.Contents) &&
+		(request.Config.VideoConfig == nil || aistudio.VideoTaskName(request.Config.VideoConfig.Task) == "") {
+		suffixVideo.Task = ""
+		request.Notes = append(request.Notes, videoTaskSuffixIgnoredNote(task))
+	}
+	video, notes, err := aistudio.NormalizeVideoConfig(overlayVideoConfig(request.Config.VideoConfig, &suffixVideo), model, request.Contents)
 	if err != nil {
 		return false, err
 	}
 	request.Config.VideoConfig = video
 	request.Notes = append(request.Notes, notes...)
 	return alias.hideThought && modelThinks(model), nil
+}
+
+// videoTaskSuffixIgnoredNote 为多轮对话忽略模型名后缀指定的视频任务时写进请求日志的说明
+func videoTaskSuffixIgnoredNote(task string) string {
+	return "模型名后缀指定的视频任务 " + task + " 只能在对话第一轮使用，这是多轮对话（已有模型回复），已忽略任务、按未指定任务发送"
 }

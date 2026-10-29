@@ -190,6 +190,12 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			buildChannel = admin.service.buildPauses().status()
 		}
 	}
+	// 启用账户的 Drive 授权状态（见 aistudio.PooledService.DriveSummary）：gemini-omni 的视频输入（及无法转为 PNG 的图片）要交给有 Drive 授权的账户
+	var drive *api.AdminDriveCounts
+	if source, ok := admin.service.service.(driveSummarySource); ok {
+		summary := source.DriveSummary()
+		drive = &api.AdminDriveCounts{Available: summary.Available, Unavailable: summary.Unavailable, Unknown: summary.Unknown}
+	}
 	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
 	counts.AuthRequired10m = admin.service.authMarks.count(time.Now(), authRecentWindow)
 	normal := aistudio.PoolScopeNormal
@@ -218,6 +224,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		BadAccounts:   admin.workers.badAccountMemory().count(),
 		ProxyPool:     admin.ipPool().status(),
 		BuildChannel:  buildChannel,
+		Drive:         drive,
 	}, nil
 }
 
@@ -300,6 +307,9 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	created, err := admin.addAccount(ctx, accountConfig, result.StorageState, directory, poolLease.adopt)
 	if err != nil {
 		return api.AdminAccount{}, err
+	}
+	if result.DriveError == "" {
+		admin.noteDriveAuthorized(created.ID)
 	}
 	admin.requests.log("auth", "INFO", fmt.Sprintf(
 		"账户添加完成 | 账户=%s | 耗时=%s",
@@ -606,6 +616,14 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 	return removed, nil
 }
 
+// noteDriveAuthorized 记下经本服务的登录流程登录、完成了官网 Drive 授权的账户 Drive 可用（新的认证文件保存之后调用）：
+// gemini-omni 的视频输入（及无法转为 PNG 的图片）随即优先交给它，不必等用户请求偶然试到；生成服务不支持时什么也不做
+func (admin *runtimeAdmin) noteDriveAuthorized(accountID string) {
+	if noter, ok := admin.service.service.(driveAuthorizedNoter); ok {
+		noter.NoteDriveAuthorized(accountID)
+	}
+}
+
 func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (api.AdminAccount, error) {
 	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
@@ -679,6 +697,10 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	// 清掉疑似失效、登录复核记录与疑似登录失效冷却（与管理验证通过、认证文件更新同一处理）
 	admin.service.noteLoginRestored(account.ID)
+	if result.DriveError == "" {
+		// 登录时完成了官网的 Drive 授权：按新的认证代际记为 Drive 可用（见 aistudio.PooledService.NoteDriveAuthorized）
+		admin.noteDriveAuthorized(account.ID)
+	}
 	admin.syncAccountModelCatalog(ctx, account)
 	admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
 		"账户登录完成 | 耗时=%s",

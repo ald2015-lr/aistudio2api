@@ -171,7 +171,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	s.thoughtSignatures.Restore(generateRequest.Contents)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
-	s.restoreMediaLinks(generateRequest.Contents)
+	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
 	if err != nil {
 		writeOpenAIInvalid(w, err)
@@ -562,8 +562,7 @@ func fileOrInlinePart(value string, name string) (aistudio.Part, error) {
 	if err != nil {
 		return aistudio.Part{}, fmt.Errorf("data URL: %w", err)
 	}
-	mimeType, data := normalizeImagePayload(strings.TrimSuffix(metadata, ";base64"), data)
-	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeType, Data: data}}, nil
+	return aistudio.Part{InlineData: normalizedImageBlob(strings.TrimSuffix(metadata, ";base64"), data)}, nil
 }
 
 func audioMIME(format string) string {

@@ -1907,7 +1907,7 @@ if not (catalog_starts or catalog_summary_lines or catalog_pauses or catalog_fai
     print("  窗口内没有模型目录同步与需要登录的日志")
 # 附件授权（aistudio/upload.go UploadInlineMediaToLease）：带图请求每次尝试先换 Drive token（GenerateAccessToken）。
 # 新版本：401 / Code 16（账号没有 Drive 授权，导入的账号多半没走过官网的 Drive 同意）不冷却、不换号，附件改为内联发送，
-# 写“Drive 未授权，附件改为内联”（同账号 10 分钟最多一行，记住的账号 6 小时内不再换 token）；上传成功写“内联附件处理完成”
+# 写“Drive 未授权，附件改为内联”（同账号 10 分钟最多一行，记住的账号 24 小时内不再换 token）；上传成功写“内联附件处理完成”
 # （Build 通道直接携带附件，同样写这一行，所以它不说明账号有 Drive 授权）。
 # 换号原因为 GenerateAccessToken 401 的“账号切换”：旧版本来自附件尝试（401 后写 2 分钟全局冷却再换号）；新版本附件不再这样换号，
 # 这类行只来自仍需要 Drive 的转写上传（app/transcriptions.go）与跨账户复制文件引用（app/runtime.go），只让这次尝试失败、换号、不冷却。

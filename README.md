@@ -374,7 +374,7 @@ providers:
 
 四套生成接口均可按各自协议字段启用 Search、Image Search、URL Context、Code Execution 和 Maps。Files、Transcribe、Live、Robotics 的请求与事件格式见 [Google AI Studio 协议规范](docs/protocol.md)。
 
-生成请求中的内联附件会优先上传为临时 Drive 文件，随请求结束清理；账户未授予 Drive 权限时保持内联数据发送（不冷却、不换号，服务记住这个账户 6 小时，期间不再先换 Drive token），过大的文件可能被上游以 400 拒绝。图片、音频、视频、PDF 等输入仍需所选模型支持。重复使用的附件可通过 Files 接口上传一次并复用文件 ID。
+生成请求中的内联附件会优先上传为临时 Drive 文件，随请求结束清理（Gemini Omni 的 PNG、JPEG 图片按官网直接内联、不上传，见 [Omni 的图片与视频输入](#omni-的图片与视频输入)）；账户未授予 Drive 权限时保持内联数据发送（不冷却、不换号，服务记住这个账户 24 小时，记录写盘、重启后沿用，期间不再先换 Drive token），过大的文件可能被上游以 400 拒绝。图片、音频、视频、PDF 等输入仍需所选模型支持。重复使用的附件可通过 Files 接口上传一次并复用文件 ID。
 
 Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。
 
@@ -519,7 +519,7 @@ Gemini Omni（如 `gemini-omni-1.1-flash`，经官网 CreateInteractionStream �
 | Thinking level | `high`、`low` | 与其他模型的思考参数相同（`reasoning_effort`、`thinkingConfig.thinkingLevel`、Interactions `thinking_level`），或用 `-high`、`-low` 后缀 |
 | Add stop sequence | — | 未确认 CreateInteractionStream 的停止序列字段，不发送、也不在本地匹配：忽略并在请求日志记一行 `未确认 CreateInteractionStream 的停止序列字段，已忽略 N 个停止序列`（原先整次请求返回 400） |
 | Output length | 最大 65536 | `max_tokens` 等，超过模型上限时按上限发送 |
-| Video task | `text_to_video`、`image_to_video`、`reference_to_video`、`edit`、`extend`；不传或 `unspecified` 为官网的 Unspecified | **只能在对话第一轮使用**：对话里已有模型回复时返回 400 `Video task is only supported on the first turn of a conversation`（与官网提示一致）；`image_to_video`、`reference_to_video` 需要至少一张图片，`edit`、`extend` 需要至少一段视频，缺少时返回 400；`edit` 时不发送宽高比、时长与分辨率 |
+| Video task | `text_to_video`、`image_to_video`、`reference_to_video`、`edit`、`extend`；不传或 `unspecified` 为官网的 Unspecified | **只能在对话第一轮使用**：对话里已有模型回复时，请求字段里写的任务返回 400 `Video task is only supported on the first turn of a conversation`（与官网提示一致），只来自模型名后缀的任务忽略（按未指定任务发送，请求日志记一行），见下文；`image_to_video`、`reference_to_video` 需要至少一张图片，`edit`、`extend` 需要至少一段视频，缺少时返回 400；`edit` 时不发送宽高比、时长与分辨率 |
 
 各协议的写法（同一项同时出现时，模型名后缀 > 后一种写法 > 前一种写法）：
 
@@ -562,7 +562,29 @@ new-api 里在渠道的“模型”中填对外名称，在“模型重定向”
 }
 ```
 
-带任务后缀的名称（`-t2v`、`-i2v` 等）只适合单轮生成：多轮对话的第二轮起会因“视频任务只能在第一轮使用”返回 400，日常对话的映射不要带任务后缀（不指定任务时由模型按输入决定）。经 new-api 转发生成的视频还需要设置 `MEDIA_OUTPUT=url`，见下节。
+任务后缀（`-t2v`、`-i2v`、`-edit`、`-extend` 等）只在对话第一轮发送：多轮对话的第二轮起忽略任务，按未指定任务发送（与官网的 Unspecified 相同，由模型按输入决定），并在该请求的管理日志记一行 `模型名后缀指定的视频任务 edit 只能在对话第一轮使用，这是多轮对话（已有模型回复），已忽略任务、按未指定任务发送`，不再返回 400，所以带任务后缀的静态映射在多轮对话里也能用；请求字段里显式写的任务在多轮对话里仍返回 400。是否多轮按客户端回传的对话判断：上一轮回复只有本服务的视频链接（`[video](…)`）时同样算多轮，不随链接能否恢复为视频变化。经 new-api 转发生成的视频还需要设置 `MEDIA_OUTPUT=url`，见下节。
+
+### Omni 的图片与视频输入
+
+Gemini Omni 经 CreateInteractionStream 生成。**PNG、JPEG 图片直接内联发送，不需要 Drive**：与官网相同（官网给 Omni 附一张图片时，请求里直接带图片数据，没有 Drive 文件引用；本服务对两份官网抓包——一张 PNG、一张 JPEG 照片——的编码逐字节一致），图片按原文件字节发送（JPEG 不转码、不去掉 EXIF 等元数据），GIF 取首帧转成 PNG 后发送。用户附件、历史里移到用户消息的模型图片、从本服务链接恢复的图片都一样；只有图片的 Omni 请求与纯文本请求一样选号，号池里任何账户都能处理，不查 Drive 状态、不换号。原先图片也要先上传 Drive，线上约 1000 个账户里有 958 个没有 Drive 授权，带图的 Omni 请求多半返回 400。
+
+**视频与其他格式的图片需要 Drive 授权**：视频（官网发送视频时同样先上传到 Drive，再以文件引用发送）、其他文件，以及 PNG、JPEG、GIF 以外的图片（WebP、HEIC、HEIF、AVIF 等）、画布超过 4096×4096 的 GIF，以及转成 PNG 后超过单次请求 64MB 上限的 GIF（一次请求里客户端带的 GIF 与从本服务链接恢复的 GIF 转出的 PNG 合计，超出的换回原 GIF 上传），要先上传到账户的 Google Drive 再以文件引用发送，**只有已授权 Google Drive 的账户能发送**；这类图片改成 PNG 或 JPEG 发送就不需要 Drive。经本服务的登录流程登录的账户（管理页“账户”的“添加账户”或“登录”）会在登录时完成官网的 Drive 授权；只导入 Cookie 的账户（认证文件、Chrome 导入、粘贴 Cookie）没有 Drive 授权，在账户页对它点“登录”重新走一遍登录流程即可（登录日志出现 `账户登录 | Drive 授权失败` 时说明这一步没有完成）。
+
+- 选号：带视频（或无法转为 PNG 的图片）的 Omni 请求只在记着 Drive 可用的账户（换到过 Drive token，或经本服务的登录流程登录时完成了 Drive 授权）里选；这些账户都在忙时先试一个 Worker 已启动、状态未知的账户（不为试号冷启动浏览器），之后照常排队等它们空出（可以替换空闲 Worker、冷启动它们）。号池里没有记着可用的账户时在状态未知的账户里选；记着 Drive 不可用的账户（GenerateAccessToken 返回 401）不选；同一请求里的 PNG、JPEG 图片不上传，照样内联；纯文本、只有图片的请求与其他模型不受影响。选到的账户上传时才发现没有 Drive 授权时不发送请求，换有 Drive 授权的账户（不冷却、不计入连续失败），请求日志记一行 `账号没有 Drive 授权，Omni 的视频（及无法转为 PNG 的图片）无法发送，换有 Drive 授权的账号`。请求日志另记一行 `Omni 图片按官网内联发送，不经 Drive | 图片=N | 字节=…B`（有 GIF 时附转换前后的大小），不能内联的图片记 `Omni 图片无法内联，改走 Drive（需要有 Drive 授权的账号） | 张数=N | 原因=…`。状态按账户记住（可用、不可用各 24 小时，写在 `runtime/model-catalogs/drive-accounts.json`，重启后沿用；经本服务重新登录、完成 Drive 授权后直接记为可用，更新认证文件后重新探测，管理验证通过时清除不可用记录），管理页侧栏显示 `Drive 授权 · 可用 N · 不可用 N · 未知 N`，`/api/status` 的 `drive` 字段同样给出这三个数。
+- 号池里只剩记着 Drive 不可用的账户（没有已知或可能有 Drive 授权的账户）时返回 400 `FAILED_PRECONDITION`：`Video input for model gemini-omni-1.1-flash (and image input that cannot be sent inline as PNG or JPEG) requires an account with Google Drive authorized, and no account in the pool has Google Drive authorization.`（请求里有不能内联的图片时后面附上那张图的说明，例如 `contents[0]: image/webp images cannot be sent inline to this model (only PNG and JPEG images are, and GIF is converted to PNG); send the image as PNG or JPEG instead.`）；有记着可用的账户但都在忙或冷却时照常排队，排队超过主用模型的排队预算（`PRIMARY_QUEUE_WAIT`）、或可能有 Drive 授权的账户本请求都试过时返回 429（带 Retry-After；有 Drive 授权的账户刚因 Worker 失败换走、还在关闭时先回到它，等 Worker 恢复后重放）；号池里没有记着可用的账户、一个请求换满 8 个状态未知的账户都没有 Drive 授权时返回 503（稍后重试）。Omni 账户都需要登录、不可调度时与纯文本请求一样按号池暂时不可用返回 503，不按没有 Drive 授权返回 400。指定账户（管理页测试）没有 Drive 授权时返回 400。
+- 外部地址：Omni 只接受内联的图片、视频或已上传的文件，`image_url`、`fileData` 等写的 http(s) 地址（含 YouTube 链接）返回 400 `… external URLs are not supported, send the media as base64 data (inline data or a data: URI) instead`，本服务不替客户端下载；改为 base64（data URI 或 `inlineData`）发送，或先经 `/v1/files` 上传。本服务 `/media/` 的链接会自动恢复，不算外部地址。
+
+经 new-api 编辑或延长上一轮生成的视频、参考一段视频生成时（new-api 的 Gemini 渠道把 OpenAI 格式的 `image_url`、`file` 与字符串写法的 `video_url` 下载或解码成 `inlineData`，顶层 `video_config` 不转发）：
+
+- **上一轮的视频链接自动恢复**：`MEDIA_OUTPUT=url` 时上一轮回复里的 `[video](https://ai.example.com/media/<哈希>.mp4)` 在 new-api 回传的历史里只剩链接文本，目标模型是 Omni 时恢复为视频输入（移到这一轮用户消息的最前面上传发送），模型能看到原视频；图片链接同样恢复（PNG、JPEG 直接内联）。
+- **粘贴本服务的链接**：用户正文里粘贴本服务 `/media/` 的图片或视频链接（裸地址或 Markdown 链接，例如 `把这个视频的天空换成晚霞 https://ai.example.com/media/<哈希>.mp4`）同样恢复为附件。
+- **直接发送视频**：OpenAI 格式写成 `{"type":"file","file":{"file_data":"data:video/mp4;base64,…"}}` 或 `{"type":"video_url","video_url":"data:video/mp4;base64,…"}`；new-api 只转换字符串写法的 `video_url`，`{"video_url":{"url":…}}` 对象写法不转换。
+- 恢复以文件仍在保留期内为准，同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB；文件已清理、超出上限或不是本服务的链接时按链接文本发送，并在该请求的管理日志记一行说明（`回传历史里本服务的媒体链接没能恢复为媒体输入，按链接文本发送 | …`）。
+- 恢复出来的视频（及无法转为 PNG 的图片）同样要交给有 Drive 授权的账户；恢复出来的 PNG、JPEG 直接内联，不需要 Drive。这一轮需要 Drive 的只有从回传历史里恢复的媒体、客户端没有自己带需要 Drive 的附件时（这一轮用户消息里粘贴的本服务链接算客户端自己带的附件）：
+  - 恢复出视频（上一轮生成的视频，“把它改成夜景”这类编辑或延长要让模型看到原视频）：与客户端附件一样选号，记着 Drive 可用的账户在忙时照常排队（受主用模型排队预算约束，超过时返回 429）、没有已启动的 Worker 时为它冷启动，状态都未知时逐个试；只有号池里只剩记着 Drive 不可用的账户、可能有 Drive 授权的账户本请求都试过、记着可用的账户都在长时间冷却（额度用完等）、换满 8 个账户都没有 Drive 授权、或指定账户没有授权时才改按链接文本发送，这时模型看不到原视频。
+  - 只恢复出无法转为 PNG 的图片（例如 WebP 图片的链接，出图后追问“谢谢，再来一个”）：这些图片多半只是上文，不让请求久等：有空闲的 Drive 授权账户时上传发送；它们都在忙时最多等 10 秒（只用已启动的 Worker），状态都未知时只试一个 Worker 已启动的账户，之后改按链接文本发送。
+  - 改按链接文本发送时与恢复之前相同，不返回 400 或 503，请求日志记一行 `…，回传历史里恢复的 N 个媒体按链接文本发送（Omni 的视频及无法转为 PNG 的图片需要 Drive 授权）`。要让模型按原视频修改，号池里要有 Drive 授权的账户。
+- 编辑任务（`-edit`、`-extend`）只在第一轮生效：要按编辑任务处理上一轮的视频，新开一轮对话、把视频作为附件（或粘贴它的 `/media/` 链接）发给带 `-edit` 后缀的模型；在原对话里继续时（上一轮回复只有视频链接也算多轮）任务被忽略，模型按输入与要求决定（通常也会参照视频修改）。新开一轮对话指定了任务时，恢复出来的媒体就是任务的输入，取不到 Drive 授权账户时按需要 Drive 授权返回，不改按链接文本发送。
 
 ### 生成视频与媒体链接（Omni）
 
@@ -593,7 +615,7 @@ location /media/ {
 
 `MEDIA_BASE_URL` 留空时按每个请求访问的地址生成链接（`X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`），只适合客户端直接访问本服务的场景。媒体文件按 `MEDIA_RETENTION`（默认 7 天）与 `MEDIA_MAX_SIZE`（默认 20GB）在后台每小时清理一次，过期或超出总量的文件删除后链接返回 404。
 
-客户端把带链接的回复作为历史回传时：assistant 正文里的本服务图片链接恢复为图片输入（与 inline 模式回传 data URI 时一样，可以继续改图），视频、音频链接保持文本；用户消息里指向本服务媒体的 `image_url`、`fileData` 恢复为内联媒体。同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB，超出时较早的引用保持链接。换成 Omni 等 Interaction 模型继续对话时（例如先出图，再让 Omni “让它动起来”），模型消息里的图片与用户附件一样先上传到账户的 Drive，再放到随后的用户消息最前面发给模型，模型能看到这张图；账户没有 Drive 授权时与用户附件一样返回 400。url 模式只作用于 Chat Completions、Messages 与 Gemini 原生接口，Responses、Interactions、Live 以及图片、语音、视频接口的输出不变。
+客户端把带链接的回复作为历史回传时：assistant 正文里的本服务图片链接恢复为图片输入（与 inline 模式回传 data URI 时一样，可以继续改图），视频、音频链接保持文本（目标模型是 Omni 时视频链接也恢复，用户正文里粘贴的本服务图片、视频链接同样恢复，见 [Omni 的图片与视频输入](#omni-的图片与视频输入)）；用户消息里指向本服务媒体的 `image_url`、`fileData` 恢复为内联媒体。同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB，超出时较早的引用保持链接；该恢复却没能恢复的（文件已清理、超出上限）在请求日志记一行说明。换成 Omni 等 Interaction 模型继续对话时（例如先出图，再让 Omni “让它动起来”），模型消息里的 PNG、JPEG 图片与用户附件一样直接内联，放到随后的用户消息最前面发给模型，模型能看到这张图，不需要 Drive（WebP 等其他格式的图片要先上传 Drive，只交给有 Drive 授权的账户，见上节）。url 模式只作用于 Chat Completions、Messages 与 Gemini 原生接口，Responses、Interactions、Live 以及图片、语音、视频接口的输出不变。
 
 ## 模型
 

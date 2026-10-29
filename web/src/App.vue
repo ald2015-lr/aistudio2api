@@ -172,6 +172,23 @@ const authRecheckLine = computed(() => {
   }
 })
 
+// driveLine 为侧栏的 Drive 授权行：服务端报告了且有启用账户时显示；有启用账户却没有可用、也没有未知的账户时标黄
+// （gemini-omni 的视频输入及无法转为 PNG 的图片会返回 400，PNG、JPEG 图片不受影响）
+const driveLine = computed(() => {
+  const drive = status.value?.drive
+  if (drive === undefined) return null
+  const total = drive.available + drive.unavailable + drive.unknown
+  if (total === 0) return null
+  return {
+    text: tf('app.driveLine', {
+      available: drive.available,
+      unavailable: drive.unavailable,
+      unknown: drive.unknown,
+    }),
+    warn: drive.available + drive.unknown === 0,
+  }
+})
+
 // ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
 // 也没有 Ultra Worker 时不显示
 const ultraWorkers = computed(() => {
@@ -849,6 +866,14 @@ onUnmounted(() => {
             :class="authRecheckLine.warn ? 'text-yellow-400' : ''"
           >
             {{ authRecheckLine.text }}
+          </div>
+          <div
+            v-if="driveLine"
+            v-tooltip="t('app.driveDetail')"
+            class="cell-truncate"
+            :class="driveLine.warn ? 'text-yellow-400' : ''"
+          >
+            {{ driveLine.text }}
           </div>
           <div
             v-if="catalogSyncLine"

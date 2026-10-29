@@ -70,6 +70,18 @@ type AdminStatus struct {
 	ProxyPool *AdminProxyPool `json:"proxy_pool,omitempty"`
 	// BuildChannel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时，见 AdminBuildChannel）：服务运行且启用了 Build 通道时才有
 	BuildChannel *AdminBuildChannel `json:"build_channel,omitempty"`
+	// Drive 为启用账户的 Google Drive 授权状态计数（见 AdminDriveCounts）：生成服务不报告时省略
+	Drive *AdminDriveCounts `json:"drive,omitempty"`
+}
+
+// AdminDriveCounts 表示启用账户的 Google Drive 授权状态：Available 为换到过 Drive token、或经本服务登录时完成了 Drive 授权的账户，
+// Unavailable 为 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权，多半是只导入 Cookie 的账户）的账户，Unknown 为还没试过、
+// 认证代际变了或记录过期的账户。gemini-omni 的视频输入（及无法转为 PNG 的图片）只交给可用或未知的账户。可用、不可用各记 24 小时，
+// 写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用（认证文件换成另一个登录时作废）
+type AdminDriveCounts struct {
+	Available   int `json:"available"`
+	Unavailable int `json:"unavailable"`
+	Unknown     int `json:"unknown"`
 }
 
 // AdminBuildChannel 表示 Build 通道生成的暂停状态：Build 代理调用返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成）时

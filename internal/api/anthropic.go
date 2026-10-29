@@ -107,7 +107,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
-	s.restoreMediaLinks(generateRequest.Contents)
+	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
 	if err != nil {
 		writeAnthropicInvalid(w, err)
@@ -180,7 +180,7 @@ func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicInvalid(w, err)
 		return
 	}
-	s.restoreMediaLinks(generateRequest.Contents)
+	s.restoreMediaLinks(r.Context(), &generateRequest)
 	// 与生成请求一样整理对话轮次（包括把工具结果中的图片移到之后的用户消息），计数与实际发送的内容一致
 	contents, _ := normalizeTurns(generateRequest.Contents)
 	count, err := s.service.CountTokens(r.Context(), aistudio.TokenCountRequest{
@@ -486,8 +486,7 @@ func anthropicSourceParts(blockType string, raw json.RawMessage) ([]aistudio.Par
 		if err != nil {
 			return nil, fmt.Errorf("%s source data: %w", blockType, err)
 		}
-		mediaType, data := normalizeImagePayload(source.MediaType, data)
-		return []aistudio.Part{{InlineData: &aistudio.Blob{MIME: mediaType, Data: data}}}, nil
+		return []aistudio.Part{{InlineData: normalizedImageBlob(source.MediaType, data)}}, nil
 	case source.Type == "url":
 		if media, ok := aistudio.ExternalMediaForURL(source.URL); ok {
 			return []aistudio.Part{{ExternalMedia: media}}, nil

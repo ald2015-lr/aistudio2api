@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,8 +18,12 @@ import (
 type PooledService struct {
 	pool   *AccountPool
 	client *Client
-	// drive 为按账号记住的“Drive 不可用”（GenerateAccessToken 401 / Code 16，见 drive_memory.go），只在内存
+	// drive 为按账号记住的 Drive 授权状态（GenerateAccessToken 401 / Code 16 为不可用，换到 token 为可用，见 drive_memory.go）
 	drive driveMemory
+	// driveObserver 为 Drive 状态写盘的回调（见 SetDriveObserver），没有时为 nil
+	driveObserver atomic.Pointer[func(DriveRecord)]
+	// driveCache 为 DriveCandidates 的短时缓存
+	driveCache driveCandidatesCache
 }
 
 // PoolRequestContextProvider 从租约账户读取协议上下文

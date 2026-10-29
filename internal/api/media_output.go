@@ -2,10 +2,13 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -241,7 +244,17 @@ const maxRestoredMediaBytes int64 = 64 << 20
 // mediaImageLinkPattern 匹配正文里指向本服务媒体目录的 Markdown 图片（绝对地址或 /media/ 开头的相对地址），子匹配为文件名
 var mediaImageLinkPattern = regexp.MustCompile(`!\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif))\)`)
 
-// mediaReference 为回传历史里一处指向本服务媒体的引用：content 与 part 为所在位置，offset 为 Markdown 图片链接在文本 part 里的
+// mediaVisualLinkPattern 匹配正文里指向本服务媒体目录的 Markdown 图片或视频链接（![image](…)、[video](…)），子匹配为文件名：
+// 目标模型是能输出视频的 Omni 时 assistant 正文与用户正文里的这类链接恢复为媒体
+var mediaVisualLinkPattern = regexp.MustCompile(`!?\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif|mp4|webm|mov))\)`)
+
+// mediaBareLinkPattern 匹配正文里指向本服务媒体目录的图片或视频裸地址（http/https 绝对地址或 /media/ 开头的相对地址），子匹配为文件名：
+// 目标模型是能输出视频的 Omni 时用户正文里粘贴的这类地址恢复为媒体（前后的字符另行检查，见 bareMediaLinkAt）。主机与路径按段匹配
+// （段内不含斜杠），路径段取最短：原先主机部分贪婪、可以跨过逗号、顿号与中文，两个链接之间不是空白（“A.mp4，https://…/B.mp4”）时
+// 只匹配出一处，范围却覆盖两个链接，前一个链接连同它的文字一起被换成后一个视频
+var mediaBareLinkPattern = regexp.MustCompile(`(?:https?://[^\s()<>\[\]"'/]+(?:/[^\s()<>\[\]"'/]+)*?)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif|mp4|webm|mov))`)
+
+// mediaReference 为回传历史里一处指向本服务媒体的引用：content 与 part 为所在位置，offset 为链接在文本 part 里的
 // 起始位置，fileData 与外部地址的 part 为 -1
 type mediaReference struct {
 	content int
@@ -249,15 +262,28 @@ type mediaReference struct {
 	offset  int
 }
 
-// mediaRestorer 在一次请求内选定要恢复的引用并读取文件：同一文件只恢复一处，恢复的总量不超过 limit
+// mediaTextLink 为文本 part 里一处可以恢复的链接：start、end 为链接（Markdown 链接或裸地址）在文本里的范围
+type mediaTextLink struct {
+	start int
+	end   int
+	name  string
+}
+
+// mediaRestorer 在一次请求内选定要恢复的引用并读取文件：同一文件只恢复一处，恢复的总量不超过 limit。
+// omni 为目标模型是能输出视频的 Omni（aistudio.OmniVideoModel）：assistant 正文与 fileData 里的视频、用户正文里的图片与视频链接也恢复
 type mediaRestorer struct {
 	store *mediastore.Store
 	limit int64
 	used  int64
+	omni  bool
 	// restored 为已选定恢复的文件；skipped 为不存在、读取失败或超出剩余总量的文件（剩余总量只减不增，之后的引用不再重读）
 	restored map[string]bool
 	skipped  map[string]bool
 	data     map[mediaReference][]byte
+	// missing 为不在媒体目录（已清理、读取失败或不是本服务的链接）的文件，overLimit 为超出单次请求恢复总量的文件，按首次遇到的顺序，
+	// 写进该请求的管理日志
+	missing   []string
+	overLimit []string
 }
 
 // take 读取 name 并选定在 reference 处恢复；文件已在别处恢复或已确定不能恢复时什么也不做
@@ -268,6 +294,11 @@ func (restorer *mediaRestorer) take(name string, reference mediaReference) {
 	data, err := restorer.store.Read(name, restorer.limit-restorer.used)
 	if err != nil || len(data) == 0 {
 		restorer.skipped[name] = true
+		if errors.Is(err, mediastore.ErrTooLarge) {
+			restorer.overLimit = append(restorer.overLimit, name)
+		} else {
+			restorer.missing = append(restorer.missing, name)
+		}
 		return
 	}
 	restorer.used += int64(len(data))
@@ -282,23 +313,40 @@ func (restorer *mediaRestorer) take(name string, reference mediaReference) {
 //   - assistant 消息里的 fileData（Gemini 原生 SDK 回传的历史同时带文本链接与 fileData）：图片恢复为内联图片；视频与音频不恢复，
 //     同一条消息里已有它的文本链接时去掉 fileData（签名单独保留），没有时改为文本链接（模型不需要把自己生成的几 MB 视频再当输入；
 //     Interaction 模型会把模型消息里的附件移到随后的用户 step 上传发送，恢复出来就会再发一遍）
+//   - 目标模型是能输出视频的 Omni（aistudio.OmniVideoModel）时另有：assistant 正文里的视频链接（[video](…)）与 assistant 消息里的视频
+//     fileData 同样恢复为视频（编辑或延长上一轮生成的视频要让模型看到原视频；new-api 等中转回传的历史只剩链接文本），用户正文里粘贴的
+//     本服务图片、视频链接（Markdown 或裸地址）恢复为媒体附件；不能恢复的外部地址改为文本链接（Omni 不接受外部地址，保持原样会让
+//     整个请求返回 400）
 //   - 同一文件一次请求只恢复一处：从最新的消息往前选（同一条消息里 fileData 与外部地址先于文本链接），其余引用不恢复，文本链接保持文本，
 //     fileData 与外部地址按上一条去掉或改为文本链接；恢复的总量不超过 maxRestoredMediaBytes，超出时较早的引用不恢复。
 //     每处引用各展开一份的话，同一个视频在几 KB 的请求里引用上百次就能展开成几百 MB
-//   - 文件已被清理或超出总量时：fileData 改为文本链接（不让整个请求失败），其余保持原样
+//   - 文件已被清理或超出总量时：fileData 改为文本链接（不让整个请求失败），其余保持原样；按规则该恢复却没能恢复的文件（不在媒体目录、
+//     超出总量）写一行说明进该请求的管理日志（request.Notes），不再静默
 //
 // 不区分是否为链接模式：切回 inline 后，历史里已有的链接在文件保留期间照常恢复
-func (s *server) restoreMediaLinks(contents []aistudio.Content) {
+func (s *server) restoreMediaLinks(ctx context.Context, request *aistudio.GenerateRequest) {
 	if s.mediaStore == nil {
 		return
 	}
-	restoreMediaLinksWithin(s.mediaStore, contents, maxRestoredMediaBytes)
+	notes := restoreMediaLinksWithin(s.mediaStore, request.Contents, maxRestoredMediaBytes, s.omniVideoTarget(ctx, request.Model))
+	request.Notes = append(request.Notes, notes...)
 }
 
-// restoreMediaLinksWithin 按 restoreMediaLinks 的规则恢复 store 里的媒体，恢复的总量不超过 limit
-func restoreMediaLinksWithin(store *mediastore.Store, contents []aistudio.Content, limit int64) {
+// omniVideoTarget 判断请求的模型名（可带后缀与目录别名）解析为能输出视频的 Omni 模型；目录取不到时为 false（按其他模型恢复）
+func (s *server) omniVideoTarget(ctx context.Context, name string) bool {
+	models, err := s.aliasCatalog(ctx)
+	if err != nil {
+		return false
+	}
+	model, _, ok := resolveRequestModel(models, name)
+	return ok && aistudio.OmniVideoModel(model)
+}
+
+// restoreMediaLinksWithin 按 restoreMediaLinks 的规则恢复 store 里的媒体，恢复的总量不超过 limit；omni 为目标模型是能输出视频的 Omni。
+// 返回要写进该请求管理日志的说明（没有恢复失败时为空）
+func restoreMediaLinksWithin(store *mediastore.Store, contents []aistudio.Content, limit int64, omni bool) []string {
 	restorer := &mediaRestorer{
-		store: store, limit: limit,
+		store: store, limit: limit, omni: omni,
 		restored: make(map[string]bool), skipped: make(map[string]bool), data: make(map[mediaReference][]byte),
 	}
 	for index := len(contents) - 1; index >= 0; index-- {
@@ -307,27 +355,136 @@ func restoreMediaLinksWithin(store *mediastore.Store, contents []aistudio.Conten
 	for index := range contents {
 		contents[index].Parts = restorer.rewrite(index, contents[index])
 	}
+	// 最后一条用户消息（这一轮）里恢复的媒体是客户端这一轮明确给出的附件（粘贴的链接、指向本服务的 image_url 与 fileData），不算回传历史：
+	// 去掉 RestoredLink，与客户端直接带的附件一样处理（Omni 没有可用的 Drive 授权账号时按需要 Drive 授权返回，不换回链接文本）
+	if last := len(contents) - 1; last >= 0 && contents[last].Role == aistudio.RoleUser {
+		for partIndex := range contents[last].Parts {
+			contents[last].Parts[partIndex].RestoredLink, contents[last].Parts[partIndex].RestoredText = false, ""
+		}
+	}
+	return restorer.notes(limit)
 }
 
-// choose 选定一条消息里要恢复的引用：先是 fileData 与外部地址（assistant 消息只恢复图片），再是 assistant 正文里的图片链接
+// restoreMediaNoteNames 为说明里每类最多列出的文件名个数
+const restoreMediaNoteNames = 3
+
+// notes 返回恢复失败的说明：一次请求一行，按原因分别给出文件数与最多 restoreMediaNoteNames 个文件名（哈希只取前 12 位）
+func (restorer *mediaRestorer) notes(limit int64) []string {
+	if len(restorer.missing) == 0 && len(restorer.overLimit) == 0 {
+		return nil
+	}
+	list := func(names []string) string {
+		shown := make([]string, 0, min(len(names), restoreMediaNoteNames))
+		for _, name := range names[:min(len(names), restoreMediaNoteNames)] {
+			shown = append(shown, mediastore.Hash(name)[:12]+"…"+path.Ext(name))
+		}
+		if len(names) > restoreMediaNoteNames {
+			shown = append(shown, "…")
+		}
+		return strings.Join(shown, "、")
+	}
+	parts := []string{"回传历史里本服务的媒体链接没能恢复为媒体输入，按链接文本发送"}
+	if len(restorer.missing) > 0 {
+		parts = append(parts, fmt.Sprintf("不在媒体目录（已清理或不是本服务的链接）=%d（%s）", len(restorer.missing), list(restorer.missing)))
+	}
+	if len(restorer.overLimit) > 0 {
+		parts = append(parts, fmt.Sprintf("超出单次请求恢复上限 %dMB=%d（%s，较新的消息优先）", limit>>20, len(restorer.overLimit), list(restorer.overLimit)))
+	}
+	return []string{strings.Join(parts, " | ")}
+}
+
+// restorableMedia 判断一处 fileData 或外部地址按规则恢复为媒体：用户消息里的任何媒体；assistant 消息里的图片，目标为 Omni 时还有视频
+func (restorer *mediaRestorer) restorableMedia(assistant bool, name string) bool {
+	return !assistant || mediastore.IsImage(name) || restorer.omni && mediaIsVideo(name)
+}
+
+// mediaIsVideo 判断保存文件是否为视频
+func mediaIsVideo(name string) bool {
+	return strings.HasPrefix(mediastore.ContentType(name), "video/")
+}
+
+// choose 选定一条消息里要恢复的引用：先是 fileData 与外部地址，再是正文里的链接（assistant 正文里的图片链接，目标为 Omni 时还有
+// 视频链接与用户正文里的图片、视频链接）
 func (restorer *mediaRestorer) choose(index int, content aistudio.Content) {
 	assistant := content.Role == aistudio.RoleAssistant
 	for partIndex, part := range content.Parts {
-		if name, ok := mediaPartName(part); ok && (!assistant || mediastore.IsImage(name)) {
+		if name, ok := mediaPartName(part); ok && restorer.restorableMedia(assistant, name) {
 			restorer.take(name, mediaReference{content: index, part: partIndex, offset: -1})
 		}
 	}
-	if !assistant {
-		return
-	}
 	for partIndex, part := range content.Parts {
-		if !restorableText(part) {
-			continue
-		}
-		for _, match := range mediaImageLinkPattern.FindAllStringSubmatchIndex(part.Text, -1) {
-			restorer.take(part.Text[match[2]:match[3]], mediaReference{content: index, part: partIndex, offset: match[0]})
+		for _, link := range restorer.textLinks(content.Role, part) {
+			restorer.take(link.name, mediaReference{content: index, part: partIndex, offset: link.start})
 		}
 	}
+}
+
+// textLinks 返回文本 part 里按规则可以恢复的链接（按出现顺序，互不重叠）：assistant 正文里的 Markdown 图片链接，目标为 Omni 时
+// 还有视频链接；目标为 Omni 时用户正文里的 Markdown 图片、视频链接与裸地址。思考、带说话人元数据的文本与其他 part 没有
+func (restorer *mediaRestorer) textLinks(role aistudio.Role, part aistudio.Part) []mediaTextLink {
+	if !restorableText(part) {
+		return nil
+	}
+	var links []mediaTextLink
+	switch {
+	case role == aistudio.RoleAssistant:
+		pattern := mediaImageLinkPattern
+		if restorer.omni {
+			pattern = mediaVisualLinkPattern
+		}
+		for _, match := range pattern.FindAllStringSubmatchIndex(part.Text, -1) {
+			links = append(links, mediaTextLink{start: match[0], end: match[1], name: part.Text[match[2]:match[3]]})
+		}
+	case role == aistudio.RoleUser && restorer.omni && part.InlineData == nil && part.File == nil && part.ExternalMedia == nil &&
+		part.FunctionCall == nil && part.FunctionResult == nil:
+		links = userMediaLinks(part.Text)
+	}
+	return links
+}
+
+// userMediaLinks 返回用户正文里指向本服务媒体目录的图片与视频：Markdown 链接，以及不在 Markdown 链接里的裸地址
+func userMediaLinks(text string) []mediaTextLink {
+	var links []mediaTextLink
+	for _, match := range mediaVisualLinkPattern.FindAllStringSubmatchIndex(text, -1) {
+		links = append(links, mediaTextLink{start: match[0], end: match[1], name: text[match[2]:match[3]]})
+	}
+	var bare []mediaTextLink
+	for _, match := range mediaBareLinkPattern.FindAllStringSubmatchIndex(text, -1) {
+		inside := false
+		for _, link := range links {
+			if match[0] < link.end && match[1] > link.start {
+				inside = true
+				break
+			}
+		}
+		if !inside && bareMediaLinkAt(text, match[0], match[1]) {
+			bare = append(bare, mediaTextLink{start: match[0], end: match[1], name: text[match[2]:match[3]]})
+		}
+	}
+	if len(bare) == 0 {
+		return links
+	}
+	links = append(links, bare...)
+	slices.SortFunc(links, func(left, right mediaTextLink) int { return left.start - right.start })
+	return links
+}
+
+// bareMediaLinkAt 判断 text[start:end] 是一个完整的地址：前面是开头、空白、中文等非 ASCII 字符或括号引号等分隔符（相对地址不能
+// 接在其他地址或单词后面），后面不是还能接在地址里的字符（带查询串、片段或更长路径的不是本服务的媒体链接）
+func bareMediaLinkAt(text string, start int, end int) bool {
+	if start > 0 {
+		if previous := text[start-1]; previous < 0x80 && !strings.ContainsRune(" \t\r\n(<[\"'`:,;*>", rune(previous)) {
+			return false
+		}
+	}
+	if end < len(text) {
+		next := text[end]
+		if next == '?' || next == '#' || next == '/' || next == '&' || next == '=' || next == '%' || next == '_' || next == '-' ||
+			next >= '0' && next <= '9' || next >= 'a' && next <= 'z' || next >= 'A' && next <= 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 // rewrite 按选定的引用改写一条消息的 part
@@ -338,22 +495,25 @@ func (restorer *mediaRestorer) rewrite(index int, content aistudio.Content) []ai
 	for partIndex, part := range content.Parts {
 		name, ok := mediaPartName(part)
 		if !ok {
-			if assistant {
-				parts = append(parts, restorer.textParts(index, partIndex, part)...)
-			} else {
-				parts = append(parts, part)
-			}
+			parts = append(parts, restorer.textParts(index, partIndex, content.Role, part)...)
 			continue
 		}
 		if data, restored := restorer.data[mediaReference{content: index, part: partIndex, offset: -1}]; restored {
+			// 恢复前的链接文本：Interaction 模型没有可用的 Drive 授权账号时换回它（见 aistudio.Part.RestoredLink），与下面不恢复时相同
+			restoredText := ""
+			if !linked[name] {
+				restoredText = mediaLinkText(mediaPartURL(part), name)
+			}
 			parts = append(parts, aistudio.Part{
 				InlineData:       &aistudio.Blob{MIME: mediastore.ContentType(name), Data: data},
 				ThoughtSignature: part.ThoughtSignature,
+				RestoredLink:     true, RestoredText: restoredText,
 			})
 			continue
 		}
-		// 外部地址可恢复、但文件不在（也可能是别的站点同样路径的地址）或超出总量：保持原样，由上游按地址读取
-		if part.ExternalMedia != nil && !restorer.restored[name] && (!assistant || mediastore.IsImage(name)) {
+		// 外部地址可恢复、但文件不在（也可能是别的站点同样路径的地址）或超出总量：保持原样，由上游按地址读取。
+		// 目标为 Omni 时不保持（Omni 不接受外部地址），按下面改为文本链接
+		if part.ExternalMedia != nil && !restorer.restored[name] && restorer.restorableMedia(assistant, name) && !restorer.omni {
 			parts = append(parts, part)
 			continue
 		}
@@ -409,31 +569,34 @@ func mediaPartURL(part aistudio.Part) string {
 	return ""
 }
 
-// restorableText 判断 part 是否为可以恢复其中图片链接的正文：思考与带说话人元数据的文本不动
+// restorableText 判断 part 是否为可以恢复其中链接的正文：思考与带说话人元数据的文本不动
 func restorableText(part aistudio.Part) bool {
 	return part.Text != "" && !part.Thought && part.SpeechMetadata == nil
 }
 
-// textParts 把 assistant 文本 part 在选定恢复的图片链接处拆成文本与图片；其余链接、思考、带说话人元数据的文本与其他 part 原样返回。
-// 签名留在拆出的第一个 part 上
-func (restorer *mediaRestorer) textParts(index int, partIndex int, part aistudio.Part) []aistudio.Part {
-	if !restorableText(part) {
+// textParts 把文本 part 在选定恢复的链接处拆成文本与媒体（链接见 textLinks）；其余链接、思考、带说话人元数据的文本与其他 part
+// 原样返回。签名留在拆出的第一个 part 上
+func (restorer *mediaRestorer) textParts(index int, partIndex int, role aistudio.Role, part aistudio.Part) []aistudio.Part {
+	links := restorer.textLinks(role, part)
+	if len(links) == 0 {
 		return []aistudio.Part{part}
 	}
 	text := part.Text
 	parts := make([]aistudio.Part, 0)
 	position := 0
-	for _, match := range mediaImageLinkPattern.FindAllStringSubmatchIndex(text, -1) {
-		data, ok := restorer.data[mediaReference{content: index, part: partIndex, offset: match[0]}]
+	for _, link := range links {
+		data, ok := restorer.data[mediaReference{content: index, part: partIndex, offset: link.start}]
 		if !ok {
 			continue
 		}
-		if match[0] > position {
-			parts = append(parts, aistudio.Part{Text: text[position:match[0]]})
+		if link.start > position {
+			parts = append(parts, aistudio.Part{Text: text[position:link.start]})
 		}
-		name := text[match[2]:match[3]]
-		parts = append(parts, aistudio.Part{InlineData: &aistudio.Blob{MIME: mediastore.ContentType(name), Data: data}})
-		position = match[1]
+		parts = append(parts, aistudio.Part{
+			InlineData:   &aistudio.Blob{MIME: mediastore.ContentType(link.name), Data: data},
+			RestoredLink: true, RestoredText: text[link.start:link.end],
+		})
+		position = link.end
 	}
 	if position == 0 {
 		return []aistudio.Part{part}

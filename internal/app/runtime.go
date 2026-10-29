@@ -148,6 +148,10 @@ func newRuntime(
 	// 后台只低速刷新缺失与过期的账户（见 catalog_cache.go、catalog_sync.go）。要在账户目录扫描与新账户处理开始之前
 	catalogCache := openCatalogCache(catalogCacheDir, requests)
 	service.catalogSync.attach(catalogCache, catalogCache.restore(pool, client, pool.BuildEnabled()))
+	// Drive 授权状态跨重启保留（见 drive_state.go）：账户池载入认证文件后、开始调度之前恢复，gemini-omni 的视频输入（及无法转为 PNG 的图片）不必重新试号
+	driveStates := openDriveStateMemory(driveStatePath(), requests)
+	driveStates.attach(pooled)
+	service.driveStates = driveStates
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	admin.onboard = newAccountOnboarder(admin, store.PrimaryDirectory())
@@ -182,6 +186,11 @@ func newRuntime(
 		// 坏号记忆平时最多每 30 秒（badAccountSaveInterval）写一次，停止服务时已写过；关闭时再兜底写出
 		if flushErr := badAccounts.close(); flushErr != nil {
 			requests.log("service", "WARN", "坏号记忆写入失败 | 错误="+flushErr.Error())
+		}
+		// Drive 授权状态记录平时最多每 30 秒写一次，关闭时立即写出；之后的变化不再写盘（新一代生成服务另开一份）
+		pooled.SetDriveObserver(nil)
+		if flushErr := driveStates.close(); flushErr != nil {
+			requests.log("service", "WARN", "Drive 授权状态记录写入失败 | 错误="+flushErr.Error())
 		}
 		return err
 	}
@@ -2688,6 +2697,8 @@ type trackedService struct {
 	authNotes authRequiredNotes
 	// driveInlineNotes 为“Drive 未授权，附件改为内联”日志的去重状态（同账号 10 分钟最多一条，见 drive_inline.go），零值可用
 	driveInlineNotes driveInlineNotes
+	// driveStates 为写盘的 Drive 授权状态记录（见 drive_state.go），只在 newRuntime 创建；测试构造的服务为 nil（方法都 nil 安全）
+	driveStates *driveStateMemory
 	// authMarks 为“账号需要登录”的最近计数（状态接口的 auth_required_10m），零值可用
 	authMarks recentEvents
 	// authRecheck 为登录复核器（疑似登录失效的复核与需要登录账户的定期复核，见 auth_recheck.go）；只在 newRuntime 创建并挂上账户池的 gate，
@@ -3091,6 +3102,10 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	// （新一代此时读文件）、最后才关闭旧一代，原先旧一代在关闭时才写，新一代读到的是旧数据，随后又被新一代的第一次写盘整份覆盖
 	if err := service.workers.badAccountMemory().save(); err != nil && service.requests != nil {
 		service.requests.log("service", "WARN", "坏号记忆写入失败 | 错误="+err.Error())
+	}
+	// Drive 授权状态记录同理（平时有变化最多每 30 秒写一次）：停止服务时立即写出，新一代读到的是最新的记录
+	if err := service.driveStates.save(); err != nil && service.requests != nil {
+		service.requests.log("service", "WARN", "Drive 授权状态记录写入失败 | 错误="+err.Error())
 	}
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
@@ -4295,6 +4310,10 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	} else if err := aistudio.ValidateMediaResolution(request.Config.MediaResolution); err != nil {
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
+	} else if service.pool.InteractionModel(request.Model) {
+		// Interaction 模型（gemini-omni）只接受内联图片与上传到账号 Drive 的附件：外部地址的图片与视频（http(s) 链接、YouTube 链接）不替客户端下载，
+		// 按 400 返回英文说明（原先选号、发送后才由编码报错，换成通用措辞）
+		invalid = aistudio.InteractionExternalMediaError(request.Contents)
 	}
 	if invalid != nil {
 		api.SetAccessLogError(ctx, invalid)
@@ -4377,6 +4396,48 @@ func (service *trackedService) generateWithRetry(
 	var temporaryCopies *aistudio.TemporaryFileCopies
 	var err error
 	originalContents := request.Contents
+	// interactionModel：Interaction 模型（gemini-omni，见 aistudio.InteractionModel）的请求带内联附件（没有内联附件时不查模型，与原先相同）。
+	// PNG、JPEG 图片照官网原字节内联发送（Content field 2，不经 Drive）：选号前把 GIF 首帧转成 PNG（用户附件、会移到用户 step 的模型历史
+	// 图片、从本服务链接恢复的图片都算，见 aistudio.PrepareInteractionImages），结果写进请求进度；无法转为 PNG 的图片与视频、其他文件一样
+	// 要先上传 Drive。转换只在等转换名额时请求结束才失败，按请求的 ctx 错误结束
+	inlineCount, _ := inlineMediaInput(originalContents)
+	interactionModel := inlineCount > 0 && service.pool.InteractionModel(modelID)
+	imageHint := ""
+	if interactionModel {
+		prepared, report, prepareErr := aistudio.PrepareInteractionImages(requestCtx, originalContents)
+		if prepareErr != nil {
+			err = prepareErr
+			maxAttempts = 0
+		} else {
+			originalContents, imageHint = prepared, report.Hint
+			for _, note := range interactionImageNotes(report) {
+				trace.Note(note.text)
+				service.requests.logRequestProgress(request.ID, "service", note.level, note.text)
+			}
+		}
+	}
+	// driveRequired：Interaction 模型的请求带需要 Drive 的内联附件（视频、其他文件、无法转为 PNG 的图片，含会移到用户 step 的模型历史媒体，
+	// 见 aistudio.InteractionDriveMedia）：这些附件要先上传到账号的 Drive 再以文件引用发送（官网发送视频同样先传 Drive），没有 Drive 授权的
+	// 账号发不出去。不固定账号的选号按 Drive 状态安排（见 drive_select.go 与下文 Drive 选号）；取得租约后附件仍是 inline data 时不调用
+	// Generate、换号（见下文 driveMissing）。只有图片（PNG、JPEG 与转成 PNG 的 GIF）的 Omni 请求与纯文本请求一样选号，其他模型不受影响。
+	// driveMissed 为本请求因账号没有 Drive 授权换掉的账号数
+	driveCount, _ := interactionDriveMediaInput(originalContents)
+	driveRequired := interactionModel && driveCount > 0
+	drive := newDriveSelection(service.service, originalContents, request.Config.VideoConfig)
+	drive.imageHint = imageHint
+	driveMissed := 0
+	// fallBackToLinks：需要 Drive 只是因为从本服务媒体链接恢复出来的历史媒体（drive.restoredOnly），号池里却没有可用的 Drive 授权账号
+	// （候选里没有本请求还能试的可用或未知账号、换满每请求换号硬上限、指定账号没有授权；只恢复出图片时另有限时取不到）时，把这些需要 Drive 的
+	// 恢复媒体换回链接文本（与恢复之前相同；能内联的图片不动），之后按普通请求选号与发送，不让原先能成功的多轮对话返回 400 或 503；
+	// 客户端自己带的附件与指定了视频任务的请求照常按需要 Drive 授权处理。why 为原因，写进请求进度
+	fallBackToLinks := func(why string) {
+		contents, replaced := restoredMediaAsLinks(originalContents)
+		originalContents = contents
+		driveRequired = false
+		note := restoredFallbackNote(replaced, why)
+		trace.Note(note)
+		service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+	}
 	attempted := make(map[string]struct{}, maxAttempts)
 	// tried 为本请求取得过租约的不同账号（每请求换号硬上限 generateSwitchCeiling，见 quota_switch.go）：单独维护，
 	// 不受 attempted 的删除（同账号换通道、Worker 重建后重放、回到原账号）与 maxAttempts 的补偿影响
@@ -4511,6 +4572,58 @@ func (service *trackedService) generateWithRetry(
 			selection.AllowedAccountIDs = tierRetryAccountIDs
 			tierRetryAccountIDs = nil
 		}
+		// Drive 选号（Interaction 模型带需要 Drive 的内联附件，规则见 drive_select.go）：有记着 Drive 可用、本请求没试过的账号时只在这些账号里选
+		// （照常排队，预热 Worker、Ultra 分区、主用模型排队预算、排空与按通道计档照旧，忙或冷却时按现有排队与 429 语义），下面先不等待地取，
+		// 取不到时最多试一个 Worker 已就绪的状态未知账号；没有时只在状态未知的账号里选。候选里没有本请求还能试的可用或未知账号时不选号：
+		// 只剩记着 Drive 不可用的账号时按 400 FAILED_PRECONDITION 结束，有可用或未知账号但本请求都试过时按号池繁忙 429 结束；在此之前
+		// 先回到没等到关闭的原账号（returnToDeferred：它可能是唯一有 Drive 的账号，等 Worker 恢复后重放），与换号没有可用账号时相同。
+		// 只因恢复出来的历史媒体需要 Drive 时不让请求失败，取不到就换回链接文本（fallBackToLinks）。只用于不固定账号、不限定资源的选号
+		var plan drivePlan
+		if driveRequired && drive.source != nil && selection.AccountID == "" && selection.ResourceID == "" {
+			plan = drive.plan(acquireCtx, selection, attempted, service.workers.ReadyWarmAccountIDs)
+			if plan.exhausted {
+				why := "可能有 Drive 授权的账号本请求都试过"
+				if drive.noDriveAccount() {
+					why = "号池里没有可用的 Drive 授权账号"
+				}
+				if replay, ended := returnToDeferred(why, drive.exhaustedError(modelID, scope)); replay {
+					continue
+				} else if ended {
+					break
+				}
+			}
+			if plan.exhausted && drive.restoredOnly || plan.fallback {
+				why := "号池里没有可用的 Drive 授权账号"
+				switch {
+				case plan.exhausted && !drive.noDriveAccount():
+					why = "可能有 Drive 授权的账号本请求都试过或现在用不了"
+				case plan.fallback && drive.probes >= driveUnknownProbeLimit:
+					why = "没有记着 Drive 可用的账号，试过的状态未知账号也没有 Drive 授权"
+				case plan.fallback:
+					why = "没有记着 Drive 可用的账号，也没有 Worker 已就绪的状态未知账号可试"
+				}
+				fallBackToLinks(why)
+				request.Contents = originalContents
+				plan = drivePlan{}
+			} else if plan.exhausted {
+				err = drive.exhaustedError(modelID, scope)
+				var busy *aistudio.CapacityBusyError
+				if errors.As(err, &busy) {
+					trace.Note("可能有 Drive 授权的账号本请求都试过或现在用不了，按号池繁忙返回")
+					service.requests.logRequestProgress(request.ID, "service", "WARN", fmt.Sprintf(
+						"可能有 Drive 授权的账号本请求都试过或现在用不了，%s无法发送，按 429 返回 | 可用=%d 个 | 未知=%d 个",
+						driveMediaLabel, len(drive.last.Available), len(drive.last.Unknown)))
+				} else {
+					trace.Note("号池里没有已知或可能有 Drive 授权的账号，" + driveMediaLabel + "无法发送")
+					service.requests.logRequestProgress(request.ID, "service", "WARN", fmt.Sprintf(
+						"号池里没有已知或可能有 Drive 授权的账号，%s无法发送，按 400 返回 | 候选=%d 个都记着 Drive 不可用",
+						driveMediaLabel, len(drive.last.Unavailable)))
+				}
+				break
+			} else {
+				selection = plan.selection
+			}
+		}
 		useImmediate := immediateRetry
 		immediateRetry = false
 		// 没等到关闭就换走的原账号在这次选号里仍被排除：选号排队时它的关闭结束、可以重放就提前结束（errWorkerResetReady），
@@ -4558,17 +4671,75 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
+		// Drive 选号（选择条件已限定到记着 Drive 可用的账号）：还能试状态未知的账号时先不等待地在可用账号里取（热 Worker 空闲，或所在分区
+		// 有空槽、冷启动名额空闲时现场冷启动；只因恢复出来的历史图片需要 Drive 时只用已启动的 Worker），取不到（都在忙、冷却或没有 Worker
+		// 槽位）再不等待地试一个 Worker 已就绪的状态未知账号（withoutColdStart：不冷启动、不替换 Worker）；都取不到时按限定到可用账号的条件
+		// 照常选号与排队（可以替换空闲 Worker、冷启动可用的备用账号；只因恢复出来的历史图片需要 Drive 时见 acquireRestoredDriveLease）。
+		// 没有记着可用的账号、只因恢复出来的历史图片需要 Drive 时只试那个已就绪的状态未知账号，取不到就换回链接文本。
+		// driveStartFailures 记下这里现场启动失败的账号，随后的选号不再启动它们，也据此判断可用账号是否都启动不了
+		var driveStartFailures *workerStartupFailures
+		if plan.available {
+			driveStartFailures = newWorkerStartupFailures()
+		}
+		if nextLease == nil && acquireErr == nil && len(plan.probe) > 0 && !useImmediate {
+			availableNote := "没有记着 Drive 可用的账号"
+			if plan.available {
+				preferCtx := selectCtx
+				if drive.lenient {
+					preferCtx = withoutColdStart(selectCtx)
+				}
+				driveLease, preferErr := service.acquireWarmLeaseNow(preferCtx, selection, driveStartFailures)
+				if preferErr == nil {
+					nextLease = driveLease
+					trace.Note(driveMediaLabel + "：取得记着 Drive 可用的账号")
+				} else {
+					availableNote = "记着 Drive 可用的账号现在都取不到（" + preferErr.Error() + "）"
+				}
+			}
+			if nextLease == nil && requestCtx.Err() == nil {
+				if probeLease, probeErr := service.acquireWarmLeaseNow(withoutColdStart(selectCtx), plan.probeSelection, driveStartFailures); probeErr == nil {
+					nextLease = probeLease
+					drive.probes++
+					trace.Note(driveMediaLabel + "：" + availableNote + "，试一个 Worker 已就绪的状态未知账号")
+				} else if requestCtx.Err() == nil && plan.available {
+					trace.Note(driveMediaLabel + "：" + availableNote + "，已就绪的状态未知账号也取不到，排队等记着 Drive 可用的账号")
+				}
+			}
+		}
+		if nextLease == nil && acquireErr == nil && drive.lenient && len(plan.probe) > 0 && !plan.available && requestCtx.Err() == nil {
+			fallBackToLinks("没有记着 Drive 可用的账号，Worker 已就绪的状态未知账号现在也取不到")
+			maxAttempts++
+			continue
+		}
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		// 输入超限后的再试只接受现在就能取得的账号，不排队
 		switch {
 		case nextLease != nil || acquireErr != nil:
+		case plan.available && drive.lenient:
+			nextLease, acquireErr = service.acquireRestoredDriveLease(selectCtx, selection, budget, useImmediate, driveStartFailures)
 		case useImmediate:
-			nextLease, acquireErr = service.acquireWarmLeaseNow(selectCtx, selection, nil)
+			nextLease, acquireErr = service.acquireWarmLeaseNow(selectCtx, selection, driveStartFailures)
 		case service.streamPrefersPlayground(request, selection):
 			nextLease, acquireErr = service.acquireStreamPlaygroundLease(selectCtx, request.ID, selection)
 		default:
-			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
+			// 没有 Drive 选号的先取时 driveStartFailures 为 nil，与 acquireWarmLease 相同
+			nextLease, acquireErr = service.acquireLease(selectCtx, selection, false, driveStartFailures)
+		}
+		if acquireErr != nil && plan.available && drive.lenient && requestCtx.Err() == nil && !errors.Is(acquireErr, errWorkerResetReady) {
+			// 只因恢复出来的历史图片需要 Drive，记着 Drive 可用的账号限时内取不到（忙碌、冷却、没有热 Worker、排队超限或用不了）：
+			// 换回链接文本按普通请求重新选号，不让请求失败，也不占换号次数
+			fallBackToLinks("有 Drive 授权的账号现在都取不到（" + progressReason(acquireErr) + "）")
+			maxAttempts++
+			continue
+		}
+		var driveCooling *aistudio.AllCoolingError
+		if acquireErr != nil && plan.available && drive.restoredOnly && !drive.lenient && requestCtx.Err() == nil && errors.As(acquireErr, &driveCooling) {
+			// 只因恢复出来的历史视频需要 Drive，记着 Drive 可用的账号都在长时间冷却（额度用完等，排队等不到）：换回链接文本按普通请求
+			// 重新选号，不占换号次数。只是在忙时照常排队，排队超过主用模型的排队预算时与客户端附件一样按 429 返回
+			fallBackToLinks("记着 Drive 可用的账号都在冷却（" + progressReason(acquireErr) + "）")
+			maxAttempts++
+			continue
 		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && (playgroundUnavailable(acquireErr) || noWarmWorker(acquireErr)) {
 			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定。
@@ -4576,6 +4747,14 @@ func (service *trackedService) generateWithRetry(
 			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
 			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
+		}
+		if acquireErr != nil && plan.available && requestCtx.Err() == nil && availableUnusable(acquireErr, driveStartFailures) {
+			// 只在记着 Drive 可用的账号里选号失败是因为这些账号现在用不了（刚被停用、需要登录、启动失败）：改在状态未知的账号里选，
+			// 不占换号次数
+			drive.skipAvailable = true
+			trace.Note("记着 Drive 可用的账号现在用不了（" + acquireErr.Error() + "），改在状态未知的账号里选")
+			maxAttempts++
+			continue
 		}
 		if errors.Is(acquireErr, errWorkerResetReady) {
 			if requestCtx.Err() == nil {
@@ -4720,6 +4899,9 @@ func (service *trackedService) generateWithRetry(
 		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
+		// driveMissing：Interaction 模型需要 Drive 的附件（视频、其他文件、无法转为 PNG 的图片）上传后仍是 inline data（账号没有 Drive 授权），
+		// 这次尝试没有调用 Generate
+		driveMissing := false
 		if resourceID != "" {
 			fileCopies, ok := service.service.(interface {
 				CopyFileReferencesToLease(context.Context, *aistudio.AccountLease, []aistudio.Content) ([]aistudio.Content, *aistudio.TemporaryFileCopies, error)
@@ -4735,20 +4917,61 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		mediaCount, mediaBytes := inlineMediaInput(request.Contents)
+		// mediaInput 为这次要交给 Drive 上传的内联附件：Interaction 模型的 PNG、JPEG 图片按官网内联发送，不上传（只算视频、其他文件与无法转为
+		// PNG 的图片，上传前把图片从内容里拿掉、之后放回，见 holdInlineImages），只有图片时不调用上传、不换 Drive token；其他模型为全部内联附件
+		mediaInput := inlineMediaInput
+		if interactionModel {
+			mediaInput = interactionDriveMediaInput
+		}
+		mediaCount, mediaBytes := mediaInput(request.Contents)
 		if err == nil && mediaCount > 0 {
-			uploader, ok := service.service.(interface {
-				UploadInlineMediaToLease(context.Context, *aistudio.AccountLease, []aistudio.Content, *aistudio.TemporaryFileCopies) ([]aistudio.Content, *aistudio.TemporaryFileCopies, error)
-			})
+			uploader, ok := service.service.(inlineMediaUploader)
 			if !ok {
 				err = fmt.Errorf("内联附件上传服务不可用")
 			} else {
 				uploadStartedAt := time.Now()
+				uploadContents, heldImages := request.Contents, []heldInlineImage(nil)
+				if interactionModel {
+					uploadContents, heldImages = holdInlineImages(request.Contents)
+				}
 				request.Contents, attemptCopies, err = uploader.UploadInlineMediaToLease(
-					requestCtx, lease, request.Contents, attemptCopies,
+					requestCtx, lease, uploadContents, attemptCopies,
 				)
+				if err == nil {
+					request.Contents, err = restoreInlineImages(request.Contents, heldImages)
+				}
 				uploadElapsed := time.Since(uploadStartedAt).Round(time.Millisecond)
-				if retained, _ := inlineMediaInput(request.Contents); err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild {
+				retained, _ := mediaInput(request.Contents)
+				if err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild && driveRequired && drive.restoredOnly &&
+					(!(unbound || fileBound) || len(tried) >= generateSwitchCeiling) {
+					// 只因恢复出来的历史媒体需要 Drive：指定账号不能换号、或已到每请求换号硬上限时不换号，换回链接文本在这个账号上发送
+					why := "指定账号没有 Drive 授权"
+					if unbound || fileBound {
+						why = fmt.Sprintf("已试 %d 个账号都没有 Drive 授权", len(tried))
+					}
+					fallBackToLinks(why)
+					request.Contents, _ = restoredMediaAsLinks(request.Contents)
+				} else if err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild && driveRequired {
+					// Interaction 模型（gemini-omni）的视频、其他文件与无法转为 PNG 的图片不能内联：账号没有 Drive 授权时这些附件发不出去，
+					// 不调用 Generate（原先照常发送，编码返回需要 Drive 授权的参数错误，不换号，对外成了通用的 400）。不固定账号的请求排除这个
+					// 账号换号（它已记着 Drive 不可用，之后的选号也排除它），不冷却、不计入连续失败上限、不退避、不计入出口判定，受每请求换号
+					// 硬上限约束；指定账号的请求按需要 Drive 授权结束（400）
+					driveMissing = true
+					driveMissed++
+					message := "账号没有 Drive 授权，" + driveMediaLabel + "无法发送，换有 Drive 授权的账号"
+					err = &aistudio.DriveRequiredError{Reason: aistudio.DriveRequiredExhausted, Model: modelID, Tried: driveMissed, ImageHint: drive.imageHint}
+					if unbound || fileBound {
+						// 不占换号次数（只受每请求换号硬上限约束）：候选用完时下一次选号按号池里没有 Drive 授权的账号（400）或
+						// 有 Drive 授权的账号都试过（429）结束，不按换号次数用完结束
+						maxAttempts++
+					} else {
+						message = "账号没有 Drive 授权，" + driveMediaLabel + "无法发送（指定账号，不能换号）"
+						err = &aistudio.DriveRequiredError{Reason: aistudio.DriveRequiredAccount, Model: modelID, ImageHint: drive.imageHint}
+					}
+					trace.Note(message)
+					service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
+						"%s | 附件=%d | 原始=%dB", message, mediaCount, mediaBytes))
+				} else if err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild {
 					// Playground 通道上附件仍是 inline data：账号没有 Drive 授权（GenerateAccessToken 401 / Code 16，或记着它刚返回过），
 					// 附件随生成请求内联发送，不冷却、不换号（见 aistudio.UploadInlineMediaToLease）。只写这一行、不写“内联附件处理完成”，
 					// 诊断按开头分开计数；同账号 10 分钟最多一行。去重名额先占后写，所以走 logDurable：普通日志在控制台队列满时会丢，
@@ -4936,7 +5159,8 @@ func (service *trackedService) generateWithRetry(
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
 		localWorkerFailure := (workerFailed || workerReplaced) && requestCtx.Err() == nil
-		retryable := retryableGenerateAccountError(requestCtx, err) || localWorkerFailure
+		retryable := retryableGenerateAccountError(requestCtx, err) || localWorkerFailure ||
+			driveMissing && (unbound || fileBound) && requestCtx.Err() == nil
 		// buildDisabled：Build 代理返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成，见 build_pause.go）。与请求本身、
 		// 账号额度都无关：不冷却、不计连续失败上限、不退避；记进 Build 暂停（该账号不再走 Build，短时间内 3 个账号即全局暂停），
 		// 本请求立即改走 Playground：同账号的 Playground 可用时在同账号重试，否则按原规则换号。错误在首事件之前，流式请求同样无缝重试。
@@ -5186,7 +5410,7 @@ func (service *trackedService) generateWithRetry(
 		}
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
-		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled
+		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled && !driveMissing
 		// 最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
 		exhaustReason, exhausted := quota.exhaustedReason()
 		quotaExhausted := quotaFailure && exhausted
@@ -5279,6 +5503,11 @@ func (service *trackedService) generateWithRetry(
 				meta.accounts = len(tried)
 				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonCeiling, nil, err)
 			}
+			if !ended && driveMissing && len(drive.last.Available) > 0 {
+				// 换满上限的都是没有 Drive 授权的账号，号池里却有记着 Drive 可用的账号（本请求试过或现在用不了）：按号池繁忙返回 429，
+				// 不按“换过的账号都没有 Drive 授权”的 503 结束
+				err = drive.busyError(modelID, scope)
+			}
 			break
 		}
 		if !recoverWorker && countsHard {
@@ -5316,6 +5545,10 @@ func (service *trackedService) generateWithRetry(
 		}
 		if buildDisabled {
 			// 改走 Playground（或换账号的 Build）的进度上面已写；运行日志只在进入暂停时写一行（见 build_pause.go），不逐个请求写换号
+			continue
+		}
+		if driveMissing {
+			// 换有 Drive 授权的账号的进度上面已写；运行日志不逐个请求写账号切换（没有 Drive 授权的账号多，带图的 Omni 请求会刷屏）
 			continue
 		}
 		switchMessage := fmt.Sprintf(

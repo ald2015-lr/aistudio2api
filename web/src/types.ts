@@ -336,6 +336,17 @@ export interface ServiceStatus {
   proxy_pool?: ProxyPoolStatus
   // build_channel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时）：服务运行且启用了 Build 时才有；旧版服务端不返回
   build_channel?: BuildChannelStatus
+  // drive 为启用账户的 Google Drive 授权状态计数（gemini-omni 的视频输入及无法转为 PNG 的图片只交给可用或未知的账户，PNG、JPEG 图片不需要 Drive）；旧版服务端不返回
+  drive?: DriveCounters
+}
+
+// DriveCounters 为启用账户的 Google Drive 授权状态：available 为换到过 Drive token 或经本服务登录时完成了 Drive 授权，unavailable 为
+// 没有 Drive 授权（GenerateAccessToken 返回 401），unknown 为还没试过、更新认证文件后或记录过期。可用、不可用各记 24 小时，
+// 写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用
+export interface DriveCounters {
+  available: number
+  unavailable: number
+  unknown: number
 }
 
 // BuildChannelStatus 为 Build 通道生成的暂停状态：Build 代理返回 PROXY_GENERATION_DISABLED 时先按账号暂停，短时间内 3 个账号都遇到即

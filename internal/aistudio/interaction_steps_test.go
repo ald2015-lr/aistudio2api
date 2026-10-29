@@ -56,38 +56,73 @@ func TestInteractionMovesModelAttachments(t *testing.T) {
 	}
 }
 
-// TestInteractionModelAttachmentErrors 移到用户 step 的模型附件按用户附件的规则编码：没有 Drive 授权、仍是 inline data 时与用户附件
-// 一样返回需要 Drive 授权的错误（指明所在的模型消息），外部地址不接受；不静默丢掉
+// TestInteractionModelAttachmentErrors 移到用户 step 的模型附件按用户附件的规则编码：没有 Drive 授权、仍是 inline data 的视频与不能内联的
+// 图片与用户附件一样返回需要 Drive 授权的错误（指明所在的模型消息），外部地址不接受；不静默丢掉。说明为英文（原样返回客户端），不含中文
+func TestInteractionModelAttachmentErrorsEnglish(t *testing.T) {
+	for _, contents := range [][]Content{
+		{{Role: RoleUser, Parts: []Part{{InlineData: &Blob{MIME: "video/mp4", Data: []byte("video")}}}}},
+		{{Role: RoleUser, Parts: []Part{{InlineData: &Blob{MIME: "image/webp", Data: []byte("RIFF\x00\x00\x00\x00WEBPVP8 ")}}}}},
+		{{Role: RoleUser, Parts: []Part{{InlineData: &Blob{MIME: "image/png", Data: []byte("not a png")}}}}},
+		{{Role: RoleUser, Parts: []Part{{ExternalMedia: &ExternalMedia{MIME: "image/png", URL: "https://images.example.net/a.png"}}}}},
+		{{Role: RoleUser, Parts: []Part{{FunctionResult: &FunctionResult{Name: "f"}}}}},
+		{{Role: Role("system"), Parts: []Part{{Text: "x"}}}},
+		{},
+	} {
+		_, _, _, err := encodeInteractionSteps(contents)
+		if err == nil {
+			t.Fatalf("%+v 应返回错误", contents)
+		}
+		// 参数错误的哨兵前缀（中文）由 API 层去掉，其后的说明原样返回客户端
+		for _, r := range strings.TrimPrefix(err.Error(), ErrInvalidArgument.Error()) {
+			if r >= 0x4e00 && r <= 0x9fff {
+				t.Fatalf("错误说明应为英文：%v", err)
+			}
+		}
+	}
+}
+
+// TestInteractionModelAttachmentErrors 移到用户 step 的模型附件按用户附件的规则编码：没有 Drive 授权、仍是 inline data 的视频与不能内联的
+// 图片与用户附件一样返回需要 Drive 授权的错误（指明所在的模型消息），外部地址不接受；不静默丢掉
 func TestInteractionModelAttachmentErrors(t *testing.T) {
-	image := &Blob{MIME: "image/png", Data: []byte("\x89PNG")}
+	video := &Blob{MIME: "video/mp4", Data: []byte("video")}
+	webp := &Blob{MIME: "image/webp", Data: []byte("RIFF\x00\x00\x00\x00WEBPVP8 ")}
+	const videoWant = "video and file input for this model must be uploaded to Google Drive first, which requires an account with Google Drive authorized"
 	for _, test := range []struct {
 		name     string
 		contents []Content
 		want     string
 	}{
 		{
-			name: "用户内联附件",
+			name: "用户内联视频",
 			contents: []Content{
-				{Role: RoleUser, Parts: []Part{{Text: "看图"}, {InlineData: image}}},
+				{Role: RoleUser, Parts: []Part{{Text: "看视频"}, {InlineData: video}}},
 			},
-			want: "contents[0] 附件需要账户 Drive 授权",
+			want: "contents[0]: " + videoWant,
 		},
 		{
-			name: "模型内联附件",
+			name: "用户 WebP 图片",
+			contents: []Content{
+				{Role: RoleUser, Parts: []Part{{Text: "看图"}, {InlineData: webp}}},
+			},
+			want: "contents[0]: this image/webp image cannot be sent inline to this model (only PNG and JPEG images are, and GIF is converted to PNG) " +
+				"and must be uploaded to Google Drive first",
+		},
+		{
+			name: "模型内联视频",
 			contents: []Content{
 				{Role: RoleUser, Parts: []Part{{Text: "画"}}},
-				{Role: RoleAssistant, Parts: []Part{{InlineData: image, ThoughtSignature: "sig"}, {Text: "好了"}}},
+				{Role: RoleAssistant, Parts: []Part{{InlineData: video, ThoughtSignature: "sig"}, {Text: "好了"}}},
 				{Role: RoleUser, Parts: []Part{{Text: "动起来"}}},
 			},
-			want: "contents[1] 附件需要账户 Drive 授权",
+			want: "contents[1]: " + videoWant,
 		},
 		{
-			name: "模型消息结尾的内联附件",
+			name: "模型消息结尾的内联视频",
 			contents: []Content{
 				{Role: RoleUser, Parts: []Part{{Text: "画"}}},
-				{Role: RoleAssistant, Parts: []Part{{InlineData: image}}},
+				{Role: RoleAssistant, Parts: []Part{{InlineData: video}}},
 			},
-			want: "contents[1] 附件需要账户 Drive 授权",
+			want: "contents[1]: " + videoWant,
 		},
 		{
 			name: "模型外部地址",
@@ -96,7 +131,7 @@ func TestInteractionModelAttachmentErrors(t *testing.T) {
 				{Role: RoleAssistant, Parts: []Part{{ExternalMedia: &ExternalMedia{MIME: "image/png", URL: "https://images.example.net/a.png"}}, {Text: "好"}}},
 				{Role: RoleUser, Parts: []Part{{Text: "动起来"}}},
 			},
-			want: "contents[1] 只接受文本与用户附件 part",
+			want: "contents[1]: this model only accepts inline or uploaded image and video input; external URLs are not supported",
 		},
 	} {
 		_, _, _, err := encodeInteractionSteps(test.contents)

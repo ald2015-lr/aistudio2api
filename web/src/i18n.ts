@@ -492,6 +492,9 @@ const zhCN = {
   'app.ultraWorkersDetail':
     'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 不可调度 {unschedulable} · 预热目标 {target} · 峰值 {max}',
   'app.authRecheckLine': '登录复核 · 疑似失效 {suspects} · 10分钟新增需要登录 {recent} · 坏号 {bad}',
+  'app.driveLine': 'Drive 授权 · 可用 {available} · 不可用 {unavailable} · 未知 {unknown}',
+  'app.driveDetail':
+    '启用账户的 Google Drive 授权状态：可用为换到过 Drive token 或经本服务登录时完成了 Drive 授权，不可用为没有 Drive 授权（多半是只导入 Cookie 的账户），未知为还没试过。gemini-omni 的视频输入（及无法转为 PNG 的图片）要先上传到账户的 Drive，只交给可用或未知的账户，只剩不可用的账户时返回 400；PNG、JPEG 图片按官网直接内联发送（GIF 转为 PNG），不需要 Drive，任何账户都能处理。经本服务的登录流程登录（账户页“登录”或“添加账户”）会完成官网的 Drive 授权，随即记为可用。可用、不可用各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，重启后沿用；更新认证文件后重新探测，管理验证通过时清除不可用记录',
   'app.authRecheckDetail':
     '上游 401 先记疑似登录失效、冷却 5 分钟，用磁盘 Cookie 复核仍是 401 才标需要登录；按接口判定需要登录的账户每 15 分钟低速复核一轮，通过即恢复；浏览器判定未登录的（管理验证判定未登录、Worker 启动时跳到登录页）不复核，需要重新登录或更新认证文件。最近一小时：排除 {cleared}、确认 {confirmed}、恢复 {recovered}、仍失效 {invalid}。坏号为连续裸限流的账号，2 小时内不参与预热与替补',
   'app.catalogSyncPaused': '目录同步暂停到 {time}（{reason}）',
@@ -1419,6 +1422,10 @@ const en: Record<TranslationKey, string> = {
   'app.ultraWorkersDetail':
     'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · {unschedulable} unschedulable · prewarm target {target} · limit {max}',
   'app.authRecheckLine': 'Login recheck · {suspects} suspected · {recent} new login-required in 10 min · {bad} bad accounts',
+  'app.driveLine':
+    'Drive access · {available} available · {unavailable} unavailable · {unknown} unknown',
+  'app.driveDetail':
+    "Google Drive authorization of enabled accounts: available accounts have obtained a Drive token or completed Drive authorization when signing in through this service, unavailable accounts have no Drive authorization (usually accounts imported with cookies only), unknown accounts have not been tried yet. Video input for gemini-omni (and images that cannot be converted to PNG) is uploaded to the account's Drive first, so it only goes to available or unknown accounts, and returns 400 when only unavailable accounts are left; PNG and JPEG images are sent inline like the website does (GIF is converted to PNG), need no Drive and work on any account. Signing an account in through this service's login flow (Login or Add account on the Accounts page) completes the website's Drive authorization and marks the account available. Both states are kept for 24 hours in runtime/model-catalogs/drive-accounts.json and survive a restart; updating the auth file probes the account again, and a passing admin verification clears the unavailable record",
   'app.authRecheckDetail':
     'An upstream 401 first marks the login as suspected (5-minute cooldown); it is rechecked with the saved cookies and only marked as login-required if it is still 401. Accounts marked login-required by the API are rechecked every 15 minutes and restored when the recheck passes; accounts the browser found logged out (an admin verification found no login, or a worker start landed on the sign-in page) are not rechecked and need a new login or an updated auth file. Last hour: {cleared} cleared, {confirmed} confirmed, {recovered} recovered, {invalid} still invalid. Bad accounts kept getting bare rate limits and are left out of prewarm and replacements for 2 hours',
   'app.catalogSyncPaused': 'Catalog sync paused until {time} ({reason})',

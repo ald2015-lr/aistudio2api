@@ -106,6 +106,12 @@ func publicErrorFor(err error, model string) publicError {
 		}
 		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: buildUnavailable.PublicMessage()}
 	}
+	// Interaction 模型（gemini-omni）的视频输入（及无法转为 PNG 的图片）需要已授权 Google Drive 的账号：号池里没有可用账号、指定账号没有授权时为
+	// 400 FAILED_PRECONDITION，换号次数用完为 503；英文说明原样返回，不换成通用的参数错误措辞
+	var driveRequired *aistudio.DriveRequiredError
+	if errors.As(err, &driveRequired) {
+		return publicError{Status: driveRequired.HTTPStatus(), RPC: driveRequired.RPCStatus(), Message: driveRequired.PublicMessage()}
+	}
 	// 兜底：Build 的 PROXY_GENERATION_DISABLED（400）不按请求本身的参数错误透给客户端
 	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
 		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialBuildDisabledMessage}

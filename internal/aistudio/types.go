@@ -22,6 +22,11 @@ const (
 type Blob struct {
 	MIME string `json:"mime"`
 	Data []byte `json:"data"`
+	// SourceGIF 为协议层把客户端内联的 GIF 首帧转成 PNG 时（Data 为转出的 PNG，见 api 层 normalizeImagePayload）留下的原 GIF，不序列化：
+	// Interaction 模型把这张 PNG 与本服务层转换的 GIF 一同计入单次请求的转换额度，超出时换回原 GIF、按需要 Drive 处理
+	// （见 PrepareInteractionImages）；其他模型只用 MIME 与 Data，与原先相同。只用于本次请求：存入 Responses 与 Interactions 的
+	// 续接状态时去掉（见 api 层 dropSourceGIF），续接历史里的这张 PNG 按普通 PNG 处理
+	SourceGIF []byte `json:"-"`
 }
 
 // ExternalMedia 表示可由 AI Studio 直接读取的外部媒体
@@ -120,6 +125,12 @@ type Part struct {
 	SpeechMetadata      *SpeechMetadata      `json:"speech_metadata,omitempty"`
 	// FromToolResult 标记从工具结果中取出的媒体，整理对话时会移到工具结果之后的用户消息里
 	FromToolResult bool `json:"-"`
+	// RestoredLink 标记从回传历史里本服务的媒体链接（含指向它的 fileData 与外部地址）恢复出来的媒体（见 api 层 restoreMediaLinks；
+	// 最后一条用户消息里的不算，与客户端直接带的附件相同），RestoredText 为恢复前的链接文本（同一条消息里已有这处媒体的文本链接时为空）。
+	// Interaction 模型（gemini-omni）的视频与无法转为 PNG 的图片要上传到账号的 Drive（PNG、JPEG 直接内联），需要 Drive 只是因为这类
+	// 恢复媒体、号池又没有可用的 Drive 授权账号时，换回链接文本发送（与恢复之前相同），不让请求失败
+	RestoredLink bool   `json:"-"`
+	RestoredText string `json:"-"`
 }
 
 // SpeechMetadata 表示语音文本分段的说话人与风格

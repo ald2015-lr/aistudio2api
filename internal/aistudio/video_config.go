@@ -305,8 +305,22 @@ func checkVideoFrameRate(frameRate float64, listed []string) error {
 	return fmt.Errorf("video frame_rate %s is not supported; this model only supports %s", strconv.FormatFloat(frameRate, 'f', -1, 64), strings.Join(names, ", "))
 }
 
-// interactionHasModelTurn 判断对话中是否有会编码为模型 step 的模型消息，与 encodeInteractionSteps 的规则一致：
-// 只有附件（移到随后的用户 step）或只有思考的模型消息不算
+// InteractionHasModelTurn 判断对话中是否有模型轮次（规则同 interactionHasModelTurn）：有时不能指定视频任务。
+// 协议层据此在多轮对话里忽略模型名后缀指定的视频任务（见 api.applyOmniVideoAlias）
+func InteractionHasModelTurn(contents []Content) bool {
+	return interactionHasModelTurn(contents)
+}
+
+// VideoTaskName 返回统一写法的视频任务名（小写，去掉 VIDEO_TASK_ 前缀）；空串、unspecified 与 auto（官网 Unspecified）返回空串
+func VideoTaskName(value string) string {
+	return videoTaskValue(value)
+}
+
+// interactionHasModelTurn 判断对话中是否有模型轮次：会编码为模型 step 的模型消息，与 encodeInteractionSteps 的规则一致，只有附件
+// （移到随后的用户 step）或只有思考的模型消息不算；从本服务媒体链接恢复出来、带链接文本的媒体（Part.RestoredLink，RestoredText 非空）
+// 按客户端回传的链接文本算，与没能恢复、换回链接文本（app 层没有可用的 Drive 授权账号时）的结果相同。上一轮回复只有视频链接时
+// （Chat Completions 与 Messages 的 url 模式输出 "[video](…)"，不带前后换行），恢复后只剩视频，原先判为没有模型轮次：后缀任务不被忽略、
+// 显式任务也不返回 400，换回链接文本后生成层又按多轮返回 400，结果随能否恢复与回退变化
 func interactionHasModelTurn(contents []Content) bool {
 	for _, content := range contents {
 		if content.Role != RoleAssistant {
@@ -314,6 +328,8 @@ func interactionHasModelTurn(contents []Content) bool {
 		}
 		for _, part := range content.Parts {
 			switch {
+			case part.RestoredLink && part.RestoredText != "":
+				return true
 			case part.Thought || part.Text == "" && part.ThoughtSignature != "" && part.InlineData == nil && part.File == nil:
 			case part.InlineData != nil || part.File != nil || part.ExternalMedia != nil:
 			default:

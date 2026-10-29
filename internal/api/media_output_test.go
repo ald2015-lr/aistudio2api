@@ -825,7 +825,7 @@ func TestRestoreMediaLinksBudget(t *testing.T) {
 		{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{File: &aistudio.FileRef{ID: largeLink}}, {Text: "![image](" + links[3] + ")"}}},
 	}
 	limit := int64(len(images[3]) + len(images[2]) + len(images[1]) - 1)
-	restoreMediaLinksWithin(store, contents, limit)
+	restoreMediaLinksWithin(store, contents, limit, false)
 	if total, count := inlineBytes(contents); total > limit || count != 2 {
 		t.Fatalf("恢复 %d 字节、%d 个 part，上限 %d", total, count, limit)
 	}
@@ -842,8 +842,9 @@ func TestRestoreMediaLinksBudget(t *testing.T) {
 	}
 }
 
-// interactionEncodingService 像 Interaction 模型的生成一样先把内联附件上传成 Drive 引用（drive 为假时像没有 Drive 授权的账户一样
-// 保留 inline data），再编码 CreateInteractionStream 请求，编码失败时按参数错误返回；记下收到的请求、编码出的请求体与 binding
+// interactionEncodingService 像 Interaction 模型的生成一样先整理图片（GIF 转 PNG，见 aistudio.PrepareInteractionImages），PNG、JPEG 图片
+// 保持内联，视频等需要 Drive 的内联附件上传成 Drive 引用（noDrive 为真时像没有 Drive 授权的账户一样保留 inline data），再编码
+// CreateInteractionStream 请求，编码失败时按参数错误返回；记下收到的请求、编码出的请求体与 binding
 type interactionEncodingService struct {
 	modelListService
 	noDrive bool
@@ -858,12 +859,16 @@ func (service *interactionEncodingService) Generate(_ context.Context, request a
 	copied := request
 	service.last = &copied
 	uploaded := request
-	uploaded.Contents = make([]aistudio.Content, len(request.Contents))
+	prepared, _, err := aistudio.PrepareInteractionImages(context.Background(), request.Contents)
+	if err != nil {
+		return nil, err
+	}
+	uploaded.Contents = make([]aistudio.Content, len(prepared))
 	files := 0
-	for index, content := range request.Contents {
+	for index, content := range prepared {
 		content.Parts = append([]aistudio.Part(nil), content.Parts...)
 		for partIndex, part := range content.Parts {
-			if part.InlineData != nil && !service.noDrive {
+			if aistudio.InteractionDriveMedia(part) && !service.noDrive {
 				files++
 				content.Parts[partIndex] = aistudio.Part{
 					File:             &aistudio.FileRef{ID: fmt.Sprintf("drive-%d", files), MIME: part.InlineData.MIME},
@@ -894,9 +899,9 @@ func (service *interactionEncodingService) Generate(_ context.Context, request a
 const interactionModelMediaIntro = "以下是上文模型回复里的图片或视频："
 
 // TestInteractionHistoryWithModelImage 先用图片模型出图（url 模式下历史里是本服务的图片链接，inline 模式下是 data URI），
-// 再在同一对话里让 Interaction 模型（Omni）“让它动起来”：模型消息里恢复出的图片上传 Drive 后连同说明移到随后的用户 step，
-// 模型能看到这张图；模型 step 只带同一条消息里的文本，binding 与发送的文本一致。账户没有 Drive 授权时与用户附件一样返回 400，
-// 不静默丢掉图片
+// 再在同一对话里让 Interaction 模型（Omni）“让它动起来”：模型消息里恢复出的图片连同说明移到随后的用户 step，按官网内联为
+// Content field 2 [1, Base64]（不上传 Drive），模型能看到这张图；模型 step 只带同一条消息里的文本，binding 与发送的文本一致。
+// 账户没有 Drive 授权时同样内联发送成功，不再返回 400
 func TestInteractionHistoryWithModelImage(t *testing.T) {
 	service := &interactionEncodingService{}
 	handler, dir := newMediaHandler(t, service, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
@@ -906,7 +911,7 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 	}
 	imageLink := "https://ai.example.com/media/" + imageName
 	encodedImage := base64.StdEncoding.EncodeToString(testImage)
-	movedFile := `[[["` + interactionModelMediaIntro + `"]],[null,null,null,null,null,null,null,null,["drive-1"]],[["让它动起来"]]]`
+	movedImage := `[[["` + interactionModelMediaIntro + `"]],[null,[1,"` + encodedImage + `"]],[["让它动起来"]]]`
 	wantBinding := `[{"role":"user","parts":[{"text":"画一只猫"}]},{"role":"assistant","parts":[{"text":"\n"}]},` +
 		`{"role":"user","parts":[{"text":"` + interactionModelMediaIntro + `"},{"text":"让它动起来"}]}]`
 
@@ -924,8 +929,8 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 		if got := describeParts(service.last.Contents[1].Parts); strings.Join(got, "|") != "inline:image/png:"+sha256Hex(testImage)[:8]+"|text:\n" {
 			t.Fatalf("%s: 模型消息里的图片链接应照常恢复: %q", method, got)
 		}
-		if !strings.Contains(string(service.body), movedFile) || strings.Contains(string(service.body), encodedImage) {
-			t.Fatalf("%s: 模型消息里的图片应以 Drive 引用放在随后的用户 step 最前面: %s", method, service.body)
+		if !strings.Contains(string(service.body), movedImage) || strings.Contains(string(service.body), "drive-") {
+			t.Fatalf("%s: 模型消息里的图片应内联放在随后的用户 step 最前面、不上传 Drive: %s", method, service.body)
 		}
 		if got := mustJSONText(t, service.binding); got != wantBinding {
 			t.Fatalf("%s: binding = %s", method, got)
@@ -942,23 +947,25 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 	if recorder.Code != http.StatusOK || service.body == nil {
 		t.Fatalf("Chat inline 图片历史: %d %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(string(service.body), movedFile) {
-		t.Fatalf("Chat: 模型消息里的图片应放在随后的用户 step 最前面: %s", service.body)
+	if !strings.Contains(string(service.body), movedImage) {
+		t.Fatalf("Chat: 模型消息里的图片应内联放在随后的用户 step 最前面: %s", service.body)
 	}
 	if got := mustJSONText(t, service.binding); got != `[{"role":"user","parts":[{"text":"画一只猫"}]},`+
 		`{"role":"user","parts":[{"text":"`+interactionModelMediaIntro+`"},{"text":"让它动起来"}]}]` {
 		t.Fatalf("只有图片的模型消息应整条省略、图片移到随后的用户 step，binding = %s", got)
 	}
 
-	// 账户没有 Drive 授权：与用户附件一样明确返回 400（原因写进请求日志）
+	// 账户没有 Drive 授权：图片照样内联发送成功
 	service.noDrive = true
-	recorder = postJSON(t, handler, "/v1beta/models/gemini-omni-1.1-flash:generateContent", mustJSONText(t, gemini), nil)
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("没有 Drive 授权时应返回 400: %d %s", recorder.Code, recorder.Body.String())
-	}
-	recorder = postJSON(t, handler, "/v1/chat/completions", mustJSONText(t, chat), nil)
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("Chat 没有 Drive 授权时应返回 400: %d %s", recorder.Code, recorder.Body.String())
+	for _, request := range []struct{ path, body string }{
+		{path: "/v1beta/models/gemini-omni-1.1-flash:generateContent", body: mustJSONText(t, gemini)},
+		{path: "/v1/chat/completions", body: mustJSONText(t, chat)},
+	} {
+		service.body = nil
+		recorder = postJSON(t, handler, request.path, request.body, nil)
+		if recorder.Code != http.StatusOK || !strings.Contains(string(service.body), movedImage) {
+			t.Fatalf("%s: 没有 Drive 授权时图片应照样内联发送: %d %s", request.path, recorder.Code, recorder.Body.String())
+		}
 	}
 }
 
@@ -983,6 +990,14 @@ func TestInteractionContinuationWithModelVideo(t *testing.T) {
 	if got := mustJSONText(t, service.binding); got != `[{"role":"user","parts":[{"text":"做个视频"}]},{"role":"assistant","parts":[{"text":"视频好了"}]},`+
 		`{"role":"user","parts":[{"text":"`+interactionModelMediaIntro+`"},{"text":"让它更长"}]}]` {
 		t.Fatalf("binding = %s", got)
+	}
+
+	// 账户没有 Drive 授权：视频仍要先上传 Drive（官网发送视频同样先传 Drive），不内联，按参数错误返回 400 的英文说明
+	service.noDrive = true
+	recorder = postJSON(t, handler, "/v1beta/interactions",
+		fmt.Sprintf(`{"model":"gemini-omni-1.1-flash","previous_interaction_id":%q,"input":"再长一点"}`, first["id"]), nil)
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "video and file input for this model must be uploaded to Google Drive first") {
+		t.Fatalf("没有 Drive 授权时视频应按需要 Drive 返回 400: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

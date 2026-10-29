@@ -5,6 +5,8 @@
 # 组织停用 AI Studio 的账户（Google Workspace 账号所属组织关闭了 AI Studio，载入时跳到 access.workspace.google.com）：状态段显示
 # 现在的账户数，启动失败原因里单独归类（新旧两种文案），并统计“账号所属组织已停用 AI Studio，停止调度”的来源
 # 官网停用 Build 通道的生成（PROXY_GENERATION_DISABLED）：状态段显示 Build 通道是否全局暂停、开始与下次试探时间、暂停中与等待试探的账号数
+# Google Drive 授权：状态段显示启用账户中 Drive 可用、不可用与未知的账户数（gemini-omni 的视频输入及无法转为 PNG 的图片只交给可用或未知的账户，
+#   PNG、JPEG 图片直接内联发送，不需要 Drive）
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
 #
@@ -67,6 +69,15 @@ if a:
     org = a.get("org_disabled")
     print(f"账户：共 {a.get('total')}，就绪 {a.get('ready')}，忙碌 {a.get('busy')}，冷却 {a.get('cooldown')}，需要登录 {a.get('auth_required')}，"
           f"组织已停用 AI Studio {'-' if org is None else org}")
+# drive 为启用账户的 Google Drive 授权状态（gemini-omni 的视频输入及无法转为 PNG 的图片只交给可用或未知的账户）；程序版本较旧时没有这个字段
+drive = d.get("drive")
+if isinstance(drive, dict):
+    available, unavailable, unknown = (drive.get(key) or 0 for key in ("available", "unavailable", "unknown"))
+    hint = "；没有可用或未知的账户，gemini-omni 的视频输入（及无法转为 PNG 的图片）会返回 400，PNG、JPEG 图片不受影响（经本服务的登录流程登录可完成 Drive 授权）" \
+        if available + unknown == 0 and unavailable > 0 else ""
+    print(f"Drive 授权：可用 {available}，不可用 {unavailable}，未知 {unknown}{hint}")
+else:
+    print("Drive 授权：-（程序版本较旧）")
 print(f"预热：进行中 {p.get('active')}，在途 {p.get('inflight')}，本轮已启动 {p.get('launched')}，本轮已 {p.get('round_seconds')} 秒，原因 {p.get('reason') or '-'}")
 u = d.get("ultra_workers") or {}
 if u:
