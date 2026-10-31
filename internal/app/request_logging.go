@@ -26,7 +26,7 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		InputMedia: entry.InputMedia, InputMediaBytes: entry.InputMediaBytes, InputFiles: entry.InputFiles,
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
-		Channel: entry.Channel, Pool: entry.Pool,
+		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect,
 	}
 	if entry.Generation {
 		data.Parameters = map[string]string{
@@ -95,7 +95,24 @@ func upstreamFinishLog(reason string, message string) (string, string) {
 	return level, "上游结束说明 | 结束原因=" + reason + " | 说明=" + message
 }
 
-// finishedRequestLog 投影请求结果日志，失败且没有错误信息时记录 HTTP 状态
+// finishReasonAdvice 为需要写清原因与建议的上游结束原因返回一行管理日志，其余原因返回空串。客户端经 new-api 等中转时只看到
+// content_filter 或空回复（中转把不认识的结束原因一律当作内容拦截），原因只能在这里看
+func finishReasonAdvice(reason string) string {
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "missing_thought_signature":
+		return "上游以缺少思考签名结束（MISSING_THOUGHT_SIGNATURE） | 原因=历史里的函数调用没有带回上一轮的思考签名" +
+			"（中转丢掉了签名、客户端改写了调用，或服务重启后本服务记的签名已不在）" +
+			" | 建议=让客户端或中转原样回传 functionCall 的 thoughtSignature（OpenAI 格式为 extra_content.google.thought_signature）；" +
+			"经 new-api 时保留调用 ID 原样回传，本服务按调用 ID 还原本进程签发的签名（服务重启后还原不到）"
+	case "too_many_tool_calls":
+		return "上游以工具调用过多结束（TOO_MANY_TOOL_CALLS） | 原因=模型在这一轮连续或并行调用工具的次数超过上游上限" +
+			" | 建议=减少一次回复内的工具调用（限制客户端的检索轮数、合并工具或缩小每次返回的结果），或在提示词里要求先根据已有结果作答"
+	default:
+		return ""
+	}
+}
+
+// finishedRequestLog 投影请求结果日志，失败且没有错误信息时记录 HTTP 状态；取消的请求在摘要后附上断开现场（见 disconnectSummary）
 func finishedRequestLog(entry api.AccessLog) (*api.RequestLog, string, string) {
 	data := requestLogData(entry)
 	state, level, message := requestOutcome(entry)
@@ -103,7 +120,64 @@ func finishedRequestLog(entry api.AccessLog) (*api.RequestLog, string, string) {
 	if state == "failed" && data.Error == "" {
 		data.Error = fmt.Sprintf("HTTP %d", entry.Status)
 	}
+	if state == "cancelled" && entry.Disconnect != nil {
+		message += " | " + disconnectSummary(entry.Disconnect)
+	}
 	return data, level, message
+}
+
+// disconnectSummary 为取消请求的断开现场：谁断开、断开阶段、是否已提交响应头（提交后多久断开）、已写出多少、最后一次写出（含心跳）、
+// 最后一次写出中转会转发的数据与上游最近一次事件距断开多久。
+// 例："客户端断开 | 阶段=首事件前 | 响应头=已提交（断开前 9.8s） | 已写出=2 块 312 B | 距最近写出=9.8s | 距最近数据=9.8s | 距上游最近事件=无 | 已用时=20s"；
+// 写响应头后 1 秒内断开时末尾另附“写响应头后立即断开（经中转时多为下游在响应头之前已断开）”（见 RequestDisconnect.RightAfterHeaders）
+func disconnectSummary(disconnect *api.RequestDisconnect) string {
+	who := "客户端断开"
+	if disconnect.Initiator != "client" {
+		who = "服务端取消（管理端取消请求或服务停止、重启）"
+	}
+	phase := "首事件前"
+	if disconnect.Phase == "mid_stream" {
+		phase = "流中"
+	}
+	headers := "未提交"
+	if disconnect.HeadersSent {
+		headers = "已提交"
+		if since := disconnect.SinceHeadersSentMS; since != nil {
+			headers += "（断开前 " + formatLogMS(*since) + "）"
+		}
+	}
+	data := "无"
+	if since := disconnect.SinceLastDataWriteMS; since != nil {
+		data = formatLogMS(*since)
+	}
+	upstream := "无"
+	if since := disconnect.SinceUpstreamEventMS; since != nil {
+		upstream = formatLogMS(*since)
+	}
+	summary := fmt.Sprintf("%s | 阶段=%s | 响应头=%s | 已写出=%d 块 %s | 距最近写出=%s | 距最近数据=%s | 距上游最近事件=%s | 已用时=%s",
+		who, phase, headers, disconnect.WrittenChunks, formatLogBytes(disconnect.WrittenBytes),
+		formatLogMS(disconnect.SinceLastWriteMS), data, upstream, formatLogMS(disconnect.ElapsedMS))
+	if disconnect.RightAfterHeaders {
+		summary += " | 写响应头后立即断开（经中转时多为下游在响应头之前已断开）"
+	}
+	return summary
+}
+
+// formatLogMS 把毫秒写成管理日志里的时长（秒，保留一位小数）
+func formatLogMS(ms float64) string {
+	return (time.Duration(ms * float64(time.Millisecond))).Round(100 * time.Millisecond).String()
+}
+
+// formatLogBytes 把字节数写成管理日志里的大小
+func formatLogBytes(bytes int64) string {
+	switch {
+	case bytes >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(bytes)/(1<<20))
+	case bytes >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(bytes)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
 }
 
 // RecordAccessLog 保存请求结果日志

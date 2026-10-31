@@ -611,7 +611,12 @@ Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于�
 | Anthropic | `thinking` 或 `redacted_thinking` block 的 `signature` | thinking block 的 `signature` |
 | Gemini | 数据 Part 或独立 Part 的 `thoughtSignature` | Part 的 `thoughtSignature` |
 
-OpenAI Chat 的 assistant tool call 未带 `extra_content` 时，服务按调用 ID、函数名和参数补回本进程最近签发的签名；查不到时写入 `skip_thought_signature_validator`。
+OpenAI Chat 与 Gemini GenerateContent 共用一份本进程签发的函数调用签名（流式与非流式输出函数调用时登记，保留最近 4096 条）。每条都带作用域：请求的目录模型名（带后缀的别名解析为目录模型名）、号池与本服务 API key 的摘要，三者都相同才还原，另一个模型的签名可能被上游拒绝。作用域分不出对话：经 new-api 等中转时所有终端用户共用本服务的同一把 API key，所以只按调用 ID 还原。下一轮带回的调用签名缺失、为 new-api 的占位值 `context_engineering_is_the_way_to_go`（new-api 回程丢掉 `thoughtSignature`，下一轮给每条 assistant 消息的第一个 `functionCall` 写它）或 `skip_thought_signature_validator` 时补回真签名，同时改写 Part 与函数调用上的签名（编码时 Part 上的签名优先）：
+
+- 只按“调用 ID + 函数名”还原：本服务补发的 `call_local_*`（进程内唯一）参数被改写也认，其他 ID 要求规范化参数（键排序、数值按通用写法，空参数与 `null` 同 `{}`）一致。Gemini 只给并行调用的第一个签名，其余调用登记为“已签发、没有签名”，还原时保持缺失；ID 查不到（服务重启、已淘汰、客户端改写了 ID）时同样保持原样。
+- 不带 ID 的调用不还原，照原样发送占位值或跳过校验值。不按“函数名 + 参数”去找：不同用户问同一件事、同一段对话里重复检索同一关键词时，同名同参的调用很常见，按它还原会把别的对话、别的轮次的签名套上来（上游拒绝，或把另一位用户那一轮的思考上下文带进本对话）。new-api 原样带回本服务输出的调用 ID，主场景不受影响。
+
+客户端带回的真实签名不动，还原不到时保持原样（占位值照原样发送，缺失时写 `skip_thought_signature_validator`）。还原的个数写进排查记录。上游对“签名无效”没有已确认的错误形状，不做退回占位值的重试。
 
 Anthropic redacted thinking block 以 `data` 承载同一份不透明状态；适配器在输入与输出两侧保留该值。正文块打开时单独到达的签名（流式与非流式）先暂存，正文块结束后按到达顺序输出为 `redacted_thinking`，与上一个相同的签名只输出一次，正文不会被切成多个文本块；随后是不带签名的工具调用时排在该调用之后输出（紧挨在 `tool_use` 前的 `redacted_thinking` 回传时会成为该调用的签名）。正文分片自带的签名不输出。
 
@@ -708,7 +713,7 @@ frame 0 为 null 且带 prompt feedback 时表示上游拒绝当前输入（Buil
 | `stop_sequence` | `stop` | `completed` | `stop_sequence` 与实际序列 | `STOP` |
 | `max_tokens` | `length` | `incomplete/max_output_tokens` | `max_tokens` | `MAX_TOKENS` |
 | 内容拦截：`safety`、`recitation`、`blocklist`、`prohibited_content`、`spii`、`image_safety`、`image_prohibited_content`、`image_recitation` | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举 |
-| 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举或 `OTHER` |
+| 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举（`MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`TOO_MANY_TOOL_CALLS`、`MISSING_THOUGHT_SIGNATURE` 等官方枚举名，`missing_thought_signature` 原先报成 `OTHER`）或 `OTHER` |
 
 内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
 
@@ -859,7 +864,7 @@ Schema 归一化规则：
 | array 缺少 `items` | `prefixItems` 中带类型的项组成 `anyOf`；没有时为 string |
 | 其他 Schema 字段 | 降级编码：只编码层级与类型，完整 Schema 附在说明里（函数参数附在函数说明，结构化输出附在根节点说明；见下文） |
 
-函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道发送 `parametersJsonSchema`，不经过降级，字符串整数与 `TYPE_UNSPECIFIED` 也原样发送，只补齐 `required` 中未定义的属性。
+函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道发送 `parametersJsonSchema`，不经过降级，字符串整数原样发送，只补齐 `required` 中未定义的属性；Gemini 入口 `parameters` 的 OpenAPI 写法（new-api 把 OpenAI 的 parameters 转成 Gemini 请求时就是这种：类型名大写如 `OBJECT`、`STRING`，`nullable`，字符串枚举的 `format: enum`）先转成 JSON Schema：类型名改小写、`TYPE_UNSPECIFIED` 去掉，`nullable:true` 改为类型数组加 `"null"`（没有 `type` 但有 `anyOf` 时补一个 `{"type":"null"}` 分支；带 `enum` 时给 `enum` 补上 `null`，否则 null 不满足 enum、字段实际不可为 null），`format: enum` 去掉、其余 `format` 保留，子 Schema 逐层同样处理；本来就是 JSON Schema 时原样发送。Playground 通道不经过这一步（Schema 编码本来就接受这些写法）。
 
 `required` 补齐在 Playground 编码、Build `parametersJsonSchema` 与 `strict` 参数核对三处一致（核对用补齐后的 Schema，`additionalProperties:false` 时这些必填属性才可能满足，缺少必填属性的调用仍判为不符合）。大小与嵌套检查在前：超过 1 MiB 的 Schema 原样交给原有处理（Playground 返回 400，Build 原样发送）；已处于嵌套上限的节点不补，补齐不会让原本合规的 Schema 超过嵌套上限。不需要补齐时原样发送原始字节；补齐后重新编码，数值保留原写法，键顺序与空白可能变化。
 
@@ -1534,7 +1539,7 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 
 Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理：以模型文字消息结尾的历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（见上文分轮修正）。以工具调用结尾的历史仍按缺少工具结果处理。
 
-流式请求在写出响应头前最多等待首个事件 10 秒（主用模型为对应列表的排队上限加 5 秒与 10 秒中的较大者，按请求的号池取：`/ultra` 上的 `ULTRA_PRIMARY_MODELS` 为 `ULTRA_PRIMARY_QUEUE_WAIT`，普通路径上的 `PRIMARY_MODELS` 为 `PRIMARY_QUEUE_WAIT`，`ULTRA_EXCLUSIVE=false` 时普通路径上只在 Ultra 列表里的模型为 `ULTRA_PRIMARY_QUEUE_WAIT`）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、Ultra 主用模型额度不足、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回（号池繁忙的 429 以 HTTP 状态返回同样是尽力而为：排队预算整个请求共用一份，换号重试与退避都计入，通常早于这个等待；Ultra 主用模型的请求自己现场冷启动时，等待按启动时长延后（启动期间不开始推流；合计不超过 `INIT_TIMEOUT`，且从开始等待算起最多 50 秒，等待本来更长时按它），冷启动后才遇到的额度不足通常同样以 HTTP 状态返回；普通号池的主用模型在请求自己现场冷启动或候选冷却延后了截止时间而晚于这个等待时，在流内返回）。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
+流式请求在写出响应头前最多等待首个事件 10 秒（主用模型为对应列表的排队上限加 5 秒与 10 秒中的较大者，按请求的号池取：`/ultra` 上的 `ULTRA_PRIMARY_MODELS` 为 `ULTRA_PRIMARY_QUEUE_WAIT`，普通路径上的 `PRIMARY_MODELS` 为 `PRIMARY_QUEUE_WAIT`，`ULTRA_EXCLUSIVE=false` 时普通路径上只在 Ultra 列表里的模型为 `ULTRA_PRIMARY_QUEUE_WAIT`）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、Ultra 主用模型额度不足、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回（号池繁忙的 429 以 HTTP 状态返回同样是尽力而为：排队预算整个请求共用一份，换号重试与退避都计入，通常早于这个等待；Ultra 主用模型的请求自己现场冷启动时，等待按启动时长延后（启动期间不开始推流；合计不超过 `INIT_TIMEOUT`，且从调用生成服务算起扣住响应头合计不超过 50 秒，主用模型的等待本身超过 50 秒时也按 50 秒，见本节后面的“首个事件之前扣住响应头”），冷启动后才遇到的额度不足通常同样以 HTTP 状态返回；普通号池的主用模型在请求自己现场冷启动或候选冷却延后了截止时间而晚于这个等待时，在流内返回）。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
 
 四套生成入口共享同一规范请求，输入映射如下：
 
@@ -1995,10 +2000,12 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | text/thought | `text`、可选 `thought`、`thoughtSignature` |
 | inline data | `inlineData:{mimeType,data}` |
 | file data | `fileData:{mimeType?,fileUri,displayName?}`；`fileUri` 必需，`mimeType` 可省略 |
-| function call | `functionCall:{id,name,args}` |
-| function response | `functionResponse:{id,name,response}` |
+| function call | `functionCall:{id,name,args}`；`args` 缺省或为 `null` 按 `{}` |
+| function response | `functionResponse:{id,name?,response,parts?}`；`name` 可以为空（按调用 ID 或唯一待返回的调用补名），`response` 为 `null` 按 `{}`，`parts` 为附带的媒体（`inlineData` 或 `fileData`） |
 | executable code | `executableCode:{language,code}` |
 | code result | `codeExecutionResult:{outcome,output,error}` |
+
+函数结果的媒体与 OpenAI 入口一致拆分：`functionResponse.response` 里以 base64 内嵌的图片与文件（`{"result":[…]}`，即 new-api 把 OpenAI 的数组结果转成 Gemini 时的包装；`{"content":[…]}`，即 MCP 工具结果；内容块的写法见 OpenAI Chat 一节）与 `functionResponse.parts` 的媒体作为真正的媒体附在这组工具结果之后的用户消息里，结果原位置换成文字说明。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果 JSON>` 文字说明（名称为空时写 `(<调用 ID>)`），这一轮改为用户消息；各协议都经过同一步。
 
 `fileData.fileUri` 指向本服务 `/media/<文件名>` 且文件仍保存着时，用户消息里的恢复为内联媒体，模型消息里的只恢复图片（见下文“生成媒体链接”），不按已上传文件查找。`fileData` 省略 `mimeType` 时（官方 Files API 的 `fileUri` 自带类型）按 `displayName` 的扩展名推断，推断不出再按 `fileUri` 路径（URL 取 path，不含查询参数）的扩展名推断，仍推断不出时留空；本服务上传的文件按文件 ID 发送，不依赖这里的类型，YouTube 等外部媒体 URL 按外部媒体处理。缺少 `fileUri` 时返回 400。
 
@@ -2105,7 +2112,7 @@ tool group 字段：
 
 `modelVersion` 为请求的模型名去掉 `-low`、`-128`、`-nothinking` 等后缀（与 OpenAI、Anthropic、Responses、Interactions 的 `model` 一致），流式的每一帧相同，不换成上游报告的实际服务模型版本；实际服务的模型与请求的不是同一系列时，管理日志另记 `served_model`（同一系列的版本号差异不记录）。
 
-`:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`）。两种格式的心跳都是一个空行：JSON 数组元素之间的空白不影响解析，SSE 中的空行不构成事件，官方 SDK 与 new-api 都直接跳过。SSE 不使用 `: ping` 注释帧：google-genai Python SDK 把不以 `data: ` 开头的行当作分行的 JSON 错误体拼接解析，注释行会让整个流报 `UnknownApiResponseError`。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage`（与非流式相同，上游给出的结束说明优先，见第 5 节“Finish 与错误”）和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
+`:streamGenerateContent` 与官方一致：带 `alt=sse` 时使用 SSE，不带时返回逐块写出的 JSON 数组（`application/json`）。开启数据型心跳（`STREAM_DATA_HEARTBEAT`，默认开启，官方 SDK 直连时除外）时 SSE 每次心跳都写一块空候选块（首个事件还没到就提交响应头时，提交时也写一块） `{"candidates":[{"content":{"parts":[{"text":""}],"role":"model"},"index":0}],"modelVersion":…,"responseId":…}`（上一块是思考时 part 为 `{"text":"","thought":true}`），不带 `finishReason` 与 `usageMetadata`；new-api 把它转成空增量转发给它的客户端，空行则被它丢弃。JSON 数组格式与关闭时的 SSE 心跳都是一个空行：JSON 数组元素之间的空白不影响解析，SSE 中的空行不构成事件，官方 SDK 与 new-api 都直接跳过。SSE 不使用 `: ping` 注释帧：google-genai Python SDK 把不以 `data: ` 开头的行当作分行的 JSON 错误体拼接解析，注释行会让整个流报 `UnknownApiResponseError`。每个语义事件发送一个部分 `GenerateContentResponse`，包含 `responseId`、`modelVersion` 与一个 candidate Part、grounding 或 citation；最后一帧包含 candidate `finishReason`、可选 `finishMessage`（与非流式相同，上游给出的结束说明优先，见第 5 节“Finish 与错误”）和 `usageMetadata`。响应头后的错误以 `{"error":{"code","message","status"}}` 作为一帧（SSE 的 `data:` 或数组元素）发出。
 
 ### Files、Transcribe 与媒体
 
@@ -2338,13 +2345,23 @@ setup 之后的客户端对象统一字段为 `type`、可选 `text`、`mime_typ
 
 上游语义事件间隔达到 10 秒时，各流式协议发送心跳并立即 flush：
 
-| 协议 | 心跳 |
-| --- | --- |
-| OpenAI Chat、OpenAI Responses、Gemini Interactions | SSE 注释帧 `: ping` |
-| Anthropic | 官方 ping 事件 `event: ping` 加 `data: {"type":"ping"}`；Anthropic SDK 识别并跳过，new-api 按官方事件转发 |
-| Gemini `:streamGenerateContent`（SSE 与 JSON 数组） | 一个空行 |
+| 协议 | 心跳（`STREAM_DATA_HEARTBEAT=true`，默认） | 关闭时 |
+| --- | --- | --- |
+| OpenAI Chat | 空 delta 块：`id`、`model`、`created` 与本流一致，`choices[0].delta` 为 `{}`，`finish_reason` 为 `null`（`include_usage` 时带 `"usage":null`） | SSE 注释帧 `: ping` |
+| OpenAI Responses、Gemini Interactions | SSE 注释帧 `: ping`（事件都有官方语义并带序号或步骤，没有客户端会忽略的空数据事件） | 同左 |
+| Anthropic | 官方 ping 事件 `event: ping` 加 `data: {"type":"ping"}`；Anthropic SDK 识别并跳过，new-api 按官方事件转发 | 同左 |
+| Gemini `:streamGenerateContent` SSE | 空候选块（part 为空文本，上一块是思考时为空思考）；首个事件还没到就提交响应头时，提交时另写一块。官方 SDK 直连（`x-goog-api-client` 带 `google-genai-sdk/`、`genai-py/`、`genai-js/` 或 `gl-python/`）时与关闭时相同 | 一个空行 |
+| Gemini `:streamGenerateContent` JSON 数组 | 一个空行 | 同左 |
 
-OpenAI Chat 先发送 assistant role chunk，Responses 先发送 `response.created` 与 `response.in_progress`，Anthropic 先发送 `message_start`；这些起始事件在账户调度期间即可到达客户端。Gemini 的首个帧来自上游语义事件，之前只有心跳空行。
+new-api 等中转逐行读取上游 SSE，只转发 `data:` 行，并且在收到第一条 data 之前不给它的客户端写任何字节：空行与 `: ping` 只能保住本服务到中转这一段，数据型心跳能一直传到中转后面 OpenAI 格式的客户端（Gemini 空候选块被转成 `delta.content=""` 或 `delta.reasoning_content=""` 的空增量，与 new-api 自己在流开头写的 role 块同形；没有 `finishReason`，不会被当成回复结束）。Claude 格式的客户端经 new-api 时，提交响应头时写的第一块心跳会让 new-api 先写出 `message_start`（new-api 收到第一条 data 时先补一个起始块，Claude 格式由它生成 `message_start`），之后的空心跳块在转换时被丢弃，流中保活仍要靠 new-api 自己的 ping。new-api 的 OpenAI 渠道落后一块转发（收到下一条 data 才把上一条写给它的客户端），所以首个事件还没到就提交响应头时，OpenAI Chat 在 role 块之后立刻再写一块空 delta，把 role 块顶出去；首个事件已到时不另写。
+
+数据型心跳会改变 new-api 的首字时间统计：new-api 在收到第一条 data 时记首字时间，首个事件晚于响应头等待时，它日志里的首字时间与模型性能的 TTFT、生成速度反映的是本服务提交响应头（写出第一块心跳）的时刻，约 10–15 秒，而不是真实首字；真实首字时间看本服务请求日志的 `first_event_ms`。数据型心跳还会改变 new-api 的计费：new-api 每读到一条 data 都计一次上游响应（心跳块也算），流结束时没有带 token 的 `usageMetadata`（客户端断开、流被截断）且已收到过 data 时，按估算的输入 token 计费；原先首个事件之前只有换行心跳、没有 data，这类请求计 0。开启后，首个事件之前就断开的请求在 new-api 里按估算的输入计费（第 4 轮工具调用约 16k token，重试 6 次约 96k）。介意时可以关闭 `STREAM_DATA_HEARTBEAT`，只依赖 new-api 的 ping。
+
+官方 SDK 直连时 Gemini SSE 不写数据型心跳：直连不经过只转发 data 行的中转，换行心跳就能保活，也不再多写一种 SDK 判为无效的块。google-genai Python 的 chats 对流里每一块做 `_validate_response`：没有 `content` 的块都判为无效（1.55 与 2.34 相同），1.55 及以前还把 text 为 `""` 的 part（不论是不是思考）判为无效（2.x 不再这样判）；`send_message_stream` 里任一块无效，这一轮就不写进精选对话历史。本服务 Gemini SSE 的结束块只带 `finishReason` 与 `usageMetadata`、没有 `content`，所以官方 SDK 的 chats 流式这一轮本来就不记历史，换行回退并不能保住对话历史，根因在结束块的形状（与心跳无关，另行处理）。经 new-api 的 Gemini 原生格式中转时，new-api 原样转发 data、默认也不透传 `x-goog-api-client`，中转后面的官方 SDK 同样会收到空心跳块。
+
+OpenAI Chat 先发送 assistant role chunk，Responses 先发送 `response.created` 与 `response.in_progress`，Anthropic 先发送 `message_start`；这些起始事件在账户调度期间即可到达客户端。Gemini 在首个事件还没到就提交响应头时先写一块空候选心跳；首个事件已到（多数请求）时首个帧就是首个事件，流里没有多余的心跳块（关闭数据型心跳或官方 SDK 直连时首个帧总是来自上游语义事件，之前只有心跳空行）。
+
+首个事件之前扣住响应头（首事件前的错误按 HTTP 状态返回）合计不超过 50 秒，从调用生成服务算起：生成服务到时还没返回（降级判定严格模式在判定出结果前不返回）、主用模型的等待（排队上限加 5 秒）超过 50 秒或现场冷启动推迟时，到时都照常提交响应头开始推流，之后的错误在流内返回。处理请求时 panic 不让进程退出：响应头提交前按协议返回官方结构的 500，提交后写完请求日志就中止连接（不写正常的流结尾），客户端读到意外断开、知道回复不完整（见 [logging.md](logging.md#处理请求时的-panic)）。
 
 Responses 的 `web_search_call` 由实际 grounding query 触发。搜索发生时，SSE 先输出 index 0 的 search call，再输出 index 1 的 message；模型未调用搜索时仅输出 message，并按正文事件逐块发送。上游在正文后失败时，已收到的正文 delta 位于 `response.failed` 之前。
 

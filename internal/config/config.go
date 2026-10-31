@@ -52,6 +52,7 @@ var configKeys = [...]string{
 	"INIT_TIMEOUT",
 	"REQUEST_TIMEOUT",
 	"FIRST_EVENT_TIMEOUT",
+	"STREAM_DATA_HEARTBEAT",
 	"WARM_WORKER_LIMIT",
 	"MAX_ACTIVE_WORKERS",
 	"ULTRA_EXCLUSIVE",
@@ -152,6 +153,11 @@ type Config struct {
 	// FirstEventTimeout 为每次尝试等待首个上游事件的上限：超时只取消这一次尝试并按超时换号重试；0 表示关闭（默认），
 	// 思考很长的模型可能很久才有第一个事件
 	FirstEventTimeout time.Duration `json:"-"`
+	// StreamDataHeartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT，默认开启，保存后立即生效）：每次心跳都写一块中转会按 data 转发、不带内容的
+	// 空数据（Gemini SSE 为空候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 SSE 注释；
+	// 官方 Gemini SDK 直连时 Gemini SSE 仍只写换行（见 api.officialGeminiSDK）。
+	// new-api 等中转丢弃非 data 行，原先心跳传不到中转后面的客户端，首个可转发数据来得慢时客户端那一段连接长时间零字节；关闭时与原先完全一致
+	StreamDataHeartbeat bool `json:"stream_data_heartbeat"`
 	// UltraExclusive 为真（默认）时 Ultra 号池的账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 号池的账户
 	UltraExclusive bool `json:"ultra_exclusive"`
 	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
@@ -198,6 +204,7 @@ func Default() Config {
 		MaxActiveWorkers:       defaultMaxActiveWorkers,
 		UltraExclusive:         true,
 		UltraIncludePro:        false,
+		StreamDataHeartbeat:    true,
 		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
@@ -353,6 +360,12 @@ func Load(path string) (Config, error) {
 	} else {
 		cfg.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
 	}
+	if value, ok := values["STREAM_DATA_HEARTBEAT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.StreamDataHeartbeat, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("STREAM_DATA_HEARTBEAT 必须是 true 或 false")
+		}
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -421,6 +434,7 @@ func (c Config) Save(path string) error {
 		"INIT_TIMEOUT":             c.InitTimeout.String(),
 		"REQUEST_TIMEOUT":          c.RequestTimeout.String(),
 		"FIRST_EVENT_TIMEOUT":      c.FirstEventTimeout.String(),
+		"STREAM_DATA_HEARTBEAT":    strconv.FormatBool(c.StreamDataHeartbeat),
 		"WARM_WORKER_LIMIT":        strconv.Itoa(c.WarmWorkerLimit),
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
 		"ULTRA_EXCLUSIVE":          strconv.FormatBool(c.UltraExclusive),
@@ -616,6 +630,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		InitTimeout            string            `json:"init_timeout"`
 		RequestTimeout         string            `json:"request_timeout"`
 		FirstEventTimeout      string            `json:"first_event_timeout"`
+		StreamDataHeartbeat    bool              `json:"stream_data_heartbeat"`
 		WarmWorkerLimit        int               `json:"warm_worker_limit"`
 		MaxActiveWorkers       int               `json:"max_active_workers"`
 		UltraExclusive         bool              `json:"ultra_exclusive"`
@@ -649,6 +664,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		InitTimeout:            c.InitTimeout.String(),
 		RequestTimeout:         c.RequestTimeout.String(),
 		FirstEventTimeout:      c.FirstEventTimeout.String(),
+		StreamDataHeartbeat:    c.StreamDataHeartbeat,
 		WarmWorkerLimit:        c.WarmWorkerLimit,
 		MaxActiveWorkers:       c.MaxActiveWorkers,
 		UltraExclusive:         c.UltraExclusive,
@@ -686,6 +702,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		InitTimeout            string             `json:"init_timeout"`
 		RequestTimeout         string             `json:"request_timeout"`
 		FirstEventTimeout      string             `json:"first_event_timeout"`
+		StreamDataHeartbeat    *bool              `json:"stream_data_heartbeat"`
 		WarmWorkerLimit        int                `json:"warm_worker_limit"`
 		MaxActiveWorkers       int                `json:"max_active_workers"`
 		UltraExclusive         *bool              `json:"ultra_exclusive"`
@@ -723,7 +740,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理；
-	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）
+	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段时按默认开启处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -761,6 +778,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		InitTimeout:            initTimeout,
 		RequestTimeout:         requestTimeout,
 		FirstEventTimeout:      firstEventTimeout,
+		StreamDataHeartbeat:    value.StreamDataHeartbeat == nil || *value.StreamDataHeartbeat,
 		WarmWorkerLimit:        value.WarmWorkerLimit,
 		MaxActiveWorkers:       value.MaxActiveWorkers,
 		UltraExclusive:         value.UltraExclusive == nil || *value.UltraExclusive,

@@ -101,6 +101,7 @@ func withLocalCallIDs(ctx context.Context, events <-chan aistudio.Event) <-chan 
 	out := make(chan aistudio.Event, 16)
 	go func() {
 		defer close(out)
+		defer recoverEventFilter(ctx, out, events, "补发函数调用 ID")
 		for event := range events {
 			select {
 			case out <- aistudio.AssignLocalCallID(event):

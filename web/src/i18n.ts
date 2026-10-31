@@ -179,6 +179,9 @@ const zhCN = {
   'settings.firstEventTimeout': '首事件超时',
   'settings.firstEventTimeoutHelp':
     '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
+  'settings.streamDataHeartbeat': '数据型流式心跳',
+  'settings.streamDataHeartbeatHelp':
+    '每 10 秒没有输出时写一块空数据（Gemini SSE 为空文本或空思考的候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 SSE 注释。new-api 等中转只转发 data 行，开启后中转后面的客户端在等待首字和长思考时也能持续收到字节，不会因长时间零字节被手机系统、VPN 或代理断开。官方 Gemini SDK 直连时仍只写换行（直连不经过中转，不再多写一种 SDK 判为无效的块）；开启后 new-api 的首字时间统计反映的是写出第一块心跳的时刻，且客户端断开或流被截断、没有用量数据时 new-api 按估算的输入 token 计费（原先计 0）。关闭时与原先完全一致。修改后立即生效，只影响新请求。',
   'settings.warmWorkerLimit': '常驻 Worker 数',
   'settings.maxActiveWorkers': '峰值 Worker 上限',
   'settings.warmStartupConcurrency': '启动预热并发',
@@ -631,7 +634,7 @@ const zhCN = {
     'Playground 通道用上游的累计正文数，速度是精确的（开启后被拦截的模型优先走 Playground）；Build 通道只能按字数估算，估算速度落在模糊区间内时用同一账号调用 CountTokens 精确计算后再判定，超时或失败时按估算判定。CountTokens 超时填 0 表示不调用。',
   'settings.downgradeFastMode': '快速模式',
   'settings.downgradeFastModeHelp':
-    '默认是严格模式：流式请求在判定前不发出任何内容（包括思考），判定为降级时直接返回 HTTP 400（设了最长延后时，只有在时限内判定的才能返回 400）。快速模式从一开始就实时转发思考、只缓存正文，被降级时在流中发送官方格式的错误事件。',
+    '默认是严格模式：流式请求在判定前不发出任何内容（包括思考），最多扣住响应头 50 秒（与首事件前扣住响应头的上限相同），在这之内判定为降级时直接返回 HTTP 400；到 50 秒（设了最长延后时为该时限）还没判定就先返回 200，之后判定为降级时在流中发送错误事件。快速模式从一开始就实时转发思考、只缓存正文，被降级时在流中发送官方格式的错误事件。',
   'settings.downgradeRejectStatus': '拒绝时的返回码',
   'settings.downgradeReject400': '400：按内容策略拦截返回（默认）',
   'settings.downgradeReject503': '503：按服务暂时不可用返回',
@@ -642,7 +645,7 @@ const zhCN = {
     '同一段对话在这段时间内再次请求、且当时的消息原样都在时（重新生成、接着往下聊），发送前直接拒绝；用户改过其中任何一条就重新判定。只有一条消息的对话、以及客户端中途断开的请求不记录。只保存哈希，0 表示不记录。',
   'settings.downgradeMaxHold': '最长延后（毫秒）',
   'settings.downgradeMaxHoldHelp':
-    '默认 0 表示不限：判定前扣住整个思考过程，被降级时一定返回 HTTP 400，但首字要晚整个思考时长。设为正数（例如 3000）时，内容最多被延后这么久：到时限还没判定就先返回 200 并发出已缓存的思考，正文继续缓存，之后判定为降级只能在流中发送错误事件；正文缓存到时限仍未判定则放行，结束时照常复核并统计漏判。',
+    '默认 0 表示扣到判定出结果或 50 秒为止：判定前扣住思考，50 秒内判定为降级时返回 HTTP 400，首字要晚整个思考时长；到 50 秒还没判定时先返回 200 并开始写心跳，之后判定为降级时在流中发送错误事件。设为正数（例如 3000）时，内容最多被延后这么久：到时限还没判定就先返回 200 并发出已缓存的思考，正文继续缓存，之后判定为降级只能在流中发送错误事件；正文缓存到时限仍未判定则放行，结束时照常复核并统计漏判。',
   'settings.invalidDowngradeModels': '开启降级判定时至少要填一个拦截的模型',
   'settings.invalidDowngradeFuzzy': '模糊区间下限不能大于上限',
   'accounts.autoImportHint':
@@ -1097,6 +1100,9 @@ const en: Record<TranslationKey, string> = {
   'settings.firstEventTimeout': 'First event timeout',
   'settings.firstEventTimeoutHelp':
     'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
+  'settings.streamDataHeartbeat': 'Data stream heartbeat',
+  'settings.streamDataHeartbeatHelp':
+    'Write an empty data chunk after every 10 seconds without output (an empty text or empty thought candidate for Gemini SSE, an empty delta chunk for OpenAI Chat), and one more when the streaming response header is sent before the first event, instead of only a newline or an SSE comment. Relays such as new-api forward only data lines, so with this on the clients behind them keep receiving bytes while waiting for the first token or during long thinking and are not dropped by the phone OS, a VPN or a proxy after a long silence. Official Gemini SDKs connecting directly still get newline heartbeats (no relay in between, and no extra chunk the SDK treats as invalid); with this on, new-api reports the first heartbeat as the first-response time, and bills the estimated input tokens when the client disconnects or the stream is cut without usage data (0 before). When off, behavior is exactly as before. Changes apply immediately to new requests only.',
   'settings.warmWorkerLimit': 'Resident workers',
   'settings.maxActiveWorkers': 'Active worker limit',
   'settings.warmStartupConcurrency': 'Startup prewarm concurrency',
@@ -1569,7 +1575,7 @@ const en: Record<TranslationKey, string> = {
     'The Playground channel reports cumulative reply tokens, so its speed is exact (guarded models prefer Playground). The Build channel can only estimate from characters; when the estimate falls inside the uncertain range, CountTokens is called on the same account to measure exactly, and the estimate is used on timeout or failure. A CountTokens timeout of 0 disables the call.',
   'settings.downgradeFastMode': 'Fast mode',
   'settings.downgradeFastModeHelp':
-    'Strict mode (default): streaming requests send nothing, including thinking, until judged, and downgrades get an HTTP 400 (with a maximum delay set, only verdicts reached within it can return 400). Fast mode streams thinking in real time from the start and holds only the reply text; a downgrade is reported as an official error event in the stream.',
+    'Strict mode (default): streaming requests send nothing, including thinking, until judged, and hold the response headers for at most 50 seconds (the same cap as holding the headers before the first event); a downgrade judged within that time gets an HTTP 400. Without a verdict after 50 seconds (or the maximum delay, when set) the 200 response starts, and a later downgrade verdict is reported as an error event in the stream. Fast mode streams thinking in real time from the start and holds only the reply text; a downgrade is reported as an official error event in the stream.',
   'settings.downgradeRejectStatus': 'Status code when rejecting',
   'settings.downgradeReject400': '400: report as blocked by content policy (default)',
   'settings.downgradeReject503': '503: report as temporarily unavailable',
@@ -1580,7 +1586,7 @@ const en: Record<TranslationKey, string> = {
     'Within this time, a request for the same conversation that still contains the earlier messages unchanged (regenerate, continue) is rejected before sending; editing any of those messages makes it judged again. Single-message conversations and requests the client abandoned are not remembered. Only hashes are stored; 0 disables this.',
   'settings.downgradeMaxHold': 'Maximum delay (ms)',
   'settings.downgradeMaxHoldHelp':
-    'The default 0 means no limit: all thinking is held until the verdict, so downgrades always get an HTTP 400, but the first token arrives only after the whole thinking phase. With a positive value (for example 3000), content is held at most this long: if there is no verdict in time, the 200 response starts and the held thinking is sent while the reply text stays held, and a later downgrade verdict can only be reported as an error event in the stream. Reply text held this long without a verdict is released, then rechecked at the end and counted as a miss if it was downgraded.',
+    'The default 0 holds until the verdict or for 50 seconds: thinking is held, a downgrade judged within 50 seconds gets an HTTP 400, and the first token arrives only after the whole thinking phase; without a verdict after 50 seconds the 200 response starts with heartbeats, and a later downgrade verdict is reported as an error event in the stream. With a positive value (for example 3000), content is held at most this long: if there is no verdict in time, the 200 response starts and the held thinking is sent while the reply text stays held, and a later downgrade verdict can only be reported as an error event in the stream. Reply text held this long without a verdict is released, then rechecked at the end and counted as a miss if it was downgraded.',
   'settings.invalidDowngradeModels': 'Enter at least one guarded model when the downgrade check is on',
   'settings.invalidDowngradeFuzzy': 'The uncertain range low value cannot exceed the high value',
   'accounts.autoImportHint':

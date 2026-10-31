@@ -302,8 +302,8 @@ func TestAwaitStreamStartHoldBoundedByCredit(t *testing.T) {
 }
 
 // TestAwaitStreamStartHoldMax 推迟写出响应头最多到开始等待后 holdMax：前面的反向代理与中转读不到响应头时按读超时断开（nginx 默认
-// 60 秒），断开还会取消进行中的启动，原先一次 50 秒的冷启动在默认配置的 nginx 后面就成了 504；写出响应头前的等待本来就比 holdMax
-// 长时照旧等满，不因上限提前开始推流
+// 60 秒），断开还会取消进行中的启动，原先一次 50 秒的冷启动在默认配置的 nginx 后面就成了 504。写出响应头前的等待本来就比 holdMax
+// 长时（PRIMARY_QUEUE_WAIT 配得很大）同样到上限就开始推流：原先上限取 max(holdMax, wait)，这种配置下响应头没有上限
 func TestAwaitStreamStartHoldMax(t *testing.T) {
 	if streamStartHoldMax >= 60*time.Second {
 		t.Fatalf("streamStartHoldMax = %s，应短于 nginx 默认的读超时 60 秒", streamStartHoldMax)
@@ -315,7 +315,8 @@ func TestAwaitStreamStartHoldMax(t *testing.T) {
 		t.Fatalf("用时 %s，期望约 %s（推迟上限）", elapsed, holdMax)
 	}
 	const wait = 400 * time.Millisecond
-	if elapsed := awaitHeldStream(t, hold, wait, 100*time.Millisecond); elapsed < wait-10*time.Millisecond || elapsed > wait+time.Second {
-		t.Fatalf("用时 %s，等待本来就比推迟上限长时期望等满 %s", elapsed, wait)
+	const shortMax = 100 * time.Millisecond
+	if elapsed := awaitHeldStream(t, hold, wait, shortMax); elapsed < shortMax-10*time.Millisecond || elapsed >= wait-50*time.Millisecond {
+		t.Fatalf("用时 %s，等待（%s）比推迟上限长时期望到上限 %s 就开始推流", elapsed, wait, shortMax)
 	}
 }

@@ -223,7 +223,7 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 
 | 工具 | Gemini API |
 | --- | --- |
-| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`，JSON Schema 原样发送，只为 `required` 列出而 `properties` 没有定义的属性补上 `{}`（上游否则以 `property is not defined` 拒绝；超过 1 MiB 的 Schema 不补，不需要补齐时发送原始字节，规则见 [protocol.md](protocol.md) 的 Schema 归一化） |
+| 函数声明 | `{"functionDeclarations":[{"name","description?","parametersJsonSchema?"}]}`，JSON Schema 原样发送（OpenAPI 写法的 `parameters`，即类型名大写、`nullable`，先转成 JSON Schema），只为 `required` 列出而 `properties` 没有定义的属性补上 `{}`（上游否则以 `property is not defined` 拒绝；超过 1 MiB 的 Schema 不补，不需要补齐时发送原始字节，规则见 [protocol.md](protocol.md) 的 Schema 归一化） |
 | Google Search、Image Search | `{"googleSearch":{...}}`；请求 Image Search 时带 `searchTypes {imageSearch, webSearch?}`；时间范围写 `timeRangeFilter {startTime, endTime}`（RFC 3339 UTC） |
 | Code Execution | `{"codeExecution":{}}` |
 | URL Context | `{"urlContext":{}}` |

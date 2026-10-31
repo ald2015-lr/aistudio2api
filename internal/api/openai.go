@@ -169,7 +169,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIInvalid(w, err)
 		return
 	}
-	s.thoughtSignatures.Restore(generateRequest.Contents)
+	s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
@@ -181,7 +181,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	request.Model = responseModel(generateRequest)
 	generateRequest.Stream = request.Stream
 	// 首个事件前的错误按非流式返回 HTTP 状态，不再先回 200 再在流里报错（见 generate）
-	events, err := s.generate(r.Context(), generateRequest)
+	events, eventReady, err := s.generateStream(r.Context(), generateRequest)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeOpenAIRequestError(w, err)
@@ -191,7 +191,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	events = withHiddenReasoning(r.Context(), events, hideThought)
 	created := time.Now().Unix()
 	if request.Stream {
-		s.streamChatCompletion(w, r, request, requestID, created, events)
+		// 隐藏思维链时首个事件（思考）在过滤中被丢掉：按首个事件没到处理，提交时照样写一块心跳（见 handleGeminiGenerate）
+		s.streamChatCompletion(w, r, request, requestID, created, events, eventReady && !hideThought)
 		return
 	}
 	result, err := consumeEvents(r.Context(), events, nil)
@@ -201,7 +202,7 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.thoughtSignatures.Remember(result.toolCalls)
+	s.thoughtSignatures.Remember(s.thoughtSignatureScope(r.Context(), generateRequest.Model), result.toolCalls)
 	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, result, s.mediaOutputFor(r)))
 }
 
@@ -792,13 +793,26 @@ func buildChatCompletion(id string, created int64, model string, result generati
 	return response
 }
 
-func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, request chatRequest, id string, created int64, events <-chan aistudio.Event) {
+// streamChatCompletion 输出 OpenAI Chat 流式响应；eventReady 为写出响应头前已收到首个事件（见 generateStream）
+func (s *server) streamChatCompletion(
+	w http.ResponseWriter, r *http.Request, request chatRequest, id string, created int64, events <-chan aistudio.Event, eventReady bool,
+) {
 	if err := streamHeaders(w); err != nil {
 		return
 	}
 	if err := writeChatChunk(w, id, created, request.Model, map[string]any{"role": "assistant", "content": ""}, nil, request.StreamOptions.IncludeUsage); err != nil {
 		return
 	}
+	dataHeartbeat := s.config.streamDataHeartbeat()
+	heartbeat := chatHeartbeat(w, dataHeartbeat, id, created, request.Model, request.StreamOptions.IncludeUsage)
+	if dataHeartbeat && !eventReady {
+		// 首个事件还没到就提交了响应头：紧跟 role 块再写一块空 delta。new-api 的 OpenAI 渠道落后一块转发（relay-openai.go 的 OaiStreamHandler
+		// 收到下一条 data 时才把上一条写给它的客户端），不写这一块时 role 块要等到下一次心跳或首个事件才到它的客户端
+		if err := heartbeat(); err != nil {
+			return
+		}
+	}
+	signatureScope := s.thoughtSignatureScope(r.Context(), request.Model)
 	toolIndex := 0
 	hasContent := false
 	contentEndsWithNewline := false
@@ -816,7 +830,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 				return nil
 			}
 			call := event.ToolCall
-			s.thoughtSignatures.Remember([]aistudio.FunctionCall{*call})
+			s.thoughtSignatures.Remember(signatureScope, []aistudio.FunctionCall{*call})
 			toolCall := map[string]any{
 				"index": toolIndex,
 				"id":    call.ID,
@@ -857,7 +871,7 @@ func (s *server) streamChatCompletion(w http.ResponseWriter, r *http.Request, re
 			return writeChatChunk(w, id, created, request.Model, map[string]any{"content": content}, nil, request.StreamOptions.IncludeUsage)
 		}
 		return nil
-	}), func() error { return writeSSEHeartbeat(w) })
+	}), heartbeat)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = writeSSE(w, "", openAIStreamError(w, err))

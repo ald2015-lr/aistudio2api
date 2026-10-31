@@ -50,6 +50,7 @@ type EditableKey =
   | 'init_timeout'
   | 'request_timeout'
   | 'first_event_timeout'
+  | 'stream_data_heartbeat'
   | 'warm_worker_limit'
   | 'max_active_workers'
   | 'ultra_exclusive'
@@ -86,6 +87,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'init_timeout',
   'request_timeout',
   'first_event_timeout',
+  'stream_data_heartbeat',
   'warm_worker_limit',
   'max_active_workers',
   'ultra_exclusive',
@@ -212,6 +214,7 @@ const form = reactive<ServiceConfig>({
   init_timeout: '2m',
   request_timeout: '5m',
   first_event_timeout: '0s',
+  stream_data_heartbeat: true,
   warm_worker_limit: 5,
   max_active_workers: 10,
   ultra_exclusive: true,
@@ -1087,6 +1090,22 @@ onBeforeUnmount(() => {
           autocomplete="off"
         />
         <span class="mt-2 block text-xs text-gray-500">{{ t('settings.firstEventTimeoutHelp') }}</span>
+      </label>
+
+      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <input
+          v-model="form.stream_data_heartbeat"
+          class="mt-0.5 h-4 w-4 accent-blue-500"
+          type="checkbox"
+        />
+        <span>
+          <span class="block text-sm font-medium text-gray-300">{{
+            t('settings.streamDataHeartbeat')
+          }}</span>
+          <span class="mt-1 block text-xs text-gray-500">{{
+            t('settings.streamDataHeartbeatHelp')
+          }}</span>
+        </span>
       </label>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-4">

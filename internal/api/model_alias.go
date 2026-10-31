@@ -347,6 +347,12 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 	}
 	go func() {
 		defer cache.refreshing.Store(false)
+		// 后台刷新里 panic：记下后保留旧快照，不让进程退出
+		defer func() {
+			if value := recover(); value != nil {
+				_ = recoveredPanic(context.Background(), "后台刷新别名模型目录", value)
+			}
+		}()
 		ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(context.Background(), scope), 2*time.Minute)
 		defer cancel()
 		models, err := s.service.Models(ctx)
@@ -479,6 +485,7 @@ func withHiddenReasoning(ctx context.Context, events <-chan aistudio.Event, hide
 	out := make(chan aistudio.Event, 16)
 	go func() {
 		defer close(out)
+		defer recoverEventFilter(ctx, out, events, "隐藏思维链")
 		for event := range events {
 			if event.Kind == aistudio.EventReasoning {
 				switch {

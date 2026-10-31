@@ -847,3 +847,145 @@ func dropRequired(schema map[string]json.RawMessage, removed []string) error {
 func isJSONLiteral(raw json.RawMessage, literal string) bool {
 	return bytes.Equal(bytes.TrimSpace(raw), []byte(literal))
 }
+
+// openAPISchemaAsJSONSchema 把 Gemini API 的 OpenAPI 方言 Schema（functionDeclarations[].parameters：类型名大写如 OBJECT、STRING，
+// nullable、format: enum 等）转成 JSON Schema，供 Build 通道的 parametersJsonSchema 使用。new-api 等中转把 OpenAI 的 parameters
+// 转成 Gemini 请求时就是这种写法，原样放进 parametersJsonSchema 时上游按 JSON Schema 解读，大写类型名不是合法的 JSON Schema 类型。
+// 规则：类型名改小写（TYPE_UNSPECIFIED 去掉）；nullable:true 改为类型数组加 "null"（没有 type 但有 anyOf 时加一个 {"type":"null"} 分支），
+// nullable 字段去掉；字符串的 format: enum（OpenAPI 方言里只表示有 enum）去掉，其余 format 保留；properties、items、anyOf 等子 Schema 逐层同样处理。
+// 本来就是 JSON Schema（小写类型、没有 nullable）时返回原值，不重新编码；超过大小上限或无法解析时原样返回。Playground 通道不经过这里
+func openAPISchemaAsJSONSchema(raw json.RawMessage) json.RawMessage {
+	if len(raw) > maxSchemaBytes {
+		return raw
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	// 保留数值原文，重新编码时不改变 minimum、maximum 等取值的写法
+	decoder.UseNumber()
+	var schema any
+	if decoder.Decode(&schema) != nil || decoder.More() {
+		return raw
+	}
+	if !openAPINodeAsJSONSchema(schema, 0) {
+		return raw
+	}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return raw
+	}
+	return encoded
+}
+
+// openAPINodeAsJSONSchema 转换一个节点及其子节点，返回是否修改；depth 为当前嵌套层数，超过 maxSchemaDepth 的节点不处理
+func openAPINodeAsJSONSchema(value any, depth int) bool {
+	schema, ok := value.(map[string]any)
+	if !ok || depth > maxSchemaDepth {
+		return false
+	}
+	changed := false
+	switch typed := schema["type"].(type) {
+	case string:
+		lower := strings.ToLower(strings.TrimSpace(typed))
+		if lower == "type_unspecified" {
+			delete(schema, "type")
+			changed = true
+		} else if _, known := openAPITypeNames[lower]; known && lower != typed {
+			schema["type"] = lower
+			changed = true
+		}
+	case []any:
+		for index, item := range typed {
+			if name, isString := item.(string); isString {
+				if lower := strings.ToLower(strings.TrimSpace(name)); lower != name {
+					if _, known := openAPITypeNames[lower]; known {
+						typed[index] = lower
+						changed = true
+					}
+				}
+			}
+		}
+	}
+	if nullable, exists := schema["nullable"]; exists {
+		delete(schema, "nullable")
+		changed = true
+		if flag, isBool := nullable.(bool); isBool && flag {
+			addNullType(schema)
+			// JSON Schema 里 null 还要满足 enum：OpenAPI 的 nullable 加 enum 表示可以为 null（new-api 的 OpenAPISchemaToJSONSchema 同样给 enum 补 null），
+			// 不补时字段实际变成不可为 null
+			if values, isArray := schema["enum"].([]any); isArray && !enumHasNull(values) {
+				schema["enum"] = append(values, nil)
+			}
+		}
+	}
+	if format, isString := schema["format"].(string); isString && strings.EqualFold(format, "enum") {
+		delete(schema, "format")
+		changed = true
+	}
+	for key, child := range schema {
+		switch key {
+		case "properties", "$defs", "definitions", "patternProperties":
+			if children, isObject := child.(map[string]any); isObject {
+				for _, nested := range children {
+					changed = openAPINodeAsJSONSchema(nested, depth+1) || changed
+				}
+			}
+		case "items", "additionalProperties", "not", "propertyNames":
+			if children, isArray := child.([]any); isArray {
+				for _, nested := range children {
+					changed = openAPINodeAsJSONSchema(nested, depth+1) || changed
+				}
+				continue
+			}
+			changed = openAPINodeAsJSONSchema(child, depth+1) || changed
+		case "anyOf", "oneOf", "allOf", "prefixItems":
+			if children, isArray := child.([]any); isArray {
+				for _, nested := range children {
+					changed = openAPINodeAsJSONSchema(nested, depth+1) || changed
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// enumHasNull 判断 enum 的取值里是否已有 null
+func enumHasNull(values []any) bool {
+	for _, value := range values {
+		if value == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// openAPITypeNames 为 OpenAPI 方言与 JSON Schema 共有的类型名（小写）
+var openAPITypeNames = map[string]struct{}{
+	"string": {}, "number": {}, "integer": {}, "boolean": {}, "array": {}, "object": {}, "null": {},
+}
+
+// addNullType 让节点接受 null：type 为字符串时改为 [type, "null"]，为数组时补上 "null"；没有 type 时给 anyOf 补一个 null 分支，
+// 两者都没有时不限类型，本来就接受 null
+func addNullType(schema map[string]any) {
+	switch typed := schema["type"].(type) {
+	case string:
+		if typed != "null" {
+			schema["type"] = []any{typed, "null"}
+		}
+		return
+	case []any:
+		for _, item := range typed {
+			if item == "null" {
+				return
+			}
+		}
+		schema["type"] = append(typed, "null")
+		return
+	}
+	if variants, isArray := schema["anyOf"].([]any); isArray {
+		for _, variant := range variants {
+			if object, isObject := variant.(map[string]any); isObject && object["type"] == "null" {
+				return
+			}
+		}
+		schema["anyOf"] = append(variants, map[string]any{"type": "null"})
+	}
+}

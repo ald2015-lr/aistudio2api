@@ -287,6 +287,39 @@ type RequestLog struct {
 	ProofMS       float64 `json:"proof_ms,omitempty"`
 	UpstreamBytes int64   `json:"upstream_bytes,omitempty"`
 	Channel       string  `json:"channel,omitempty"`
+	// Disconnect 为请求取消（499、cancelled）时的现场，其余请求没有
+	Disconnect *RequestDisconnect `json:"disconnect,omitempty"`
+}
+
+// RequestDisconnect 为请求取消时的现场：谁取消的、断开在哪个阶段、断开前已经写给客户端多少、多久没有写出、上游多久没有事件。
+// 用来分辨是客户端那一段在等待中被掐断（长时间零字节）、还是数据一直在流时客户端自己走了
+type RequestDisconnect struct {
+	// Initiator 为 client（客户端断开了连接）或 service（客户端没有断开：管理端取消了请求，或服务正在停止、重启）
+	Initiator string `json:"initiator"`
+	// Phase 为 before_first_event（上游首个事件之前断开）或 mid_stream（已收到上游首个事件之后断开）
+	Phase string `json:"phase"`
+	// HeadersSent 为断开前是否已提交响应头（流式请求首个事件前的等待到时也会先提交）
+	HeadersSent bool `json:"headers_sent"`
+	// WrittenBytes、WrittenChunks 为断开前写给客户端的响应体字节数与块数（含心跳，SSE 每个事件算一块）
+	WrittenBytes  int64 `json:"written_bytes"`
+	WrittenChunks int64 `json:"written_chunks"`
+	// SinceLastWriteMS 为最后一次写给客户端（含心跳与响应头）到断开的时长；什么都没写过时从请求进入服务算起。只反映本服务到下一跳
+	// （中转或客户端）这一段：换行与 ": ping" 心跳也算写出，中转会丢掉它们
+	SinceLastWriteMS float64 `json:"since_last_write_ms"`
+	// SinceLastDataWriteMS 为最后一次写出中转会转发的数据（SSE 的 data 行、非 SSE 的响应体内容，含数据型心跳；不含换行与 ": ping"
+	// 注释心跳）到断开的时长，反映中转后面的客户端那一段多久没收到字节；一块数据都没写过时省略
+	SinceLastDataWriteMS *float64 `json:"since_last_data_write_ms,omitempty"`
+	// SinceHeadersSentMS 为提交响应头到断开的时长；没提交时省略。经 new-api 时手机在本服务写响应头之前断开，本服务要到写出响应头
+	// 之后才发现（new-api 发上游请求不绑定手机连接），表现为写响应头后立即断开（这个值接近 0）
+	SinceHeadersSentMS *float64 `json:"since_headers_sent_ms,omitempty"`
+	// RightAfterHeaders 为客户端在提交响应头后 1 秒内断开（与断开阶段无关）。经 new-api 等中转时多为下游在本服务写响应头之前就已断开：
+	// 中转发上游请求不绑定它的客户端连接，收到响应头开始读流时才发现客户端已走，随即关闭到本服务的连接。上游首个事件在等待内就到时，
+	// 响应头随首个事件提交，阶段显示为“流中”，已写出的也可能是首个事件的块而不是心跳
+	RightAfterHeaders bool `json:"right_after_headers,omitempty"`
+	// SinceUpstreamEventMS 为上游最近一次事件到断开的时长；还没有任何上游事件时省略
+	SinceUpstreamEventMS *float64 `json:"since_upstream_event_ms,omitempty"`
+	// ElapsedMS 为请求进入服务到断开的时长
+	ElapsedMS float64 `json:"elapsed_ms"`
 }
 
 // RequestLogUsage 区分输入、思考、回复与端到端输出速率
@@ -339,6 +372,8 @@ type AccessLog struct {
 	Authorized bool
 	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
 	Pool string
+	// Disconnect 为请求取消（状态 499）时的现场，其余请求为 nil
+	Disconnect *RequestDisconnect
 }
 
 // AdminAccountCounts 表示账户状态计数
@@ -456,6 +491,8 @@ type RuntimeConfig struct {
 	UltraIncludePro       *bool `json:"ultra_include_pro,omitempty"`
 	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
 	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
+	// StreamDataHeartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
+	StreamDataHeartbeat *bool `json:"stream_data_heartbeat,omitempty"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS），读取时总是返回（可以为空数组）；
 	// 保存时没有该字段（旧版页面）则沿用现值
 	StreamPlaygroundModels *[]string `json:"stream_playground_models,omitempty"`

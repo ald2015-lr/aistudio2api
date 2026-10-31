@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"regexp"
+	"runtime/debug"
 	"slices"
 	"strings"
 )
@@ -669,6 +671,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	go func() {
 		defer close(events)
 		defer cancelTokenCount()
+		defer recoverDecodePanic(ctx, events, response.Body)
 		stopClose := context.AfterFunc(ctx, func() {
 			_ = response.Body.Close()
 		})
@@ -912,4 +915,27 @@ func nextConversationTurn(contents []Content) int {
 		}
 	}
 	return -1
+}
+
+// recoverDecodePanic 恢复解码上游事件流时的 panic：关闭上游响应体（正常路径在解码后显式关闭，panic 时跳过了那一步，而 ctx 取消时
+// 关闭响应体的 AfterFunc 已先于这里被 defer 停掉），以错误事件结束这次尝试（带栈写进运行日志），不让进程退出。必须直接作为 defer 调用
+func recoverDecodePanic(ctx context.Context, events chan<- Event, body io.Closer) {
+	value := recover()
+	if value == nil {
+		return
+	}
+	if body != nil {
+		_ = body.Close()
+	}
+	err := decodePanicError("解码 AI Studio 事件流", value)
+	select {
+	case events <- Event{Kind: EventError, Err: err}:
+	case <-ctx.Done():
+	}
+}
+
+// decodePanicError 把解码或转发事件的 goroutine 里恢复的 panic 写进运行日志（带栈）并转成错误。必须在 recover 所在的 defer 里调用
+func decodePanicError(where string, value any) error {
+	slog.Error(where+"时 panic，已恢复", "panic", fmt.Sprint(value), "stack", string(debug.Stack()))
+	return fmt.Errorf("%s时发生 panic（已恢复）: %v", where, value)
 }

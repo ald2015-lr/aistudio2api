@@ -322,6 +322,8 @@ func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, reque
 		return nil
 	}
 	bufferWAV := audioFormat == "wav"
+	// 心跳仍为 SSE 注释（不受 STREAM_DATA_HEARTBEAT 影响）：Interactions 的事件（interaction.*、step.*）都有官方语义，没有客户端会忽略的
+	// 空数据事件，空的 step.delta 也必须挂在已开始的步骤上；响应头提交时已写出 interaction.created 一条数据
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
 		if bufferWAV && event.Kind == aistudio.EventMedia && event.Media != nil && strings.HasPrefix(event.Media.MIME, "audio/") {
 			return nil

@@ -497,6 +497,8 @@ export interface RequestLog {
   first_event_ms?: number
   upstream_bytes?: number
   channel?: UpstreamChannel
+  // disconnect 为请求取消（cancelled）时的现场：谁断开、断开阶段、断开前写出的字节与块数、最后一次写出与上游最近一次事件距断开多久
+  disconnect?: RequestDisconnect
   usage?: {
     input_tokens: number
     reasoning_tokens: number
@@ -506,6 +508,25 @@ export interface RequestLog {
     average_tokens_per_second: number
   }
   downgrade?: DowngradeDecision
+}
+
+// RequestDisconnect 对应请求日志里取消请求的断开现场
+export interface RequestDisconnect {
+  initiator: 'client' | 'service'
+  phase: 'before_first_event' | 'mid_stream'
+  headers_sent: boolean
+  written_bytes: number
+  written_chunks: number
+  // 最后一次写出（含换行与 ": ping" 心跳、响应头）到断开的时长
+  since_last_write_ms: number
+  // 最后一次写出中转会转发的数据（data 行、非 SSE 响应体，含数据型心跳）到断开的时长；一块数据都没写过时省略
+  since_last_data_write_ms?: number
+  // 提交响应头到断开的时长；没提交时省略
+  since_headers_sent_ms?: number
+  // 提交响应头后 1 秒内断开（与阶段无关，经中转时多为下游在响应头之前已断开）；为假时省略
+  right_after_headers?: boolean
+  since_upstream_event_ms?: number
+  elapsed_ms: number
 }
 
 export interface Model {
@@ -636,6 +657,9 @@ export interface ServiceConfig {
   request_timeout: string
   // first_event_timeout 为每次尝试等待首个上游事件的上限，0s 表示关闭
   first_event_timeout: string
+  // stream_data_heartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT）：流式心跳写中转会转发的空数据块，保存后立即生效。
+  // 服务端总是返回该字段，因此这里不是可选字段
+  stream_data_heartbeat: boolean
   // warm_worker_limit 与 max_active_workers 只约束普通分区的 Worker
   warm_worker_limit: number
   max_active_workers: number

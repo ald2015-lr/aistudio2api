@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -17,10 +18,33 @@ var errUpstreamStream = errors.New("upstream stream error")
 
 const streamHeartbeatInterval = 10 * time.Second
 
-// streamStartHoldMax 为生成服务现场冷启动推迟写出流式响应头时，从开始等首个事件算起最多等多久（写出响应头前的等待本来就更长时按它）：
-// 推迟期间连接上没有任何字节，前面的反向代理与中转读不到响应头时按读超时断开（nginx 默认 60 秒，Cloudflare 100 秒），断开还会取消
-// 请求与进行中的启动，客户端重试又要从头冷启动。到时照常先回 200 再推流（之后有心跳），启动更久时其后的错误在流内返回
+// heartbeatIntervalOverride 非 0 时代替 streamHeartbeatInterval 作为流式心跳间隔（纳秒），只供测试缩短；写出响应头前的等待不受影响
+var heartbeatIntervalOverride atomic.Int64
+
+// heartbeatInterval 返回流式心跳间隔：上一次输出（事件或心跳）之后这么久没有新事件就写一次心跳
+func heartbeatInterval() time.Duration {
+	if override := heartbeatIntervalOverride.Load(); override > 0 {
+		return time.Duration(override)
+	}
+	return streamHeartbeatInterval
+}
+
+// streamStartHoldMax 为首个事件之前扣住流式响应头的总时长上限，从调用生成服务算起：包括生成服务自己阻塞的时间（降级判定严格模式
+// 等到判定出结果才返回）、写出响应头前的等待（主用模型为排队上限加余量，PRIMARY_QUEUE_WAIT 配得很大时也不超过它）与现场冷启动推迟的等待。
+// 扣住期间连接上没有任何字节，前面的反向代理与中转读不到响应头时按读超时断开（nginx 默认 60 秒，Cloudflare 100 秒），断开还会取消
+// 请求与进行中的启动，客户端重试又要从头冷启动。到时照常先回 200 再推流（之后有心跳），更晚的错误在流内返回
 const streamStartHoldMax = 50 * time.Second
+
+// streamStartHoldMaxOverride 非 0 时代替 streamStartHoldMax 作为 server.generate 扣住响应头的上限（纳秒），只供测试缩短
+var streamStartHoldMaxOverride atomic.Int64
+
+// streamStartHoldLimit 返回 server.generate 扣住流式响应头的总时长上限
+func streamStartHoldLimit() time.Duration {
+	if override := streamStartHoldMaxOverride.Load(); override > 0 {
+		return time.Duration(override)
+	}
+	return streamStartHoldMax
+}
 
 type generationResult struct {
 	events        []aistudio.Event
@@ -128,17 +152,87 @@ func (s *server) streamStartWait(ctx context.Context, model string) time.Duratio
 
 // generate 调用生成服务。流式请求在写出响应头前等首个事件（见 awaitStreamStart）：首个事件前的错误按非流式返回 HTTP 状态，
 // 不先回 200 再在流里报错；交给生成服务的 context 带一份 aistudio.StreamStartHold，生成服务为请求现场冷启动 Worker 时用它推迟
-// 写出响应头（Ultra 主用模型，启动结束后才遇到的额度不足仍以 429 返回；最多推迟到 streamStartHoldMax）。非流式请求原样调用
+// 写出响应头（Ultra 主用模型，启动结束后才遇到的额度不足仍以 429 返回）。从调用生成服务起扣住响应头合计不超过 streamStartHoldMax：
+// 生成服务到时还没返回（降级判定严格模式在判定出结果前不返回）时同样照常开始推流，见 generateWithin。非流式请求原样调用
 func (s *server) generate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
+	events, _, err := s.generateStream(ctx, request)
+	return events, err
+}
+
+// generateStream 与 generate 相同，另返回写出响应头前是否已收到首个事件（eventReady，非流式请求总为假）：已收到时真实数据紧随响应头写出，
+// 协议层不在提交响应头时另写数据型心跳块（见 geminiChunkWriter、chatHeartbeat），快速返回的流里没有心跳块
+func (s *server) generateStream(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, bool, error) {
 	if !request.Stream {
-		return s.service.Generate(ctx, request)
+		events, err := s.service.Generate(ctx, request)
+		return events, false, err
 	}
+	startedAt := time.Now()
+	holdMax := streamStartHoldLimit()
 	ctx = aistudio.WithStreamStartHold(ctx, aistudio.NewStreamStartHold())
-	events, err := s.service.Generate(ctx, request)
+	wait := s.streamStartWait(ctx, request.Model)
+	events, err := generateWithin(ctx, s.service, request, startedAt.Add(holdMax))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return awaitStreamStart(ctx, events, s.streamStartWait(ctx, request.Model))
+	return awaitStreamStartSince(ctx, events, wait, holdMax, startedAt)
+}
+
+// generateWithin 调用生成服务，最多等到 deadline。生成服务按时返回时原样返回它的结果（错误照旧由调用方按 HTTP 状态返回）；
+// 到时还没返回时不再等，返回一个之后才接上的事件流：生成服务随后返回的错误转成流内的错误事件，返回的事件流原样转发。
+// 原先降级判定严格模式在判定出结果前一直不返回，写出响应头前的等待要等它返回后才开始计时，响应头可能扣住几十秒到上游结束。
+// 生成服务在这里 panic 时转成错误（见 recoveredPanic），不让进程退出
+func generateWithin(ctx context.Context, service aistudio.Service, request aistudio.GenerateRequest, deadline time.Time) (<-chan aistudio.Event, error) {
+	type started struct {
+		events <-chan aistudio.Event
+		err    error
+	}
+	done := make(chan started, 1)
+	go func() {
+		var result started
+		defer func() {
+			if value := recover(); value != nil {
+				result = started{err: recoveredPanic(ctx, "调用生成服务", value)}
+			}
+			done <- result
+		}()
+		result.events, result.err = service.Generate(ctx, request)
+	}()
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	select {
+	case result := <-done:
+		return result.events, result.err
+	case <-ctx.Done():
+		// 客户端已断开：生成服务随后返回的事件流照常读完，让生产方正常结束
+		go func() {
+			if result := <-done; result.events != nil {
+				drainEvents(result.events)
+			}
+		}()
+		return nil, ctx.Err()
+	case <-timer.C:
+	}
+	late := make(chan aistudio.Event)
+	go func() {
+		defer close(late)
+		result := <-done
+		if result.err != nil {
+			select {
+			case late <- aistudio.Event{Kind: aistudio.EventError, Err: result.err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		for event := range result.events {
+			select {
+			case late <- event:
+			case <-ctx.Done():
+				drainEvents(result.events)
+				return
+			}
+		}
+	}()
+	return late, nil
 }
 
 // awaitStreamStart 在写出流式响应头前最多等待 wait 等首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
@@ -149,13 +243,22 @@ func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event, wait ti
 	return awaitStreamStartWithin(ctx, events, wait, streamStartHoldMax)
 }
 
-// awaitStreamStartWithin 与 awaitStreamStart 相同，推迟写出响应头最多到开始等待后 holdMax（不早于 wait）
+// awaitStreamStartWithin 与 awaitStreamStart 相同，推迟写出响应头最多到开始等待后 holdMax
 func awaitStreamStartWithin(ctx context.Context, events <-chan aistudio.Event, wait time.Duration, holdMax time.Duration) (<-chan aistudio.Event, error) {
-	hold := aistudio.StreamStartHoldFromContext(ctx)
-	holdMax = max(holdMax, wait)
 	// 起点在创建计时器之前取（单调时钟）：没有延长时计时器第一次到期就判定为已到
-	startedAt := time.Now()
-	timer := time.NewTimer(wait)
+	stream, _, err := awaitStreamStartSince(ctx, events, wait, holdMax, time.Now())
+	return stream, err
+}
+
+// awaitStreamStartSince 与 awaitStreamStartWithin 相同，等待与上限都从 startedAt（调用生成服务的时刻）算起。等待本身也不超过 holdMax：
+// 原先上限取 max(holdMax, wait)，主用模型的等待（排队上限加 5 秒）在 PRIMARY_QUEUE_WAIT 配到 45 秒以上时没有上限；
+// 排队超限的 429 晚于上限时改在流内返回。eventReady 为返回前已收到首个事件（返回的是重放首个事件的流）；等待到时还没有事件时为假
+func awaitStreamStartSince(
+	ctx context.Context, events <-chan aistudio.Event, wait time.Duration, holdMax time.Duration, startedAt time.Time,
+) (stream <-chan aistudio.Event, eventReady bool, err error) {
+	hold := aistudio.StreamStartHoldFromContext(ctx)
+	wait = min(wait, holdMax)
+	timer := time.NewTimer(max(wait-time.Since(startedAt), 0))
 	defer timer.Stop()
 	// expired 复查等待是否已到：截止时间为 wait 加当前要延长的等待、不超过 holdMax；没到时按它重设计时器，已到时返回 true
 	expired := func() bool {
@@ -167,34 +270,42 @@ func awaitStreamStartWithin(ctx context.Context, events <-chan aistudio.Event, w
 		return false
 	}
 	var first aistudio.Event
-waiting:
-	for {
+	ok, received := false, false
+	for !received {
 		select {
 		case <-ctx.Done():
 			go drainEvents(events)
-			return nil, ctx.Err()
+			return nil, false, ctx.Err()
 		case <-timer.C:
-			if expired() {
-				return events, nil
+			if !expired() {
+				continue
 			}
 		case <-hold.Changed():
-			if expired() {
-				return events, nil
+			if !expired() {
+				continue
 			}
-		case event, ok := <-events:
-			if !ok {
-				return nil, errIncompleteStream
-			}
-			if event.Kind == aistudio.EventError {
-				go drainEvents(events)
-				if event.Err != nil {
-					return nil, event.Err
-				}
-				return nil, errUpstreamStream
-			}
-			first = event
-			break waiting
+		case first, ok = <-events:
+			received = true
+			continue
 		}
+		// 等待已到：恰好已有事件时仍先按首个事件处理（生成服务很晚才返回时事件往往已在等待），首个事件为错误时照旧按 HTTP 状态返回；
+		// 没有事件时照常开始推流
+		select {
+		case first, ok = <-events:
+			received = true
+		default:
+			return events, false, nil
+		}
+	}
+	if !ok {
+		return nil, false, errIncompleteStream
+	}
+	if first.Kind == aistudio.EventError {
+		go drainEvents(events)
+		if first.Err != nil {
+			return nil, false, first.Err
+		}
+		return nil, false, errUpstreamStream
 	}
 	replay := make(chan aistudio.Event)
 	go func() {
@@ -209,7 +320,7 @@ waiting:
 			}
 		}
 	}()
-	return replay, nil
+	return replay, true, nil
 }
 
 func drainEvents(events <-chan aistudio.Event) {
@@ -242,7 +353,7 @@ func consumeEventsWithHeartbeat(
 	var heartbeatTimer *time.Timer
 	var heartbeatTick <-chan time.Time
 	if heartbeat != nil {
-		heartbeatTimer = time.NewTimer(streamHeartbeatInterval)
+		heartbeatTimer = time.NewTimer(heartbeatInterval())
 		heartbeatTick = heartbeatTimer.C
 		defer heartbeatTimer.Stop()
 	}
@@ -256,7 +367,7 @@ func consumeEventsWithHeartbeat(
 			default:
 			}
 		}
-		heartbeatTimer.Reset(streamHeartbeatInterval)
+		heartbeatTimer.Reset(heartbeatInterval())
 	}
 	for {
 		select {
@@ -329,13 +440,17 @@ func finishFiltered(reason string) bool {
 // 原先整个工具结果都按 JSON 发送，图片的 base64 会变成一大串文字：模型看不到图片，
 // 输入 token 也会暴涨，连续读取两张图片基本必然超过上限而报错。
 // 支持 OpenAI（image_url / input_image 的 data URL）、Anthropic（image + base64 source）、
-// MCP（image + data + mimeType）格式，以及 MCP 工具结果对象 {"content": [...]}。
+// MCP（image + data + mimeType）格式，以及包在对象里的内容块：MCP 工具结果对象 {"content": [...]}，
+// new-api 把 OpenAI 格式的数组结果转成 Gemini 时的 {"result": [...]}。
 // 取出的图片在原位置替换为文字说明；网络地址形式的图片保持原样
 func splitFunctionResultMedia(raw json.RawMessage) (json.RawMessage, []aistudio.Part, error) {
 	return splitFunctionResultMediaDepth(raw, 0)
 }
 
-// functionResultMediaMaxDepth 为沿 {"content": ...} 向内查找附件的最大层数。真实工具结果（MCP 的 {"content":[...]}）只有一两层；
+// functionResultMediaWrappers 为对象形式的工具结果里可能包着内容块的字段，按顺序查找
+var functionResultMediaWrappers = []string{"content", "result"}
+
+// functionResultMediaMaxDepth 为沿 {"content": ...}、{"result": ...} 向内查找附件的最大层数。真实工具结果（MCP 的 {"content":[...]}）只有一两层；
 // 每层都要重新解析并复制剩余的 JSON，不设上限时几千层嵌套的请求体会让 CPU 与内存按层数平方增长。更深的部分原样按 JSON 发送
 const functionResultMediaMaxDepth = 8
 
@@ -349,15 +464,24 @@ func splitFunctionResultMediaDepth(raw json.RawMessage, depth int) (json.RawMess
 		if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
 			return raw, nil, nil
 		}
-		content, exists := object["content"]
-		if !exists {
+		var media []aistudio.Part
+		for _, key := range functionResultMediaWrappers {
+			value, exists := object[key]
+			if !exists {
+				continue
+			}
+			cleaned, extracted, err := splitFunctionResultMediaDepth(value, depth+1)
+			if err != nil {
+				return raw, nil, err
+			}
+			if len(extracted) > 0 {
+				object[key] = cleaned
+				media = append(media, extracted...)
+			}
+		}
+		if len(media) == 0 {
 			return raw, nil, nil
 		}
-		cleaned, media, err := splitFunctionResultMediaDepth(content, depth+1)
-		if err != nil || len(media) == 0 {
-			return raw, nil, err
-		}
-		object["content"] = cleaned
 		encoded, err := json.Marshal(object)
 		if err != nil {
 			return nil, nil, err

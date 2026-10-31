@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
@@ -27,11 +28,12 @@ const prefillContinuationPrompt = "Continue exactly from where your previous mes
 //     保证工具结果那一轮只有工具结果、数量与调用一致
 //   - 历史以模型的文字消息结尾（SillyTavern 等的预填充、"继续"续写）：在最后补一条请模型接着写的用户消息。
 //     否则上游返回 400 "Requests ending with a model turn are not supported"
+//   - 历史开头（任何函数调用之前）的工具结果没有对应的调用：改写成文字说明，见 orphanResultsAsText
 //
-// 只调整分轮，不改动任何内容与思考签名；返回修正后的历史与修正次数
+// 除开头的孤立工具结果外只调整分轮，不改动任何内容与思考签名；返回修正后的历史与修正次数
 func normalizeTurns(contents []aistudio.Content) ([]aistudio.Content, int) {
+	contents, fixes := orphanResultsAsText(contents)
 	result := make([]aistudio.Content, 0, len(contents)+2)
-	fixes := 0
 	// pendingMedia 为当前这组工具结果中取出的图片，这组工具结果结束后放进紧随其后的用户消息
 	var pendingMedia []aistudio.Part
 	flushMedia := func(next *aistudio.Content) {
@@ -88,6 +90,52 @@ func normalizeTurns(contents []aistudio.Content) ([]aistudio.Content, int) {
 		fixes++
 	}
 	return result, fixes
+}
+
+// orphanResultsAsText 把历史开头（任何函数调用之前）的工具结果改写成文字说明。这些结果没有对应的调用（客户端或中转截断上下文时
+// 把调用那一轮裁掉了，new-api 这时发出的 functionResponse 也没有名称），原样发给上游会被拒绝，名称也补不上。
+// 写法与 Anthropic 入口渲染服务端工具历史的方式一致："Tool result <名称>: <结果 JSON>"；这一轮整个改为用户消息，
+// 结果里取出的媒体留在原处（已经在用户消息里）。不改动传入的切片，返回改写后的历史与改写的结果数
+func orphanResultsAsText(contents []aistudio.Content) ([]aistudio.Content, int) {
+	rewritten := 0
+	copied := false
+	for index, content := range contents {
+		if hasFunctionCall(content) {
+			break
+		}
+		if !hasFunctionResult(content) {
+			continue
+		}
+		if !copied {
+			contents = append([]aistudio.Content(nil), contents...)
+			copied = true
+		}
+		parts := make([]aistudio.Part, 0, len(content.Parts))
+		for _, part := range content.Parts {
+			if result := part.FunctionResult; result != nil {
+				parts = append(parts, aistudio.Part{Text: orphanResultText(*result)})
+				rewritten++
+				continue
+			}
+			part.FromToolResult = false
+			parts = append(parts, part)
+		}
+		contents[index] = aistudio.Content{Role: aistudio.RoleUser, Parts: parts}
+	}
+	return contents, rewritten
+}
+
+// orphanResultText 为孤立工具结果的文字说明：名称为空时用调用 ID
+func orphanResultText(result aistudio.FunctionResult) string {
+	label := result.Name
+	if label == "" && result.ID != "" {
+		label = "(" + result.ID + ")"
+	}
+	content := strings.TrimSpace(string(result.Content))
+	if label == "" {
+		return "Tool result: " + content
+	}
+	return "Tool result " + label + ": " + content
 }
 
 // toolMediaIntro 放在工具结果图片与文件之前的说明

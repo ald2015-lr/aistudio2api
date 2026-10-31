@@ -4232,7 +4232,9 @@ func (service *trackedService) Generate(ctx context.Context, request aistudio.Ge
 
 // startGenerate 开始一次生成并立即返回事件流。被拦截的模型在流式严格模式下还返回 wait：调用方在不持有任何锁时调用它，
 // 等到降级判定出结果（判定为降级时返回拒绝错误，见 downgrade_guard.go）
-func (service *trackedService) startGenerate(ctx context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, func() error, error) {
+func (service *trackedService) startGenerate(
+	ctx context.Context, request aistudio.GenerateRequest,
+) (stream <-chan aistudio.Event, waitFn func() error, startErr error) {
 	generationStartedAt := time.Now()
 	// trace 只在 /trace/ 排查路由的请求上存在，主路由为 nil（所有记录方法都是空操作）
 	trace := aistudio.TraceFromContext(ctx)
@@ -4338,6 +4340,25 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 		return nil, nil, err
 	}
 	service.requests.start(ctx, request, cancel)
+	// 登记之后的步骤（文件资源刷新、开始降级判定）panic 时：取消请求并转成错误返回（协议层按 500 返回），没交给 generateWithRetry 时
+	// 按失败结束登记，不留下一条一直“进行中”的请求登记、不泄漏请求上下文；已交给它时它在请求取消后自己结束登记
+	handedOff := false
+	defer func() {
+		value := recover()
+		if value == nil {
+			return
+		}
+		startErr = service.recoveredPanic(request.ID, "service", "开始生成", value)
+		stream, waitFn = nil, nil
+		cancel()
+		if !handedOff {
+			api.SetAccessLogError(requestCtx, startErr)
+			service.requests.finish(request.ID, "failed", startErr)
+		}
+	}()
+	if hook := startGeneratePanicHook.Load(); hook != nil {
+		(*hook)(request.ID)
+	}
 	resourceID, err := service.pool.ResourceIDForContents(requestCtx, request.Contents)
 	if err != nil {
 		// 文件资源刷新属于首事件前：期限到期时同样标明是本服务的首事件前期限
@@ -4352,6 +4373,7 @@ func (service *trackedService) startGenerate(ctx context.Context, request aistud
 	events := make(chan aistudio.Event, 8)
 	diag.downgrade = gate
 	go service.generateWithRetry(ctx, requestCtx, cancel, generationStartedAt, request, resourceID, events, diag)
+	handedOff = true
 	if gate == nil {
 		return events, nil, nil
 	}
@@ -4370,6 +4392,47 @@ func (service *trackedService) generateWithRetry(
 	diag *generationDiagnostics,
 ) {
 	trace := aistudio.TraceFromContext(requestCtx)
+	var lease *aistudio.AccountLease
+	var source <-chan aistudio.Event
+	// finishAttempt 为成功尝试的上下文取消函数，事件流转发结束后调用
+	var finishAttempt context.CancelCauseFunc
+	var temporaryCopies *aistudio.TemporaryFileCopies
+	// forwarding 为已交给 forwardEvents：它一进入就注册了自己的恢复与清理，负责释放租约并关闭事件流
+	forwarding := false
+	defer func() {
+		value := recover()
+		if value == nil {
+			return
+		}
+		if forwarding {
+			// 只有 forwardEvents 自己的清理里再 panic 才会到这里：记下后返回，不让进程退出
+			_ = service.recoveredPanic(request.ID, "service", "转发结束后清理", value)
+			return
+		}
+		// 换号重试中 panic：把错误交给协议层，取消请求并限时读完这次尝试的事件流后释放持有的租约（与正常路径先读完再释放的顺序相同），
+		// 清理临时文件副本，按失败结束本请求，不让进程退出
+		err := service.recoveredPanic(request.ID, "service", "生成重试", value)
+		api.SetAccessLogError(requestCtx, err)
+		select {
+		case destination <- aistudio.Event{Kind: aistudio.EventError, Err: err}:
+		case <-clientCtx.Done():
+		}
+		cancel()
+		if finishAttempt != nil {
+			finishAttempt(err)
+		}
+		if !drainAttemptEvents(source, attemptDrainTimeout) {
+			service.requests.logRequestProgress(request.ID, "service", "WARN", "生成重试 panic 后上游事件流未及时结束")
+		}
+		if lease != nil {
+			_ = lease.Release()
+		}
+		if temporaryCopies != nil {
+			_ = temporaryCopies.Cleanup()
+		}
+		service.requests.finish(request.ID, "failed", err)
+		close(destination)
+	}()
 	// scope 为请求可以使用的号池：换号、文件复制与通道回退都只在这个号池内进行
 	scope := aistudio.PoolScopeFromContext(requestCtx)
 	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，各方法按原来的整段期限处理
@@ -4387,13 +4450,8 @@ func (service *trackedService) generateWithRetry(
 			maxAttempts = eligible
 		}
 	}
-	var lease *aistudio.AccountLease
-	var source <-chan aistudio.Event
 	var first aistudio.Event
 	var activity *upstreamActivity
-	// finishAttempt 为成功尝试的上下文取消函数，事件流转发结束后调用
-	var finishAttempt context.CancelCauseFunc
-	var temporaryCopies *aistudio.TemporaryFileCopies
 	var err error
 	originalContents := request.Contents
 	// interactionModel：Interaction 模型（gemini-omni，见 aistudio.InteractionModel）的请求带内联附件（没有内联附件时不查模型，与原先相同）。
@@ -5600,6 +5658,7 @@ func (service *trackedService) generateWithRetry(
 		close(destination)
 		return
 	}
+	forwarding = true
 	service.forwardEvents(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
@@ -6013,15 +6072,76 @@ func (service *trackedService) forwardEvents(
 	diag *generationDiagnostics,
 ) {
 	state := "completed"
+	var requestErr error
+	accountLabel := ""
+	var guard *downgradeGate
+	var usage *aistudio.Usage
+	toolCalls := 0
+	// 清理与 panic 恢复最先注册：之后任何一步（含下面取账号、接上降级判定、核对服务模型等前置步骤）panic 都转成错误事件结束本请求，
+	// 照常释放租约、记录结果并关闭事件流，不让进程退出。原先注册在约百行前置步骤之后，前置步骤 panic 时 generateWithRetry 的恢复
+	// 看到已交给本函数就直接返回：租约永久占用、事件流不关闭，协议层一直等（开着数据型心跳时还会一直写心跳）
+	defer cancel()
+	defer func() {
+		if value := recover(); value != nil {
+			if accountLabel == "" {
+				accountLabel = leaseAccountLabel(lease)
+			}
+			requestErr = service.recoveredPanic(requestID, accountLabel, "转发上游事件", value)
+			state = "failed"
+			if activity != nil {
+				api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
+			}
+			api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+			if clientCtx.Err() == nil {
+				select {
+				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: requestErr}:
+				case <-clientCtx.Done():
+				}
+			}
+			// 与正常截断相同：先取消上游并限时读完它的事件流，确认上游 goroutine 退出后再释放租约
+			cancel()
+			if !drainAttemptEvents(source, attemptDrainTimeout) {
+				service.requests.logRequestProgress(requestID, accountLabel, "WARN", "转发 panic 后上游事件流未及时结束")
+			}
+		}
+		if activity != nil {
+			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
+		}
+		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+		if temporaryCopies != nil {
+			if err := temporaryCopies.Cleanup(); err != nil {
+				service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
+			}
+		}
+		if err := lease.Release(); err != nil {
+			state = "failed"
+			requestErr = errors.Join(requestErr, err)
+			if clientCtx.Err() == nil {
+				select {
+				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: err}:
+				case <-clientCtx.Done():
+				}
+			}
+		}
+		if rejection := guard.rejection(); rejection != nil {
+			// 降级判定拒绝了这次回复并取消了上游：记为失败并写明原因，而不是"客户端取消"
+			state, requestErr = "failed", rejection
+		}
+		api.SetAccessLogError(requestCtx, requestErr)
+		service.requests.finish(requestID, state, requestErr)
+		close(destination)
+	}()
+	if hook := forwardEventsPrologueHook.Load(); hook != nil {
+		(*hook)(requestID)
+	}
 	trace := aistudio.TraceFromContext(requestCtx)
 	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，不检查空闲
 	phase := generateContextFrom(requestCtx)
 	replyBytes := 0
-	var requestErr error
 	terminal := false
-	accountLabel := lease.Account().Config.Label
+	accountLabel = lease.Account().Config.Label
 	// 降级判定要知道本次的账号与通道（Build 通道的 CountTokens 在同一账号上计数）
-	guard := diag.guard()
+	guard = diag.guard()
 	guard.attach(lease, requestCtx)
 	// 上游标明的模型：Build 通道前面的内容块沿用请求的模型名，最后一块（含最终用量）报告实际服务的模型，
 	// 所以每次变化都核对；管理日志里的"模型"仍是请求的模型，实际模型另记
@@ -6044,8 +6164,6 @@ func (service *trackedService) forwardEvents(
 	contentEvents := 0
 	// replyDigest 对回复正文计算指纹，用于在诊断中找出内容完全相同的回复（不保存内容本身）
 	replyDigest := sha256.New()
-	var usage *aistudio.Usage
-	toolCalls := 0
 	stalled := false
 	stallTimer := time.NewTimer(streamStallThreshold)
 	if !stallTimer.Stop() {
@@ -6083,6 +6201,20 @@ func (service *trackedService) forwardEvents(
 		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
 	}
 	finishFromContext := func() {
+		if clientCtx.Err() != nil && !terminal {
+			// 下游（客户端或协议层）先结束了：记下断开前上游的状态，配合 request.finished 的断开现场判断是不是长时间零字节后被掐断
+			now := time.Now()
+			upstreamQuiet, elapsed := "无", "-"
+			if !lastEventAt.IsZero() {
+				upstreamQuiet = now.Sub(lastEventAt).Round(time.Millisecond).String()
+			}
+			if phase != nil {
+				elapsed = now.Sub(phase.startedAt).Round(time.Millisecond).String()
+			}
+			service.requests.logRequestProgress(requestID, accountLabel, "WARN", fmt.Sprintf(
+				"下游已断开，结束转发 | 阶段=流中 | 已用时=%s | 距上游最近事件=%s | 最近事件=%s | 推理=%d | 正文=%d | %s",
+				elapsed, upstreamQuiet, lastEventKind, reasoningEvents, contentEvents, activity.logFields(now)))
+		}
 		requestErr = requestCtx.Err()
 		if cause := phase.deadlineCause(); cause != nil {
 			// 本服务的空闲期限或总时长上限：错误写明是哪一段与已输出的事件数，仍满足 context.DeadlineExceeded（对外 504）
@@ -6107,33 +6239,6 @@ func (service *trackedService) forwardEvents(
 		case <-clientCtx.Done():
 		}
 	}
-	defer cancel()
-	defer func() {
-		api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
-		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
-		if temporaryCopies != nil {
-			if err := temporaryCopies.Cleanup(); err != nil {
-				service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
-			}
-		}
-		if err := lease.Release(); err != nil {
-			state = "failed"
-			requestErr = errors.Join(requestErr, err)
-			if clientCtx.Err() == nil {
-				select {
-				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: err}:
-				case <-clientCtx.Done():
-				}
-			}
-		}
-		if rejection := guard.rejection(); rejection != nil {
-			// 降级判定拒绝了这次回复并取消了上游：记为失败并写明原因，而不是"客户端取消"
-			state, requestErr = "failed", rejection
-		}
-		api.SetAccessLogError(requestCtx, requestErr)
-		service.requests.finish(requestID, state, requestErr)
-		close(destination)
-	}()
 	pendingFirst := true
 	verified := false
 	for {
@@ -6208,6 +6313,7 @@ func (service *trackedService) forwardEvents(
 		lastEventAt = now
 		lastProgress = now
 		lastEventKind = string(event.Kind)
+		api.MarkAccessLogUpstreamEvent(requestCtx)
 		trace.RecordEvent(event)
 		switch event.Kind {
 		case aistudio.EventReasoning:
@@ -6258,6 +6364,10 @@ func (service *trackedService) forwardEvents(
 				// 上游对结束原因的说明（如 MALFORMED_FUNCTION_CALL 出错的调用）写进这次请求的管理日志，排查时不用再抓原始响应
 				level, message := upstreamFinishLog(event.FinishReason, event.FinishMessage)
 				service.requests.logRequestProgress(requestID, accountLabel, level, message)
+			}
+			if advice := finishReasonAdvice(event.FinishReason); advice != "" {
+				// 缺少思考签名、工具调用过多：写清原因与建议，客户端经中转只看到 content_filter 或空回复
+				service.requests.logRequestProgress(requestID, accountLabel, "WARN", advice)
 			}
 			if contentEvents > 0 {
 				replyHash := hex.EncodeToString(replyDigest.Sum(nil))[:12]

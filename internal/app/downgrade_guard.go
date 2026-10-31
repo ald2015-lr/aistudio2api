@@ -504,6 +504,7 @@ func (run *downgradeRun) loop(upstream <-chan aistudio.Event) {
 	defer close(run.out)
 	defer run.signal(nil)
 	defer run.stopHold()
+	defer run.recoverPanic(upstream)
 	for {
 		select {
 		case event, ok := <-upstream:
@@ -578,6 +579,29 @@ func (run *downgradeRun) hold(event aistudio.Event, now time.Time) {
 	if len(run.buffer) == 1 {
 		run.armHold()
 	}
+}
+
+// recoverPanic 恢复判定 goroutine 里的 panic：取消上游并读完它的事件流，结束本请求而不让进程退出。严格模式还没放行时让 wait 返回错误
+// （协议层按 HTTP 状态返回），其余情况往流里写错误事件
+func (run *downgradeRun) recoverPanic(upstream <-chan aistudio.Event) {
+	value := recover()
+	if value == nil {
+		return
+	}
+	gate := run.gate
+	err := gate.service.recoveredPanic(gate.requestID, gate.label(), "降级判定", value)
+	if gate.cancel != nil {
+		gate.cancel()
+	}
+	go func() {
+		for range upstream {
+		}
+	}()
+	if gate.mode == gateModeStrict && !run.signaled {
+		run.signal(err)
+		return
+	}
+	run.send(aistudio.Event{Kind: aistudio.EventError, Err: err})
 }
 
 func downgradeThinkingEvent(event aistudio.Event) bool {

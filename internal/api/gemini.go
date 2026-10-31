@@ -102,6 +102,8 @@ type geminiPart struct {
 		ID       string          `json:"id"`
 		Name     string          `json:"name"`
 		Response json.RawMessage `json:"response"`
+		// Parts 为函数结果附带的媒体（官方 FunctionResponsePart：inlineData 或 fileData）
+		Parts []geminiPart `json:"parts"`
 	} `json:"functionResponse"`
 	ExecutableCode *struct {
 		Language string `json:"language"`
@@ -431,6 +433,11 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeGeminiInvalid(w, err)
 		return
+	}
+	// 历史函数调用的签名缺失或为占位值（new-api 回程丢掉真签名，下一轮写 context_engineering_is_the_way_to_go）时，
+	// 按调用 ID（new-api 原样带回本服务输出的 call_local_*）补回本进程在同一模型、号池签发过的真实签名，Gemini 3 才能拿到前几步的思考上下文（见 thoughtSignatureStore）
+	if restored := s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents); restored > 0 {
+		aistudio.TraceFromContext(r.Context()).Note(fmt.Sprintf("已为 %d 个历史函数调用还原本服务签发的思考签名（客户端带回的签名缺失或为占位值）", restored))
 	}
 	// 回传历史里本服务的媒体链接与 fileData 恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
@@ -763,19 +770,30 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case part.FunctionResponse != nil:
-			if part.FunctionResponse.Name == "" {
-				return nil, false, fmt.Errorf("functionResponse requires name")
-			}
+			// 名称可以为空：中转在客户端截掉了对应的 assistant 消息、tool 消息又没有 name 时会这样发，编码时按调用 ID 或唯一待返回的调用补名，
+			// 历史开头没有对应调用的结果改写成文字说明（见 normalizeTurns）；原先这里直接返回 400
 			response, err := geminiJSONObject(part.FunctionResponse.Response, "functionResponse.response")
+			if err != nil {
+				return nil, false, err
+			}
+			// 结果里以 base64 内嵌的图片与文件（{"result":[…]}、{"content":[…]} 等包装，与 OpenAI 入口相同）和 functionResponse.parts
+			// 里的媒体取出来作为真正的媒体发送，原位置换成文字说明，避免按 JSON 文本发送让输入 token 暴涨
+			cleaned, media, err := splitFunctionResultMedia(response)
+			if err != nil {
+				return nil, false, fmt.Errorf("functionResponse.response: %w", err)
+			}
+			attached, err := geminiFunctionResponseMedia(part.FunctionResponse.Parts)
 			if err != nil {
 				return nil, false, err
 			}
 			parts = append(parts, aistudio.Part{
 				FunctionResult: &aistudio.FunctionResult{
-					ID: part.FunctionResponse.ID, Name: part.FunctionResponse.Name, Content: response,
+					ID: part.FunctionResponse.ID, Name: part.FunctionResponse.Name, Content: cleaned,
 				},
 				ThoughtSignature: part.ThoughtSignature,
 			})
+			parts = append(parts, media...)
+			parts = append(parts, attached...)
 			hasResult = true
 		case part.ExecutableCode != nil:
 			parts = append(parts, aistudio.Part{
@@ -806,8 +824,10 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 	return parts, hasResult, nil
 }
 
+// geminiJSONObject 校验函数参数或结果是 JSON object；缺省与 null 按 {} 处理（new-api 把 OpenAI 的 "null" 参数转成 args:null，
+// 原先返回 400，整段对话之后每一轮都失败）
 func geminiJSONObject(raw json.RawMessage, field string) (json.RawMessage, error) {
-	if len(raw) == 0 {
+	if trimmed := bytes.TrimSpace(raw); len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
 		return json.RawMessage(`{}`), nil
 	}
 	var object map[string]any
@@ -815,6 +835,44 @@ func geminiJSONObject(raw json.RawMessage, field string) (json.RawMessage, error
 		return nil, fmt.Errorf("%s must be an object", field)
 	}
 	return raw, nil
+}
+
+// geminiFunctionResponseMedia 把 functionResponse.parts 里的媒体（inlineData、fileData）转成随工具结果附带的媒体 Part，
+// 由 normalizeTurns 移到这组工具结果之后的用户消息里（与 OpenAI 入口取出的工具结果图片相同）
+func geminiFunctionResponseMedia(input []geminiPart) ([]aistudio.Part, error) {
+	media := make([]aistudio.Part, 0, len(input))
+	for index, item := range input {
+		inline, file := item.inline(), item.file()
+		switch {
+		case inline != nil && file == nil:
+			mime := inline.MIME()
+			if mime == "" || inline.Data == "" {
+				return nil, fmt.Errorf("functionResponse.parts[%d].inlineData requires mimeType and data", index)
+			}
+			data, err := decodeBase64Flexible(inline.Data)
+			if err != nil {
+				return nil, fmt.Errorf("functionResponse.parts[%d].inlineData.data: %w", index, err)
+			}
+			media = append(media, aistudio.Part{InlineData: normalizedImageBlob(mime, data), FromToolResult: true})
+		case file != nil && inline == nil:
+			uri := file.URI()
+			if uri == "" {
+				return nil, fmt.Errorf("functionResponse.parts[%d].fileData requires fileUri", index)
+			}
+			mime := file.MIME()
+			if mime == "" {
+				mime = mimeForFilename(file.DisplayName, mimeForFilename(geminiFileURIPath(uri), ""))
+			}
+			if external, ok := aistudio.ExternalMediaForURL(uri); ok {
+				media = append(media, aistudio.Part{ExternalMedia: external, FromToolResult: true})
+			} else {
+				media = append(media, aistudio.Part{File: &aistudio.FileRef{ID: uri, Name: file.DisplayName, MIME: mime}, FromToolResult: true})
+			}
+		default:
+			return nil, fmt.Errorf("functionResponse.parts[%d] must contain exactly one of inlineData or fileData", index)
+		}
+	}
+	return media, nil
 }
 
 func mapGeminiGoogleSearch(raw json.RawMessage) (*aistudio.GoogleSearchOptions, error) {
@@ -984,7 +1042,7 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	request.Stream = stream
-	events, err := s.generate(r.Context(), request)
+	events, eventReady, err := s.generateStream(r.Context(), request)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			writeGeminiRequestError(w, err)
@@ -993,7 +1051,9 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	}
 	events = withHiddenReasoning(r.Context(), events, hideThought)
 	if stream {
-		s.streamGemini(w, r, request, events)
+		// 隐藏思维链时首个事件（思考）在过滤中被丢掉，提交响应头后要等下一个可见事件或一个心跳间隔才有数据：按首个事件没到处理，
+		// 提交时照样写一块心跳（多一块对客户端没有副作用）
+		s.streamGemini(w, r, request, events, eventReady && !hideThought)
 		return
 	}
 	result, err := consumeEvents(r.Context(), events, nil)
@@ -1003,6 +1063,8 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		}
 		return
 	}
+	// 登记输出的函数调用：客户端或中转下一轮没有原样带回签名时按调用还原（见 handleGeminiAction）
+	s.thoughtSignatures.Remember(s.thoughtSignatureScope(r.Context(), request.Model), result.toolCalls)
 	writeJSON(w, http.StatusOK, buildGeminiResponse(request, result, s.mediaOutputFor(r)))
 }
 
@@ -1312,7 +1374,8 @@ func geminiFinishReason(reason string) string {
 	case "image_recitation":
 		return "IMAGE_RECITATION"
 	case "missing_thought_signature":
-		return "OTHER"
+		// Gemini API FinishReason 的官方枚举名（编号 18，与 AI Studio 的编号相同）；原先报成 OTHER，客户端分不出是缺少思考签名
+		return "MISSING_THOUGHT_SIGNATURE"
 	default:
 		return "OTHER"
 	}
@@ -1358,12 +1421,36 @@ type geminiChunkWriter struct {
 	w     http.ResponseWriter
 	sse   bool
 	wrote bool
+	// dataHeartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT，见 streamDataHeartbeat；官方 SDK 直连时不用，见 officialGeminiSDK）：
+	// SSE 下每次心跳都写一块空候选块（heartbeatChunk），首个事件还没到就提交响应头时提交时也写一块；JSON 数组模式不受影响，仍写换行
+	dataHeartbeat bool
+	// responseID、model 为本流各块的 responseId 与 modelVersion，心跳块与它们一致
+	responseID string
+	model      string
+	// thought 记录本流上一块是不是思考（thought:true 的 part）：心跳块随之用空思考 part，中转转成的空增量与上一块同类，
+	// 客户端的思考界面状态不变（正在思考时不会被当成开始正文）
+	thought bool
 }
 
-func newGeminiChunkWriter(w http.ResponseWriter, r *http.Request) (*geminiChunkWriter, error) {
-	writer := &geminiChunkWriter{w: w, sse: strings.EqualFold(r.URL.Query().Get("alt"), "sse")}
+// newGeminiChunkWriter 写出流式响应头。dataHeartbeat 为真、为 SSE 且首个事件还没到（eventReady 为假，等待到时先提交响应头）时随即写一块心跳，
+// 中转收到第一条 data 就把响应头转给它的客户端；首个事件已到时真实数据紧随其后，不写这一块（快速返回的流里没有心跳块）
+func newGeminiChunkWriter(
+	w http.ResponseWriter, r *http.Request, responseID string, model string, dataHeartbeat bool, eventReady bool,
+) (*geminiChunkWriter, error) {
+	writer := &geminiChunkWriter{
+		w: w, sse: strings.EqualFold(r.URL.Query().Get("alt"), "sse"), responseID: responseID, model: model,
+	}
 	if writer.sse {
-		return writer, streamHeaders(w)
+		writer.dataHeartbeat = dataHeartbeat
+		if err := streamHeaders(w); err != nil {
+			return nil, err
+		}
+		if writer.dataHeartbeat && !eventReady {
+			if err := writer.chunk(writer.heartbeatChunk()); err != nil {
+				return nil, err
+			}
+		}
+		return writer, nil
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1394,14 +1481,41 @@ func (writer *geminiChunkWriter) chunk(payload any) error {
 	return http.NewResponseController(writer.w).Flush()
 }
 
-// heartbeat 保持连接，两种格式都只写一个换行：JSON 数组元素之间的空白不影响解析；SSE 下空行不构成事件，
-// 官方 SDK 与 new-api 都直接跳过。SSE 注释 ": ping" 不能用：google-genai Python SDK 把不以 "data: " 开头的行
-// 当作分行的 JSON 错误体拼接解析，注释行会被当成 JSON 解码失败，整个流报 UnknownApiResponseError
+// heartbeat 保持连接。SSE 下开启数据型心跳时写一块空候选块（见 heartbeatChunk）；关闭时与 JSON 数组模式一样只写一个换行：
+// JSON 数组元素之间的空白不影响解析；SSE 下空行不构成事件，官方 SDK 与 new-api 都直接跳过（所以传不到 new-api 后面的客户端）。
+// SSE 注释 ": ping" 不能用：google-genai Python SDK 把不以 "data: " 开头的行当作分行的 JSON 错误体拼接解析，
+// 注释行会被当成 JSON 解码失败，整个流报 UnknownApiResponseError
 func (writer *geminiChunkWriter) heartbeat() error {
+	if writer.sse && writer.dataHeartbeat {
+		return writer.chunk(writer.heartbeatChunk())
+	}
 	if _, err := io.WriteString(writer.w, "\n"); err != nil {
 		return err
 	}
 	return http.NewResponseController(writer.w).Flush()
+}
+
+// heartbeatChunk 返回数据型心跳块：responseId、modelVersion 与本流其他块一致，唯一的 part 为空文本（上一块是思考时为空思考），
+// 不带 finishReason 与 usageMetadata。官方 SDK 把它当作没有内容的一块；new-api 把它转成 delta.content=""（空思考为
+// delta.reasoning_content=""）的增量原样写给它的客户端，与它自己在流开头写的 role 块（content 同样为 ""）同形，
+// 没有 finishReason 不会被当成回复结束，也不计入用量
+func (writer *geminiChunkWriter) heartbeatChunk() map[string]any {
+	part := map[string]any{"text": ""}
+	if writer.thought {
+		part["thought"] = true
+	}
+	return map[string]any{"responseId": writer.responseID, "modelVersion": writer.model, "candidates": []any{geminiStreamCandidate(part)}}
+}
+
+// observe 记下本流刚写出的一块是不是思考，供随后的心跳块沿用；不带 part 的块（搜索来源、引用）不改变记录
+func (writer *geminiChunkWriter) observe(kind aistudio.EventKind) {
+	switch kind {
+	case aistudio.EventGrounding, aistudio.EventCitation:
+	case aistudio.EventReasoning, aistudio.EventThoughtSignature:
+		writer.thought = true
+	default:
+		writer.thought = false
+	}
 }
 
 func (writer *geminiChunkWriter) close() {
@@ -1411,11 +1525,14 @@ func (writer *geminiChunkWriter) close() {
 	}
 }
 
-func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, events <-chan aistudio.Event) {
-	chunks, err := newGeminiChunkWriter(w, r)
+// streamGemini 输出 Gemini 流式响应；eventReady 为写出响应头前已收到首个事件（见 generateStream）
+func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request aistudio.GenerateRequest, events <-chan aistudio.Event, eventReady bool) {
+	dataHeartbeat := s.config.streamDataHeartbeat() && !officialGeminiSDK(r)
+	chunks, err := newGeminiChunkWriter(w, r, request.ID, responseModel(request), dataHeartbeat, eventReady)
 	if err != nil {
 		return
 	}
+	signatureScope := s.thoughtSignatureScope(r.Context(), request.Model)
 	defer chunks.close()
 	media := s.mediaOutputFor(r)
 	// textOpen 记录已输出的正文没有以换行结尾，随后的媒体链接先换行
@@ -1434,6 +1551,10 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 			if event.ToolCall == nil {
 				return nil
 			}
+			// 记下输出的函数调用：new-api 回程丢掉签名，下一轮按调用 ID 还原（见 handleGeminiAction）
+			call := *event.ToolCall
+			call.ThoughtSignature = firstNonEmpty(call.ThoughtSignature, event.ThoughtSignature)
+			s.thoughtSignatures.Remember(signatureScope, []aistudio.FunctionCall{call})
 			response["candidates"] = []any{geminiStreamCandidate(geminiSignedPart(geminiFunctionCallPart(*event.ToolCall), event.ThoughtSignature))}
 		case aistudio.EventExecutableCode:
 			if event.ExecutableCode == nil {
@@ -1475,6 +1596,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 				response["candidates"] = []any{map[string]any{
 					"index": 0, "content": map[string]any{"role": "model", "parts": []any{linked[0], linked[1]}},
 				}}
+				chunks.observe(event.Kind)
 				return chunks.chunk(response)
 			}
 			var part map[string]any
@@ -1498,6 +1620,7 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 		default:
 			return nil
 		}
+		chunks.observe(event.Kind)
 		return chunks.chunk(response)
 	}), chunks.heartbeat)
 	if err != nil {

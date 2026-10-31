@@ -61,6 +61,19 @@ func (manager *runtimeManager) applyUltraExclusive(exclusive bool) {
 	manager.requests.log("service", "INFO", fmt.Sprintf("Ultra 独占设置已更新并立即生效 | 独占=%t", exclusive))
 }
 
+// activeStreamDataHeartbeat 返回当前是否使用数据型心跳（STREAM_DATA_HEARTBEAT）：公开 API 在每个流式请求开始时读取
+func (manager *runtimeManager) activeStreamDataHeartbeat() bool {
+	return manager.streamDataHeartbeat.Load()
+}
+
+// applyStreamDataHeartbeat 立即切换数据型心跳：之后开始的流式请求按新设置写心跳，进行中的请求不受影响
+func (manager *runtimeManager) applyStreamDataHeartbeat(enabled bool) {
+	if manager.streamDataHeartbeat.Swap(enabled) == enabled {
+		return
+	}
+	manager.requests.log("service", "INFO", fmt.Sprintf("数据型心跳设置已更新并立即生效 | 开启=%t", enabled))
+}
+
 // applyAPIKey 立即切换公开 API 密钥，无需重启管理进程
 func (manager *runtimeManager) applyAPIKey(key string) {
 	key = config.EffectiveProxyAPIKey(key)
@@ -176,6 +189,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
+		saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
@@ -220,8 +234,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		return nil, saved, false
 	}
 	manager.overrides.Apply(&saved)
-	// 独占设置与媒体设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
+	// 独占设置、数据型心跳与媒体设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
 	manager.applyUltraExclusive(saved.UltraExclusive)
+	manager.applyStreamDataHeartbeat(saved.StreamDataHeartbeat)
 	manager.applyMediaSettings(saved.Media)
 
 	manager.mu.Lock()

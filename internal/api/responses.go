@@ -783,6 +783,8 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 	if err := writer.emit("response.in_progress", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 		return
 	}
+	// 心跳仍为 SSE 注释（不受 STREAM_DATA_HEARTBEAT 影响）：Responses 的事件都有官方语义并带递增的 sequence_number，没有官方客户端会忽略的
+	// 空数据事件，重复 response.in_progress 会打乱客户端按事件推进的状态；响应头提交时已写出 response.created 与 response.in_progress 两条数据
 	result, err := consumeStreamEvents(r.Context(), events, writer.live, func() error { return writeSSEHeartbeat(w) })
 	if err != nil {
 		if shouldWriteRequestError(r, err) {

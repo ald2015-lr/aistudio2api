@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -63,6 +65,30 @@ type accessLogMetadata struct {
 	attempts []RequestAttempt
 	// authorized 表示请求已通过公开 API key 校验，只有这类请求写入用量账本
 	authorized bool
+	// lastUpstreamEvent 为上游最近一次事件的时刻（UnixNano，0 为还没有事件），由生成服务逐个事件写入（MarkAccessLogUpstreamEvent），
+	// 客户端断开时读取，不加锁
+	lastUpstreamEvent atomic.Int64
+	// disconnect 为客户端断开那一刻的现场（见 requestLoggingMiddleware），没有断开时为 nil
+	disconnect *accessDisconnect
+}
+
+// accessDisconnect 为请求被取消那一刻的现场，请求结束时转成 RequestDisconnect 写进请求日志
+type accessDisconnect struct {
+	at time.Time
+	// client 为客户端断开了连接（请求的 context 被取消）；为假时是服务端取消（管理端取消请求、停止或重启服务）
+	client      bool
+	headersSent bool
+	bytes       int64
+	chunks      int64
+	// lastWrite 为最后一次写给客户端的时刻（含心跳与响应头），没写过时为零值
+	lastWrite time.Time
+	// headerAt 为提交响应头的时刻，没提交时为零值；lastData 为最后一次写出中转会转发的数据（见 dataWrite）的时刻，没写过时为零值
+	headerAt time.Time
+	lastData time.Time
+	// firstEvent 为断开前已收到上游首个事件；upstreamAt 为上游最近一次事件的时刻，没有事件时为零值
+	firstEvent bool
+	upstreamAt time.Time
+	started    time.Time
 }
 
 type accessLogSnapshot struct {
@@ -97,12 +123,26 @@ type accessLogSnapshot struct {
 	proof           time.Duration
 	attempts        []RequestAttempt
 	authorized      bool
+	disconnect      *accessDisconnect
 }
 
 type accessLogResponseWriter struct {
 	http.ResponseWriter
 	status   int
 	metadata *accessLogMetadata
+	// stats 为写给客户端的统计：处理请求的 goroutine 写入，客户端断开时由 context.AfterFunc 的 goroutine 读取，所以用原子值
+	stats accessWriteStats
+}
+
+// accessWriteStats 统计写给客户端的字节、块数与时刻（UnixNano）
+type accessWriteStats struct {
+	headerAt  atomic.Int64
+	bytes     atomic.Int64
+	chunks    atomic.Int64
+	pending   atomic.Int64
+	lastWrite atomic.Int64
+	// lastData 为最后一次写出数据的时刻：只有空白（换行心跳）或只有 SSE 注释（": ping"）的写出不算，中转会丢掉它们
+	lastData atomic.Int64
 }
 
 func (writer *accessLogResponseWriter) WriteHeader(status int) {
@@ -110,6 +150,9 @@ func (writer *accessLogResponseWriter) WriteHeader(status int) {
 		return
 	}
 	writer.status = status
+	now := time.Now().UnixNano()
+	writer.stats.headerAt.Store(now)
+	writer.stats.lastWrite.Store(now)
 	writer.ResponseWriter.WriteHeader(status)
 }
 
@@ -117,15 +160,80 @@ func (writer *accessLogResponseWriter) Write(data []byte) (int, error) {
 	if writer.status == 0 {
 		writer.WriteHeader(http.StatusOK)
 	}
-	return writer.ResponseWriter.Write(data)
+	written, err := writer.ResponseWriter.Write(data)
+	if written > 0 {
+		now := time.Now().UnixNano()
+		writer.stats.bytes.Add(int64(written))
+		writer.stats.pending.Add(int64(written))
+		writer.stats.lastWrite.Store(now)
+		if dataWrite(data[:written]) {
+			writer.stats.lastData.Store(now)
+		}
+	}
+	return written, err
 }
 
-// FlushError 记录状态并向响应控制器返回底层刷新错误
+// dataWrite 判断一次写出里有没有中转会转发的数据：new-api 等中转逐行读取上游 SSE，只转发 data 行，空行（Gemini 的换行心跳）与
+// SSE 注释（OpenAI、Responses、Interactions 的 ": ping"）都被丢弃，传不到中转后面的客户端。有一行不是空白也不以 ":" 开头就算数据
+// （SSE 的 data、event 行，非 SSE 响应体的内容）
+func dataWrite(data []byte) bool {
+	for len(data) > 0 {
+		line := data
+		if index := bytes.IndexByte(data, '\n'); index >= 0 {
+			line, data = data[:index], data[index+1:]
+		} else {
+			data = nil
+		}
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 && line[0] != ':' {
+			return true
+		}
+	}
+	return false
+}
+
+// FlushError 记录状态并向响应控制器返回底层刷新错误；上次刷新后写过数据的每次刷新计为一块（SSE 每个事件、Gemini JSON 数组每个元素）
 func (writer *accessLogResponseWriter) FlushError() error {
 	if writer.status == 0 {
 		writer.WriteHeader(http.StatusOK)
 	}
+	if writer.stats.pending.Swap(0) > 0 {
+		writer.stats.chunks.Add(1)
+	}
 	return http.NewResponseController(writer.ResponseWriter).Flush()
+}
+
+// committed 判断响应头是否已经提交
+func (writer *accessLogResponseWriter) committed() bool {
+	return writer.status != 0
+}
+
+// disconnectSnapshot 读取此刻写给客户端的统计与上游最近一次事件，client 为是否客户端断开。可在任意 goroutine 调用
+func (writer *accessLogResponseWriter) disconnectSnapshot(client bool) accessDisconnect {
+	stats := &writer.stats
+	chunks := stats.chunks.Load()
+	if stats.pending.Load() > 0 {
+		// 写了还没刷新的数据（非流式响应体）按一块计
+		chunks++
+	}
+	snapshot := accessDisconnect{
+		at: time.Now(), client: client, headersSent: stats.headerAt.Load() != 0,
+		bytes: stats.bytes.Load(), chunks: chunks,
+		lastWrite: unixNanoTime(stats.lastWrite.Load()), upstreamAt: unixNanoTime(writer.metadata.lastUpstreamEvent.Load()),
+		headerAt: unixNanoTime(stats.headerAt.Load()), lastData: unixNanoTime(stats.lastData.Load()),
+	}
+	writer.metadata.mu.Lock()
+	snapshot.firstEvent = writer.metadata.firstEvent > 0
+	snapshot.started = writer.metadata.startedAt
+	writer.metadata.mu.Unlock()
+	return snapshot
+}
+
+func unixNanoTime(value int64) time.Time {
+	if value == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, value)
 }
 
 func (writer *accessLogResponseWriter) Unwrap() http.ResponseWriter {
@@ -204,6 +312,24 @@ func (metadata *accessLogMetadata) setRequestError(err error) {
 	} else {
 		// 与返回给客户端的状态码一致（号池内部的 401/403 等已按官方格式改为 503；指明模型时没有账户支持按 404）
 		metadata.failureStatus = publicErrorFor(err, metadata.model).Status
+	}
+	metadata.mu.Unlock()
+}
+
+// setPanic 记下处理请求时恢复的 panic：请求按 500 失败记录
+func (metadata *accessLogMetadata) setPanic(err error) {
+	metadata.mu.Lock()
+	metadata.err = panicSummary(err)
+	metadata.canceled = false
+	metadata.failureStatus = http.StatusInternalServerError
+	metadata.mu.Unlock()
+}
+
+// markDisconnect 记下客户端断开那一刻的现场（只记第一次）
+func (metadata *accessLogMetadata) markDisconnect(snapshot accessDisconnect) {
+	metadata.mu.Lock()
+	if metadata.disconnect == nil {
+		metadata.disconnect = &snapshot
 	}
 	metadata.mu.Unlock()
 }
@@ -373,7 +499,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 		temperature: metadata.temperature, topP: metadata.topP, topK: metadata.topK,
 		thinking: metadata.thinking, maxOutputTokens: metadata.maxOutputTokens, seed: metadata.seed, requestID: metadata.requestID,
 		queueWait: metadata.queueWait, proof: metadata.proof,
-		attempts: slices.Clone(metadata.attempts), authorized: metadata.authorized,
+		attempts: slices.Clone(metadata.attempts), authorized: metadata.authorized, disconnect: metadata.disconnect,
 	}
 	metadata.mu.Unlock()
 	return snapshot
@@ -421,6 +547,13 @@ func AddAccessLogProof(ctx context.Context, duration time.Duration) {
 		metadata.mu.Lock()
 		metadata.proof += duration
 		metadata.mu.Unlock()
+	}
+}
+
+// MarkAccessLogUpstreamEvent 记下上游最近一次事件的时刻（生成服务每转发一个上游事件调用一次）：客户端断开时据此写出断开前上游静默了多久
+func MarkAccessLogUpstreamEvent(ctx context.Context) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.lastUpstreamEvent.Store(time.Now().UnixNano())
 	}
 }
 
@@ -551,14 +684,32 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, pool: pool, requestID: newID("req"), startedAt: started}
 		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}
 		request := r.WithContext(context.WithValue(r.Context(), accessLogContextKey{}, metadata))
-		next.ServeHTTP(writer, request)
+		// 客户端断开（请求的 context 被取消）那一刻记下现场：是否已提交响应头、已写出多少、多久没写出、上游多久没有事件。
+		// 处理函数返回后 net/http 也会取消 context，所以返回前先停止观察；观察已经开始时等它记完
+		watched := make(chan struct{})
+		stopWatch := context.AfterFunc(r.Context(), func() {
+			defer close(watched)
+			metadata.markDisconnect(writer.disconnectSnapshot(true))
+		})
+		aborted := serveRecovering(next, writer, request)
+		if !stopWatch() {
+			<-watched
+		}
 		status := writer.status
 		if status == 0 {
 			status = http.StatusOK
 		}
 		snapshot := metadata.snapshot()
+		var disconnect *RequestDisconnect
 		if snapshot.canceled || errors.Is(r.Context().Err(), context.Canceled) {
 			status = 499
+			// 客户端没有断开却以取消结束：管理端取消了请求，或服务正在停止、重启
+			moment := snapshot.disconnect
+			if moment == nil {
+				service := writer.disconnectSnapshot(false)
+				moment = &service
+			}
+			disconnect = moment.report()
 		} else if status < http.StatusBadRequest && snapshot.failureStatus >= http.StatusBadRequest {
 			status = snapshot.failureStatus
 		}
@@ -585,10 +736,61 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
-				Authorized: snapshot.authorized,
+				Authorized: snapshot.authorized, Disconnect: disconnect,
 			})
 		}
+		if aborted {
+			// 处理函数主动中止连接（http.ErrAbortHandler），或响应头提交后 panic：请求日志写完后交给 net/http 中止连接（不再打印栈）
+			panic(http.ErrAbortHandler)
+		}
 	})
+}
+
+// rightAfterHeadersWindow 为“写响应头后立即断开”的时限（见 RequestDisconnect.RightAfterHeaders）：中转发现它的客户端已走、关闭到本服务的连接
+// 只要一个往返，1 秒足够
+const rightAfterHeadersWindow = time.Second
+
+// report 转成请求日志里的断开现场
+func (moment *accessDisconnect) report() *RequestDisconnect {
+	report := &RequestDisconnect{
+		Initiator: "service", Phase: "before_first_event", HeadersSent: moment.headersSent,
+		WrittenBytes: moment.bytes, WrittenChunks: moment.chunks,
+		ElapsedMS: durationMS(moment.at.Sub(moment.started)),
+	}
+	if moment.client {
+		report.Initiator = "client"
+	}
+	if moment.firstEvent {
+		report.Phase = "mid_stream"
+	}
+	lastWrite := moment.lastWrite
+	if lastWrite.IsZero() {
+		lastWrite = moment.started
+	}
+	report.SinceLastWriteMS = durationMS(moment.at.Sub(lastWrite))
+	if !moment.lastData.IsZero() {
+		since := durationMS(moment.at.Sub(moment.lastData))
+		report.SinceLastDataWriteMS = &since
+	}
+	if !moment.headerAt.IsZero() {
+		since := moment.at.Sub(moment.headerAt)
+		sinceMS := durationMS(since)
+		report.SinceHeadersSentMS = &sinceMS
+		report.RightAfterHeaders = moment.client && since < rightAfterHeadersWindow
+	}
+	if !moment.upstreamAt.IsZero() {
+		since := durationMS(moment.at.Sub(moment.upstreamAt))
+		report.SinceUpstreamEventMS = &since
+	}
+	return report
+}
+
+// durationMS 把时长换成毫秒（保留一位小数，负值按 0）
+func durationMS(duration time.Duration) float64 {
+	if duration < 0 {
+		return 0
+	}
+	return float64(duration.Round(100*time.Microsecond)) / float64(time.Millisecond)
 }
 
 func setAccessLogResponseError(w http.ResponseWriter, message string) {

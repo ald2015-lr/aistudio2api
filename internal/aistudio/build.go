@@ -292,8 +292,9 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 			if declaration.Description != "" {
 				encoded["description"] = declaration.Description
 			}
-			// required 列出的未定义属性补上 {}，上游不再以 property is not defined 拒绝（超过大小上限的 Schema 原样发送）
-			encoded["parametersJsonSchema"] = defineRequiredProperties(normalizeFunctionParameters(declaration.Parameters))
+			// required 列出的未定义属性补上 {}，上游不再以 property is not defined 拒绝（超过大小上限的 Schema 原样发送）；
+			// Gemini 入口 parameters 的 OpenAPI 写法（类型大写、nullable）先转成 JSON Schema，见 openAPISchemaAsJSONSchema
+			encoded["parametersJsonSchema"] = defineRequiredProperties(openAPISchemaAsJSONSchema(normalizeFunctionParameters(declaration.Parameters)))
 			declarations = append(declarations, encoded)
 		}
 		wire = append(wire, map[string]any{"functionDeclarations": declarations})

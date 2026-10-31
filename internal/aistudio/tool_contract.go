@@ -251,6 +251,22 @@ func (contract *toolContract) forward(ctx context.Context, source <-chan Event) 
 		calls := 0
 		serverSideUsed := false
 		failed := false
+		// 核对时 panic：以错误事件结束本请求并读完上游，不让进程退出
+		defer func() {
+			value := recover()
+			if value == nil {
+				return
+			}
+			err := decodePanicError("核对工具调用契约", value)
+			select {
+			case destination <- Event{Kind: EventError, Err: err}:
+			case <-ctx.Done():
+			}
+			go func() {
+				for range source {
+				}
+			}()
+		}()
 		for event := range source {
 			if failed {
 				continue
@@ -326,6 +342,11 @@ func assignLocalCallID(event Event) Event {
 // AssignLocalCallID 供公开协议层兜底：生成服务之外来源的事件同样按本地规则补 ID，发回上游时照常去掉
 func AssignLocalCallID(event Event) Event {
 	return assignLocalCallID(event)
+}
+
+// LocalCallID 判断调用 ID 是不是本地补发的（call_local_*，进程内唯一）
+func LocalCallID(id string) bool {
+	return strings.HasPrefix(id, localCallIDPrefix)
 }
 
 // upstreamCallID 返回发回上游时使用的调用 ID：本地补发的 ID 不发给上游

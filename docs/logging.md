@@ -152,7 +152,7 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 
 不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`，换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回去等待，写 `换号次数已用完，回到原账号等待 Worker 恢复后重放` 或 `已连续 5 次失败，回到原账号等待 Worker 恢复后重放`。这次失败计入连续失败上限后就到上限的请求不再换号，直接等原账户关闭完成。换号后的选号在排队（其他账户都忙）时原账户关闭完成，写 `换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号`：不再排除原账户，按原来的排队位置重新选号，不固定到原账户（关闭后它没有 Worker，要冷启动并占一个 Worker 槽位），原账户与其他账户哪个先能用就用哪个。回到原账户等待时请求超时或被取消，错误为 `回到原账号等待 <DURATION> 后请求超时（最后原因=WAA Worker 恢复，上次失败=...）: context deadline exceeded`（取消时为 `请求已取消`），对外仍是 504 或取消的官方措辞；经生成服务以首事件前期限结束时，`request.error` 前面另加 `本服务首事件前期限 <DURATION> 到期: `（见[流式等待](#流式等待)）。
 
-按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`策略=<ROUTING_STRATEGY>` 之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
+按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`策略=<ROUTING_STRATEGY>` 之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
 
 保存服务配置使 `ULTRA_INCLUDE_PRO` 实际切换时（热更新；同一次保存还改了需要重建生成服务的字段时随重建生效，不写这几行），`service` 依次记录下面几行。数值都在切换之后读取当前状态：`并入` 为账户池当前的开关，`Ultra 号池账户` 为当前属于 Ultra 号池的账户数，两个分区的 Worker 数为驻留与正在启动的 Worker 之和，`/` 后为 `ULTRA_MAX_ACTIVE_WORKERS` 与 `MAX_ACTIVE_WORKERS`。已运行的 Worker 不重启，只改按新分区计数：
 
@@ -431,6 +431,13 @@ WARN  service  IP 池检查完成 | 出口=http://isp.decodo.com | 端口=200 | 
 WARN  account@example.com  上游结束说明 | 结束原因=malformed_function_call | 说明=<上游说明>
 ```
 
+结束原因为 `missing_thought_signature`（缺少思考签名）或 `too_many_tool_calls`（工具调用过多）时，请求时间线另写一行 WARN 写明原因与建议（不论上游有没有给出结束说明）。客户端经 new-api 等中转时只看到 `content_filter` 或空回复（中转把不认识的结束原因一律当作内容拦截），原因只能在这里看；Gemini 响应的 `finishReason` 为官方枚举名 `MISSING_THOUGHT_SIGNATURE`、`TOO_MANY_TOOL_CALLS`：
+
+```text
+WARN  account@example.com  上游以缺少思考签名结束（MISSING_THOUGHT_SIGNATURE） | 原因=历史里的函数调用没有带回上一轮的思考签名（中转丢掉了签名、客户端改写了调用，或服务重启后本服务记的签名已不在） | 建议=让客户端或中转原样回传 functionCall 的 thoughtSignature（OpenAI 格式为 extra_content.google.thought_signature）；经 new-api 时保留调用 ID 原样回传，本服务按调用 ID 还原本进程签发的签名（服务重启后还原不到）
+WARN  account@example.com  上游以工具调用过多结束（TOO_MANY_TOOL_CALLS） | 原因=模型在这一轮连续或并行调用工具的次数超过上游上限 | 建议=减少一次回复内的工具调用（限制客户端的检索轮数、合并工具或缩小每次返回的结果），或在提示词里要求先根据已有结果作答
+```
+
 Omni 视频模型的请求在协议层整理时，每条说明在选号前写一条进度（WARN，来源 `service`）；发送前按所选账户的目录再整理时留下的新说明（协议层所用的合并目录与所选账户的目录不一致，例如别名目录缓存还没刷新；或协议层没有整理到的请求，例如启动期间别名目录取不到、目录没有列出视频选项的 Interaction 模型）同样写一条进度（WARN，来源为该账户，换号重试时每个账户各记各的）。两种都进入排查记录的 `timeline`，不影响响应（规则见 [protocol.md](protocol.md#omni-视频设置与模型名后缀)）：
 
 | 消息 | 含义 |
@@ -488,6 +495,60 @@ Drive 授权状态记录的运行日志（`service`）：装配运行时恢复�
 客户端取消记录为 `499`；认证、额度和上游失败分别使用对应 HTTP 状态与 `request.error`。
 
 管理端取消活动请求或停止生成服务时，仍连接的客户端按公开协议收到 `503 request_canceled` 或对应的流式 error event。
+
+### 请求取消的断开现场
+
+状态为 `cancelled`（HTTP `499`）的请求，`request.finished` 的摘要后附上断开现场，载荷里另有 `request.disconnect`：
+
+```text
+WARN  account@example.com  请求已取消 | 客户端断开 | 阶段=首事件前 | 响应头=已提交（断开前 0s） | 已写出=1 块 196 B | 距最近写出=0s | 距最近数据=0s | 距上游最近事件=无 | 已用时=10.1s | 写响应头后立即断开（经中转时多为下游在响应头之前已断开）
+WARN  account@example.com  请求已取消 | 客户端断开 | 阶段=流中 | 响应头=已提交（断开前 0s） | 已写出=1 块 210 B | 距最近写出=0s | 距最近数据=0s | 距上游最近事件=0s | 已用时=3.4s | 写响应头后立即断开（经中转时多为下游在响应头之前已断开）
+WARN  account@example.com  请求已取消 | 客户端断开 | 阶段=首事件前 | 响应头=已提交（断开前 50s） | 已写出=6 块 6 B | 距最近写出=9.9s | 距最近数据=无 | 距上游最近事件=无 | 已用时=60.1s
+WARN  account@example.com  请求已取消 | 客户端断开 | 阶段=流中 | 响应头=已提交（断开前 41.8s） | 已写出=4 块 1.5 KB | 距最近写出=9.8s | 距最近数据=31.2s | 距上游最近事件=31.2s | 已用时=42s
+WARN  service  请求已取消 | 服务端取消（管理端取消请求或服务停止、重启） | 阶段=首事件前 | 响应头=未提交 | 已写出=0 块 0 B | 距最近写出=12.3s | 距最近数据=无 | 距上游最近事件=无 | 已用时=12.3s
+```
+
+```json
+{"time":"2026-10-31T10:05:39Z","level":"WARN","msg":"请求已取消 | 客户端断开 | 阶段=流中 | …","event":"request.finished","source":"account@example.com","request":{"id":"resp_example","state":"cancelled","status":499,"disconnect":{"initiator":"client","phase":"mid_stream","headers_sent":true,"written_bytes":1536,"written_chunks":4,"since_last_write_ms":9800,"since_last_data_write_ms":31200,"since_headers_sent_ms":41800,"since_upstream_event_ms":31200,"elapsed_ms":42000}}}
+```
+
+| 字段 | 摘要里的写法 | 含义 |
+| --- | --- | --- |
+| `initiator` | `客户端断开` / `服务端取消（…）` | `client`：下一跳关闭了连接（请求的 context 被取消，在处理函数返回前发现）；经 new-api 等中转时指中转关闭了到本服务的连接，不一定是手机断开的那一刻（见下文）。`service`：连接没有断开，请求以取消结束（管理端取消请求、停止或重启服务） |
+| `phase` | `阶段=首事件前` / `阶段=流中` | 断开时是否已收到上游首个事件（`before_first_event` / `mid_stream`） |
+| `headers_sent`、`since_headers_sent_ms` | `响应头=已提交（断开前 X）` / `未提交` | 断开前是否已提交响应头（流式请求首事件前的等待到时也会先提交），以及提交后多久断开；没提交时省略 `since_headers_sent_ms` |
+| `right_after_headers` | 末尾的 `写响应头后立即断开（…）` | 客户端在提交响应头后 1 秒内断开，与 `phase` 无关；为假时省略。经 new-api 等中转时多为下游在本服务写响应头之前就已断开（见下文） |
+| `written_chunks`、`written_bytes` | `已写出=N 块 X` | 断开前写给下一跳的响应体块数与字节数，含心跳；SSE 每个事件算一块 |
+| `since_last_write_ms` | `距最近写出` | 最后一次写出（含换行与 `: ping` 心跳、响应头）到断开的时长；什么都没写过时从请求进入服务算起。只反映本服务到下一跳这一段：中转会丢掉换行与注释心跳 |
+| `since_last_data_write_ms` | `距最近数据` | 最后一次写出中转会转发的数据（SSE 的 `data:` 行与非 SSE 响应体的内容，含数据型心跳；不含换行与 `: ping`）到断开的时长，反映中转后面的客户端那一段多久没收到字节；一块数据都没写过时省略，摘要写 `无` |
+| `since_upstream_event_ms` | `距上游最近事件` | 上游最近一次事件（生成服务每转发一个上游事件记一次）到断开的时长；还没有上游事件时省略，摘要写 `无` |
+| `elapsed_ms` | `已用时` | 请求进入服务到断开的时长 |
+
+怎么看（直连与经 new-api 等中转统一按下面的规则）：
+
+- **先看 `距最近数据`**。几十秒、`已用时` 扎堆在 60 秒或 100 秒附近：连接这么久没有中转会转发的数据，被前置 nginx（`proxy_read_timeout` 默认 60 秒）、Cloudflare（100 秒）或手机系统、VPN、运营商掐断。开启数据型心跳（`STREAM_DATA_HEARTBEAT`，默认开启）；Responses、Interactions 只有 `: ping` 注释心跳，经中转时这一段同样没有数据，靠中转自己的 ping。`距最近写出` 很短而 `距最近数据` 很长，说明换行或 `: ping` 心跳一直在写，但中转把它们丢了，传不到它后面的客户端。
+- **`响应头=已提交` 而 `距最近数据=无`**：响应头提交后一块中转会转发的数据都没写出，只有换行或 `: ping` 心跳（关闭数据型心跳、官方 SDK 直连，或 Responses、Interactions 在响应头之后一直没有事件）。经中转时等同于从进入服务到断开，中转后面的客户端一直零字节（本次事故的形状：响应头已提交、只有换行心跳、`已用时` 约 60 秒），按 `已用时` 代替 `距最近数据` 套用上一条。直连的客户端能收到这些心跳，不在此列。
+- **`距最近数据` 在 10 秒以内仍断开**：数据型心跳已经写到下一跳，客户端那一段仍断开，多半是客户端自己走了（转入后台、切网、用户取消），或中转没把数据转给它的客户端（Claude 格式的客户端经 new-api 时，第一块心跳让 new-api 写出 `message_start`，之后的空心跳块被丢弃），对照中转与客户端的日志。带 `写响应头后立即断开` 的先按下一条看。
+- **“写响应头后立即断开”**（摘要末尾带这一句，`right_after_headers` 为真：`响应头=已提交（断开前 0s 左右）`，提交后 1 秒内断开，已写出的块很少）：与阶段无关。经 new-api 时多为手机在本服务写响应头之前就断开了：new-api 发上游请求时不绑定手机那条连接，要等收到本服务的响应头、进入读流的循环后，才发现手机那条连接的 context 已取消，随即关闭上游响应体（到本服务的连接），所以这里看到的断开时刻晚于手机真实断开的时刻。首个事件在等待时长（默认 10 秒，主用模型 15 秒）到时之前没到时，响应头随一块心跳提交，表现为 `阶段=首事件前`、`已用时` 接近等待时长；首个事件在等待内就到了（多数第 4 轮这类请求，首个思考几秒内就到）时，响应头随首个事件提交，表现为 `阶段=流中`、`距上游最近事件≈0`、`已用时` 为首个事件的时刻，已写出的是首个事件的块，**不代表手机收到过数据**，不要按上一条当成“收到数据后客户端自己走了”。真实断开时刻看 new-api 日志里的 `stream ended … reason=client_gone` 及其时间；这类断开发生在本服务写响应头之前，只能靠 new-api 自己的 ping 保活。
+- **`距上游最近事件` 很长而 `距最近数据` 很短**：上游在长思考或排队，数据型心跳一直在写。
+- **`服务端取消`**：看同一时刻的管理操作与生命周期日志。
+
+生成服务转发上游事件时，下游（客户端或协议层）在终态之前先结束，请求时间线另写一行，记下断开前上游的状态：
+
+```text
+WARN  account@example.com  下游已断开，结束转发 | 阶段=流中 | 已用时=42.1s | 距上游最近事件=31.2s | 最近事件=reasoning | 推理=12 | 正文=0 | 网络字节=18240 | 最近网络=31.2s
+```
+
+`bash tools/diag_cancel.sh`（只读，读运行日志，邮箱打码）汇总最近被取消的请求：谁断开、断开阶段、是否已提交响应头、写响应头后 1 秒内断开的个数（不论阶段，两组都给提示；经 new-api 时多为手机在本服务写响应头之前就断开了）、断开前距最近数据写出、距最近写出与距上游最近事件的分布（响应头已提交却一块数据都没写出的按已用时计入“30 秒以上没有数据”与“只有换行或 `: ping` 在写”两条提示），并列出最近几个请求；`MINUTES`、`SAMPLES`、`MODEL`、`LOG_FILE`、`DIAG_NOW` 见脚本开头的用法。程序版本早于断开诊断的取消记录没有 `request.disconnect`，单独计数；早于数据写出诊断的记录没有 `since_last_data_write_ms`，按“距最近写出”计并注明。
+
+### 处理请求时的 panic
+
+下面这些地方 panic 时进程不退出，请求按 500 失败结束：HTTP 处理函数；生成请求的后台 goroutine（换号重试、转发上游事件、降级判定、开始生成时登记请求之后的步骤）；解码上游事件流（`GenerateContent` 与 Interaction 流）；核对工具调用契约；协议层的事件过滤（隐藏思维链、补发函数调用 ID）与后台刷新别名模型目录。租约照常释放，请求登记照常结束。
+
+- 响应头提交前：客户端收到官方结构的 500（Gemini `INTERNAL`、OpenAI `server_error`、Anthropic `api_error`，消息为官方的内部错误措辞）。
+- 响应头提交后：后台 goroutine 里的 panic 以流内的官方错误事件结束；HTTP 处理函数里的 panic 写完请求日志后中止连接（不写正常的流结尾，HTTP/1.1 不写 chunked 结尾、HTTP/2 发 `RST_STREAM`），客户端读到意外断开、知道回复不完整可以重试。不能正常收尾：Gemini SSE 没有结束标记，截断的流会被 SDK 当成完整回复。
+
+运行日志另记一行带栈的 ERROR（`请求处理 panic，已恢复`、`生成请求后台 panic，已恢复` 或 `<步骤>时 panic，已恢复`，字段 `request_id`、`where`、`panic`、`stack`），生成请求的时间线写一行 `<步骤>时发生 panic，已恢复并结束本请求 | 错误=<panic 的值>`，`request.error` 为 `<步骤>时发生 panic（已恢复，栈见运行日志）: <panic 的值>`。处理函数主动中止连接（`http.ErrAbortHandler`）时同样写完请求日志后交给 net/http 断开。
 
 ## 排队等待
 
@@ -721,7 +782,18 @@ WARN  account@example.com  事件流停顿 | 模型=gemini-3.7-flash | 已等待
 INFO  account@example.com  事件流恢复 | 模型=gemini-3.7-flash | 停顿=1m31.208s | 当前事件=reasoning
 ```
 
-流式公开协议在连续 10 秒没有语义事件时发送心跳，格式按协议不同。OpenAI Chat、OpenAI Responses 与 Gemini Interactions 发送 SSE 注释帧：
+流式公开协议在连续 10 秒没有语义事件时发送心跳，格式按协议不同。默认开启的数据型心跳（`STREAM_DATA_HEARTBEAT=true`）下，Gemini SSE（`alt=sse`）每次心跳都写一块空候选块（`responseId`、`modelVersion` 与本流其他块一致；上一块是思考时 part 为 `{"text":"","thought":true}`，搜索来源与引用块不改变这一判断），OpenAI Chat 写空 delta 块（`id`、`model`、`created` 与本流一致，`include_usage` 时同样带 `"usage":null`）。首个事件还没到就提交响应头时，提交时立刻再写一块（Gemini 为空候选块，OpenAI Chat 在 role 块之后写空 delta，把 role 块顶出落后一块转发的 new-api OpenAI 渠道）；首个事件已到时不写，快速返回的流里没有心跳块。官方 SDK 直连（`x-goog-api-client` 带 `google-genai-sdk/`、`genai-py/`、`genai-js/` 或 `gl-python/`）时 Gemini SSE 不写数据型心跳，与关闭时相同（直连不经过中转，换行就能保活，也不再多写一种 SDK 判为无效的块，见 [protocol.md](protocol.md)）：
+
+```text
+data: {"candidates":[{"content":{"parts":[{"text":""}],"role":"model"},"index":0}],"modelVersion":"gemini-3.8-flash","responseId":"resp_1"}
+
+data: {"candidates":[{"content":{"parts":[{"text":"","thought":true}],"role":"model"},"index":0}],"modelVersion":"gemini-3.8-flash","responseId":"resp_1"}
+
+data: {"choices":[{"delta":{},"finish_reason":null,"index":0}],"created":1700000000,"id":"chatcmpl_1","model":"gemini-3.8-flash","object":"chat.completion.chunk"}
+
+```
+
+new-api 等中转逐行读取上游 SSE，只转发 `data:` 行：空候选块被转成 `delta.content=""`（空思考为 `delta.reasoning_content=""`）的空增量写给它 OpenAI 格式的客户端，与它自己在流开头写的 role 块同形；没有 `finishReason` 不会被当成回复结束，也不带用量（Claude 格式的客户端经 new-api 时，第一块心跳让 new-api 写出 `message_start`，之后的空心跳块被丢弃）。new-api 在收到第一条 data 时记首字时间：首个事件晚于响应头等待时，它的首字时间与模型性能 TTFT 反映的是本服务提交响应头的时刻，真实首字时间看本服务请求日志的 `first_event_ms`。new-api 收到过 data（心跳块也算）后，流结束时没有带 token 的 `usageMetadata`（客户端断开、流被截断）就按估算的输入 token 计费，所以首个事件之前就断开的请求在 new-api 里不再计 0（见 [protocol.md](protocol.md)）。关闭数据型心跳时与原先一致，OpenAI Chat、OpenAI Responses 与 Gemini Interactions 发送 SSE 注释帧（Responses 与 Interactions 不论开关都发送注释帧：它们的事件都有官方语义，没有客户端会忽略的空数据事件）：
 
 ```text
 : ping
@@ -736,7 +808,7 @@ data: {"type":"ping"}
 
 ```
 
-Gemini `:streamGenerateContent` 在 SSE（`alt=sse`）与 JSON 数组两种格式下都只写一个空行：SSE 中的空行不构成事件，JSON 数组元素之间的空白不影响解析。google-genai Python SDK 会把 `: ping` 注释行当作 JSON 解析而报 `UnknownApiResponseError`，所以 Gemini 不用注释帧。
+关闭数据型心跳时 Gemini `:streamGenerateContent` 在 SSE（`alt=sse`）与 JSON 数组两种格式下都只写一个空行（JSON 数组格式不论开关都是这样）：SSE 中的空行不构成事件，JSON 数组元素之间的空白不影响解析。google-genai Python SDK 会把 `: ping` 注释行当作 JSON 解析而报 `UnknownApiResponseError`，所以 Gemini 不用注释帧。
 
 客户端把心跳作为连接存活信号，正文、推理和 usage 继续使用各协议的 `data` 或命名事件。Anthropic 在调用生成服务前发送起始事件；OpenAI Chat 与 Responses 在取得生成事件流后发送起始事件。
 

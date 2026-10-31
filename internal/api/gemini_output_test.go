@@ -467,6 +467,8 @@ func TestGeminiStreamStandaloneSignature(t *testing.T) {
 				}
 				chunks = append(chunks, chunk)
 			}
+			// SSE 默认开启数据型心跳：响应头提交时先有一块空文本心跳，这里只看内容帧
+			chunks = withoutGeminiHeartbeats(t, chunks)
 		}
 		if len(chunks) == 0 {
 			t.Fatalf("query=%q: 没有输出帧: %s", query, recorder.Body.String())

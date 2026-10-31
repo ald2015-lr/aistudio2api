@@ -327,7 +327,7 @@ func TestGeminiMediaOutput(t *testing.T) {
 		stream := postJSON(t, handler, path+":streamGenerateContent?alt=sse", body, nil)
 		var streamed []map[string]any
 		mediaChunks := 0
-		for _, chunk := range sseData(t, stream.Body.String()) {
+		for _, chunk := range withoutGeminiHeartbeats(t, sseData(t, stream.Body.String())) {
 			chunkParts := geminiResponseParts(t, chunk)
 			if len(chunkParts) == 2 {
 				mediaChunks++
@@ -1093,7 +1093,7 @@ func TestGeminiInteractionVideoLinkEndToEnd(t *testing.T) {
 	}
 	var parts []map[string]any
 	var usage map[string]any
-	for _, chunk := range sseData(t, recorder.Body.String()) {
+	for _, chunk := range withoutGeminiHeartbeats(t, sseData(t, recorder.Body.String())) {
 		parts = append(parts, geminiResponseParts(t, chunk)...)
 		if value, ok := chunk["usageMetadata"].(map[string]any); ok {
 			usage = value

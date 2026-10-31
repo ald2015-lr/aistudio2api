@@ -1204,6 +1204,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.UltraMaxActiveWorkers != nil {
 		ultraMax = *value.UltraMaxActiveWorkers
 	}
+	// 数据型心跳：旧版页面保存时不带该字段，沿用现值
+	streamDataHeartbeat := saved.StreamDataHeartbeat
+	if value.StreamDataHeartbeat != nil {
+		streamDataHeartbeat = *value.StreamDataHeartbeat
+	}
 	// 单账户每分钟上限：旧版页面保存时不带该字段，沿用现值（0 表示关闭，不能用零值判断是否缺省）
 	accountRPMLimit := saved.AccountRPMLimit
 	if value.AccountRPMLimit != nil {
@@ -1263,6 +1268,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		Proxy: proxy, ProxyPool: poolSettings, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
+		StreamDataHeartbeat:    streamDataHeartbeat,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		AccountRPMLimit:        accountRPMLimit,
@@ -1982,6 +1988,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		DowngradeGuard:         downgradeGuardToAPI(cfg.DowngradeGuard),
 		UltraExclusive:         &cfg.UltraExclusive,
 		UltraIncludePro:        &cfg.UltraIncludePro,
+		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
 		StreamPlaygroundModels: &streamPlaygroundModels,

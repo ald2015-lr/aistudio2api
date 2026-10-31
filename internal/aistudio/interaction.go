@@ -278,6 +278,23 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		})
 		defer stopClose()
 		committed := false
+		// 解码或转发时 panic：关闭上游响应体，还没交出事件流时按错误返回（调用方照旧换号或返回错误），已交出时以错误事件结束，不让进程退出
+		defer func() {
+			value := recover()
+			if value == nil {
+				return
+			}
+			_ = response.Body.Close()
+			err := decodePanicError("解码 AI Studio Interaction 事件流", value)
+			if !committed {
+				ready <- err
+				return
+			}
+			select {
+			case events <- Event{Kind: EventError, Err: err}:
+			case <-ctx.Done():
+			}
+		}()
 		send := func(event Event) error {
 			event = assignLocalCallID(event)
 			if request.Config.HideThinking && event.Kind == EventReasoning {
