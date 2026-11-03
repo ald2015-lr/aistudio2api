@@ -900,7 +900,7 @@ func anthropicBlocks(result generationResult, media mediaOutput) []anthropicCont
 func anthropicStop(reason string, hasTools bool, stopSequence string) (string, *string) {
 	normalized := strings.ToLower(strings.TrimSpace(reason))
 	switch normalized {
-	case "max_tokens", "max_output_tokens", "length":
+	case "max_tokens", "max_output_tokens", "length", "continuation":
 		return "max_tokens", nil
 	case "stop_sequence":
 		if stopSequence != "" {

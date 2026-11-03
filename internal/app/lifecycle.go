@@ -691,6 +691,14 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.OmniIgnoreSystemPrompt != nil {
 		saved.OmniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
 	}
+	// 自动续写：提交时省略（旧版页面）按生效值比较
+	saved.LongOutputEnabled, saved.LongOutputMaxTokens = active.LongOutputEnabled, active.LongOutputMaxTokens
+	if value.LongOutputEnabled != nil {
+		saved.LongOutputEnabled = *value.LongOutputEnabled
+	}
+	if value.LongOutputMaxTokens != nil {
+		saved.LongOutputMaxTokens = *value.LongOutputMaxTokens
+	}
 	if value.UltraIncludePro != nil {
 		saved.UltraIncludePro = *value.UltraIncludePro
 	}
@@ -727,6 +735,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
 		saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
+		saved.LongOutputEnabled == active.LongOutputEnabled && saved.LongOutputMaxTokens == active.LongOutputMaxTokens &&
 		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.WAABackend == active.WAABackend &&
 		saved.DowngradeGuard.Equal(active.DowngradeGuard) &&

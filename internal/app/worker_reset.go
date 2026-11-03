@@ -15,7 +15,8 @@ import (
 // 失败 Worker 的后台关闭。
 //
 // 请求遇到 Worker 失败（浏览器退出、控制连接断开）或协议 Code 5 时要关闭这个 Worker 版本，关闭前要等同账户其他进行中的请求结束：
-// 它们经同一个浏览器流式返回，每个最长可达总时长上限（生成请求开始输出后不再受 REQUEST_TIMEOUT 限制，见 generateMaxDurationFor）。
+// 它们经同一个浏览器流式返回，每个最长可达总时长上限（生成请求开始输出后不再受 REQUEST_TIMEOUT 限制，见 generateMaxDurationFor；
+// long- 自动续写的请求最长到续写的绝对总时长上限，见 workerResetLimitFor）。
 // 原先失败的请求同步等这次关闭，自己干等几分钟，等到超时还直接失败、不换号。
 // 现在关闭交给后台（scheduleWorkerReset）：
 //   - 同一账户的同一 Worker 版本只关闭一次，并发失败的请求与失败 Worker 巡检共用这一次；
@@ -259,7 +260,7 @@ func (manager *accountWorkerManager) scheduleWorkerReset(
 	if base == nil {
 		base = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(base, manager.workerResetLimit())
+	ctx, cancel := context.WithTimeout(base, manager.workerResetLimitFor(accountID))
 	pending = &workerReset{done: make(chan struct{})}
 	if manager.resets == nil {
 		manager.resets = make(map[workerResetKey]*workerReset)
@@ -331,6 +332,15 @@ func (manager *accountWorkerManager) workerResetLimit() time.Duration {
 		return limit
 	}
 	return manager.drainTimeout()
+}
+
+// workerResetLimitFor 返回账号后台关闭等待独占租约的上限：账号上还有服务 long- 自动续写请求的租约时按账号的排空超时
+// （续写的绝对总时长上限加体面结束的等待再加 30 秒，见 drainTimeoutFor），否则同 workerResetLimit。登记关闭后账号不再发出新租约，之后不会有新的续写租约
+func (manager *accountWorkerManager) workerResetLimitFor(accountID string) time.Duration {
+	if limit := time.Duration(manager.resetLimit.Load()); limit > 0 {
+		return limit
+	}
+	return manager.drainTimeoutFor(accountID)
 }
 
 // pauseWorkerResets 暂停登记新的后台关闭（ResetAll 使用，可嵌套），返回恢复登记的函数。

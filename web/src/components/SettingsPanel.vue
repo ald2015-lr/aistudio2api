@@ -72,6 +72,8 @@ type EditableKey =
   | 'ignore_client_seed'
   | 'repeat_prompt_nonce'
   | 'min_output_tokens'
+  | 'long_output_enabled'
+  | 'long_output_max_tokens'
   | 'downgrade_guard'
   | 'proxy_pool'
   | 'media_output'
@@ -110,6 +112,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'ignore_client_seed',
   'repeat_prompt_nonce',
   'min_output_tokens',
+  'long_output_enabled',
+  'long_output_max_tokens',
   'downgrade_guard',
   'proxy_pool',
   'media_output',
@@ -238,6 +242,8 @@ const form = reactive<ServiceConfig>({
   ignore_client_seed: false,
   repeat_prompt_nonce: true,
   min_output_tokens: 60000,
+  long_output_enabled: true,
+  long_output_max_tokens: 262144,
   downgrade_guard: defaultDowngradeGuard(),
   media_output: 'inline',
   media_base_url: '',
@@ -511,6 +517,16 @@ function validate(value: ServiceConfig): string {
   const floor = value.min_output_tokens
   if (typeof floor !== 'number' || !Number.isInteger(floor) || floor < 0) {
     return tf('settings.invalidNumber', { field: label('settings.minOutputTokens') })
+  }
+  // 自动续写的默认总上限可以为 0（不模拟续写），最大 1048576（与官网自动续写的总量相同）
+  const longTotal = value.long_output_max_tokens
+  if (
+    typeof longTotal !== 'number' ||
+    !Number.isInteger(longTotal) ||
+    longTotal < 0 ||
+    longTotal > 1048576
+  ) {
+    return t('settings.invalidLongOutputMaxTokens')
   }
   const guard = value.downgrade_guard
   if (guard !== undefined && guard.enabled) {
@@ -1533,6 +1549,41 @@ onBeforeUnmount(() => {
         />
         <span class="mt-2 block text-xs text-gray-500">{{ t('settings.minOutputTokensHelp') }}</span>
       </label>
+
+      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.long_output_enabled"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.longOutputEnabled')
+            }}</span>
+            <span class="mt-1 block text-xs text-gray-500">{{
+              t('settings.longOutputEnabledHelp')
+            }}</span>
+          </span>
+        </label>
+        <label class="mt-4 block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.longOutputMaxTokens')
+          }}</span>
+          <input
+            v-model.number="form.long_output_max_tokens"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            type="number"
+            min="0"
+            max="1048576"
+            step="1"
+            required
+          />
+          <span class="mt-2 block text-xs text-gray-500">{{
+            t('settings.longOutputMaxTokensHelp')
+          }}</span>
+        </label>
+      </div>
 
       <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <label class="flex items-start gap-3">

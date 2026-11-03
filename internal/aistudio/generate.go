@@ -40,11 +40,20 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 	if err != nil {
 		return nil, err
 	}
+	official := request.continuation
+	if official != nil {
+		// long- 请求的官网自动续写（能力码 91，见 continuation.go）：与官网一致开启续写，输出上限按本轮的累计上限
+		config = continueGenerationConfig(config, official.round, official.total)
+	}
 	serverSideTools := explicitTools && len(request.Tools.Functions) > 0 && (len(request.Tools.Google) > 0 || request.Tools.GoogleSearch != nil)
-	// 与网页版一致：普通对话请求共 11 项、不带时区；只有同时使用内置工具与函数调用时才需要第 14 项工具配置
+	// 与网页版一致：普通对话请求共 11 项、不带时区；只有同时使用内置工具与函数调用时才需要第 14 项工具配置；
+	// 官网自动续写的续写轮带第 17 项续写 token
 	length := 11
 	if serverSideTools {
 		length = 14
+	}
+	if official != nil && official.token != "" {
+		length = 17
 	}
 	wire := make([]any, length)
 	wire[0] = wireModelName(request.Model)
@@ -64,10 +73,16 @@ func EncodeGenerateContentRequest(request GenerateRequest, defaults GenerationDe
 		// 可设置分辨率模型的默认扩展工具字段
 		wire[6] = []any{[]any{nil, nil, nil, []any{nil, []any{}}}}
 	}
-	wire[10] = int64(1)
+	if official == nil {
+		// 官网对自动续写模型的续写请求省略这一项
+		wire[10] = int64(1)
+	}
 	if serverSideTools {
 		// 同时使用内置工具与函数调用时开启 include_server_side_tool_invocations
 		wire[13] = []any{nil, nil, true}
+	}
+	if official != nil && official.token != "" {
+		wire[16] = official.token
 	}
 	return json.Marshal(wire)
 }
@@ -648,11 +663,14 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	source := request
 	var wireRequest GenerateRequest
 	request, wireRequest = playgroundWireRequest(source, entry)
+	// rounds 记录 long- 请求的续写是否已决定发第二轮（见 continuation.go）：之后不再重新生成、不再按原生续写被拒改回补用户消息。
+	// 续写的后续轮次在原始上下文 ctx 上发送：重发的上下文（resendCtx）每次开始发送都重新起算首事件计时，续写各轮不能这样
+	rounds := &longOutputRounds{}
 	sendRequest := func(sendCtx context.Context) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 		if build {
 			return c.sendBuild(sendCtx, wireRequest, entry)
 		}
-		return c.sendPlayground(sendCtx, wireRequest, entry)
+		return c.sendPlayground(sendCtx, wireRequest, entry, ctx, rounds)
 	}
 	// 重发（续写回退、重新生成）不报告请求阶段，开始向上游发送时重新起算首事件计时（见 regenerate.go）
 	resendCtx := resendContext(ctx)
@@ -764,7 +782,11 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 					}
 					event = hiddenThought(event)
 				}
-				delivered = true
+				if !delivered {
+					delivered = true
+					// long- 请求的第一轮据此判断这次结果还会不会被重新生成放弃（见 continuation.go 的 decodeLongRounds）
+					rounds.markDelivered()
+				}
 				return send(event)
 			}
 		}
@@ -800,7 +822,8 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		for {
 			reader := &streamReadFailure{source: observeStreamActivity(ctx, response.Body)}
 			err = decodeStream(reader, emit)
-			if errors.Is(err, errStopSequenceMatched) || delivered || ctx.Err() != nil {
+			// 已交出内容、续写已发过第二轮（第二轮起的失败按续写规则体面结束，不重新生成）时照旧结束
+			if errors.Is(err, errStopSequenceMatched) || delivered || rounds.started() || ctx.Err() != nil {
 				break
 			}
 			if err != nil && request.PrefillTail && prefillRejectedError(err) {
@@ -937,8 +960,11 @@ func playgroundWireRequest(source GenerateRequest, entry modelEntry) (GenerateRe
 	return request, wire
 }
 
-// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码
-func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, entry modelEntry) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
+// sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码。long- 请求按自动续写解码：longCtx 为续写的
+// 后续轮次发送用的上下文（Generate 的原始上下文，不是重发的上下文），rounds 为本次 Generate 的续写记录（见 continuation.go）
+func (c *Client) sendPlayground(
+	ctx context.Context, request GenerateRequest, entry modelEntry, longCtx context.Context, rounds *longOutputRounds,
+) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 	runtime := RequestContext{}
 	if c.contextProvider != nil {
 		var err error
@@ -947,6 +973,13 @@ func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, en
 			return nil, nil, fmt.Errorf("读取 AI Studio 请求上下文: %w", err)
 		}
 	}
+	// 模型名带 long- 前缀的请求按自动续写生成（见 continuation.go）；不续写时 plan 为 nil，与普通请求完全相同，并报告一次原因
+	plan, skip := newLongOutputPlan(request, entry.defaults, entry.model.ID)
+	if plan != nil {
+		request = plan.firstRequest(request)
+	} else if request.LongOutput {
+		reportContinuation(ctx, ContinuationProgress{Stage: ContinuationSkipped, Stop: skip})
+	}
 	body, err := EncodeGenerateContentRequest(request, entry.defaults, runtime)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
@@ -954,6 +987,11 @@ func (c *Client) sendPlayground(ctx context.Context, request GenerateRequest, en
 	response, err := c.doProtected(ctx, request, body)
 	if err != nil {
 		return nil, nil, err
+	}
+	if plan != nil {
+		return response, func(source io.Reader, emit func(Event) error) error {
+			return c.decodeLongRounds(longCtx, plan, request, entry.defaults, runtime, source, emit, rounds)
+		}, nil
 	}
 	decoder := NewFrameDecoder()
 	return response, func(source io.Reader, emit func(Event) error) error {

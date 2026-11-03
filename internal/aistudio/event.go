@@ -11,6 +11,18 @@ type FrameDecoder struct {
 	usage     *Usage
 	finished  bool
 	lastFrame json.RawMessage
+	// continuable 表示本轮按官网自动续写编码（long- 请求、模型有能力码 91，见 continuation.go）：读取候选 field 9 的续写 token
+	continuable bool
+	// continueAtMaxTokens 表示本轮的累计输出上限低于请求的输出总上限：以 max_tokens 结束且同一帧带续写 token 时也转入下一轮
+	continueAtMaxTokens bool
+	// latestToken 为本轮已出现的最近一个续写 token
+	latestToken string
+	// continuation 为本轮结束后下一轮使用的续写 token；continuationRequired 表示上游以终止原因 22 或带 token 的 max_tokens
+	// 要求续写（本轮不形成终态，不发出用量与结束事件）
+	continuation         string
+	continuationRequired bool
+	// finishCode 为本轮完成帧的终止原因编号（续写循环判断是否转入下一轮）
+	finishCode int64
 }
 
 // NewFrameDecoder 创建单次 GenerateContent 的有状态解码器
@@ -46,6 +58,14 @@ func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
 		return nil, withMethod(err, "GenerateContent")
 	}
 	finishRaw := rawAt(candidate, 1)
+	frameToken := ""
+	if d.continuable {
+		// 候选 field 9（JSON 索引 8）为官网自动续写的续写 token：不是字符串时忽略
+		_ = json.Unmarshal(rawAt(candidate, 8), &frameToken)
+		if frameToken != "" {
+			d.latestToken = frameToken
+		}
+	}
 	events := make([]Event, 0, 4)
 	if len(candidate) > 0 && !isJSONNull(candidate[0]) {
 		contentEvents, err := d.decodeContent(candidate[0], raw)
@@ -85,6 +105,17 @@ func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
 		finishCode, err := rawInt64(finishRaw, "$[0][][0][0][1]", raw)
 		if err != nil {
 			return nil, withMethod(err, "GenerateContent")
+		}
+		if d.continuable && !d.finished && (finishCode == 22 || finishCode == 2 && frameToken != "" && d.continueAtMaxTokens) {
+			// 官网自动续写：本轮不形成终态，用量（d.usage）与续写 token 交给续写循环，下一轮带 token 接着生成
+			d.continuationRequired = true
+			d.continuation = d.latestToken
+			d.finishCode = finishCode
+			d.finished = true
+			return events, nil
+		}
+		if !d.finished {
+			d.finishCode = finishCode
 		}
 		finishReason := decodeFinishReason(finishCode)
 		// candidate field 4 为上游对结束原因的说明（finishMessage），只是诊断信息：不是字符串时忽略
@@ -178,6 +209,9 @@ func decodeFinishReason(code int64) string {
 		return "image_recitation"
 	case 18:
 		return "missing_thought_signature"
+	case 22:
+		// 官网自动续写要求下一轮（只在 long- 请求按续写编码时出现）；续写循环不再续写时按 max_tokens 结束，协议层同样按长度截断映射
+		return "continuation"
 	default:
 		return fmt.Sprintf("provider_%d", code)
 	}

@@ -346,7 +346,7 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if model, ok := lookupPublicModel(models, modelID); ok {
+	if model, ok := lookupLongPublicModel(models, modelID); ok {
 		writeJSON(w, http.StatusOK, geminiModelObject(model))
 		return
 	}
@@ -1344,7 +1344,7 @@ func geminiFinishReason(reason string) string {
 		return "STOP"
 	case "unspecified":
 		return "FINISH_REASON_UNSPECIFIED"
-	case "max_tokens", "max_output_tokens", "length":
+	case "max_tokens", "max_output_tokens", "length", "continuation":
 		return "MAX_TOKENS"
 	case "safety", "content_filter", "blocked":
 		return "SAFETY"

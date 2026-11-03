@@ -553,6 +553,9 @@ type Account struct {
 	rate *accountRate
 	// egress 为账户所在的出口通道（按出口键与 Ultra 成员关系，见 egress_rate.go）；不在号池中时为 nil。受账户池 mu 保护
 	egress *egressRate
+	// longOutputs 为服务 long- 自动续写请求、还没释放的租约数（见 MarkLongOutput）：排空超时与后台关闭失败 Worker 的等待上限
+	// 按续写的绝对总时长上限计算。受账户池 mu 保护
+	longOutputs int
 	// rateStrikes 为连续裸限流 429 的冷却档位（见 rate_strike.go），只在内存中（重启后从第一档起，冷却本身照常落盘）；受账户池 mu 保护
 	rateStrikes map[rateStrikeKey]rateStrike
 	// proxyBinding 为 IP 池推送的出口（原子替换，见 proxy_binding.go）：装配前由 SetProxyBinding 直接写，进入账户池后只经
@@ -723,6 +726,8 @@ type AccountPool struct {
 	rateFull         map[*Account]struct{}
 	rateWake         *time.Timer
 	rateWakeAt       int64
+	// continuationSeq 为 long- 自动续写重新预占名额的登记序号（见 ReserveContinuation），只增不减；受 mu 保护
+	continuationSeq uint64
 	// globalProxy 为全局代理（PROXY），只用于计算出口键；egresses 为出口键 → 出口记录，egressLanes 按编号排列（索引里存编号，
 	// 编号 = 出口序号×2 + 通道；空闲出口的记录删除后两个位置为 nil，编号对的起点记进 egressFree，新出口优先复用），
 	// egressFull 为令牌桶对某类选择不准入、登记了下一个令牌时刻的通道（与 rateFull 共用窗口释放计时器），
@@ -773,6 +778,12 @@ type AccountLease struct {
 	egressPending bool
 	egressPrimary bool
 	egressCharged bool
+	// rateContinuation 为 long- 自动续写为下一轮重新预占的每分钟名额的登记序号（见 ReserveContinuation，0 为预占来自取得租约或没有预占）：
+	// 同账号的续写预占按登记先后发出，后登记的不挡先登记的；egressAdmitAt 为续写预占的出口令牌可以使用的时刻（UnixNano，0 为立即）；
+	// longOutput 为本租约服务 long- 自动续写请求（见 MarkLongOutput）。都受账户池 mu 保护
+	rateContinuation uint64
+	egressAdmitAt    int64
+	longOutput       bool
 }
 
 // AccountRuntimeLease 保证同一邮箱只有一个 WAA runtime
@@ -2786,6 +2797,12 @@ func (l *AccountLease) releaseLocked() {
 	// 没有发出的生成租约退还每分钟名额与出口通道的预占（独占租约没有预占）
 	l.releaseRateLocked()
 	l.releaseEgressLocked(time.Now().UnixNano())
+	if l.longOutput {
+		l.longOutput = false
+		if l.account.longOutputs > 0 {
+			l.account.longOutputs--
+		}
+	}
 	l.pool.notifyLocked()
 }
 

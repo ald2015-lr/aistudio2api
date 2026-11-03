@@ -169,11 +169,11 @@ Build 独有模型计算：Playground 目录按模型 ID 与别名建立索引�
 
 工具结果中的图片：工具（如读取文件、截图、MCP 工具）返回的 base64 图片会取出来作为真正的图片发送，放在这组工具结果之后的用户消息里并标注来自哪次调用；工具结果原位置替换为文字说明。此前图片的 base64 会被当成文字塞进工具结果：模型看不到图片，输入 token 暴涨，连续读取两张图片基本必然报错。支持 OpenAI、Anthropic、Responses、Gemini 原生（`functionResponse.response` 里 `{"result":[…]}`、`{"content":[…]}` 包装的图片与 `functionResponse.parts` 的媒体）与 MCP 格式；网络地址形式的图片保持原样。
 
-对话历史分轮修正：发往上游前自动合并连续的模型消息与连续的工具结果；历史以模型工具调用开头时在前面补一条用户消息；历史以模型文字消息结尾（预填充、续写）时，3.5 以前的模型（`gemini-3.1-pro-preview`、`gemini-pro-latest`、`gemini-3.1-flash-lite`、`gemini-3-flash-preview`、`gemini-nano-banana-2.1`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、`gemini-3-pro-image`、`gemini-2.5-flash-image` 与 `gemma-` 开头的模型）原样以模型轮结尾发送，由模型从这段文字结尾原生续写；其余模型（含 Omni）在最后补一条请模型从原消息结尾接着写、不重复已有内容的用户消息，避免上游返回 400 “Requests ending with a model turn are not supported”。名单内的模型上游仍返回这类 400 时，同一请求改回补用户消息重发一次（与重新生成一样计入每账号每分钟上限与出口限速；账号已冷却、名额满了或出口限速时不在这个账号重发，换号再试、下一次补用户消息，不冷却、不计入连续失败上限，指定账号的请求在原账号再试，不把这个 400 交给客户端），请求日志写一行“上游不接受以模型轮结尾的请求，改回在末尾补用户消息重试一次”，同模型同通道一小时内直接补用户消息。用于兼容把说明文字和工具调用、或把并行工具调用拆成多条 assistant 消息的客户端，避免上游返回 400 “function call turn comes immediately after a user turn or after a function response turn”。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果>` 文字说明、改为用户消息，各协议一致。除此之外只调整分轮，不改动内容与思考签名。
+对话历史分轮修正：发往上游前自动合并连续的模型消息与连续的工具结果；历史以模型工具调用开头时在前面补一条用户消息；历史以模型文字消息结尾（预填充、续写）时，3.5 以前的模型（`gemini-3.1-pro-preview`、`gemini-pro-latest`、`gemini-3.1-flash-lite`、`gemini-3-flash-preview`、`gemini-nano-banana-2.1`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、`gemini-3-pro-image`、`gemini-2.5-flash-image` 与 `gemma-` 开头的模型）原样以模型轮结尾发送，由模型从这段文字结尾原生续写；其余模型（含 Omni）在最后补一条请模型从原消息结尾接着写、不重复已有内容的用户消息，避免上游返回 400 “Requests ending with a model turn are not supported”。名单内的模型上游仍返回这类 400 时，同一请求改回补用户消息重发一次（与重新生成一样计入每账号每分钟上限与出口限速；账号已冷却、名额满了或出口限速时不在这个账号重发，换号再试、下一次补用户消息，不冷却、不计入连续失败上限，指定账号的请求在原账号再试；能换号或再试时不把这个 400 交给客户端，没有别的账号可换或已再试 2 次时按上游的 400 返回），请求日志写一行“上游不接受以模型轮结尾的请求，改回在末尾补用户消息重试一次”，同模型同通道一小时内直接补用户消息。用于兼容把说明文字和工具调用、或把并行工具调用拆成多条 assistant 消息的客户端，避免上游返回 400 “function call turn comes immediately after a user turn or after a function response turn”。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果>` 文字说明、改为用户消息，各协议一致。除此之外只调整分轮，不改动内容与思考签名。
 
 流尾错误：Playground 的 GenerateContent 流在帧列表之后带 google.rpc 状态 `[[...], [code, message, details]]` 时按状态码交出上游错误：8 为 429（冷却、换号）、5xx 重试、3 为 400 按请求错误返回，完成帧之后的流尾错误同样交出。原先跳过流尾，一律报“流结束前没有完成帧”（对外 502）。
 
-客户端还没收到内容时重新生成：上游以 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL` 结束，或流在完成帧之前中断（连接被重置、响应被截断、正常结束却没有完成帧）、流尾为 5xx（504 除外，交给换号），而这次请求还没有向客户端交出任何正文、思考或工具调用（数据型心跳不算）时，在同一账号重新生成，每个请求最多 2 次（换号后的尝试共用这 2 次）。上游对完全相同的输入返回完全相同的回复（见[排查路由 /trace/](#排查路由-trace)里的重复回复说明），所以因结束原因重新生成时换一个随机后缀再发；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE=false`）原样重发多半还是同一个错误调用，不因结束原因重新生成，请求日志写一行说明；流中断与流尾 5xx 不是确定性的，照旧原样重发。上游字段类型变了、函数调用缺少名称这类确定性的格式不符不算中断，不重新生成。重新生成计入每账号每分钟上限（`ACCOUNT_RPM_LIMIT`）与出口限速，账号已冷却、名额满了或出口限速时不再重新生成、按原结果处理，请求日志写明是哪一项（“账号冷却至 15:04:05（原因=…）”“每分钟名额 10/10”或“出口 <出口>（普通通道）限速 n 次/分钟”）；几次生成共用首事件前期限（`REQUEST_TIMEOUT`），剩余期限不到这次耗时的 1.2 倍时同样按原结果结束，长思考模型不会因为重来而变成 504；首事件超时（`FIRST_EVENT_TIMEOUT`）按每次发送计，重新生成的那次发送重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成（免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时）；用量与访问日志只记最后一次；请求日志每次写一行“客户端还没收到内容，同账号重新生成 | 第 n/2 次 | 原因 | 本次耗时=… | 上游说明=… | 输入=已换随机后缀|原样重发”（附被放弃那次的结束说明或流尾错误原文）。已经交出内容的照旧结束；非流式请求同样以“已交出事件”为界：思考摘要先交出、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成。
+客户端还没收到内容时重新生成：上游以 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL` 结束，或流在完成帧之前中断（连接被重置、响应被截断、正常结束却没有完成帧）、流尾为 5xx（504 除外，交给换号），而这次请求还没有向客户端交出任何正文、思考或工具调用（数据型心跳不算）时，在同一账号重新生成，每个请求最多 2 次（换号后的尝试共用这 2 次）。上游对完全相同的输入返回完全相同的回复（见[排查路由 /trace/](#排查路由-trace)里的重复回复说明），所以因结束原因重新生成时换一个随机后缀再发；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE=false`）原样重发多半还是同一个错误调用，不因结束原因重新生成，请求日志写一行说明；流中断与流尾 5xx 不是确定性的，照旧原样重发。上游字段类型变了、函数调用缺少名称这类确定性的格式不符不算中断，不重新生成。重新生成计入每账号每分钟上限（`ACCOUNT_RPM_LIMIT`）与出口限速，账号已冷却、名额满了或出口限速时不再重新生成、按原结果处理，请求日志写明是哪一项（“账号冷却至 15:04:05（原因=…）”“每分钟名额 10/10”或“出口 <出口>（普通通道）限速 n 次/分钟”）；几次生成共用首事件前期限（`REQUEST_TIMEOUT`），剩余期限不到这次耗时的 1.2 倍时同样按原结果结束，长思考模型不会因为重来而变成 504；首事件超时（`FIRST_EVENT_TIMEOUT`）按每次发送计，重新生成的那次发送重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成（免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时）；用量与访问日志只记最后一次；请求日志每次写一行“客户端还没收到内容，同账号重新生成 | 第 n/2 次 | 原因 | 本次耗时=… | 上游说明=… | 输入=已换随机后缀|原样重发”（附被放弃那次的结束说明或流尾错误原文）。已经交出内容的照旧结束；非流式请求同样以“已交出事件”为界：思考摘要先交出、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成。`long-` 自动续写的请求只在第一轮还没交出内容时重新生成（重发的第一轮照样按续写方式发送），续写发了第二轮之后不再重新生成，后面的失败按续写的规则结束；重新生成次数与续写轮数互不占用，两者共用同一套每分钟名额与出口限速的准入。
 
 Schema 里的空串：官网拒收 `enum` 里的空串，Playground 编码时去掉空串（去完为空时不写 `enum`），并把完整 Schema 附在函数说明或结构化输出的说明里交给模型遵守；`not` 只排除空串（`not: ""`、`not: {"enum": [""]}`、`not: {"const": ""}`）时字符串参数改写为 `minLength: 1`，排除值里的其他取值照旧，联合类型与带其他约束的 `not` 只去掉空串、不收紧其余取值；`not` 里用 `anyOf`、`oneOf`、`allOf` 或对象属性写出的空串排除去掉空串后会变成“一律禁止”，这时删除对应的分支或整个 `not`，宁可放宽也不发出无法满足的约束。Build 通道原样发送 JSON Schema，不受影响。
 
@@ -306,6 +306,32 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 | `-online` | 开启 Google 搜索（模型支持时） |
 
 模型列表为每个可调节思考的文本模型列出 `-low`、`-medium`、`-128` 等别名；目录里的模型 ID 本身以等级结尾时（例如 `xxx-low`）按 ID 里的等级设置，不再强制最高思考。Gemini Omni 另有宽高比、分辨率、时长与视频任务后缀（例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`），见 [Omni 视频参数](#omni-视频参数)。
+
+#### 自动续写（long- 前缀）
+
+在模型名前加 `long-`（不分大小写）开启自动续写，与上面的全部后缀照常组合，例如 `long-gemini-4-argon`、`long-gemini-4-argon-low`、`long-gemini-3.8-flash-nothinking`；不带 `long-` 的请求完全不续写，与原先逐字节相同。输出达到单轮上限时，本服务在同一个账号上接着发下一轮，客户端收到的是一条连续的流（非流式为一整段回复），结束原因与合并后的用量只在最后给一次：
+
+| 模型 | 续写方式 | 没给最大输出时的总上限 |
+| --- | --- | --- |
+| 模型目录有官网自动续写能力（能力码 91，如 `gemini-4-argon`） | 照官网：每轮 32768 token，上游给出续写 token 后带着它发下一轮，由上游接着生成（思考也可以跨轮） | 官网续写总量（模型的 `inputTokenLimit`，约 100 万） |
+| 其他文本模型 | 模拟续写：本轮以 `max_tokens` 结束、有新的正文且没有工具调用时，把已输出的正文作为模型消息放在历史末尾再发一轮；新一轮开头与已输出正文重复的部分去掉，后续轮次的思考不输出、思考强度按最低发送。结构化输出（JSON Schema、JSON 模式）与带联网搜索等 Google 内置工具的请求不模拟续写，按普通请求处理 | `LONG_OUTPUT_MAX_TOKENS`（默认 262144） |
+
+- **上限**：客户端给了最大输出（`max_tokens`、`max_completion_tokens`、`max_output_tokens`、`maxOutputTokens`）就以它为总上限（官网续写不超过官网总量）；单轮仍按模型单轮上限。客户端给的值不超过单轮上限时一轮就结束，与不带 `long-` 相同（请求日志记一行“本次不自动续写”的原因），所以想要更长的输出时不要给最大输出，或给一个更大的值。正文与思考都计入总上限。官网续写照官网的分段方式：总上限超过 32768 就按每轮 32768 分轮（例如 Anthropic 协议的 `max_tokens` 被 `MIN_OUTPUT_TOKENS` 提高到 60000 时，输出超过 32768 的部分在第二轮），不先按目录的单轮上限发一个普通请求：普通请求一轮能否写到 32768 以上没有证实。
+- **代价**：每轮都是一次新的生成请求，照常取新的 WAA proof、占一次请求额度并计入 `ACCOUNT_RPM_LIMIT`，整体会更慢。轮数约为 总上限 ÷ 单轮上限：官网续写每轮 32768（写满约 100 万 token 要约 32 轮）；模拟续写在单轮 65536 的模型上用默认的 262144 最多约 4 轮（多占 3 次请求额度），单轮更小的模型轮数更多（单轮 8192 的模型约 32 轮），一个请求最多 64 轮。下一轮发送前照号池的准入规则等待：账号的每分钟窗口（已发出的加同账号其他请求已占的名额）已满时等窗口释放，出口被判定限流时等出口令牌，账号刚进入分钟限额这类很快恢复的冷却时等它结束。续写中途不换号；第二轮起某一轮发送失败、输出中途中断，或本服务自己的期限到期（首事件后空闲期限 `REQUEST_TIMEOUT`、每轮的总时长上限、整段的绝对上限）时不报错，只结束这一轮：已输出的内容（含前面各轮与这一轮已收到的部分）完整返回，按 `max_tokens`（OpenAI 为 `length`）结束并带合并后的用量，流式与非流式相同，请求结果为 `completed`；第一轮失败与普通请求相同。每个请求从开始算起最长 6 小时（总时长上限的 6 倍，每开始一轮重新计算 1 小时的总时长上限，但不超过它），离这个上限不到一个 `REQUEST_TIMEOUT` 时不再发下一轮。建议用流式请求：非流式要等全部轮次结束才返回，前面的反向代理与中转可能先超时。
+- **模拟续写的局限**：模型只看得到已输出的正文，看不到第一轮的思考，后续轮次的风格与思路可能和前面不完全一致；接缝处按至少 20 字节的重复去重，模型改写了结尾的半句时可能多出或少几个字；本轮有工具调用、代码执行或媒体输出、搜索来源，或思考占满单轮上限还没有正文时不续写；结构化输出（`response_format` 为 `json_schema`/`json_object`、Gemini `responseSchema`/`responseMimeType`）不模拟续写：上游按约束解码要求每一轮从头就是一个完整的 JSON，接着写会拼出两个 JSON；带联网搜索（`-online`）、URL Context 等 Google 内置工具的请求同样不模拟续写：搜索来源与片段位置按单轮给出（官网续写不受这两条影响）；后续轮次的思考强度降到最低（客户端本来就关闭思考或要求最低时保留客户端的设置）。已输出的正文要作为输入发回上游，总长受账号的输入上限约束：部分账号的输入上限为 131072 token，提示词加已输出的正文超过它时不再续写、按 `max_tokens` 结束，`LONG_OUTPUT_MAX_TOKENS` 的默认值在这类账号上可能到不了。能原生预填充的模型（与上文“对话历史分轮修正”里客户端预填充的名单、拒绝判断与记忆是同一份，如 `gemini-3.1-pro-preview`、`gemini-3-flash-preview`、`gemma-` 系列）以模型消息结尾发送，上游拒绝时（发送时或流尾）在这一轮内改补用户消息重发（不换号），并按“模型 + 通道”记住一小时：这期间同模型的续写与客户端预填充都直接补用户消息；其余模型补一条“Continue exactly from where your previous message ended…”的用户消息。
+- **只在 Playground 通道**：选号时先在所有账号的 Playground 里选（某个账号的 Playground 冷却时取其他账号的 Playground，不落到这个账号的 Build），也不拿来做 Build 恢复试探；所有账号的 Playground 都不可用时才经 Build 发送，按普通请求处理。经 Build 通道发送的尝试与 Interaction（Gemini Omni）请求日志各记一行说明；图片、语音等非文本模型按普通请求处理。
+- **模型名与日志**：响应里的模型名、用量账本与请求日志的模型与其他后缀同口径（报告目录模型名，不带 `long-`）；请求日志每轮记一行 `自动续写 | 第 N 轮结束 | 方式=… | 本轮结束原因=… | …`，用量账本只记一条合并后的用量。`/v1/models` 只为能经 Playground 调用的文本模型多列一个 `long-<模型>`，`long-` 与后缀的组合不逐个列出，但 `GET /v1/models/<名称>` 能查到。
+- **关闭**：`LONG_OUTPUT_ENABLED=false`（管理页“服务配置”可改，保存后立即生效）时 `long-` 前缀照常识别，按普通请求处理。
+
+经 new-api 使用时，在渠道的“模型重定向”里把对外的模型名映射到带 `long-` 的名称即可，例如：
+
+```json
+{
+  "gemini-4-argon-long": "long-gemini-4-argon",
+  "gemini-4-argon-long-low": "long-gemini-4-argon-low",
+  "gemini-3.8-flash-long": "long-gemini-3.8-flash-nothinking"
+}
+```
 
 响应里的模型名（OpenAI、Anthropic、Responses、Interactions 的 `model`，Gemini 的 `modelVersion`）是请求的模型名去掉上述后缀：请求 `gemini-3.1-pro-preview`、`gemini-3.1-pro-preview-128`、`gemini-3.1-pro-preview-low` 都返回 `gemini-3.1-pro-preview`；目录里没有的名称按请求原样返回。带 `models/` 前缀的名称（如 `models/gemini-3.1-pro-preview-low`）先去掉前缀再解析，各协议一致。不返回上游报告的实际服务模型版本：它只出现在 OpenAI、Responses 与 Anthropic 非流式响应的 `provider_model` 字段里；实际服务的模型与请求的不是同一系列时，管理日志另记 `served_model`。
 
@@ -746,6 +772,8 @@ cp .env.example .env
 | `PRIMARY_QUEUE_WAIT` | `10s` | 主用模型的排队上限，整个请求共用一份：从第一次选号起按实际经过的时间计，失败后换号重试的尝试（如 403、额度 429）与换号退避都算在内，不再每次换号重新计时；请求自己现场冷启动的浏览器启动时间不计（最多 `INIT_TIMEOUT`）；上限到了之后只接受立即可用的账号，否则返回 429；`0` 表示不排队，没有立即可用的账号就返回 429；不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
 | `ULTRA_PRIMARY_MODELS` | `gemini-4-argon` | Ultra 号池的主用模型，逗号分隔，作用于 `/ultra` 请求（`ULTRA_EXCLUSIVE=false` 时也作用于普通路径上不在 `PRIMARY_MODELS` 里的这些模型）。排队规则与 `PRIMARY_MODELS` 相同，另外没有额度时立即返回 429：候选全部冷却立即返回；额度 429 后，每日额度用完最多再换 2 次账号，分钟限额与限流最多再换 5 次，每次额度失败后的那次换号只用已启动的 Worker（见[主用模型](#主用模型)）。在 `.env` 写空值或在管理页清空即关闭；进程环境变量的空值不生效。保存后立即生效 |
 | `ULTRA_PRIMARY_QUEUE_WAIT` | `10s` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同：整个请求共用一份，`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
+| `LONG_OUTPUT_ENABLED` | `true` | 模型名带 `long-` 前缀时自动续写：输出达到单轮上限后在同一账号上接着发下一轮，客户端收到一条连续的回复；官网支持自动续写的模型照官网分轮续写，其他模型模拟续写。每轮占一次请求额度、会更慢；`false` 时 `long-` 前缀照常识别，按普通请求处理。管理页“服务配置”可改，保存后立即生效，见[自动续写](#自动续写long--前缀) |
+| `LONG_OUTPUT_MAX_TOKENS` | `262144` | `long-` 请求没有给出最大输出时，不支持官网续写的模型最多输出的 token 数（正文与思考合计，约为常见单轮上限 65536 的 4 倍）；`0` 表示不模拟续写，最大 `1048576`。轮数约为 总上限 ÷ 模型单轮上限：单轮 65536 的模型最多约 4 轮（多占 3 次请求额度），单轮更小的模型轮数更多（一个请求最多 64 轮），每轮占一次请求额度并计入 `ACCOUNT_RPM_LIMIT`。支持官网续写的模型按官网总量，客户端给出最大输出时以客户端为准。模拟续写把已输出的正文发回上游，输入上限为 131072 的账号到不了更大的值（超过时按 `max_tokens` 结束）。保存后立即生效 |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话（只认 `true`/`false`，写错时启动即报错） |
 | `MEDIA_OUTPUT` | `inline` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 与原先一样内联（data URI / `inlineData`）；`url` 按内容保存到 `runtime/media/`，正文改为本服务 `/media/<文件名>` 的链接（Gemini 原生接口为链接文本加 `fileData`），该路径不校验 API key。经 new-api 等中转使用、或生成视频时设为 `url`，见[生成视频与媒体链接](#生成视频与媒体链接omni)。保存后立即生效 |
@@ -1069,10 +1097,12 @@ localStorage 只在启动成功后写回：如果旧格式的设置本身就让�
 | --- | --- | --- |
 | `本服务首事件前期限 <期限> 到期[（停在 <位置>）]: …` | 首字之前就到时：排队、现场冷启动，或隐藏思考（Anthropic `thinking.type=disabled`、Gemini `includeThoughts=false`：Build 通道上游不返回思考，Playground 通道上游返回但本服务丢弃）时的长思考。在某次尝试中到期时带 `（停在 …）`，文件资源刷新时到期带 `（停在 文件资源刷新）`；排队或回到原账号等待时到期为 `…到期: 排队 … 后请求超时（…）`、`…到期: 回到原账号等待 … 后请求超时（…）`；其他不在尝试中到期的情形（如换号退避中、上一次为超时类错误）为 `…到期: <上一次错误>` | 调大 `REQUEST_TIMEOUT`，或排查排队（`bash tools/diag_busy.sh`） |
 | `本服务首事件后空闲期限 <期限> 到期（已输出 推理=N 正文=M）: …` | 开始输出后上游卡住：连续 `REQUEST_TIMEOUT` 没有事件也没有字节 | 看请求时间线里最后一次 `事件流停顿` |
-| `本服务总时长上限 1h0m0s 到期（…）: …` | 整条请求超过总时长上限 | 需要更长时调大 `REQUEST_TIMEOUT` |
+| `本服务总时长上限 1h0m0s 到期（…）: …` | 整条请求超过总时长上限（`long-` 自动续写每开始一轮从此刻重新计算，整段最长为它的 6 倍；第二轮起到期时只结束这一轮，按 `max_tokens` 正常结束，不报这个错误） | 需要更长时调大 `REQUEST_TIMEOUT` |
 | `… 返回 HTTP 504、协议错误码 4: …` | Google 侧自己的期限 | 缩短思考或输出 |
 | `AI Studio stream closed before finish` | 上游在结束帧之前断流 | 看同账号同一时刻的告警 |
 | 只有 `context deadline exceeded` 本身（没有“本服务”前缀） | 旧版本的整段期限，或计数、视频、转写请求。带 `AI Studio … 协议位置` 或 `BiDi … 等待回复超时` 的是上游或浏览器链路超时，不是本服务期限 | 升级；链路超时看同账号同一时刻的告警 |
+
+单轮输出有上限（模型目录的输出上限；`gemini-4-argon` 这类官网自动续写的模型在官网每轮 32768 token）：回复写到单轮上限时以 `max_tokens`（OpenAI 为 `length`）正常结束，不是截断错误；需要更长的输出时在模型名前加 `long-` 自动续写，见[自动续写](#自动续写long--前缀)。
 
 “截断后又重新生成”在本服务这边是相同输入、请求 ID 不同的新请求：收到首个上游事件后本服务不会再换号或重做，重新生成来自客户端或中转。最常见的是 new-api 的 Claude 类型渠道开了失败重试：它把流内错误改写成 500，在同一个连接里重新请求，客户端在一条回复里先看到截断的前半段，再看到从头生成的第二段。把 new-api 的重试次数设为 0，或把接本服务的渠道改成 OpenAI 类型。非流式请求在生成完之前没有任何字节，前面有 Cloudflare 时约 100 秒返回 524（本服务记为约 100 秒的取消 499），客户端重发就是整段重新生成，长思考模型请用流式。完整说明（含 new-api 不转发 `: ping` 时的处理、Worker 层的影响）见[长生成与中转重试](docs/development.md#长生成与中转重试)。
 
@@ -1114,7 +1144,7 @@ MINUTES=180 MODEL=gemini-3.8-flash bash tools/diag_cancel.sh
 | 路径不存在或方法不对（如 `GET /v1/chat/completions`） | 404 | `Invalid URL (GET /v1/chat/completions)`，按路径所属协议的错误结构返回 |
 | 模型不存在（号池的模型目录里没有它） | 404 | `models/<模型> is not found for API version v1beta, …` |
 | 号池目录列出了模型，但它不在这个号池的模型列表里（`/v1/models` 不列出：目录列出它的账号都因权益或启用的上游通道接不了，例如只启用 Build 时的 Omni、模型的权益要求与账号不符）；管理日志写一行 `选号没有候选` 与按原因的账号计数 | 404 | `models/<模型> is not available to the accounts in this pool: <原因>. Call ListModels to see the list of available models.`，原因如 `no account in this pool has a subscription tier that allows this model`、`the enabled upstream channels (build) cannot serve this model`；不带 `Retry-After`，重试也不会好转 |
-| 模型在列、账号也能接，选号却没有候选（假设的候选索引与账号状态不一致，或核对前账号状态刚变化）：本服务重试一次选号（候选索引没有候选时先作废它；输入超限后的再试不重试），管理日志按 ERROR 写一行 `选号没有候选，逐个账户核对却还有候选`；重试后仍没有候选时。这是兜底，线上 Omni 只带图片的请求同一秒以“没有符合条件的账户”结束的根因尚未查明，见 [logging.md](docs/logging.md) 的核对摘要与 Omni 选号诊断 | 503 | `Model <模型> is listed, but no account in the pool can serve this request right now. Please try again later.`，附 `Retry-After` |
+| 模型在列、账号也能接，选号却没有候选（假设的候选索引与账号状态不一致，或核对前账号状态刚变化）：本服务重试一次选号（候选索引没有候选时先作废它；输入超限后的再试不重试），管理日志按 ERROR 写一行 `选号没有候选，逐个账户核对却还有候选`；模型在列时，没有重试（逐个账户核对也没有候选）或重试后仍没有候选，都按这一行返回。这是兜底，线上 Omni 只带图片的请求同一秒以“没有符合条件的账户”结束的根因尚未查明，见 [logging.md](docs/logging.md) 的核对摘要与 Omni 选号诊断 | 503 | `Model <模型> is listed, but no account in the pool can serve this request right now. Please try again later.`，附 `Retry-After` |
 | 号池全部冷却、上游限流、主用模型排队超限、Ultra 主用模型额度不足、租到的账号在请求发出前进入冷却又不能再换号 | 429 | `Resource has been exhausted (e.g. check quota).`；号池全部冷却时附 `Retry-After`（距最早恢复的秒数），主用模型排队超限、Ultra 主用模型额度不足（见[主用模型](#主用模型)）与租到的账号在请求发出前进入冷却（距拦下它的冷却恢复的秒数）时同样附 `Retry-After`；`Retry-After` 在建议间隔上随机往后加 0 到 3 秒（建议间隔不到 5 秒不加） |
 | 输入超过 Playground 的输入上限、而官网停用了 Build 通道的生成（无法改走 Build，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成)） | 400 | `The input token count exceeds the maximum number of tokens allowed (131072) on the AI Studio Playground channel, and longer inputs cannot be processed because AI Studio has disabled generation through the Build channel.`；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头，客户端可以压缩上下文后重试 |
 | 只能经 Build 调用的模型（Build 目录有、Playground 目录没有，如 `gemini-4-argon`）在官网停用 Build 通道的生成期间 | 503 | `Model <模型> is only available through the AI Studio Build channel, and AI Studio has disabled generation through the Build channel. Please try again later or use another model.` |

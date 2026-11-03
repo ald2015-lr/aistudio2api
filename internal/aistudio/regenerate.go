@@ -23,7 +23,11 @@ import (
 //   - 每个请求最多 regenerationLimit 次，换号重试共用这个次数（app 层每个请求建一个 RegenerationBudget 挂到各次尝试上），
 //     不会因为换了账号再各来一轮
 //   - 每次重新生成先经 AccountLease.ReserveRegeneration：账号已冷却、每分钟名额（ACCOUNT_RPM_LIMIT）已满或出口令牌桶不准入时
-//     不重新生成，原样交出结果（错误照旧由 app 层冷却、换号），说明里写明是哪一项；准入时像取得租约一样预占名额，发送时抵掉
+//     不重新生成，原样交出结果（错误照旧由 app 层冷却、换号），说明里写明是哪一项；准入时像取得租约一样预占名额，发送时抵掉。
+//     与 long- 续写的下一轮共用同一套预占、判断与退还（见 resend_admission.go）
+//   - long- 自动续写（continuation.go）：重新生成只可能落在第一轮（还没交出事件），重发经 sendPlayground 按同一份请求重新生成续写计划，
+//     官网续写的编码照旧；续写决定发第二轮之后不再重新生成（longOutputRounds），第二轮起的失败按续写规则体面结束。
+//     重新生成次数与续写轮数互不占用
 //   - 只交出最后一次的用量（前面几次的用量与结束事件丢弃），用量账本与访问日志只记一次；降级判定的计时从第一块正文开始，
 //     重新生成发生在任何正文之前，不受影响
 //   - 三次生成共用首事件前期限（REQUEST_TIMEOUT）：剩余期限不到本次耗时的 1.2 倍时不重新生成，按这次的结果结束；
@@ -182,10 +186,16 @@ func regenerationTimeShort(ctx context.Context, elapsed time.Duration) string {
 	return ""
 }
 
+// regenerableFinish 判断结束原因可以在客户端还没收到内容时同账号重新生成：函数调用格式错误（MALFORMED_FUNCTION_CALL）、
+// 意外的工具调用（UNEXPECTED_TOOL_CALL）
+func regenerableFinish(reason string) bool {
+	return reason == "malformed_function_call" || reason == "unexpected_tool_call"
+}
+
 // regenerationReason 返回可以在同一账号重新生成的原因（写进请求说明），不能重新生成时为空。readErr 为读取上游响应时的非 EOF 错误
 func regenerationReason(err error, readErr error, finish *Event) string {
 	if err == nil {
-		if finish != nil && (finish.FinishReason == "malformed_function_call" || finish.FinishReason == "unexpected_tool_call") {
+		if finish != nil && regenerableFinish(finish.FinishReason) {
 			return "结束原因=" + finish.FinishReason
 		}
 		return ""

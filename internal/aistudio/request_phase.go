@@ -27,3 +27,8 @@ func reportRequestPhase(ctx context.Context, phase RequestPhase) {
 		observer(phase)
 	}
 }
+
+// ReportRequestPhaseForTest 报告受保护请求的阶段：测试替身按 WorkerProtectedTransport 的顺序报告准备 WAA proof、等响应头与开始流式
+func ReportRequestPhaseForTest(ctx context.Context, phase RequestPhase) {
+	reportRequestPhase(ctx, phase)
+}

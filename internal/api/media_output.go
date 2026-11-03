@@ -340,13 +340,13 @@ func (s *server) restoreMediaLinks(ctx context.Context, request *aistudio.Genera
 	request.Notes = append(request.Notes, notes...)
 }
 
-// omniVideoTarget 判断请求的模型名（可带后缀与目录别名）解析为能输出视频的 Omni 模型；目录取不到时为 false（按其他模型恢复）
+// omniVideoTarget 判断请求的模型名（可带后缀、long- 前缀与目录别名）解析为能输出视频的 Omni 模型；目录取不到时为 false（按其他模型恢复）
 func (s *server) omniVideoTarget(ctx context.Context, name string) bool {
 	models, err := s.aliasCatalog(ctx)
 	if err != nil {
 		return false
 	}
-	model, _, ok := resolveRequestModel(models, name)
+	model, _, _, _, ok := resolveLongRequestModel(models, name)
 	return ok && aistudio.OmniVideoModel(model)
 }
 

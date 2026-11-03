@@ -99,10 +99,12 @@ func (t *Trace) analyzeLocked() {
 	}
 	// 预填充：客户端最后一条是模型消息（见 notes）。名单内的模型原样以模型轮结尾发送、由模型原生续写，其余模型在末尾补了一条
 	// 请模型接着写的用户消息；原生续写被上游拒绝（改回补用户消息重试）或近期被拒过（直接补用户消息）时按补用户消息说明。
-	// 改回补用户消息的说明经请求说明观察者写进时间线（有观察者时不写 notes），两处都看
+	// 改回补用户消息的说明经请求说明观察者写进时间线（有观察者时不写 notes），两处都看。long- 自动续写的进度（下一步=…（原生预填充））
+	// 与续写轮被拒的改回说明（“自动续写第 N 轮：…”）说的是续写的后续轮次，不是客户端的预填充，不算
 	prefill, nativePrefill, prefillAppended := false, false, false
 	observePrefill := func(message string) {
 		switch {
+		case strings.HasPrefix(message, "自动续写"):
 		case strings.Contains(message, "预填充"):
 			prefill = true
 			nativePrefill = nativePrefill || strings.Contains(message, "原生续写")

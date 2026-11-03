@@ -14,7 +14,10 @@ import (
 //   - 收到首个非错误上游事件、转发之前 generateWithRetry 调用 beginStreaming：期限在原对象上延长到总时长上限，
 //     之前派生的上下文（本次尝试、上游连接、响应体）随之延长，不需要逐个通知；
 //   - 首事件后空闲期限 = REQUEST_TIMEOUT：由 forwardEvents 的看门狗判断，到期调用 expire；
-//   - 总时长上限 = max(generateMaxDuration, REQUEST_TIMEOUT)：从建立上下文算起。
+//   - 总时长上限 = max(generateMaxDuration, REQUEST_TIMEOUT)：从建立上下文算起；long- 自动续写每开始一轮从此刻重新计算，
+//     整段不超过总时长上限的 longOutputDurationFactor 倍（见 renewTotal）。long- 自动续写第二轮起登记了这一轮的结束函数
+//     （beginLongRound）时，首事件后空闲期限与总时长上限（含绝对总时长上限）到期只结束这一轮，续写按这一轮失败体面结束
+//     （已输出的内容完整返回、按 max_tokens 结束），longRoundGrace 后整个请求仍没有结束时才按期限到期结束。
 //
 // 三种期限到期时 Err() 都是 context.DeadlineExceeded 本身（不包装），deadlineCause 给出是哪一段；
 // 父上下文取消、管理端取消、生成服务停止时为父上下文的错误或 context.Canceled。三段期限都在创建时取值，热更新只影响新请求。
@@ -33,9 +36,25 @@ import (
 const generateMaxDuration = time.Hour
 
 // generateMaxDurationFor 返回 REQUEST_TIMEOUT 为 requestTimeout 时生成请求的总时长上限（不短于首事件前期限）。
-// Worker 层“进行中的请求最长持续多久”的估计（排空超时、后台关闭失败 Worker 的上限）同样按它
+// Worker 层“进行中的请求最长持续多久”的估计（排空超时、后台关闭失败 Worker 的上限）同样按它；账号上有 long- 自动续写的租约时
+// 按 longOutputMaxDurationFor
 func generateMaxDurationFor(requestTimeout time.Duration) time.Duration {
 	return max(generateMaxDuration, requestTimeout)
+}
+
+// longOutputDurationFactor 为 long- 自动续写的绝对总时长上限相对总时长上限的倍数：续写每开始一轮从此刻重新计算总时长上限，
+// 但从建立请求上下文算起不超过总时长上限的这个倍数（默认 6 小时）。按官网续写约 100 万 token、每秒几十到一百多 token 估计，
+// 多数长输出在这之内写完；没有这个上限时一个请求最多 64 轮、每轮各 1 小时，可以持续几十小时，排空与后台关闭等不到它结束
+const longOutputDurationFactor = 6
+
+// longRoundGrace 为 long- 自动续写第二轮起总时长上限到期、只结束当前这一轮之后，等整个请求体面结束（交出扣住的正文、用量与
+// max_tokens 结束）的时间：过后仍没有结束时按总时长上限到期结束整个请求
+const longRoundGrace = 30 * time.Second
+
+// longOutputMaxDurationFor 返回 REQUEST_TIMEOUT 为 requestTimeout 时 long- 自动续写请求最长持续的时间：绝对总时长上限加上
+// 到期后体面结束的等待（longRoundGrace）
+func longOutputMaxDurationFor(requestTimeout time.Duration) time.Duration {
+	return generateMaxDurationFor(requestTimeout)*longOutputDurationFactor + longRoundGrace
 }
 
 // serviceDeadlineStage 为本服务自己的哪一段期限到期
@@ -126,16 +145,22 @@ type generateContext struct {
 	startLimit  time.Duration // 首事件前总期限（创建时的 REQUEST_TIMEOUT）
 	idleLimit   time.Duration // 首事件后空闲期限（同一个值）
 	maxDuration time.Duration // 总时长上限（不小于 startLimit）
+	longLimit   time.Duration // long- 自动续写的绝对总时长上限（maxDuration × longOutputDurationFactor，见 renewTotal）
 
 	mu         sync.Mutex
 	stage      generateStage
 	deadline   time.Time
+	totalLimit time.Duration // 首事件后当前期限对应的上限（总时长上限，或 renewTotal 截到绝对总时长上限时的 longLimit），写进到期原因
 	timer      *time.Timer
 	timerGen   uint64 // 计时器代数：延长、结束时加一，旧计时器的回调作废
 	err        error
 	cause      *serviceDeadlineError
 	funcs      map[*generateAfterFunc]struct{} // 结束时置 nil
 	stopParent func() bool
+	// longRound 为 long- 自动续写第二轮起当前这一轮的结束函数（见 beginLongRound，没有时为 nil）；longRoundFired 为已经为这一轮
+	// 调用过（之后到期按原规则结束整个请求）
+	longRound      func(error)
+	longRoundFired bool
 }
 
 var _ context.Context = (*generateContext)(nil)
@@ -147,6 +172,7 @@ func newGenerateContext(parent context.Context, startedAt time.Time, requestTime
 	c := &generateContext{
 		parent: parent, done: make(chan struct{}), startedAt: startedAt,
 		startLimit: requestTimeout, idleLimit: requestTimeout, maxDuration: maxDuration,
+		longLimit: maxDuration * longOutputDurationFactor, totalLimit: maxDuration,
 		funcs: make(map[*generateAfterFunc]struct{}),
 	}
 	c.mu.Lock()
@@ -274,7 +300,15 @@ func (c *generateContext) deadlineReached(gen uint64) {
 	}
 	cause := &serviceDeadlineError{stage: serviceDeadlineStart, limit: c.startLimit, elapsed: time.Since(c.startedAt)}
 	if c.stage == generateStreaming {
-		cause.stage, cause.limit = serviceDeadlineTotal, c.maxDuration
+		cause.stage, cause.limit = serviceDeadlineTotal, c.totalLimit
+		if interrupt := c.longRound; interrupt != nil && !c.longRoundFired {
+			// long- 自动续写第二轮起：只结束当前这一轮，续写体面结束；longRoundGrace 后仍没有结束时再按总时长上限结束整个请求
+			c.longRoundFired = true
+			c.armLocked(time.Now().Add(longRoundGrace))
+			c.mu.Unlock()
+			interrupt(fmt.Errorf("本服务总时长上限 %s 到期", cause.limit))
+			return
+		}
 	}
 	after := c.finishLocked(context.DeadlineExceeded, cause)
 	c.mu.Unlock()
@@ -296,6 +330,81 @@ func (c *generateContext) beginStreaming() bool {
 		c.stage = generateStreaming
 		c.armLocked(c.startedAt.Add(c.maxDuration))
 	}
+	return true
+}
+
+// renewTotal 在 long- 自动续写开始新一轮时调用（见 long_output.go）：首事件后的总时长上限从此刻重新计算（照上游每轮重新计时的做法），
+// 多轮续写的长输出不会被按整段计算的总时长上限截断；每一轮仍受总时长上限约束，整段从建立上下文算起不超过绝对总时长上限
+// （longLimit，到期按总时长上限截断，原因里的期限为它）。首事件前、已结束或为 nil 时不做任何事并返回 false
+func (c *generateContext) renewTotal() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.renewTotalLocked()
+}
+
+// renewTotalLocked 为 renewTotal 在 mu 内的部分
+func (c *generateContext) renewTotalLocked() bool {
+	if c.err != nil || c.stage != generateStreaming {
+		return false
+	}
+	deadline, limit := time.Now().Add(c.maxDuration), c.maxDuration
+	if ceiling := c.startedAt.Add(c.longLimit); deadline.After(ceiling) {
+		deadline, limit = ceiling, c.longLimit
+	}
+	c.totalLimit = limit
+	c.armLocked(deadline)
+	return true
+}
+
+// beginLongRound 在 long- 自动续写决定发下一轮（第二轮起）时调用（见 long_output.go）：登记这一轮的结束函数 interrupt（之后本服务的
+// 首事件后空闲期限（interruptLongRound）与总时长上限、绝对总时长上限到期时只结束这一轮），首事件后再从此刻重新计算总时长上限
+// （同 renewTotal，等号池准入的时间不占下一轮的总时长）。第一轮很短时解码可能先于转发首个事件就决定续写：这时还在首事件前，
+// 只登记、不改期限（转发首个事件时 beginStreaming 照常设总时长上限），之后的期限到期同样只结束这一轮。
+// 返回离绝对总时长上限的剩余时间；已结束或为 nil 时不做任何事，ok 为假
+func (c *generateContext) beginLongRound(interrupt func(error)) (remaining time.Duration, ok bool) {
+	if c == nil {
+		return 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return 0, false
+	}
+	// 先登记再重设计时器（同一把锁内）：已过绝对总时长上限时计时器立即到时，到时的回调看得到这一轮的登记，只结束这一轮
+	c.longRound, c.longRoundFired = interrupt, false
+	c.renewTotalLocked()
+	return time.Until(c.startedAt.Add(c.longLimit)), true
+}
+
+// endLongRound 在 long- 自动续写的一轮结束（或续写失败）时清除登记的结束函数：之后的期限到期按原规则结束整个请求。nil 安全
+func (c *generateContext) endLongRound() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.longRound, c.longRoundFired = nil, false
+	c.mu.Unlock()
+}
+
+// interruptLongRound 在首事件后空闲期限到期时调用（forwardEvents 的看门狗）：long- 自动续写第二轮起的这一轮还没有被结束过时
+// 只结束这一轮并返回 true；没有登记（第一轮、普通请求）、这一轮已经结束过一次（之后仍没有动静）或请求已结束时返回 false，
+// 由调用方按原规则结束整个请求。nil 安全
+func (c *generateContext) interruptLongRound(reason error) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	interrupt := c.longRound
+	if c.err != nil || interrupt == nil || c.longRoundFired {
+		c.mu.Unlock()
+		return false
+	}
+	c.longRoundFired = true
+	c.mu.Unlock()
+	interrupt(reason)
 	return true
 }
 

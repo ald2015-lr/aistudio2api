@@ -307,6 +307,14 @@ type GenerateRequest struct {
 	// PrefillTail 为历史以模型文字消息结尾、按原生续写原样发送（模型在 NativePrefillModel 名单内，协议层没有补用户消息）：
 	// 上游拒绝时 Generate 改回补用户消息重发一次（见 prefill.go）
 	PrefillTail bool `json:"-"`
+	// LongOutput 为模型名带 long- 前缀（见 api 包 model_alias.go）且生成服务没有关闭自动续写（LONG_OUTPUT_ENABLED）：
+	// 经 Playground GenerateContent 发送时按自动续写生成（见 continuation.go）；Build 与 Interaction 通道按普通请求处理
+	LongOutput bool `json:"-"`
+	// LongOutputDefaultTokens 为 long- 请求没有给出输出上限时、模型目录没有官网续写能力（能力码 91）的模型的输出总上限
+	// （LONG_OUTPUT_MAX_TOKENS，由生成服务填写）；0 表示按模型单轮上限，不模拟续写
+	LongOutputDefaultTokens int64 `json:"-"`
+	// continuation 为官网自动续写本轮的编码设置（轮次、续写 token 与输出总上限），只在 Client 的续写循环内设置
+	continuation *officialContinuation
 }
 
 // TokenCountRequest 表示计数请求
@@ -441,6 +449,9 @@ type Event struct {
 	// UpstreamPromptTokens 为上游在这一块报告的输入 token（0 表示这一块没有），只供降级判定校准"字数 → token"的比例
 	UpstreamPromptTokens int64 `json:"-"`
 	Err                  error `json:"-"`
+	// ContinuationErr 只出现在 long- 自动续写第二轮起失败后体面结束的结束事件上（见 continuation.go 的 finishFailedRound），为失败的原因：
+	// 生成服务不把这次结束当作模型资格验证成功（否则会清掉刚为这次失败写回的冷却）；协议层照常按结束原因处理
+	ContinuationErr error `json:"-"`
 }
 
 // Service 定义公开协议适配器依赖的最小能力

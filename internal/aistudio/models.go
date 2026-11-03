@@ -37,6 +37,8 @@ var capabilityNames = map[int64]string{
 	81: "transcription_custom_vocabulary",
 	84: "transcription_smart",
 	85: "speech_metadata",
+	// 91 为官网自动续写（Output length 上限到 inputTokenLimit，单轮 32768，超过时分多轮续写，如 gemini-4-argon）
+	91: "output_continuation",
 }
 
 var secondaryCapabilityNames = map[int64]string{}
@@ -83,6 +85,9 @@ type GenerationDefaults struct {
 	// VideoResolution 为视频输出分辨率选项（video_output_resolutions）的第一项，即官网 Omni 的默认分辨率；
 	// Interaction 视频输出格式没有指定分辨率时使用
 	VideoResolution string
+	// ContinuedOutputTokens 为有官网自动续写能力（能力码 91）的模型的输出总上限（模型目录的 inputTokenLimit），其他模型为 0。
+	// 只用于模型名带 long- 前缀的请求（见 continuation.go），不带前缀的请求仍按 MaxOutputTokens 发送
+	ContinuedOutputTokens int64
 }
 
 type modelEntry struct {
@@ -229,6 +234,9 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 	}
 	if resolutions := options["video_output_resolutions"]; len(resolutions) > 0 {
 		defaults.VideoResolution = resolutions[0]
+	}
+	if capabilities["output_continuation"] {
+		defaults.ContinuedOutputTokens = inputLimit
 	}
 	return modelEntry{model: model, defaults: defaults}, nil
 }

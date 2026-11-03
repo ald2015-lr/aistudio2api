@@ -110,7 +110,7 @@ func (s *server) handleOpenAIModel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	modelID := strings.TrimPrefix(r.PathValue("model"), "models/")
-	model, ok := lookupPublicModel(models, modelID)
+	model, ok := lookupLongPublicModel(models, modelID)
 	switch {
 	case !ok && anthropic:
 		writeAnthropicError(w, http.StatusNotFound, "not_found_error", "model: "+modelID)
@@ -932,7 +932,7 @@ func writeChatChunk(w http.ResponseWriter, id string, created int64, model strin
 
 func openAIFinishReason(reason string, hasTools bool) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
-	case "max_tokens", "max_output_tokens", "length":
+	case "max_tokens", "max_output_tokens", "length", "continuation":
 		return "length"
 	case "stop_sequence":
 		return "stop"

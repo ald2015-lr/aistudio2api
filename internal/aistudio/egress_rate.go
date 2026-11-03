@@ -640,6 +640,7 @@ func (p *AccountPool) recordEgressSentLocked(lease *AccountLease, now int64) {
 	}
 	if lease.egressPending {
 		lease.egressPending = false
+		lease.egressAdmitAt = 0
 		if rate.pending > 0 {
 			rate.pending--
 		}
@@ -654,6 +655,7 @@ func (l *AccountLease) releaseEgressLocked(now int64) {
 		return
 	}
 	l.egressPending = false
+	l.egressAdmitAt = 0
 	rate := l.egress
 	if rate == nil {
 		return

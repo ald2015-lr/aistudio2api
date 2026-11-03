@@ -416,7 +416,7 @@ func inputTokens(usage *aistudio.Usage) int64 {
 // 例如 malformed_function_call、safety、provider_N，便于排查；标准原因返回空串
 func providerFinishReason(reason string) string {
 	switch normalized := strings.ToLower(strings.TrimSpace(reason)); normalized {
-	case "", "stop", "max_tokens", "max_output_tokens", "length", "stop_sequence", "pause_turn":
+	case "", "stop", "max_tokens", "max_output_tokens", "length", "continuation", "stop_sequence", "pause_turn":
 		return ""
 	default:
 		return normalized

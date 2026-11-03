@@ -400,7 +400,7 @@ func (manager *accountWorkerManager) retirePass() int {
 		if candidate.drain != nil {
 			// 已在排空：替补在排空开始时已经启动，不再核对可接替账户；空闲后照常淘汰
 			if busy {
-				if since := candidate.drain.age(now); since >= manager.drainTimeout() {
+				if since := candidate.drain.age(now); since >= manager.drainTimeoutFor(accountID) {
 					manager.clearDrain(accountID)
 					manager.deferRetirement(accountID, now.Add(drainRetryBackoff))
 					manager.requests.log(accountID, "WARN", fmt.Sprintf(

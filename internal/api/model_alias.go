@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,13 +25,49 @@ import (
 //
 // 目录里本身就以等级结尾的模型 ID（例如 xxx-low）不再强制最高思考，按 ID 里的等级设置。
 // 能输出视频的 Omni 模型另有视频后缀（-16x9、-720p、-8s、-i2v 等，见 omni_video.go），可与思考等级、-nothinking 组合，
-// 例如 gemini-omni-1.1-flash-9x16-720p-8s-low；Omni 不带等级后缀时沿用模型默认等级，不强制最高
+// 例如 gemini-omni-1.1-flash-9x16-720p-8s-low；Omni 不带等级后缀时沿用模型默认等级，不强制最高。
+//
+// 模型名前缀 long-（不分大小写）表示自动续写（见 aistudio/continuation.go）：与上面的全部后缀照常组合，例如 long-gemini-4-argon、
+// long-gemini-4-argon-low、long-gemini-3.8-flash-nothinking。整个名称本身能解析（目录 ID 以 long- 开头）时按目录 ID，不当作前缀；
+// 去掉前缀后的名称按不带 long- 的请求原样处理，只对文本对话模型续写，其他模型（图片、语音、Omni 等）按普通请求处理并记一行说明
 const (
 	suffixMinThinking = "-128"
 	suffixHideThought = "-nothinking"
 	suffixOnline      = "-online"
 	minThinkingBudget = 128
+	// longOutputPrefix 为自动续写的模型名前缀
+	longOutputPrefix = "long-"
 )
+
+// cutLongPrefix 去掉名称开头的 long-（不分大小写，先去掉首尾空白与 models/），返回去掉后的名称与是否带前缀；只有前缀时不算
+func cutLongPrefix(name string) (string, bool) {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	if len(name) > len(longOutputPrefix) && strings.EqualFold(name[:len(longOutputPrefix)], longOutputPrefix) {
+		return name[len(longOutputPrefix):], true
+	}
+	return name, false
+}
+
+// resolveLongRequestModel 与 resolveRequestModel 相同，另识别 long- 前缀：整个名称能解析时按原样（long 为假，目录 ID 以 long- 开头时
+// 按目录 ID）；不能解析而去掉 long- 后能解析时 long 为真，rest 为去掉前缀后的名称。都不能解析时 ok 为假
+func resolveLongRequestModel(models []aistudio.Model, name string) (model aistudio.Model, alias modelAlias, rest string, long bool, ok bool) {
+	if model, alias, ok = resolveRequestModel(models, name); ok {
+		return model, alias, name, false, true
+	}
+	rest, prefixed := cutLongPrefix(name)
+	if !prefixed {
+		return aistudio.Model{}, alias, name, false, false
+	}
+	if model, alias, ok = resolveRequestModel(models, rest); !ok {
+		return aistudio.Model{}, alias, name, false, false
+	}
+	return model, alias, rest, true, true
+}
+
+// longOutputModel 判断 long- 前缀对模型生效（自动续写）：文本对话模型且能经 Playground 调用（续写只在 Playground GenerateContent 进行）
+func longOutputModel(model aistudio.Model) bool {
+	return isTextChatModel(model) && (len(model.Channels) == 0 || slices.Contains(model.Channels, string(aistudio.ChannelPlayground)))
+}
 
 // thinkingLevelSuffixes 为按名称指定思考等级的后缀与对应的等级（reasoning_effort 写法）
 var thinkingLevelSuffixes = []struct {
@@ -371,9 +408,19 @@ func (s *server) applyModelAlias(ctx context.Context, request *aistudio.Generate
 	if err != nil {
 		return false, nil
 	}
-	model, alias, ok := resolveRequestModel(models, request.Model)
+	model, alias, rest, long, ok := resolveLongRequestModel(models, request.Model)
 	if !ok {
 		return false, nil
+	}
+	if long {
+		// 去掉 long- 前缀后按不带前缀的请求原样处理（下面的逻辑与原先完全相同），只多一个续写标记
+		request.Model = rest
+		if longOutputModel(model) {
+			request.LongOutput = true
+		} else {
+			request.Notes = append(request.Notes, fmt.Sprintf(
+				"模型名带 long- 前缀，但 %s 不是能经 Playground 调用的文本对话模型，不自动续写，按普通请求处理", model.ID))
+		}
 	}
 	if aistudio.OmniVideoModel(model) {
 		return applyOmniVideoAlias(request, model, alias)
@@ -404,7 +451,8 @@ func (s *server) resolveModelName(ctx context.Context, name string) string {
 	if err != nil {
 		return name
 	}
-	if model, _, ok := resolveRequestModel(models, name); ok {
+	// long- 前缀同样换成目录模型名（计数、思考签名缓存与生成请求按同一个模型）
+	if model, _, _, _, ok := resolveLongRequestModel(models, name); ok {
 		return model.ID
 	}
 	return name
@@ -439,7 +487,8 @@ func aliasVariants(model aistudio.Model) []aliasVariant {
 	return variants
 }
 
-// expandModelAliases 在公开模型列表中为文本对话模型追加后缀别名，客户端可直接选择
+// expandModelAliases 在公开模型列表中为文本对话模型追加后缀别名，客户端可直接选择。能经 Playground 调用的文本对话模型另列一个
+// long-<模型> 的自动续写别名；long- 与各后缀的组合（如 long-gemini-4-argon-low）同样可用，但不逐个列出，免得列表成倍膨胀
 func expandModelAliases(models []aistudio.Model) []aistudio.Model {
 	expanded := make([]aistudio.Model, 0, len(models)*3)
 	for _, model := range models {
@@ -448,6 +497,12 @@ func expandModelAliases(models []aistudio.Model) []aistudio.Model {
 			alias := model
 			alias.ID = model.ID + variant.suffix
 			alias.Name = model.Name + " · " + variant.label
+			expanded = append(expanded, alias)
+		}
+		if longOutputModel(model) {
+			alias := model
+			alias.ID = longOutputPrefix + model.ID
+			alias.Name = model.Name + " · 自动续写"
 			expanded = append(expanded, alias)
 		}
 	}
@@ -472,6 +527,21 @@ func lookupPublicModel(models []aistudio.Model, name string) (aistudio.Model, bo
 	if model, alias, ok := resolveRequestModel(models, name); ok && alias.base != name && (isTextChatModel(model) || aistudio.OmniVideoModel(model)) {
 		model.ID = name
 		return model, true
+	}
+	return aistudio.Model{}, false
+}
+
+// lookupLongPublicModel 与 lookupPublicModel 相同，另识别 long- 前缀（与生成请求的解析一致）：整个名称查不到时去掉一次前缀再查，
+// 查到的模型以请求的名称返回（列表只列出 long-<模型>，long- 与后缀的组合在这里查到）
+func lookupLongPublicModel(models []aistudio.Model, name string) (aistudio.Model, bool) {
+	if model, ok := lookupPublicModel(models, name); ok {
+		return model, true
+	}
+	if rest, prefixed := cutLongPrefix(name); prefixed {
+		if model, ok := lookupPublicModel(models, rest); ok {
+			model.ID = name
+			return model, true
+		}
 	}
 	return aistudio.Model{}, false
 }

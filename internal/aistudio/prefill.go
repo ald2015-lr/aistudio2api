@@ -19,7 +19,11 @@ import (
 // 重发与重新生成一样先占每分钟名额与出口令牌（AccountLease.ReserveRegeneration，不占重新生成次数）；不准入（账号已冷却、
 // 每分钟名额已满或出口限速）时交出 *PrefillRetryError，app 层按可换号、不冷却的错误换号（指定账号的请求在原账号）再试，
 // 下一次尝试经 applyPrefillMemory 补用户消息，不把上游的 400 交给客户端。
-// Omni（gemini-omni-*）经 CreateInteractionStream 编码，不在名单里，照旧补用户消息
+// Omni（gemini-omni-*）经 CreateInteractionStream 编码，不在名单里，照旧补用户消息。
+//
+// long- 模拟续写（continuation.go）的后续轮次是否原样以模型轮结尾与这里共用同一份名单（NativePrefillModel）、拒绝判断
+// （prefillRejectedError）与记忆（prefillRejections）：续写轮被拒时记进同一份记忆，在这一轮内改补用户消息重发（不换号，不交出
+// PrefillRetryError）；客户端预填充被拒过的模型续写时也直接补用户消息。PrefillRetryError 只用于普通请求与 long- 请求的第一轮
 
 // nativePrefillModels 为接受以 model 轮结尾请求的规范模型 ID（gemma- 前缀的模型同样接受）
 var nativePrefillModels = map[string]bool{

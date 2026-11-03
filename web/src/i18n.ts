@@ -282,6 +282,13 @@ const zhCN = {
   'settings.minOutputTokens': '最大输出 token 下限',
   'settings.minOutputTokensHelp':
     '客户端设置的最大输出低于这个值时提高到它（不超过模型上限），避免思考把输出额度用完、回复被截断或为空；客户端没设置时沿用模型上限。图片、语音等模型不调整，0 表示不调整。',
+  'settings.longOutputEnabled': '模型名带 long- 时自动续写',
+  'settings.longOutputEnabledHelp':
+    '模型名前加 long-（如 long-gemini-4-argon、long-gemini-4-argon-low）时，输出达到单轮上限后在同一账号上自动续写下一轮，客户端收到的是一条连续的回复。官网支持自动续写的模型照官网分轮续写，其他模型把已输出的正文作为模型消息再发一轮接着写。每轮占一次请求额度，会更慢。只在 Playground 通道进行；关闭后 long- 前缀照常识别，但按普通请求处理。保存后立即生效。',
+  'settings.longOutputMaxTokens': '自动续写默认总上限（token）',
+  'settings.longOutputMaxTokensHelp':
+    '带 long- 的请求没有给出最大输出时，不支持官网续写的模型最多输出这么多 token（正文与思考合计，默认 262144，约为常见单轮上限的 4 倍）；支持官网续写的模型按官网总量（约 100 万）。客户端给出最大输出时以客户端为准。0 表示不模拟续写。轮数约为总上限除以模型单轮上限：单轮 65536 的模型最多约 4 轮，单轮更小的模型轮数更多（一个请求最多 64 轮），每轮占一次请求额度并计入每账号每分钟上限。模拟续写把已输出的正文发回上游，输入上限为 131072 的账号到不了更大的值，超过时按 max_tokens 结束。',
+  'settings.invalidLongOutputMaxTokens': '自动续写默认总上限必须是 0 到 1048576 的整数',
   'settings.activeValue': '当前生效',
   'settings.pendingService': '已保存值将在下次生成服务启动时生效',
   'settings.pendingManagement': '监听地址需重启管理进程生效（./start.sh restart 或重新运行 start.bat）',
@@ -1213,6 +1220,14 @@ const en: Record<TranslationKey, string> = {
   'settings.minOutputTokens': 'Minimum max output tokens',
   'settings.minOutputTokensHelp':
     'When a client sets max output tokens below this value it is raised to it (capped at the model limit), so thinking does not use up the budget and truncate or empty the reply. Requests without a value use the model limit. Image and speech models are not changed; 0 disables.',
+  'settings.longOutputEnabled': 'Continue automatically for long- model names',
+  'settings.longOutputEnabledHelp':
+    'When the model name starts with long- (such as long-gemini-4-argon or long-gemini-4-argon-low), output that reaches the per-round limit continues automatically in further rounds on the same account, and the client receives one continuous reply. Models with official automatic continuation continue in rounds as AI Studio does; other models get the text written so far sent back as a model message and continue from there. Every round uses one request of quota and takes longer. Playground channel only; when disabled the long- prefix is still recognized but the request is handled normally. Applies immediately after saving.',
+  'settings.longOutputMaxTokens': 'Default total limit for continuation (tokens)',
+  'settings.longOutputMaxTokensHelp':
+    'When a long- request does not set max output tokens, models without official continuation output at most this many tokens (text and thinking combined; default 262144, about 4 times a common per-round limit); models with official continuation use the official total (about 1 million). A max output set by the client takes precedence. 0 disables simulated continuation. The number of rounds is about the total divided by the per-round limit of the model: at most about 4 rounds at 65536 per round, more for models with smaller per-round limits (at most 64 rounds per request); every round uses one request of quota and counts toward the per-account per-minute limit. Simulated continuation sends the text written so far back upstream, so accounts with a 131072-token input limit cannot reach larger values and end with max_tokens once it is exceeded.',
+  'settings.invalidLongOutputMaxTokens':
+    'Default total limit for continuation must be an integer from 0 to 1048576',
   'settings.activeValue': 'Active',
   'settings.pendingService': 'Saved values apply the next time the generation service starts',
   'settings.pendingManagement':

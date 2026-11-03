@@ -788,6 +788,16 @@ func TestTraceFindingPrefillKind(t *testing.T) {
 			want:     "上游不接受，已改回补一条",
 		},
 		{
+			// long- 续写的进度与续写轮被拒的改回说明不是客户端预填充：客户端预填充原样发送成功，续写的第二轮被拒改回补用户消息
+			name:  "续写轮被拒不改变客户端预填充的结论",
+			notes: []string{"客户端最后一条是模型消息（预填充）：模型接受以模型轮结尾的请求，原样发送、由模型原生续写"},
+			timeline: []string{
+				"自动续写 | 第 1 轮结束 | 方式=模拟续写 | 本轮结束原因=max_tokens | 本轮输入=10 | 本轮输出=100 | 累计输出=100 | 总上限=300 | 下一步=第 2 轮（原生预填充）",
+				"自动续写第 2 轮：" + prefillFallbackNote("gemma-x", ChannelPlayground, nil),
+			},
+			want: "已按原生续写原样以模型轮结尾发送",
+		},
+		{
 			name:  "近期被拒过",
 			notes: []string{"客户端最后一条是模型消息（预填充）：模型接受以模型轮结尾的请求，原样发送、由模型原生续写", "该模型近期在 playground 通道拒绝过以模型轮结尾的请求：直接在末尾补用户消息"},
 			want:  "上游不接受，已改回补一条",
@@ -1004,9 +1014,27 @@ func TestReserveRegenerationReasons(t *testing.T) {
 	if denied := lease.ReserveRegeneration(indexTestModel); denied != "" {
 		t.Fatalf("名额还有余量时应准入：%q", denied)
 	}
-	if denied := lease.ReserveRegeneration(indexTestModel); denied != "每分钟名额 2/2（已发出 1、预占 1，ACCOUNT_RPM_LIMIT）" {
+	// 本租约已有没发出的预占：不被自己的预占挡住，也不重复预占（与续写的下一轮同一口径，见 resend_admission.go）
+	if denied := lease.ReserveRegeneration(indexTestModel); denied != "" {
+		t.Fatalf("自己的预占不应挡住自己：%q", denied)
+	}
+	if _, _, pending, _ := rateSnapshot(pool, "alice@example.com"); pending != 1 {
+		t.Fatalf("预占 = %d，期望不重复预占", pending)
+	}
+	lease.RecordGenerationSent()
+	if denied := lease.ReserveRegeneration(indexTestModel); denied != "每分钟名额 2/2（已发出 2、预占 0，ACCOUNT_RPM_LIMIT）" {
 		t.Fatalf("名额已满时的说明 = %q", denied)
 	}
+	_ = lease.Release()
+	// 其他租约的预占同样计入
+	pool = newRateTestPool(t, time.Minute, 2, 2, indexTestAccount("alice@example.com", BenefitTierFree, indexTestCatalog()))
+	lease = mustTryAcquire(t, pool, rateTestSelection)
+	lease.RecordGenerationSent()
+	other := mustTryAcquire(t, pool, rateTestSelection)
+	if denied := lease.ReserveRegeneration(indexTestModel); denied != "每分钟名额 2/2（已发出 1、预占 1，ACCOUNT_RPM_LIMIT）" {
+		t.Fatalf("其他租约预占占满时的说明 = %q", denied)
+	}
+	_ = other.Release()
 	_ = lease.Release()
 	// 出口限速：取得租约用掉令牌、发出后令牌未到
 	pool = newEgressTestPool(4, "alice@example.com")
@@ -1017,4 +1045,20 @@ func TestReserveRegenerationReasons(t *testing.T) {
 		t.Fatalf("出口限速时的说明 = %q", denied)
 	}
 	_ = lease.Release()
+}
+
+// TestTraceFindingIgnoresContinuationProgress long- 请求的客户端没有预填充时，续写进度里的“原生预填充”与续写轮被拒的改回说明不让排查结论
+// 误报“最后一条消息是模型消息（预填充）”
+func TestTraceFindingIgnoresContinuationProgress(t *testing.T) {
+	trace := NewTrace()
+	trace.Activate()
+	trace.Timeline("INFO", "service", "自动续写 | 第 1 轮结束 | 方式=模拟续写 | 本轮结束原因=max_tokens | 本轮输入=10 | 本轮输出=100 | 累计输出=100 | 总上限=300 | 下一步=第 2 轮（原生预填充）")
+	trace.Timeline("WARN", "service", "自动续写第 2 轮："+prefillFallbackNote("gemma-x", ChannelPlayground, nil))
+	data, err := trace.Finish()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "最后一条消息是模型消息（预填充）") {
+		t.Fatalf("续写进度不应让排查结论报预填充：%s", data)
+	}
 }

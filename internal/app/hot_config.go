@@ -203,6 +203,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		saved.StreamDataHeartbeat == active.StreamDataHeartbeat && saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
+		saved.LongOutputEnabled == active.LongOutputEnabled && saved.LongOutputMaxTokens == active.LongOutputMaxTokens &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
@@ -216,16 +217,24 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | IP 池=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
 		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
 		saved.RoutingStrategy, strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
-		saved.ProxyPool.Summary(),
+		longOutputSummary(saved.LongOutputEnabled, saved.LongOutputMaxTokens), saved.ProxyPool.Summary(),
 	))
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()
+}
+
+// longOutputSummary 为热更新日志里的 long- 自动续写设置：关闭时写“关闭”，开启时带默认总上限
+func longOutputSummary(enabled bool, maxTokens int) string {
+	if !enabled {
+		return "关闭"
+	}
+	return fmt.Sprintf("开启（默认总上限 %d）", maxTokens)
 }
 
 // rpmLimitSummary 为热更新日志里的单账户每分钟上限：0 为关闭
@@ -281,6 +290,7 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	admin.service.ignoreSeed.Store(saved.IgnoreClientSeed)
 	admin.service.repeatNonce.Store(saved.RepeatPromptNonce)
 	admin.service.minOutputTokens.Store(int64(saved.MinOutputTokens))
+	admin.service.setLongOutput(saved.LongOutputEnabled, saved.LongOutputMaxTokens)
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
 	admin.service.setPrimaryModelSettings(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait)

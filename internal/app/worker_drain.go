@@ -31,7 +31,7 @@ import (
 // 逐个再排空时不设上限的话，分区可接单的 Worker 会降到远低于峰值；有这个上限，可接单的 Worker 不少于 峰值 - drainLimit。
 // 排空在每条退出路径上清除：Worker 关闭（含 ResetAll 与 Close，见 closeCleanupLeftovers）、登记被放弃（冷却被清除或缩短）、
 // 淘汰出错、排空超时（总时长上限 + 30 秒后仍有请求，多半是固定账户或文件绑定的请求一直在用：清除标记，1 分钟后再试；
-// 总时长上限见 generateMaxDurationFor）。
+// 总时长上限见 generateMaxDurationFor，账号上有 long- 自动续写的租约时按续写的绝对总时长上限，见 drainTimeoutFor）。
 //
 // 替补：淘汰（排空开始、空闲淘汰、清扫、轮换）之后在同一分区挑一个能服务登记模型、对热门与主用模型都没有长时间冷却的
 // 备用账号，经后台冷启动名额启动。WARM_WORKER_LIMIT 低于驻留数时预热不会补齐空出的槽位，驻留数靠替补保持；分区低于预热目标时
@@ -276,11 +276,25 @@ func (manager *accountWorkerManager) drainSlotTimeout() time.Duration {
 // drainTimeout 返回排空超时：进行中的请求最长可能持续的时间加 30 秒。生成请求开始输出后不再受 REQUEST_TIMEOUT 限制，
 // 最长到总时长上限（generateMaxDurationFor：1 小时，REQUEST_TIMEOUT 更长时按它）；生成服务没有设置时按默认请求超时
 func (manager *accountWorkerManager) drainTimeout() time.Duration {
+	return generateMaxDurationFor(manager.effectiveRequestTimeout()) + drainTimeoutGrace
+}
+
+// drainTimeoutFor 返回账号的排空超时：账号上有服务 long- 自动续写请求的租约时（aistudio.AccountPool.LongOutputActive），
+// 进行中的请求最长持续到续写的绝对总时长上限再加体面结束的等待（longOutputMaxDurationFor），按它加 30 秒；否则同 drainTimeout
+func (manager *accountWorkerManager) drainTimeoutFor(accountID string) time.Duration {
+	if manager.pool != nil && manager.pool.LongOutputActive(accountID) {
+		return longOutputMaxDurationFor(manager.effectiveRequestTimeout()) + drainTimeoutGrace
+	}
+	return manager.drainTimeout()
+}
+
+// effectiveRequestTimeout 返回生成服务设置的 REQUEST_TIMEOUT；没有设置时按默认请求超时
+func (manager *accountWorkerManager) effectiveRequestTimeout() time.Duration {
 	timeout := time.Duration(manager.requestTimeout.Load())
 	if timeout <= 0 {
 		timeout = config.Default().RequestTimeout
 	}
-	return generateMaxDurationFor(timeout) + drainTimeoutGrace
+	return timeout
 }
 
 // workerPrimaryModels 为 Worker 管理器使用的两份主用模型（已按降级判定的规则整理并排序）：normal 为普通号池的列表（PRIMARY_MODELS），

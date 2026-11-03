@@ -1231,6 +1231,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.OmniIgnoreSystemPrompt != nil {
 		omniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
 	}
+	// 自动续写：旧版页面保存时不带这些字段，沿用现值（默认总上限可以为 0，不能用零值判断是否缺省）
+	longOutputEnabled, longOutputMaxTokens := saved.LongOutputEnabled, saved.LongOutputMaxTokens
+	if value.LongOutputEnabled != nil {
+		longOutputEnabled = *value.LongOutputEnabled
+	}
+	if value.LongOutputMaxTokens != nil {
+		longOutputMaxTokens = *value.LongOutputMaxTokens
+	}
 	// 单账户每分钟上限：旧版页面保存时不带该字段，沿用现值（0 表示关闭，不能用零值判断是否缺省）
 	accountRPMLimit := saved.AccountRPMLimit
 	if value.AccountRPMLimit != nil {
@@ -1306,6 +1314,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		RepeatPromptNonce:      value.RepeatPromptNonce,
 		MinOutputTokens:        value.MinOutputTokens,
 		OmniIgnoreSystemPrompt: omniIgnoreSystemPrompt,
+		LongOutputEnabled:      longOutputEnabled,
+		LongOutputMaxTokens:    longOutputMaxTokens,
 		WAABackend:             value.WAABackend,
 		AutoStart:              autoStart,
 		RequestBodyLog:         requestBodyLog,
@@ -2017,6 +2027,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraIncludePro:        &cfg.UltraIncludePro,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
 		OmniIgnoreSystemPrompt: &cfg.OmniIgnoreSystemPrompt,
+		LongOutputEnabled:      &cfg.LongOutputEnabled,
+		LongOutputMaxTokens:    &cfg.LongOutputMaxTokens,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
 		StreamPlaygroundModels: &streamPlaygroundModels,

@@ -141,6 +141,7 @@ func newRuntime(
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
+	service.setLongOutput(cfg.LongOutputEnabled, cfg.LongOutputMaxTokens)
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	service.setPrimaryModelSettings(cfg.PrimaryModels, cfg.PrimaryQueueWait, cfg.UltraPrimaryModels, cfg.UltraPrimaryQueueWait)
@@ -2664,6 +2665,10 @@ type trackedService struct {
 	modelAccessPublishPending atomic.Bool
 	// minOutputTokens 为最大输出 token 的下限（MIN_OUTPUT_TOKENS，可热更新）
 	minOutputTokens atomic.Int64
+	// longOutputEnabled 为模型名带 long- 前缀时是否自动续写（LONG_OUTPUT_ENABLED，可热更新）；longOutputMaxTokens 为没有官网续写能力的
+	// 模型在客户端没有给出输出上限时的输出总上限（LONG_OUTPUT_MAX_TOKENS，可热更新），见 long_output.go
+	longOutputEnabled   atomic.Bool
+	longOutputMaxTokens atomic.Int64
 	// firstEventTimeout 为每次尝试等待首个上游事件的上限（FIRST_EVENT_TIMEOUT，0 为关闭，可热更新）
 	firstEventTimeout atomic.Int64
 	// downgradeGuard 为降级判定的生效设置（服务配置页修改后立即替换，见 downgrade_guard.go）
@@ -4123,6 +4128,8 @@ type upstreamActivity struct {
 	bytes atomic.Int64
 	// lastMono 为最近一次收到上游字节相对 activityEpoch 的纳秒数加 1（0 表示还没有字节）
 	lastMono atomic.Int64
+	// paused 为 long- 自动续写在两轮之间（一轮结束到下一轮开始发送）：这段时间不算上游空闲，见 pause、resume
+	paused atomic.Bool
 }
 
 type requestPreparationTiming struct {
@@ -4195,6 +4202,30 @@ func (activity *upstreamActivity) observe(count int) {
 	activity.bytes.Add(int64(count))
 }
 
+// touch 记一次没有字节的上游进展（long- 自动续写的下一轮准备 WAA proof、等响应头）：首事件后空闲期限从此刻重新计
+func (activity *upstreamActivity) touch() {
+	if activity == nil {
+		return
+	}
+	activity.lastMono.Store(int64(time.Since(activityEpoch)) + 1)
+}
+
+// pause 在 long- 自动续写的一轮结束、决定接着发下一轮时暂停空闲计时：等账号每分钟窗口释放（最长一个窗口）不算上游空闲
+func (activity *upstreamActivity) pause() {
+	if activity != nil {
+		activity.paused.Store(true)
+	}
+}
+
+// resume 在下一轮开始发送时恢复空闲计时并从此刻重新计：准备 WAA proof、等响应头与首个字节合计仍受首事件后空闲期限约束
+func (activity *upstreamActivity) resume() {
+	if activity == nil {
+		return
+	}
+	activity.touch()
+	activity.paused.Store(false)
+}
+
 // sinceLastByte 返回最近一次上游字节距 now 的时间（now 应来自 time.Now()，带单调时钟读数）；还没有字节时 ok 为假
 func (activity *upstreamActivity) sinceLastByte(now time.Time) (time.Duration, bool) {
 	if activity == nil {
@@ -4207,8 +4238,12 @@ func (activity *upstreamActivity) sinceLastByte(now time.Time) (time.Duration, b
 	return now.Sub(activityEpoch) - time.Duration(last-1), true
 }
 
-// quietFor 返回上游连续没有活动的时间：从 progress（最近一次收到事件或向下游交付完成）与最近一次上游字节中较晚的一个算起
+// quietFor 返回上游连续没有活动的时间：从 progress（最近一次收到事件或向下游交付完成）与最近一次上游字节中较晚的一个算起；
+// long- 自动续写在两轮之间暂停计时（见 pause）时为 0
 func (activity *upstreamActivity) quietFor(now, progress time.Time) time.Duration {
+	if activity != nil && activity.paused.Load() {
+		return 0
+	}
 	quiet := now.Sub(progress)
 	if since, ok := activity.sinceLastByte(now); ok && since < quiet {
 		quiet = since
@@ -4347,6 +4382,8 @@ func (service *trackedService) startGenerate(
 			service.requests.logRequestProgress(request.ID, "service", "WARN", note)
 		}
 	}
+	// 模型名带 long- 前缀（协议层已解析并去掉前缀）：按开关与模型决定是否自动续写，不续写时写一行说明（见 long_output.go）
+	service.prepareLongOutput(&request)
 	// 选号前就能判断的参数错误直接返回 400，不占用账号：既没有系统提示也没有对话内容（例如消息全被过滤掉），
 	// 工具选择本身不成立（指定了未声明的函数、要求调用却没有工具），停止序列超限，或媒体分辨率不是可用的枚举名
 	var invalid error
@@ -4590,6 +4627,10 @@ func (service *trackedService) generateWithRetry(
 	noCandidateRechecked := false
 	// omniDiagnostic：Interaction 模型（gemini-omni）的请求，取得租约时写一行临时诊断（见 omniSelectionNote），文字与带图请求都写
 	omniDiagnostic := interactionModel || inlineCount == 0 && service.pool.InteractionModel(modelID)
+	// longBuildNoted：long- 请求的某次尝试经 Build 通道发送（不续写）的说明已写过，换号后再经 Build 时不重复写；
+	// longNotes 为 long- 请求在各次尝试之间共用的日志去重（不续写的原因一个请求最多写一次，见 long_output.go）
+	longBuildNoted := false
+	longNotes := &longOutputNotes{}
 	pauses := service.buildPauses()
 	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
 	authFailures := 0
@@ -4688,6 +4729,12 @@ func (service *trackedService) generateWithRetry(
 		if preferPlaygroundAfterBuild && !selection.BuildOnly && !selection.PlaygroundOnly {
 			selection.PreferPlayground = true
 		}
+		// long- 自动续写只在 Playground 进行：先在所有账号的 Playground 里选号（PlaygroundFirst），某个账号的 Playground 冷却时
+		// 取其他账号的 Playground，不落到这个账号的 Build；没有可用的 Playground 账号时下面去掉 PlaygroundFirst 再选（Build 按普通请求处理），
+		// 那时每个账号仍先 Playground（PreferPlayground，只调整顺序）
+		if request.LongOutput && !selection.BuildOnly && !selection.PlaygroundOnly {
+			selection.PlaygroundFirst, selection.PreferPlayground = true, true
+		}
 		// 换号重试排除已尝试过的账户（通常只有几个）：选号留在候选索引的快路径上，与同模型的请求同队排队；
 		// 原先把"全部启用账户减去已尝试的"作为限定列表，3 万多个账户时每次复查候选都在账户池锁内建表排序几十毫秒
 		if (unbound || fileBound) && len(attempted) > 0 {
@@ -4775,7 +4822,7 @@ func (service *trackedService) generateWithRetry(
 		// 可试时才拿来试探，否则以这类流量为主的服务在官网恢复 Build 后也一直不会解除暂停
 		probeAttempt := false
 		probeAllowed := unbound && !recoveringAccount && selection.AllowedAccountIDs == nil && !selection.PlaygroundOnly &&
-			pauses.probeDue() && service.pool.BuildServesModel(modelID, scope)
+			!request.LongOutput && pauses.probeDue() && service.pool.BuildServesModel(modelID, scope)
 		probePreferred := probeAllowed && !selection.PlaygroundFirst && !service.streamPrefersPlayground(request, selection)
 		if claimed, queued := pauses.claimProbe(probePreferred, probeAllowed); claimed {
 			probe := selection
@@ -4874,9 +4921,10 @@ func (service *trackedService) generateWithRetry(
 			continue
 		}
 		if acquireErr != nil && selection.PlaygroundFirst && requestCtx.Err() == nil && (playgroundUnavailable(acquireErr) || noWarmWorker(acquireErr)) {
-			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道，Build 通道按估算 + CountTokens 判定。
-			// 只用已启动 Worker 的选号在 Playground 上没有热 Worker 时同样退回：已启动的账号可能还能走 Build
-			trace.Note("降级判定：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
+			// 没有可用的 Playground 账号（不支持该模型或全部冷却）：退回其他通道（降级判定在 Build 通道按估算 + CountTokens 判定，
+			// long- 请求在 Build 上按普通请求处理、不续写）。只用已启动 Worker 的选号在 Playground 上没有热 Worker 时同样退回：
+			// 已启动的账号可能还能走 Build
+			trace.Note("Playground 优先（降级判定或 long- 自动续写）：Playground 通道没有可用账号（" + acquireErr.Error() + "），改为不限通道选号")
 			selection.PlaygroundFirst = false
 			nextLease, acquireErr = service.acquireWarmLease(selectCtx, selection)
 		}
@@ -5039,6 +5087,15 @@ func (service *trackedService) generateWithRetry(
 				"账号每分钟请求已满 | 上限=%d 次/60 秒 | 窗口释放前新请求换到其他账号，热 Worker 都满且分区有空槽时扩容",
 				service.pool.AccountRateLimit()))
 		}
+		if request.LongOutput && lease.Channel() == aistudio.ChannelBuild && !longBuildNoted {
+			longBuildNoted = true
+			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", longOutputBuildNote)
+		}
+		if request.LongOutput && lease.Channel() != aistudio.ChannelBuild {
+			// 可能自动续写的租约：续写每轮重新计算总时长上限，可以远超普通请求的 1 小时，租约释放前该账号的排空超时与
+			// 后台关闭失败 Worker 的等待上限按续写的绝对总时长上限计算（见 drainTimeoutFor）
+			lease.MarkLongOutput()
+		}
 		trace.StartAttempt(accountLabel, string(lease.Channel()))
 		attemptStartedAt := time.Now()
 		api.SetAccessLogChannel(requestCtx, string(lease.Channel()))
@@ -5161,8 +5218,16 @@ func (service *trackedService) generateWithRetry(
 		})
 		activity = &upstreamActivity{}
 		attemptCtx = aistudio.ContextWithStreamActivityObserver(attemptCtx, activity.observe)
+		// streamed 为本次尝试已收到首个上游事件或 long- 自动续写已决定发第二轮：之后的阶段切换只来自续写的后续轮次（见 long_output.go），
+		// 不写阶段日志、不启动首事件计时（首事件计时只管第一轮，续写各轮不重新起算）
+		streamed := &atomic.Bool{}
 		// 阶段切换写入请求进度日志，便于把"分到账号 → 首字"拆成生成 proof、等上游响应头、响应头到首字三段
 		attemptCtx = aistudio.ContextWithRequestPhaseObserver(attemptCtx, func(phase aistudio.RequestPhase) {
+			if streamed.Load() {
+				// 续写的后续轮次：准备 proof、等响应头都算上游有进展，不触发首事件后空闲期限；每轮的进度另写一行，这里不再逐阶段写
+				activity.touch()
+				return
+			}
 			if phase == aistudio.RequestPhaseSendingUpstream {
 				// 首事件超时从向上游发送时开始计（WAA proof 排队与生成不计入）
 				firstEvent.start()
@@ -5198,6 +5263,12 @@ func (service *trackedService) generateWithRetry(
 		// 降级判定的输入字数按本次尝试实际发送的内容（工具约束提示、附带的 Schema、截断之后）校准
 		if gate := diag.guard(); gate != nil {
 			attemptCtx = aistudio.ContextWithSentInputObserver(attemptCtx, gate.observeSentInput)
+		}
+		if request.LongOutput {
+			attemptCtx = aistudio.ContextWithContinuationObserver(attemptCtx, service.continuationObserver(continuationAttempt{
+				requestID: request.ID, accountLabel: accountLabel, modelID: modelID, pool: aistudio.PoolScopeFromContext(requestCtx),
+				lease: lease, phase: phase, activity: activity, notes: longNotes, rounds: streamed,
+			}))
 		}
 		// generated 表示本次尝试已经向上游发出生成请求：之后的错误来自生成本身，不是文件复制或附件上传
 		generated := false
@@ -5287,6 +5358,7 @@ func (service *trackedService) generateWithRetry(
 			startCutWhere = startCutStage(generated, source != nil, sameTime, prepareTiming)
 		}
 		if err == nil {
+			streamed.Store(true)
 			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
 			service.workers.ipPool().succeeded(request.AccountID)
@@ -6458,6 +6530,13 @@ func (service *trackedService) forwardEvents(
 					idleTimer.Reset(remaining)
 					continue
 				}
+				if !terminal && phase.interruptLongRound(fmt.Errorf("本服务首事件后空闲期限 %s 到期", idleLimit)) {
+					// long- 自动续写第二轮起：只结束当前这一轮，续写按这一轮失败体面结束（已输出的内容完整返回、按 max_tokens 结束，
+					// 见 long_output.go）；从此刻再过一个空闲期限仍没有结束时按原规则结束整个请求
+					activity.touch()
+					idleTimer.Reset(idleLimit)
+					continue
+				}
 				idle = nil
 				expired := phase.expire(&serviceDeadlineError{
 					stage: serviceDeadlineIdle, limit: idleLimit, elapsed: now.Sub(phase.startedAt),
@@ -6589,7 +6668,8 @@ func (service *trackedService) forwardEvents(
 			finishFromContext()
 			return
 		}
-		if !verified && event.Kind == aistudio.EventFinish {
+		if !verified && event.Kind == aistudio.EventFinish && event.ContinuationErr == nil {
+			// long- 自动续写后续轮次失败后的结束不算验证成功：验证会清掉刚为这次失败写回的冷却（见 long_output.go）
 			verified = true
 			service.markModelAccessVerifiedAsync(
 				lease.Account().ID, accountLabel, lease.CooldownScope(requestedModelID), accessGeneration, lease.CheckedAt(),

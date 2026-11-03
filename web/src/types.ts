@@ -693,6 +693,11 @@ export interface ServiceConfig {
   ignore_client_seed: boolean
   repeat_prompt_nonce: boolean
   min_output_tokens: number
+  // long_output_enabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED），long_output_max_tokens 为没有官网续写能力的模型
+  // 在客户端没有给出输出上限时的输出总上限（LONG_OUTPUT_MAX_TOKENS，0 表示不模拟续写）；都保存后立即生效。
+  // 服务端总是返回这两个字段，因此这里不是可选字段
+  long_output_enabled: boolean
+  long_output_max_tokens: number
   downgrade_guard: DowngradeGuardConfig
   // proxy_pool 为 IP 池设置；旧版服务端不返回，此时设置页不显示 IP 池分组，保存时也不提交（服务端沿用现值）
   proxy_pool?: ProxyPoolConfig

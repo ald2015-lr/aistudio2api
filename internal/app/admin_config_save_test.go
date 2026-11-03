@@ -33,6 +33,13 @@ func TestUpdateRuntimeConfigErrors(t *testing.T) {
 	if !errors.As(err, &operation) || operation.status != http.StatusBadRequest || operation.code != "invalid_config" {
 		t.Fatalf("无效时长: err=%v", err)
 	}
+	// 自动续写的默认总上限越界：加载 .env 时按默认值启动，管理页保存时照旧拒绝
+	invalid = validRuntimeConfig()
+	tooMany := 2000000
+	invalid.LongOutputMaxTokens = &tooMany
+	if _, err := admin.UpdateRuntimeConfig(ctx, invalid); !errors.As(err, &operation) || operation.code != "invalid_config" {
+		t.Fatalf("LONG_OUTPUT_MAX_TOKENS 越界: err=%v", err)
+	}
 
 	broken := []byte("ADMIN_PASSWORD=secret\nnot a valid line\n")
 	if err := os.WriteFile(path, broken, 0o600); err != nil {

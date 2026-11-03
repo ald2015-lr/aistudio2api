@@ -156,6 +156,8 @@ func (c *Config) resetKey(key string) {
 		c.AccountRPMLimit = defaults.AccountRPMLimit
 	case "MIN_OUTPUT_TOKENS":
 		c.MinOutputTokens = defaults.MinOutputTokens
+	case "LONG_OUTPUT_MAX_TOKENS":
+		c.LongOutputMaxTokens = defaults.LongOutputMaxTokens
 	case "ROUTING_STRATEGY":
 		c.RoutingStrategy = defaults.RoutingStrategy
 	case "UPSTREAM_CHANNELS":
@@ -303,6 +305,12 @@ var configChecks = []configCheck{
 	{keys: []string{"MIN_OUTPUT_TOKENS"}, check: func(c Config) error {
 		if c.MinOutputTokens < 0 {
 			return fmt.Errorf("MIN_OUTPUT_TOKENS 必须是 0 或正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"LONG_OUTPUT_MAX_TOKENS"}, check: func(c Config) error {
+		if c.LongOutputMaxTokens < 0 || c.LongOutputMaxTokens > maxLongOutputMaxTokens {
+			return fmt.Errorf("LONG_OUTPUT_MAX_TOKENS 必须是 0 到 %d 的整数", maxLongOutputMaxTokens)
 		}
 		return nil
 	}},

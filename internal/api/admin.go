@@ -495,6 +495,10 @@ type RuntimeConfig struct {
 	StreamDataHeartbeat *bool `json:"stream_data_heartbeat,omitempty"`
 	// OmniIgnoreSystemPrompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	OmniIgnoreSystemPrompt *bool `json:"omni_ignore_system_prompt,omitempty"`
+	// LongOutputEnabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED），LongOutputMaxTokens 为没有官网续写能力的模型的默认输出
+	// 总上限（LONG_OUTPUT_MAX_TOKENS，0 表示不模拟续写）；都保存后立即生效，读取时总是返回，保存时没有这些字段（旧版页面）则沿用现值
+	LongOutputEnabled   *bool `json:"long_output_enabled,omitempty"`
+	LongOutputMaxTokens *int  `json:"long_output_max_tokens,omitempty"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型（STREAM_PLAYGROUND_MODELS），读取时总是返回（可以为空数组）；
 	// 保存时没有该字段（旧版页面）则沿用现值
 	StreamPlaygroundModels *[]string `json:"stream_playground_models,omitempty"`

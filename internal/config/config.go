@@ -73,6 +73,8 @@ var configKeys = [...]string{
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
 	"MIN_OUTPUT_TOKENS",
+	"LONG_OUTPUT_ENABLED",
+	"LONG_OUTPUT_MAX_TOKENS",
 	"DOWNGRADE_GUARD",
 	"DOWNGRADE_GUARD_MODELS",
 	"DOWNGRADE_SPEED_THRESHOLD",
@@ -151,6 +153,14 @@ type Config struct {
 	RepeatPromptNonce bool `json:"repeat_prompt_nonce"`
 	// MinOutputTokens 为最大输出 token 的下限：客户端设置的更小值会提高到它（不超过模型上限）；0 表示不调整
 	MinOutputTokens int `json:"min_output_tokens"`
+	// LongOutputEnabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED，默认开启，保存后立即生效）：关闭时 long- 前缀照常解析，
+	// 按普通请求处理（不续写）
+	LongOutputEnabled bool `json:"long_output_enabled"`
+	// LongOutputMaxTokens 为 long- 请求没有给出输出上限时、没有官网续写能力（能力码 91）的模型模拟续写的输出总上限
+	// （LONG_OUTPUT_MAX_TOKENS，默认 262144，即常见单轮上限 65536 的 4 倍；轮数约为它除以模型单轮上限，单轮更小的模型轮数更多，
+	// 一个请求最多 64 轮；0 表示不模拟续写，保存后立即生效）。
+	// 能力码 91 的模型按官网续写总量（模型目录的 inputTokenLimit），客户端给出输出上限时以客户端为准
+	LongOutputMaxTokens int `json:"long_output_max_tokens"`
 	// FirstEventTimeout 为每次尝试等待首个上游事件的上限：超时只取消这一次尝试并按超时换号重试；0 表示关闭（默认），
 	// 思考很长的模型可能很久才有第一个事件
 	FirstEventTimeout time.Duration `json:"-"`
@@ -227,6 +237,8 @@ func Default() Config {
 		WAABackend:             WAABackendCamoufox,
 		RepeatPromptNonce:      true,
 		MinOutputTokens:        defaultMinOutputTokens,
+		LongOutputEnabled:      true,
+		LongOutputMaxTokens:    defaultLongOutputMaxTokens,
 		DowngradeGuard:         DefaultDowngradeGuard(),
 		Media:                  DefaultMediaSettings(),
 		AutoStart:              true,
@@ -357,6 +369,15 @@ func Load(path string) (Config, error) {
 		cfg.MinOutputTokens = parsed
 		return nil
 	})
+	boolean("LONG_OUTPUT_ENABLED", true, &cfg.LongOutputEnabled)
+	_ = loader.field("LONG_OUTPUT_MAX_TOKENS", true, func(value string) error {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || parsed < 0 || parsed > maxLongOutputMaxTokens {
+			return fmt.Errorf("LONG_OUTPUT_MAX_TOKENS 必须是 0 到 %d 的整数", maxLongOutputMaxTokens)
+		}
+		cfg.LongOutputMaxTokens = parsed
+		return nil
+	})
 	loadDowngradeGuard(loader, &cfg.DowngradeGuard)
 	_ = loader.field("WAA_BACKEND", false, func(value string) error {
 		cfg.WAABackend = strings.ToLower(strings.TrimSpace(value))
@@ -437,6 +458,8 @@ func (c Config) save(path string, kept map[string]string) error {
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
 		"MIN_OUTPUT_TOKENS":        strconv.Itoa(c.MinOutputTokens),
+		"LONG_OUTPUT_ENABLED":      strconv.FormatBool(c.LongOutputEnabled),
+		"LONG_OUTPUT_MAX_TOKENS":   strconv.Itoa(c.LongOutputMaxTokens),
 		"WAA_BACKEND":              c.WAABackend,
 		"AUTO_START":               strconv.FormatBool(c.AutoStart),
 		"REQUEST_BODY_LOG":         strconv.FormatBool(c.RequestBodyLog),
@@ -556,6 +579,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt bool              `json:"omni_ignore_system_prompt"`
+		LongOutputEnabled      bool              `json:"long_output_enabled"`
+		LongOutputMaxTokens    int               `json:"long_output_max_tokens"`
 		DowngradeGuard         DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string            `json:"waa_backend"`
 		Media                  mediaSettingsJSON `json:"media"`
@@ -591,6 +616,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RepeatPromptNonce:      c.RepeatPromptNonce,
 		MinOutputTokens:        c.MinOutputTokens,
 		OmniIgnoreSystemPrompt: c.OmniIgnoreSystemPrompt,
+		LongOutputEnabled:      c.LongOutputEnabled,
+		LongOutputMaxTokens:    c.LongOutputMaxTokens,
 		DowngradeGuard:         c.DowngradeGuard,
 		WAABackend:             c.WAABackend,
 		Media:                  c.Media.toJSON(),
@@ -630,6 +657,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        *int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt *bool              `json:"omni_ignore_system_prompt"`
+		LongOutputEnabled      *bool              `json:"long_output_enabled"`
+		LongOutputMaxTokens    *int               `json:"long_output_max_tokens"`
 		DowngradeGuard         *DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string             `json:"waa_backend"`
 		Media                  *mediaSettingsJSON `json:"media"`
@@ -707,6 +736,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,
 		MinOutputTokens:        intOrDefault(value.MinOutputTokens, defaultMinOutputTokens),
 		OmniIgnoreSystemPrompt: value.OmniIgnoreSystemPrompt == nil || *value.OmniIgnoreSystemPrompt,
+		LongOutputEnabled:      value.LongOutputEnabled == nil || *value.LongOutputEnabled,
+		LongOutputMaxTokens:    intOrDefault(value.LongOutputMaxTokens, defaultLongOutputMaxTokens),
 		DowngradeGuard:         downgradeGuardOrDefault(value.DowngradeGuard),
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
 		Media:                  media,
@@ -1309,6 +1340,14 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 
 // defaultMinOutputTokens 为最大输出 token 下限的默认值
 const defaultMinOutputTokens = 60000
+
+// defaultLongOutputMaxTokens 为 LONG_OUTPUT_MAX_TOKENS 的默认值：常见单轮上限 65536 的 4 倍（单轮 65536 的模型最多约 4 轮，即多占 3 次
+// 请求额度；单轮更小的模型轮数约为它除以单轮上限，一个请求最多 64 轮）；
+// maxLongOutputMaxTokens 为允许配置的最大值，与官网自动续写的总量（1048576）相同
+const (
+	defaultLongOutputMaxTokens = 262144
+	maxLongOutputMaxTokens     = 1048576
+)
 
 func intOrDefault(value *int, fallback int) int {
 	if value == nil {
