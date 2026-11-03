@@ -170,6 +170,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents)
+	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），之后恢复媒体与整理分轮都按去掉后的对话进行
+	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)

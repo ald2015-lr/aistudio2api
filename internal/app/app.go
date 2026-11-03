@@ -179,6 +179,18 @@ func parseFlags(args []string, cfg *config.Config) (commandOptions, error) {
 	return options, nil
 }
 
+// publicAPIConfig 返回公开 API 与管理接口的配置：热更新的设置（API Key、Ultra 独占、数据型心跳、视频模型忽略系统提示、媒体输出）
+// 都接到管理器的当前值上，每个请求读取一次，在管理页保存后立即生效
+func publicAPIConfig(manager *runtimeManager, cfg config.Config, adminToken string, stopping <-chan struct{}) api.Config {
+	return api.Config{
+		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
+		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
+		Ledger: manager.requestLedger(), UltraExclusive: manager.activeUltraExclusive,
+		StreamDataHeartbeat: manager.activeStreamDataHeartbeat, OmniIgnoreSystemPrompt: manager.activeOmniIgnoreSystemPrompt,
+		MediaDir: mediaDir, MediaLinks: manager.mediaLinks,
+	}
+}
+
 // runServer 管理 HTTP 监听与优雅退出
 func runServer(ctx context.Context, cfg config.Config, options commandOptions, manager *runtimeManager) error {
 	manager.requests.log("service", "INFO", fmt.Sprintf("管理监听启动 | 地址=%s", cfg.ListenAddr))
@@ -198,12 +210,7 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	}
 	// stopping 在开始优雅退出时关闭，让管理页的实时事件流主动结束，不拖住退出等待
 	stopping := make(chan struct{})
-	apiHandler := api.NewHandler(manager, api.Config{
-		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
-		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
-		Ledger: manager.requestLedger(), UltraExclusive: manager.activeUltraExclusive,
-		StreamDataHeartbeat: manager.activeStreamDataHeartbeat, MediaDir: mediaDir, MediaLinks: manager.mediaLinks,
-	})
+	apiHandler := api.NewHandler(manager, publicAPIConfig(manager, cfg, adminToken, stopping))
 	if cfg.AdminPassword != "" {
 		manager.requests.log("service", "INFO", "远程管理已开启 | HTTP Basic 认证 | 未配置 HTTPS 时密码为明文传输")
 	}

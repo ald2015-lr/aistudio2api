@@ -199,6 +199,7 @@ func hasFunctionCall(content aistudio.Content) bool {
 }
 
 // prepareGenerate 在发往上游前整理请求：先修正对话历史分轮，再解析模型名后缀（Omni 模型另整理视频设置）。
+// 各入口在此之前已按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），预填充判断与分轮合并按去掉后的对话进行。
 // 返回是否需要隐藏思维链；Omni 视频设置不成立（例如非第一轮指定视频任务、帧率不是 24fps）时返回参数错误，调用方在选号前按 400 返回
 func (s *server) prepareGenerate(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
 	if count := len(request.Contents); count > 0 && request.Contents[count-1].Role == aistudio.RoleAssistant &&

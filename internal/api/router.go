@@ -29,6 +29,9 @@ type Config struct {
 	UltraExclusive func() bool
 	// StreamDataHeartbeat 每个流式请求开始时读取是否使用数据型心跳（STREAM_DATA_HEARTBEAT，见 streamDataHeartbeat）；为 nil 时按默认开启
 	StreamDataHeartbeat func() bool
+	// OmniIgnoreSystemPrompt 每个生成请求整理时读取是否对能输出视频的 Omni 模型去掉系统提示（OMNI_IGNORE_SYSTEM_PROMPT，见 omni_system.go）；
+	// 为 nil 时按默认开启
+	OmniIgnoreSystemPrompt func() bool
 	// MediaDir 为生成媒体的保存目录（MEDIA_OUTPUT=url 时保存、/media/ 路由读取、回传的本服务媒体链接从这里恢复）；为空时不启用这些功能
 	MediaDir string
 	// MediaLinks 每次请求读取媒体输出设置：是否以本服务链接输出生成的媒体，与链接使用的服务地址（MEDIA_BASE_URL，为空时按请求地址）；

@@ -143,6 +143,9 @@ type SpeechMetadata struct {
 type Content struct {
 	Role  Role   `json:"role"`
 	Parts []Part `json:"parts"`
+	// FromSystem 标记由客户端 system 角色消息转成的一轮（Anthropic Messages 入口把 messages 里的 system 消息包成 <system-reminder> 的用户消息）：
+	// 它和请求的系统提示一样来自客户端的系统提示，开启视频模型忽略系统提示（api 层 OMNI_IGNORE_SYSTEM_PROMPT）时随系统提示一起去掉；不参与编码
+	FromSystem bool `json:"-"`
 }
 
 // FunctionDeclaration 表示客户端声明的函数
@@ -294,6 +297,13 @@ type GenerateRequest struct {
 	// Notes 为协议层整理请求时留下的说明（例如 Omni 模型忽略的 stop sequences、按模型范围调整的视频时长），
 	// 生成服务在选号前逐条写进该请求的管理日志
 	Notes []string `json:"-"`
+	// IgnoreOmniSystemPrompt 为协议层开启了视频模型忽略系统提示（api 层 OMNI_IGNORE_SYSTEM_PROMPT）、请求带了客户端的系统提示，
+	// 但按别名目录没有认出能输出视频的 Omni 模型（启动期间取不到、缓存还没刷新等）：生成服务按所选账户的目录判定为 Omni 时
+	// 在发送前按同一规则去掉并记说明（见 omni_system.go）。协议层已去掉或开关关闭时为假，不参与编码
+	IgnoreOmniSystemPrompt bool `json:"-"`
+	// clientSystem 与 toolHints 为 prepareToolRequest 追加工具要求时记下的客户端系统提示与追加的要求（以换行连接）；
+	// 没有追加时都为空，System 就是客户端的系统提示
+	clientSystem, toolHints string
 }
 
 // TokenCountRequest 表示计数请求

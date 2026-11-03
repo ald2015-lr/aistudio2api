@@ -1209,6 +1209,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.StreamDataHeartbeat != nil {
 		streamDataHeartbeat = *value.StreamDataHeartbeat
 	}
+	// 视频模型忽略系统提示：旧版页面保存时不带该字段，沿用现值
+	omniIgnoreSystemPrompt := saved.OmniIgnoreSystemPrompt
+	if value.OmniIgnoreSystemPrompt != nil {
+		omniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
+	}
 	// 单账户每分钟上限：旧版页面保存时不带该字段，沿用现值（0 表示关闭，不能用零值判断是否缺省）
 	accountRPMLimit := saved.AccountRPMLimit
 	if value.AccountRPMLimit != nil {
@@ -1283,6 +1288,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
 		MinOutputTokens:        value.MinOutputTokens,
+		OmniIgnoreSystemPrompt: omniIgnoreSystemPrompt,
 		WAABackend:             value.WAABackend,
 		AutoStart:              autoStart,
 		RequestBodyLog:         requestBodyLog,
@@ -1989,6 +1995,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraExclusive:         &cfg.UltraExclusive,
 		UltraIncludePro:        &cfg.UltraIncludePro,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
+		OmniIgnoreSystemPrompt: &cfg.OmniIgnoreSystemPrompt,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  &cfg.UltraMaxActiveWorkers,
 		StreamPlaygroundModels: &streamPlaygroundModels,

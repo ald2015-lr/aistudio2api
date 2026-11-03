@@ -47,3 +47,20 @@ func TestApplyPromptNonceAppendsToPlainText(t *testing.T) {
 		t.Fatalf("得到 %#v", modified.Contents[0].Parts)
 	}
 }
+
+// TestApplyPromptNonceKeepsFromSystem 最后一条用户消息是 system 角色消息转成的轮次（Anthropic messages 以 system 消息结尾）时，
+// 加后缀后 FromSystem 标记保留：Omni 发送前补做系统提示去除要靠它认出这一轮
+func TestApplyPromptNonceKeepsFromSystem(t *testing.T) {
+	nonce := newPromptNonce()
+	request := aistudio.GenerateRequest{Contents: []aistudio.Content{
+		{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "生成一个猫的视频"}}},
+		{Role: aistudio.RoleUser, FromSystem: true, Parts: []aistudio.Part{{Text: "<system-reminder>只回中文</system-reminder>"}}},
+	}}
+	modified, ok := applyPromptNonce(request, nonce)
+	if !ok || !modified.Contents[1].FromSystem || modified.Contents[1].Parts[0].Text != "<system-reminder>只回中文</system-reminder>"+nonce {
+		t.Fatalf("得到 %+v", modified.Contents)
+	}
+	if request.Contents[1].Parts[0].Text != "<system-reminder>只回中文</system-reminder>" {
+		t.Fatal("调用方的原始内容被修改")
+	}
+}

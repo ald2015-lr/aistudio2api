@@ -74,6 +74,19 @@ func (manager *runtimeManager) applyStreamDataHeartbeat(enabled bool) {
 	manager.requests.log("service", "INFO", fmt.Sprintf("数据型心跳设置已更新并立即生效 | 开启=%t", enabled))
 }
 
+// activeOmniIgnoreSystemPrompt 返回当前是否对能输出视频的 Omni 模型去掉系统提示（OMNI_IGNORE_SYSTEM_PROMPT）：公开 API 在每个生成请求整理时读取
+func (manager *runtimeManager) activeOmniIgnoreSystemPrompt() bool {
+	return manager.omniIgnoreSystemPrompt.Load()
+}
+
+// applyOmniIgnoreSystemPrompt 立即切换视频模型忽略系统提示：之后进入的请求按新设置整理，进行中的请求不受影响
+func (manager *runtimeManager) applyOmniIgnoreSystemPrompt(enabled bool) {
+	if manager.omniIgnoreSystemPrompt.Swap(enabled) == enabled {
+		return
+	}
+	manager.requests.log("service", "INFO", fmt.Sprintf("视频模型忽略系统提示设置已更新并立即生效 | 开启=%t", enabled))
+}
+
 // applyAPIKey 立即切换公开 API 密钥，无需重启管理进程
 func (manager *runtimeManager) applyAPIKey(key string) {
 	key = config.EffectiveProxyAPIKey(key)
@@ -189,7 +202,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
-		saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
+		saved.StreamDataHeartbeat == active.StreamDataHeartbeat && saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
@@ -234,9 +247,11 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		return nil, saved, false
 	}
 	manager.overrides.Apply(&saved)
-	// 独占设置、数据型心跳与媒体设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），需要重建生成服务的配置变化也不例外
+	// 独占设置、数据型心跳、视频模型忽略系统提示与媒体设置按读取到的配置立即生效（进程环境变量覆盖 .env 时与读取配置显示的值一致），
+	// 需要重建生成服务的配置变化也不例外
 	manager.applyUltraExclusive(saved.UltraExclusive)
 	manager.applyStreamDataHeartbeat(saved.StreamDataHeartbeat)
+	manager.applyOmniIgnoreSystemPrompt(saved.OmniIgnoreSystemPrompt)
 	manager.applyMediaSettings(saved.Media)
 
 	manager.mu.Lock()

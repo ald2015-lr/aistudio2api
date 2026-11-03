@@ -106,6 +106,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicInvalid(w, err)
 		return
 	}
+	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），之后恢复媒体与整理分轮都按去掉后的对话进行
+	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
@@ -180,6 +182,8 @@ func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicInvalid(w, err)
 		return
 	}
+	// 与生成请求一样先去掉发给 Omni 视频模型的系统提示（OMNI_IGNORE_SYSTEM_PROMPT，见 omni_system.go），计数与实际发送的内容一致
+	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	// 与生成请求一样整理对话轮次（包括把工具结果中的图片移到之后的用户消息），计数与实际发送的内容一致
 	contents, _ := normalizeTurns(generateRequest.Contents)
@@ -221,7 +225,9 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 				return aistudio.GenerateRequest{}, fmt.Errorf("system message: %w", err)
 			}
 			if strings.TrimSpace(text) != "" {
-				contents = append(contents, aistudio.Content{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "<system-reminder>\n" + text + "\n</system-reminder>"}}})
+				contents = append(contents, aistudio.Content{
+					Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: aistudio.SystemReminderOpen + text + aistudio.SystemReminderClose}}, FromSystem: true,
+				})
 			}
 			continue
 		}

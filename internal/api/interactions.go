@@ -52,6 +52,8 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	}
 	current := cloneResponseContents(contents[start:])
 	generate.Contents = contents
+	// 按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go）
+	s.ignoreOmniSystemPrompt(r.Context(), &generate)
 	hideThought, err := s.prepareGenerate(r.Context(), &generate)
 	if err != nil {
 		writeGeminiInvalid(w, err)

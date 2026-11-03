@@ -439,6 +439,9 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	if restored := s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents); restored > 0 {
 		aistudio.TraceFromContext(r.Context()).Note(fmt.Sprintf("已为 %d 个历史函数调用还原本服务签发的思考签名（客户端带回的签名缺失或为占位值）", restored))
 	}
+	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go；countTokens 同样，计数与实际发送的内容一致），
+	// 之后恢复媒体与整理分轮都按去掉后的对话进行
+	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接与 fileData 恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	switch method {

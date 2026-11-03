@@ -703,6 +703,9 @@ export interface ServiceConfig {
   media_base_url: string
   media_retention: string
   media_max_size: string
+  // omni_ignore_system_prompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT）：发给能输出视频的 Omni 模型的请求去掉客户端的系统提示，
+  // 保存后立即生效。服务端总是返回该字段，因此这里不是可选字段
+  omni_ignore_system_prompt: boolean
 }
 
 // ProxyTestProbe 为“测试代理”一条路径的结果：成功时 ip 为出口 IP，失败时 error 为说明（不含账号密码）

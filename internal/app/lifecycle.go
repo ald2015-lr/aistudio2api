@@ -83,6 +83,9 @@ type runtimeManager struct {
 	// streamDataHeartbeat 为生效的 STREAM_DATA_HEARTBEAT（数据型心跳）：与 ultraExclusive 一样是进程级设置，公开 API 在每个流式请求开始时读取，
 	// 保存配置后立即生效，启动生成服务时按新读取的配置同步
 	streamDataHeartbeat atomic.Bool
+	// omniIgnoreSystemPrompt 为生效的 OMNI_IGNORE_SYSTEM_PROMPT（视频模型忽略系统提示）：与 streamDataHeartbeat 一样是进程级设置，
+	// 公开 API 在每个生成请求整理时读取，保存配置后立即生效，启动生成服务时按新读取的配置同步
+	omniIgnoreSystemPrompt atomic.Bool
 	// liveConfigMu 让配置热更新逐次进行：applyLiveConfig 在锁外读取 .env，两次保存并发时，先读到旧文件的一次可能最后应用，
 	// 账户池里的 ULTRA_INCLUDE_PRO、current.config 与 .env 就会不一致。逐次进行后，最后一次应用读到的一定是最后写入的文件
 	liveConfigMu sync.Mutex
@@ -132,6 +135,7 @@ func newRuntimeManager(
 	}
 	manager.ultraExclusive.Store(cfg.UltraExclusive)
 	manager.streamDataHeartbeat.Store(cfg.StreamDataHeartbeat)
+	manager.omniIgnoreSystemPrompt.Store(cfg.OmniIgnoreSystemPrompt)
 	media := cfg.Media.Normalized()
 	manager.media.Store(&media)
 	manager.mediaCleaner = newMediaCleaner(manager)
@@ -240,9 +244,10 @@ func (manager *runtimeManager) startService(ctx context.Context, user bool) (api
 	current = manager.current
 	manager.current = next
 	manager.mu.Unlock()
-	// 独占设置、数据型心跳与媒体设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
+	// 独占设置、数据型心跳、视频模型忽略系统提示与媒体设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
 	manager.applyUltraExclusive(cfg.UltraExclusive)
 	manager.applyStreamDataHeartbeat(cfg.StreamDataHeartbeat)
+	manager.applyOmniIgnoreSystemPrompt(cfg.OmniIgnoreSystemPrompt)
 	manager.applyMediaSettings(cfg.Media)
 
 	current.cancelLifecycle()
@@ -656,7 +661,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait, StreamDataHeartbeat: active.StreamDataHeartbeat,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
-		ProxyPool: active.ProxyPool,
+		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -681,6 +686,10 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	// 数据型心跳：提交时省略（旧版页面）按生效值比较
 	if value.StreamDataHeartbeat != nil {
 		saved.StreamDataHeartbeat = *value.StreamDataHeartbeat
+	}
+	// 视频模型忽略系统提示：提交时省略（旧版页面）按生效值比较
+	if value.OmniIgnoreSystemPrompt != nil {
+		saved.OmniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
 	}
 	if value.UltraIncludePro != nil {
 		saved.UltraIncludePro = *value.UltraIncludePro
@@ -717,6 +726,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
+		saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
 		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.WAABackend == active.WAABackend &&
 		saved.DowngradeGuard.Equal(active.DowngradeGuard) &&

@@ -1630,6 +1630,8 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 
 模型名后缀可与 `-low`、`-high`、`-minimal`、`-medium`、`-128`、`-nothinking` 组合，顺序不限、不分大小写，同一项出现多次时以最靠后的为准，例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`。解析先按原有后缀进行（与原先完全相同）；解析不到时再连同视频后缀解析，且结果必须是能输出视频的 Omni 模型，其他模型名带 `-720p`、`-8s` 等字样时保持原名，目录 ID 本身带这类字样时按目录 ID。视频后缀也可以加在 Omni 的目录别名（`capability_options.aliases`）后面，别名与某个目录 ID 同名时按该 ID；按别名调用时请求与响应里的模型名为去掉后缀的别名，调度前再换成目录 ID。Omni 的思考等级后缀优先于请求参数，不带等级后缀时沿用请求参数与模型默认等级（不像文本模型那样设为最高）；`-online` 对 Omni 不生效。响应里的模型名为去掉后缀的目录模型名。`/v1/models` 不展开这些组合，单模型查询能查到。
 
+系统提示：`OMNI_IGNORE_SYSTEM_PROMPT=true`（默认，热更新）时，发给能输出视频的 Omni 模型（同上，含带后缀的名称与目录别名）的请求去掉客户端的系统提示，不发给上游：OpenAI Chat 的 `system`、`developer` 消息，Responses 的 `instructions` 与 `input` 里的 `system`、`developer` 消息（含 `previous_response_id` 续接带上的系统指令），Anthropic 的顶层 `system` 与 `messages` 里的 `system` 角色消息（转成的 `<system-reminder>` 用户消息整轮去掉），Gemini 的 `systemInstruction`（`system_instruction`），Interactions 的 `system_instruction`。去掉发生在恢复回传的媒体链接与整理分轮之前（去掉后的请求与不带系统提示时完全相同，例如末尾的 `system` 角色消息去掉后，最后一条用户消息才是“这一轮”），其余消息原样；请求除系统提示外没有任何对话消息时保留（生成服务按用户消息发送），Anthropic 请求除顶层 `system` 外只有 `system` 角色消息时只去掉顶层 `system`，这些消息照常按用户消息发送。Gemini `countTokens` 与 Anthropic `count_tokens` 按同一规则计数。协议层按别名目录没有认出 Omni（启动期间别名目录取不到、别名目录缓存还没刷新，例如新加入的账户是唯一带 Omni 的账户）时只做标记（`GenerateRequest.IgnoreOmniSystemPrompt`），生成服务按所选账户的目录判定为 Omni 时在发送前按同一规则去掉。本服务按工具设置追加的提示（`tool_choice` 等）不受影响，发送前补做时同样保留。说明写进该请求的管理日志（见 [logging.md](logging.md)）。Chatbox 等客户端自动加的 “You are a helpful assistant.” 会让 Omni 只回文字、说无法生成视频，因此默认开启；`false` 时与原先完全一致。
+
 ### OpenAI Chat Completions
 
 `POST /v1/chat/completions` 请求字段：

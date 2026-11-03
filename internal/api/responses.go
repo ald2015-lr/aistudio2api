@@ -185,6 +185,8 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		instructions = append(instructions, inlineInstructions...)
 		generateRequest.System = strings.Join(instructions, "\n")
 	}
+	// 按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（含续接带上的系统指令，见 omni_system.go）；续接用的状态已在上面存下，不受影响
+	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
 	if err != nil {
 		writeOpenAIInvalid(w, err)

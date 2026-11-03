@@ -621,6 +621,11 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if err := ValidateMediaResolution(request.Config.MediaResolution); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
+	// 协议层开启了视频模型忽略系统提示、但没有认出 Omni（启动期间别名目录取不到、别名目录缓存还没刷新等）：按所选账户的目录补做一次，
+	// 说明写进该请求的管理日志（换号重试时每个账户各记各的）；在截断与报告实际输入之前，计数与发送的内容一致
+	if note, ok := ignoreOmniSystemPromptBeforeSend(&request, entry.model); ok {
+		ReportRequestNote(ctx, note)
+	}
 	if request.Truncate && entry.model.InputTokenLimit > 0 {
 		if request, err = c.truncateRequest(ctx, request, entry.model.InputTokenLimit); err != nil {
 			return nil, err

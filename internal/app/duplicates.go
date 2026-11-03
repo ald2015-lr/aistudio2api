@@ -368,7 +368,9 @@ func applyPromptNonce(request aistudio.GenerateRequest, nonce string) (aistudio.
 			parts = append(parts, aistudio.Part{Text: nonce})
 		}
 		contents := append([]aistudio.Content(nil), request.Contents...)
-		contents[index] = aistudio.Content{Role: content.Role, Parts: parts}
+		// 复制原消息只换 part，保留 FromSystem 等不参与编码的标记（Omni 发送前补做系统提示去除时要靠它认出 system 角色消息转成的轮次）
+		content.Parts = parts
+		contents[index] = content
 		request.Contents = contents
 		return request, true
 	}

@@ -269,6 +269,9 @@ const zhCN = {
     '媒体链接地址必须是 http 或 https 地址，不能带账号密码、查询参数或片段',
   'settings.invalidMediaRetention': '媒体保存期限必须是 0 或不少于 1 小时，例如 7d、72h',
   'settings.invalidMediaMaxSize': '媒体总量上限必须是 0 或不小于 100MB，例如 20GB、500MB',
+  'settings.omniIgnoreSystemPrompt': '视频模型忽略系统提示',
+  'settings.omniIgnoreSystemPromptHelp':
+    '发给能输出视频的 Omni 模型（如 gemini-omni-1.1-flash，含带后缀的名称与目录别名）的请求去掉客户端的系统提示（各协议的 system、systemInstruction、instructions、system_instruction 与 system 角色消息），不发给上游，请求日志记一行去掉的字数。默认开启：Chatbox 等聊天客户端每次都自动加 “You are a helpful assistant.” 一类的系统提示，Omni 带上它时常常只回一段文字、说自己无法生成视频。开启时客户端设置的系统提示（如 Chatbox 的角色设定）对 Omni 不生效，要规定视频风格请写进用户消息；开启前已被拒绝过的对话可能仍只回文字，请新建对话再试。关闭后系统提示照常发送（与其他模型相同）；这是全局设置，对所有客户端生效，Chatbox 等客户端又会只回文字。除系统提示外没有其他消息时保留系统提示；文本、图片、Veo、Lyria 等其他模型不受影响。修改后立即生效，只影响新请求。',
   'settings.temporaryChat': 'WAA 预热使用临时对话',
   'settings.ignoreClientSeed': '忽略客户端传入的 seed',
   'settings.ignoreClientSeedHelp':
@@ -1193,6 +1196,9 @@ const en: Record<TranslationKey, string> = {
     'Media retention must be 0 or at least 1 hour, such as 7d or 72h',
   'settings.invalidMediaMaxSize':
     'Media size limit must be 0 or at least 100MB, such as 20GB or 500MB',
+  'settings.omniIgnoreSystemPrompt': 'Ignore system prompts for video models',
+  'settings.omniIgnoreSystemPromptHelp':
+    'Requests to Omni models that output video (such as gemini-omni-1.1-flash, including suffixed names and catalog aliases) drop the client system prompt (system, systemInstruction, instructions, system_instruction and system-role messages in every protocol) instead of sending it upstream, and the request log records how many characters were dropped. On by default: chat clients such as Chatbox add a system prompt like "You are a helpful assistant." to every request, and with it Omni often replies with text only, saying it cannot generate videos. While on, system prompts set in the client (such as a Chatbox persona) have no effect on Omni, so put style instructions in the user message; a conversation that was already refused before may keep replying with text only, so start a new one. When off, system prompts are sent as usual (as for other models); this is a global setting that applies to every client, and Chatbox-style requests go back to text-only. A system prompt is kept when the request has no other messages; text, image, Veo, Lyria and other models are not affected. Changes apply immediately to new requests only.',
   'settings.temporaryChat': 'Use temporary chat for WAA prewarming',
   'settings.ignoreClientSeed': 'Ignore seed sent by clients',
   'settings.ignoreClientSeedHelp':

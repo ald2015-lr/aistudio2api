@@ -90,6 +90,7 @@ var configKeys = [...]string{
 	"MEDIA_BASE_URL",
 	"MEDIA_RETENTION",
 	"MEDIA_MAX_SIZE",
+	"OMNI_IGNORE_SYSTEM_PROMPT",
 	"AUTO_START",
 	"REQUEST_BODY_LOG",
 	"ADMIN_PASSWORD",
@@ -158,6 +159,11 @@ type Config struct {
 	// 官方 Gemini SDK 直连时 Gemini SSE 仍只写换行（见 api.officialGeminiSDK）。
 	// new-api 等中转丢弃非 data 行，原先心跳传不到中转后面的客户端，首个可转发数据来得慢时客户端那一段连接长时间零字节；关闭时与原先完全一致
 	StreamDataHeartbeat bool `json:"stream_data_heartbeat"`
+	// OmniIgnoreSystemPrompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT，默认开启，保存后立即生效）：发给能输出视频的 Omni 模型的请求
+	// 去掉系统提示（各协议的 system、systemInstruction、instructions、system_instruction 与 system 角色消息），不发给上游，并在该请求的管理日志记一行。
+	// 聊天客户端（如 Chatbox）每次都自动加 “You are a helpful assistant.” 一类的系统提示，Omni 带上它时只回一段文字、说自己无法生成视频；
+	// 关闭时与原先完全一致，其他模型不受影响
+	OmniIgnoreSystemPrompt bool `json:"omni_ignore_system_prompt"`
 	// UltraExclusive 为真（默认）时 Ultra 号池的账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 号池的账户
 	UltraExclusive bool `json:"ultra_exclusive"`
 	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
@@ -205,6 +211,7 @@ func Default() Config {
 		UltraExclusive:         true,
 		UltraIncludePro:        false,
 		StreamDataHeartbeat:    true,
+		OmniIgnoreSystemPrompt: true,
 		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
@@ -366,6 +373,12 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("STREAM_DATA_HEARTBEAT 必须是 true 或 false")
 		}
 	}
+	if value, ok := values["OMNI_IGNORE_SYSTEM_PROMPT"]; ok && strings.TrimSpace(value) != "" {
+		cfg.OmniIgnoreSystemPrompt, err = strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return Config{}, fmt.Errorf("OMNI_IGNORE_SYSTEM_PROMPT 必须是 true 或 false")
+		}
+	}
 	if value, ok := values["TEMPORARY_CHAT"]; ok {
 		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil {
@@ -469,6 +482,7 @@ func (c Config) Save(path string) error {
 	for key, value := range c.Media.envValues() {
 		values[key] = value
 	}
+	values["OMNI_IGNORE_SYSTEM_PROMPT"] = strconv.FormatBool(c.OmniIgnoreSystemPrompt)
 
 	var output strings.Builder
 	for _, key := range configKeys {
@@ -651,6 +665,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		IgnoreClientSeed       bool              `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        int               `json:"min_output_tokens"`
+		OmniIgnoreSystemPrompt bool              `json:"omni_ignore_system_prompt"`
 		DowngradeGuard         DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string            `json:"waa_backend"`
 		Media                  mediaSettingsJSON `json:"media"`
@@ -685,6 +700,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
 		MinOutputTokens:        c.MinOutputTokens,
+		OmniIgnoreSystemPrompt: c.OmniIgnoreSystemPrompt,
 		DowngradeGuard:         c.DowngradeGuard,
 		WAABackend:             c.WAABackend,
 		Media:                  c.Media.toJSON(),
@@ -723,6 +739,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		IgnoreClientSeed       bool               `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        *int               `json:"min_output_tokens"`
+		OmniIgnoreSystemPrompt *bool              `json:"omni_ignore_system_prompt"`
 		DowngradeGuard         *DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string             `json:"waa_backend"`
 		Media                  *mediaSettingsJSON `json:"media"`
@@ -740,7 +757,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理；
-	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段时按默认开启处理
+	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段、视频模型忽略系统提示字段时按默认开启处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -799,6 +816,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,
 		MinOutputTokens:        intOrDefault(value.MinOutputTokens, defaultMinOutputTokens),
+		OmniIgnoreSystemPrompt: value.OmniIgnoreSystemPrompt == nil || *value.OmniIgnoreSystemPrompt,
 		DowngradeGuard:         downgradeGuardOrDefault(value.DowngradeGuard),
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
 		Media:                  media,

@@ -138,12 +138,19 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 		hints = append(hints, "Call at most one function in this response.")
 	}
 	if len(hints) > 0 {
-		request.System = strings.TrimSpace(strings.Join(append([]string{request.System}, hints...), "\n"))
+		// 记下客户端的系统提示与追加的要求：发送前补做视频模型忽略系统提示时只去掉客户端的部分（见 ignoreOmniSystemPromptBeforeSend）
+		request.clientSystem, request.toolHints = request.System, strings.Join(hints, "\n")
+		request.System = joinToolHints(request.System, request.toolHints)
 	}
 	if !contract.required && len(config.AllowedFunctionNames) == 0 && len(contract.schemas) == 0 && !contract.single {
 		contract = nil
 	}
 	return request, contract, nil
+}
+
+// joinToolHints 把工具要求（以换行连接）追加在系统提示之后
+func joinToolHints(system string, hints string) string {
+	return strings.TrimSpace(system + "\n" + hints)
 }
 
 // compileToolSchema 编译 strict 函数的参数 Schema，用于核对上游返回的参数
