@@ -179,7 +179,7 @@ func interactionDeltaEvent(content []any) []any {
 }
 
 // TestDecodeInteractionImageAndCitations 按上游移植的解码：content delta field 2 为图片（MIME 枚举 1 为 PNG）作为媒体输出，
-// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；未识别的图片 MIME 与缺少网址的引用按协议证据错误返回
+// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；图片不是 Base64 与缺少网址的引用按协议证据错误返回
 func TestDecodeInteractionImageAndCitations(t *testing.T) {
 	image := []byte("\x89PNG\r\n\x1a\nimage")
 	video := []byte("\x00\x00\x00\x18ftypmp42video")
@@ -229,7 +229,6 @@ func TestDecodeInteractionImageAndCitations(t *testing.T) {
 		t.Fatalf("field 5 视频 = %+v", events[4].Media)
 	}
 	for name, content := range map[string][]any{
-		"未识别的图片 MIME": {nil, []any{7, base64.StdEncoding.EncodeToString(image)}},
 		"图片不是 Base64": {nil, []any{1, "%%%"}},
 		"引用缺少网址":      {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1, nil, []any{}}}}},
 		"引用字段不足":      {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1}}}},
@@ -238,6 +237,42 @@ func TestDecodeInteractionImageAndCitations(t *testing.T) {
 		var evidence *ProtocolEvidenceError
 		if err := DecodeInteractionStream(bytes.NewReader(raw), func(Event) error { return nil }); !errors.As(err, &evidence) {
 			t.Fatalf("%s: 期望协议证据错误，实际 %v", name, err)
+		}
+	}
+}
+
+// TestDecodeInteractionMediaMIMEDefaults 媒体 MIME 枚举按官网前端的表解码；枚举省略（null）或不在表中时取该类媒体的缺省类型
+// （图片 image/jpeg、视频 video/mp4），不再按协议证据错误结束整次生成（官网生成视频的 delta 现在常为 [null,"<MP4 Base64>"]）
+func TestDecodeInteractionMediaMIMEDefaults(t *testing.T) {
+	data := []byte("media-bytes")
+	encoded := base64.StdEncoding.EncodeToString(data)
+	interaction := make([]any, 13)
+	interaction[1] = 3
+	interaction[12] = []any{10, nil, nil, nil, 20, nil, nil, nil, 0, 30}
+	final := make([]any, 20)
+	final[19] = []any{interaction}
+	for name, test := range map[string]struct {
+		content []any
+		mime    string
+	}{
+		"视频枚举省略":  {[]any{nil, nil, nil, nil, []any{nil, encoded}}, "video/mp4"},
+		"视频 webm": {[]any{nil, nil, nil, nil, []any{7, encoded}}, "video/webm"},
+		"视频表外枚举":  {[]any{nil, nil, nil, nil, []any{42, encoded}}, "video/mp4"},
+		"图片枚举省略":  {[]any{nil, []any{nil, encoded}}, "image/jpeg"},
+		"图片 gif":  {[]any{nil, []any{7, encoded}}, "image/gif"},
+		"图片 webp": {[]any{nil, []any{3, encoded}}, "image/webp"},
+		"图片表外枚举":  {[]any{nil, []any{6, encoded}}, "image/jpeg"},
+	} {
+		raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent(test.content), final}, []any{0}})
+		var media *Media
+		err := DecodeInteractionStream(bytes.NewReader(raw), func(event Event) error {
+			if event.Kind == EventMedia {
+				media = event.Media
+			}
+			return nil
+		})
+		if err != nil || media == nil || media.MIME != test.mime || !bytes.Equal(media.Data, data) {
+			t.Fatalf("%s: media=%+v err=%v，期望 %s", name, media, err, test.mime)
 		}
 	}
 }

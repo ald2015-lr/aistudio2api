@@ -15,12 +15,25 @@ import (
 // interactionThinkingLevels 把 GenerateContent thinking level 换算为 Interaction 枚举
 var interactionThinkingLevels = map[int64]int64{4: 1, 1: 2, 2: 3, 3: 4}
 
-// interactionImageMIME 表示 Interaction 图片内容的 MIME 枚举：1 为 image/png（与上游 Mag1cFall/AIStudio2API 相同）；官网发送图片输入时
-// 同一个 Content field 2 以 1 表示 PNG、2 表示 JPEG（见 interaction_image.go），输出带 2 时按 JPEG 解码
-var interactionImageMIME = map[int64]string{interactionPNGEnum: "image/png", interactionJPEGEnum: "image/jpeg"}
+// interactionImageMIME 表示 Interaction 图片内容的 MIME 枚举，与官网前端相同（上游 Mag1cFall/AIStudio2API 45e33b4）；官网发送图片输入时
+// 同一个 Content field 2 以 1 表示 PNG、2 表示 JPEG（见 interaction_image.go）
+var interactionImageMIME = map[int64]string{
+	interactionPNGEnum: "image/png", interactionJPEGEnum: "image/jpeg", 3: "image/webp", 4: "image/heic", 5: "image/heif",
+	7: "image/gif", 8: "image/bmp", 9: "image/tiff",
+}
 
-// interactionVideoMIME 表示 Interaction 视频内容的 MIME 枚举
-var interactionVideoMIME = map[int64]string{1: "video/mp4"}
+// interactionVideoMIME 表示 Interaction 视频内容的 MIME 枚举，与官网前端相同
+var interactionVideoMIME = map[int64]string{
+	1: "video/mp4", 2: "video/mpeg", 3: "video/mpg", 4: "video/mov", 5: "video/avi", 6: "video/x-flv", 7: "video/webm",
+	8: "video/wmv", 9: "video/3gpp",
+}
+
+// interactionImageDefaultMIME、interactionVideoDefaultMIME 为 MIME 枚举省略（null）或不在表中时的类型，与官网前端相同：
+// 官网生成视频的 content delta 现在常省略枚举（[null,"<MP4 Base64>"]），原先按协议证据错误让整次生成以 500 结束
+const (
+	interactionImageDefaultMIME = "image/jpeg"
+	interactionVideoDefaultMIME = "video/mp4"
+)
 
 // interactionStatusHTTP 把流尾 google.rpc 状态码换算为 HTTP 状态
 var interactionStatusHTTP = map[int64]int{
@@ -482,11 +495,11 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 				return err
 			}
 		case 1, 4:
-			mimes, kind := interactionImageMIME, "图片"
+			mimes, fallback, kind := interactionImageMIME, interactionImageDefaultMIME, "图片"
 			if index == 4 {
-				mimes, kind = interactionVideoMIME, "视频"
+				mimes, fallback, kind = interactionVideoMIME, interactionVideoDefaultMIME, "视频"
 			}
-			media, err := decodeInteractionMedia(value, index, mimes, kind, raw)
+			media, err := decodeInteractionMedia(value, index, mimes, fallback, kind, raw)
 			if err != nil {
 				return err
 			}
@@ -513,19 +526,22 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 }
 
 // decodeInteractionMedia 解码图片（field 2）或视频（field 5）content：MIME 枚举与 Base64 数据；kind 为写进协议证据的媒体名称
-func decodeInteractionMedia(value json.RawMessage, index int, mimes map[int64]string, kind string, raw json.RawMessage) (*Media, error) {
+func decodeInteractionMedia(value json.RawMessage, index int, mimes map[int64]string, fallback string, kind string, raw json.RawMessage) (*Media, error) {
 	path := fmt.Sprintf("$delta[1][%d]", index)
 	media, err := rawArray(value, path, raw)
 	if err != nil || len(media) < 2 {
 		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path, Detail: kind + " delta 无效", Raw: cloneRaw(raw)}
 	}
-	code, err := rawInt64(media[0], path+"[0]", raw)
-	if err != nil {
-		return nil, withMethod(err, "CreateInteractionStream")
-	}
-	mimeType, ok := mimes[code]
-	if !ok {
-		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[0]", Detail: fmt.Sprintf("未识别的%s MIME 枚举 %d", kind, code), Raw: cloneRaw(raw)}
+	// MIME 枚举省略（null）或不在表中时按官网前端取该类媒体的缺省类型
+	mimeType := fallback
+	if !isJSONNull(media[0]) {
+		code, err := rawInt64(media[0], path+"[0]", raw)
+		if err != nil {
+			return nil, withMethod(err, "CreateInteractionStream")
+		}
+		if known, ok := mimes[code]; ok {
+			mimeType = known
+		}
 	}
 	encoded, err := rawString(media[1], path+"[1]", raw)
 	if err != nil {
