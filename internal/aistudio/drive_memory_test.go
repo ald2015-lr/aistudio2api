@@ -23,13 +23,15 @@ const driveMissingCredential = "Request is missing required authentication crede
 
 // driveTokenTransport 按账户返回 GenerateAccessToken 的结果：denied 中的账户返回 HTTP 401、协议 Code 16（文案为对应的值），
 // login 中的账户返回签名 Cookie 失效（ErrAuthenticationRequired），其余返回 bearer token。Drive 上传读完数据后返回递增的文件 ID，
-// 下载返回固定内容，删除直接成功。记录各账户换 token 的次数
+// 下载返回固定内容，删除返回 deleteErr（默认成功）。记录各账户换 token 的次数与删除次数
 type driveTokenTransport struct {
-	mu      sync.Mutex
-	denied  map[string]string
-	login   map[string]bool
-	tokens  map[string]int
-	uploads int
+	mu        sync.Mutex
+	denied    map[string]string
+	login     map[string]bool
+	tokens    map[string]int
+	uploads   int
+	deleteErr error
+	deletes   int
 }
 
 func newDriveTokenTransport() *driveTokenTransport {
@@ -94,7 +96,10 @@ func (transport *driveTokenTransport) DownloadDrive(context.Context, string, str
 }
 
 func (transport *driveTokenTransport) DeleteDrive(context.Context, string, string, string) error {
-	return nil
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	transport.deletes++
+	return transport.deleteErr
 }
 
 // driveTestService 返回 accountIDs 账户的号池服务，上游为 driveTokenTransport；账户目录带 ceilingModel（转写也能选中）

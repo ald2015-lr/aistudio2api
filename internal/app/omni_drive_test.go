@@ -308,7 +308,7 @@ func TestOmniDriveMissingSwitchesAccount(t *testing.T) {
 	if elapsed > 2*time.Second {
 		t.Fatalf("换号不应退避，用了 %s", elapsed)
 	}
-	if !progressLogged(service, "账号没有 Drive 授权，Omni 的视频（及无法转为 PNG 的图片）无法发送，换有 Drive 授权的账号") {
+	if !progressLogged(service, "账号没有 Drive 授权，Omni 的视频（及不能内联的图片）无法发送，换有 Drive 授权的账号") {
 		t.Fatal("应在请求进度里记下换号原因")
 	}
 	for _, message := range serviceLogMessages(service.requests) {
@@ -535,7 +535,7 @@ func TestOmniDriveProbeOnlyWarmUnknown(t *testing.T) {
 }
 
 // restoredMediaRequest 为第 2 轮请求：上一轮生成的视频（mime 为 video/mp4）或图片在 assistant 正文里只是本服务的链接，协议层已恢复为
-// 媒体（RestoredLink），这一轮是纯文本追问。需要 Drive 的图片用 image/webp（PNG、JPEG 直接内联，见 omni_image_test.go）
+// 媒体（RestoredLink），这一轮是纯文本追问。需要 Drive 的图片用 image/avif（官网枚举表里没有；PNG、JPEG、WebP 等直接内联，见 omni_image_test.go）
 func restoredMediaRequest(id string, mime string) aistudio.GenerateRequest {
 	return aistudio.GenerateRequest{
 		ID: id, Model: omniDriveModel,
@@ -592,13 +592,13 @@ func assertRestoredSentAsFile(t *testing.T, upstream *omniDriveUpstream) {
 	}
 }
 
-// TestOmniDriveRestoredLinksFallBack 需要 Drive 只是因为从本服务链接恢复出来的历史视频或无法转为 PNG 的图片（WebP）时，号池里没有可用的 Drive 授权账号
+// TestOmniDriveRestoredLinksFallBack 需要 Drive 只是因为从本服务链接恢复出来的历史视频或不能内联的图片（AVIF）时，号池里没有可用的 Drive 授权账号
 // 不让请求失败：全部记着不可用时不选号就换回链接文本、按普通请求成功；记着可用的账号都已过时、试满每请求换号硬上限时最后一个账号
 // 换回链接文本发送；指定账号没有 Drive 时在它上面换回链接文本发送；都在请求进度里留一行说明。有空闲的 Drive 授权账号时上传发送。
 // 客户端自己带的视频、指定了视频任务的请求照常按需要 Drive 授权返回 400（恢复的媒体是任务的输入，换回链接文本后任务没有输入）；
 // 客户端自己带的 PNG 图片不需要 Drive，不影响换回链接文本
 func TestOmniDriveRestoredLinksFallBack(t *testing.T) {
-	for _, kind := range []struct{ name, mime string }{{name: "视频", mime: "video/mp4"}, {name: "WebP 图片", mime: "image/webp"}} {
+	for _, kind := range []struct{ name, mime string }{{name: "视频", mime: "video/mp4"}, {name: "AVIF 图片", mime: "image/avif"}} {
 		t.Run(kind.name+"/全部记着不可用", func(t *testing.T) {
 			accounts := []string{"a-nodrive@example.com", "b-nodrive@example.com"}
 			upstream := newOmniDriveUpstream(accounts)
@@ -744,10 +744,10 @@ func TestOmniDriveRestoredLinksFallBack(t *testing.T) {
 	})
 }
 
-// TestOmniDriveRestoredImageLenient 只因恢复出来的无法转为 PNG 的历史图片（WebP）需要 Drive（例如出图后追问“谢谢，再来一个”）时不让请求久等：状态都未知时
+// TestOmniDriveRestoredImageLenient 只因恢复出来的不能内联的历史图片（AVIF）需要 Drive（例如出图后追问“谢谢，再来一个”）时不让请求久等：状态都未知时
 // 只试一个 Worker 已就绪的账号，没有已就绪的状态未知账号时不为试 Drive 冷启动，记着可用的账号在忙时限时排队；之后换回链接文本发送
 func TestOmniDriveRestoredImageLenient(t *testing.T) {
-	const mime = "image/webp"
+	const mime = "image/avif"
 	t.Run("状态未知只试一个", func(t *testing.T) {
 		accounts := make([]string, 0, generateSwitchCeiling+2)
 		for index := range generateSwitchCeiling + 2 {
@@ -928,7 +928,7 @@ func TestOmniDriveRestoredVideoNeedsDrive(t *testing.T) {
 }
 
 // TestRestoredMediaAsLinks 换回链接文本：与恢复时拆开的前后文本合并、签名留在第一段；同一条消息里已有文本链接（RestoredText 为空）时
-// 只留签名；只换回需要 Drive 的视频与无法转为 PNG 的图片（WebP），恢复出来的 PNG、JPEG 照样内联；没有恢复媒体的消息与客户端自己的附件
+// 只留签名；只换回需要 Drive 的视频与不能内联的图片（数据不是 WebP 的 .webp），恢复出来的 PNG、JPEG 照样内联；没有恢复媒体的消息与客户端自己的附件
 // 不动，原内容不改
 func TestRestoredMediaAsLinks(t *testing.T) {
 	video := &aistudio.Blob{MIME: "video/mp4", Data: []byte("v")}
@@ -1039,7 +1039,7 @@ func (stub driveCandidatesStub) DriveCandidates(context.Context, aistudio.Accoun
 }
 
 // TestDrivePlanSelectionLists Drive 选号的限定与排除列表：可用账号少于其余账号时限定到可用账号，多于其余账号时改为排除记着不可用与
-// 状态未知的账号（列表不随号池增长）；先试的状态未知账号只取 Worker 已就绪的，选择条件保留本请求原有的排除；只因恢复出来的无法转为 PNG 的历史图片
+// 状态未知的账号（列表不随号池增长）；先试的状态未知账号只取 Worker 已就绪的，选择条件保留本请求原有的排除；只因恢复出来的不能内联的历史图片
 // 需要 Drive、没有可用账号时只试已就绪的状态未知账号，没有就换回链接文本，恢复出视频时照常选号；候选集为空时不限定；
 // 用尽时只剩记着不可用的账号为 400，其余为 429
 func TestDrivePlanSelectionLists(t *testing.T) {
@@ -1443,7 +1443,7 @@ func (login *driveResultLogin) Login(ctx context.Context, request aistudio.Isola
 }
 
 // TestLoginNotesDriveAuthorized 经本服务的登录流程重新登录、完成了 Drive 授权时，保存新认证文件后把账号记为 Drive 可用
-// （gemini-omni 的视频输入及无法转为 PNG 的图片随即优先交给它）；Drive 授权失败时不记；添加账户同样如此
+// （gemini-omni 的视频输入及不能内联的图片随即优先交给它）；Drive 授权失败时不记；添加账户同样如此
 func TestLoginNotesDriveAuthorized(t *testing.T) {
 	admin, _, accounts := keepCatalogAdmin(t, "login-drive@example.com")
 	accountID := accounts[0].ID

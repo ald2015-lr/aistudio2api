@@ -294,6 +294,85 @@ func TestNormalizeVideoConfig(t *testing.T) {
 	}
 }
 
+// TestVideoTaskInputsMatchEncoding 视频任务的输入检查与编码用同一套识别：MIME 为空或 octet-stream 一类的内联附件按文件头判断，
+// 是已知图片格式（PNG、HEIC、GIF 等，与 InteractionInlineImage 一致）的算图片，image_to_video、reference_to_video 通过；不是图片的
+// （octet-stream 的 MP4、认不出的数据）按需要 Drive 的文件发送、算视频，edit、extend 通过而图片任务仍报缺少输入图片；声明了 MIME 的
+// 按 MIME 前缀、不按文件头改判；文件引用与外部地址的 MIME 为空或 octet-stream 一类时类型不明、两种任务都算
+func TestVideoTaskInputsMatchEncoding(t *testing.T) {
+	model := omniTestModel()
+	pngData := omniTestPNG(t)
+	inline := func(mime string, data []byte) []Content {
+		return []Content{{Role: RoleUser, Parts: []Part{{InlineData: &Blob{MIME: mime, Data: data}}, {Text: "动起来"}}}}
+	}
+	unknownData := []byte("not-a-known-media-header-0123456789")
+	for _, test := range []struct {
+		name     string
+		task     string
+		contents []Content
+		inline   bool
+		err      string
+	}{
+		{name: "octet-stream PNG 图生视频", task: "image_to_video", contents: inline("application/octet-stream", pngData), inline: true},
+		{name: "octet-stream PNG 参考生视频", task: "reference_to_video", contents: inline("application/octet-stream", pngData), inline: true},
+		{name: "binary/octet-stream PNG 图生视频", task: "image_to_video", contents: inline("binary/octet-stream", pngData), inline: true},
+		{name: "带参数的 octet-stream PNG", task: "image_to_video", contents: inline("Application/Octet-Stream; name=a.png", pngData), inline: true},
+		{name: "octet-stream HEIC 图生视频", task: "image_to_video", contents: inline("application/octet-stream", omniTestHEIC), inline: true},
+		{name: "octet-stream HEIC 参考生视频", task: "reference_to_video", contents: inline("application/octet-stream", omniTestHEIC), inline: true},
+		{name: "octet-stream GIF 图生视频", task: "image_to_video", contents: inline("application/octet-stream", omniTestGIF(t))},
+		{name: "空 MIME 的 PNG 图生视频", task: "image_to_video", contents: inline("", pngData), inline: true},
+		{name: "octet-stream MP4 图生视频", task: "image_to_video", contents: inline("application/octet-stream", omniTestMP4), err: "requires an input image"},
+		{name: "octet-stream MP4 参考生视频", task: "reference_to_video", contents: inline("application/octet-stream", omniTestMP4), err: "requires an input image"},
+		{name: "octet-stream MP4 编辑", task: "edit", contents: inline("application/octet-stream", omniTestMP4)},
+		{name: "octet-stream MP4 延长", task: "extend", contents: inline("application/octet-stream", omniTestMP4)},
+		{name: "空 MIME 的 MP4 延长", task: "extend", contents: inline("", omniTestMP4)},
+		{name: "octet-stream 认不出的数据图生视频", task: "image_to_video", contents: inline("application/octet-stream", unknownData), err: "requires an input image"},
+		{name: "octet-stream 认不出的数据编辑", task: "edit", contents: inline("application/octet-stream", unknownData)},
+		{name: "octet-stream PNG 编辑", task: "edit", contents: inline("application/octet-stream", pngData), inline: true, err: "requires an input video"},
+		{name: "空 MIME 的 PNG 编辑", task: "edit", contents: inline("", pngData), inline: true, err: "requires an input video"},
+		{name: "声明为视频的 PNG 数据图生视频", task: "image_to_video", contents: inline("video/mp4", pngData), err: "requires an input image"},
+		{name: "声明为视频的 PNG 数据编辑", task: "edit", contents: inline("video/mp4", pngData)},
+		{name: "声明为 PDF 的 PNG 数据图生视频", task: "image_to_video", contents: inline("application/pdf", pngData), err: "requires an input image"},
+		{name: "声明为 PNG 的视频数据图生视频", task: "image_to_video", contents: inline("image/png", omniTestMP4)},
+		{name: "大写 MIME 的视频编辑", task: "edit", contents: inline("VIDEO/MP4", omniTestMP4)},
+		{name: "模型消息里 octet-stream PNG 图生视频", task: "image_to_video", contents: []Content{
+			{Role: RoleAssistant, Parts: []Part{{InlineData: &Blob{MIME: "application/octet-stream", Data: pngData}}}},
+			{Role: RoleUser, Parts: []Part{{Text: "动起来"}}},
+		}, inline: true},
+		{name: "octet-stream 文件引用图生视频", task: "image_to_video", contents: []Content{{Role: RoleUser, Parts: []Part{
+			{File: &FileRef{ID: "drive-file", MIME: "application/octet-stream"}}, {Text: "动起来"},
+		}}}},
+		{name: "octet-stream 文件引用编辑", task: "edit", contents: []Content{{Role: RoleUser, Parts: []Part{
+			{File: &FileRef{ID: "drive-file", MIME: "binary/octet-stream"}}, {Text: "改"},
+		}}}},
+		{name: "octet-stream 外部地址延长", task: "extend", contents: []Content{{Role: RoleUser, Parts: []Part{
+			{ExternalMedia: &ExternalMedia{URL: "https://example.com/a", MIME: "application/octet-stream"}}, {Text: "延长"},
+		}}}},
+		{name: "音频文件引用编辑", task: "edit", contents: []Content{{Role: RoleUser, Parts: []Part{
+			{File: &FileRef{ID: "drive-audio", MIME: "audio/wav"}}, {Text: "改"},
+		}}}, err: "requires an input video"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.contents[0].Parts[0].InlineData != nil && InteractionInlineImage(test.contents[0].Parts[0]) != test.inline {
+				t.Fatalf("前提：InteractionInlineImage = %t，期望 %t", !test.inline, test.inline)
+			}
+			got, _, err := NormalizeVideoConfig(&VideoConfig{Task: test.task}, model, test.contents)
+			if test.err != "" {
+				if err == nil || !strings.Contains(err.Error(), test.err) || containsHan(err.Error()) {
+					t.Fatalf("期望英文错误含 %q，得到 %+v err=%v", test.err, got, err)
+				}
+				return
+			}
+			if err != nil || got == nil || got.Task != test.task {
+				t.Fatalf("应通过：得到 %+v err=%v", got, err)
+			}
+			// 生成层（按所选账户目录再整理一次）同样通过
+			if _, _, err := normalizeVideoConfig(&VideoConfig{Task: test.task}, model, test.contents, false); err != nil {
+				t.Fatalf("生成层整理应通过: %v", err)
+			}
+		})
+	}
+}
+
 func withOption(model Model, key string, values ...string) *Model {
 	options := make(map[string][]string, len(model.CapabilityOptions))
 	for name, current := range model.CapabilityOptions {

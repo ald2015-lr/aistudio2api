@@ -160,7 +160,9 @@ func (copies *TemporaryFileCopies) SourceAccountIDs() []string {
 	return result
 }
 
-// Cleanup 在目标账户租约释放前删除全部临时 Drive 副本
+// Cleanup 在目标账户租约释放前删除全部临时 Drive 副本。DriveDelete 返回 404（文件已被外部删除或回收）按已删除处理、照常解绑资源，
+// 解绑时资源映射已不存在（ErrResourceNotFound，已经解绑过）同样算成功（按上游 Mag1cFall/AIStudio2API a9a4aa5 移植）：原先 404 时既不解绑、
+// runtime-state 里留下已不存在文件的绑定，又把 404 并进这次尝试的错误，成功的请求多记一行“临时文件清理失败”
 func (copies *TemporaryFileCopies) Cleanup() error {
 	if copies == nil {
 		return nil
@@ -177,9 +179,15 @@ func (copies *TemporaryFileCopies) Cleanup() error {
 			deleteErr := copies.client.deleteDriveFile(
 				cleanupCtx, copies.lease.Account().ID, copy.token, copy.id,
 			)
+			if driveFileNotFound(deleteErr, "DriveDelete") {
+				deleteErr = nil
+			}
 			unbindErr := error(nil)
 			if deleteErr == nil && copy.bound {
 				unbindErr = copies.lease.pool.unbindResourceContext(cleanupCtx, copy.id)
+				if errors.Is(unbindErr, ErrResourceNotFound) {
+					unbindErr = nil
+				}
 			}
 			cancel()
 			copies.err = errors.Join(copies.err, deleteErr, unbindErr)

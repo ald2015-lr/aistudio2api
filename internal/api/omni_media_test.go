@@ -290,7 +290,7 @@ func TestDriveRequiredPublicErrors(t *testing.T) {
 		{err: aistudio.InteractionExternalMediaError([]aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{
 			{ExternalMedia: &aistudio.ExternalMedia{MIME: "image/png", URL: "https://images.example.net/a.png"}},
 		}}}), status: http.StatusBadRequest, rpc: "INVALID_ARGUMENT", message: "external URLs are not supported"},
-		{err: fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, "contents[0]: video and file input for this model must be uploaded to Google Drive first, which requires an account with Google Drive authorized"),
+		{err: fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, "contents[0]: video, audio and document input for this model must be uploaded to Google Drive first, which requires an account with Google Drive authorized"),
 			status: http.StatusBadRequest, rpc: "INVALID_ARGUMENT", message: "must be uploaded to Google Drive first"},
 	} {
 		public := publicErrorFor(test.err, "gemini-omni-1.1-flash")

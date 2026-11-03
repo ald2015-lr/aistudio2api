@@ -274,3 +274,151 @@ func TestContinuationStateDropsSourceGIF(t *testing.T) {
 		})
 	}
 }
+
+// TestOmniImageTableFormatsThroughProtocols 经 new-api 等中转常见的两个入口（Gemini inlineData、OpenAI image_url data URI）发来的 WebP、HEIC 与
+// MIME 为 application/octet-stream 的图片，整理并编码出的请求体按官网前端的枚举表内联（WebP 3、HEIC 4，octet-stream 按文件头识别），
+// 与 PNG、JPEG 的官网抓包同一结构；声明为视频的 PNG 数据不按文件头改判，仍是需要 Drive 的附件
+func TestOmniImageTableFormatsThroughProtocols(t *testing.T) {
+	pngData, _, _ := omniImageFixtures(t)
+	webp := []byte("RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00\x2f\x00\x00\x00\x10\x07\x10\x11\x11\x88\x88\xfe\x07\x00")
+	heic := []byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic\x00\x00\x00\x10meta-data-here")
+	encode := base64.StdEncoding.EncodeToString
+	defaults := aistudio.GenerationDefaults{
+		MaxOutputTokens: 65536, Thinking: true, ThinkingLevel: true, DefaultThinkingLevel: 3,
+		ThinkingLevels: []int64{1, 3}, InteractionStream: true, VideoResolution: "360p",
+	}
+	gemini := func(mime string, data []byte) string {
+		return `{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"` + mime + `","data":"` + encode(data) + `"}},{"text":"随机视频"}]}]}`
+	}
+	chat := func(mime string, data []byte) string {
+		return `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:` + mime +
+			`;base64,` + encode(data) + `"}},{"type":"text","text":"随机视频"}]}]}`
+	}
+	want := func(enum int, data []byte) string {
+		return omniImageCaptureBody(fmt.Sprintf(`[null,[%d,"%s"]],[["随机视频"]]`, enum, encode(data)), `[null,null,null,null,null,1]`)
+	}
+	const generate = "/v1beta/models/gemini-omni-1.1-flash:generateContent"
+	for _, test := range []struct {
+		name, path, body, want string
+	}{
+		{name: "Gemini inlineData WebP", path: generate, body: gemini("image/webp", webp), want: want(3, webp)},
+		{name: "Gemini inlineData octet-stream HEIC", path: generate, body: gemini("application/octet-stream", heic), want: want(4, heic)},
+		{name: "Gemini inlineData octet-stream PNG", path: generate, body: gemini("application/octet-stream", pngData), want: want(1, pngData)},
+		{name: "Chat image_url WebP", path: "/v1/chat/completions", body: chat("image/webp", webp), want: want(3, webp)},
+		{name: "Chat image_url octet-stream PNG", path: "/v1/chat/completions", body: chat("application/octet-stream", pngData), want: want(1, pngData)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, service := omniHandler(t)
+			recorder := postJSON(t, handler, test.path, test.body, nil)
+			if recorder.Code != http.StatusOK || service.last == nil {
+				t.Fatalf("状态 %d: %s", recorder.Code, recorder.Body.String())
+			}
+			request := *service.last
+			prepared, report, err := aistudio.PrepareInteractionImages(context.Background(), request.Contents)
+			if err != nil || report.DriveImages != 0 || report.Inline != 1 {
+				t.Fatalf("应按官网内联、不需要 Drive: %+v err=%v", report, err)
+			}
+			if aistudio.InteractionDriveMedia(prepared[0].Parts[0]) {
+				t.Fatal("不应按需要 Drive 的附件处理")
+			}
+			request.Contents = prepared
+			body, _, err := aistudio.EncodeCreateInteractionStreamRequest(request, defaults)
+			if err != nil || string(body) != test.want {
+				t.Fatalf("请求体 = %.400s\n期望 %.400s\nerr=%v", body, test.want, err)
+			}
+		})
+	}
+	// 声明为视频的 PNG 数据：不按文件头改判为图片，仍要先上传 Drive
+	handler, service := omniHandler(t)
+	if recorder := postJSON(t, handler, generate, gemini("video/mp4", pngData), nil); recorder.Code != http.StatusOK || service.last == nil {
+		t.Fatalf("状态 %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if part := service.last.Contents[0].Parts[0]; !aistudio.InteractionDriveMedia(part) || aistudio.InteractionInlineImage(part) {
+		t.Fatalf("声明为视频的附件应仍需 Drive: %+v", part.InlineData.MIME)
+	}
+}
+
+// TestOmniOctetStreamImageVideoTask 经 new-api 转发、被标成 application/octet-stream 的图片配图生视频（模型名后缀 -i2v，README 示例映射的
+// gemini-omni-1.1-flash-i2v-9x16）或显式写 reference_to_video 时：视频任务的输入检查与编码用同一套文件头识别，返回 200，编码出的请求体与
+// 官网抓包同一结构，图片按枚举 1 原字节内联、任务为 2（参考生视频为 3）；同样标成 octet-stream 的 MP4 不是图片，图生视频仍在选号前返回 400
+func TestOmniOctetStreamImageVideoTask(t *testing.T) {
+	pngData, _, _ := omniImageFixtures(t)
+	encode := base64.StdEncoding.EncodeToString
+	defaults := aistudio.GenerationDefaults{
+		MaxOutputTokens: 65536, Thinking: true, ThinkingLevel: true, DefaultThinkingLevel: 3,
+		ThinkingLevels: []int64{1, 3}, InteractionStream: true, VideoResolution: "360p",
+	}
+	chat := func(model, mime string, data []byte, extra string) string {
+		return `{"model":"` + model + `","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:` + mime +
+			`;base64,` + encode(data) + `"}},{"type":"text","text":"随机视频"}]}]` + extra + `}`
+	}
+	gemini := func(mime string, data []byte) string {
+		return `{"contents":[{"role":"user","parts":[{"inlineData":{"mimeType":"` + mime + `","data":"` + encode(data) + `"}},{"text":"随机视频"}]}]}`
+	}
+	// want 为带视频任务 task 的请求体：GenerationConfig field 25 为 [task]，video 为 field 54 视频格式的 field 4
+	want := func(task int, video string) string {
+		body := omniImageCaptureBody(`[null,[1,"`+encode(pngData)+`"]],[["随机视频"]]`, video)
+		return strings.Replace(body, `,[]]],`, fmt.Sprintf(`,[%d]]],`, task), 1)
+	}
+	for _, test := range []struct {
+		name, path, body, want string
+		task                   string
+	}{
+		{name: "Chat -i2v-9x16 octet-stream PNG", path: "/v1/chat/completions",
+			body: chat("gemini-omni-1.1-flash-i2v-9x16", "application/octet-stream", pngData, ""),
+			want: want(2, `[null,null,null,2,null,1]`), task: "image_to_video"},
+		{name: "Chat -i2v binary/octet-stream PNG", path: "/v1/chat/completions",
+			body: chat("gemini-omni-1.1-flash-i2v", "binary/octet-stream", pngData, ""),
+			want: want(2, `[null,null,null,null,null,1]`), task: "image_to_video"},
+		{name: "Chat 显式 reference_to_video octet-stream PNG", path: "/v1/chat/completions",
+			body: chat("gemini-omni-1.1-flash", "application/octet-stream", pngData, `,"video_config":{"task":"reference_to_video"}`),
+			want: want(3, `[null,null,null,null,null,1]`), task: "reference_to_video"},
+		{name: "Gemini -i2v octet-stream PNG", path: "/v1beta/models/gemini-omni-1.1-flash-i2v:generateContent",
+			body: gemini("application/octet-stream", pngData), want: want(2, `[null,null,null,null,null,1]`), task: "image_to_video"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, service := omniHandler(t)
+			recorder := postJSON(t, handler, test.path, test.body, nil)
+			if recorder.Code != http.StatusOK || service.last == nil {
+				t.Fatalf("状态 %d: %s", recorder.Code, recorder.Body.String())
+			}
+			request := *service.last
+			if request.Config.VideoConfig == nil || request.Config.VideoConfig.Task != test.task {
+				t.Fatalf("视频设置 = %+v，期望任务 %s", request.Config.VideoConfig, test.task)
+			}
+			prepared, report, err := aistudio.PrepareInteractionImages(context.Background(), request.Contents)
+			if err != nil || report.DriveImages != 0 || report.Inline != 1 || aistudio.InteractionDriveMedia(prepared[0].Parts[0]) {
+				t.Fatalf("应按官网内联、不需要 Drive: %+v err=%v", report, err)
+			}
+			request.Contents = prepared
+			body, _, err := aistudio.EncodeCreateInteractionStreamRequest(request, defaults)
+			if err != nil || string(body) != test.want {
+				t.Fatalf("请求体 = %.500s\n期望 %.500s\nerr=%v", body, test.want, err)
+			}
+		})
+	}
+	mp4 := []byte("\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42-video-data")
+	for _, test := range []struct{ name, path, body string }{
+		{name: "Chat -i2v octet-stream MP4", path: "/v1/chat/completions", body: chat("gemini-omni-1.1-flash-i2v-9x16", "application/octet-stream", mp4, "")},
+		{name: "Gemini -i2v octet-stream MP4", path: "/v1beta/models/gemini-omni-1.1-flash-i2v:generateContent", body: gemini("application/octet-stream", mp4)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			handler, service := omniHandler(t)
+			recorder := postJSON(t, handler, test.path, test.body, nil)
+			if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "video task image_to_video requires an input image") {
+				t.Fatalf("状态 %d: %s，期望 400 缺少输入图片", recorder.Code, recorder.Body.String())
+			}
+			if service.last != nil {
+				t.Fatal("参数错误应在交给生成服务前返回")
+			}
+		})
+	}
+	// 同一段 octet-stream 的 MP4 配编辑任务：按视频（需要 Drive 的文件）通过
+	handler, service := omniHandler(t)
+	if recorder := postJSON(t, handler, "/v1/chat/completions", chat("gemini-omni-1.1-flash-edit", "application/octet-stream", mp4, ""), nil); recorder.Code != http.StatusOK || service.last == nil {
+		t.Fatalf("编辑任务：状态 %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if part := service.last.Contents[0].Parts[0]; !aistudio.InteractionDriveMedia(part) || service.last.Config.VideoConfig.Task != "edit" {
+		t.Fatalf("octet-stream 的 MP4 应按需要 Drive 的视频发送: %+v %+v", part.InlineData.MIME, service.last.Config.VideoConfig)
+	}
+}

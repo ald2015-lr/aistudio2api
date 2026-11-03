@@ -119,11 +119,11 @@ func TestDriveRequiredErrorMessages(t *testing.T) {
 		want   string
 	}{
 		{err: &DriveRequiredError{Reason: DriveRequiredNoAccount, Model: "gemini-omni-1.1-flash", Unavailable: 958}, status: http.StatusBadRequest, rpc: "FAILED_PRECONDITION",
-			want: "Video input for model gemini-omni-1.1-flash (and image input that cannot be sent inline as PNG or JPEG) requires an account with " +
+			want: "Video input for model gemini-omni-1.1-flash (and audio, document or image input that cannot be sent inline) requires an account with " +
 				"Google Drive authorized, and no account in the pool has Google Drive authorization."},
-		{err: &DriveRequiredError{Reason: DriveRequiredNoAccount, Model: "gemini-omni-1.1-flash", ImageHint: "contents[0]: image/webp images cannot be sent inline"},
+		{err: &DriveRequiredError{Reason: DriveRequiredNoAccount, Model: "gemini-omni-1.1-flash", ImageHint: "contents[0]: image/avif images cannot be sent inline"},
 			status: http.StatusBadRequest, rpc: "FAILED_PRECONDITION",
-			want: "no account in the pool has Google Drive authorization. contents[0]: image/webp images cannot be sent inline."},
+			want: "no account in the pool has Google Drive authorization. contents[0]: image/avif images cannot be sent inline."},
 		{err: &DriveRequiredError{Reason: DriveRequiredAccount, Model: "gemini-omni-1.1-flash"}, status: http.StatusBadRequest, rpc: "FAILED_PRECONDITION",
 			want: "the requested account has no Google Drive authorization"},
 		{err: &DriveRequiredError{Reason: DriveRequiredExhausted, Model: "gemini-omni-1.1-flash", Tried: 8}, status: http.StatusServiceUnavailable, rpc: "UNAVAILABLE",
@@ -179,7 +179,8 @@ func interactionDeltaEvent(content []any) []any {
 }
 
 // TestDecodeInteractionImageAndCitations 按上游移植的解码：content delta field 2 为图片（MIME 枚举 1 为 PNG）作为媒体输出，
-// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；图片不是 Base64 与缺少网址的引用按协议证据错误返回
+// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；不是 Base64 的图片、缺少网址或字段不足的引用按协议证据错误返回
+// （表外的 MIME 枚举取缺省 MIME，见 TestDecodeInteractionMediaMIME）
 func TestDecodeInteractionImageAndCitations(t *testing.T) {
 	image := []byte("\x89PNG\r\n\x1a\nimage")
 	video := []byte("\x00\x00\x00\x18ftypmp42video")
@@ -229,50 +230,16 @@ func TestDecodeInteractionImageAndCitations(t *testing.T) {
 		t.Fatalf("field 5 视频 = %+v", events[4].Media)
 	}
 	for name, content := range map[string][]any{
-		"图片不是 Base64": {nil, []any{1, "%%%"}},
-		"引用缺少网址":      {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1, nil, []any{}}}}},
-		"引用字段不足":      {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1}}}},
+		"图片不是 Base64":   {nil, []any{1, "%%%"}},
+		"图片枚举不是整数":      {nil, []any{"image/png", base64.StdEncoding.EncodeToString(image)}},
+		"视频 delta 字段不足": {nil, nil, nil, nil, []any{1}},
+		"引用缺少网址":        {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1, nil, []any{}}}}},
+		"引用字段不足":        {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1}}}},
 	} {
 		raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent(content), final}, []any{0}})
 		var evidence *ProtocolEvidenceError
 		if err := DecodeInteractionStream(bytes.NewReader(raw), func(Event) error { return nil }); !errors.As(err, &evidence) {
 			t.Fatalf("%s: 期望协议证据错误，实际 %v", name, err)
-		}
-	}
-}
-
-// TestDecodeInteractionMediaMIMEDefaults 媒体 MIME 枚举按官网前端的表解码；枚举省略（null）或不在表中时取该类媒体的缺省类型
-// （图片 image/jpeg、视频 video/mp4），不再按协议证据错误结束整次生成（官网生成视频的 delta 现在常为 [null,"<MP4 Base64>"]）
-func TestDecodeInteractionMediaMIMEDefaults(t *testing.T) {
-	data := []byte("media-bytes")
-	encoded := base64.StdEncoding.EncodeToString(data)
-	interaction := make([]any, 13)
-	interaction[1] = 3
-	interaction[12] = []any{10, nil, nil, nil, 20, nil, nil, nil, 0, 30}
-	final := make([]any, 20)
-	final[19] = []any{interaction}
-	for name, test := range map[string]struct {
-		content []any
-		mime    string
-	}{
-		"视频枚举省略":  {[]any{nil, nil, nil, nil, []any{nil, encoded}}, "video/mp4"},
-		"视频 webm": {[]any{nil, nil, nil, nil, []any{7, encoded}}, "video/webm"},
-		"视频表外枚举":  {[]any{nil, nil, nil, nil, []any{42, encoded}}, "video/mp4"},
-		"图片枚举省略":  {[]any{nil, []any{nil, encoded}}, "image/jpeg"},
-		"图片 gif":  {[]any{nil, []any{7, encoded}}, "image/gif"},
-		"图片 webp": {[]any{nil, []any{3, encoded}}, "image/webp"},
-		"图片表外枚举":  {[]any{nil, []any{6, encoded}}, "image/jpeg"},
-	} {
-		raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent(test.content), final}, []any{0}})
-		var media *Media
-		err := DecodeInteractionStream(bytes.NewReader(raw), func(event Event) error {
-			if event.Kind == EventMedia {
-				media = event.Media
-			}
-			return nil
-		})
-		if err != nil || media == nil || media.MIME != test.mime || !bytes.Equal(media.Data, data) {
-			t.Fatalf("%s: media=%+v err=%v，期望 %s", name, media, err, test.mime)
 		}
 	}
 }
@@ -470,5 +437,73 @@ func TestInteractionModelTurnRestoredLink(t *testing.T) {
 				t.Fatalf("不算模型轮次时任务应照常发送: %v", err)
 			}
 		})
+	}
+}
+
+// TestDecodeInteractionMediaMIME content delta 的图片（field 2）、音频（field 3）、文档（field 4）与视频（field 5）按官网前端的枚举表取 MIME，
+// 枚举为 null 或不在表里时取该类的缺省 MIME（图片 image/jpeg、音频 audio/wav、文档 application/pdf、视频 video/mp4），数据原样输出；
+// 原先视频 [null,…]、视频枚举 7、图片枚举 3、音频 field 3 都按协议证据错误整次 502（此时视频已生成、额度已扣）
+func TestDecodeInteractionMediaMIME(t *testing.T) {
+	data := []byte("\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+	interaction := make([]any, 13)
+	interaction[1] = 3
+	final := make([]any, 20)
+	final[19] = []any{interaction}
+	for _, test := range []struct {
+		field int
+		code  any
+		mime  string
+	}{
+		{1, 1, "image/png"}, {1, 2, "image/jpeg"}, {1, 3, "image/webp"}, {1, 4, "image/heic"}, {1, 5, "image/heif"},
+		{1, 7, "image/gif"}, {1, 8, "image/bmp"}, {1, 9, "image/tiff"}, {1, nil, "image/jpeg"}, {1, 6, "image/jpeg"}, {1, 42, "image/jpeg"},
+		{2, 1, "audio/wav"}, {2, 2, "audio/mp3"}, {2, 3, "audio/aiff"}, {2, 4, "audio/aac"}, {2, 5, "audio/ogg"}, {2, 6, "audio/flac"},
+		{2, 7, "audio/mpeg"}, {2, 8, "audio/m4a"}, {2, 9, "audio/l16"}, {2, 10, "audio/s16le"}, {2, 11, "audio/opus"}, {2, 12, "audio/alaw"},
+		{2, 13, "audio/mulaw"}, {2, nil, "audio/wav"}, {2, 14, "audio/wav"},
+		{3, 1, "application/pdf"}, {3, nil, "application/pdf"}, {3, 2, "application/pdf"},
+		{4, 1, "video/mp4"}, {4, 2, "video/mpeg"}, {4, 3, "video/mpg"}, {4, 4, "video/mov"}, {4, 5, "video/avi"}, {4, 6, "video/x-flv"},
+		{4, 7, "video/webm"}, {4, 8, "video/wmv"}, {4, 9, "video/3gpp"}, {4, nil, "video/mp4"}, {4, 0, "video/mp4"}, {4, 42, "video/mp4"},
+	} {
+		content := make([]any, test.field+1)
+		content[test.field] = []any{test.code, base64.StdEncoding.EncodeToString(data)}
+		body, err := json.Marshal([]any{[]any{interactionDeltaEvent(content), final}, []any{0}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var media []*Media
+		if err := DecodeInteractionStream(bytes.NewReader(body), func(event Event) error {
+			if event.Kind == EventMedia {
+				media = append(media, event.Media)
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("field %d 枚举 %v: %v", test.field+1, test.code, err)
+		}
+		if len(media) != 1 || media[0].MIME != test.mime || !bytes.Equal(media[0].Data, data) {
+			t.Fatalf("field %d 枚举 %v: 媒体 = %+v，期望 %s", test.field+1, test.code, media, test.mime)
+		}
+	}
+}
+
+// TestInteractionImageInputEnums 输入编码与解码用同一张官网枚举表：PNG 1、JPEG 2（与两份官网抓包一致）、WebP 3、HEIC 4、HEIF 5、BMP 8、TIFF 9；
+// GIF（7）不用于输入（转成 PNG 发送）；结构摘要里的格式名按同一张表
+func TestInteractionImageInputEnums(t *testing.T) {
+	want := map[interactionImageFormat]int64{
+		interactionPNG: 1, interactionJPEG: 2, interactionWebP: 3, interactionHEIC: 4, interactionHEIF: 5, interactionBMP: 8, interactionTIFF: 9,
+	}
+	if len(interactionImageInputEnum) != len(want) {
+		t.Fatalf("输入枚举 = %v", interactionImageInputEnum)
+	}
+	for format, enum := range want {
+		if interactionImageInputEnum[format] != enum || interactionMediaMIME[1].codes[enum] != interactionImageInputMIME[format].mime {
+			t.Fatalf("%s: 枚举 %d，期望 %d", interactionImageInputMIME[format].name, interactionImageInputEnum[format], enum)
+		}
+	}
+	if _, ok := interactionImageInputEnum[interactionGIF]; ok {
+		t.Fatal("GIF 不应按原字节内联")
+	}
+	for code, name := range map[int64]string{1: "PNG", 3: "WebP", 9: "TIFF", 7: "GIF", 6: "枚举 6"} {
+		if got := interactionImageEnumName(code); got != name {
+			t.Fatalf("枚举 %d 的格式名 = %q，期望 %q", code, got, name)
+		}
 	}
 }

@@ -901,6 +901,7 @@ const interactionModelMediaIntro = "以下是上文模型回复里的图片或�
 // TestInteractionHistoryWithModelImage 先用图片模型出图（url 模式下历史里是本服务的图片链接，inline 模式下是 data URI），
 // 再在同一对话里让 Interaction 模型（Omni）“让它动起来”：模型消息里恢复出的图片连同说明移到随后的用户 step，按官网内联为
 // Content field 2 [1, Base64]（不上传 Drive），模型能看到这张图；模型 step 只带同一条消息里的文本，binding 与发送的文本一致。
+// 只有图片的模型消息整条省略后前后两条用户消息相邻，合并为一条用户 step（图片仍在“让它动起来”这条消息的最前面）。
 // 账户没有 Drive 授权时同样内联发送成功，不再返回 400
 func TestInteractionHistoryWithModelImage(t *testing.T) {
 	service := &interactionEncodingService{}
@@ -947,23 +948,24 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 	if recorder.Code != http.StatusOK || service.body == nil {
 		t.Fatalf("Chat inline 图片历史: %d %s", recorder.Code, recorder.Body.String())
 	}
-	if !strings.Contains(string(service.body), movedImage) {
-		t.Fatalf("Chat: 模型消息里的图片应内联放在随后的用户 step 最前面: %s", service.body)
+	mergedImage := `[[[[[["画一只猫"]],[["` + interactionModelMediaIntro + `"]],[null,[1,"` + encodedImage + `"]],[["让它动起来"]]]]]]`
+	if !strings.Contains(string(service.body), mergedImage) {
+		t.Fatalf("Chat: 模型消息里的图片应内联放在随后的用户消息最前面，前后两条用户消息合并为一条 step: %s", service.body)
 	}
 	if got := mustJSONText(t, service.binding); got != `[{"role":"user","parts":[{"text":"画一只猫"}]},`+
 		`{"role":"user","parts":[{"text":"`+interactionModelMediaIntro+`"},{"text":"让它动起来"}]}]` {
-		t.Fatalf("只有图片的模型消息应整条省略、图片移到随后的用户 step，binding = %s", got)
+		t.Fatalf("只有图片的模型消息应整条省略、图片移到随后的用户消息，binding 不随 step 合并（仍按消息逐条），binding = %s", got)
 	}
 
 	// 账户没有 Drive 授权：图片照样内联发送成功
 	service.noDrive = true
-	for _, request := range []struct{ path, body string }{
-		{path: "/v1beta/models/gemini-omni-1.1-flash:generateContent", body: mustJSONText(t, gemini)},
-		{path: "/v1/chat/completions", body: mustJSONText(t, chat)},
+	for _, request := range []struct{ path, body, want string }{
+		{path: "/v1beta/models/gemini-omni-1.1-flash:generateContent", body: mustJSONText(t, gemini), want: movedImage},
+		{path: "/v1/chat/completions", body: mustJSONText(t, chat), want: mergedImage},
 	} {
 		service.body = nil
 		recorder = postJSON(t, handler, request.path, request.body, nil)
-		if recorder.Code != http.StatusOK || !strings.Contains(string(service.body), movedImage) {
+		if recorder.Code != http.StatusOK || !strings.Contains(string(service.body), request.want) {
 			t.Fatalf("%s: 没有 Drive 授权时图片应照样内联发送: %d %s", request.path, recorder.Code, recorder.Body.String())
 		}
 	}
@@ -996,7 +998,7 @@ func TestInteractionContinuationWithModelVideo(t *testing.T) {
 	service.noDrive = true
 	recorder = postJSON(t, handler, "/v1beta/interactions",
 		fmt.Sprintf(`{"model":"gemini-omni-1.1-flash","previous_interaction_id":%q,"input":"再长一点"}`, first["id"]), nil)
-	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "video and file input for this model must be uploaded to Google Drive first") {
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "video, audio and document input for this model must be uploaded to Google Drive first") {
 		t.Fatalf("没有 Drive 授权时视频应按需要 Drive 返回 400: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
@@ -1191,5 +1193,91 @@ func TestInlineStreamMediaUnchanged(t *testing.T) {
 	}
 	if countFiles(t, dir) != 0 {
 		t.Fatal("inline 模式不应写媒体文件")
+	}
+}
+
+// TestRestoreOmniTableMediaLinks url 模式下 Omni 输出枚举解码出的 BMP 图片与 MPEG 视频按 .bmp、.mpg 保存并输出链接，下一轮经 Chat 回传时
+// （new-api 回传的历史只剩链接文本）：目标为 Omni 时 assistant 正文里的这两个链接、用户正文里粘贴的 .avi 裸地址都在原位置恢复为内联媒体，
+// MIME 按扩展名提供时的类型；其他模型只恢复 assistant 正文里的图片链接（HEIC 同样），视频链接保持文本
+func TestRestoreOmniTableMediaLinks(t *testing.T) {
+	bmp := append([]byte{'B', 'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0}, bytes.Repeat([]byte{0x33}, 64)...)
+	mpeg := append([]byte{0x00, 0x00, 0x01, 0xba}, bytes.Repeat([]byte{0x44}, 256)...)
+	service := &scriptedService{modelListService: modelListService{models: omniAliasModels()}, events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "生成好了："},
+		{Kind: aistudio.EventMedia, Media: &aistudio.Media{MIME: "image/bmp", Data: bmp}},
+		{Kind: aistudio.EventMedia, Media: &aistudio.Media{MIME: "video/mpeg", Data: mpeg}},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}}
+	handler, dir := newMediaHandler(t, service, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+	imageLink := "https://ai.example.com/media/" + sha256Hex(bmp) + ".bmp"
+	videoLink := "https://ai.example.com/media/" + sha256Hex(mpeg) + ".mpg"
+	recorder := postJSON(t, handler, "/v1/chat/completions", `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":"画一张再做个视频"}]}`, nil)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态 %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || len(response.Choices) != 1 {
+		t.Fatalf("响应: %v %s", err, recorder.Body.String())
+	}
+	reply := response.Choices[0].Message.Content
+	if !strings.Contains(reply, "![image]("+imageLink+")") || !strings.Contains(reply, "[video]("+videoLink+")") {
+		t.Fatalf("url 模式应输出 .bmp 图片与 .mpg 视频链接: %q", reply)
+	}
+	aviData := append([]byte("RIFF\x10\x00\x00\x00AVI LIST"), bytes.Repeat([]byte{0x55}, 128)...)
+	heicData := append([]byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"), bytes.Repeat([]byte{0x66}, 64)...)
+	store := mediastore.New(dir)
+	aviName, err := store.Save(aviData, "video/avi")
+	if err != nil || !strings.HasSuffix(aviName, ".avi") {
+		t.Fatalf("保存 AVI: %q %v", aviName, err)
+	}
+	heicName, err := store.Save(heicData, "image/heic")
+	if err != nil || !strings.HasSuffix(heicName, ".heic") {
+		t.Fatalf("保存 HEIC: %q %v", heicName, err)
+	}
+	aviLink := "https://ai.example.com/media/" + aviName
+	heicLink := "https://ai.example.com/media/" + heicName
+	history := func(model string) string {
+		return mustJSONText(t, map[string]any{"model": model, "messages": []any{
+			map[string]any{"role": "user", "content": "画一张再做个视频"},
+			map[string]any{"role": "assistant", "content": reply + "\n另一张：![image](" + heicLink + ")"},
+			map[string]any{"role": "user", "content": "参考 " + aviLink + " 再改一下"},
+		}})
+	}
+	imageHash, videoHash, aviHash, heicHash := sha256Hex(bmp)[:8], sha256Hex(mpeg)[:8], sha256Hex(aviData)[:8], sha256Hex(heicData)[:8]
+
+	service.last = nil
+	if recorder := postJSON(t, handler, "/v1/chat/completions", history("gemini-omni-1.1-flash"), nil); recorder.Code != http.StatusOK || service.last == nil {
+		t.Fatalf("Omni 回传: %d %s", recorder.Code, recorder.Body.String())
+	}
+	assistant := strings.Join(describeParts(service.last.Contents[1].Parts), "|")
+	for _, want := range []string{"inline:image/bmp:" + imageHash, "inline:video/mpeg:" + videoHash, "inline:image/heic:" + heicHash} {
+		if !strings.Contains(assistant, want) {
+			t.Fatalf("Omni assistant 正文恢复 = %q，缺 %q", assistant, want)
+		}
+	}
+	if strings.Contains(assistant, imageLink) || strings.Contains(assistant, videoLink) {
+		t.Fatalf("恢复后的链接不应再留在文本里: %q", assistant)
+	}
+	if user := strings.Join(describeParts(service.last.Contents[2].Parts), "|"); user != "text:参考 |inline:video/x-msvideo:"+aviHash+"|text: 再改一下" {
+		t.Fatalf("Omni 用户正文里的 .avi 裸地址恢复 = %q", user)
+	}
+
+	service.last = nil
+	if recorder := postJSON(t, handler, "/v1/chat/completions", history("plain-chat"), nil); recorder.Code != http.StatusOK || service.last == nil {
+		t.Fatalf("其他模型回传: %d %s", recorder.Code, recorder.Body.String())
+	}
+	assistant = strings.Join(describeParts(service.last.Contents[1].Parts), "|")
+	if !strings.Contains(assistant, "inline:image/bmp:"+imageHash) || !strings.Contains(assistant, "inline:image/heic:"+heicHash) ||
+		!strings.Contains(assistant, "[video]("+videoLink+")") || strings.Contains(assistant, "inline:video/") {
+		t.Fatalf("其他模型 assistant 正文恢复 = %q，期望图片恢复、视频链接保持文本", assistant)
+	}
+	if user := strings.Join(describeParts(service.last.Contents[2].Parts), "|"); user != "text:参考 "+aviLink+" 再改一下" {
+		t.Fatalf("其他模型用户正文不应改动: %q", user)
 	}
 }

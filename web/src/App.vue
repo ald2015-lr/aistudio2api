@@ -173,7 +173,7 @@ const authRecheckLine = computed(() => {
 })
 
 // driveLine 为侧栏的 Drive 授权行：服务端报告了且有启用账户时显示；有启用账户却没有可用、也没有未知的账户时标黄
-// （gemini-omni 的视频输入及无法转为 PNG 的图片会返回 400，PNG、JPEG 图片不受影响）
+// （gemini-omni 的视频输入及不能内联的图片会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）
 const driveLine = computed(() => {
   const drive = status.value?.drive
   if (drive === undefined) return null

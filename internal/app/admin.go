@@ -190,7 +190,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			buildChannel = admin.service.buildPauses().status()
 		}
 	}
-	// 启用账户的 Drive 授权状态（见 aistudio.PooledService.DriveSummary）：gemini-omni 的视频输入（及无法转为 PNG 的图片）要交给有 Drive 授权的账户
+	// 启用账户的 Drive 授权状态（见 aistudio.PooledService.DriveSummary）：gemini-omni 的视频输入（及不能内联的图片）要交给有 Drive 授权的账户
 	var drive *api.AdminDriveCounts
 	if source, ok := admin.service.service.(driveSummarySource); ok {
 		summary := source.DriveSummary()
@@ -617,7 +617,7 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 }
 
 // noteDriveAuthorized 记下经本服务的登录流程登录、完成了官网 Drive 授权的账户 Drive 可用（新的认证文件保存之后调用）：
-// gemini-omni 的视频输入（及无法转为 PNG 的图片）随即优先交给它，不必等用户请求偶然试到；生成服务不支持时什么也不做
+// gemini-omni 的视频输入（及不能内联的图片）随即优先交给它，不必等用户请求偶然试到；生成服务不支持时什么也不做
 func (admin *runtimeAdmin) noteDriveAuthorized(accountID string) {
 	if noter, ok := admin.service.service.(driveAuthorizedNoter); ok {
 		noter.NoteDriveAuthorized(accountID)

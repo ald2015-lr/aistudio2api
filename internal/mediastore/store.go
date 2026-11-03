@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -23,28 +24,56 @@ var extensionTypes = map[string]string{
 	".jpg":  "image/jpeg",
 	".webp": "image/webp",
 	".gif":  "image/gif",
+	".heic": "image/heic",
+	".heif": "image/heif",
+	".bmp":  "image/bmp",
+	".tiff": "image/tiff",
 	".mp4":  "video/mp4",
 	".webm": "video/webm",
 	".mov":  "video/quicktime",
+	".mpg":  "video/mpeg",
+	".avi":  "video/x-msvideo",
+	".flv":  "video/x-flv",
+	".wmv":  "video/x-ms-wmv",
+	".3gp":  "video/3gpp",
 	".mp3":  "audio/mpeg",
 	".wav":  "audio/wav",
 	".ogg":  "audio/ogg",
 	".m4a":  "audio/mp4",
 	".aac":  "audio/aac",
 	".flac": "audio/flac",
+	".aiff": "audio/aiff",
+	".opus": "audio/opus",
+	".pdf":  "application/pdf",
 	".bin":  "application/octet-stream",
 }
 
-// typeExtensions 为媒体类型（不含参数、小写）对应的扩展名
+// typeExtensions 为媒体类型（不含参数、小写）对应的扩展名。含 Omni（CreateInteractionStream）输出的媒体 MIME 枚举表解码出的写法
+// （见 aistudio interactionMediaMIME：video/mov、video/avi、video/wmv、video/mpg 等不是标准名，按同一容器的扩展名保存，提供时用标准
+// Content-Type）；裸 PCM（audio/l16、audio/s16le）与 A-law、μ-law 没有文件头，仍为 .bin
 var typeExtensions = map[string]string{
 	"image/png":       ".png",
 	"image/jpeg":      ".jpg",
 	"image/jpg":       ".jpg",
 	"image/webp":      ".webp",
 	"image/gif":       ".gif",
+	"image/heic":      ".heic",
+	"image/heif":      ".heif",
+	"image/bmp":       ".bmp",
+	"image/x-ms-bmp":  ".bmp",
+	"image/tiff":      ".tiff",
 	"video/mp4":       ".mp4",
 	"video/webm":      ".webm",
 	"video/quicktime": ".mov",
+	"video/mov":       ".mov",
+	"video/mpeg":      ".mpg",
+	"video/mpg":       ".mpg",
+	"video/x-msvideo": ".avi",
+	"video/avi":       ".avi",
+	"video/x-flv":     ".flv",
+	"video/x-ms-wmv":  ".wmv",
+	"video/wmv":       ".wmv",
+	"video/3gpp":      ".3gp",
 	"audio/mpeg":      ".mp3",
 	"audio/mp3":       ".mp3",
 	"audio/wav":       ".wav",
@@ -58,13 +87,20 @@ var typeExtensions = map[string]string{
 	"audio/aac":       ".aac",
 	"audio/flac":      ".flac",
 	"audio/x-flac":    ".flac",
+	"audio/aiff":      ".aiff",
+	"audio/x-aiff":    ".aiff",
+	"audio/opus":      ".opus",
+	"application/pdf": ".pdf",
 }
 
+// mediaExtensions 为文件名里允许的扩展名（不含点），与 extensionTypes 一致
+const mediaExtensions = `png|jpg|webp|gif|heic|heif|bmp|tiff|mp4|webm|mov|mpg|avi|flv|wmv|3gp|mp3|wav|ogg|m4a|aac|flac|aiff|opus|pdf|bin`
+
 // namePattern 为保存文件的名字：64 位小写十六进制加已知扩展名，不含路径分隔符与 ..
-var namePattern = regexp.MustCompile(`^[0-9a-f]{64}\.(png|jpg|webp|gif|mp4|webm|mov|mp3|wav|ogg|m4a|aac|flac|bin)$`)
+var namePattern = regexp.MustCompile(`^[0-9a-f]{64}\.(` + mediaExtensions + `)$`)
 
 // tempPattern 为写入中的临时文件名（os.CreateTemp 的随机部分为十进制数字）：.<文件名>.<随机数>.tmp
-var tempPattern = regexp.MustCompile(`^\.[0-9a-f]{64}\.(png|jpg|webp|gif|mp4|webm|mov|mp3|wav|ogg|m4a|aac|flac|bin)\.[0-9]+\.tmp$`)
+var tempPattern = regexp.MustCompile(`^\.[0-9a-f]{64}\.(` + mediaExtensions + `)\.[0-9]+\.tmp$`)
 
 // ValidName 判断 name 是否为保存文件的名字
 func ValidName(name string) bool {
@@ -99,6 +135,28 @@ func ContentType(name string) string {
 // IsImage 判断保存文件是否为图片
 func IsImage(name string) bool {
 	return strings.HasPrefix(ContentType(name), "image/")
+}
+
+// Extensions 返回提供时的 Content-Type 以 prefixes 之一开头（如 image/、video/）的扩展名（不含点），按长度从长到短、同长按字母排序：
+// 协议层据此拼出回传恢复的链接正则（见 api 的 mediaImageLinkPattern 等），与 ContentType、IsImage 用同一张表，新增的扩展名不会只能保存、
+// 回传时却恢复不了；较长的排在前面，正则分支不会先匹配到较短的前缀
+func Extensions(prefixes ...string) []string {
+	var extensions []string
+	for extension, contentType := range extensionTypes {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(contentType, prefix) {
+				extensions = append(extensions, strings.TrimPrefix(extension, "."))
+				break
+			}
+		}
+	}
+	slices.SortFunc(extensions, func(left, right string) int {
+		if len(left) != len(right) {
+			return len(right) - len(left)
+		}
+		return strings.Compare(left, right)
+	})
+	return extensions
 }
 
 // FileName 返回内容保存时的文件名

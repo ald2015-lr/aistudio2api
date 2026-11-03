@@ -14,7 +14,7 @@ import (
 )
 
 // Drive 授权状态写盘：生成服务按账号记住 Drive 可用（换到过 Drive token）与不可用（GenerateAccessToken 返回 401 / Code 16），
-// 原先只在内存，重启后全部变成未知，gemini-omni 需要 Drive 的输入（视频与无法转为 PNG 的图片；当时图片也都走 Drive）要靠用户请求
+// 原先只在内存，重启后全部变成未知，gemini-omni 需要 Drive 的输入（视频与不能内联的图片；当时图片也都走 Drive）要靠用户请求
 // 重新试号（线上约 1000 个账号里 958 个没有 Drive 授权，重启后每个带图请求最多试 8 个账号，约七成以 503 结束）。这里把记忆写进模型目录缓存同目录的 drive-accounts.json，装配运行时恢复：
 // 记录带记下时认证文件的登录签名（aistudio.LoginIdentity，只认登录签名 Cookie），重启后认证文件换成另一个登录的账号不恢复；
 // 有效期仍按记下时间计（见 aistudio.driveAvailableTTL、driveUnavailableTTL）

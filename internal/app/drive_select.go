@@ -11,9 +11,10 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
 
-// Interaction 模型（gemini-omni）带需要 Drive 的内联附件（视频、其他文件、无法转为 PNG 的图片，见 aistudio.InteractionDriveMedia）的生成
+// Interaction 模型（gemini-omni）带需要 Drive 的内联附件（视频、其他文件、不能内联的图片，见 aistudio.InteractionDriveMedia）的生成
 // 选号（见 generateWithRetry）：这些附件要先上传到账号的 Drive 再以文件引用发送（官网发送视频同样先传 Drive），没有 Drive 授权的账号
-// 发不出去。PNG、JPEG 图片（以及选号前转成 PNG 的 GIF）照官网内联发送，不需要 Drive：只有图片的请求不经这里，与纯文本请求一样选号。
+// 发不出去。能内联的图片（PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF，以及选号前转成 PNG 的 GIF）照官网内联发送，不需要 Drive：只有这些图片的
+// 请求不经这里，与纯文本请求一样选号；需要 Drive 的只有视频、音频、文档等文件与官网枚举表里没有的图片格式（如 AVIF）。
 // 不固定账号的选号分两段：
 //   - 号池里有记着 Drive 可用、本请求还没试过的账号时，选号只在这些账号里进行（限定列表，或排除其余账号，取较短的一种，列表不随号池
 //     大小增长；照常排队、受主用模型排队预算约束、可以替换空闲 Worker 或冷启动它们，忙或冷却时按现有排队与 429 语义）；在此之前先不等待地
@@ -27,23 +28,23 @@ import (
 //
 // 需要 Drive 只是因为从本服务媒体链接恢复出来的历史媒体时（aistudio.Part.RestoredLink，客户端没有自己带需要 Drive 的附件、也没有指定
 // 视频任务），号池里没有可用的 Drive 授权账号时把这些恢复媒体换回链接文本、按普通请求发送（见 restoredMediaAsLinks），与恢复之前相同，
-// 不让原先能成功的多轮对话返回 400 或 503。恢复出来的 PNG、JPEG 图片直接内联（GIF 转成 PNG），不算需要 Drive。按需要 Drive 的
+// 不让原先能成功的多轮对话返回 400 或 503。恢复出来的能内联的图片直接内联（GIF 转成 PNG），不算需要 Drive。按需要 Drive 的
 // 恢复媒体分两种：
 //   - 有视频（上一轮生成的视频，“把它改成夜景”这类编辑或延长要让模型看到原视频）：与客户端附件一样选号（照常排队、冷启动与替换 Worker，
 //     受主用模型排队预算约束，排队超过预算时按 429 返回），只在候选里没有本请求还能试的可用或未知账号、记着可用的账号都在长时间冷却
 //     （排队等不到，见 generateWithRetry）、换满每请求换号硬上限、指定账号没有授权时换回链接文本。原先与只有图片时一样只等 10 秒、
 //     不冷启动，有 Drive 的账号在跑一两分钟的生成时多半等不到，模型看不到原视频
-//   - 只有无法转为 PNG 的图片（如 WebP，多半只是上文，例如出图后追问“谢谢，再来一个”）：不值得让请求久等，只用已启动的 Worker
+//   - 只有不能内联的图片（如 AVIF，多半只是上文，例如出图后追问“谢谢，再来一个”）：不值得让请求久等，只用已启动的 Worker
 //     （不冷启动、不替换；记着可用的账号都没有热 Worker 时为其中一个发起后台扩容、不等它），在记着可用的账号上最多排队
 //     restoredDriveQueueWait，状态未知的账号只试一个 Worker 已就绪的；取不到同样换回链接文本，也不挤在少数有 Drive 的账号上排队
 //
 // 纯文本请求、只有图片的 Omni 请求、其他模型、固定账号与限定资源的选号不经这里
 
 // driveMediaLabel 为请求日志里需要 Drive 的 Omni 附件的称呼
-const driveMediaLabel = "Omni 的视频（及无法转为 PNG 的图片）"
+const driveMediaLabel = "Omni 的视频（及不能内联的图片）"
 
 const (
-	// driveUnknownProbeLimit 为一个请求最多试的状态未知账号数：记着 Drive 可用的账号都取不到时试；只因恢复出来的无法转为 PNG 的
+	// driveUnknownProbeLimit 为一个请求最多试的状态未知账号数：记着 Drive 可用的账号都取不到时试；只因恢复出来的不能内联的
 	// 历史图片需要 Drive 时没有可用账号也只试这么多个，之后换回链接文本
 	driveUnknownProbeLimit = 1
 	// driveProbeCandidates 为试状态未知账号时限定列表的上限（只取 Worker 已就绪的）
@@ -99,7 +100,7 @@ type driveSelection struct {
 	// 号池里没有可用的 Drive 授权账号时可以换回链接文本（见 fallBackToLinks）。指定了视频任务时恢复的媒体就是任务的输入
 	// （edit、extend 的视频，image_to_video 的图片），换回链接文本后任务缺少输入或按多轮返回 400，与客户端附件一样处理
 	restoredOnly bool
-	// lenient：restoredOnly 且需要 Drive 的恢复媒体里没有视频（只有无法转为 PNG 的图片），选号只用已启动的 Worker、限时排队（见文件开头）
+	// lenient：restoredOnly 且需要 Drive 的恢复媒体里没有视频（只有不能内联的图片），选号只用已启动的 Worker、限时排队（见文件开头）
 	lenient bool
 	// imageHint 为请求里不能内联的图片的英文说明（aistudio.InteractionImageReport.Hint），附在需要 Drive 授权的错误后面
 	imageHint string
@@ -189,7 +190,7 @@ func (drive *driveSelection) plan(
 		return drivePlan{exhausted: true}
 	}
 	// 先试的状态未知账号：只取 Worker 已就绪的（候选按账号 ID 排序，见 aistudio.DriveCandidates）。有记着可用的账号时作为它们都取不到时的
-	// 补充；只因恢复出来的无法转为 PNG 的历史图片需要 Drive 时没有可用账号也只试这些
+	// 补充；只因恢复出来的不能内联的历史图片需要 Drive 时没有可用账号也只试这些
 	if drive.probes < driveUnknownProbeLimit && len(unknown) > 0 && (len(available) > 0 || drive.lenient) {
 		for _, accountID := range warmReady() {
 			if _, found := slices.BinarySearch(unknown, accountID); found {
@@ -269,7 +270,7 @@ func availableUnusable(err error, failures *workerStartupFailures) bool {
 }
 
 // restoredMediaAsLinks 把从本服务媒体链接恢复出来、需要 Drive 的内联媒体（aistudio.Part.RestoredLink 且 aistudio.InteractionDriveMedia：
-// 视频与无法转为 PNG 的图片；能内联的图片不动）换回恢复前的链接文本，与恢复时拆开的前后文本合并回一段（签名留在第一段上，同恢复时）；
+// 视频与不能内联的图片；能内联的图片不动）换回恢复前的链接文本，与恢复时拆开的前后文本合并回一段（签名留在第一段上，同恢复时）；
 // 没有链接文本（同一条消息里已有这处媒体的文本链接）时只留签名。返回新的内容与换回的个数，不改动 contents
 func restoredMediaAsLinks(contents []aistudio.Content) ([]aistudio.Content, int) {
 	result := make([]aistudio.Content, len(contents))
@@ -319,5 +320,5 @@ func restoredMediaAsLinks(contents []aistudio.Content) ([]aistudio.Content, int)
 
 // restoredFallbackNote 为换回链接文本时写进请求进度的说明
 func restoredFallbackNote(replaced int, why string) string {
-	return fmt.Sprintf("%s，回传历史里恢复的 %d 个媒体按链接文本发送（Omni 的视频及无法转为 PNG 的图片需要 Drive 授权）", why, replaced)
+	return fmt.Sprintf("%s，回传历史里恢复的 %d 个媒体按链接文本发送（Omni 的视频及不能内联的图片需要 Drive 授权）", why, replaced)
 }

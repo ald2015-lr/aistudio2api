@@ -180,6 +180,12 @@ type RPCError struct {
 	// 任何详情（ErrorInfo、QuotaFailure 或 GeminiApiErrorDetails）解析出指标时为空，不影响分类
 	UnparsedDetailType string
 	UnparsedDetail     string
+	// Details 为状态 details 的原文（json.Compact 压缩，超过 unparsedDetailLimit 字节时按 UTF-8 边界截断并注明总字节数）；状态没有 details
+	// 时为空。上游 4xx（例如 Interaction 的 400 INVALID_ARGUMENT 可能带 BadRequest 指出哪个字段不对）时 app 层写进请求日志
+	Details string
+	// Body 为错误响应体不是状态数组（HTML 错误页、空响应体等）时的原文开头（连续空白合成一个空格，同样不超过 unparsedDetailLimit 字节），
+	// 能解析出状态时为空
+	Body string
 }
 
 // unparsedDetailLimit 为 RPCError.UnparsedDetail 的最大字节数
@@ -321,10 +327,12 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 	}
 	value, err := decodeJSONValue(raw)
 	if err != nil {
+		rpcError.Body = rpcErrorBodyText(raw)
 		return rpcError
 	}
 	root, err := rawArray(value, "$", value)
 	if err != nil || len(root) == 0 {
+		rpcError.Body = rpcErrorBodyText(raw)
 		return rpcError
 	}
 	// 两种形状：独立状态 [code, message, details]，以及流式封装 [null, [code, message, details]]。
@@ -333,6 +341,7 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 	if len(root) > 1 && bytes.HasPrefix(bytes.TrimSpace(root[1]), []byte("[")) {
 		provider, err = rawArray(root[1], "$[1]", value)
 		if err != nil || len(provider) == 0 {
+			rpcError.Body = rpcErrorBodyText(raw)
 			return rpcError
 		}
 		providerPath = "$[1]"
@@ -347,6 +356,7 @@ func DecodeRPCError(method string, statusCode int, raw []byte) *RPCError {
 	}
 	if len(provider) > 2 && !isJSONNull(provider[2]) {
 		decodeRPCErrorMetadata(rpcError, provider[2])
+		rpcError.Details = unparsedDetailText(provider[2])
 	}
 	// 没有 RetryInfo 时采纳文案里的 “retry in <时长>”；validateRPCResponse 只在两者都没有时才读 Retry-After 头
 	if rpcError.RetryDelay <= 0 {
@@ -525,6 +535,20 @@ func unparsedDetailText(raw json.RawMessage) string {
 	if json.Compact(&compact, raw) == nil {
 		text = compact.String()
 	}
+	if len(text) <= unparsedDetailLimit {
+		return text
+	}
+	cut := unparsedDetailLimit
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s…（已截断，共 %d 字节）", text[:cut], len(text))
+}
+
+// rpcErrorBodyText 返回不是状态数组的错误响应体原文：连续空白合成一个空格，超过 unparsedDetailLimit 字节时按 UTF-8 边界截断并注明总字节数；
+// 响应体为空时为空
+func rpcErrorBodyText(raw []byte) string {
+	text := strings.Join(strings.Fields(strings.ToValidUTF8(string(raw), "\uFFFD")), " ")
 	if len(text) <= unparsedDetailLimit {
 		return text
 	}

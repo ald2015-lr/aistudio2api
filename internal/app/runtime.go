@@ -148,7 +148,7 @@ func newRuntime(
 	// 后台只低速刷新缺失与过期的账户（见 catalog_cache.go、catalog_sync.go）。要在账户目录扫描与新账户处理开始之前
 	catalogCache := openCatalogCache(catalogCacheDir, requests)
 	service.catalogSync.attach(catalogCache, catalogCache.restore(pool, client, pool.BuildEnabled()))
-	// Drive 授权状态跨重启保留（见 drive_state.go）：账户池载入认证文件后、开始调度之前恢复，gemini-omni 的视频输入（及无法转为 PNG 的图片）不必重新试号
+	// Drive 授权状态跨重启保留（见 drive_state.go）：账户池载入认证文件后、开始调度之前恢复，gemini-omni 的视频输入（及不能内联的图片）不必重新试号
 	driveStates := openDriveStateMemory(driveStatePath(), requests)
 	driveStates.attach(pooled)
 	service.driveStates = driveStates
@@ -4455,9 +4455,9 @@ func (service *trackedService) generateWithRetry(
 	var err error
 	originalContents := request.Contents
 	// interactionModel：Interaction 模型（gemini-omni，见 aistudio.InteractionModel）的请求带内联附件（没有内联附件时不查模型，与原先相同）。
-	// PNG、JPEG 图片照官网原字节内联发送（Content field 2，不经 Drive）：选号前把 GIF 首帧转成 PNG（用户附件、会移到用户 step 的模型历史
-	// 图片、从本服务链接恢复的图片都算，见 aistudio.PrepareInteractionImages），结果写进请求进度；无法转为 PNG 的图片与视频、其他文件一样
-	// 要先上传 Drive。转换只在等转换名额时请求结束才失败，按请求的 ctx 错误结束
+	// 能内联的图片（PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF，按文件头识别）照官网原字节内联发送（Content field 2，不经 Drive）：选号前把 GIF
+	// 首帧转成 PNG（用户附件、会移到用户 step 的模型历史图片、从本服务链接恢复的图片都算，见 aistudio.PrepareInteractionImages），结果写进
+	// 请求进度；不能内联的图片与视频、音频、文档等文件一样要先上传 Drive。转换只在等转换名额时请求结束才失败，按请求的 ctx 错误结束
 	inlineCount, _ := inlineMediaInput(originalContents)
 	interactionModel := inlineCount > 0 && service.pool.InteractionModel(modelID)
 	imageHint := ""
@@ -4474,10 +4474,10 @@ func (service *trackedService) generateWithRetry(
 			}
 		}
 	}
-	// driveRequired：Interaction 模型的请求带需要 Drive 的内联附件（视频、其他文件、无法转为 PNG 的图片，含会移到用户 step 的模型历史媒体，
+	// driveRequired：Interaction 模型的请求带需要 Drive 的内联附件（视频、音频、文档等文件与不能内联的图片，含会移到用户 step 的模型历史媒体，
 	// 见 aistudio.InteractionDriveMedia）：这些附件要先上传到账号的 Drive 再以文件引用发送（官网发送视频同样先传 Drive），没有 Drive 授权的
 	// 账号发不出去。不固定账号的选号按 Drive 状态安排（见 drive_select.go 与下文 Drive 选号）；取得租约后附件仍是 inline data 时不调用
-	// Generate、换号（见下文 driveMissing）。只有图片（PNG、JPEG 与转成 PNG 的 GIF）的 Omni 请求与纯文本请求一样选号，其他模型不受影响。
+	// Generate、换号（见下文 driveMissing）。只有能内联的图片（含转成 PNG 的 GIF）的 Omni 请求与纯文本请求一样选号，其他模型不受影响。
 	// driveMissed 为本请求因账号没有 Drive 授权换掉的账号数
 	driveCount, _ := interactionDriveMediaInput(originalContents)
 	driveRequired := interactionModel && driveCount > 0
@@ -4957,7 +4957,7 @@ func (service *trackedService) generateWithRetry(
 		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
-		// driveMissing：Interaction 模型需要 Drive 的附件（视频、其他文件、无法转为 PNG 的图片）上传后仍是 inline data（账号没有 Drive 授权），
+		// driveMissing：Interaction 模型需要 Drive 的附件（视频、其他文件、不能内联的图片）上传后仍是 inline data（账号没有 Drive 授权），
 		// 这次尝试没有调用 Generate
 		driveMissing := false
 		if resourceID != "" {
@@ -4975,8 +4975,9 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		// mediaInput 为这次要交给 Drive 上传的内联附件：Interaction 模型的 PNG、JPEG 图片按官网内联发送，不上传（只算视频、其他文件与无法转为
-		// PNG 的图片，上传前把图片从内容里拿掉、之后放回，见 holdInlineImages），只有图片时不调用上传、不换 Drive token；其他模型为全部内联附件
+		// mediaInput 为这次要交给 Drive 上传的内联附件：Interaction 模型能内联的图片按官网内联发送，不上传（只算视频、音频、文档等文件与
+		// 不能内联的图片，上传前把能内联的图片从内容里拿掉、之后放回，见 holdInlineImages），只有这些图片时不调用上传、不换 Drive token；
+		// 其他模型为全部内联附件
 		mediaInput := inlineMediaInput
 		if interactionModel {
 			mediaInput = interactionDriveMediaInput
@@ -5010,7 +5011,7 @@ func (service *trackedService) generateWithRetry(
 					fallBackToLinks(why)
 					request.Contents, _ = restoredMediaAsLinks(request.Contents)
 				} else if err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild && driveRequired {
-					// Interaction 模型（gemini-omni）的视频、其他文件与无法转为 PNG 的图片不能内联：账号没有 Drive 授权时这些附件发不出去，
+					// Interaction 模型（gemini-omni）的视频、其他文件与不能内联的图片不能内联：账号没有 Drive 授权时这些附件发不出去，
 					// 不调用 Generate（原先照常发送，编码返回需要 Drive 授权的参数错误，不换号，对外成了通用的 400）。不固定账号的请求排除这个
 					// 账号换号（它已记着 Drive 不可用，之后的选号也排除它），不冷却、不计入连续失败上限、不退避、不计入出口判定，受每请求换号
 					// 硬上限约束；指定账号的请求按需要 Drive 授权结束（400）
@@ -5081,6 +5082,10 @@ func (service *trackedService) generateWithRetry(
 		noteRequestID, noteSource := request.ID, accountLabel
 		attemptCtx = aistudio.ContextWithRequestNoteObserver(attemptCtx, func(note string) {
 			service.requests.logRequestProgress(noteRequestID, noteSource, "WARN", note)
+		})
+		// 生成服务发送前留下的排查信息（Interaction 请求的结构摘要等，不含提示词与图片数据）以 INFO 写进该请求的管理日志，来源为本次账户
+		attemptCtx = aistudio.ContextWithRequestInfoObserver(attemptCtx, func(message string) {
+			service.requests.logRequestProgress(noteRequestID, noteSource, "INFO", message)
 		})
 		// 降级判定的输入字数按本次尝试实际发送的内容（工具约束提示、附带的 Schema、截断之后）校准
 		if gate := diag.guard(); gate != nil {
@@ -5201,13 +5206,16 @@ func (service *trackedService) generateWithRetry(
 			break
 		}
 		cancelAttempt(nil)
-		// attemptErr 为本次尝试本身的错误（文件复制、附件上传或生成），不含随后删除临时 Drive 副本的错误：额度冷却与单模型 403
-		// 只按它判断。清理错误照旧并入 err 写日志与返回；Drive 删除返回的 429、403 与模型额度、模型权限无关，一次非额度的生成失败
-		// （连接重置、首事件超时等）不能因为清理时的 DriveDelete 429 被当成生成本身的裸限流逐级冷却、同步冷却另一通道
+		// attemptErr 为本次尝试本身的错误（文件复制、附件上传或生成），不含随后删除临时 Drive 副本的错误：是否换号、额度冷却与单模型 403
+		// 只按它判断。清理错误照旧并入 err 写日志与返回；Drive 删除返回的 429、403、404 与模型额度、模型权限无关，一次非额度的生成失败
+		// （连接重置、首事件超时、协议证据错误等）不能因为清理时的 DriveDelete 429 被当成生成本身的裸限流逐级冷却、同步冷却另一通道，
+		// 也不能因为清理错误是可换号的 RPC 状态（404、429、5xx）把本不该换号的失败变成换号
 		attemptErr := err
 		if attemptCopies != nil {
 			err = errors.Join(err, attemptCopies.Cleanup())
 		}
+		// 上游返回的 4xx（不只 429）在请求日志记一行证据：方法、状态、文案、details 类型与原文（见 upstream_error_log.go）
+		service.logUpstreamClientError(request.ID, accountLabel, attemptErr, "")
 		trace.FinishAttempt(err)
 		api.AddAccessLogAttempt(requestCtx, api.RequestAttempt{
 			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
@@ -5217,7 +5225,7 @@ func (service *trackedService) generateWithRetry(
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
 		localWorkerFailure := (workerFailed || workerReplaced) && requestCtx.Err() == nil
-		retryable := retryableGenerateAccountError(requestCtx, err) || localWorkerFailure ||
+		retryable := retryableGenerateAccountError(requestCtx, attemptErr) || localWorkerFailure ||
 			driveMissing && (unbound || fileBound) && requestCtx.Err() == nil
 		// buildDisabled：Build 代理返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成，见 build_pause.go）。与请求本身、
 		// 账号额度都无关：不冷却、不计连续失败上限、不退避；记进 Build 暂停（该账号不再走 Build，短时间内 3 个账号即全局暂停），
@@ -5345,8 +5353,9 @@ func (service *trackedService) generateWithRetry(
 		if quotaFailure && policy.warmAfter(quota.last) || policy.ultra && coolingDown && quota.hits() > 0 {
 			warmOnlyNext = true
 		}
-		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度
-		if isPermissionDenied(err) {
+		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度。与单模型 403 一样只按本次尝试本身的错误判断：
+		// 删除临时 Drive 副本时 DriveDelete 返回的 403 与模型权限无关，不计入（原先按并入清理错误后的 err，几次清理 403 就可能暂停正常账号）
+		if isPermissionDenied(attemptErr) {
 			now := time.Now()
 			if pause, count, models := service.forbidden.record(request.AccountID, modelID, now); pause {
 				until := now.Add(forbiddenPause)
@@ -6337,6 +6346,8 @@ func (service *trackedService) forwardEvents(
 		}
 		if event.Kind == aistudio.EventError {
 			requestErr = event.Err
+			// 已输出内容后流内收到的上游 4xx 同样记一行证据
+			service.logUpstreamClientError(requestID, accountLabel, event.Err, "已输出内容后")
 			if aistudio.DefinitiveAuthenticationFailure(event.Err) {
 				// 上游 401 先经账户池的 gate（疑似登录失效、复核后才标记，见 auth_recheck.go）；没有标记时不释放 Worker、不写“账号需要登录”
 				if marked, stateErr := lease.MarkAuthenticationFailure(event.Err); stateErr != nil {

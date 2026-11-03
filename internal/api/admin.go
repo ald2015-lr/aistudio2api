@@ -76,7 +76,7 @@ type AdminStatus struct {
 
 // AdminDriveCounts 表示启用账户的 Google Drive 授权状态：Available 为换到过 Drive token、或经本服务登录时完成了 Drive 授权的账户，
 // Unavailable 为 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权，多半是只导入 Cookie 的账户）的账户，Unknown 为还没试过、
-// 认证代际变了或记录过期的账户。gemini-omni 的视频输入（及无法转为 PNG 的图片）只交给可用或未知的账户。可用、不可用各记 24 小时，
+// 认证代际变了或记录过期的账户。gemini-omni 的视频输入（及不能内联的图片）只交给可用或未知的账户。可用、不可用各记 24 小时，
 // 写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用（认证文件换成另一个登录时作废）
 type AdminDriveCounts struct {
 	Available   int `json:"available"`

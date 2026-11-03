@@ -9,11 +9,11 @@ import (
 )
 
 // driveUnavailableTTL 为“Drive 不可用”记忆的有效期：期间这个账号的内联附件直接内联发送，不再先换 Drive token，Interaction 模型
-// （gemini-omni）的视频输入（及无法转为 PNG 的图片）也不选它。账号获得 Drive 授权只发生在重新登录（推进认证代际，记录随之失效）或人工操作之后
+// （gemini-omni）的视频输入（及不能内联的图片）也不选它。账号获得 Drive 授权只发生在重新登录（推进认证代际，记录随之失效）或人工操作之后
 // （管理验证通过时清除，见 ForgetDriveUnavailable），所以记一天：原先 6 小时，没有 Drive 授权的账号每 6 小时就要被用户请求重新试一遍
 const driveUnavailableTTL = 24 * time.Hour
 
-// driveAvailableTTL 为“Drive 可用”记忆的有效期：期间 Interaction 模型（gemini-omni）的视频输入（及无法转为 PNG 的图片）优先交给这个账号。
+// driveAvailableTTL 为“Drive 可用”记忆的有效期：期间 Interaction 模型（gemini-omni）的视频输入（及不能内联的图片）优先交给这个账号。
 // 只影响选号先后，记错的代价是一次换号（发送前发现附件仍是 inline data 时换号，见 app 层）
 const driveAvailableTTL = 24 * time.Hour
 
@@ -304,7 +304,7 @@ func (s *PooledService) uploadFileForLease(ctx context.Context, lease *AccountLe
 
 // NoteDriveAuthorized 记下账号 Drive 可用：经本服务的登录流程登录、官网 Drive 授权完成（登录页面的 GenerateAccessToken 返回 200，
 // camoufoxnative 的 authorizeDrive 没有报错）并保存了新的认证文件之后调用（app 层 LoginAccount、CreateAccount）。按账户当前的认证代际
-// 记下（与换到 Drive token 时相同，写盘），gemini-omni 的视频输入（及无法转为 PNG 的图片）随即优先交给它；原先重新登录后状态回到未知，记着可用的账号
+// 记下（与换到 Drive token 时相同，写盘），gemini-omni 的视频输入（及不能内联的图片）随即优先交给它；原先重新登录后状态回到未知，记着可用的账号
 // 有空时不会选它，只能等用户请求偶然试到。账户不在池中时不记
 func (s *PooledService) NoteDriveAuthorized(accountID string) {
 	if s == nil || s.pool == nil {
@@ -486,7 +486,7 @@ type driveCandidatesEntry struct {
 }
 
 // DriveCandidates 返回选择条件对应候选集（启用、就绪、属于号池、至少一个通道支持该模型；冷却中的也算）里各账号的 Drive 授权状态。
-// 指定账号、资源、限定与排除列表不参与（只看模型、方法、通道与号池）。Interaction 模型（gemini-omni）的视频输入（及无法转为 PNG 的图片）要先上传到账号的
+// 指定账号、资源、限定与排除列表不参与（只看模型、方法、通道与号池）。Interaction 模型（gemini-omni）的视频输入（及不能内联的图片）要先上传到账号的
 // Drive：生成选号据此先试记着可用的账号、只在这些账号都在忙时试一次状态未知的账号、不选记着不可用的账号，候选里没有可用或未知的账号时
 // 直接返回需要 Drive 授权的错误（见 app 层 drive_select.go）。先在账户池 mu 下读好各账号的对象与认证代际，再取记忆的锁；
 // 结果按 driveCandidatesCacheTTL 缓存，记忆版本变化时失效

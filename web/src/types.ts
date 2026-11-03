@@ -336,7 +336,7 @@ export interface ServiceStatus {
   proxy_pool?: ProxyPoolStatus
   // build_channel 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成时）：服务运行且启用了 Build 时才有；旧版服务端不返回
   build_channel?: BuildChannelStatus
-  // drive 为启用账户的 Google Drive 授权状态计数（gemini-omni 的视频输入及无法转为 PNG 的图片只交给可用或未知的账户，PNG、JPEG 图片不需要 Drive）；旧版服务端不返回
+  // drive 为启用账户的 Google Drive 授权状态计数（gemini-omni 的视频输入及不能内联的图片只交给可用或未知的账户，PNG、JPEG、WebP 等能内联的图片不需要 Drive）；旧版服务端不返回
   drive?: DriveCounters
 }
 

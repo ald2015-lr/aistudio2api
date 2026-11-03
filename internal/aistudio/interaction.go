@@ -2,7 +2,9 @@ package aistudio
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,25 +17,30 @@ import (
 // interactionThinkingLevels 把 GenerateContent thinking level 换算为 Interaction 枚举
 var interactionThinkingLevels = map[int64]int64{4: 1, 1: 2, 2: 3, 3: 4}
 
-// interactionImageMIME 表示 Interaction 图片内容的 MIME 枚举，与官网前端相同（上游 Mag1cFall/AIStudio2API 45e33b4）；官网发送图片输入时
-// 同一个 Content field 2 以 1 表示 PNG、2 表示 JPEG（见 interaction_image.go）
-var interactionImageMIME = map[int64]string{
-	interactionPNGEnum: "image/png", interactionJPEGEnum: "image/jpeg", 3: "image/webp", 4: "image/heic", 5: "image/heif",
-	7: "image/gif", 8: "image/bmp", 9: "image/tiff",
+// interactionMediaKind 为 Content 一类媒体字段的 MIME 枚举表：name 为写进协议证据的中文名称，枚举为 null 或不在表里时取 unlisted
+type interactionMediaKind struct {
+	name     string
+	codes    map[int64]string
+	unlisted string
 }
 
-// interactionVideoMIME 表示 Interaction 视频内容的 MIME 枚举，与官网前端相同
-var interactionVideoMIME = map[int64]string{
-	1: "video/mp4", 2: "video/mpeg", 3: "video/mpg", 4: "video/mov", 5: "video/avi", 6: "video/x-flv", 7: "video/webm",
-	8: "video/wmv", 9: "video/3gpp",
+// interactionMediaMIME 为 Content 各媒体字段（按数组下标：1 为 field 2 图片、2 为 field 3 音频、3 为 field 4 文档、4 为 field 5 视频）的
+// MIME 枚举表，与官网前端相同（按上游 Mag1cFall/AIStudio2API 45e33b4 移植）：解码输出时枚举为 null 或不在表里取该类的缺省 MIME，
+// 不按协议证据错误返回（原先视频已经生成、额度已扣，却因 [null,…] 或表外枚举整次 502）。输入编码用同一张表：Omni 的图片按文件头识别格式后
+// 取这里的枚举内联发送（见 interaction_image.go 的 interactionImageInputMIME）；两份官网抓包的输入 PNG 为 1、JPEG 为 2，与表一致
+var interactionMediaMIME = map[int]interactionMediaKind{
+	1: {name: "图片", codes: map[int64]string{
+		1: "image/png", 2: "image/jpeg", 3: "image/webp", 4: "image/heic", 5: "image/heif", 7: "image/gif", 8: "image/bmp", 9: "image/tiff",
+	}, unlisted: "image/jpeg"},
+	2: {name: "音频", codes: map[int64]string{
+		1: "audio/wav", 2: "audio/mp3", 3: "audio/aiff", 4: "audio/aac", 5: "audio/ogg", 6: "audio/flac", 7: "audio/mpeg",
+		8: "audio/m4a", 9: "audio/l16", 10: "audio/s16le", 11: "audio/opus", 12: "audio/alaw", 13: "audio/mulaw",
+	}, unlisted: "audio/wav"},
+	3: {name: "文档", codes: map[int64]string{1: "application/pdf"}, unlisted: "application/pdf"},
+	4: {name: "视频", codes: map[int64]string{
+		1: "video/mp4", 2: "video/mpeg", 3: "video/mpg", 4: "video/mov", 5: "video/avi", 6: "video/x-flv", 7: "video/webm", 8: "video/wmv", 9: "video/3gpp",
+	}, unlisted: "video/mp4"},
 }
-
-// interactionImageDefaultMIME、interactionVideoDefaultMIME 为 MIME 枚举省略（null）或不在表中时的类型，与官网前端相同：
-// 官网生成视频的 content delta 现在常省略枚举（[null,"<MP4 Base64>"]），原先按协议证据错误让整次生成以 500 结束
-const (
-	interactionImageDefaultMIME = "image/jpeg"
-	interactionVideoDefaultMIME = "video/mp4"
-)
 
 // interactionStatusHTTP 把流尾 google.rpc 状态码换算为 HTTP 状态
 var interactionStatusHTTP = map[int64]int{
@@ -46,13 +53,35 @@ var interactionStatusHTTP = map[int64]int{
 // stop sequences 不发送：没有 CreateInteractionStream 停止序列字段的现场证据（上游 Mag1cFall/AIStudio2API 同样不发送，只在本地匹配正文），
 // 不猜字段号；协议层或 generateInteraction 已清空并在该请求的管理日志记一行（原先整次请求返回参数错误）
 func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults GenerationDefaults) ([]byte, []Content, error) {
-	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents)
+	encoded, err := encodeCreateInteractionStream(request, defaults)
 	if err != nil {
 		return nil, nil, err
 	}
+	return encoded.body, encoded.binding, nil
+}
+
+// interactionEncoding 为编码好的 CreateInteractionStream 请求：请求体、参与 WAA binding 的内容，以及写请求结构摘要用的各部分
+// （input steps、是否多轮、thinking level、max output tokens、视频格式与任务；编辑任务没有视频格式，video 为 nil）
+type interactionEncoding struct {
+	body         []byte
+	binding      []Content
+	steps        []any
+	hasModelTurn bool
+	level        int64
+	maxOutput    int64
+	video        []any
+	task         int64
+}
+
+// encodeCreateInteractionStream 为 EncodeCreateInteractionStreamRequest 的实现，另外返回请求结构摘要要用的各部分
+func encodeCreateInteractionStream(request GenerateRequest, defaults GenerationDefaults) (interactionEncoding, error) {
+	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents)
+	if err != nil {
+		return interactionEncoding{}, err
+	}
 	level, err := interactionThinkingLevel(request.Config, defaults)
 	if err != nil {
-		return nil, nil, err
+		return interactionEncoding{}, err
 	}
 	maxOutput := defaults.MaxOutputTokens
 	if request.Config.MaxOutputTokens != nil && *request.Config.MaxOutputTokens > 0 {
@@ -63,15 +92,15 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 		maxOutput = defaults.MaxOutputTokens
 	}
 	if maxOutput <= 0 {
-		return nil, nil, fmt.Errorf("模型目录缺少有效 output token limit")
+		return interactionEncoding{}, fmt.Errorf("模型目录缺少有效 output token limit")
 	}
 	video, task, err := interactionVideoFormat(request.Config.VideoConfig, defaults.VideoResolution)
 	if err != nil {
-		return nil, nil, err
+		return interactionEncoding{}, err
 	}
 	// 视频任务只能在第一轮使用（官网 Video task 的提示），协议层已按同一规则返回 400，这里兜底
 	if task != 0 && hasModelTurn {
-		return nil, nil, errors.New(videoTaskFirstTurnMessage)
+		return interactionEncoding{}, errors.New(videoTaskFirstTurnMessage)
 	}
 	// GenerationConfig：field 6 thinking level、field 7 thinking summaries、field 8 max output tokens；
 	// 历史中没有模型输出时 field 25 为视频任务，未指定任务时为 []
@@ -95,14 +124,17 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 	// field 54 输出格式：视频格式 field 4 宽高比、field 5 时长、field 6 分辨率；编辑任务不带输出格式，interaction 只到 field 27
 	if task == interactionVideoTasks["edit"] {
 		interaction = interaction[:27]
+		video = nil
 	} else {
 		interaction[53] = []any{[]any{[]any{nil, nil, nil, video}}}
 	}
 	body, err := json.Marshal([]any{int64(1), int64(1), nil, interaction, nil, int64(1)})
 	if err != nil {
-		return nil, nil, fmt.Errorf("编码 CreateInteractionStream: %w", err)
+		return interactionEncoding{}, fmt.Errorf("编码 CreateInteractionStream: %w", err)
 	}
-	return body, binding, nil
+	return interactionEncoding{
+		body: body, binding: binding, steps: steps, hasModelTurn: hasModelTurn, level: level, maxOutput: maxOutput, video: video, task: task,
+	}, nil
 }
 
 // interactionModelMediaIntro 放在从模型消息移到用户 step 的附件之前的说明
@@ -114,18 +146,38 @@ type interactionModelMedia struct {
 	part  Part
 }
 
+// interactionStep 为编码中的一条 input step：model 为模型 step，parts 为 Content 列表
+type interactionStep struct {
+	model bool
+	parts []any
+}
+
 // encodeInteractionSteps 把规范消息编码为 Interaction input steps，用户为 step field 1、模型为 field 2；part 按客户端给的顺序编码。
+// 相邻同角色的消息合并为一条 step（与上游 Mag1cFall/AIStudio2API 的 encodeInteractionSteps 相同；官网每轮只有一条用户 step 与一条模型
+// step），例如连续两条用户消息、只有附件的模型消息省略后前后两条用户消息，以及连续的模型消息。
 // 模型 step 只带文本：模型消息里的附件（客户端回传的生成图片、本服务恢复的图片与视频链接、续接历史里模型生成的视频）连同一句说明
-// 移到紧随其后的用户 step 最前面（与 api.normalizeTurns 移动工具结果图片的做法一致），以模型消息结尾时单独成一条用户 step；
-// 只有附件的模型消息整条省略。移过去的附件按用户附件编码：PNG、JPEG 图片内联（与官网相同），视频等上传后为 Drive 引用；没有 Drive 授权、
-// 仍是 inline data 的视频与不能内联的图片与用户附件一样返回需要 Drive 授权的错误，外部地址不接受，不静默丢掉。错误说明为英文，按参数
-// 错误原样返回客户端（app 层在发送前已把这类请求交给有 Drive 授权的账号，外部地址在选号前按 400 返回，这里只是兜底）
+// 移到紧随其后的用户消息最前面（与 api.normalizeTurns 移动工具结果图片的做法一致），以模型消息结尾时单独成一条用户消息（前面是用户 step 时
+// 按上一条规则并入）；只有附件的模型消息整条省略。移过去的附件按用户附件编码：能内联的图片（PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF）内联
+// （与官网相同），视频等上传后为 Drive 引用；没有 Drive 授权、仍是 inline data 的视频与不能内联的图片与用户附件一样返回需要 Drive 授权的
+// 错误，外部地址不接受，不静默丢掉。错误说明为英文，按参数错误原样返回客户端（app 层在发送前已把这类请求交给有 Drive 授权的账号，
+// 外部地址在选号前按 400 返回，这里只是兜底）。binding 不随 step 合并：与合并前、与上游相同，每条编码出 part 的消息一条（以模型消息结尾时
+// 移过去的说明文字另成一条），只含文本（图片数据与文件 ID 不参与，移过去的说明文字参与，放在随后那条用户消息的开头）。bindingPrompt 按
+// 消息处理 YouTube 链接（去掉链接文本、补一个占位，只在同一条消息内去重），合并后两条消息里同一个链接只剩一个占位，参与 WAA proof 的
+// 字符串就变了
 func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
-	steps := make([]any, 0, len(contents)+1)
+	merged := make([]interactionStep, 0, len(contents)+1)
 	binding := make([]Content, 0, len(contents)+1)
 	hasModelTurn := false
 	var pendingMedia []interactionModelMedia
-	// flushMedia 编码待移动的模型附件，返回放在用户 step 最前面的 part 与参与 binding 的说明文字（图片数据与文件 ID 不参与 binding）
+	// appendStep 追加一条 step；与上一条同角色时并入上一条（parts 按顺序接在后面）
+	appendStep := func(model bool, parts []any) {
+		if last := len(merged) - 1; last >= 0 && merged[last].model == model {
+			merged[last].parts = append(merged[last].parts, parts...)
+			return
+		}
+		merged = append(merged, interactionStep{model: model, parts: parts})
+	}
+	// flushMedia 编码待移动的模型附件，返回放在用户消息最前面的 part 与参与 binding 的说明文字（图片数据与文件 ID 不参与 binding）
 	flushMedia := func() ([]any, []Part, error) {
 		if len(pendingMedia) == 0 {
 			return nil, nil, nil
@@ -174,9 +226,9 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		}
 		switch content.Role {
 		case RoleUser:
-			steps = append(steps, []any{[]any{parts}})
+			appendStep(false, parts)
 		case RoleAssistant:
-			steps = append(steps, []any{nil, []any{parts}})
+			appendStep(true, parts)
 			hasModelTurn = true
 		default:
 			return nil, nil, false, fmt.Errorf("contents[%d]: this model does not accept %s messages", index, content.Role)
@@ -188,18 +240,27 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		return nil, nil, false, err
 	}
 	if len(media) > 0 {
-		steps = append(steps, []any{[]any{media}})
+		appendStep(false, media)
 		binding = append(binding, Content{Role: RoleUser, Parts: intro})
 	}
-	if len(steps) == 0 {
+	if len(merged) == 0 {
 		return nil, nil, false, fmt.Errorf("%w: contents must not be empty", ErrInvalidArgument)
+	}
+	steps := make([]any, 0, len(merged))
+	for _, step := range merged {
+		if step.model {
+			steps = append(steps, []any{nil, []any{step.parts}})
+		} else {
+			steps = append(steps, []any{[]any{step.parts}})
+		}
 	}
 	return steps, binding, hasModelTurn, nil
 }
 
-// encodeInteractionAttachment 编码 step 里的附件 part：PNG、JPEG 图片按官网内联为 Content field 2 [MIME 枚举, Base64]（PNG 为 1、JPEG 为 2，
-// 原文件字节；GIF 已在 app 层转成 PNG，见 PrepareInteractionImages），用户的 Drive 文件引用为 Content field 9；其余 inline data（视频、
-// 其他文件、不能内联的图片，账户没有 Drive 授权时仍是 inline data）返回需要 Drive 授权的错误；外部地址与其他 part 不接受。
+// encodeInteractionAttachment 编码 step 里的附件 part：能内联的图片按官网内联为 Content field 2 [MIME 枚举, Base64]（枚举取官网前端的表：
+// PNG 1、JPEG 2、WebP 3、HEIC 4、HEIF 5、BMP 8、TIFF 9，原文件字节；GIF 已在 app 层转成 PNG，见 PrepareInteractionImages），用户的 Drive
+// 文件引用为 Content field 9；其余 inline data（视频、音频、PDF 等文件与不能内联的图片，账户没有 Drive 授权时仍是 inline data）返回需要
+// Drive 授权的错误；外部地址与其他 part 不接受。
 // 错误说明为英文（原样返回客户端）
 func encodeInteractionAttachment(index int, part Part, role Role) ([]any, error) {
 	switch {
@@ -266,17 +327,33 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		ReportRequestNote(ctx, InteractionStopSequencesNote(count))
 		request.Config.StopSequences = nil
 	}
-	body, binding, err := EncodeCreateInteractionStreamRequest(request, entry.defaults)
+	encoded, err := encodeCreateInteractionStream(request, entry.defaults)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	rpc := newRPCRequest("CreateInteractionStream", request.AccountID, request.ID, body, true)
+	// 请求结构摘要（各 step 的 part 种类、图片格式与字节数、Drive 引用、视频设置等，不含提示词正文与图片数据）写进该请求的管理日志，
+	// 上游返回笼统的 400 时与官网抓包逐项对照
+	ReportRequestInfo(ctx, encoded.summary(request))
+	rpc := newRPCRequest("CreateInteractionStream", request.AccountID, request.ID, encoded.body, true)
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	bindingRequest := request
-	bindingRequest.Contents = binding
+	bindingRequest.Contents = encoded.binding
+	// 经排查路由（/trace/）的请求与 GenerateContent 一样记下发往上游的请求体与上游原始响应的开头（含错误响应：在读出错误之前接上），
+	// 另记 binding 的字节数与 sha256（只是证据，binding 的组成不变），便于与官网页面算 proof 时的输入对照
+	trace := TraceFromContext(ctx)
+	trace.RecordRequest(rpc.Method, rpc.URL, encoded.body)
+	if trace != nil {
+		if prompt, promptErr := bindingPrompt(bindingRequest); promptErr == nil {
+			sum := sha256.Sum256([]byte(prompt))
+			trace.Note(fmt.Sprintf("CreateInteractionStream binding | 字节=%d | sha256=%s", len(prompt), hex.EncodeToString(sum[:])))
+		}
+	}
 	response, err := c.protected.DoProtected(ctx, bindingRequest, rpc)
 	if err != nil {
 		return nil, fmt.Errorf("发送 AI Studio CreateInteractionStream: %w", err)
+	}
+	if response != nil {
+		response.Body = trace.TeeUpstream(response.Body)
 	}
 	response, err = validateRPCResponse("CreateInteractionStream", response)
 	if err != nil {
@@ -466,8 +543,9 @@ func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error) (bool, 
 	return true, emit(Event{Kind: EventFinish, FinishReason: "stop"})
 }
 
-// decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 5 视频、field 6 思考摘要、field 7 思考签名、field 10 引用
-// （图片与引用按上游 Mag1cFall/AIStudio2API 的解码移植：图片作为媒体输出，引用为正文起止位置与来源网址）
+// decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 3 音频、field 4 文档、field 5 视频、field 6 思考摘要、
+// field 7 思考签名、field 10 引用（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植：媒体按官网前端的枚举表取 MIME 后作为媒体输出，
+// 引用为正文起止位置与来源网址）
 func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 	delta, err := rawArray(raw, "$delta", raw)
 	if err != nil || len(delta) < 2 {
@@ -494,12 +572,8 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 			if err := emit(Event{Kind: EventText, Text: decoded}); err != nil {
 				return err
 			}
-		case 1, 4:
-			mimes, fallback, kind := interactionImageMIME, interactionImageDefaultMIME, "图片"
-			if index == 4 {
-				mimes, fallback, kind = interactionVideoMIME, interactionVideoDefaultMIME, "视频"
-			}
-			media, err := decodeInteractionMedia(value, index, mimes, fallback, kind, raw)
+		case 1, 2, 3, 4:
+			media, err := decodeInteractionMedia(value, index, raw)
 			if err != nil {
 				return err
 			}
@@ -525,23 +599,25 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 	return nil
 }
 
-// decodeInteractionMedia 解码图片（field 2）或视频（field 5）content：MIME 枚举与 Base64 数据；kind 为写进协议证据的媒体名称
-func decodeInteractionMedia(value json.RawMessage, index int, mimes map[int64]string, fallback string, kind string, raw json.RawMessage) (*Media, error) {
+// decodeInteractionMedia 解码图片（field 2）、音频（field 3）、文档（field 4）或视频（field 5）content：MIME 枚举与 Base64 数据。
+// 枚举为 null 或不在 interactionMediaMIME 表里时按官网前端取该类的缺省 MIME（图片 image/jpeg、音频 audio/wav、文档 application/pdf、
+// 视频 video/mp4），不按文件头另行判断；枚举不是整数、数据不是 Base64 时按协议证据错误返回
+func decodeInteractionMedia(value json.RawMessage, index int, raw json.RawMessage) (*Media, error) {
+	kind := interactionMediaMIME[index]
 	path := fmt.Sprintf("$delta[1][%d]", index)
 	media, err := rawArray(value, path, raw)
 	if err != nil || len(media) < 2 {
-		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path, Detail: kind + " delta 无效", Raw: cloneRaw(raw)}
+		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path, Detail: kind.name + " delta 无效", Raw: cloneRaw(raw)}
 	}
-	// MIME 枚举省略（null）或不在表中时按官网前端取该类媒体的缺省类型
-	mimeType := fallback
+	var code int64
 	if !isJSONNull(media[0]) {
-		code, err := rawInt64(media[0], path+"[0]", raw)
-		if err != nil {
+		if code, err = rawInt64(media[0], path+"[0]", raw); err != nil {
 			return nil, withMethod(err, "CreateInteractionStream")
 		}
-		if known, ok := mimes[code]; ok {
-			mimeType = known
-		}
+	}
+	mimeType, ok := kind.codes[code]
+	if !ok {
+		mimeType = kind.unlisted
 	}
 	encoded, err := rawString(media[1], path+"[1]", raw)
 	if err != nil {
@@ -549,7 +625,7 @@ func decodeInteractionMedia(value json.RawMessage, index int, mimes map[int64]st
 	}
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[1]", Detail: kind + "数据不是 Base64", Raw: cloneRaw(raw)}
+		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[1]", Detail: kind.name + "数据不是 Base64", Raw: cloneRaw(raw)}
 	}
 	return &Media{MIME: mimeType, Data: data}, nil
 }

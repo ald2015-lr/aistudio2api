@@ -64,6 +64,12 @@ func omniTestCaptureBody(parts string, video string) string {
 // omniTestWebP 为文件头是 WebP 的图片数据（标准库解不了）
 var omniTestWebP = []byte("RIFF\x1a\x00\x00\x00WEBPVP8L\x0d\x00\x00\x00\x2f\x00\x00\x00\x10\x07\x10\x11\x11\x88\x88\xfe\x07\x00")
 
+// omniTestAVIF 为 AVIF 文件头（HEIF 容器的 avif 品牌；官网枚举表里没有 AVIF，要先上传 Drive）
+var omniTestAVIF = []byte("\x00\x00\x00\x1cftypavif\x00\x00\x00\x00mif1miafavif\x00\x00\x00\x10meta-data-here")
+
+// omniTestHEIC 为 iPhone 照片那样主品牌 heic 的 HEIF 文件头
+var omniTestHEIC = []byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic\x00\x00\x00\x10meta-data-here")
+
 // omniTestHugeGIF 为头部声明 65535×65535 画布、首帧 1×1 的最小 GIF
 var omniTestHugeGIF = []byte{'G', 'I', 'F', '8', '9', 'a', 0xff, 0xff, 0xff, 0xff, 0x80, 0, 0,
 	0, 0, 0, 0xff, 0xff, 0xff, ',', 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 0x44, 0x01, 0, ';'}
@@ -205,9 +211,9 @@ func TestOmniImageGoldenThroughService(t *testing.T) {
 	}
 }
 
-// TestOmniUndecodableImagesNeedDrive 不能内联的图片（WebP、头部声明超过 4096×4096 画布的 GIF）与视频一样要先上传 Drive：有 Drive 授权的
-// 账号时只上传这张图（同一请求的 PNG 拿出来不上传、在原位置内联发送），号池里没有 Drive 授权的账号时不调用 Generate，返回 400
-// FAILED_PRECONDITION 与英文说明（请改用 PNG 或 JPEG），请求进度写明原因
+// TestOmniUndecodableImagesNeedDrive 不能内联的图片（官网枚举表里没有的 AVIF、头部声明超过 4096×4096 画布的 GIF）与视频一样要先上传 Drive：
+// 有 Drive 授权的账号时只上传这张图（同一请求的 PNG 拿出来不上传、在原位置内联发送），号池里没有 Drive 授权的账号时不调用 Generate，返回 400
+// FAILED_PRECONDITION 与英文说明（请改用 PNG、JPEG 或 WebP），请求进度写明原因
 func TestOmniUndecodableImagesNeedDrive(t *testing.T) {
 	pngData, _, _ := omniTestImages(t)
 	encode := base64.StdEncoding.EncodeToString
@@ -217,8 +223,8 @@ func TestOmniUndecodableImagesNeedDrive(t *testing.T) {
 		hint   string
 		reason string
 	}{
-		{name: "WebP", blob: aistudio.Blob{MIME: "image/webp", Data: omniTestWebP},
-			hint: "contents[0]: image/webp images cannot be sent inline to this model", reason: "image/webp 图片不是 PNG、JPEG 或 GIF"},
+		{name: "AVIF", blob: aistudio.Blob{MIME: "image/avif", Data: omniTestAVIF},
+			hint: "contents[0]: image/avif images cannot be sent inline to this model", reason: "image/avif 图片不是能内联的格式"},
 		{name: "超大 GIF", blob: aistudio.Blob{MIME: "image/gif", Data: omniTestHugeGIF},
 			hint: "contents[0]: the GIF image is 65535x65535 pixels, larger than the 4096x4096 pixels", reason: "超过转 PNG 的上限 4096×4096"},
 	} {
@@ -275,7 +281,7 @@ func TestOmniUndecodableImagesNeedDrive(t *testing.T) {
 			}
 			message := driveRequired.PublicMessage()
 			if !strings.Contains(message, "requires an account with Google Drive authorized, and no account in the pool has Google Drive authorization.") ||
-				!strings.Contains(message, test.hint) || !strings.HasSuffix(message, "as PNG or JPEG instead.") {
+				!strings.Contains(message, test.hint) || !strings.HasSuffix(message, "as PNG, JPEG or WebP instead.") {
 				t.Fatalf("对外说明 = %q", message)
 			}
 			for _, r := range message {
@@ -286,7 +292,7 @@ func TestOmniUndecodableImagesNeedDrive(t *testing.T) {
 			if calls, uploads, _ := upstream.snapshot(); len(calls)+len(uploads) != 0 {
 				t.Fatalf("Generate=%v 上传=%v，不应发送", calls, uploads)
 			}
-			if !progressLogged(service, "号池里没有已知或可能有 Drive 授权的账号，Omni 的视频（及无法转为 PNG 的图片）无法发送，按 400 返回") {
+			if !progressLogged(service, "号池里没有已知或可能有 Drive 授权的账号，Omni 的视频（及不能内联的图片）无法发送，按 400 返回") {
 				t.Fatal("应写明需要 Drive 的进度")
 			}
 			assertNoAccountCooldown(t, pool)
@@ -363,21 +369,23 @@ func TestOmniImageOtherModelsUnchanged(t *testing.T) {
 	}
 }
 
-// TestHoldRestoreInlineImages 上传前拿掉的 PNG、JPEG 按位置放回（视频与 WebP 留给上传）；不改动原内容；上传改了消息结构时报错，不让图片错位
+// TestHoldRestoreInlineImages 上传前拿掉的能内联的图片（PNG、JPEG、WebP 等）按位置放回（视频与 AVIF 留给上传）；不改动原内容；
+// 上传改了消息结构时报错，不让图片错位
 func TestHoldRestoreInlineImages(t *testing.T) {
 	pngData, jpegData, _ := omniTestImages(t)
 	pngBlob := &aistudio.Blob{MIME: "image/png", Data: pngData}
 	jpegBlob := &aistudio.Blob{MIME: "image/jpeg", Data: jpegData}
 	video := &aistudio.Blob{MIME: "video/mp4", Data: []byte("video")}
 	webp := &aistudio.Blob{MIME: "image/webp", Data: omniTestWebP}
+	avif := &aistudio.Blob{MIME: "image/avif", Data: omniTestAVIF}
 	contents := []aistudio.Content{
 		{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "a"}}},
 		{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{InlineData: pngBlob, RestoredLink: true}, {Text: "b"}}},
-		{Role: aistudio.RoleUser, Parts: []aistudio.Part{{InlineData: jpegBlob}, {InlineData: video}, {InlineData: webp}, {Text: "c"}}},
+		{Role: aistudio.RoleUser, Parts: []aistudio.Part{{InlineData: jpegBlob}, {InlineData: video}, {InlineData: avif}, {InlineData: webp}, {Text: "c"}}},
 	}
 	held, images := holdInlineImages(contents)
-	if len(images) != 2 || held[1].Parts[0].InlineData != nil || !held[1].Parts[0].RestoredLink || held[2].Parts[0].InlineData != nil ||
-		held[2].Parts[1].InlineData != video || held[2].Parts[2].InlineData != webp {
+	if len(images) != 3 || held[1].Parts[0].InlineData != nil || !held[1].Parts[0].RestoredLink || held[2].Parts[0].InlineData != nil ||
+		held[2].Parts[1].InlineData != video || held[2].Parts[2].InlineData != avif || held[2].Parts[3].InlineData != nil {
 		t.Fatalf("拿掉的图片 = %+v，内容 = %+v", images, held)
 	}
 	if contents[1].Parts[0].InlineData != pngBlob || contents[2].Parts[0].InlineData != jpegBlob {
@@ -391,7 +399,7 @@ func TestHoldRestoreInlineImages(t *testing.T) {
 	uploaded[2].Parts[1] = aistudio.Part{File: &aistudio.FileRef{ID: "drive-video"}}
 	restored, err := restoreInlineImages(uploaded, images)
 	if err != nil || restored[1].Parts[0].InlineData != pngBlob || restored[2].Parts[0].InlineData != jpegBlob ||
-		restored[2].Parts[1].File == nil || restored[2].Parts[2].InlineData != webp {
+		restored[2].Parts[1].File == nil || restored[2].Parts[2].InlineData != avif || restored[2].Parts[3].InlineData != webp {
 		t.Fatalf("放回后 = %+v err=%v", restored, err)
 	}
 	if uploaded[2].Parts[0].InlineData != nil {
@@ -496,7 +504,7 @@ func TestOmniClientGIFThroughProtocol(t *testing.T) {
 			recorder := post(t, service, entry.path, entry.body)
 			if recorder.Code != http.StatusBadRequest ||
 				!strings.Contains(recorder.Body.String(), "contents[0]: the GIF image exceeds the 1 MB limit on PNG data converted from GIF images in one request") ||
-				!strings.Contains(recorder.Body.String(), "as PNG or JPEG instead.") {
+				!strings.Contains(recorder.Body.String(), "as PNG, JPEG or WebP instead.") {
 				t.Fatalf("状态 %d: %s，期望 400 与英文说明", recorder.Code, recorder.Body.String())
 			}
 			if calls, uploads, _ := upstream.snapshot(); len(calls)+len(uploads) != 0 {

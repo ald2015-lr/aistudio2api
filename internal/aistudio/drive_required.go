@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// DriveRequiredReason 为 Interaction 模型的视频输入（及无法转为 PNG 的图片）找不到有 Drive 授权的账号的原因
+// DriveRequiredReason 为 Interaction 模型的视频输入（及不能内联的图片）找不到有 Drive 授权的账号的原因
 type DriveRequiredReason int
 
 const (
@@ -18,10 +18,11 @@ const (
 	DriveRequiredExhausted
 )
 
-// DriveRequiredError 表示 Interaction 模型（gemini-omni）的视频输入（以及其他非图片文件、无法转为 PNG 的图片）需要已授权 Google Drive
-// 的账号：这些附件要先上传到账号的 Drive，再以文件引用发送（官网发送视频同样先传 Drive），没有 Drive 授权的账号发不出去。PNG、JPEG 图片
-// 与转成 PNG 的 GIF 按官网内联发送，不需要 Drive（见 PrepareInteractionImages）。
-// 对外给出英文说明：没有可用账号与指定账号为 400 FAILED_PRECONDITION（换个请求也不会好转，要先让账号获得 Drive 授权，或把图片改成 PNG、JPEG），
+// DriveRequiredError 表示 Interaction 模型（gemini-omni）的视频输入（以及音频、文档等其他文件、不能内联的图片）需要已授权 Google Drive
+// 的账号：这些附件要先上传到账号的 Drive，再以文件引用发送（官网发送视频同样先传 Drive），没有 Drive 授权的账号发不出去。能内联的图片
+// （PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF 与转成 PNG 的 GIF）按官网内联发送，不需要 Drive（见 PrepareInteractionImages）。
+// 对外给出英文说明：没有可用账号与指定账号为 400 FAILED_PRECONDITION（换个请求也不会好转，要先让账号获得 Drive 授权，或把图片改成 PNG、JPEG 等
+// 能内联的格式），
 // 换号次数用完为 503（号池里可能还有没试过的账号，稍后重试）
 type DriveRequiredError struct {
 	Reason DriveRequiredReason
@@ -38,11 +39,11 @@ func (e *DriveRequiredError) Error() string {
 	model := strings.TrimSpace(e.Model)
 	switch e.Reason {
 	case DriveRequiredAccount:
-		return "模型 " + model + " 的视频输入（及无法转为 PNG 的图片）需要已授权 Google Drive 的账号，指定的账号没有 Drive 授权"
+		return "模型 " + model + " 的视频输入（及不能内联的图片）需要已授权 Google Drive 的账号，指定的账号没有 Drive 授权"
 	case DriveRequiredExhausted:
-		return fmt.Sprintf("模型 %s 的视频输入（及无法转为 PNG 的图片）需要已授权 Google Drive 的账号，本请求换过的 %d 个账号都没有 Drive 授权", model, e.Tried)
+		return fmt.Sprintf("模型 %s 的视频输入（及不能内联的图片）需要已授权 Google Drive 的账号，本请求换过的 %d 个账号都没有 Drive 授权", model, e.Tried)
 	default:
-		return fmt.Sprintf("模型 %s 的视频输入（及无法转为 PNG 的图片）需要已授权 Google Drive 的账号，号池里没有已知或可能有 Drive 授权的账号"+
+		return fmt.Sprintf("模型 %s 的视频输入（及不能内联的图片）需要已授权 Google Drive 的账号，号池里没有已知或可能有 Drive 授权的账号"+
 			"（%d 个候选都记着 Drive 不可用）", model, e.Unavailable)
 	}
 }
@@ -71,7 +72,7 @@ func (e *DriveRequiredError) PublicMessage() string {
 	} else {
 		model = "model " + model
 	}
-	prefix := "Video input for " + model + " (and image input that cannot be sent inline as PNG or JPEG) requires an account with Google Drive authorized"
+	prefix := "Video input for " + model + " (and audio, document or image input that cannot be sent inline) requires an account with Google Drive authorized"
 	var message string
 	switch e.Reason {
 	case DriveRequiredAccount:
@@ -108,8 +109,8 @@ func InteractionExternalMediaError(contents []Content) error {
 }
 
 // InteractionModel 判断模型经 Interactions 生成（目录带 Interaction 配置 field 79，如 gemini-omni）：按 Playground 模型索引
-// （ID 或别名）查找，不看账户是否可调度。这类模型不走 Build 通道（见 buildExcludedPlaygroundModel）；PNG、JPEG 图片按官网内联发送，
-// 视频与无法转为 PNG 的图片要先上传到账号的 Drive（见 InteractionDriveMedia）
+// （ID 或别名）查找，不看账户是否可调度。这类模型不走 Build 通道（见 buildExcludedPlaygroundModel）；能内联的图片按官网内联发送，
+// 视频与不能内联的图片要先上传到账号的 Drive（见 InteractionDriveMedia）
 func (p *AccountPool) InteractionModel(modelID string) bool {
 	if p == nil {
 		return false

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -28,6 +29,87 @@ func TestExtension(t *testing.T) {
 	}
 	if ContentType("0000000000000000000000000000000000000000000000000000000000000000.bin") != "application/octet-stream" {
 		t.Fatal(".bin 应按 application/octet-stream 提供")
+	}
+}
+
+// TestExtensionInteractionMediaTable Omni（CreateInteractionStream）输出的媒体 MIME 枚举表（与官网前端相同，见 aistudio interactionMediaMIME）
+// 解码出的写法都按已知扩展名保存、按标准 Content-Type 提供（video/mov 与 video/quicktime 同为 .mov 等），不存成 .bin 按下载提供；
+// 裸 PCM、A-law、μ-law 没有文件头，仍为 .bin。各扩展名都在 extensionTypes 与文件名格式里
+func TestExtensionInteractionMediaTable(t *testing.T) {
+	hash := strings.Repeat("cd", 32)
+	for mimeType, want := range map[string]struct{ extension, served string }{
+		"image/png": {".png", "image/png"}, "image/jpeg": {".jpg", "image/jpeg"}, "image/webp": {".webp", "image/webp"},
+		"image/heic": {".heic", "image/heic"}, "image/heif": {".heif", "image/heif"}, "image/gif": {".gif", "image/gif"},
+		"image/bmp": {".bmp", "image/bmp"}, "image/tiff": {".tiff", "image/tiff"},
+		"audio/wav": {".wav", "audio/wav"}, "audio/mp3": {".mp3", "audio/mpeg"}, "audio/aiff": {".aiff", "audio/aiff"},
+		"audio/aac": {".aac", "audio/aac"}, "audio/ogg": {".ogg", "audio/ogg"}, "audio/flac": {".flac", "audio/flac"},
+		"audio/mpeg": {".mp3", "audio/mpeg"}, "audio/m4a": {".m4a", "audio/mp4"}, "audio/opus": {".opus", "audio/opus"},
+		"audio/l16": {".bin", "application/octet-stream"}, "audio/s16le": {".bin", "application/octet-stream"},
+		"audio/alaw": {".bin", "application/octet-stream"}, "audio/mulaw": {".bin", "application/octet-stream"}, "application/pdf": {".pdf", "application/pdf"},
+		"video/mp4": {".mp4", "video/mp4"}, "video/mpeg": {".mpg", "video/mpeg"}, "video/mpg": {".mpg", "video/mpeg"},
+		"video/mov": {".mov", "video/quicktime"}, "video/avi": {".avi", "video/x-msvideo"}, "video/x-flv": {".flv", "video/x-flv"},
+		"video/webm": {".webm", "video/webm"}, "video/wmv": {".wmv", "video/x-ms-wmv"}, "video/3gpp": {".3gp", "video/3gpp"},
+	} {
+		extension := Extension(mimeType)
+		name := hash + extension
+		if extension != want.extension || !ValidName(name) || ContentType(name) != want.served || !validTempName("."+name+".123.tmp") {
+			t.Fatalf("%s: 扩展名 %q（期望 %q），ValidName=%v，提供为 %q（期望 %q）", mimeType, extension, want.extension, ValidName(name), ContentType(name), want.served)
+		}
+	}
+	for mimeType, extension := range typeExtensions {
+		if _, ok := extensionTypes[extension]; !ok || !ValidName(hash+extension) {
+			t.Fatalf("%s 的扩展名 %s 应在 extensionTypes 与文件名格式里", mimeType, extension)
+		}
+	}
+	for extension := range extensionTypes {
+		if !ValidName(hash + extension) {
+			t.Fatalf("扩展名 %s 应符合文件名格式", extension)
+		}
+	}
+}
+
+// TestExtensions 按提供时的 Content-Type 列出扩展名（协议层据此拼回传恢复的链接正则）：图片含 Omni 输出枚举解码出的 HEIC、HEIF、BMP、TIFF，
+// 视频含 MPEG、AVI、FLV、WMV、3GP；与 extensionTypes 一一对应（不多不少），较长的在前，没有一项是排在它前面的另一项的前缀
+func TestExtensions(t *testing.T) {
+	images := Extensions("image/")
+	if want := []string{"heic", "heif", "tiff", "webp", "bmp", "gif", "jpg", "png"}; strings.Join(images, "|") != strings.Join(want, "|") {
+		t.Fatalf("图片扩展名 = %v，期望 %v", images, want)
+	}
+	videos := Extensions("video/")
+	if want := []string{"webm", "3gp", "avi", "flv", "mov", "mp4", "mpg", "wmv"}; strings.Join(videos, "|") != strings.Join(want, "|") {
+		t.Fatalf("视频扩展名 = %v，期望 %v", videos, want)
+	}
+	visual := Extensions("image/", "video/")
+	if len(visual) != len(images)+len(videos) {
+		t.Fatalf("图片加视频 = %v", visual)
+	}
+	hash := strings.Repeat("ab", 32)
+	counted := 0
+	for extension, contentType := range extensionTypes {
+		if !strings.HasPrefix(contentType, "image/") && !strings.HasPrefix(contentType, "video/") {
+			continue
+		}
+		counted++
+		name := hash + extension
+		if !ValidName(name) || !slices.Contains(visual, strings.TrimPrefix(extension, ".")) {
+			t.Fatalf("%s（%s）应在图片或视频扩展名里", extension, contentType)
+		}
+		if IsImage(name) != slices.Contains(images, strings.TrimPrefix(extension, ".")) {
+			t.Fatalf("%s: IsImage 与 Extensions(image/) 不一致", extension)
+		}
+	}
+	if counted != len(visual) {
+		t.Fatalf("extensionTypes 里的图片与视频有 %d 种，Extensions 列出 %d 种", counted, len(visual))
+	}
+	for index, extension := range visual {
+		for _, earlier := range visual[:index] {
+			if strings.HasPrefix(extension, earlier) {
+				t.Fatalf("%s 排在 %s 后面，正则分支会先匹配到较短的前缀", extension, earlier)
+			}
+		}
+	}
+	if audio := Extensions("audio/"); slices.Contains(audio, "mp4") || !slices.Contains(audio, "m4a") || len(Extensions()) != 0 {
+		t.Fatalf("音频扩展名 = %v，没有前缀时 = %v", audio, Extensions())
 	}
 }
 

@@ -241,18 +241,26 @@ func (s *server) handleMedia(w http.ResponseWriter, r *http.Request) {
 // 展开后不能远远超出前置中转允许的请求体。同一文件一次请求只恢复一处，超过上限时较早消息里的引用不恢复
 const maxRestoredMediaBytes int64 = 64 << 20
 
+// mediaImageExtensions、mediaVisualExtensions 为回传恢复的链接正则里的扩展名分组：媒体目录里按图片提供的扩展名，以及图片加视频
+// （见 mediastore.Extensions，与保存、提供用同一张表）。原先写死 png|jpg|webp|gif 与 mp4|webm|mov：Omni 输出枚举解码出的 HEIC、HEIF、
+// BMP、TIFF 图片与 MPEG、AVI、FLV、WMV、3GP 视频按 .heic、.bmp、.mpg 等保存并提供，下一轮回传时这些链接却不恢复为媒体，只按链接文本发送
+var (
+	mediaImageExtensions  = strings.Join(mediastore.Extensions("image/"), "|")
+	mediaVisualExtensions = strings.Join(mediastore.Extensions("image/", "video/"), "|")
+)
+
 // mediaImageLinkPattern 匹配正文里指向本服务媒体目录的 Markdown 图片（绝对地址或 /media/ 开头的相对地址），子匹配为文件名
-var mediaImageLinkPattern = regexp.MustCompile(`!\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif))\)`)
+var mediaImageLinkPattern = regexp.MustCompile(`!\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:` + mediaImageExtensions + `))\)`)
 
 // mediaVisualLinkPattern 匹配正文里指向本服务媒体目录的 Markdown 图片或视频链接（![image](…)、[video](…)），子匹配为文件名：
 // 目标模型是能输出视频的 Omni 时 assistant 正文与用户正文里的这类链接恢复为媒体
-var mediaVisualLinkPattern = regexp.MustCompile(`!?\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif|mp4|webm|mov))\)`)
+var mediaVisualLinkPattern = regexp.MustCompile(`!?\[[^\]\n]*\]\((?:https?://[^\s()<>]+)?/media/([0-9a-f]{64}\.(?:` + mediaVisualExtensions + `))\)`)
 
 // mediaBareLinkPattern 匹配正文里指向本服务媒体目录的图片或视频裸地址（http/https 绝对地址或 /media/ 开头的相对地址），子匹配为文件名：
 // 目标模型是能输出视频的 Omni 时用户正文里粘贴的这类地址恢复为媒体（前后的字符另行检查，见 bareMediaLinkAt）。主机与路径按段匹配
 // （段内不含斜杠），路径段取最短：原先主机部分贪婪、可以跨过逗号、顿号与中文，两个链接之间不是空白（“A.mp4，https://…/B.mp4”）时
 // 只匹配出一处，范围却覆盖两个链接，前一个链接连同它的文字一起被换成后一个视频
-var mediaBareLinkPattern = regexp.MustCompile(`(?:https?://[^\s()<>\[\]"'/]+(?:/[^\s()<>\[\]"'/]+)*?)?/media/([0-9a-f]{64}\.(?:png|jpg|webp|gif|mp4|webm|mov))`)
+var mediaBareLinkPattern = regexp.MustCompile(`(?:https?://[^\s()<>\[\]"'/]+(?:/[^\s()<>\[\]"'/]+)*?)?/media/([0-9a-f]{64}\.(?:` + mediaVisualExtensions + `))`)
 
 // mediaReference 为回传历史里一处指向本服务媒体的引用：content 与 part 为所在位置，offset 为链接在文本 part 里的
 // 起始位置，fileData 与外部地址的 part 为 -1

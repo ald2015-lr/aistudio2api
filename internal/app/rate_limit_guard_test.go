@@ -546,8 +546,8 @@ func (upstream *cleanupRateUpstream) Generate(ctx context.Context, request aistu
 }
 
 // TestRateLimitCleanupErrorNotEscalated 附件上传成功、生成以非 RPC 的连接错误失败、随后删除临时 Drive 副本时 Drive 返回 429 或 403：
-// 额度冷却与单模型 403 只看这次尝试本身的错误，清理错误与模型额度、模型权限无关，不能当成生成本身的裸限流逐级冷却（两个通道都冷却、
-// 计入号池级限流）或单模型 403 冷却；清理错误照旧并入返回的错误
+// 额度冷却、单模型 403 与多模型连续 403 的自动暂停计数只看这次尝试本身的错误，清理错误与模型额度、模型权限无关，不能当成生成本身的
+// 裸限流逐级冷却（两个通道都冷却、计入号池级限流）、单模型 403 冷却或计入自动暂停；清理错误照旧并入返回的错误
 func TestRateLimitCleanupErrorNotEscalated(t *testing.T) {
 	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
@@ -601,6 +601,12 @@ func TestRateLimitCleanupErrorNotEscalated(t *testing.T) {
 			service.rateLimits.mu.Unlock()
 			if observed != 0 {
 				t.Fatalf("清理的 Drive 错误不应计入号池级限流：记录 %d 个账号", observed)
+			}
+			service.forbidden.mu.Lock()
+			forbidden := len(service.forbidden.events[account])
+			service.forbidden.mu.Unlock()
+			if forbidden != 0 {
+				t.Fatalf("清理的 Drive 错误不应计入连续 403 的自动暂停计数：记录 %d 次", forbidden)
 			}
 		})
 	}

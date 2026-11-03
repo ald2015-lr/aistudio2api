@@ -30,3 +30,23 @@ func ReportRequestNote(ctx context.Context, note string) {
 func InteractionStopSequencesNote(count int) string {
 	return fmt.Sprintf("未确认 CreateInteractionStream 的停止序列字段，已忽略 %d 个停止序列", count)
 }
+
+type requestInfoContextKey struct{}
+
+// ContextWithRequestInfoObserver 接收生成服务发送前留下的排查信息（例如 Interaction 请求的结构摘要），调用方以 INFO 写进该请求的管理日志；
+// 与 ContextWithRequestNoteObserver 分开：那些是改动了请求的说明（WARN），这些只是证据
+func ContextWithRequestInfoObserver(ctx context.Context, observer func(string)) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestInfoContextKey{}, observer)
+}
+
+// ReportRequestInfo 报告一条排查信息；没有观察者时写进排查记录（主路由请求没有排查记录时什么也不做）
+func ReportRequestInfo(ctx context.Context, message string) {
+	if observer, _ := ctx.Value(requestInfoContextKey{}).(func(string)); observer != nil {
+		observer(message)
+		return
+	}
+	TraceFromContext(ctx).Note(message)
+}

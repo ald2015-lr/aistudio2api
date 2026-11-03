@@ -341,7 +341,7 @@ func interactionHasModelTurn(contents []Content) bool {
 }
 
 // checkVideoTaskInputs 校验视频任务需要的输入：image_to_video、reference_to_video 需要至少一张图片，edit、extend 需要至少一段视频。
-// 模型消息里的附件会移到随后的用户 step，同样计入；类型不明的文件引用两种都算
+// 模型消息里的附件会移到随后的用户 step，同样计入；附件是图片还是视频与编码用同一套识别（见 videoTaskInputKind），类型不明的文件引用两种都算
 func checkVideoTaskInputs(task string, contents []Content) error {
 	want := ""
 	switch task {
@@ -354,8 +354,8 @@ func checkVideoTaskInputs(task string, contents []Content) error {
 	}
 	for _, content := range contents {
 		for _, part := range content.Parts {
-			mime, ok := partMediaMIME(part)
-			if ok && (mime == "" || strings.HasPrefix(strings.ToLower(mime), want)) {
+			kind, ok := videoTaskInputKind(part)
+			if ok && (kind == "" || kind == want) {
 				return nil
 			}
 		}
@@ -366,17 +366,49 @@ func checkVideoTaskInputs(task string, contents []Content) error {
 	return fmt.Errorf("video task %s requires an input video", task)
 }
 
-// partMediaMIME 返回附件 part 的 MIME，不是附件时 ok 为 false
-func partMediaMIME(part Part) (string, bool) {
+// videoTaskInputKind 返回附件 part 能作为哪种视频任务的输入：图片为 "image/"，视频为 "video/"，类型不明为空串（两种都算），其他文件
+// （音频、PDF 等）为 MIME 的类型名（两种都不算）；不是附件时 ok 为 false。内联数据与编码用同一套识别（见 imageFormatOf）：MIME 为空或
+// application/octet-stream 一类时按文件头判断，是已知图片格式（含之后转成 PNG 的 GIF）的算图片、按图片内联发送，不是的按需要 Drive 的
+// 文件发送、算视频（octet-stream 的 MP4 等）；声明了 MIME 的按 MIME 前缀，不按文件头改判（与编码相同）。原先只按 MIME 前缀判断、只有空 MIME
+// 算类型不明：标成 octet-stream 的图片不带任务时按图片内联，带 -i2v、-r2v 后缀或显式写 image_to_video、reference_to_video 时却在选号前
+// 按缺少输入图片返回 400；标成 octet-stream 的视频配 edit、extend 同样被拒。文件引用与外部地址没有数据，只看 MIME，MIME 为空或
+// octet-stream 一类时类型不明
+func videoTaskInputKind(part Part) (string, bool) {
+	var mimeType string
 	switch {
 	case part.InlineData != nil:
-		return part.InlineData.MIME, true
+		mediaType := imageMediaType(part.InlineData.MIME)
+		if !undeclaredMediaType(mediaType) {
+			return declaredVideoTaskInputKind(mediaType), true
+		}
+		if imageFormatOf(part.InlineData) != interactionNotImage {
+			return "image/", true
+		}
+		return "video/", true
 	case part.File != nil:
-		return part.File.MIME, true
+		mimeType = part.File.MIME
 	case part.ExternalMedia != nil:
-		return part.ExternalMedia.MIME, true
+		mimeType = part.ExternalMedia.MIME
+	default:
+		return "", false
 	}
-	return "", false
+	mediaType := imageMediaType(mimeType)
+	if undeclaredMediaType(mediaType) {
+		return "", true
+	}
+	return declaredVideoTaskInputKind(mediaType), true
+}
+
+// declaredVideoTaskInputKind 把声明的 MIME 类型名（小写、去掉参数）归为视频任务输入的种类：image/* 为 "image/"，video/* 为 "video/"，
+// 其他为原文（两种任务都不算）
+func declaredVideoTaskInputKind(mediaType string) string {
+	switch {
+	case strings.HasPrefix(mediaType, "image/"):
+		return "image/"
+	case strings.HasPrefix(mediaType, "video/"):
+		return "video/"
+	}
+	return mediaType
 }
 
 // interactionVideoFormat 编码视频输出格式并返回任务枚举：格式依次为 field 4 宽高比、field 5 时长 [秒]、field 6 分辨率。

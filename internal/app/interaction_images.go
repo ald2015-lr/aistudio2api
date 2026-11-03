@@ -7,10 +7,10 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
 
-// Interaction 模型（gemini-omni）的图片按官网内联发送（Content field 2：PNG 为 [1, Base64]、JPEG 为 [2, Base64]，原文件字节，不经 Drive，
-// 见 aistudio.PrepareInteractionImages）：generateWithRetry 在选号前把 GIF 首帧转成 PNG，只有视频、其他文件与无法转为 PNG 的图片
-// （aistudio.InteractionDriveMedia）才按 Drive 状态选号、上传到账号的 Drive。只有图片的 Omni 请求与纯文本请求一样选号，不查 Drive 状态、
-// 不换 Drive token、不因账号没有 Drive 授权换号
+// Interaction 模型（gemini-omni）的图片按官网内联发送（Content field 2 [MIME 枚举, Base64]，枚举取官网前端的表：PNG 1、JPEG 2、WebP 3、
+// HEIC 4、HEIF 5、BMP 8、TIFF 9，原文件字节，不经 Drive，见 aistudio.PrepareInteractionImages）：generateWithRetry 在选号前把 GIF 首帧转成 PNG，
+// 只有视频、音频、文档等文件与不能内联的图片（aistudio.InteractionDriveMedia）才按 Drive 状态选号、上传到账号的 Drive。只有图片的 Omni 请求
+// 与纯文本请求一样选号，不查 Drive 状态、不换 Drive token、不因账号没有 Drive 授权换号
 
 // interactionDriveMediaInput 返回内容里需要先上传 Drive 的内联附件数与原始字节数（aistudio.InteractionDriveMedia）
 func interactionDriveMediaInput(contents []aistudio.Content) (int, int64) {
@@ -34,7 +34,7 @@ type heldInlineImage struct {
 	blob    *aistudio.Blob
 }
 
-// holdInlineImages 返回拿掉内联图片（PNG、JPEG，aistudio.InteractionInlineImage）inline data 的内容副本与拿掉的图片（不改动 contents）：
+// holdInlineImages 返回拿掉内联图片（能内联的格式，aistudio.InteractionInlineImage）inline data 的内容副本与拿掉的图片（不改动 contents）：
 // 交给 UploadInlineMediaToLease 的内容只剩需要 Drive 的附件，图片不上传（上传只改写 inline data 所在的 part，不增删消息与 part，
 // 之后按位置放回）
 func holdInlineImages(contents []aistudio.Content) ([]aistudio.Content, []heldInlineImage) {
@@ -91,12 +91,12 @@ type imageProgressNote struct {
 	text  string
 }
 
-// interactionImageNotes 返回 Interaction 模型图片整理结果写进请求进度的说明：按官网内联发送的图片数、字节数与 GIF 转换情况，
-// 以及无法转为 PNG、改走 Drive 的图片
+// interactionImageNotes 返回 Interaction 模型图片整理结果写进请求进度的说明：按官网内联发送的图片数、字节数、各格式张数与 GIF 转换情况，
+// 以及不能内联、改走 Drive 的图片
 func interactionImageNotes(report aistudio.InteractionImageReport) []imageProgressNote {
 	var notes []imageProgressNote
 	if report.Inline > 0 {
-		text := fmt.Sprintf("Omni 图片按官网内联发送，不经 Drive | 图片=%d | 字节=%dB", report.Inline, report.InlineBytes)
+		text := fmt.Sprintf("Omni 图片按官网内联发送，不经 Drive | 图片=%d | 字节=%dB | 格式=%s", report.Inline, report.InlineBytes, report.Formats)
 		if report.Converted > 0 {
 			text += fmt.Sprintf(" | GIF 转为 PNG=%d | GIF=%dB | PNG=%dB", report.Converted, report.SourceBytes, report.PNGBytes)
 		}
