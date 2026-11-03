@@ -4301,6 +4301,27 @@ func (service *trackedService) startGenerate(
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
 	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
+	// Interaction 模型（gemini-omni）的 CreateInteractionStream 不带工具：中转与客户端附带的函数（new-api 的 save_memory、delete_memory 等）
+	// 与 Google 工具在这里去掉并记一行说明，与停止序列一样不发送。原先函数声明发送前按模型目录校验（Omni 没有 function_declarations），
+	// 中文原因被换成通用措辞，经 new-api 的多轮请求对外成了 400 “Request contains an invalid argument.”
+	interactionModel := service.pool.InteractionModel(request.Model)
+	if note := aistudio.InteractionToolsNote(request.Tools); interactionModel && note != "" {
+		request.Tools = aistudio.Tools{}
+		trace.Note(note)
+		service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+	}
+	// 工具留在对话历史里的痕迹同样发不出去：CreateInteractionStream 的 step 只接受文本、图片与视频。同一段对话先用其他模型调用过函数
+	// （new-api、Chatbox 的 save_memory 等）、再切到 Omni 时，历史里的函数调用、函数结果与代码执行改为文本（tool 消息改为用户消息，见
+	// aistudio.InteractionToolHistoryAsText），保留上下文并记一行说明；原先选到账号后编码报 “this part type is not supported”，按 400 结束
+	if interactionModel {
+		contents, converted := aistudio.InteractionToolHistoryAsText(request.Contents)
+		request.Contents = contents
+		if converted > 0 {
+			note := aistudio.InteractionToolHistoryNote(converted)
+			trace.Note(note)
+			service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+		}
+	}
 	// 选号前就能判断的参数错误直接返回 400，不占用账号：既没有系统提示也没有对话内容（例如消息全被过滤掉），
 	// 工具选择本身不成立（指定了未声明的函数、要求调用却没有工具），停止序列超限，或媒体分辨率不是可用的枚举名
 	var invalid error
@@ -4312,7 +4333,7 @@ func (service *trackedService) startGenerate(
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	} else if err := aistudio.ValidateMediaResolution(request.Config.MediaResolution); err != nil {
 		invalid = fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
-	} else if service.pool.InteractionModel(request.Model) {
+	} else if interactionModel {
 		// Interaction 模型（gemini-omni）只接受内联图片与上传到账号 Drive 的附件：外部地址的图片与视频（http(s) 链接、YouTube 链接）不替客户端下载，
 		// 按 400 返回英文说明（原先选号、发送后才由编码报错，换成通用措辞）
 		invalid = aistudio.InteractionExternalMediaError(request.Contents)
@@ -4379,6 +4400,18 @@ func (service *trackedService) startGenerate(
 	}
 	guarded, wait := gate.start(ctx, cancel, events)
 	return guarded, wait, nil
+}
+
+// selectionFailureHook 非空时 generateWithRetry 每次选号前以这次的选择条件调用它，返回非空错误时按这次选号以该错误失败处理（不取租约）。
+// 只供包内测试模拟“选号没有候选、逐个账户核对还有候选”（见 omni_selection_test.go），不改动账户池与候选索引
+var selectionFailureHook atomic.Pointer[func(aistudio.AccountSelection) error]
+
+// omniSelectionNote 为 Omni（Interaction 模型）的请求取得租约时写进请求进度的临时诊断：这次选号的条件与所用候选集在候选索引里的概况
+// （aistudio.CandidateIndexSummary，只读）。线上只带图片的 Omni 请求同一秒以“没有符合条件的账户”结束、纯文字请求正常，选号条件与内容无关，
+// 根因未查明：成功的请求也写这一行，与失败请求的“选号没有候选”核对摘要对照（同一秒内先后各发一次文字与图片请求）
+func omniSelectionNote(selection aistudio.AccountSelection, index aistudio.CandidateIndexSummary) string {
+	return fmt.Sprintf("Omni 选号诊断（临时） | 条件=%s | 限定=%d | 排除=%d | 候选索引=%s",
+		aistudio.SelectionFlagsText(selection), len(selection.AllowedAccountIDs), len(selection.ExcludedAccountIDs), index.Text())
 }
 
 func (service *trackedService) generateWithRetry(
@@ -4521,6 +4554,15 @@ func (service *trackedService) generateWithRetry(
 	// preferPlaygroundAfterBuild：本请求已在 Build 上遇到 PROXY_GENERATION_DISABLED，之后的尝试每个账号先 Playground（只调整顺序，
 	// Playground 接不了的模型仍可用其他账号的 Build），不在其他账号的 Build 上再白试一次
 	preferPlaygroundAfterBuild := false
+	// noCandidate 为最近一次选号失败时、不固定账户的选号没有候选（aistudio.NoCandidateFailure）的核对结果（见 aistudio.NoCandidateReport）：
+	// 请求以这个错误结束时按它写原因摘要并决定对外状态（循环后的 NoServingAccountError）；指定账户、绑定文件的选号不核对，照原来的错误返回。
+	// 只在这次没有候选会成为请求的最终错误时核对（之前没有失败的尝试，err 为空）：换号用尽、输入超限后的再试等情况下请求按之前的错误结束，
+	// 核对结果用不上，不在账户池锁内遍历全部账户；之后取得租约时清空，不拿旧的核对结果包装后面尝试的错误。
+	// noCandidateRechecked 保证“逐个账户核对还有候选”时的重试选号只做一次
+	var noCandidate *aistudio.NoCandidateReport
+	noCandidateRechecked := false
+	// omniDiagnostic：Interaction 模型（gemini-omni）的请求，取得租约时写一行临时诊断（见 omniSelectionNote），文字与带图请求都写
+	omniDiagnostic := interactionModel || inlineCount == 0 && service.pool.InteractionModel(modelID)
 	pauses := service.buildPauses()
 	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
 	authFailures := 0
@@ -4772,6 +4814,9 @@ func (service *trackedService) generateWithRetry(
 		// 流式优先 Playground（STREAM_PLAYGROUND_MODELS）：先不等待地取 Playground 账号，Playground 繁忙或没有可用账号时
 		// 立即按默认条件在全部启用通道中选号，不排队等 Playground。降级判定的 Playground 优先（会等待）不受影响
 		// 输入超限后的再试只接受现在就能取得的账号，不排队
+		if hook := selectionFailureHook.Load(); hook != nil && nextLease == nil && acquireErr == nil {
+			acquireErr = (*hook)(selection)
+		}
 		switch {
 		case nextLease != nil || acquireErr != nil:
 		case plan.available && drive.lenient:
@@ -4834,6 +4879,26 @@ func (service *trackedService) generateWithRetry(
 		}
 		if acquireErr != nil {
 			trace.Note("获取账号失败: " + acquireErr.Error())
+			noCandidate = nil
+			// 只在这次没有候选会成为请求的最终错误时核对（err 为空：之前没有失败的尝试，下面 err 取这次的错误）。换号用尽时 err 是上一次尝试的错误，
+			// 请求按它结束，核对结果用不上：不核对，不在账户池锁内为每个换号用尽的请求遍历全部账户
+			if err == nil && aistudio.NoCandidateFailure(acquireErr) && selection.AccountID == "" && selection.ResourceID == "" {
+				report := service.pool.NoCandidateReport(selection)
+				noCandidate = &report
+				// 重试只用于普通条件的选号：输入超限后的再试（只取立即可用的账号、限定更高权益的账号）在本次尝试开头已消费掉这些一次性条件，
+				// 重试会按普通条件排队、落到同样会输入超限的账号上，不重试，交给下面按输入超限结束
+				if report.Recheckable() && !noCandidateRechecked && requestCtx.Err() == nil &&
+					inputLimitErr == nil && !useImmediate && selection.AllowedAccountIDs == nil {
+					// 候选索引说没有候选，逐个账户核对却还有（假设的候选索引与账户状态不一致，或核对前账户状态刚变化；候选索引没有时已作废）：
+					// 按同样的条件重试一次选号，不占换号次数。这是兜底，不是线上“文字成功、图片失败”的根因修复（见 aistudio.NoCandidateReport）
+					noCandidateRechecked = true
+					message := "选号没有候选，逐个账户核对却还有候选（候选索引与账户状态不一致，或核对前账户状态刚变化），重试一次选号 | " + report.Text()
+					trace.Note(message)
+					service.requests.logRequestProgress(request.ID, "service", "ERROR", message)
+					maxAttempts++
+					continue
+				}
+			}
 			// buildOffEnd：改走 Build 的尝试（输入超过 Playground 上限）没有可用账号是因为官网停用了 Build 通道的生成：选号因 Build 暂停
 			// 没有候选（中间在 Build 上以其他原因失败、inputLimitErr 已清空时同样如此），或输入超限后的不等待再试没有账号而本请求已在
 			// Build 上遇到 PROXY_GENERATION_DISABLED。按输入超限结束，写明上限（取自 playgroundCapErr）与原因
@@ -4926,6 +4991,12 @@ func (service *trackedService) generateWithRetry(
 		warmOnlyNext = false
 		err = nil
 		source = nil
+		// 之前选号没有候选的核对结果只属于那次选号：这次尝试以满足 NoCandidateFailure 的错误结束时（例如发送前的租约校验）照原来的错误返回，
+		// 不按旧摘要包装成“模型在列、暂时没有账户能接”
+		noCandidate = nil
+		if omniDiagnostic && selection.AccountID == "" && selection.ResourceID == "" {
+			service.requests.logRequestProgress(request.ID, "service", "INFO", omniSelectionNote(selection, service.pool.CandidateIndexSummary(selection)))
+		}
 		request.AccountID = lease.Account().ID
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
 		attempted[request.AccountID] = struct{}{}
@@ -5629,6 +5700,20 @@ func (service *trackedService) generateWithRetry(
 		} else {
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
 		}
+	}
+	// 不固定账户的选号没有候选、请求以此结束：写一行核对摘要（目录列出的账户数与按原因的分布、可用通道、选择条件、模型列表、候选索引，
+	// 见 aistudio.NoCandidateReport），对外按 aistudio.NoServingAccountError 返回：模型不在这个号池的模型列表里（权益、方法或启用的上游通道
+	// 接不了，GET /v1/models 也不列出）为 404 与写明原因类别的英文说明，模型在列为 503 与 Retry-After。原先同一秒内以
+	// “没有符合条件的 AI Studio 账户”结束，请求日志里没有任何原因，对外一律按模型不存在的 404 model_not_found
+	if noCandidate != nil && aistudio.NoCandidateFailure(err) {
+		noServing := aistudio.NewNoServingAccountError(*noCandidate, time.Now())
+		decision := "模型不在这个号池的模型列表里，按 404 返回"
+		if noServing.Listed {
+			decision = "模型在这个号池的模型列表里，暂时没有账户能接，按 503 返回"
+		}
+		trace.Note("选号没有候选（" + decision + "）: " + noServing.Summary)
+		service.requests.logRequestProgress(request.ID, "service", "WARN", "选号没有候选："+decision+" | "+noServing.Summary)
+		err = noServing
 	}
 	if err == nil && (lease == nil || source == nil) {
 		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents

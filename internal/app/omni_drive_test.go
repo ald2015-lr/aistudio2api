@@ -36,9 +36,10 @@ type omniDriveUpstream struct {
 	// uploadMIMEs 为每次上传收到的内联附件 MIME（按出现顺序），uploadData 为它们的数据
 	uploadMIMEs [][]string
 	uploadData  [][][]byte
-	// contents 为每次 Generate 收到的内容，bodies 为 Interaction 模型编码出的 CreateInteractionStream 请求体
+	// contents 为每次 Generate 收到的内容，bodies 为 Interaction 模型编码出的 CreateInteractionStream 请求体，tools 为收到的工具
 	contents [][]aistudio.Content
 	bodies   [][]byte
+	tools    []aistudio.Tools
 }
 
 // omniDriveDefaults 为 Omni 模型目录解析出的生成默认值（思考 High、输出上限 65536、默认分辨率 360p），与官网抓包的设置相同
@@ -147,6 +148,11 @@ func (upstream *omniDriveUpstream) Generate(_ context.Context, request aistudio.
 	var encodeErr error
 	if request.Model == omniDriveModel {
 		body, _, encodeErr = aistudio.EncodeCreateInteractionStreamRequest(request, omniDriveDefaults)
+		// 与 aistudio.Client.Generate 发送前按模型目录校验工具相同：Omni 目录没有 function_declarations，带函数声明时返回中文原因的参数错误
+		// （见 aistudio 的 TestOmniCatalogRejectsFunctionTools）
+		if len(request.Tools.Functions) > 0 {
+			encodeErr = fmt.Errorf("模型 %q 不支持 function declarations", request.Model)
+		}
 	}
 	upstream.mu.Lock()
 	call := request.AccountID
@@ -156,6 +162,7 @@ func (upstream *omniDriveUpstream) Generate(_ context.Context, request aistudio.
 	upstream.calls = append(upstream.calls, call)
 	upstream.contents = append(upstream.contents, request.Contents)
 	upstream.bodies = append(upstream.bodies, body)
+	upstream.tools = append(upstream.tools, request.Tools)
 	upstream.mu.Unlock()
 	if encodeErr != nil {
 		return nil, fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, encodeErr)

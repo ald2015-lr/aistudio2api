@@ -118,6 +118,11 @@ func statusFromError(err error) int {
 	if errors.As(err, &notReady) {
 		return http.StatusServiceUnavailable
 	}
+	// 不固定账户的生成选号没有候选：与 publicErrorFor 一致，模型在列为 503，不在号池的模型列表里为 404
+	var noServing *aistudio.NoServingAccountError
+	if errors.As(err, &noServing) {
+		return noServing.HTTPStatus()
+	}
 	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
 		return http.StatusBadRequest
 	}
@@ -261,6 +266,13 @@ func openAIErrorCode(err error) string {
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {
 		return "account_unavailable"
+	}
+	var noServing *aistudio.NoServingAccountError
+	if errors.As(err, &noServing) {
+		if !noServing.Listed {
+			return "model_not_found"
+		}
+		return "model_unavailable"
 	}
 	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
 		return "account_required"

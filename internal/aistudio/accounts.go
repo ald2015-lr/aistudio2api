@@ -681,6 +681,8 @@ type AccountPool struct {
 	// selectionRefreshAt 记录各模型最近一次从磁盘刷新运行态的时间，用于限频
 	selectionRefreshMu sync.Mutex
 	selectionRefreshAt map[string]time.Time
+	// noCandidateReports 为生成选号没有候选时的核对结果缓存（见 no_serving.go），受 mu 保护
+	noCandidateReports map[string]noCandidateCacheEntry
 	// catalogVersion 在账户增删或 Playground 目录变化时递增；playgroundIndex 是按模型 ID 与别名
 	// 建立的 Playground 目录索引（取账户顺序中第一个匹配的模型），版本变化时才重建。均受 mu 保护
 	catalogVersion         uint64

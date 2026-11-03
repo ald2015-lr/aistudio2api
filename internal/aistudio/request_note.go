@@ -50,3 +50,17 @@ func ReportRequestInfo(ctx context.Context, message string) {
 	}
 	TraceFromContext(ctx).Note(message)
 }
+
+// InteractionToolsNote 为经 CreateInteractionStream 生成的请求（gemini-omni）带了工具时写进请求日志的说明；没有工具时为空串。
+// Interaction 请求体不带工具（见 EncodeCreateInteractionStreamRequest），Omni 的模型目录也没有 function_declarations：中转与客户端自动附带的
+// 函数（如 new-api 的记忆函数 save_memory、delete_memory）与 Google 工具不发送，原先函数声明在发送前按模型目录校验，按通用措辞的 400 结束
+func InteractionToolsNote(tools Tools) string {
+	google := len(tools.Google)
+	if tools.GoogleSearch != nil && google == 0 {
+		google = 1
+	}
+	if len(tools.Functions) == 0 && google == 0 {
+		return ""
+	}
+	return fmt.Sprintf("CreateInteractionStream 不带工具，已忽略 %d 个函数声明与 %d 个 Google 工具（Omni 模型不调用工具）", len(tools.Functions), google)
+}

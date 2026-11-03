@@ -163,6 +163,17 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.Is(err, aistudio.ErrModelNotFound) {
 		return modelNotFoundPublicError(model)
 	}
+	// 不固定账户的生成选号没有候选（见 aistudio.NoServingAccountError）：模型不在这个号池的模型列表里（权益、方法或启用的上游通道接不了）
+	// 按 404 NOT_FOUND 与写明原因类别的英文说明（OpenAI code 为 model_not_found），模型在列、暂时没有账户能接按 503 UNAVAILABLE
+	// （OpenAI code 为 model_unavailable，Retry-After 由 setRetryAfter 写入）；核对摘要只写管理日志
+	var noServing *aistudio.NoServingAccountError
+	if errors.As(err, &noServing) {
+		public := publicError{Status: noServing.HTTPStatus(), RPC: noServing.RPCStatus(), Message: noServing.PublicMessage(), Code: "model_unavailable"}
+		if !noServing.Listed {
+			public.Kind, public.Code = publicKindModelNotFound, ""
+		}
+		return public
+	}
 	// 号池中没有任何账户能处理请求的模型、能力或通道组合：属于请求本身的原因，指明模型时按模型不存在返回 404
 	if errors.Is(err, aistudio.ErrNoEligibleAccount) {
 		if strings.TrimSpace(model) != "" {
