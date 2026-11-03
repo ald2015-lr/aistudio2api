@@ -488,27 +488,29 @@ type ModelAccess struct {
 
 // Account 表示一个稳定目录对应的 AI Studio 账户
 type Account struct {
-	ID                    string        `json:"id"`
-	Directory             string        `json:"-"`
-	ConfigPath            string        `json:"-"`
-	StoragePath           string        `json:"-"`
-	RuntimePath           string        `json:"-"`
-	Config                AccountConfig `json:"config"`
-	StorageState          StorageState  `json:"-"`
-	Models                []Model       `json:"models,omitempty"`
-	BenefitTier           BenefitTier   `json:"benefit_tier"`
-	State                 AccountState  `json:"state"`
-	LastUsed              time.Time     `json:"last_used,omitempty"`
-	runtime               accountRuntimeState
-	active                int
-	exclusive             bool
-	exclusiveWaiters      int
-	authRefreshers        int
-	leaseLock             *flock.Flock
-	leasePath             string
-	storageMu             sync.Mutex
-	runtimeMu             sync.Mutex
-	persistenceLocked     bool
+	ID                string        `json:"id"`
+	Directory         string        `json:"-"`
+	ConfigPath        string        `json:"-"`
+	StoragePath       string        `json:"-"`
+	RuntimePath       string        `json:"-"`
+	Config            AccountConfig `json:"config"`
+	StorageState      StorageState  `json:"-"`
+	Models            []Model       `json:"models,omitempty"`
+	BenefitTier       BenefitTier   `json:"benefit_tier"`
+	State             AccountState  `json:"state"`
+	LastUsed          time.Time     `json:"last_used,omitempty"`
+	runtime           accountRuntimeState
+	active            int
+	exclusive         bool
+	exclusiveWaiters  int
+	authRefreshers    int
+	leaseLock         *flock.Flock
+	leasePath         string
+	storageMu         sync.Mutex
+	runtimeMu         sync.Mutex
+	persistenceLocked bool
+	// deferredStorage 为只有轮换 Cookie 变化、还没写盘的认证状态（见 cookie_write.go），受 storageMu 保护
+	deferredStorage       *deferredStorage
 	authGeneration        uint64
 	authCheckedAt         time.Time
 	modelAccessGeneration uint64
@@ -742,6 +744,8 @@ type AccountPool struct {
 	authGate atomic.Pointer[AuthFailureGate]
 	// orgDisabledReporter 为 aistudio 内部识别出账号所属组织停用了 AI Studio 时的回调（见 org_disabled.go）；为空时只写账户池的标记
 	orgDisabledReporter atomic.Pointer[OrgDisabledReporter]
+	// storageDirect 为不再暂存轮换 Cookie、每次都直接写盘（生成服务停止后，见 cookie_write.go 的 SetStorageDeferral）
+	storageDirect atomic.Bool
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -971,6 +975,8 @@ func (s *AccountStore) Delete(account *Account) error {
 	}
 	account.storageMu.Lock()
 	lockedByPool := account.persistenceLocked
+	// 目录要删除了：丢弃还没写盘的 Cookie，计时到期时不再写回
+	account.dropDeferredStorageLocked()
 	account.storageMu.Unlock()
 	if lockedByPool {
 		if err := os.RemoveAll(directory); err != nil {
@@ -1423,6 +1429,8 @@ func (p *AccountPool) removeExclusive(account *Account, leaseLock *flock.Flock, 
 		return nil, err
 	}
 	account.storageMu.Lock()
+	// 暂存未写盘的轮换 Cookie 先写出（见 cookie_write.go）：删除失败、账户留在号池时磁盘与内存一致，删除时不会与计时写盘撞上
+	_ = p.flushDeferredLocked(account)
 	account.persistenceLocked = true
 	account.storageMu.Unlock()
 	deleteErr := deleteDirectory(account)
@@ -2185,7 +2193,7 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	if err := l.account.writeStorageLocked(state); err != nil {
 		return err
 	}
 	l.pool.mu.Lock()
@@ -2250,7 +2258,7 @@ func (l *AccountLease) RefreshStorageState(
 		l.authGeneration = currentGeneration
 		return nil
 	}
-	state, err := LoadStorageState(l.account.StoragePath)
+	state, err := l.pool.loadStorageLocked(l.account)
 	if err != nil {
 		return err
 	}
@@ -2261,7 +2269,7 @@ func (l *AccountLease) RefreshStorageState(
 	if err != nil {
 		return err
 	}
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	if err := l.account.writeStorageLocked(state); err != nil {
 		finishCommit(false)
 		return err
 	}
@@ -2360,7 +2368,8 @@ func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	state, err := LoadStorageState(l.account.StoragePath)
+	// 有暂存的轮换 Cookie 时取暂存状态（见 cookie_write.go）：Go 通道发出的 Cookie 与每次都写盘时相同
+	state, err := l.pool.loadStorageLocked(l.account)
 	if err != nil {
 		return StorageState{}, err
 	}
@@ -2392,12 +2401,14 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 		// 让账户卡在需要登录。旧浏览器会随续签被重建，直接丢弃
 		return nil
 	}
-	state, err := LoadStorageState(l.account.StoragePath)
+	previous, err := l.pool.loadStorageLocked(l.account)
 	if err != nil {
 		return err
 	}
-	state.Cookies = mergeStateCookies(state.Cookies, cookies, time.Now())
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	state := cloneStorageState(previous)
+	state.Cookies = mergeStateCookies(previous.Cookies, cookies, time.Now())
+	// 只有轮换 Cookie 变化且 30 秒内写过盘时暂存、到间隔再写（见 cookie_write.go）；其他变化立即写
+	if err := l.pool.persistCookiesLocked(l.account, previous, state); err != nil {
 		return err
 	}
 	l.pool.mu.Lock()
@@ -2431,7 +2442,7 @@ func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, c
 	if !current {
 		return false, nil
 	}
-	state, err := LoadStorageState(account.StoragePath)
+	state, err := p.loadStorageLocked(account)
 	if err != nil {
 		return false, err
 	}
@@ -2443,7 +2454,7 @@ func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, c
 		return false, nil
 	}
 	state.Cookies = merged
-	if err := WriteStorageState(account.StoragePath, state); err != nil {
+	if err := account.writeStorageLocked(state); err != nil {
 		return false, err
 	}
 	p.mu.Lock()
@@ -2513,7 +2524,7 @@ func (p *AccountPool) MergeBrowserLocalStorage(accountID string, generation uint
 	if !current {
 		return false, nil
 	}
-	state, err := LoadStorageState(account.StoragePath)
+	state, err := p.loadStorageLocked(account)
 	if err != nil {
 		return false, err
 	}
@@ -2528,7 +2539,7 @@ func (p *AccountPool) MergeBrowserLocalStorage(accountID string, generation uint
 		return false, nil
 	}
 	state.Origins = merged
-	if err := WriteStorageState(account.StoragePath, state); err != nil {
+	if err := account.writeStorageLocked(state); err != nil {
 		return false, err
 	}
 	p.mu.Lock()
@@ -2690,19 +2701,21 @@ func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string
 		// 响应属于续签前的会话，合并它的 Set-Cookie 会用旧会话的轮换值覆盖新登录态
 		return nil
 	}
-	state, err := LoadStorageState(l.account.StoragePath)
+	previous, err := l.pool.loadStorageLocked(l.account)
 	if err != nil {
 		return err
 	}
 	// 磁盘上的登录 Cookie 已被外部更新（与内存不同）：记下来，由账户目录扫描在账户空闲时重启它的浏览器，
 	// 让浏览器与签名用同一份新 Cookie。只比较几个 Cookie 值，不加锁
-	if LoginIdentity(state) != LoginIdentity(l.account.StorageState) {
+	if LoginIdentity(previous) != LoginIdentity(l.account.StorageState) {
 		externalLoginChanges.Store(l.account.ID, struct{}{})
 	}
+	state := cloneStorageState(previous)
 	if err := state.MergeSetCookieHeaders(headers, requestURL, now); err != nil {
 		return err
 	}
-	if err := WriteStorageState(l.account.StoragePath, state); err != nil {
+	// 只有轮换 Cookie 变化且 30 秒内写过盘时暂存（见 cookie_write.go）
+	if err := l.pool.persistCookiesLocked(l.account, previous, state); err != nil {
 		return err
 	}
 	l.pool.mu.Lock()

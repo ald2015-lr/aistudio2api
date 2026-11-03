@@ -148,7 +148,8 @@ func encodeFunctionDeclarationHint(declaration FunctionDeclaration) ([]any, int6
 		degraded = true
 	}
 	description := declaration.Description
-	if degraded || declaration.Strict {
+	// enum 里有空串时编码去掉了空串（官网拒收），同样附上完整 Schema
+	if degraded || declaration.Strict || schemaHasEmptyEnum(raw) {
 		description = appendSchemaHint(description, "Arguments must follow this JSON Schema: ", raw)
 	}
 	var wireDescription any
@@ -186,6 +187,15 @@ func encodeResponseSchema(raw json.RawMessage) ([]any, error) {
 // encodeResponseSchemaHint 同 encodeResponseSchema，另返回降级时附在根说明里的完整 Schema 提示字数（没有附时为 0）
 func encodeResponseSchemaHint(raw json.RawMessage) ([]any, int64, error) {
 	wire, err := encodeJSONSchema(raw)
+	if err == nil && schemaHasEmptyEnum(raw) {
+		// enum 里的空串编码时去掉了（官网拒收）：完整 Schema 附在根节点说明里
+		description, _ := wireDescription(wire)
+		hinted := appendSchemaHint(description, "The response must follow this JSON Schema: ", raw)
+		if hinted == description {
+			return wire, 0, nil
+		}
+		return setWireField(wire, 2, hinted), schemaHintChars(description, hinted), nil
+	}
 	if err == nil || isSchemaLimitError(err) {
 		return wire, 0, err
 	}
@@ -206,6 +216,15 @@ func encodeResponseSchemaHint(raw json.RawMessage) ([]any, int64, error) {
 		return nil, 0, err
 	}
 	return wire, schemaHintChars(description, hinted), nil
+}
+
+// wireDescription 返回已编码 Schema 数组的说明（第 3 位）
+func wireDescription(wire []any) (string, bool) {
+	if len(wire) <= 2 {
+		return "", false
+	}
+	description, ok := wire[2].(string)
+	return description, ok
 }
 
 // toolSchemaShape 提取工具参数的层级与类型，供 Playground 编码；depth 防止病态嵌套

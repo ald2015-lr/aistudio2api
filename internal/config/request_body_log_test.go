@@ -29,8 +29,8 @@ func TestRequestBodyLogConfig(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.fail {
-			if err == nil {
-				t.Fatalf("%q 应报错", test.content)
+			if requireInvalidKey(t, test.content, cfg, err, "REQUEST_BODY_LOG"); cfg.RequestBodyLog {
+				t.Fatalf("%q：无效时应取默认值 false", test.content)
 			}
 			continue
 		}

@@ -898,6 +898,11 @@ func (syncer *catalogSyncer) noteAuthRequired(accountID string, at time.Time) {
 	}
 	var modTime time.Time
 	if account, err := syncer.service.pool.Account(accountID); err == nil {
+		// 先写出只有轮换 Cookie 变化、暂存未写盘的认证状态（见 aistudio/cookie_write.go）再记修改时间：否则暂存稍后到期写盘（或停止服务时
+		// 写出）会改掉修改时间，下次启动按“认证文件改过、用户重新登录过”清掉这条记录，失效账户又排到预热前面
+		if flushErr := syncer.service.pool.FlushDeferredStorage(accountID); flushErr != nil && syncer.service.requests != nil {
+			syncer.service.requests.log(account.Config.Label, "WARN", "暂存的认证 Cookie 写盘失败，需要登录记录的修改时间可能不准 | 错误="+flushErr.Error())
+		}
 		modTime, _ = fileModTime(account.StoragePath)
 	}
 	syncer.cache.noteAuthRequired(accountID, at, modTime)

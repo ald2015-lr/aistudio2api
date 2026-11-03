@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 )
@@ -46,8 +45,11 @@ func TestLegacyShortRequestTimeoutLoads(t *testing.T) {
 	if err := os.WriteFile(path, []byte("AISTUDIO_AUTH_STATES=auth\nREQUEST_TIMEOUT=8s\nPRIMARY_QUEUE_WAIT=9s\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "PRIMARY_QUEUE_WAIT") {
-		t.Fatalf("显式超过请求超时的排队上限应读取失败并指明 PRIMARY_QUEUE_WAIT，实际 err=%v", err)
+	// 显式超过请求超时的排队上限：按默认值（不超过请求超时）启动并记入无效项，不再整个读取失败
+	if cfg, err := Load(path); err != nil {
+		t.Fatalf("排队上限超过请求超时应按默认值载入，实际 err=%v", err)
+	} else if requireInvalidKey(t, "PRIMARY_QUEUE_WAIT=9s", cfg, err, "PRIMARY_QUEUE_WAIT"); cfg.PrimaryQueueWait != 8*time.Second {
+		t.Fatalf("排队上限应改回不超过请求超时的默认值 8s，得到 %s", cfg.PrimaryQueueWait)
 	}
 
 	// 进程环境变量给出的短请求超时同样适用

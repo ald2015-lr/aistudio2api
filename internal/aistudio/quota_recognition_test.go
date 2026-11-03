@@ -56,7 +56,7 @@ func decodeQuotaShapes(t *testing.T, status string) map[string]*RPCError {
 		decoded[name] = DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(payload))
 	}
 	var trailer *RPCError
-	if err := buildTrailerError(json.RawMessage(status)); !errors.As(err, &trailer) {
+	if err := trailerError(buildProxyStreamedMethod, json.RawMessage(status)); !errors.As(err, &trailer) {
 		t.Fatalf("Build 流尾错误=%v", err)
 	}
 	decoded["Build 流尾"] = trailer

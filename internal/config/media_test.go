@@ -54,11 +54,13 @@ func TestMediaConfigLoad(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.fail != "" {
-			if err == nil || !strings.Contains(err.Error(), test.fail) {
-				t.Fatalf("%q 应报 %s 错误，得到 %v", test.content, test.fail, err)
+			// 取值无效时按默认值启动并记入无效项；服务地址可能带账号密码，原值不记录
+			item := requireInvalidKey(t, test.content, cfg, err, test.fail)
+			if strings.Contains(item.Value+item.Reason, "secret-value") || test.fail == "MEDIA_BASE_URL" && item.Value != "" {
+				t.Fatalf("无效项不应包含服务地址原值: %+v", item)
 			}
-			if strings.Contains(err.Error(), "secret-value") {
-				t.Fatalf("错误不应包含密码: %v", err)
+			if !cfg.Media.Equal(DefaultMediaSettings()) {
+				t.Fatalf("%q：无效项应改回默认值，得到 %+v", test.content, cfg.Media)
 			}
 			continue
 		}

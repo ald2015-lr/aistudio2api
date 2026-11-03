@@ -152,13 +152,15 @@ localStorage 由站点脚本之前运行的 preload 按 origin 恢复，只写�
 | 文件 | 内容 |
 | --- | --- |
 | `auth/<Google 邮箱>/account.json` | 邮箱、enabled（缺少该字段按启用读取）、proxy（规范化后的上游 URL，可含账号密码，明文保存，文件 0600）、locale、timezone |
-| `auth/<Google 邮箱>/storage-state.json` | Cookie、localStorage 和可选 Chrome 续签材料 |
+| `auth/<Google 邮箱>/storage-state.json` | Cookie、localStorage 和可选 Chrome 续签材料；只有轮换 Cookie（`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`）的值或过期时间变化、且文件 30 秒内写过时不立即写盘，最新状态暂存在账户上、到 30 秒写出（见下文） |
 | `auth/<Google 邮箱>/camoufox-fingerprint.json` | 账户固定的 navigator、屏幕、字体、语言、地区和时区配置 |
 | `auth/<Google 邮箱>/runtime-state.json` | 账户权益、实测模型资格、冷却与 Drive/Veo 资源绑定 |
 | `auth/<Google 邮箱>/camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存（上限 256 MB），使用它的 WAA Worker 持有目录内 `.lock` 独占；`.created` 记录这份缓存的创建时间，超过 3 天的在下次启动拿到锁后先清空再用；页面状态类启动失败后清空（12 小时内新建或清空过的不清，同账户 10 分钟最多一次），见 [开发文档](development.md#账户浏览器缓存) |
 | `auth/.leases/<Google 邮箱>.lock` | 同一账户目录的跨进程占用锁 |
 | `auth/.leases/<Google 邮箱>.runtime.lock` | 每次 `runtime-state.json` 读取、合并与写回的短事务锁 |
 | `[用户缓存]/AIStudio2API/runtime-leases/<Google 邮箱>.lock` | 当前电脑上该邮箱的 WAA Worker 占用锁 |
+
+认证文件的 Cookie 写回：每个受保护请求结束后把浏览器 Cookie 合并写回（`ReplaceCookies`），Go 通道的响应 `Set-Cookie` 也逐次合并（`MergeSetCookieHeaders`）。合并后与当前状态相比只有轮换 Cookie 的值或过期时间不同（按 name、domain、path 对应，顺序不算变化）、且文件修改时间在 30 秒内时，合并结果暂存在账户上（受账户的 storage 锁保护），内存里的状态照常更新，到 30 秒时由计时器写盘；其他任何 Cookie 变化立即写盘，连同暂存的轮换值。持 storage 锁读认证文件的路径（Go 通道发请求前的 `ReloadStorageState`、续签、Set-Cookie 合并、Worker 启动后的 Cookie 与 localStorage 写回）先取暂存状态；Worker 冷启动前先写盘，删除账户前也先写出。生成服务停止时（Worker 都已重置）把全部暂存写盘，之后这个账户池直接写、不再暂存（`AccountPool.SetStorageDeferral`，启动时恢复）：停止再启动时新一代生成服务先建好、旧一代最后才关闭，新一代从磁盘载入认证文件，读到的是最新值。进程关闭时在关闭 Worker 之前写一次（Worker 多、关闭超过 `STOP_TIMEOUT` 被强杀时也已落盘），关闭之后再写一次收尾。写盘间隔按文件修改时间算，修改时间在未来（从时钟偏快的机器拷来、解压保留了时间、手动 touch）时按刚写过处理，但最多等 30 秒。暂存之后文件被外部改过（修改时间或大小变化，如重新上传）或认证代际变了（新登录、续签）时丢弃暂存、以磁盘为准。本进程正常运行与正常停止时发给 Google 的 Cookie 与每次都写盘时相同；进程被强杀（OOM、`kill -9`、守护脚本判定卡死后结束进程）时每个账号最多丢失 30 秒内的轮换 Cookie，重启后带的是稍早的值（与浏览器自身约每 30 秒落盘一次 Cookie 相当）。
 
 Google 邮箱的小写形式同时作为账户目录、管理页面标识和日志来源。新账户的 locale 与 timezone 读取当前电脑设置，管理页面使用浏览器语言和 IANA 时区；CLI 使用操作系统语言和时区。初始化、WAA、MakerSuite、OAuth 续签和 Drive 使用账户固定代理。代理带账号密码时，Camoufox（WAA Worker、隔离登录与登录验证）经 `127.0.0.1` 随机端口上的本机中转连接上游代理（Firefox prefs 没有账号密码字段），隧道内字节不变；Go 侧请求（MakerSuite、Drive、WebChannel、Go WAA、Chrome OAuth 导入与续签）直接带认证连接上游，两条路径的出口相同；不带账号密码的代理不经过中转，见 [开发文档](development.md#本机代理中转)。locale 同时设置 navigator language、Accept-Language 与地区，timezone 设置浏览器时区；重新登录和 WAA runtime 复用同一账户指纹。同一电脑上的多个进程按邮箱共享 WAA runtime lease，调度器只会为未被占用的邮箱创建 Worker。
 
@@ -701,9 +703,11 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 | 18 | missing_thought_signature | 19 | `provider_19` |
 | 其他整数 | `provider_<code>` | | |
 
-错误响应根形状为 `[null,[code,message,...]]`。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
+错误响应根形状为 `[null,[code,message,...]]`。HTTP 200 的流在帧列表之后也可能带 google.rpc 状态：`[[帧...],[code,message,details]]`，code 不为 0 时按 Interaction 同一张表换算 HTTP 状态（3→400、4→504、5→404、7→403、8→429、9→400、13→500、14→503、16→401，其余 502），带 ErrorInfo 与 RetryInfo 的完整状态照常解码；完成帧之后的流尾错误同样交出，先于完成帧校验。流尾为 code 0、`[]`、`null` 或其他不是状态的形状（第一项不是整数）时照常结束，Build 代理的流尾按状态严格校验。原先 Playground 跳过流尾，429 不冷却、5xx 不重试、400 对外成了 502（Build 代理一直这样处理）。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
 
 frame 0 为 null 且带 prompt feedback 时表示上游拒绝当前输入（Build 为没有 candidate 而带 `promptFeedback.blockReason`），形成输入拦截错误。上游给出的拦截说明（Playground 的 prompt feedback `[2]`、Build 的 `promptFeedback.blockReasonMessage`）只附在内部错误与管理日志的 `request.error` 中（`AI Studio 拒绝当前输入: <reason>: <说明>`）；公开协议的错误消息仍按 block reason 统一生成官方措辞，不含这段原文。
+
+客户端还没收到内容时重新生成（Playground 与 Build 代理，Interaction 不在此列）：上游以 `malformed_function_call` 或 `unexpected_tool_call` 结束，或流在完成帧之前中断（读取响应出错、响应在 JSON 结构中途结束即 `io.ErrUnexpectedEOF`/`io.EOF`、正常结束却没有完成帧）、流尾为 5xx 状态（504 `DEADLINE_EXCEEDED` 除外：上游在这个账号上超时，同账号再来多半还是超时，交给换号），而这次请求还没有向客户端交出任何事件（正文、思考、签名、工具调用、媒体、来源；协议层的数据型心跳不算）时，在同一租约、同一账号上重新发送同一请求。每个请求最多 2 次，同一请求换号后的尝试共用这 2 次；每次重新生成先像取得租约一样占用每账号每分钟名额（`ACCOUNT_RPM_LIMIT`）与出口令牌（`AccountLease.ReserveRegeneration`），账号已冷却、名额已满或出口不准入时不重新生成，原样交出结果（错误照旧由换号与冷却规则处理），说明里写明是哪一项（冷却截止与原因、窗口内已发出 + 预占 / 上限、出口的脱敏显示与限速）。因结束原因（`malformed_function_call`、`unexpected_tool_call`）重新生成时换一个输入：上游对完全相同的输入返回完全相同的回复，原样重发多半还是同一个错误调用，app 层在加过随机后缀的请求上挂换后缀的函数（`aistudio.ContextWithRegenerationVariant`，见 `app/duplicates.go` 的 `promptNonceVariant`），重发前把后缀换成新的、按第一次发送的步骤（媒体默认值、图片路由、语音台词分段、去掉停止序列）重建线格式请求；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE` 关闭）不因结束原因重新生成。流中断与流尾 5xx 不是确定性的，照旧原样重发。几次生成共用首事件前期限（`REQUEST_TIMEOUT`）：重新生成前按 `ctx.Deadline()` 比较，剩余时间不到这次耗时的 1.2 倍时不重新生成、按这次的结果结束，免得把本可以交出的结果拖成 504、白白多烧一次额度。首事件超时（`FIRST_EVENT_TIMEOUT`）由 app 层经 `aistudio.ContextWithFirstEventClock` 交来，按每次发送计：重发前与重发开始向上游发送时重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成，免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时并换号。确定性的格式不符不算中断、不重新生成：上游字段类型变了（`json.UnmarshalTypeError`）、函数调用缺少名称、JSON 语法错误，同账号重发只会得到同样的结果。前几次的用量与结束事件丢弃，只交出最后一次的，用量账本与访问日志只记一次；重新生成的发送不报告请求阶段（“WAA proof 完成”“上游已返回响应头”与首事件计时只按第一次），每次写一行请求说明（`ReportRequestNote`：有观察者时只交给观察者，经 `/trace/` 的请求只出现在排查记录的时间线里，不另写一份 notes；见 [logging.md](logging.md)），附上被放弃那次的耗时与原文（结束说明 `finishMessage`、流尾错误说明或中断时的错误，截断到 200 字）；降级判定从第一块正文起计时，不受影响。已经交出事件的照旧结束：429、400 等其他错误不重新生成。非流式请求同样以“已交出事件”为界：思考摘要先交给 app 层、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成（交出的事件已经过 app 层的首事件判定、降级判定与访问日志，四个协议的非流式汇总也没有撤回已收集思考的办法）。
 
 各协议的具体终态转换如下：
 
@@ -853,9 +857,12 @@ Schema 归一化规则：
 | `required` 列出而 `properties` 没有定义的属性（MCP 与 agent 客户端常见） | 函数参数补上不限类型的定义 `{}`，上游不再以 `property is not defined` 拒绝；递归处理 `properties`、`$defs`、`definitions`、`items`、`additionalProperties`、`not`、`anyOf`、`oneOf`、`allOf`、`prefixItems`；`properties` 不是 object 时不补 |
 | `items: true` / `items: false` | `true` 不限制元素；`false` 编码为 `maxItems=0`，元素类型按缺省补齐 |
 | `properties` 中的 `true` / `null` / `false` | `true` 与 `null` 按开放节点处理；`false` 删除该属性并同步移出 `required` |
-| `not` 为 `null`、`false`、`true`、`""`、空对象 | 删除；`true` 本应禁止所有值，按宽松处理 |
+| `not` 为 `null`、`false`、`true`、空对象 | 删除；`true` 本应禁止所有值，按宽松处理 |
 | `not: {"type":"null"}` | `nullable=false` |
 | `not` 为字符串或数组 | 转为 `not: {"enum": [...]}` |
+| `enum` 含空串 `""` | 官网拒收（整单 400 `Request contains an invalid argument.`）：线格式去掉空串，去完为空时不写 `enum`；函数说明或结构化输出根说明附上完整 Schema（`const: ""` 同样） |
+| `not` 排除空串（`not: ""`、`not: {"enum":[""...]}`、`not: {"const":""}`、数组写法含 `""`） | 纯枚举排除（`not` 里除 `enum` 或字符串 `const` 外只有 `type:"string"` 与说明字段）且节点类型为 string 时写 `minLength: 1`（已有不小于 1 的不动），其余排除值照旧写进 `not.enum`；联合类型、其他节点类型与带其他约束（如 `pattern`）的 `not` 只去掉空串，不收紧其余取值；没有剩下的排除值时删除 `not` |
+| `not` 里用组合写出的空串排除（`not: {"anyOf":[{"const":""}]}`、`not` 内的对象属性或数组元素为 `const: ""` 等） | 去掉空串后子 Schema 只剩类型、取反就成了“一律禁止”：编码时跟踪 `not` 的奇偶层，`not` 之内 `anyOf`、`oneOf` 被放宽的分支删除（并集变小，取反后只会少排除），分支全删或 `items`、`properties`、`allOf` 被放宽时删除整个 `not`，宁可放宽，不发出无法满足的约束 |
 | `type: [T, "null"]` | 根类型 `T` 与 `nullable=true` |
 | `anyOf` / `oneOf` 的 null 分支 | 移除 null 分支并设置 `nullable=true` |
 | 多个非 null `type` | 首项作为根类型，完整类型集合写入 `anyOf` |
@@ -864,7 +871,7 @@ Schema 归一化规则：
 | array 缺少 `items` | `prefixItems` 中带类型的项组成 `anyOf`；没有时为 string |
 | 其他 Schema 字段 | 降级编码：只编码层级与类型，完整 Schema 附在说明里（函数参数附在函数说明，结构化输出附在根节点说明；见下文） |
 
-函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道发送 `parametersJsonSchema`，不经过降级，字符串整数原样发送，只补齐 `required` 中未定义的属性；Gemini 入口 `parameters` 的 OpenAPI 写法（new-api 把 OpenAI 的 parameters 转成 Gemini 请求时就是这种：类型名大写如 `OBJECT`、`STRING`，`nullable`，字符串枚举的 `format: enum`）先转成 JSON Schema：类型名改小写、`TYPE_UNSPECIFIED` 去掉，`nullable:true` 改为类型数组加 `"null"`（没有 `type` 但有 `anyOf` 时补一个 `{"type":"null"}` 分支；带 `enum` 时给 `enum` 补上 `null`，否则 null 不满足 enum、字段实际不可为 null），`format: enum` 去掉、其余 `format` 保留，子 Schema 逐层同样处理；本来就是 JSON Schema 时原样发送。Playground 通道不经过这一步（Schema 编码本来就接受这些写法）。
+函数参数 Schema 含 Playground 无法编码的写法（`$ref`/`$defs`、`uniqueItems`、`examples`、数值或 null 常量、非字符串 `enum` 等）时不再让请求失败：只编码层级与类型（常量与非字符串枚举写进字段说明），并在函数说明末尾附上 `Arguments must follow this JSON Schema: <完整 Schema>`（压缩后超过 16 KB 时不附）。`strict` 函数与 `enum` 含空串的函数同样附上完整 Schema。超过 1 MiB 或 64 层嵌套的 Schema 仍返回 400。Build 通道发送 `parametersJsonSchema`，不经过降级，字符串整数原样发送，只补齐 `required` 中未定义的属性；Gemini 入口 `parameters` 的 OpenAPI 写法（new-api 把 OpenAI 的 parameters 转成 Gemini 请求时就是这种：类型名大写如 `OBJECT`、`STRING`，`nullable`，字符串枚举的 `format: enum`）先转成 JSON Schema：类型名改小写、`TYPE_UNSPECIFIED` 去掉，`nullable:true` 改为类型数组加 `"null"`（没有 `type` 但有 `anyOf` 时补一个 `{"type":"null"}` 分支；带 `enum` 时给 `enum` 补上 `null`，否则 null 不满足 enum、字段实际不可为 null），`format: enum` 去掉、其余 `format` 保留，子 Schema 逐层同样处理；本来就是 JSON Schema 时原样发送。Playground 通道不经过这一步（Schema 编码本来就接受这些写法）。
 
 `required` 补齐在 Playground 编码、Build `parametersJsonSchema` 与 `strict` 参数核对三处一致（核对用补齐后的 Schema，`additionalProperties:false` 时这些必填属性才可能满足，缺少必填属性的调用仍判为不符合）。大小与嵌套检查在前：超过 1 MiB 的 Schema 原样交给原有处理（Playground 返回 400，Build 原样发送）；已处于嵌套上限的节点不补，补齐不会让原本合规的 Schema 超过嵌套上限。不需要补齐时原样发送原始字节；补齐后重新编码，数值保留原写法，键顺序与空白可能变化。
 
@@ -1166,6 +1173,8 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 实时 WebSocket | `GET /v1/live`、`GET /v1/robotics/stream` |
 
 上表全部端点另有 `/ultra` 前缀的版本（`/ultra/v1/...`、`/ultra/v1beta/...`），去掉前缀后交给与主路由完全相同的处理链（API key、CORS、来源检查、请求体上限、请求日志、排查记录与正文记录），只是请求只使用 Ultra 号池的账户；去掉前缀时保留客户端的转义（如 ID 中的 `%2F`），与直接请求 `/v1` 时匹配到同一个路由；客户端的接口地址为 OpenAI `http://<host>:<port>/ultra/v1`、Anthropic `http://<host>:<port>/ultra`、Gemini `http://<host>:<port>/ultra`（请求 `/ultra/v1beta/...`）。其余 `/ultra/*` 路径返回 404；排查路由 `/trace/` 按普通路径的规则选号，`/trace/ultra/v1/...` 去掉两个前缀并只用 Ultra 号池，`/ultra/trace/...` 返回 404。`/ultra` 请求在 Ultra 号池为空或账户都不可调度时返回 503（消息说明 Ultra 号池没有可用账户），全部冷却返回 429 与 `Retry-After`；`ULTRA_PRIMARY_MODELS` 中的模型没有额度时立即返回 429 与 `Retry-After`（见下文 `PrimaryQuotaError`）；引用的文件、视频或 operation 绑定在另一号池的账户上时（`ULTRA_EXCLUSIVE=true` 时普通路径引用 Ultra 号池账户的资源同样如此，含 `ULTRA_INCLUDE_PRO=true` 时 Pro 账户上的资源）按各协议格式返回 400，消息说明资源属于哪个号池。资源不随 `ULTRA_INCLUDE_PRO` 切换迁移，是否放行按资源所属账户当前的号池判断：开启后，`ULTRA_EXCLUSIVE=true` 时经普通路径引用 Pro 账户上已有的资源返回 400（消息说明资源属于 Ultra 号池，要改用 `/ultra`），`ULTRA_EXCLUSIVE=false` 时普通路径不检查号池，开启不会产生 400；关闭后经 `/ultra` 引用 Pro 账户上的资源返回 400（消息说明资源属于普通号池，要改用普通路径）。`/ultra/v1/models`、`/ultra/v1beta/models` 与 Anthropic 模型列表只列 Ultra 号池账户可用的模型。
+
+`/v1/`、`/v1beta/` 下没有注册的路径或方法不对（如 `GET /v1/chat/completions`）的请求返回 404，错误体按 `protocolForRequest` 选协议，消息为 `Invalid URL (<方法> <转义后的路径>)`：`/v1beta/` 与 `/v1/interactions` 为 Gemini 格式（`status: "NOT_FOUND"`），`/v1/messages` 开头或带 `Anthropic-Version` 头为 Anthropic 格式（`not_found_error`），其余为 OpenAI 格式（`invalid_request_error`，`param` 与 `code` 为 null，与官方一致）；`/ultra`、`/trace` 前缀去掉后同样处理，消息里是去掉前缀后的路径。API key 校验在前，没带密钥时仍返回 401。原先是 Go 默认的纯文本 `404 page not found` 与 405。
 
 动态路由的注册形状为 `GET /v1/files/{file}`、`GET /v1/files/{file}/content`、`DELETE /v1/files/{file}`、`GET /v1/videos/{video}`、`GET /v1/videos/{video}/content`、`POST /v1beta/models/{action}` 与 `GET /v1beta/operations/{operation}`；端点表中的 `{id}` 表示对应资源标识。
 
@@ -1550,7 +1559,7 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 | `/v1/audio/transcriptions` | multipart `file`；`model` 默认 `gemini-3.5-transcribe` | 文本或转录 JSON |
 | `/v1/videos` | `model`、`prompt` | 长任务对象，随后轮询并下载内容 |
 
-Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理：以模型文字消息结尾的历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（见上文分轮修正）。以工具调用结尾的历史仍按缺少工具结果处理。
+Anthropic assistant prefill 以最后一条 `assistant` message 表示。AI Studio 当前没有对应生成前缀字段，`/v1/messages` 与其他三个入口一样按续写处理（`prepareGenerate`，模型名后缀解析之后按规范模型 ID 决定）：接受以 model 轮结尾的模型（`aistudio.NativePrefillModel`：`gemini-3.1-pro-preview`、`gemini-pro-latest`、`gemini-3.1-flash-lite`、`gemini-3-flash-preview`、`gemini-nano-banana-2.1`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、`gemini-3-pro-image`、`gemini-2.5-flash-image` 与 `gemma-` 前缀，取自上游 Mag1cFall/AIStudio2API 的名单）原样以模型轮结尾发送（`GenerateRequest.PrefillTail`），由模型从这段文字结尾原生续写；其余模型在历史末尾补一条请模型从上一条消息结尾处接着写、不重复已有内容的用户消息（`aistudio.PrefillContinuationPrompt`）。Omni 经 CreateInteractionStream 编码，不在名单里。名单内的模型上游仍返回 400 且说明含 `model turn`、`ending with a model`、`last turn`、`final turn` 或 `last message`（如 “Requests ending with a model turn are not supported”）时——无论是发送时的 HTTP 400 还是流尾 400、只要客户端还没收到内容——同一请求改回补用户消息重发一次（不占重新生成次数，但与重新生成一样先经 `AccountLease.ReserveRegeneration` 占每分钟名额与出口令牌；账号已冷却、名额已满或出口不准入时不在本次尝试重发，写一行说明并交出 `*aistudio.PrefillRetryError`（`Unwrap` 为上游的 400，流尾 400 时作为首个事件），app 层按可换号的错误处理：不冷却、不计入连续失败上限与出口判定、不占换号次数，不固定账号的请求换号、指定账号的请求在原账号再试，每个请求最多 2 次，下一次尝试经 `applyPrefillMemory` 补用户消息），写一行请求说明，并按模型与通道记住 1 小时（不重发时同样记住），期间同模型同通道直接补用户消息。计数接口照旧补用户消息后计数。以工具调用结尾的历史仍按缺少工具结果处理。
 
 流式请求在写出响应头前最多等待首个事件 10 秒（主用模型为对应列表的排队上限加 5 秒与 10 秒中的较大者，按请求的号池取：`/ultra` 上的 `ULTRA_PRIMARY_MODELS` 为 `ULTRA_PRIMARY_QUEUE_WAIT`，普通路径上的 `PRIMARY_MODELS` 为 `PRIMARY_QUEUE_WAIT`，`ULTRA_EXCLUSIVE=false` 时普通路径上只在 Ultra 列表里的模型为 `ULTRA_PRIMARY_QUEUE_WAIT`）：首个事件之前出现的参数错误、无可用账号、全部冷却、号池繁忙、Ultra 主用模型额度不足、降级拒绝等错误按非流式返回 HTTP 状态与官方格式的错误对象；等待期内没有事件时照常开始推流，之后的错误仍在流内返回（号池繁忙的 429 以 HTTP 状态返回同样是尽力而为：排队预算整个请求共用一份，换号重试与退避都计入，通常早于这个等待；Ultra 主用模型的请求自己现场冷启动时，等待按启动时长延后（启动期间不开始推流；合计不超过 `INIT_TIMEOUT`，且从调用生成服务算起扣住响应头合计不超过 50 秒，主用模型的等待本身超过 50 秒时也按 50 秒，见本节后面的“首个事件之前扣住响应头”），冷启动后才遇到的额度不足通常同样以 HTTP 状态返回；普通号池的主用模型在请求自己现场冷启动或候选冷却延后了截止时间而晚于这个等待时，在流内返回）。既没有系统提示也没有对话内容的请求在选择账户前返回 400。
 
@@ -1932,7 +1941,7 @@ server tool 的 `cache_control`、`defer_loading` 等只影响 Anthropic 自身�
 }
 ```
 
-content 输出 block 为 `text`、`thinking`、`redacted_thinking`、`tool_use`、`server_tool_use` 或 `web_search_tool_result`。stop reason 为 `end_turn`、`tool_use`、`stop_sequence`、`max_tokens`、`pause_turn` 或 `refusal`。`POST /v1/messages/count_tokens` 接受同一 message/system/tools 输入并返回 `{"input_tokens":<INT>}`；它提供独立计数估算，PDF 等媒体请求的最终用量以生成响应 `usage.input_tokens` 为准。
+content 输出 block 为 `text`、`thinking`、`redacted_thinking`、`tool_use`、`server_tool_use` 或 `web_search_tool_result`。非流式响应里搜索块放在开头的 `thinking`、`redacted_thinking` 之后、正文与工具调用之前，与官方顺序一致（原先拼在全部内容之后）；流式响应的正文实时写出，搜索块仍在流尾。stop reason 为 `end_turn`、`tool_use`、`stop_sequence`、`max_tokens`、`pause_turn` 或 `refusal`。`POST /v1/messages/count_tokens` 接受同一 message/system/tools 输入并返回 `{"input_tokens":<INT>}`；它提供独立计数估算，PDF 等媒体请求的最终用量以生成响应 `usage.input_tokens` 为准。
 
 Anthropic 响应中的媒体编码为 text block 中的 Markdown：`MEDIA_OUTPUT=inline` 时为 data URL，`url` 时为本服务链接（见下文“生成媒体链接”），代码编码为 fenced text。Google Search 的每个去重查询生成一组 `server_tool_use` 和 `web_search_tool_result`，结果按 URL 去重，来源集合覆盖本次搜索的全部查询。`usage.server_tool_use.web_search_requests` 记录上游报告的去重查询数，`web_fetch_requests` 为 `0`。URL Context 等其余引用在末尾追加 `Sources:` Markdown 列表。
 

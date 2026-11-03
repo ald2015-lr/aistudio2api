@@ -706,6 +706,17 @@ export interface ServiceConfig {
   // omni_ignore_system_prompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT）：发给能输出视频的 Omni 模型的请求去掉客户端的系统提示，
   // 保存后立即生效。服务端总是返回该字段，因此这里不是可选字段
   omni_ignore_system_prompt: boolean
+  // invalid_config 为 .env 或进程环境变量里取值无效、已按默认值生效的配置项，只读；没有时服务端不返回
+  invalid_config?: InvalidConfigValue[]
+}
+
+// InvalidConfigValue 为一项取值无效、已按默认值生效的配置：value 为原值（凭据类配置不返回），reason 为服务端的说明，
+// environment 为取值来自进程环境变量（在设置页保存改不了它）
+export interface InvalidConfigValue {
+  key: string
+  value?: string
+  reason: string
+  environment?: boolean
 }
 
 // ProxyTestProbe 为“测试代理”一条路径的结果：成功时 ip 为出口 IP，失败时 error 为说明（不含账号密码）

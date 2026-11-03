@@ -183,6 +183,8 @@ type Config struct {
 	// RequestBodyLog 为真时用量账本同时保存公开 API POST 请求与响应的截断正文（明文保存在本机，默认关闭）
 	RequestBodyLog bool   `json:"request_body_log"`
 	AdminPassword  string `json:"-"`
+	// Invalid 为加载时取值无效、已改用默认值的配置项（见 invalid.go），只由 Load 填写；启动日志与管理页逐项提示
+	Invalid []InvalidValue `json:"-"`
 }
 
 // DefaultProxyAPIKey 为没有设置 PROXY_API_KEY 时使用的公开 API 密钥。公开 API 始终要求密钥，
@@ -231,211 +233,178 @@ func Default() Config {
 	}
 }
 
-// Load 从指定 env 文件和进程环境加载配置
+// Load 从指定 env 文件和进程环境加载配置。取值无效的项改用默认值并记入 Config.Invalid（见 invalid.go），
+// 决定网络出口、WAA 发送路径、上游通道、Worker 打开的官网页面与是否自动启动生成服务的键（PROXY、PROXY_POOL_*、WAA_BACKEND、
+// UPSTREAM_CHANNELS、TEMPORARY_CHAT、AUTO_START）无效时返回错误
 func Load(path string) (Config, error) {
 	values, err := readEnvFile(path)
 	if err != nil {
 		return Config{}, err
 	}
 	// 进程环境变量优先于 .env；空值视为未设置，避免 docker compose 的 ${VAR} 在宿主机没有设置时把 .env 里的值清空
+	environment := make(map[string]bool)
 	for _, key := range configKeys {
 		if value, ok := os.LookupEnv(key); ok && strings.TrimSpace(value) != "" {
 			values[key] = value
+			environment[key] = true
 		}
 	}
 
 	cfg := Default()
-	if value, ok := values["AISTUDIO_AUTH_STATES"]; ok {
-		cfg.AuthStates = strings.TrimSpace(value)
+	loader := &envLoader{values: values, environment: environment}
+	text := func(key string, target *string) {
+		_ = loader.field(key, false, func(value string) error {
+			*target = strings.TrimSpace(value)
+			return nil
+		})
 	}
-	if value, ok := values["LISTEN_ADDR"]; ok {
-		cfg.ListenAddr = strings.TrimSpace(value)
+	parseBool := func(key string, target *bool) func(string) error {
+		return func(value string) error {
+			parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+			if err != nil {
+				return fmt.Errorf("%s 必须是 true 或 false", key)
+			}
+			*target = parsed
+			return nil
+		}
 	}
-	if value, ok := values["PROXY_API_KEY"]; ok {
+	boolean := func(key string, skipEmpty bool, target *bool) {
+		_ = loader.field(key, skipEmpty, parseBool(key, target))
+	}
+	integer := func(key string, skipEmpty bool, parse func(string, string) (int, error), target *int) {
+		_ = loader.field(key, skipEmpty, func(value string) error {
+			parsed, err := parse(key, value)
+			if err != nil {
+				return err
+			}
+			*target = parsed
+			return nil
+		})
+	}
+	duration := func(key string, skipEmpty bool, parse func(string, string) (time.Duration, error), target *time.Duration) {
+		_ = loader.field(key, skipEmpty, func(value string) error {
+			parsed, err := parse(key, value)
+			if err != nil {
+				return err
+			}
+			*target = parsed
+			return nil
+		})
+	}
+	models := func(key string, target *[]string) {
+		_ = loader.field(key, false, func(value string) error {
+			*target = ParseModelList(value)
+			return nil
+		})
+	}
+
+	text("AISTUDIO_AUTH_STATES", &cfg.AuthStates)
+	text("LISTEN_ADDR", &cfg.ListenAddr)
+	_ = loader.field("PROXY_API_KEY", false, func(value string) error {
 		cfg.ProxyAPIKey = EffectiveProxyAPIKey(value)
-	}
-	if value, ok := values["PROXY"]; ok {
-		// 手写的 host:port:用户名:密码 等写法在这里改写成规范 URL，保存侧与生效侧都从这里来；无法规范化的值留给 Validate 报错
+		return nil
+	})
+	_ = loader.field("PROXY", false, func(value string) error {
+		// 手写的 host:port:用户名:密码 等写法在这里改写成规范 URL，保存侧与生效侧都从这里来；无法规范化的值由校验报错（启动即报错）
 		cfg.Proxy = CanonicalProxy(value)
-	}
+		return nil
+	})
 	if err := loadProxyPool(values, &cfg.ProxyPool); err != nil {
 		return Config{}, err
 	}
-	if value, ok := values["INIT_TIMEOUT"]; ok {
-		cfg.InitTimeout, err = parsePositiveDuration("INIT_TIMEOUT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["REQUEST_TIMEOUT"]; ok {
-		cfg.RequestTimeout, err = parsePositiveDuration("REQUEST_TIMEOUT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["FIRST_EVENT_TIMEOUT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.FirstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["WARM_WORKER_LIMIT"]; ok {
-		cfg.WarmWorkerLimit, err = parsePositiveInt("WARM_WORKER_LIMIT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["MAX_ACTIVE_WORKERS"]; ok {
-		cfg.MaxActiveWorkers, err = parsePositiveInt("MAX_ACTIVE_WORKERS", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["ULTRA_EXCLUSIVE"]; ok && strings.TrimSpace(value) != "" {
-		cfg.UltraExclusive, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("ULTRA_EXCLUSIVE 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["ULTRA_INCLUDE_PRO"]; ok && strings.TrimSpace(value) != "" {
-		cfg.UltraIncludePro, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("ULTRA_INCLUDE_PRO 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["ULTRA_WARM_WORKER_LIMIT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.UltraWarmWorkerLimit, err = parseNonNegativeInt("ULTRA_WARM_WORKER_LIMIT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["ULTRA_MAX_ACTIVE_WORKERS"]; ok && strings.TrimSpace(value) != "" {
-		cfg.UltraMaxActiveWorkers, err = parsePositiveInt("ULTRA_MAX_ACTIVE_WORKERS", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["WARM_STARTUP_CONCURRENCY"]; ok {
-		cfg.WarmStartupConcurrency, err = parsePositiveInt("WARM_STARTUP_CONCURRENCY", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["PER_ACCOUNT_CONCURRENCY"]; ok {
-		cfg.PerAccountConcurrency, err = parsePositiveInt("PER_ACCOUNT_CONCURRENCY", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
+	duration("INIT_TIMEOUT", false, parsePositiveDuration, &cfg.InitTimeout)
+	duration("REQUEST_TIMEOUT", false, parsePositiveDuration, &cfg.RequestTimeout)
+	duration("FIRST_EVENT_TIMEOUT", true, parseOptionalDuration, &cfg.FirstEventTimeout)
+	integer("WARM_WORKER_LIMIT", false, parsePositiveInt, &cfg.WarmWorkerLimit)
+	integer("MAX_ACTIVE_WORKERS", false, parsePositiveInt, &cfg.MaxActiveWorkers)
+	boolean("ULTRA_EXCLUSIVE", true, &cfg.UltraExclusive)
+	boolean("ULTRA_INCLUDE_PRO", true, &cfg.UltraIncludePro)
+	integer("ULTRA_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.UltraWarmWorkerLimit)
+	integer("ULTRA_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.UltraMaxActiveWorkers)
+	integer("WARM_STARTUP_CONCURRENCY", false, parsePositiveInt, &cfg.WarmStartupConcurrency)
+	integer("PER_ACCOUNT_CONCURRENCY", false, parsePositiveInt, &cfg.PerAccountConcurrency)
 	// 空值沿用默认值，关闭必须写 0
-	if value, ok := values["ACCOUNT_RPM_LIMIT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.AccountRPMLimit, err = parseNonNegativeInt("ACCOUNT_RPM_LIMIT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	}
-	if value, ok := values["ROUTING_STRATEGY"]; ok {
-		cfg.RoutingStrategy = strings.TrimSpace(value)
-	}
-	if value, ok := values["UPSTREAM_CHANNELS"]; ok {
+	integer("ACCOUNT_RPM_LIMIT", true, parseNonNegativeInt, &cfg.AccountRPMLimit)
+	text("ROUTING_STRATEGY", &cfg.RoutingStrategy)
+	_ = loader.field("UPSTREAM_CHANNELS", false, func(value string) error {
 		cfg.UpstreamChannels = ParseUpstreamChannels(value)
-	}
-	if value, ok := values["STREAM_PLAYGROUND_MODELS"]; ok {
-		cfg.StreamPlaygroundModels = ParseModelList(value)
-	}
-	if value, ok := values["PRIMARY_MODELS"]; ok {
-		cfg.PrimaryModels = ParseModelList(value)
-	}
-	if value, ok := values["PRIMARY_QUEUE_WAIT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.PrimaryQueueWait, err = parseOptionalDuration("PRIMARY_QUEUE_WAIT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	} else {
-		cfg.PrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
-	}
+		return nil
+	})
+	models("STREAM_PLAYGROUND_MODELS", &cfg.StreamPlaygroundModels)
+	models("PRIMARY_MODELS", &cfg.PrimaryModels)
+	// 排队上限没有写（或写法无效）时按默认值，但不超过请求超时
+	cfg.PrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
+	duration("PRIMARY_QUEUE_WAIT", true, parseOptionalDuration, &cfg.PrimaryQueueWait)
 	// Ultra 主用模型：键存在时按写的值（空值表示关闭），键不存在时保持默认列表。进程环境变量的空值在上面已被忽略，
 	// 只能经 .env 的空值或管理页清空来关闭
-	if value, ok := values["ULTRA_PRIMARY_MODELS"]; ok {
-		cfg.UltraPrimaryModels = ParseModelList(value)
+	models("ULTRA_PRIMARY_MODELS", &cfg.UltraPrimaryModels)
+	cfg.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
+	duration("ULTRA_PRIMARY_QUEUE_WAIT", true, parseOptionalDuration, &cfg.UltraPrimaryQueueWait)
+	boolean("STREAM_DATA_HEARTBEAT", true, &cfg.StreamDataHeartbeat)
+	boolean("OMNI_IGNORE_SYSTEM_PROMPT", true, &cfg.OmniIgnoreSystemPrompt)
+	// TEMPORARY_CHAT 决定 Worker 打开的官网页面（预热页带不带 &temporary=true、预热提示词会不会自动保存进账号历史）：
+	// 写错时启动即报错，不悄悄按 false 打开普通对话页
+	if err := loader.field("TEMPORARY_CHAT", false, parseBool("TEMPORARY_CHAT", &cfg.TemporaryChat)); err != nil {
+		return Config{}, err
 	}
-	if value, ok := values["ULTRA_PRIMARY_QUEUE_WAIT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.UltraPrimaryQueueWait, err = parseOptionalDuration("ULTRA_PRIMARY_QUEUE_WAIT", value)
-		if err != nil {
-			return Config{}, err
-		}
-	} else {
-		cfg.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
-	}
-	if value, ok := values["STREAM_DATA_HEARTBEAT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.StreamDataHeartbeat, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("STREAM_DATA_HEARTBEAT 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["OMNI_IGNORE_SYSTEM_PROMPT"]; ok && strings.TrimSpace(value) != "" {
-		cfg.OmniIgnoreSystemPrompt, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("OMNI_IGNORE_SYSTEM_PROMPT 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["TEMPORARY_CHAT"]; ok {
-		cfg.TemporaryChat, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("TEMPORARY_CHAT 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["IGNORE_CLIENT_SEED"]; ok && strings.TrimSpace(value) != "" {
-		cfg.IgnoreClientSeed, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("IGNORE_CLIENT_SEED 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["REPEAT_PROMPT_NONCE"]; ok && strings.TrimSpace(value) != "" {
-		cfg.RepeatPromptNonce, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("REPEAT_PROMPT_NONCE 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["MIN_OUTPUT_TOKENS"]; ok && strings.TrimSpace(value) != "" {
-		parsed, parseErr := strconv.Atoi(strings.TrimSpace(value))
-		if parseErr != nil || parsed < 0 {
-			return Config{}, fmt.Errorf("MIN_OUTPUT_TOKENS 必须是 0 或正整数")
+	boolean("IGNORE_CLIENT_SEED", true, &cfg.IgnoreClientSeed)
+	boolean("REPEAT_PROMPT_NONCE", true, &cfg.RepeatPromptNonce)
+	_ = loader.field("MIN_OUTPUT_TOKENS", true, func(value string) error {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil || parsed < 0 {
+			return fmt.Errorf("MIN_OUTPUT_TOKENS 必须是 0 或正整数")
 		}
 		cfg.MinOutputTokens = parsed
-	}
-	if err := loadDowngradeGuard(values, &cfg.DowngradeGuard); err != nil {
-		return Config{}, err
-	}
-	if value, ok := values["WAA_BACKEND"]; ok {
+		return nil
+	})
+	loadDowngradeGuard(loader, &cfg.DowngradeGuard)
+	_ = loader.field("WAA_BACKEND", false, func(value string) error {
 		cfg.WAABackend = strings.ToLower(strings.TrimSpace(value))
-	}
-	if err := loadMediaSettings(values, &cfg.Media); err != nil {
+		return nil
+	})
+	loadMediaSettings(loader, &cfg.Media)
+	// AUTO_START 决定管理进程起来后是否自动启动生成服务、为账号预热 Worker 连官网：写错（如 off、no）时启动即报错，
+	// 不悄悄按默认 true 自动启动（与 TEMPORARY_CHAT 同理）
+	if err := loader.field("AUTO_START", true, parseBool("AUTO_START", &cfg.AutoStart)); err != nil {
 		return Config{}, err
 	}
-	if value, ok := values["AUTO_START"]; ok && strings.TrimSpace(value) != "" {
-		cfg.AutoStart, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("AUTO_START 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["REQUEST_BODY_LOG"]; ok && strings.TrimSpace(value) != "" {
-		cfg.RequestBodyLog, err = strconv.ParseBool(strings.TrimSpace(value))
-		if err != nil {
-			return Config{}, fmt.Errorf("REQUEST_BODY_LOG 必须是 true 或 false")
-		}
-	}
-	if value, ok := values["ADMIN_PASSWORD"]; ok {
-		cfg.AdminPassword = strings.TrimSpace(value)
-	}
-	if err := cfg.Validate(); err != nil {
+	boolean("REQUEST_BODY_LOG", true, &cfg.RequestBodyLog)
+	text("ADMIN_PASSWORD", &cfg.AdminPassword)
+	// 联动校验：不成立时把涉及的键改回默认值（代理、WAA_BACKEND、UPSTREAM_CHANNELS 的校验不成立时报错）
+	if err := loader.settle(&cfg); err != nil {
 		return Config{}, err
 	}
+	cfg.Invalid = loader.invalid
 	return cfg, nil
 }
 
 // Save 将配置原子写入指定 env 文件
 func (c Config) Save(path string) error {
+	return c.save(path, nil)
+}
+
+// SaveKeeping 与 Save 相同，只是 keep 里的键在现有文件里有这一行时沿用文件里的原值，不写 c 的值（文件里没有时照常写 c 的值）。
+// 管理页不编辑的键（REQUEST_BODY_LOG 等）在 .env 里取值无效、按默认值生效时，保存其他设置不把默认值写回、抹掉原值：
+// 下次加载照旧记为无效项，要在 .env 里改正
+func (c Config) SaveKeeping(path string, keep []string) error {
+	if len(keep) == 0 {
+		return c.save(path, nil)
+	}
+	existing, err := readEnvFile(path)
+	if err != nil {
+		return err
+	}
+	kept := make(map[string]string, len(keep))
+	for _, key := range keep {
+		if value, ok := existing[key]; ok {
+			kept[key] = value
+		}
+	}
+	return c.save(path, kept)
+}
+
+// save 校验后按 configKeys 的顺序整体重写 env 文件；kept 里的键写它的值
+func (c Config) save(path string, kept map[string]string) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
@@ -483,6 +452,9 @@ func (c Config) Save(path string) error {
 		values[key] = value
 	}
 	values["OMNI_IGNORE_SYSTEM_PROMPT"] = strconv.FormatBool(c.OmniIgnoreSystemPrompt)
+	for key, value := range kept {
+		values[key] = value
+	}
 
 	var output strings.Builder
 	for _, key := range configKeys {
@@ -494,94 +466,12 @@ func (c Config) Save(path string) error {
 	return atomicWrite(path, []byte(output.String()), 0o600)
 }
 
-// Validate 校验配置值是否能用于服务启动
+// Validate 校验配置值是否能用于服务启动（逐项校验见 configChecks）
 func (c Config) Validate() error {
-	if strings.TrimSpace(c.AuthStates) == "" {
-		return fmt.Errorf("AISTUDIO_AUTH_STATES 不能为空")
-	}
-	if err := validateListenAddr(c.ListenAddr); err != nil {
-		return err
-	}
-	if err := ValidateProxy(c.Proxy); err != nil {
-		return err
-	}
-	if c.InitTimeout <= 0 {
-		return fmt.Errorf("INIT_TIMEOUT 必须是正数时长")
-	}
-	if c.RequestTimeout <= 0 {
-		return fmt.Errorf("REQUEST_TIMEOUT 必须是正数时长")
-	}
-	if c.FirstEventTimeout < 0 {
-		return fmt.Errorf("FIRST_EVENT_TIMEOUT 必须是 0 或正数时长")
-	}
-	if c.FirstEventTimeout > 0 && c.FirstEventTimeout >= c.RequestTimeout {
-		return fmt.Errorf("FIRST_EVENT_TIMEOUT 必须小于 REQUEST_TIMEOUT")
-	}
-	if c.WarmWorkerLimit <= 0 {
-		return fmt.Errorf("WARM_WORKER_LIMIT 必须是正整数")
-	}
-	if c.MaxActiveWorkers < c.WarmWorkerLimit {
-		return fmt.Errorf("MAX_ACTIVE_WORKERS 必须大于或等于 WARM_WORKER_LIMIT")
-	}
-	if c.UltraWarmWorkerLimit < 0 {
-		return fmt.Errorf("ULTRA_WARM_WORKER_LIMIT 必须是 0 或正整数")
-	}
-	if c.UltraMaxActiveWorkers <= 0 {
-		return fmt.Errorf("ULTRA_MAX_ACTIVE_WORKERS 必须是正整数")
-	}
-	if c.UltraMaxActiveWorkers < c.UltraWarmWorkerLimit {
-		return fmt.Errorf("ULTRA_MAX_ACTIVE_WORKERS 必须大于或等于 ULTRA_WARM_WORKER_LIMIT")
-	}
-	if c.WarmStartupConcurrency <= 0 || c.WarmStartupConcurrency > c.WarmWorkerLimit {
-		return fmt.Errorf("WARM_STARTUP_CONCURRENCY 必须是 1 到 WARM_WORKER_LIMIT")
-	}
-	if c.PerAccountConcurrency <= 0 {
-		return fmt.Errorf("PER_ACCOUNT_CONCURRENCY 必须是正整数")
-	}
-	if c.AccountRPMLimit < 0 || c.AccountRPMLimit > maxAccountRPMLimit {
-		return fmt.Errorf("ACCOUNT_RPM_LIMIT 必须是 0 到 %d 的整数", maxAccountRPMLimit)
-	}
-	if c.MinOutputTokens < 0 {
-		return fmt.Errorf("MIN_OUTPUT_TOKENS 必须是 0 或正整数")
-	}
-	if c.RoutingStrategy != "round-robin" && c.RoutingStrategy != "fill-first" {
-		return fmt.Errorf("ROUTING_STRATEGY 必须是 round-robin 或 fill-first")
-	}
-	if err := validateUpstreamChannels(c.UpstreamChannels); err != nil {
-		return err
-	}
-	if err := validateModelList("STREAM_PLAYGROUND_MODELS", c.StreamPlaygroundModels); err != nil {
-		return err
-	}
-	if err := validateModelList("PRIMARY_MODELS", c.PrimaryModels); err != nil {
-		return err
-	}
-	if c.PrimaryQueueWait < 0 {
-		return fmt.Errorf("PRIMARY_QUEUE_WAIT 必须是 0 或正数时长")
-	}
-	if c.PrimaryQueueWait > c.RequestTimeout {
-		return fmt.Errorf("PRIMARY_QUEUE_WAIT 不能超过 REQUEST_TIMEOUT")
-	}
-	if err := validateModelList("ULTRA_PRIMARY_MODELS", c.UltraPrimaryModels); err != nil {
-		return err
-	}
-	if c.UltraPrimaryQueueWait < 0 {
-		return fmt.Errorf("ULTRA_PRIMARY_QUEUE_WAIT 必须是 0 或正数时长")
-	}
-	if c.UltraPrimaryQueueWait > c.RequestTimeout {
-		return fmt.Errorf("ULTRA_PRIMARY_QUEUE_WAIT 不能超过 REQUEST_TIMEOUT")
-	}
-	if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {
-		return fmt.Errorf("WAA_BACKEND 必须是 camoufox 或 go")
-	}
-	if err := c.DowngradeGuard.Validate(); err != nil {
-		return err
-	}
-	if err := c.ProxyPool.Validate(); err != nil {
-		return err
-	}
-	if err := c.Media.Validate(); err != nil {
-		return err
+	for _, item := range configChecks {
+		if err := item.check(c); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1493,34 +1383,77 @@ func (g DowngradeGuard) Equal(other DowngradeGuard) bool {
 
 // Validate 校验设置；关闭时不检查数值（未设置该项的旧配置等同于关闭）
 func (g DowngradeGuard) Validate() error {
+	for _, check := range []func() error{
+		g.validateRejectStatus, g.validateModels, g.validateSpeedThreshold, g.validateMinTokens, g.validateMinWindow,
+		g.validateFuzzy, g.validateCountTimeout, g.validateMemory, g.validateMaxHold,
+	} {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 以下逐项校验降级判定设置（Validate 与加载时的逐项改回默认值共用）；除拒绝返回码外，关闭降级判定时都不检查
+
+func (g DowngradeGuard) validateRejectStatus() error {
 	if status := NormalizeDowngradeRejectStatus(g.RejectStatus); status != DowngradeRejectBlocked && status != DowngradeRejectUnavailable {
 		return fmt.Errorf("DOWNGRADE_REJECT_STATUS 必须是 400 或 503")
 	}
-	if !g.Enabled {
-		return nil
-	}
-	if len(g.Models) == 0 {
+	return nil
+}
+
+func (g DowngradeGuard) validateModels() error {
+	if g.Enabled && len(g.Models) == 0 {
 		return fmt.Errorf("开启降级判定时 DOWNGRADE_GUARD_MODELS 不能为空")
 	}
-	if g.SpeedThreshold <= 0 {
+	return nil
+}
+
+func (g DowngradeGuard) validateSpeedThreshold() error {
+	if g.Enabled && g.SpeedThreshold <= 0 {
 		return fmt.Errorf("DOWNGRADE_SPEED_THRESHOLD 必须是正数")
 	}
-	if g.MinTokens <= 0 {
+	return nil
+}
+
+func (g DowngradeGuard) validateMinTokens() error {
+	if g.Enabled && g.MinTokens <= 0 {
 		return fmt.Errorf("DOWNGRADE_MIN_TOKENS 必须是正整数")
 	}
-	if g.MinWindowMS < 0 || g.MinWindowMS > 60000 {
+	return nil
+}
+
+func (g DowngradeGuard) validateMinWindow() error {
+	if g.Enabled && (g.MinWindowMS < 0 || g.MinWindowMS > 60000) {
 		return fmt.Errorf("DOWNGRADE_MIN_WINDOW_MS 必须在 0 到 60000 之间")
 	}
-	if g.FuzzyLow <= 0 || g.FuzzyHigh < g.FuzzyLow {
+	return nil
+}
+
+func (g DowngradeGuard) validateFuzzy() error {
+	if g.Enabled && (g.FuzzyLow <= 0 || g.FuzzyHigh < g.FuzzyLow) {
 		return fmt.Errorf("DOWNGRADE_FUZZY_LOW 与 DOWNGRADE_FUZZY_HIGH 必须是正数，且下限不大于上限")
 	}
-	if g.CountTimeoutMS < 0 || g.CountTimeoutMS > 30000 {
+	return nil
+}
+
+func (g DowngradeGuard) validateCountTimeout() error {
+	if g.Enabled && (g.CountTimeoutMS < 0 || g.CountTimeoutMS > 30000) {
 		return fmt.Errorf("DOWNGRADE_COUNT_TIMEOUT_MS 必须在 0 到 30000 之间")
 	}
-	if g.MemoryMinutes < 0 {
+	return nil
+}
+
+func (g DowngradeGuard) validateMemory() error {
+	if g.Enabled && g.MemoryMinutes < 0 {
 		return fmt.Errorf("DOWNGRADE_MEMORY_MINUTES 必须是 0 或正整数")
 	}
-	if g.MaxHoldMS < 0 || g.MaxHoldMS > 600000 {
+	return nil
+}
+
+func (g DowngradeGuard) validateMaxHold() error {
+	if g.Enabled && (g.MaxHoldMS < 0 || g.MaxHoldMS > 600000) {
 		return fmt.Errorf("DOWNGRADE_MAX_HOLD_MS 必须在 0 到 600000 之间")
 	}
 	return nil
@@ -1586,83 +1519,57 @@ func (g DowngradeGuard) envValues() map[string]string {
 	}
 }
 
-// loadDowngradeGuard 从 env 读取降级判定设置；没有写的项沿用默认值
-func loadDowngradeGuard(values map[string]string, guard *DowngradeGuard) error {
-	if err := envBool(values, "DOWNGRADE_GUARD", &guard.Enabled); err != nil {
-		return err
-	}
-	if value, ok := values["DOWNGRADE_GUARD_MODELS"]; ok {
+// loadDowngradeGuard 从 env 读取降级判定设置；没有写的项沿用默认值，写法无效的项保持默认值并记入无效项
+func loadDowngradeGuard(loader *envLoader, guard *DowngradeGuard) {
+	envBool(loader, "DOWNGRADE_GUARD", &guard.Enabled)
+	_ = loader.field("DOWNGRADE_GUARD_MODELS", false, func(value string) error {
 		guard.Models = ParseModelList(value)
-	}
-	if err := envFloat(values, "DOWNGRADE_SPEED_THRESHOLD", &guard.SpeedThreshold); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_MIN_TOKENS", &guard.MinTokens); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_MIN_WINDOW_MS", &guard.MinWindowMS); err != nil {
-		return err
-	}
-	if err := envFloat(values, "DOWNGRADE_FUZZY_LOW", &guard.FuzzyLow); err != nil {
-		return err
-	}
-	if err := envFloat(values, "DOWNGRADE_FUZZY_HIGH", &guard.FuzzyHigh); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_COUNT_TIMEOUT_MS", &guard.CountTimeoutMS); err != nil {
-		return err
-	}
-	if err := envBool(values, "DOWNGRADE_FAST_MODE", &guard.FastMode); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_MEMORY_MINUTES", &guard.MemoryMinutes); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_MAX_HOLD_MS", &guard.MaxHoldMS); err != nil {
-		return err
-	}
-	if err := envInt(values, "DOWNGRADE_REJECT_STATUS", &guard.RejectStatus); err != nil {
-		return err
-	}
+		return nil
+	})
+	envFloat(loader, "DOWNGRADE_SPEED_THRESHOLD", &guard.SpeedThreshold)
+	envInt(loader, "DOWNGRADE_MIN_TOKENS", &guard.MinTokens)
+	envInt(loader, "DOWNGRADE_MIN_WINDOW_MS", &guard.MinWindowMS)
+	envFloat(loader, "DOWNGRADE_FUZZY_LOW", &guard.FuzzyLow)
+	envFloat(loader, "DOWNGRADE_FUZZY_HIGH", &guard.FuzzyHigh)
+	envInt(loader, "DOWNGRADE_COUNT_TIMEOUT_MS", &guard.CountTimeoutMS)
+	envBool(loader, "DOWNGRADE_FAST_MODE", &guard.FastMode)
+	envInt(loader, "DOWNGRADE_MEMORY_MINUTES", &guard.MemoryMinutes)
+	envInt(loader, "DOWNGRADE_MAX_HOLD_MS", &guard.MaxHoldMS)
+	envInt(loader, "DOWNGRADE_REJECT_STATUS", &guard.RejectStatus)
 	guard.RejectStatus = NormalizeDowngradeRejectStatus(guard.RejectStatus)
-	return nil
 }
 
-func envBool(values map[string]string, key string, target *bool) error {
-	value, ok := values[key]
-	if !ok || strings.TrimSpace(value) == "" {
+// envBool、envInt、envFloat 读取键存在且非空的布尔值、整数与数字，写法无效时保持默认值并记入无效项（降级判定设置没有网络出口相关的键）
+
+func envBool(loader *envLoader, key string, target *bool) {
+	_ = loader.field(key, true, func(value string) error {
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s 必须是 true 或 false", key)
+		}
+		*target = parsed
 		return nil
-	}
-	parsed, err := strconv.ParseBool(strings.TrimSpace(value))
-	if err != nil {
-		return fmt.Errorf("%s 必须是 true 或 false", key)
-	}
-	*target = parsed
-	return nil
+	})
 }
 
-func envInt(values map[string]string, key string, target *int) error {
-	value, ok := values[key]
-	if !ok || strings.TrimSpace(value) == "" {
+func envInt(loader *envLoader, key string, target *int) {
+	_ = loader.field(key, true, func(value string) error {
+		parsed, err := strconv.Atoi(strings.TrimSpace(value))
+		if err != nil {
+			return fmt.Errorf("%s 必须是整数", key)
+		}
+		*target = parsed
 		return nil
-	}
-	parsed, err := strconv.Atoi(strings.TrimSpace(value))
-	if err != nil {
-		return fmt.Errorf("%s 必须是整数", key)
-	}
-	*target = parsed
-	return nil
+	})
 }
 
-func envFloat(values map[string]string, key string, target *float64) error {
-	value, ok := values[key]
-	if !ok || strings.TrimSpace(value) == "" {
+func envFloat(loader *envLoader, key string, target *float64) {
+	_ = loader.field(key, true, func(value string) error {
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		if err != nil {
+			return fmt.Errorf("%s 必须是数字", key)
+		}
+		*target = parsed
 		return nil
-	}
-	parsed, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
-	if err != nil {
-		return fmt.Errorf("%s 必须是数字", key)
-	}
-	*target = parsed
-	return nil
+	})
 }

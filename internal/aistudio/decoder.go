@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"strconv"
 	"unicode"
 )
@@ -181,6 +183,13 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		if err := decoder.Decode(&raw); err != nil {
 			return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[%d]", fieldIndex), Detail: err.Error(), Err: err}
 		}
+		// 流尾 google.rpc 状态 [[...帧], [code, message, details]]：code 不为 0 时按状态码返回上游错误（429 冷却换号、5xx 重试、
+		// 400 按请求错误）。原先跳过，最后都成了“流结束前没有完成帧”。完成帧之后的流尾错误同样返回，先于完成帧校验
+		if fieldIndex == 1 {
+			if err := playgroundTrailerError(raw); err != nil {
+				return err
+			}
+		}
 		fieldIndex++
 	}
 	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
@@ -197,6 +206,57 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$", Detail: err.Error(), Err: err}
 	}
 	return nil
+}
+
+// trailerError 解码流式响应列表之后的 google.rpc 状态 [code, message, details]：code 为 0 时返回 nil，否则按状态码换算的 HTTP 状态
+// 返回带 ErrorInfo 与 RetryInfo 的 RPCError；状态不是数组或缺少状态码时返回协议错误。Playground GenerateContent 与 Build 代理共用
+func trailerError(method string, raw json.RawMessage) error {
+	status, err := rawArray(raw, "$[1]", raw)
+	if err != nil || len(status) == 0 {
+		return &ProtocolEvidenceError{Method: method, Path: "$[1]", Detail: "流尾状态无效", Raw: cloneRaw(raw)}
+	}
+	code, err := rawInt64(status[0], "$[1][0]", raw)
+	if err != nil {
+		return withMethod(err, method)
+	}
+	if code == 0 {
+		return nil
+	}
+	statusCode := http.StatusBadGateway
+	if mapped, ok := interactionStatusHTTP[code]; ok {
+		statusCode = mapped
+	}
+	// 按完整状态解码，保留 ErrorInfo 与 RetryInfo
+	return DecodeRPCError(method, statusCode, raw)
+}
+
+// playgroundTrailerError 解码 Playground GenerateContent 的流尾：是 google.rpc 状态（数组，第一项为整数状态码）时按 trailerError 处理；
+// null、空数组与其他形状照旧忽略，不因为没见过的流尾让原本正常的回复失败（Build 代理的流尾按 trailerError 严格校验）
+func playgroundTrailerError(raw json.RawMessage) error {
+	status, err := rawArray(raw, "$[1]", raw)
+	if err != nil || len(status) == 0 {
+		return nil
+	}
+	if _, err := rawInt64(status[0], "$[1][0]", raw); err != nil {
+		return nil
+	}
+	return trailerError("GenerateContent", raw)
+}
+
+// errMissingFinishFrame 表示生成流正常结束却没有完成帧（FrameDecoder.End、BuildStreamDecoder.End 的错误链上带着它）
+var errMissingFinishFrame = errors.New("流结束前没有完成帧")
+
+// StreamInterrupted 判断生成流在完成帧之前中断：正常结束却没有完成帧，或响应在 JSON 结构中途就结束了（解码报 io.ErrUnexpectedEOF、
+// 读到 io.EOF，即响应被截断）。连接重置、HTTP/2 流被重置这类读取错误由调用方从读取器上判断（见 streamReadFailure）。
+//
+// 只认这几种：上游字段类型变了（json.UnmarshalTypeError）、函数调用缺少名称、JSON 语法错误等确定性的格式不符不算中断，
+// 同一账号重发只会得到同样的结果；读取超时与取消也不算（由本服务的期限处理）
+func StreamInterrupted(err error) bool {
+	if errors.Is(err, errMissingFinishFrame) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var evidence *ProtocolEvidenceError
+	return errors.As(err, &evidence) && evidence.Err == io.EOF
 }
 
 func rawArray(raw json.RawMessage, path string, evidence json.RawMessage) ([]json.RawMessage, error) {

@@ -80,16 +80,35 @@ func (m MediaSettings) Equal(other MediaSettings) bool {
 
 // Validate 校验设置；错误文案为固定文本
 func (m MediaSettings) Validate() error {
-	m = m.withDefaults()
-	if m.Output != MediaOutputInline && m.Output != MediaOutputURL {
+	for _, check := range []func() error{m.validateOutput, m.validateBaseURL, m.validateRetention, m.validateMaxSize} {
+		if err := check(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// 以下逐项校验（Validate 与加载时的逐项改回默认值共用），按零值语义补齐后判断
+
+func (m MediaSettings) validateOutput() error {
+	if output := m.withDefaults().Output; output != MediaOutputInline && output != MediaOutputURL {
 		return errMediaOutput
 	}
-	if err := validateMediaBaseURL(m.BaseURL); err != nil {
-		return err
-	}
+	return nil
+}
+
+func (m MediaSettings) validateBaseURL() error {
+	return validateMediaBaseURL(m.withDefaults().BaseURL)
+}
+
+func (m MediaSettings) validateRetention() error {
 	if m.Retention < 0 || m.Retention > 0 && m.Retention < minMediaRetention {
 		return errMediaRetention
 	}
+	return nil
+}
+
+func (m MediaSettings) validateMaxSize() error {
 	if m.MaxBytes < 0 || m.MaxBytes > 0 && m.MaxBytes < minMediaMaxBytes {
 		return errMediaMaxSize
 	}
@@ -141,29 +160,33 @@ func (m MediaSettings) envValues() map[string]string {
 	}
 }
 
-// loadMediaSettings 从 env 读取媒体设置：键存在且非空时解析，没有写的项沿用默认值；关闭清理必须写 0
-func loadMediaSettings(values map[string]string, media *MediaSettings) error {
-	if value, ok := values["MEDIA_OUTPUT"]; ok && strings.TrimSpace(value) != "" {
+// loadMediaSettings 从 env 读取媒体设置：键存在且非空时解析，没有写的项沿用默认值；关闭清理必须写 0。
+// 写法无效的项保持默认值并记入无效项
+func loadMediaSettings(loader *envLoader, media *MediaSettings) {
+	_ = loader.field("MEDIA_OUTPUT", true, func(value string) error {
 		media.Output = strings.ToLower(strings.TrimSpace(value))
-	}
-	if value, ok := values["MEDIA_BASE_URL"]; ok {
+		return nil
+	})
+	_ = loader.field("MEDIA_BASE_URL", false, func(value string) error {
 		media.BaseURL = strings.TrimRight(strings.TrimSpace(value), "/")
-	}
-	if value, ok := values["MEDIA_RETENTION"]; ok && strings.TrimSpace(value) != "" {
+		return nil
+	})
+	_ = loader.field("MEDIA_RETENTION", true, func(value string) error {
 		retention, err := ParseMediaRetention(value)
 		if err != nil {
 			return err
 		}
 		media.Retention = retention
-	}
-	if value, ok := values["MEDIA_MAX_SIZE"]; ok && strings.TrimSpace(value) != "" {
+		return nil
+	})
+	_ = loader.field("MEDIA_MAX_SIZE", true, func(value string) error {
 		size, err := ParseMediaSize(value)
 		if err != nil {
 			return err
 		}
 		media.MaxBytes = size
-	}
-	return nil
+		return nil
+	})
 }
 
 // ParseMediaRetention 解析保存期限：Go 时长写法（72h、90m）或整数天数加 d（7d），单独的 0 表示不清理。

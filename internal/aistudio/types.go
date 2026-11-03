@@ -304,6 +304,9 @@ type GenerateRequest struct {
 	// clientSystem 与 toolHints 为 prepareToolRequest 追加工具要求时记下的客户端系统提示与追加的要求（以换行连接）；
 	// 没有追加时都为空，System 就是客户端的系统提示
 	clientSystem, toolHints string
+	// PrefillTail 为历史以模型文字消息结尾、按原生续写原样发送（模型在 NativePrefillModel 名单内，协议层没有补用户消息）：
+	// 上游拒绝时 Generate 改回补用户消息重发一次（见 prefill.go）
+	PrefillTail bool `json:"-"`
 }
 
 // TokenCountRequest 表示计数请求

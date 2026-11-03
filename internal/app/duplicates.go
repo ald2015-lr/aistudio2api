@@ -34,6 +34,8 @@ type generationDiagnostics struct {
 	thinking    string
 	promptHash  string
 	nonce       bool
+	// promptNonce 为加到请求上的随机后缀（没加时为空）：因结束原因重新生成时换成新的后缀（见 promptNonceVariant）
+	promptNonce string
 	// downgrade 为降级判定（只有被拦截的模型才有，见 downgrade_guard.go）
 	downgrade *downgradeGate
 }
@@ -399,13 +401,65 @@ func (service *trackedService) maybeAddPromptNonce(request *aistudio.GenerateReq
 	if clientSeed || greedy || !service.repeatNonce.Load() || !randomSeedApplicable(request.Model, request.Config) {
 		return false
 	}
-	modified, ok := applyPromptNonce(*request, newPromptNonce())
+	nonce := newPromptNonce()
+	modified, ok := applyPromptNonce(*request, nonce)
 	if !ok {
 		return false
 	}
 	*request = modified
-	diag.nonce = true
+	diag.nonce, diag.promptNonce = true, nonce
 	return true
+}
+
+// promptNonceVariant 返回因结束原因（函数调用格式错误、意外的工具调用）重新生成时换输入的函数（见 aistudio.ContextWithRegenerationVariant）：
+// 上游对完全相同的输入返回完全相同的回复（见上面的排查结论），原样重发多半还是同一个错误调用，所以把请求里的随机后缀换成新的一个。
+// 每次尝试各建一个（每次尝试发出的请求都带本请求原来的后缀），只在这次尝试的生成 goroutine 里调用。没加随机后缀的请求（nonce 为空：
+// 客户端指定了 seed、温度为 0、最后一轮是工具结果、REPEAT_PROMPT_NONCE 关闭）返回 nil，不因结束原因重新生成
+func promptNonceVariant(nonce string) func(aistudio.GenerateRequest) (aistudio.GenerateRequest, bool) {
+	if nonce == "" {
+		return nil
+	}
+	current := nonce
+	return func(request aistudio.GenerateRequest) (aistudio.GenerateRequest, bool) {
+		next := newPromptNonce()
+		for next == current {
+			next = newPromptNonce()
+		}
+		modified, ok := replacePromptNonce(request, current, next)
+		if !ok {
+			return request, false
+		}
+		current = next
+		return modified, true
+	}
+}
+
+// replacePromptNonce 把请求里的随机后缀 current 换成 next：从后往前找文本以 current 结尾的用户消息（预填充改回补用户消息时
+// 后缀在补上的那条之前的用户消息上）。返回副本，不修改调用方的数据；没找到时返回假
+func replacePromptNonce(request aistudio.GenerateRequest, current, next string) (aistudio.GenerateRequest, bool) {
+	if current == "" {
+		return request, false
+	}
+	for index := len(request.Contents) - 1; index >= 0; index-- {
+		content := request.Contents[index]
+		if content.Role != aistudio.RoleUser {
+			continue
+		}
+		for partIndex := len(content.Parts) - 1; partIndex >= 0; partIndex-- {
+			part := content.Parts[partIndex]
+			if part.Thought || !strings.HasSuffix(part.Text, current) {
+				continue
+			}
+			parts := append([]aistudio.Part(nil), content.Parts...)
+			parts[partIndex].Text = strings.TrimSuffix(part.Text, current) + next
+			contents := append([]aistudio.Content(nil), request.Contents...)
+			content.Parts = parts
+			contents[index] = content
+			request.Contents = contents
+			return request, true
+		}
+	}
+	return request, false
 }
 
 func nonceLabel(added bool) string {

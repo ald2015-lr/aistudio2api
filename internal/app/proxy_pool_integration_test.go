@@ -487,7 +487,8 @@ func TestConfigFieldsCovered(t *testing.T) {
 	value := reflectValueOf(&base)
 	for index := 0; index < value.NumField(); index++ {
 		field := value.Type().Field(index)
-		if !field.IsExported() || management[field.Name] {
+		// Invalid 只是加载时取值无效的记录（启动日志与管理页提示），不是生效的设置
+		if !field.IsExported() || management[field.Name] || field.Name == "Invalid" {
 			continue
 		}
 		changed := base

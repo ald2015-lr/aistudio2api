@@ -33,8 +33,10 @@ func TestFirstEventTimeoutConfig(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.invalid {
-			if err == nil {
-				t.Fatalf("%q 应报错", test.content)
+			// 写法无效或不小于 REQUEST_TIMEOUT 时按默认值（关闭）启动并记入无效项
+			requireInvalidKey(t, test.content, cfg, err, "FIRST_EVENT_TIMEOUT")
+			if cfg.FirstEventTimeout != 0 {
+				t.Fatalf("%q：无效时应取默认值 0，得到 %s", test.content, cfg.FirstEventTimeout)
 			}
 			continue
 		}

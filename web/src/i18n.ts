@@ -178,7 +178,7 @@ const zhCN = {
     '生成请求在首个上游事件之前的总期限：排队、冷启动、WAA proof、附件上传、等首字与首事件前的换号都计入，到时返回 504。开始输出后改为空闲上限：上游连续这么久既没有事件也没有网络字节才以 504 结束，持续出字的长回复不会被切断；整条生成请求最长 1 小时（本项更长时按本项）。计数、视频与转写等其他请求整段受它限制。修改后立即生效，只影响新请求。',
   'settings.firstEventTimeout': '首事件超时',
   'settings.firstEventTimeoutHelp':
-    '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
+    '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504；客户端还没收到内容时的同账号重新生成每次发送重新起算。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
   'settings.streamDataHeartbeat': '数据型流式心跳',
   'settings.streamDataHeartbeatHelp':
     '每 10 秒没有输出时写一块空数据（Gemini SSE 为空文本或空思考的候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 SSE 注释。new-api 等中转只转发 data 行，开启后中转后面的客户端在等待首字和长思考时也能持续收到字节，不会因长时间零字节被手机系统、VPN 或代理断开。官方 Gemini SDK 直连时仍只写换行（直连不经过中转，不再多写一种 SDK 判为无效的块）；开启后 new-api 的首字时间统计反映的是写出第一块心跳的时刻，且客户端断开或流被截断、没有用量数据时 new-api 按估算的输入 token 计费（原先计 0）。关闭时与原先完全一致。修改后立即生效，只影响新请求。',
@@ -285,6 +285,10 @@ const zhCN = {
   'settings.activeValue': '当前生效',
   'settings.pendingService': '已保存值将在下次生成服务启动时生效',
   'settings.pendingManagement': '监听地址需重启管理进程生效（./start.sh restart 或重新运行 start.bat）',
+  'settings.invalidConfigTitle': '以下配置项取值无效，已按默认值生效',
+  'settings.invalidConfigEnvironment': '来自进程环境变量，要在启动环境里修改',
+  'settings.invalidConfigHint':
+    '在本页修改后保存即写入有效值；REQUEST_BODY_LOG 不在本页编辑，保存其他设置时保留 .env 里的原行，要在 .env 里改正；代理（PROXY、PROXY_POOL_*）、WAA_BACKEND、UPSTREAM_CHANNELS、TEMPORARY_CHAT 与 AUTO_START 无效时服务不会启动，不会出现在这里；凭据类配置不显示原值。',
   'settings.saved': '配置已保存',
   'settings.savedService': '配置已保存，在左下角停止并重新启动生成服务后生效',
   'settings.savedManagement': '配置已保存，请重启管理进程（./start.sh restart 或重新运行 start.bat）',
@@ -1102,7 +1106,7 @@ const en: Record<TranslationKey, string> = {
     'Deadline before the first upstream event of a generation request: queuing, cold starts, WAA proof, attachment uploads, waiting for the first token and account switches before it all count, and a 504 is returned when it expires. Once output starts it becomes an idle limit: the request ends with 504 only when upstream sends no event and no bytes for this long, so a long reply that keeps streaming is not cut off; a whole generation request is capped at 1 hour (or this value if longer). Token counting, video and transcription requests are limited by it as a whole. Changes apply immediately to new requests only.',
   'settings.firstEventTimeout': 'First event timeout',
   'settings.firstEventTimeoutHelp':
-    'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
+    'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. It restarts for each same-account regeneration before any output reaches the client. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
   'settings.streamDataHeartbeat': 'Data stream heartbeat',
   'settings.streamDataHeartbeatHelp':
     'Write an empty data chunk after every 10 seconds without output (an empty text or empty thought candidate for Gemini SSE, an empty delta chunk for OpenAI Chat), and one more when the streaming response header is sent before the first event, instead of only a newline or an SSE comment. Relays such as new-api forward only data lines, so with this on the clients behind them keep receiving bytes while waiting for the first token or during long thinking and are not dropped by the phone OS, a VPN or a proxy after a long silence. Official Gemini SDKs connecting directly still get newline heartbeats (no relay in between, and no extra chunk the SDK treats as invalid); with this on, new-api reports the first heartbeat as the first-response time, and bills the estimated input tokens when the client disconnects or the stream is cut without usage data (0 before). When off, behavior is exactly as before. Changes apply immediately to new requests only.',
@@ -1213,6 +1217,12 @@ const en: Record<TranslationKey, string> = {
   'settings.pendingService': 'Saved values apply the next time the generation service starts',
   'settings.pendingManagement':
     'Restart the management process (./start.sh restart or start.bat) to apply the listen address',
+  'settings.invalidConfigTitle':
+    'These settings have invalid values and are running with their defaults',
+  'settings.invalidConfigEnvironment':
+    'set by a process environment variable; change it where the service is started',
+  'settings.invalidConfigHint':
+    'Edit and save them here to write valid values. REQUEST_BODY_LOG is not edited on this page: saving other settings keeps its .env line as it is, so fix it in .env. An invalid proxy (PROXY, PROXY_POOL_*), WAA_BACKEND, UPSTREAM_CHANNELS, TEMPORARY_CHAT or AUTO_START stops the service from starting instead, so it never appears here. Credential values are not shown.',
   'settings.saved': 'Configuration saved',
   'settings.savedService':
     'Configuration saved. Stop and start the generation service at bottom left.',

@@ -171,7 +171,15 @@ func newRuntime(
 		// 停用原因与新账户处理记录都是合并几秒后才写文件，关闭时立即写出，退出前的变化不会丢失
 		admin.onboard.flush()
 		accountDisableNotes.flush()
+		// 只有轮换 Cookie 变化、还没写盘的认证状态（最多 30 秒，见 aistudio/cookie_write.go）：先在关闭 Worker 之前写出并改为直接写盘
+		// （Worker 多、关闭超过 STOP_TIMEOUT 被强杀时也已落盘），Worker 都关了之后再写一次，收尾仍在进行的请求的写回
+		if flushErr := pool.SetStorageDeferral(false); flushErr != nil {
+			requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+flushErr.Error())
+		}
 		err := workers.Close()
+		if flushErr := pool.FlushAllDeferredStorage(); flushErr != nil {
+			requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+flushErr.Error())
+		}
 		// Worker 关闭时归还的端口改变了亲和与归属：立即写出 IP 池记录
 		proxyPool.flush()
 		transport.CloseIdleConnections()
@@ -1345,6 +1353,11 @@ func (manager *accountWorkerManager) startReservedWorker(
 	var budget *leaseWaitBudget
 	if !backgroundStartup(ctx) {
 		budget = leaseWaitBudgetFromContext(ctx)
+	}
+	// 浏览器与纯 Go runtime 从认证文件读 Cookie：先把只有轮换 Cookie 变化、暂存未写盘的认证状态写出（见 aistudio/cookie_write.go），
+	// 新 Worker 带的 Cookie 与每次都写盘时相同
+	if err := manager.pool.FlushDeferredStorage(account.id); err != nil {
+		manager.requests.log(label, "WARN", "暂存的认证 Cookie 写盘失败，Worker 照常启动 | 错误="+err.Error())
 	}
 	launchStartedAt := time.Now()
 	budget.beginColdStart(initTimeout)
@@ -2815,6 +2828,8 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	service.transitionTimedOut = false
 	service.state.Store(serviceLaunching)
 	service.lifecycleMu.Unlock()
+	// 停止时改为直接写盘的轮换 Cookie 恢复暂存（见 aistudio/cookie_write.go）
+	_ = service.pool.SetStorageDeferral(true)
 	stopCaller := context.AfterFunc(ctx, dataCancel)
 	service.replaceModelSnapshot(service.catalog.CachedModels())
 	if launching != nil {
@@ -2959,6 +2974,7 @@ func (service *trackedService) finishLaunch(
 	refreshErr := waitServiceTransition(modelRefreshDone, modelCatalogShutdownTimeout, "模型目录刷新停止")
 	service.workers.waitPrewarm()
 	resetErr := service.workers.ResetAll()
+	service.stopDeferredCookieWrites()
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.state.Store(serviceStopped)
@@ -3087,6 +3103,14 @@ func (service *trackedService) Stop() (bool, error) {
 	return true, errors.Join(transitionErr, cleanupErr)
 }
 
+// stopDeferredCookieWrites 在生成服务停止后（Worker 都已重置）把只有轮换 Cookie 变化、暂存未写盘的认证状态立即写出，之后直接写盘
+// （见 aistudio/cookie_write.go）：停止再启动时新一代生成服务先建好、旧一代最后才关闭，新一代从磁盘载入认证文件，读到的是最新的 Cookie
+func (service *trackedService) stopDeferredCookieWrites() {
+	if err := service.pool.SetStorageDeferral(false); err != nil && service.requests != nil {
+		service.requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+err.Error())
+	}
+}
+
 // finishStop 完成运行态服务的后台清理
 func (service *trackedService) finishStop(transitionDone chan struct{}, modelRefreshDone <-chan struct{}) {
 	service.requests.cancelAll()
@@ -3098,6 +3122,7 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	service.lifecycleMu.Unlock()
 	service.workers.waitPrewarm()
 	resetErr := service.workers.ResetAll()
+	service.stopDeferredCookieWrites()
 	// 坏号记忆平时最多每 30 秒写一次：停止服务时立即写出。重建运行时（进程内重启、重建服务的配置保存）先停旧服务、再建新一代
 	// （新一代此时读文件）、最后才关闭旧一代，原先旧一代在关闭时才写，新一代读到的是旧数据，随后又被新一代的第一次写盘整份覆盖
 	if err := service.workers.badAccountMemory().save(); err != nil && service.requests != nil {
@@ -4425,6 +4450,8 @@ func (service *trackedService) generateWithRetry(
 	diag *generationDiagnostics,
 ) {
 	trace := aistudio.TraceFromContext(requestCtx)
+	// regenerations 为本请求剩余的同账号重新生成次数（客户端还没收到内容时，见 aistudio/regenerate.go），各次尝试共用：换号后不再各来一轮
+	regenerations := aistudio.NewRegenerationBudget()
 	var lease *aistudio.AccountLease
 	var source <-chan aistudio.Event
 	// finishAttempt 为成功尝试的上下文取消函数，事件流转发结束后调用
@@ -4566,6 +4593,8 @@ func (service *trackedService) generateWithRetry(
 	pauses := service.buildPauses()
 	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
 	authFailures := 0
+	// prefillRetries：本请求因原生续写被拒、本账号又不能马上重发（*aistudio.PrefillRetryError）而再试的次数，见 prefillRetryLimit
+	prefillRetries := 0
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
 	// 单模型 403 写入冷却后同样计入，但不退避；没等到同账号关闭失败的 Worker 就换号时同样计入，已经等过，不再退避）。
 	// 这类失败往往与请求本身有关，换号次数不再随账号数增长，并在两次之间退避。租约账号在发出前已进入冷却（ErrAccountCoolingDown，
@@ -5158,6 +5187,14 @@ func (service *trackedService) generateWithRetry(
 		attemptCtx = aistudio.ContextWithRequestInfoObserver(attemptCtx, func(message string) {
 			service.requests.logRequestProgress(noteRequestID, noteSource, "INFO", message)
 		})
+		attemptCtx = aistudio.ContextWithRegenerationBudget(attemptCtx, regenerations)
+		// 重新生成与续写回退的重发各自重新起算首事件计时，剩余不够再来一次时不重新生成（见 aistudio/regenerate.go）
+		attemptCtx = aistudio.ContextWithFirstEventClock(attemptCtx, firstEvent)
+		// 因结束原因重新生成时换一个随机后缀（每次尝试从本请求原来的后缀起换，见 promptNonceVariant）；没加随机后缀的请求不挂，
+		// 不因结束原因重新生成
+		if diag != nil {
+			attemptCtx = aistudio.ContextWithRegenerationVariant(attemptCtx, promptNonceVariant(diag.promptNonce))
+		}
 		// 降级判定的输入字数按本次尝试实际发送的内容（工具约束提示、附带的 Schema、截断之后）校准
 		if gate := diag.guard(); gate != nil {
 			attemptCtx = aistudio.ContextWithSentInputObserver(attemptCtx, gate.observeSentInput)
@@ -5336,6 +5373,30 @@ func (service *trackedService) generateWithRetry(
 		} else if probeAttempt {
 			// 试探请求以其他原因失败（额度、超时等）：说明不了 Build 是否恢复，稍后再放行下一次试探；这次请求照常换号
 			pauses.probeUnresolved(false)
+		}
+		// prefillRetry：原生续写被上游以 400 拒绝，本账号又不能马上改回补用户消息重发（已冷却、每分钟名额已满或出口限速，见
+		// aistudio/prefill.go）。与账号、出口都无关：不冷却、不计连续失败上限、不退避、不计入出口判定、不占换号次数（只受每请求换号硬上限
+		// 约束）；该模型在该通道的拒绝已记住，下一次尝试补用户消息。不固定账号的请求换号，指定账号的请求在原账号再试。
+		// 每个请求最多 prefillRetryLimit 次（每个通道各记一次拒绝，记住后同通道不会再出现）
+		var prefillRetryErr *aistudio.PrefillRetryError
+		prefillRetry := generated && requestCtx.Err() == nil && errors.As(attemptErr, &prefillRetryErr)
+		if prefillRetry {
+			prefillRetries++
+			if prefillRetries > prefillRetryLimit {
+				prefillRetry, retryable = false, false
+			} else {
+				retryable = true
+				maxAttempts++
+				where := "换号"
+				if !(unbound || fileBound) {
+					delete(attempted, request.AccountID)
+					where = "原账号（指定账号）"
+				}
+				trace.Note("上游不接受以模型轮结尾的请求，本账号不能马上重发，" + where + "再试，下一次补用户消息")
+				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", fmt.Sprintf(
+					"上游不接受以模型轮结尾的请求，本账号不能马上重发（%s），%s再试，下一次补用户消息 | 第 %d/%d 次",
+					prefillRetryErr.Denied, where, prefillRetries, prefillRetryLimit))
+			}
 		}
 		if !inputTokenLimitError(err) && !(buildDisabled && buildOnly) {
 			inputLimitErr = nil
@@ -5548,7 +5609,8 @@ func (service *trackedService) generateWithRetry(
 		}
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
-		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled && !driveMissing
+		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled && !driveMissing &&
+			!prefillRetry
 		// 最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
 		exhaustReason, exhausted := quota.exhaustedReason()
 		quotaExhausted := quotaFailure && exhausted
@@ -5687,6 +5749,10 @@ func (service *trackedService) generateWithRetry(
 		}
 		if driveMissing {
 			// 换有 Drive 授权的账号的进度上面已写；运行日志不逐个请求写账号切换（没有 Drive 授权的账号多，带图的 Omni 请求会刷屏）
+			continue
+		}
+		if prefillRetry {
+			// 续写被拒后再试的进度上面已写；与账号无关，运行日志不写账号切换
 			continue
 		}
 		switchMessage := fmt.Sprintf(
@@ -5915,6 +5981,9 @@ func waitRetryBackoff(ctx context.Context, failures int) error {
 	}
 }
 
+// prefillRetryLimit 为每个请求因原生续写被拒、本账号不能马上重发而再试的上限（Playground 与 Build 两个通道各一次）
+const prefillRetryLimit = 2
+
 // attemptDrainTimeout 为首事件超时取消尝试后等待上游事件流结束的上限
 const attemptDrainTimeout = 5 * time.Second
 
@@ -5968,6 +6037,30 @@ func (deadline *firstEventDeadline) expire() {
 	err := deadline.fired
 	deadline.mu.Unlock()
 	deadline.cancel(err)
+}
+
+// FirstEventWindow 返回首事件超时（0 为关闭），供生成服务判断重新生成够不够时间（见 aistudio.FirstEventClock）
+func (deadline *firstEventDeadline) FirstEventWindow() time.Duration {
+	return deadline.timeout
+}
+
+// RestartFirstEvent 为同一尝试内的重发（续写回退、重新生成，都在任何事件交出之前）重新起算首事件计时：每次发送各有一个完整的
+// FIRST_EVENT_TIMEOUT，几次生成加起来不会被计时打断。未启用时返回真；已触发（尝试正被取消）或已停止时返回假
+func (deadline *firstEventDeadline) RestartFirstEvent() bool {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	if deadline.timeout <= 0 {
+		return true
+	}
+	if deadline.stopped {
+		return false
+	}
+	if deadline.timer != nil && !deadline.timer.Stop() {
+		// 计时恰好到期，expire 正在等锁：照旧按首事件超时处理
+		return false
+	}
+	deadline.timer = time.AfterFunc(deadline.timeout, deadline.expire)
+	return true
 }
 
 // stop 停止计时，返回已经触发的超时错误（没有触发时为 nil）。停止与触发互斥：stop 返回 nil 后本次尝试不会再被取消
@@ -6084,6 +6177,11 @@ func inputTokenCapError(err error) bool {
 func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.Is(err, errStreamClosedBeforeFirstEvent) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return true
+	}
+	// 原生续写被拒、本账号不能马上重发：换号（指定账号在原账号）再试，下一次补用户消息（不冷却等见 generateWithRetry 的 prefillRetry）
+	var prefillRetry *aistudio.PrefillRetryError
+	if errors.As(err, &prefillRetry) {
+		return ctx.Err() == nil
 	}
 	// 输入 token 超过上限与账号无关：即使上游按 429 返回也不换号（Playground 超限改走 Build 的那一次重试另行处理）
 	if inputTokenLimitError(err) {

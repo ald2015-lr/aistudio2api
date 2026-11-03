@@ -169,7 +169,19 @@ Build 独有模型计算：Playground 目录按模型 ID 与别名建立索引�
 
 工具结果中的图片：工具（如读取文件、截图、MCP 工具）返回的 base64 图片会取出来作为真正的图片发送，放在这组工具结果之后的用户消息里并标注来自哪次调用；工具结果原位置替换为文字说明。此前图片的 base64 会被当成文字塞进工具结果：模型看不到图片，输入 token 暴涨，连续读取两张图片基本必然报错。支持 OpenAI、Anthropic、Responses、Gemini 原生（`functionResponse.response` 里 `{"result":[…]}`、`{"content":[…]}` 包装的图片与 `functionResponse.parts` 的媒体）与 MCP 格式；网络地址形式的图片保持原样。
 
-对话历史分轮修正：发往上游前自动合并连续的模型消息与连续的工具结果；历史以模型工具调用开头时在前面补一条用户消息；历史以模型文字消息结尾（预填充、续写）时在最后补一条请模型从原消息结尾接着写、不重复已有内容的用户消息，避免上游返回 400 “Requests ending with a model turn are not supported”。用于兼容把说明文字和工具调用、或把并行工具调用拆成多条 assistant 消息的客户端，避免上游返回 400 “function call turn comes immediately after a user turn or after a function response turn”。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果>` 文字说明、改为用户消息，各协议一致。除此之外只调整分轮，不改动内容与思考签名。
+对话历史分轮修正：发往上游前自动合并连续的模型消息与连续的工具结果；历史以模型工具调用开头时在前面补一条用户消息；历史以模型文字消息结尾（预填充、续写）时，3.5 以前的模型（`gemini-3.1-pro-preview`、`gemini-pro-latest`、`gemini-3.1-flash-lite`、`gemini-3-flash-preview`、`gemini-nano-banana-2.1`、`gemini-3.1-flash-image`、`gemini-3.1-flash-lite-image`、`gemini-3-pro-image`、`gemini-2.5-flash-image` 与 `gemma-` 开头的模型）原样以模型轮结尾发送，由模型从这段文字结尾原生续写；其余模型（含 Omni）在最后补一条请模型从原消息结尾接着写、不重复已有内容的用户消息，避免上游返回 400 “Requests ending with a model turn are not supported”。名单内的模型上游仍返回这类 400 时，同一请求改回补用户消息重发一次（与重新生成一样计入每账号每分钟上限与出口限速；账号已冷却、名额满了或出口限速时不在这个账号重发，换号再试、下一次补用户消息，不冷却、不计入连续失败上限，指定账号的请求在原账号再试，不把这个 400 交给客户端），请求日志写一行“上游不接受以模型轮结尾的请求，改回在末尾补用户消息重试一次”，同模型同通道一小时内直接补用户消息。用于兼容把说明文字和工具调用、或把并行工具调用拆成多条 assistant 消息的客户端，避免上游返回 400 “function call turn comes immediately after a user turn or after a function response turn”。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果>` 文字说明、改为用户消息，各协议一致。除此之外只调整分轮，不改动内容与思考签名。
+
+流尾错误：Playground 的 GenerateContent 流在帧列表之后带 google.rpc 状态 `[[...], [code, message, details]]` 时按状态码交出上游错误：8 为 429（冷却、换号）、5xx 重试、3 为 400 按请求错误返回，完成帧之后的流尾错误同样交出。原先跳过流尾，一律报“流结束前没有完成帧”（对外 502）。
+
+客户端还没收到内容时重新生成：上游以 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL` 结束，或流在完成帧之前中断（连接被重置、响应被截断、正常结束却没有完成帧）、流尾为 5xx（504 除外，交给换号），而这次请求还没有向客户端交出任何正文、思考或工具调用（数据型心跳不算）时，在同一账号重新生成，每个请求最多 2 次（换号后的尝试共用这 2 次）。上游对完全相同的输入返回完全相同的回复（见[排查路由 /trace/](#排查路由-trace)里的重复回复说明），所以因结束原因重新生成时换一个随机后缀再发；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE=false`）原样重发多半还是同一个错误调用，不因结束原因重新生成，请求日志写一行说明；流中断与流尾 5xx 不是确定性的，照旧原样重发。上游字段类型变了、函数调用缺少名称这类确定性的格式不符不算中断，不重新生成。重新生成计入每账号每分钟上限（`ACCOUNT_RPM_LIMIT`）与出口限速，账号已冷却、名额满了或出口限速时不再重新生成、按原结果处理，请求日志写明是哪一项（“账号冷却至 15:04:05（原因=…）”“每分钟名额 10/10”或“出口 <出口>（普通通道）限速 n 次/分钟”）；几次生成共用首事件前期限（`REQUEST_TIMEOUT`），剩余期限不到这次耗时的 1.2 倍时同样按原结果结束，长思考模型不会因为重来而变成 504；首事件超时（`FIRST_EVENT_TIMEOUT`）按每次发送计，重新生成的那次发送重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成（免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时）；用量与访问日志只记最后一次；请求日志每次写一行“客户端还没收到内容，同账号重新生成 | 第 n/2 次 | 原因 | 本次耗时=… | 上游说明=… | 输入=已换随机后缀|原样重发”（附被放弃那次的结束说明或流尾错误原文）。已经交出内容的照旧结束；非流式请求同样以“已交出事件”为界：思考摘要先交出、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成。
+
+Schema 里的空串：官网拒收 `enum` 里的空串，Playground 编码时去掉空串（去完为空时不写 `enum`），并把完整 Schema 附在函数说明或结构化输出的说明里交给模型遵守；`not` 只排除空串（`not: ""`、`not: {"enum": [""]}`、`not: {"const": ""}`）时字符串参数改写为 `minLength: 1`，排除值里的其他取值照旧，联合类型与带其他约束的 `not` 只去掉空串、不收紧其余取值；`not` 里用 `anyOf`、`oneOf`、`allOf` 或对象属性写出的空串排除去掉空串后会变成“一律禁止”，这时删除对应的分支或整个 `not`，宁可放宽也不发出无法满足的约束。Build 通道原样发送 JSON Schema，不受影响。
+
+未知路由：`/v1/`、`/v1beta/`（以及 `/ultra`、`/trace` 前缀）下没有的路径或方法不对时按所属协议返回 404 错误体，消息为 `Invalid URL (GET /v1/xxx)`：`/v1beta/` 与 `/v1/interactions` 为 Gemini 格式，`/v1/messages` 或带 `Anthropic-Version` 头为 Anthropic 格式，其余为 OpenAI 格式。原先是纯文本 `404 page not found`。
+
+Anthropic 搜索块顺序：非流式 Messages 响应里 `server_tool_use`、`web_search_tool_result` 放在开头的思考之后、正文之前，与官方顺序一致；流式响应正文实时写出，搜索块仍在流尾。
+
+Cookie 写盘：只有轮换 Cookie（`SIDCC`、`__Secure-1PSIDCC`、`__Secure-3PSIDCC`）变化、且认证文件 30 秒内写过时不立即写盘，最新值暂存在内存，到 30 秒时写出；其他 Cookie 变化照常立即写。Go 通道发请求前读到的是暂存的最新值，Worker 冷启动前、账号被标为需要登录时（之后按认证文件修改时间判断重启后是否仍疑似失效）、生成服务停止时（之后直接写盘，停止再启动时新一代读到的是最新值）与进程关闭时（关闭 Worker 之前与之后各一次）先写盘；认证文件修改时间在未来时最多也只等 30 秒。正常运行与正常停止时发给 Google 的 Cookie 与每次都写盘时相同，只是少了每个请求一次的认证文件读写；进程被强杀（OOM、`kill -9`、守护脚本判定卡死后结束进程）时每个账号最多丢失 30 秒内的轮换 Cookie，重启后带的是稍早的值（与浏览器自身约每 30 秒落盘一次相当）。
 
 新账户自动处理（账户页顶部面板）：新目录导入后进入队列，待处理达到“每批数量”（默认 10）或最早的账户已等待 2 分钟时开始处理。账户默认启用（见下文“账户停用原因与认证文件更新”），导入的账户已经是启用状态，开启自动验证时启动浏览器验证登录（默认并发 3），未通过的显示为“需要登录”；仍为停用的账户（例如手动停用后交给“处理现有停用账户”）在停用状态下验证，通过后才启用，失效的保持停用、不会接到请求；手动停用的账户导入时不进入队列，排队或验证期间被手动停用的也保持停用（“处理现有停用账户”加入的除外），停用账户的验证结果按浏览器实际验证判断。验证过程出错会间隔 2 分钟重试，共 3 次；处理结果合并约 2 秒写一次 `.onboarding.json`，停止服务时立即写出。设置与处理记录保存在账户目录的 `.onboarding.json`，重启后继续有效，服务停止期间上传的账户在启动后同样会处理。首次开启时已有账户记为基线不做改动，面板上的“处理现有停用账户”可以把它们交给同一流程；管理页手动添加的账户不自动处理；删除后重新上传的账户会再次处理。
 
@@ -716,7 +728,7 @@ cp .env.example .env
 | `PROXY_POOL_PORT_END` | `10200` | 静态 IP 的结束端口（含）；端口段最多 5000 个端口，任何模式下都要是 1–65535 且起始不大于结束 |
 | `INIT_TIMEOUT` | `2m` | 单账户 WAA 初始化超时 |
 | `REQUEST_TIMEOUT` | `5m` | 生成请求在首个上游事件之前的总期限：排队、冷启动、WAA proof、附件上传、等首字与首事件前的换号都计入，到时返回 504。开始输出后改为空闲上限：上游连续这么久既没有事件也没有网络字节才以 504 结束；整条生成请求最长 1 小时（本项更长时按本项）。计数、视频与转写等其他请求整段受它限制。修改只影响新请求，见[长回复中途截断或重新生成](#长回复中途截断或重新生成) |
-| `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
+| `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限（客户端还没收到内容时的同账号重新生成每次发送重新起算）；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
 | `STREAM_DATA_HEARTBEAT` | `true` | 数据型流式心跳：每 10 秒没有输出时写一块中转会按 data 转发的空数据（Gemini SSE 为空文本或空思考的候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 `: ping`，new-api 等中转后面的客户端在等首字、长思考时也能持续收到字节。官方 SDK 直连时 Gemini SSE 仍只写换行（直连不经过中转，不再多写一种 SDK 判为无效的块）；开启后 new-api 的首字时间与 TTFT 统计反映的是本服务写出第一块心跳的时刻，且 new-api 收到第一块心跳就当作已有上游响应：之后客户端断开或流被截断、没有 `usageMetadata` 时按估算的输入 token 计费（原先只有换行心跳时计 0），介意时关闭它、只依赖 new-api 的 ping。`false` 时与原先完全一致。管理页“服务配置”可改，保存后立即生效，只影响新请求，见[经 new-api 中转时连接被中止](#经-new-api-中转时连接被中止或工具调用后续请求失败) |
 | `WARM_WORKER_LIMIT` | `5` | 普通号池的常驻预热账户数（不含 Ultra 号池的账户）。应不小于希望常驻的 Worker 数：超出它的 Worker 空闲 5 分钟后被回收，预热也不会补齐超出部分空出的槽位，只能靠请求现场冷启动 |
 | `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS` 之和。淘汰仍在服务请求的冷却占位时替补先启动，排空期间每个分区最多再多 `min(WARM_STARTUP_CONCURRENCY×2, 峰值/4)` 个（至少 1 个） |
@@ -735,15 +747,17 @@ cp .env.example .env
 | `ULTRA_PRIMARY_MODELS` | `gemini-4-argon` | Ultra 号池的主用模型，逗号分隔，作用于 `/ultra` 请求（`ULTRA_EXCLUSIVE=false` 时也作用于普通路径上不在 `PRIMARY_MODELS` 里的这些模型）。排队规则与 `PRIMARY_MODELS` 相同，另外没有额度时立即返回 429：候选全部冷却立即返回；额度 429 后，每日额度用完最多再换 2 次账号，分钟限额与限流最多再换 5 次，每次额度失败后的那次换号只用已启动的 Worker（见[主用模型](#主用模型)）。在 `.env` 写空值或在管理页清空即关闭；进程环境变量的空值不生效。保存后立即生效 |
 | `ULTRA_PRIMARY_QUEUE_WAIT` | `10s` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同：整个请求共用一份，`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`（未配置时取 10s 与 `REQUEST_TIMEOUT` 中较小者） |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
-| `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话 |
+| `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话（只认 `true`/`false`，写错时启动即报错） |
 | `MEDIA_OUTPUT` | `inline` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 与原先一样内联（data URI / `inlineData`）；`url` 按内容保存到 `runtime/media/`，正文改为本服务 `/media/<文件名>` 的链接（Gemini 原生接口为链接文本加 `fileData`），该路径不校验 API key。经 new-api 等中转使用、或生成视频时设为 `url`，见[生成视频与媒体链接](#生成视频与媒体链接omni)。保存后立即生效 |
 | `MEDIA_BASE_URL` | 空 | 媒体链接使用的服务地址，例如 `https://ai.example.com`（可带路径前缀，不能带账号密码、查询参数）；经 new-api、nginx 等转发时必须填用户能访问到的公网地址，并让反向代理放行 `/media/`。留空时按每个请求的 `X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`。保存后立即生效 |
 | `MEDIA_RETENTION` | `7d` | 媒体文件的保存期限（如 `7d`、`72h`），按文件修改时间计算，后台每小时清理；`0` 不按时间清理，不为 0 时至少 1 小时。保存后立即生效 |
 | `MEDIA_MAX_SIZE` | `20GB` | `runtime/media/` 的总量上限（如 `20GB`、`500MB`，按 1024 进位），超过时从最旧的文件开始删除，最近 10 分钟内生成的不删；`0` 不限，不为 0 时至少 100MB。只删除以内容哈希命名的媒体文件。保存后立即生效 |
 | `OMNI_IGNORE_SYSTEM_PROMPT` | `true` | 视频模型忽略系统提示：发给能输出视频的 Omni 模型（含带后缀的名称与目录别名）的请求去掉客户端的系统提示（各协议的 `system`、`systemInstruction`、`instructions`、`system_instruction` 与 `system` 角色消息），不发给上游，请求日志记一行去掉的字数。默认开启是因为 Chatbox 等客户端自动加的 “You are a helpful assistant.” 会让 Omni 只回文字、说无法生成视频；`false` 时系统提示照常发送，与原先完全一致。开启时客户端设置的系统提示（如 Chatbox 的角色设定）对 Omni 不生效，要规定视频风格请写进用户消息；关闭是全局的，对所有客户端生效。除系统提示外没有其他消息时保留；其他模型不受影响。管理页“服务配置”可改，保存后立即生效，只影响新请求，见 [Omni 视频参数](#omni-视频参数) |
-| `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动 |
+| `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动（只认 `true`/`false`，写错时启动即报错） |
 | `REQUEST_BODY_LOG` | `false` | 用量账本同时保存公开 API POST 请求与响应的正文（各截断到 64 KiB，只保留最近 1000 条），在用量页的请求详情中查看；正文以明文保存在本机，修改后重启程序生效 |
 | `ADMIN_PASSWORD` | 空 | 设置后除管理令牌外也可以用密码打开管理页面，浏览器弹出登录框（用户名随意，密码为此值）；同一 IP 10 分钟内错 10 次封禁 15 分钟；留空时只能用管理令牌（`.admin-token`）登录。纯 HTTP 下令牌与密码均为明文传输，建议配合 HTTPS |
+
+取值无效的配置项按默认值启动：`.env` 或进程环境变量里某一项写法无效（时长、整数、布尔值解析不了等），或几项组合起来不成立（如 `MAX_ACTIVE_WORKERS` 小于 `WARM_WORKER_LIMIT`、`FIRST_EVENT_TIMEOUT` 不小于 `REQUEST_TIMEOUT`）时，涉及的项改用默认值，进程照常启动：启动日志逐项写一行 `配置项取值无效，已按默认值启动 | 键=… | 原值=… | 来源=.env|环境变量 | 原因=…`（`PROXY_API_KEY`、`ADMIN_PASSWORD`、`MEDIA_BASE_URL` 等可能带凭据的键不写原值），管理页“服务配置”顶部同样列出，在管理页修改后保存即写入有效值（管理页不编辑的 `REQUEST_BODY_LOG` 写错时，保存其他设置保留 `.env` 里的原行，要在 `.env` 里改正）。决定发往 Google 的网络形态、通道与是否自动启动的键例外，取值无效时仍然启动即报错：代理相关的 `PROXY`、`PROXY_POOL_*` 绝不悄悄改成直连；`WAA_BACKEND` 写错时不悄悄从纯 Go 改成 Camoufox 浏览器（发送路径与 TLS、HTTP/2 指纹都会变）；`UPSTREAM_CHANNELS` 写错时不悄悄打开本想停用的 Build 通道；`TEMPORARY_CHAT` 写错（如 `yes`、`on`，只认 `true`/`false`）时不悄悄按 `false` 打开普通对话页（预热页不再带 `&temporary=true`，官网会把预热提示词自动保存进账号历史）；`AUTO_START` 写错（如 `off`、`no`，只认 `true`/`false`）时不悄悄按 `true` 自动启动生成服务、为账号预热 Worker 连官网。管理页保存设置时无效值照旧直接报错。
 
 管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。
 
@@ -1097,6 +1111,7 @@ MINUTES=180 MODEL=gemini-3.8-flash bash tools/diag_cancel.sh
 | 输入超过模型 token 上限（提示词过长）等参数错误 | 400 | 谷歌原文（去掉 `[original: …]`、`(qos=…)` 等内部标记）；OpenAI 附 `code: context_length_exceeded`，Anthropic 以 `prompt is too long:` 开头 |
 | 输入超过账号的输入上限（部分账号的 Playground 与 Build 另有上限，如 131072 token，上游文案为 `The input token count exceeds the maximum number of tokens allowed 131072`） | 400 | 与安全拦截相同：`Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)`，OpenAI 附 `code: content_policy_violation`，不向客户端暴露账号上限；上游按 429 返回时同样按 400 返回，不冷却账号，只改走 Build、改用更高权益账号各再试一次；管理日志仍记录“输入超过模型上限（提示词过长）” |
 | 输入被安全策略拦截 | 400 | 如 `Prompt was blocked due to prohibited content. (blockReason: PROHIBITED_CONTENT)` |
+| 路径不存在或方法不对（如 `GET /v1/chat/completions`） | 404 | `Invalid URL (GET /v1/chat/completions)`，按路径所属协议的错误结构返回 |
 | 模型不存在（号池的模型目录里没有它） | 404 | `models/<模型> is not found for API version v1beta, …` |
 | 号池目录列出了模型，但它不在这个号池的模型列表里（`/v1/models` 不列出：目录列出它的账号都因权益或启用的上游通道接不了，例如只启用 Build 时的 Omni、模型的权益要求与账号不符）；管理日志写一行 `选号没有候选` 与按原因的账号计数 | 404 | `models/<模型> is not available to the accounts in this pool: <原因>. Call ListModels to see the list of available models.`，原因如 `no account in this pool has a subscription tier that allows this model`、`the enabled upstream channels (build) cannot serve this model`；不带 `Retry-After`，重试也不会好转 |
 | 模型在列、账号也能接，选号却没有候选（假设的候选索引与账号状态不一致，或核对前账号状态刚变化）：本服务重试一次选号（候选索引没有候选时先作废它；输入超限后的再试不重试），管理日志按 ERROR 写一行 `选号没有候选，逐个账户核对却还有候选`；重试后仍没有候选时。这是兜底，线上 Omni 只带图片的请求同一秒以“没有符合条件的账户”结束的根因尚未查明，见 [logging.md](docs/logging.md) 的核对摘要与 Omni 选号诊断 | 503 | `Model <模型> is listed, but no account in the pool can serve this request right now. Please try again later.`，附 `Retry-After` |

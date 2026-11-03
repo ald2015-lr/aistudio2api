@@ -97,13 +97,24 @@ func (t *Trace) analyzeLocked() {
 	if count := len(data.Parameters); count > 0 && data.Parameters[count-1].Model != "" {
 		requested = data.Parameters[count-1].Model
 	}
-	// 预填充：客户端最后一条是模型消息，转换时在末尾补了一条请模型接着写的用户消息（见 notes）
-	prefill := false
-	for _, note := range data.Notes {
-		if strings.Contains(note, "预填充") {
+	// 预填充：客户端最后一条是模型消息（见 notes）。名单内的模型原样以模型轮结尾发送、由模型原生续写，其余模型在末尾补了一条
+	// 请模型接着写的用户消息；原生续写被上游拒绝（改回补用户消息重试）或近期被拒过（直接补用户消息）时按补用户消息说明。
+	// 改回补用户消息的说明经请求说明观察者写进时间线（有观察者时不写 notes），两处都看
+	prefill, nativePrefill, prefillAppended := false, false, false
+	observePrefill := func(message string) {
+		switch {
+		case strings.Contains(message, "预填充"):
 			prefill = true
-			break
+			nativePrefill = nativePrefill || strings.Contains(message, "原生续写")
+		case strings.Contains(message, "改回在末尾补用户消息") || strings.Contains(message, "直接在末尾补用户消息"):
+			prefillAppended = true
 		}
+	}
+	for _, note := range data.Notes {
+		observePrefill(note)
+	}
+	for _, entry := range data.Timeline {
+		observePrefill(entry.Message)
 	}
 
 	// 1. 请求结果
@@ -229,7 +240,14 @@ func (t *Trace) analyzeLocked() {
 	}
 	// 最后一条是模型消息（预填充）：模型直接接着写，通常不先思考；偶尔只输出思考、没有正文
 	if prefill {
-		add("提示", "最后一条消息是模型消息（预填充）", "客户端在末尾放了一条模型消息让模型接着写（已转成\"从上一条结尾接着写\"的用户消息）："+
+		how := "已转成\"从上一条结尾接着写\"的用户消息"
+		switch {
+		case nativePrefill && prefillAppended:
+			how = "该模型本应原样以模型轮结尾发送，但上游不接受，已改回补一条\"从上一条结尾接着写\"的用户消息"
+		case nativePrefill:
+			how = "已按原生续写原样以模型轮结尾发送，模型从这段文字结尾处接着写"
+		}
+		add("提示", "最后一条消息是模型消息（预填充）", "客户端在末尾放了一条模型消息让模型接着写（"+how+"）："+
 			"这类请求常常跳过思考直接输出（思考 0 token），偶尔也会只输出思考、没有正文")
 	}
 

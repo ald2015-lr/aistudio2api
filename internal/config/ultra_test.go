@@ -41,7 +41,7 @@ func TestUltraConfigLoad(t *testing.T) {
 		{content: "ULTRA_WARM_WORKER_LIMIT=-1\n", invalid: "ULTRA_WARM_WORKER_LIMIT"},
 		{content: "ULTRA_WARM_WORKER_LIMIT=abc\n", invalid: "ULTRA_WARM_WORKER_LIMIT"},
 		{content: "ULTRA_MAX_ACTIVE_WORKERS=0\n", invalid: "ULTRA_MAX_ACTIVE_WORKERS"},
-		{content: "ULTRA_WARM_WORKER_LIMIT=6\n", invalid: "ULTRA_MAX_ACTIVE_WORKERS"},
+		{content: "ULTRA_WARM_WORKER_LIMIT=6\n", invalid: "ULTRA_WARM_WORKER_LIMIT"},
 		{content: "ULTRA_WARM_WORKER_LIMIT=3\nULTRA_MAX_ACTIVE_WORKERS=2\n", invalid: "ULTRA_MAX_ACTIVE_WORKERS"},
 	} {
 		path := filepath.Join(t.TempDir(), ".env")
@@ -50,8 +50,11 @@ func TestUltraConfigLoad(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.invalid != "" {
-			if err == nil || !strings.Contains(err.Error(), test.invalid) {
-				t.Fatalf("%q 应报 %s 错误，得到 %v", test.content, test.invalid, err)
+			// 取值无效或组合不成立：涉及的键按默认值启动，写在 .env 里的记入无效项
+			requireInvalidKey(t, test.content, cfg, err, test.invalid)
+			if !cfg.UltraExclusive || cfg.UltraWarmWorkerLimit != 2 || cfg.UltraMaxActiveWorkers != 5 {
+				t.Fatalf("%q：应改回默认 true/2/5，得到 %t/%d/%d", test.content,
+					cfg.UltraExclusive, cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
 			}
 			continue
 		}

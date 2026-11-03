@@ -617,7 +617,7 @@ func (d *BuildStreamDecoder) End() error {
 	if d.finished {
 		return nil
 	}
-	return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "流结束前没有 finishReason"}
+	return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: "流结束前没有 finishReason", Err: errMissingFinishFrame}
 }
 
 // buildEnumName 把 Gemini API 枚举名转换为规范小写名称
@@ -752,7 +752,7 @@ func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(
 		if err := stream.Decode(&raw); err != nil {
 			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: err.Error(), Err: err}
 		}
-		if err := buildTrailerError(raw); err != nil {
+		if err := trailerError(buildProxyStreamedMethod, raw); err != nil {
 			return err
 		}
 	}
@@ -833,26 +833,6 @@ func buildFunctionCallingConfig(tools Tools) map[string]any {
 		return nil
 	}
 	return calling
-}
-
-func buildTrailerError(raw json.RawMessage) error {
-	status, err := rawArray(raw, "$[1]", raw)
-	if err != nil || len(status) == 0 {
-		return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$[1]", Detail: "流尾状态无效", Raw: cloneRaw(raw)}
-	}
-	code, err := rawInt64(status[0], "$[1][0]", raw)
-	if err != nil {
-		return withMethod(err, buildProxyStreamedMethod)
-	}
-	if code == 0 {
-		return nil
-	}
-	statusCode := http.StatusBadGateway
-	if mapped, ok := interactionStatusHTTP[code]; ok {
-		statusCode = mapped
-	}
-	// 按完整状态解码，保留 ErrorInfo 与 RetryInfo
-	return DecodeRPCError(buildProxyStreamedMethod, statusCode, raw)
 }
 
 // sendBuild 编码并发送 Build 代理请求，返回响应与含 finishReason 校验的解码

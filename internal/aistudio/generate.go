@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"slices"
 	"strings"
+	"time"
 )
 
 var errStopSequenceMatched = errors.New("stop sequence matched")
@@ -636,21 +637,53 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	if build {
 		channel = ChannelBuild
 	}
+	interaction := entry.defaults.InteractionStream && !build
+	// 以模型轮原样发送（原生续写）：Interaction 模型与近期在该通道拒绝过的模型改回补用户消息
+	request = applyPrefillMemory(ctx, request, channel, entry.model.ID, interaction)
 	reportSentInput(ctx, channel, request)
-	if entry.defaults.InteractionStream && !build {
+	if interaction {
 		return c.generateInteraction(ctx, request, entry)
 	}
-	request.Config = applyModelMediaDefaults(request.Config, entry.model)
-	request.ImageRoute = entry.defaults.ImageRoute
-	request.Contents = applySpeechTranscript(request.Contents, entry.model, request.Config)
-	wireRequest := request
-	wireRequest.Config.StopSequences = nil
-	var response *RPCResponse
-	var decodeStream func(io.Reader, func(Event) error) error
-	if build {
-		response, decodeStream, err = c.sendBuild(ctx, wireRequest, entry)
-	} else {
-		response, decodeStream, err = c.sendPlayground(ctx, wireRequest, entry)
+	// source 为整理成线格式之前的请求：改回补用户消息与因结束原因换输入都在它上面改，再按第一次发送的步骤重建
+	source := request
+	var wireRequest GenerateRequest
+	request, wireRequest = playgroundWireRequest(source, entry)
+	sendRequest := func(sendCtx context.Context) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
+		if build {
+			return c.sendBuild(sendCtx, wireRequest, entry)
+		}
+		return c.sendPlayground(sendCtx, wireRequest, entry)
+	}
+	// 重发（续写回退、重新生成）不报告请求阶段，开始向上游发送时重新起算首事件计时（见 regenerate.go）
+	resendCtx := resendContext(ctx)
+	// prefillFallback 处理上游拒绝原生续写：记住该模型与通道（之后同模型同通道直接补用户消息）。重发与重新生成一样先经
+	// AccountLease.ReserveRegeneration 占每分钟名额与出口令牌（不占重新生成次数）：准入时把请求改回补用户消息、写一行请求说明并返回空串；
+	// 账号已冷却、名额已满或出口限速时不在本次尝试重发，写一行说明并返回不准入的原因，调用方交出 *PrefillRetryError 由 app 层换号再试
+	prefillFallback := func(cause error) string {
+		rememberPrefillRejected(channel, entry.model.ID, time.Now())
+		if lease, leased := AccountLeaseFromContext(ctx); leased {
+			if denied := lease.ReserveRegeneration(entry.model.ID); denied != "" {
+				ReportRequestNote(ctx, prefillFallbackDeniedNote(entry.model.ID, channel, denied, cause))
+				return denied
+			}
+		}
+		ReportRequestNote(ctx, prefillFallbackNote(entry.model.ID, channel, cause))
+		source = withPrefillContinuation(source)
+		request, wireRequest = playgroundWireRequest(source, entry)
+		reportSentInput(ctx, channel, request)
+		return ""
+	}
+	sendStarted := time.Now()
+	response, decodeStream, err := sendRequest(ctx)
+	if err != nil && request.PrefillTail && ctx.Err() == nil && prefillRejectedError(err) {
+		if denied := prefillFallback(err); denied != "" {
+			err = &PrefillRetryError{Err: err, Denied: denied}
+		} else if !restartFirstEvent(ctx) {
+			// 首事件计时恰好到期：这次尝试正被取消，app 层按首事件超时换号
+			err = context.Canceled
+		} else {
+			response, decodeStream, err = sendRequest(resendCtx)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -666,8 +699,10 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		countRequest := TokenCountRequest{
 			Model: request.Model, System: request.System, Contents: request.Contents, Tools: request.Tools,
 		}
+		// 账户 ID 先取出来：解码 goroutine 改回补用户消息时会整体改写 request
+		accountID := request.AccountID
 		go func() {
-			count, countErr := c.CountTokensForAccount(countContext, request.AccountID, countRequest)
+			count, countErr := c.CountTokensForAccount(countContext, accountID, countRequest)
 			results <- tokenCountResult{count: count, err: countErr}
 			close(results)
 		}()
@@ -676,11 +711,17 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	go func() {
 		defer close(events)
 		defer cancelTokenCount()
-		defer recoverDecodePanic(ctx, events, response.Body)
-		stopClose := context.AfterFunc(ctx, func() {
-			_ = response.Body.Close()
-		})
-		defer stopClose()
+		// 重新生成后换成新的响应：panic 恢复关闭的是当前持有的那一个
+		body := &currentBody{body: response.Body}
+		defer recoverDecodePanic(ctx, events, body)
+		// 每个响应各自登记取消时关闭（回调在另一个 goroutine 里运行，只读它自己的那个正文）
+		closeOnCancel := func(closer io.Closer) func() bool {
+			return context.AfterFunc(ctx, func() {
+				_ = closer.Close()
+			})
+		}
+		stopClose := closeOnCancel(response.Body)
+		defer func() { stopClose() }()
 		send := func(event Event) error {
 			// Build 通道的事件已带有上游报告的实际模型，其余事件标为本次请求的模型
 			if event.ProviderModel == "" {
@@ -699,6 +740,8 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		var finish *Event
 		var output generatedOutputParts
 		matchedStopSequence := ""
+		// delivered 为已经向客户端交出过内容（正文、思考、工具调用、媒体等任何事件）：之后不再重新生成
+		delivered := false
 		emitEvent := func(event Event) error {
 			switch event.Kind {
 			case EventUsage:
@@ -721,6 +764,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 					}
 					event = hiddenThought(event)
 				}
+				delivered = true
 				return send(event)
 			}
 		}
@@ -749,7 +793,86 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			}
 			return nil
 		}
-		err := decodeStream(observeStreamActivity(ctx, response.Body), emit)
+		regenerations := regenerationBudgetFrom(ctx)
+		// attemptStarted 为本次发送的开始时刻：重新生成前按它估计再来一次要多久，剩余期限不够时不重新生成
+		attemptStarted := sendStarted
+		var err error
+		for {
+			reader := &streamReadFailure{source: observeStreamActivity(ctx, response.Body)}
+			err = decodeStream(reader, emit)
+			if errors.Is(err, errStopSequenceMatched) || delivered || ctx.Err() != nil {
+				break
+			}
+			if err != nil && request.PrefillTail && prefillRejectedError(err) {
+				// 原生续写在流里被拒（流尾 400）：改回补用户消息重发一次，不占重新生成次数；本账号不能马上重发时交出 *PrefillRetryError，
+				// 作为首个事件交给 app 层换号再试
+				if denied := prefillFallback(err); denied != "" {
+					err = &PrefillRetryError{Err: err, Denied: denied}
+					break
+				}
+			} else {
+				reason := regenerationReason(err, reader.err, finish)
+				if reason == "" {
+					break
+				}
+				elapsed := time.Since(attemptStarted)
+				reason += " | " + regenerationDetail(err, finish, elapsed)
+				// 三次生成共用首事件前期限（REQUEST_TIMEOUT），首事件超时每次重发重新起算：剩余时间不够再来一次（按本次耗时的 1.2 倍估计）
+				// 就按这次的结果结束，免得长思考模型把本可以交出的结果拖成 504、白白多烧一次额度
+				if short := regenerationTimeShort(ctx, elapsed); short != "" {
+					ReportRequestNote(ctx, "客户端还没收到内容，"+short+" | "+reason)
+					break
+				}
+				// 因结束原因重新生成要换一个输入（重新加随机后缀）：原样重发多半还是同一个错误调用
+				varied, variedOK := source, false
+				if err == nil {
+					if varied, variedOK = regenerationVariant(ctx, source); !variedOK {
+						ReportRequestNote(ctx, regenerationNoVariantNote+" | "+reason)
+						break
+					}
+				}
+				sequence, ok := regenerations.take()
+				if !ok {
+					ReportRequestNote(ctx, fmt.Sprintf("客户端还没收到内容，重新生成次数已用完（%d 次），按上游结果结束 | %s", regenerationLimit, reason))
+					break
+				}
+				if lease, leased := AccountLeaseFromContext(ctx); leased {
+					if denied := lease.ReserveRegeneration(entry.model.ID); denied != "" {
+						regenerations.giveBack()
+						ReportRequestNote(ctx, "客户端还没收到内容，但"+denied+"，不重新生成 | "+reason)
+						break
+					}
+				}
+				input := "原样重发"
+				if variedOK {
+					source, input = varied, "已换随机后缀"
+					request, wireRequest = playgroundWireRequest(source, entry)
+				}
+				ReportRequestNote(ctx, fmt.Sprintf("客户端还没收到内容，同账号重新生成 | 第 %d/%d 次 | %s | 输入=%s", sequence, regenerationLimit, reason, input))
+			}
+			stopClose()
+			_ = response.Body.Close()
+			// 只交出最后一次的用量与结束事件；输出与停止序列从头计（停止序列暂存的正文属于丢弃的这次，没有交出过）
+			usage, usageModel, finish = nil, "", nil
+			output = generatedOutputParts{}
+			matcher = newStopSequenceMatcher(request.Config.StopSequences)
+			matchedStopSequence = ""
+			attemptStarted = time.Now()
+			// 首事件计时按每次发送重新起算；计时已到时这次尝试正被取消（app 层按首事件超时换号），被放弃的这次已经清空，不再交出
+			if !restartFirstEvent(ctx) {
+				err = context.Canceled
+				break
+			}
+			next, nextDecode, sendErr := sendRequest(resendCtx)
+			if sendErr != nil {
+				// 重新发送失败：交出这次的错误（app 层按首事件错误冷却、换号）
+				err = sendErr
+				break
+			}
+			response, decodeStream = next, nextDecode
+			body.body = response.Body
+			stopClose = closeOnCancel(response.Body)
+		}
 		if errors.Is(err, errStopSequenceMatched) {
 			_ = response.Body.Close()
 			select {
@@ -800,6 +923,18 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		}
 	}()
 	return events, nil
+}
+
+// playgroundWireRequest 按发送前的步骤整理请求：媒体默认值、图片路由、语音台词分段；返回整理后的请求与发往上游的副本
+// （停止序列在本地匹配，不发送）。改回补用户消息与因结束原因换输入后同样经它重建，与第一次发送的步骤相同
+func playgroundWireRequest(source GenerateRequest, entry modelEntry) (GenerateRequest, GenerateRequest) {
+	request := source
+	request.Config = applyModelMediaDefaults(request.Config, entry.model)
+	request.ImageRoute = entry.defaults.ImageRoute
+	request.Contents = applySpeechTranscript(request.Contents, entry.model, request.Config)
+	wire := request
+	wire.Config.StopSequences = nil
+	return request, wire
 }
 
 // sendPlayground 编码并发送 Playground GenerateContent，返回响应与含完成帧校验的流解码

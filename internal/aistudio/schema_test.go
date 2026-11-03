@@ -103,10 +103,14 @@ func TestEncodeJSONSchemaTopLevelNull(t *testing.T) {
 
 // TestEncodeJSONSchemaNotVariants not 的各种写法被规范化为可编码形式
 func TestEncodeJSONSchemaNotVariants(t *testing.T) {
-	for _, not := range []string{`null`, `false`, `true`, `{}`, `{"description":null}`, `""`} {
+	for _, not := range []string{`null`, `false`, `true`, `{}`, `{"description":null}`} {
 		if got := mustEncodeSchema(t, `{"type":"string","not":`+not+`}`); got != `[1]` {
 			t.Fatalf("not:%s 编码为 %s", not, got)
 		}
+	}
+	// not:"" 排除空串：官网拒收 not.enum 里的空串，改写为 minLength 1（线格式第 13 位）
+	if got := mustEncodeSchema(t, `{"type":"string","not":""}`); got != `[1,null,null,null,null,null,null,null,null,null,null,null,1]` {
+		t.Fatalf(`not:"" 编码为 %s`, got)
 	}
 	if got := mustEncodeSchema(t, `{"type":"string","not":{"type":"null"}}`); got != `[1,null,null,false]` {
 		t.Fatalf("not:{type:null} 编码为 %s", got)

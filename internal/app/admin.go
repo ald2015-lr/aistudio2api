@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1151,6 +1152,21 @@ func (admin *runtimeAdmin) RuntimeConfig(context.Context) (api.RuntimeConfig, er
 	return runtimeConfigDTO(cfg), nil
 }
 
+// adminUneditedConfigKeys 为管理页面不编辑的配置键：保存时沿用 .env 中的现值
+var adminUneditedConfigKeys = []string{"AUTO_START", "REQUEST_BODY_LOG", "ADMIN_PASSWORD"}
+
+// uneditedInvalidConfigKeys 返回加载时取值无效、按默认值生效的项里管理页面不编辑的键：保存其他设置时沿用 .env 里的原行，
+// 不把默认值写回抹掉原值（本页改不了它们，要在 .env 里改正）
+func uneditedInvalidConfigKeys(invalid []config.InvalidValue) []string {
+	var keys []string
+	for _, item := range invalid {
+		if slices.Contains(adminUneditedConfigKeys, item.Key) {
+			keys = append(keys, item.Key)
+		}
+	}
+	return keys
+}
+
 // invalidConfigError 表示管理页面提交的配置无效，返回 400 invalid_config（原先按上游错误返回 502）
 func invalidConfigError(err error) error {
 	return &adminOperationError{status: http.StatusBadRequest, code: "invalid_config", message: err.Error()}
@@ -1165,7 +1181,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("REQUEST_TIMEOUT 无效: %w", err))
 	}
-	// 管理页面不编辑 AUTO_START、REQUEST_BODY_LOG 与 ADMIN_PASSWORD，保存时沿用 .env 中的现值，避免被整体重写抹掉。
+	// 管理页面不编辑 AUTO_START、REQUEST_BODY_LOG 与 ADMIN_PASSWORD（adminUneditedConfigKeys），保存时沿用 .env 中的现值，避免被整体重写抹掉；
+	// 其中取值无效、按默认值生效的（AUTO_START 写错时读不出 .env，到不了这里）沿用 .env 里的原行，不把默认值写回（见 Config.SaveKeeping）。
 	// 现有 .env 读不出来时不保存：原先按默认值继续，会用空的 ADMIN_PASSWORD 与默认降级判定设置覆盖写盘
 	saved, loadErr := config.Load(admin.configPath)
 	if loadErr != nil {
@@ -1299,10 +1316,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
 	}
-	if err := cfg.Save(admin.configPath); err != nil {
+	if err := cfg.SaveKeeping(admin.configPath, uneditedInvalidConfigKeys(saved.Invalid)); err != nil {
 		return api.RuntimeConfig{}, err
 	}
 	admin.requests.log("service", "INFO", "服务配置已保存")
+	// 保存后 .env 里本页编辑的值都有效了；仍然无效的只剩进程环境变量里的项与本页不编辑、沿用原行的项（重新读取一次，管理页照常提示）
+	if reloaded, err := config.Load(admin.configPath); err == nil {
+		cfg.Invalid = reloaded.Invalid
+	}
 	return runtimeConfigDTO(cfg), nil
 }
 
@@ -2008,7 +2029,22 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		MediaBaseURL:           &media.BaseURL,
 		MediaRetention:         config.FormatMediaRetention(media.Retention),
 		MediaMaxSize:           config.FormatMediaSize(media.MaxBytes),
+		InvalidConfig:          invalidConfigDTO(cfg.Invalid),
 	}
+}
+
+// invalidConfigDTO 返回取值无效、已按默认值生效的配置项（凭据键在加载时就没有记录原值）
+func invalidConfigDTO(items []config.InvalidValue) []api.InvalidConfigValue {
+	if len(items) == 0 {
+		return nil
+	}
+	result := make([]api.InvalidConfigValue, 0, len(items))
+	for _, item := range items {
+		result = append(result, api.InvalidConfigValue{
+			Key: item.Key, Value: item.Value, Reason: item.Reason, Environment: item.Environment,
+		})
+	}
+	return result
 }
 
 // mediaSettingsFromInput 合并页面提交的媒体设置：没有提交的字段沿用 current；输出方式不区分大小写，服务地址去掉首尾空白与末尾的 /

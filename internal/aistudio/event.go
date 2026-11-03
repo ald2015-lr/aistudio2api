@@ -188,7 +188,9 @@ func (d *FrameDecoder) End() error {
 	if d.finished {
 		return nil
 	}
-	return d.protocolError("$", "流结束前没有完成帧", d.lastFrame)
+	return &ProtocolEvidenceError{
+		Method: "GenerateContent", Path: "$", Detail: "流结束前没有完成帧", Raw: append(json.RawMessage(nil), d.lastFrame...), Err: errMissingFinishFrame,
+	}
 }
 
 func (d *FrameDecoder) decodeContent(raw json.RawMessage, evidence json.RawMessage) ([]Event, error) {

@@ -74,8 +74,10 @@ func TestDowngradeRejectStatusConfig(t *testing.T) {
 			err = cfg.Validate()
 		}
 		if test.invalid {
-			if err == nil {
-				t.Fatalf("%q 应报错", test.content)
+			// 取值无效时按默认值（400）启动并记入无效项
+			requireInvalidKey(t, test.content, cfg, err, "DOWNGRADE_REJECT_STATUS")
+			if cfg.DowngradeGuard.RejectStatus != DowngradeRejectBlocked {
+				t.Fatalf("%q：无效时应取默认 400，得到 %d", test.content, cfg.DowngradeGuard.RejectStatus)
 			}
 			continue
 		}

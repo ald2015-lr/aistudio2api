@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestOmniIgnoreSystemPromptConfig 视频模型忽略系统提示默认开启，可显式关闭，非布尔值报错；进程环境变量优先于 .env；
+// TestOmniIgnoreSystemPromptConfig 视频模型忽略系统提示默认开启，可显式关闭，非布尔值按默认值加载并记入无效项；进程环境变量优先于 .env；
 // .env 与管理接口的 JSON 往返不变，旧版 JSON 没有该字段时按默认开启
 func TestOmniIgnoreSystemPromptConfig(t *testing.T) {
 	t.Setenv("OMNI_IGNORE_SYSTEM_PROMPT", "")
@@ -37,8 +37,8 @@ func TestOmniIgnoreSystemPromptConfig(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.fail {
-			if err == nil {
-				t.Fatalf("%q 应报错", test.content)
+			if requireInvalidKey(t, test.content, cfg, err, "OMNI_IGNORE_SYSTEM_PROMPT"); !cfg.OmniIgnoreSystemPrompt {
+				t.Fatalf("%q：无效时应取默认值 true", test.content)
 			}
 			continue
 		}

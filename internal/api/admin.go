@@ -515,6 +515,18 @@ type RuntimeConfig struct {
 	MediaBaseURL   *string `json:"media_base_url,omitempty"`
 	MediaRetention string  `json:"media_retention,omitempty"`
 	MediaMaxSize   string  `json:"media_max_size,omitempty"`
+	// InvalidConfig 为 .env 或进程环境变量里取值无效、已按默认值生效的配置项，只读（保存时忽略）；凭据键没有原值
+	InvalidConfig []InvalidConfigValue `json:"invalid_config,omitempty"`
+}
+
+// InvalidConfigValue 为一项取值无效、已按默认值生效的配置
+type InvalidConfigValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"`
+	// Reason 为无效的原因（中文说明）
+	Reason string `json:"reason"`
+	// Environment 为取值来自进程环境变量：在管理页保存设置改不了它
+	Environment bool `json:"environment,omitempty"`
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（管理页 → 服务配置，修改后立即生效）

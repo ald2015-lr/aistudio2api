@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -768,7 +769,7 @@ func buildAnthropicResponse(id string, model string, result generationResult, se
 		"type":          "message",
 		"role":          "assistant",
 		"model":         model,
-		"content":       append(anthropicBlocks(result, media), searchBlocks...),
+		"content":       withSearchBlocks(anthropicBlocks(result, media), searchBlocks),
 		"stop_reason":   stopReason,
 		"stop_sequence": stopSequence,
 	}
@@ -790,6 +791,19 @@ func buildAnthropicResponse(id string, model string, result generationResult, se
 		usage["server_tool_use"] = map[string]int{"web_search_requests": searchCount, "web_fetch_requests": 0}
 	}
 	return response
+}
+
+// withSearchBlocks 把搜索块（server_tool_use、web_search_tool_result）放在开头的思考块之后、正文与工具调用之前，与官方 Messages API
+// 的顺序一致（原先拼在全部内容之后）。流式响应的正文实时写出，搜索块仍在流尾
+func withSearchBlocks(blocks []anthropicContentBlock, search []anthropicContentBlock) []anthropicContentBlock {
+	if len(search) == 0 {
+		return blocks
+	}
+	at := 0
+	for at < len(blocks) && (blocks[at].Type == "thinking" || blocks[at].Type == "redacted_thinking") {
+		at++
+	}
+	return slices.Concat(blocks[:at], search, blocks[at:])
 }
 
 func anthropicBlocks(result generationResult, media mediaOutput) []anthropicContentBlock {

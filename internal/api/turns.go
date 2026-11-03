@@ -11,11 +11,9 @@ import (
 // continuationPrompt 为历史以模型工具调用开头时补在最前面的用户消息
 const continuationPrompt = "Continue."
 
-// prefillContinuationPrompt 为历史以模型消息结尾（预填充、续写）时补在最后的用户消息。
-// Gemini 3 等模型不接受以模型轮结尾的请求，改为请模型从上一条消息结尾处接着写；
-// 客户端会把输出接在原消息后面，所以要求模型不要重复已有内容
-const prefillContinuationPrompt = "Continue exactly from where your previous message ended. " +
-	"Do not repeat any of it; output only the continuation."
+// prefillContinuationPrompt 为历史以模型消息结尾（预填充、续写）时补在最后的用户消息（见 aistudio.PrefillContinuationPrompt）。
+// 不接受以模型轮结尾的模型改为请模型从上一条消息结尾处接着写；接受的模型（aistudio.NativePrefillModel）由 prepareGenerate 原样发送
+const prefillContinuationPrompt = aistudio.PrefillContinuationPrompt
 
 // normalizeTurns 修正客户端常见的对话历史分轮问题，使其满足 Gemini 的要求：
 //
@@ -32,6 +30,17 @@ const prefillContinuationPrompt = "Continue exactly from where your previous mes
 //
 // 除开头的孤立工具结果外只调整分轮，不改动任何内容与思考签名；返回修正后的历史与修正次数
 func normalizeTurns(contents []aistudio.Content) ([]aistudio.Content, int) {
+	result, fixes := normalizeTurnSplits(contents)
+	// 以模型的文字消息结尾时补一条用户消息；以工具调用结尾说明缺少工具结果，属于客户端错误，保持原样
+	if aistudio.EndsWithModelText(result) {
+		result = aistudio.AppendPrefillContinuation(result)
+		fixes++
+	}
+	return result, fixes
+}
+
+// normalizeTurnSplits 同 normalizeTurns，但历史以模型的文字消息结尾时不补用户消息（由调用方按模型决定，见 prepareGenerate）
+func normalizeTurnSplits(contents []aistudio.Content) ([]aistudio.Content, int) {
 	contents, fixes := orphanResultsAsText(contents)
 	result := make([]aistudio.Content, 0, len(contents)+2)
 	// pendingMedia 为当前这组工具结果中取出的图片，这组工具结果结束后放进紧随其后的用户消息
@@ -80,13 +89,6 @@ func normalizeTurns(contents []aistudio.Content) ([]aistudio.Content, int) {
 		result = append([]aistudio.Content{{
 			Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: continuationPrompt}},
 		}}, result...)
-		fixes++
-	}
-	// 以模型的文字消息结尾时补一条用户消息；以工具调用结尾说明缺少工具结果，属于客户端错误，保持原样
-	if count := len(result); count > 0 && result[count-1].Role == aistudio.RoleAssistant && !hasFunctionCall(result[count-1]) {
-		result = append(result, aistudio.Content{
-			Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: prefillContinuationPrompt}},
-		})
 		fixes++
 	}
 	return result, fixes
@@ -201,11 +203,22 @@ func hasFunctionCall(content aistudio.Content) bool {
 // prepareGenerate 在发往上游前整理请求：先修正对话历史分轮，再解析模型名后缀（Omni 模型另整理视频设置）。
 // 各入口在此之前已按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），预填充判断与分轮合并按去掉后的对话进行。
 // 返回是否需要隐藏思维链；Omni 视频设置不成立（例如非第一轮指定视频任务、帧率不是 24fps）时返回参数错误，调用方在选号前按 400 返回
+//
+// 历史以模型的文字消息结尾（预填充、续写）时按解析后的模型处理：接受以模型轮结尾的模型（aistudio.NativePrefillModel，
+// 3.5 以前的模型与 gemma-）原样发送、靠模型原生续写（标记 PrefillTail，上游仍拒绝时生成服务改回补用户消息重试一次），
+// 其余模型在末尾补一条请模型从这里接着写的用户消息
 func (s *server) prepareGenerate(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
-	if count := len(request.Contents); count > 0 && request.Contents[count-1].Role == aistudio.RoleAssistant &&
-		!hasFunctionCall(request.Contents[count-1]) {
-		aistudio.TraceFromContext(ctx).Note("客户端最后一条是模型消息（预填充）：已在末尾补一条请模型从这里接着写的用户消息")
+	request.Contents, _ = normalizeTurnSplits(request.Contents)
+	hide, err := s.applyModelAlias(ctx, request)
+	if err != nil || !aistudio.EndsWithModelText(request.Contents) {
+		return hide, err
 	}
-	request.Contents, _ = normalizeTurns(request.Contents)
-	return s.applyModelAlias(ctx, request)
+	if aistudio.NativePrefillModel(request.Model) {
+		request.PrefillTail = true
+		aistudio.TraceFromContext(ctx).Note("客户端最后一条是模型消息（预填充）：模型接受以模型轮结尾的请求，原样发送、由模型原生续写")
+		return hide, nil
+	}
+	request.Contents = aistudio.AppendPrefillContinuation(request.Contents)
+	aistudio.TraceFromContext(ctx).Note("客户端最后一条是模型消息（预填充）：已在末尾补一条请模型从这里接着写的用户消息")
+	return hide, nil
 }

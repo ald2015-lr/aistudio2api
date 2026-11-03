@@ -196,6 +196,21 @@ func writeAuthError(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// writeRouteNotFound 以请求路径所属协议（protocolForRequest）的错误体返回 404，消息含请求的方法与路径：
+// "Invalid URL (POST /v1/foo)"，与 OpenAI 官方对未知路径与方法不对的写法一致。代替 Go 默认的纯文本 "404 page not found"，
+// 客户端与中转能按协议解析出错误；方法不对（如 GET /v1/chat/completions）同样按 404 返回
+func writeRouteNotFound(w http.ResponseWriter, r *http.Request) {
+	message := fmt.Sprintf("Invalid URL (%s %s)", r.Method, r.URL.EscapedPath())
+	switch protocolForRequest(r) {
+	case "gemini":
+		writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", message)
+	case "anthropic":
+		writeAnthropicError(w, http.StatusNotFound, "not_found_error", message)
+	default:
+		writeOpenAIError(w, http.StatusNotFound, "not_found", message)
+	}
+}
+
 func protocolForRequest(r *http.Request) string {
 	switch {
 	// /v1/interactions 是 Gemini Interactions 的稳定版入口，与 /v1beta/interactions 一样返回 Gemini 格式错误

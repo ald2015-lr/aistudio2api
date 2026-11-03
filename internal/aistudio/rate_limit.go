@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -272,6 +273,82 @@ func (l *AccountLease) beginGenerationSend(modelID string) error {
 		p.recordGenerationSentLocked(l, now)
 	}
 	return nil
+}
+
+// ReserveRegeneration 为同一租约内的重新生成（见 regenerate.go）占一个发送名额：账户已不在号池或被替换、按租约通道与全局已冷却、
+// 每分钟窗口没有余量（窗口内已发出 + 预占 ≥ ACCOUNT_RPM_LIMIT）或出口令牌桶对租约不准入时不准入，返回具体是哪一项（写进请求说明，
+// 排查时分得清该等冷却、调每分钟上限还是调出口限速）；准入时返回空串，并像取得生成租约时一样预占每分钟名额与出口令牌
+// （重新生成的发送经 beginGenerationSend 抵掉，没发出时随租约释放退还）
+func (l *AccountLease) ReserveRegeneration(modelID string) string {
+	if l == nil || l.pool == nil || l.account == nil {
+		return ""
+	}
+	scope := l.CooldownScope(strings.TrimPrefix(strings.TrimSpace(modelID), "models/"))
+	now := time.Now()
+	p := l.pool
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.byID[l.account.ID] != l.account {
+		return "账号已不在号池或已被替换"
+	}
+	if cooldown, active := accountCooldown(l.account, scope, now); active {
+		return regenerationCooldownDenial(cooldown)
+	}
+	nowNanos := now.UnixNano()
+	if p.accountRateLimit > 0 && p.computeRateUntilLocked(l.account.rate, nowNanos) > nowNanos {
+		return p.regenerationRateDenialLocked(l.account.rate, nowNanos)
+	}
+	if l.egress != nil {
+		if admitted, _ := p.egressAdmitLocked(l.egress, l.egressPrimary, nowNanos); !admitted {
+			return regenerationEgressDenial(l.egress)
+		}
+	}
+	if !l.ratePending {
+		p.reserveRateLocked(l.account, l, now)
+	}
+	if !l.egressPending {
+		p.reserveEgressLocked(l, now, l.egressPrimary)
+	}
+	return ""
+}
+
+// regenerationDenialReasonLimit 为不准入说明里冷却原因的最大字数
+const regenerationDenialReasonLimit = 80
+
+// regenerationCooldownDenial 为账号已冷却时的不准入说明：冷却截止时刻（本地时间）与原因
+func regenerationCooldownDenial(cooldown CooldownState) string {
+	reason := strings.Join(strings.Fields(cooldown.Reason), " ")
+	if runes := []rune(reason); len(runes) > regenerationDenialReasonLimit {
+		reason = string(runes[:regenerationDenialReasonLimit]) + "…"
+	}
+	if reason == "" {
+		reason = "-"
+	}
+	return fmt.Sprintf("账号冷却至 %s（原因=%s）", cooldown.Until.Local().Format("15:04:05"), reason)
+}
+
+// regenerationRateDenialLocked 为每分钟窗口没有余量时的不准入说明：窗口内已发出 + 预占 / ACCOUNT_RPM_LIMIT。调用方持有 p.mu
+func (p *AccountPool) regenerationRateDenialLocked(rate *accountRate, nowNanos int64) string {
+	live, pending := 0, 0
+	if rate != nil {
+		window := int64(p.rateWindowLocked())
+		start := sort.Search(len(rate.sent), func(i int) bool { return rate.sent[i] > nowNanos-window })
+		live, pending = len(rate.sent)-start, rate.pending
+	}
+	return fmt.Sprintf("每分钟名额 %d/%d（已发出 %d、预占 %d，ACCOUNT_RPM_LIMIT）", live+pending, p.accountRateLimit, live, pending)
+}
+
+// regenerationEgressDenial 为出口令牌桶不准入时的不准入说明：出口的脱敏显示（EgressLabel）、通道与每分钟上限
+func regenerationEgressDenial(rate *egressRate) string {
+	lane := "普通"
+	if rate.lane == EgressLaneUltra {
+		lane = "Ultra"
+	}
+	label := "-"
+	if rate.record != nil {
+		label = rate.record.label
+	}
+	return fmt.Sprintf("出口 %s（%s通道）限速 %d 次/分钟，令牌未到", label, lane, rate.limit)
 }
 
 // RecordGenerationSent 为租约记一次发往上游的生成请求（抵掉本租约的预占）。供不经 WorkerProtectedTransport 发送的调用方

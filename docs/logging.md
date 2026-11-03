@@ -42,6 +42,14 @@ INFO  service  管理服务就绪 | 地址=http://127.0.0.1:2048
 INFO  service  管理页面已打开 | 地址=http://127.0.0.1:2048
 ```
 
+`.env` 或进程环境变量里取值无效的配置项（写法解析不了，或几项组合起来不成立）按默认值启动，管理进程启动时逐项写一行 WARN（不进控制台丢弃队列）；`PROXY_API_KEY`、`ADMIN_PASSWORD`、`PROXY`、`PROXY_POOL_URL`、`MEDIA_BASE_URL` 不写原值。决定发往 Google 的网络形态、通道、Worker 打开的官网页面与是否自动启动的键（代理相关的 `PROXY`、`PROXY_POOL_*`，以及 `WAA_BACKEND`、`UPSTREAM_CHANNELS`、`TEMPORARY_CHAT`、`AUTO_START`）无效时不会出现这一行：进程以 `AIStudio2API 启动失败` 退出，不会悄悄改成直连、改用 Camoufox 浏览器、打开 Build 通道、打开会自动保存历史的普通对话页或自动启动生成服务。管理页“服务配置”顶部同样列出这些项，保存设置后 `.env` 里本页编辑的值都改为有效值，只剩进程环境变量里的与本页不编辑的 `REQUEST_BODY_LOG`（保存时沿用 `.env` 里的原行，要在 `.env` 里改正）：
+
+```text
+WARN  service  配置项取值无效，已按默认值启动 | 键=INIT_TIMEOUT | 原值=abc | 来源=.env | 原因=INIT_TIMEOUT 必须是正数时长，例如 30s 或 5m
+WARN  service  配置项取值无效，已按默认值启动 | 键=MAX_ACTIVE_WORKERS | 原值=3 | 来源=.env | 原因=MAX_ACTIVE_WORKERS 必须大于或等于 WARM_WORKER_LIMIT
+WARN  service  配置项取值无效，已按默认值启动 | 键=MEDIA_BASE_URL | 原值=<已隐藏> | 来源=环境变量 | 原因=MEDIA_BASE_URL 必须是 http 或 https 地址，…
+```
+
 点击“启动服务”后状态进入 `LAUNCHING`。模型目录在装配运行时（`协议运行时就绪` 之前）已经从写盘缓存 `runtime/model-catalogs/` 一次载入（账户池与协议客户端的目录、权益与 Pro/Ultra 的权益头），启动时不再对全部账户全量同步：只把缺失、恢复时不一致、疑似登录失效与过期（24 小时 ±10%）的账户排进后台队列低速刷新（见[模型目录缓存与后台同步](#模型目录缓存与后台同步)）。缓存非空时立即预热 Worker；完全没有缓存（首次升级、缓存损坏）时等第一个非空目录，其余账户继续后台同步。首个 Worker 就绪后状态进入 `RUNNING` 并开始接收请求，其余目标 Worker 继续预热。`LAUNCHING` 期间点击“停止服务”会取消当前阶段并回到 `STOPPED`。
 
 ```text
@@ -99,6 +107,13 @@ Camoufox 冷启动名额已满时，`1/7` 之前先记录一行 `WAA Worker 启�
 页面停在 AI Studio 首次使用页时启动流程自动完成它，日志与失败文案见[AI Studio 首次使用页](#ai-studio-首次使用页)。
 
 页面被跳到组织停用页（`access.workspace.google.com` 的 ServiceNotAllowed 等，账号所属组织关闭了 AI Studio）时启动立即失败、不再等页面就绪，日志与状态见[组织停用 AI Studio 的账户](#组织停用-ai-studio-的账户)。
+
+只有轮换 Cookie（`SIDCC` 一类）变化时认证文件最多每 30 秒写一次（见 [protocol.md](protocol.md#账户持久状态)），Worker 冷启动前、账号被标为需要登录时（先写出再记认证文件的修改时间，重启后疑似失效的判断不会被稍后的暂存写盘打乱）、生成服务停止时（之后直接写盘）与进程关闭时（关闭 Worker 之前与之后）先写出暂存的值；写盘失败时各写一行 WARN，Worker 照常启动（浏览器读到的是上一次写盘的值）。进程被强杀时没有这几次写盘，每个账号最多丢失 30 秒内的轮换 Cookie：
+
+```text
+WARN  account@example.com  暂存的认证 Cookie 写盘失败，Worker 照常启动 | 错误=<原因>
+WARN  service              暂存的认证 Cookie 写盘失败 | 错误=<原因>
+```
 
 ### 组织停用 AI Studio 的账户
 
@@ -424,6 +439,33 @@ WARN  service  IP 池检查完成 | 出口=http://isp.decodo.com | 端口=200 | 
 用量在生成服务返回 usage 后展示；用量未知时省略 `request.usage`。平均速度衡量端到端吞吐，网络缓冲或集中到达的响应也使用同一计算区间。
 
 `request.state` 区分 `running`、`completed`、`tool_calls`、`limited`、`blocked`、`failed` 和 `cancelled`。策略终止保留 HTTP `200` 并显示原始 `finish_reason`；达到输出上限时显示 `max_tokens`。未知终止原因保留为 `provider_<code>`。
+
+客户端还没收到任何内容时，上游以 `MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL` 结束，或流在完成帧之前中断（连接被重置、响应被截断、正常结束却没有完成帧）、流尾为 5xx（504 除外），这次请求在同一账号重新生成（每个请求最多 2 次，换号后的尝试共用），请求时间线每次写一行 WARN，末尾附被放弃那次的耗时与原文（`上游说明=` 为结束说明 `finishMessage` 或流尾错误说明，`错误=` 为中断时的错误，超过 200 字截断并以 `…` 结尾；app 层的 `上游结束说明` 只写最终交出的那次，前几次的原文只在这里），最后的 `输入=` 为 `已换随机后缀`（因结束原因重新生成，换一个随机后缀再发）或 `原样重发`（流中断、流尾 5xx）。没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE=false`）不因结束原因重新生成，写“请求没有加随机后缀……不因结束原因重新生成”。次数用完、账号不能再发或剩余时间不足时另写一行，之后按上游结果结束：账号不能再发时写明是哪一项——`账号冷却至 15:04:05（原因=…）`、`每分钟名额 10/10（已发出 9、预占 1，ACCOUNT_RPM_LIMIT）` 或 `出口 <出口>（普通通道|Ultra通道）限速 n 次/分钟，令牌未到`（出口按管理页的脱敏显示，不含代理密码），分别对应等冷却结束、调 `ACCOUNT_RPM_LIMIT`、调出口限速；剩余时间不足分两种：几次生成共用首事件前期限，剩余不到这次耗时的 1.2 倍；或首事件超时（`FIRST_EVENT_TIMEOUT`，每次重发重新起算）不到这次耗时的 1.2 倍。上游字段类型变了、函数调用缺少名称这类确定性的协议错误不算中断，不写这几行。重新生成不重复写“WAA proof 完成”“上游已返回响应头”“收到上游首个事件”，用量与访问日志只记最后一次；经 `/trace/` 的请求这几行只进排查记录的 `timeline`，不在 `notes` 里另写一份：
+
+```text
+WARN  account@example.com  客户端还没收到内容，同账号重新生成 | 第 1/2 次 | 结束原因=malformed_function_call | 本次耗时=41.207s | 上游说明=Malformed function call: print(default_api.lookup(id=)) | 输入=已换随机后缀
+WARN  account@example.com  客户端还没收到内容，同账号重新生成 | 第 2/2 次 | 流尾错误=HTTP 503 | 本次耗时=2.315s | 上游说明=The service is currently unavailable. | 输入=原样重发
+WARN  account@example.com  客户端还没收到内容，同账号重新生成 | 第 1/2 次 | 流中断 | 本次耗时=12.04s | 错误=AI Studio GenerateContent 协议位置 $[0][3]: read tcp …: connection reset by peer | 输入=原样重发
+WARN  account@example.com  客户端还没收到内容，但请求没有加随机后缀（客户端指定了 seed、温度为 0、最后一轮是工具结果或 REPEAT_PROMPT_NONCE 关闭），原样重发多半得到同样的结果，不因结束原因重新生成 | 结束原因=malformed_function_call | 本次耗时=38.5s | 上游说明=Malformed function call: …
+WARN  account@example.com  客户端还没收到内容，重新生成次数已用完（2 次），按上游结果结束 | 结束原因=malformed_function_call | 本次耗时=39.88s | 上游说明=Malformed function call: …
+WARN  account@example.com  客户端还没收到内容，但每分钟名额 10/10（已发出 9、预占 1，ACCOUNT_RPM_LIMIT），不重新生成 | 流尾错误=HTTP 500 | 本次耗时=1.02s | 上游说明=Internal error encountered.
+WARN  account@example.com  客户端还没收到内容，但账号冷却至 15:04:05（原因=分钟限额…），不重新生成 | 流中断 | 本次耗时=3.1s | 错误=…
+WARN  account@example.com  客户端还没收到内容，但出口 socks5://gw.example:1080#a3f9（普通通道）限速 30 次/分钟，令牌未到，不重新生成 | 流尾错误=HTTP 503 | 本次耗时=0.9s | 上游说明=…
+WARN  account@example.com  客户端还没收到内容，剩余期限不足（不到本次耗时的 1.2 倍），不重新生成 | 剩余=1m58.1s | 结束原因=malformed_function_call | 本次耗时=2m0.412s | 上游说明=Malformed function call: …
+WARN  account@example.com  客户端还没收到内容，首事件超时不到本次耗时的 1.2 倍（重发多半被首事件计时打断），不重新生成 | FIRST_EVENT_TIMEOUT=1m0s | 结束原因=malformed_function_call | 本次耗时=55.2s | 上游说明=Malformed function call: …
+```
+
+重新生成与续写回退的重发都在任何事件交出之前，首事件超时（`FIRST_EVENT_TIMEOUT`）按每次发送重新起算（重发前与开始向上游发送时），上游每次都按时返回时不会写“上游首事件超时”。非流式请求同样以“已交出事件”为界：思考摘要先交出、之后才以函数调用格式错误结束或断流的不重新生成（交出的事件已经过首事件判定、降级判定与访问日志）。
+
+以模型轮结尾、原样发送的预填充请求（3.5 以前的模型与 `gemma-`）被上游以 400 拒绝时，改回在末尾补用户消息重发一次，写一行 WARN；重发与重新生成一样先占每分钟名额与出口令牌，账号已冷却、名额已满或出口限速时不在这个账号重发，写另一行 WARN（写明是哪一项），换号再试（指定账号的请求在原账号再试），下一次尝试补用户消息，进度写“本账号不能马上重发（…），换号再试，下一次补用户消息 | 第 n/2 次”；这次再试不冷却账号、不计入连续失败上限与出口判定，运行日志不写“账号切换”，不把这个 400 交给客户端。之后一小时内同模型同通道直接补用户消息，只在排查记录里留一条说明。排查记录的预填充结论按实际处理写“已按原生续写原样以模型轮结尾发送”“已转成从上一条结尾接着写的用户消息”或“上游不接受，已改回补一条…用户消息”：
+
+```text
+WARN  account@example.com  上游不接受以模型轮结尾的请求，改回在末尾补用户消息重试一次 | 模型=gemini-3-flash-preview | 通道=playground | 原因=Requests ending with a model turn are not supported.
+WARN  account@example.com  上游不接受以模型轮结尾的请求，但每分钟名额 10/10（已发出 10、预占 0，ACCOUNT_RPM_LIMIT），不在本次尝试重发，换号再试（下一次补用户消息） | 模型=gemini-3-flash-preview | 通道=playground | 原因=Requests ending with a model turn are not supported.
+INFO  account@example.com  上游不接受以模型轮结尾的请求，本账号不能马上重发（每分钟名额 10/10（已发出 10、预占 0，ACCOUNT_RPM_LIMIT）），换号再试，下一次补用户消息 | 第 1/2 次
+```
+
+流尾 google.rpc 状态现在按状态码交出：原先一律写成 `AI Studio GenerateContent 协议位置 $: 流结束前没有完成帧`，现在是 `AI Studio GenerateContent 返回 HTTP 429、协议错误码 8: …` 这类上游错误，冷却与换号日志随之照常出现。
 
 上游在终止时给出结束说明（Gemini API 的 `finishMessage`，Playground 与 Build 都会解码；例如 `MALFORMED_FUNCTION_CALL` 时写明出错的调用）时，请求时间线另写一条进度 `上游结束说明 | 结束原因=<reason> | 说明=<message>`，排查时不用再抓原始响应。结束原因为 `stop` 或 `stop_sequence` 时级别为 INFO，其余为 WARN；说明超过 2000 字时截断并以 `…` 结尾。这一行同样进入排查记录（`/trace/`）的 `timeline`；`request.finished` 的字段不变。说明另外作为 Gemini 响应的 `finishMessage` 返回，其他协议不携带（见 [protocol.md](protocol.md)）。
 

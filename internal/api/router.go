@@ -86,6 +86,8 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("GET /v1beta/models/{model}", s.handleGeminiModel)
 	public.HandleFunc("POST /v1beta/models/{action}", s.handleGeminiAction)
 	public.HandleFunc("GET /v1beta/operations/{operation}", s.handleGeminiVideoOperation)
+	// 未知路由（含方法不对）按所属协议返回错误体，/trace 与 /ultra 前缀共用这条处理链
+	public.HandleFunc("/", writeRouteNotFound)
 
 	control := http.NewServeMux()
 	control.HandleFunc("GET /api/status", s.handleStatus)

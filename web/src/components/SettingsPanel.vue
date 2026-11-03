@@ -966,6 +966,25 @@ onBeforeUnmount(() => {
       >
         {{ t('settings.pendingManagement') }}
       </div>
+      <div
+        v-if="config.invalid_config?.length"
+        class="rounded border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+      >
+        <p class="font-medium">{{ t('settings.invalidConfigTitle') }}</p>
+        <ul class="mt-2 space-y-1 text-xs leading-5">
+          <li v-for="item in config.invalid_config" :key="item.key" class="break-all">
+            <span class="font-mono">{{ item.key }}</span>
+            <template v-if="item.value">
+              = <span class="font-mono">{{ item.value }}</span>
+            </template>
+            <span class="text-amber-300/80"> · {{ item.reason }}</span>
+            <span v-if="item.environment" class="text-amber-300/80">
+              · {{ t('settings.invalidConfigEnvironment') }}</span
+            >
+          </li>
+        </ul>
+        <p class="mt-2 text-xs text-amber-300/80">{{ t('settings.invalidConfigHint') }}</p>
+      </div>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
         <label class="block">

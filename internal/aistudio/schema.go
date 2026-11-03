@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,29 +52,40 @@ func encodeJSONSchema(raw json.RawMessage) ([]any, error) {
 
 // encodeSchemaNode 转换一个 schema 节点；depth 为当前嵌套层数
 func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
+	wire, _, err := encodeSchemaNodeIn(raw, depth, false)
+	return wire, err
+}
+
+// encodeSchemaNodeIn 转换一个 schema 节点。negated 表示该节点处在 not 之内（奇数层 not）：这里的约束被取反，放宽它等于收紧外层。
+//
+// widened 表示编码结果比原 Schema 放宽了（某个 enum 只有空串，去掉后整个 enum 不写，变成该类型的任意值），沿 items、properties、
+// allOf 向上传：
+//   - not 之内的 anyOf、oneOf 分支放宽时去掉这个分支（并集变小，取反后只会少排除）；分支全部去掉时整个节点算放宽
+//   - not 的子 Schema 放宽时删除这个 not（宁可放宽，不能把“不能为空串”反转成“一律禁止”），节点算放宽；本节点已在 not 之内时保留
+func encodeSchemaNodeIn(raw json.RawMessage, depth int, negated bool) (_ []any, widened bool, _ error) {
 	if depth > maxSchemaDepth {
-		return nil, &schemaLimitError{message: fmt.Sprintf("schema 嵌套超过 %d 层", maxSchemaDepth)}
+		return nil, false, &schemaLimitError{message: fmt.Sprintf("schema 嵌套超过 %d 层", maxSchemaDepth)}
 	}
 	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &schema); err != nil || schema == nil {
-		return nil, fmt.Errorf("schema 必须是 JSON object")
+		return nil, false, fmt.Errorf("schema 必须是 JSON object")
 	}
 	cleanNullFields(schema)
 	canonicalSchemaIntegers(schema)
 	if err := normalizeNot(schema); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := normalizeBooleanItems(schema); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := normalizeConstAndMetadata(schema); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := normalizeNullableVariants(schema); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := normalizeImplicitType(schema); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	allowed := map[string]bool{
 		"type": true, "format": true, "description": true, "nullable": true,
@@ -87,52 +99,59 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	}
 	for name := range schema {
 		if !allowed[name] {
-			return nil, &UnverifiedProtocolError{Feature: "JSON schema 字段 " + name}
+			return nil, false, &UnverifiedProtocolError{Feature: "JSON schema 字段 " + name}
 		}
 	}
 	typeName, err := schemaType(schema)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	typeName = strings.ToLower(typeName)
 	typeCode, ok := schemaTypeCodes[typeName]
 	if !ok {
-		return nil, fmt.Errorf("未知 schema.type %q", typeName)
+		return nil, false, fmt.Errorf("未知 schema.type %q", typeName)
 	}
 	wire := []any{typeCode}
 	if value, ok := schema["format"]; ok {
 		format, err := schemaString(value, "format")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		wire = setWireField(wire, 1, format)
 	}
 	if value, ok := schema["description"]; ok {
 		description, err := schemaString(value, "description")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		wire = setWireField(wire, 2, description)
 	}
 	if value, ok := schema["nullable"]; ok {
 		var nullable bool
 		if err := json.Unmarshal(value, &nullable); err != nil {
-			return nil, fmt.Errorf("schema.nullable 必须是布尔值")
+			return nil, false, fmt.Errorf("schema.nullable 必须是布尔值")
 		}
 		wire = setWireField(wire, 3, nullable)
 	}
 	if value, ok := schema["enum"]; ok {
 		values, err := schemaStrings(value, "enum")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
-		wire = setWireField(wire, 4, values)
+		// 官网拒收 enum 里的空串（整单 400 “Request contains an invalid argument.”）：去掉空串，去完为空时不写 enum；
+		// 完整 Schema 由调用方附在说明里（见 schemaHasEmptyEnum）
+		if values = slices.DeleteFunc(values, func(value string) bool { return value == "" }); len(values) > 0 {
+			wire = setWireField(wire, 4, values)
+		} else {
+			widened = true
+		}
 	}
 	if value, ok := schema["items"]; ok {
-		items, err := encodeSchemaNode(value, depth+1)
+		items, itemsWidened, err := encodeSchemaNodeIn(value, depth+1, negated)
 		if err != nil {
-			return nil, fmt.Errorf("schema.items: %w", err)
+			return nil, false, fmt.Errorf("schema.items: %w", err)
 		}
+		widened = widened || itemsWidened
 		wire = setWireField(wire, 5, items)
 	}
 	// 整数字段已由 canonicalSchemaIntegers 规范为整数字面量
@@ -150,7 +169,7 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		if value, ok := schema[field.name]; ok {
 			integer, err := schemaInteger(value, field.name)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			wire = setWireField(wire, field.index, integer)
 		}
@@ -158,11 +177,11 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if value, ok := schema["properties"]; ok {
 		var properties map[string]json.RawMessage
 		if err := json.Unmarshal(value, &properties); err != nil || properties == nil {
-			return nil, fmt.Errorf("schema.properties 必须是 JSON object")
+			return nil, false, fmt.Errorf("schema.properties 必须是 JSON object")
 		}
 		if removed := normalizeBooleanProperties(properties); len(removed) > 0 {
 			if err := dropRequired(schema, removed); err != nil {
-				return nil, err
+				return nil, false, err
 			}
 		}
 		names := make([]string, 0, len(properties))
@@ -172,10 +191,11 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		sort.Strings(names)
 		entries := make([]any, 0, len(names))
 		for _, name := range names {
-			property, err := encodeSchemaNode(properties[name], depth+1)
+			property, propertyWidened, err := encodeSchemaNodeIn(properties[name], depth+1, negated)
 			if err != nil {
-				return nil, fmt.Errorf("schema.properties.%s: %w", name, err)
+				return nil, false, fmt.Errorf("schema.properties.%s: %w", name, err)
 			}
+			widened = widened || propertyWidened
 			entries = append(entries, []any{name, property})
 		}
 		if len(entries) > 0 {
@@ -185,7 +205,7 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if value, ok := schema["required"]; ok {
 		required, err := schemaStrings(value, "required")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		wire = setWireField(wire, 7, required)
 	}
@@ -199,7 +219,7 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		if value, ok := schema[field.name]; ok {
 			number, err := schemaNumber(value, field.name)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			wire = setWireField(wire, field.index, number)
 		}
@@ -207,14 +227,14 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 	if value, ok := schema["pattern"]; ok {
 		pattern, err := schemaString(value, "pattern")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		wire = setWireField(wire, 14, pattern)
 	}
 	if value, ok := schema["example"]; ok {
 		var example any
 		if err := json.Unmarshal(value, &example); err != nil {
-			return nil, fmt.Errorf("schema.example 必须是 JSON value")
+			return nil, false, fmt.Errorf("schema.example 必须是 JSON value")
 		}
 		wire = setWireField(wire, 15, encodeWireValue(example))
 	}
@@ -227,30 +247,39 @@ func encodeSchemaNode(raw json.RawMessage, depth int) ([]any, error) {
 		{name: "allOf", index: 18},
 	} {
 		if value, ok := schema[field.name]; ok {
-			variants, err := encodeSchemaVariants(value, field.name, depth+1)
+			// not 之内的 anyOf、oneOf 去掉放宽的分支；allOf 的分支放宽时整个节点放宽
+			dropWidened := negated && field.name != "allOf"
+			variants, variantsWidened, err := encodeSchemaVariants(value, field.name, depth+1, negated, dropWidened)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
+			widened = widened || variantsWidened
 			if len(variants) > 0 {
 				wire = setWireField(wire, field.index, variants)
 			}
 		}
 	}
 	if value, ok := schema["not"]; ok {
-		notSchema, err := encodeSchemaNode(value, depth+1)
+		notSchema, notWidened, err := encodeSchemaNodeIn(value, depth+1, !negated)
 		if err != nil {
-			return nil, fmt.Errorf("schema.not: %w", err)
+			return nil, false, fmt.Errorf("schema.not: %w", err)
 		}
-		wire = setWireField(wire, 19, notSchema)
+		if notWidened && !negated {
+			// 取反的子 Schema 被放宽（例如 not:{"anyOf":[{"const":""}]} 去掉空串后只剩 string）：发出去就成了“不能是字符串”，删除这个 not。
+			// 本节点已在 not 之内时，子 Schema 放宽只会让本节点更窄、外层少排除，照常保留
+			widened = true
+		} else {
+			wire = setWireField(wire, 19, notSchema)
+		}
 	}
 	if value, ok := schema["propertyOrdering"]; ok {
 		ordering, err := schemaStrings(value, "propertyOrdering")
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		wire = setWireField(wire, 22, ordering)
 	}
-	return wire, nil
+	return wire, widened, nil
 }
 
 // normalizeNullableVariants 将 JSON Schema null 联合映射为 AI Studio nullable
@@ -553,20 +582,30 @@ func schemaNumber(raw json.RawMessage, name string) (float64, error) {
 	return value, nil
 }
 
-func encodeSchemaVariants(raw json.RawMessage, name string, depth int) ([]any, error) {
+// encodeSchemaVariants 转换 anyOf、oneOf、allOf 的各分支。dropWidened 时去掉放宽了的分支，分支全部去掉才算放宽；
+// 否则任一分支放宽即算放宽
+func encodeSchemaVariants(raw json.RawMessage, name string, depth int, negated bool, dropWidened bool) ([]any, bool, error) {
 	var variants []json.RawMessage
 	if err := json.Unmarshal(raw, &variants); err != nil {
-		return nil, fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
+		return nil, false, fmt.Errorf("schema.%s 必须是 JSON object 数组", name)
 	}
 	encoded := make([]any, 0, len(variants))
+	widened := false
 	for index, variant := range variants {
-		wire, err := encodeSchemaNode(variant, depth)
+		wire, variantWidened, err := encodeSchemaNodeIn(variant, depth, negated)
 		if err != nil {
-			return nil, fmt.Errorf("schema.%s[%d]: %w", name, index, err)
+			return nil, false, fmt.Errorf("schema.%s[%d]: %w", name, index, err)
 		}
+		if variantWidened && dropWidened {
+			continue
+		}
+		widened = widened || variantWidened
 		encoded = append(encoded, wire)
 	}
-	return encoded, nil
+	if dropWidened && len(variants) > 0 && len(encoded) == 0 {
+		widened = true
+	}
+	return encoded, widened, nil
 }
 
 func schemaString(raw json.RawMessage, name string) (string, error) {
@@ -704,9 +743,10 @@ func cleanNullFields(schema map[string]json.RawMessage) {
 
 // normalizeNot 把 not 约束规范为可编码的形式。只处理当前节点，子 schema 在各自编码时再规范化。
 //
-// not 为 null、false、"" 或清理后为空的对象时不限制任何值，直接删除；not 为 true 时本应禁止所有值，
+// not 为 null、false 或清理后为空的对象时不限制任何值，直接删除；not 为 true 时本应禁止所有值，
 // 这样的 schema 无法满足，按宽松处理删除，避免整个请求失败；not:{"type":"null"} 等价于不可为 null；
-// 字符串、数字等标量或数组写法按排除这些值处理，转换为 not+enum
+// 字符串、数字等标量或数组写法按排除这些值处理，转换为 not+enum。
+// 排除值里的空串官网拒收（见 excludeEmptyString）：只排除空串时字符串节点改写为 minLength 1，其余排除值照旧，不收紧其余取值
 func normalizeNot(schema map[string]json.RawMessage) error {
 	raw, ok := schema["not"]
 	if !ok {
@@ -714,7 +754,7 @@ func normalizeNot(schema map[string]json.RawMessage) error {
 	}
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || isJSONLiteral(trimmed, "null") || isJSONLiteral(trimmed, "false") ||
-		isJSONLiteral(trimmed, "true") || bytes.Equal(trimmed, []byte(`""`)) {
+		isJSONLiteral(trimmed, "true") {
 		delete(schema, "not")
 		return nil
 	}
@@ -733,31 +773,130 @@ func normalizeNot(schema map[string]json.RawMessage) error {
 			if typeName, err := schemaString(sub["type"], "type"); err == nil && strings.EqualFold(typeName, "null") {
 				delete(schema, "not")
 				schema["nullable"] = json.RawMessage("false")
+				return nil
 			}
 		}
+		var values []any
+		enumKey := "enum"
+		var constant string
+		if json.Unmarshal(sub["const"], &constant) == nil {
+			// 字符串 const 与单值 enum 等价（子 Schema 编码时 normalizeSchemaConst 也这样转换）：not:{"const":""} 同样改写为 minLength 1。
+			// 原先只看 enum，const 到子 Schema 编码时才变成 enum:[""]，去掉空串后只剩 string，发出去成了“不能是字符串”
+			values, enumKey = []any{constant}, "const"
+		} else if json.Unmarshal(sub["enum"], &values) != nil {
+			return nil
+		}
+		if !slices.Contains(values, any("")) {
+			return nil
+		}
+		// 纯枚举排除：not 里除 enum（或 const）外只有与节点一致的 type:"string" 与说明字段；带其他约束（pattern 等）时排除的是
+		// 同时满足各约束的值，去掉空串只会少排除，不能再改写为 minLength
+		pure := true
+		for key, value := range sub {
+			switch key {
+			case enumKey, "title", "description", "$id", "$comment":
+			case "type":
+				typeName, err := schemaString(value, "type")
+				pure = pure && err == nil && strings.EqualFold(typeName, "string")
+			default:
+				pure = false
+			}
+		}
+		if values = excludeEmptyString(schema, values, pure); len(values) == 0 {
+			delete(schema, "not")
+			return nil
+		}
+		encoded, err := json.Marshal(values)
+		if err != nil {
+			return err
+		}
+		sub["enum"] = encoded
+		encoded, err = json.Marshal(sub)
+		if err != nil {
+			return err
+		}
+		schema["not"] = encoded
 		return nil
 	case '[':
 		var values []any
 		if err := json.Unmarshal(trimmed, &values); err != nil {
 			return fmt.Errorf("schema.not 必须是 JSON object")
 		}
-		return setNotEnum(schema, values)
+		return setNotEnum(schema, excludeEmptyString(schema, values, true))
 	default:
 		var value any
 		if err := json.Unmarshal(trimmed, &value); err != nil {
 			return fmt.Errorf("schema.not 必须是 JSON object")
 		}
-		return setNotEnum(schema, []any{value})
+		return setNotEnum(schema, excludeEmptyString(schema, []any{value}, true))
 	}
 }
 
+// excludeEmptyString 去掉排除值里官网拒收的空串，返回其余排除值。pure 表示 not 只是纯枚举排除：这时节点类型为 string（不是联合类型）
+// 就改写为 minLength 1（已有不小于 1 的 minLength 时不动），表达“不能为空串”；联合类型与其他节点类型不加 minLength，
+// 只是不再排除空串（不收紧其余类型的取值）
+func excludeEmptyString(schema map[string]json.RawMessage, values []any, pure bool) []any {
+	if !slices.Contains(values, any("")) {
+		return values
+	}
+	if typeName, err := schemaString(schema["type"], "type"); pure && err == nil && strings.EqualFold(typeName, "string") {
+		var minLength int64
+		if json.Unmarshal(schema["minLength"], &minLength) != nil || minLength < 1 {
+			schema["minLength"] = json.RawMessage("1")
+		}
+	}
+	return slices.DeleteFunc(slices.Clone(values), func(value any) bool { return value == any("") })
+}
+
+// setNotEnum 把排除值写成 not+enum；没有排除值时删除 not
 func setNotEnum(schema map[string]json.RawMessage, values []any) error {
+	if len(values) == 0 {
+		delete(schema, "not")
+		return nil
+	}
 	encoded, err := json.Marshal(map[string]any{"enum": values})
 	if err != nil {
 		return err
 	}
 	schema["not"] = encoded
 	return nil
+}
+
+// schemaHasEmptyEnum 判断 Schema 某一层的 enum（含 not 里的 enum 与 const:""）含官网拒收的空串：Playground 编码时去掉空串，
+// 调用方据此把完整 Schema 附在说明里交给模型遵守
+func schemaHasEmptyEnum(raw json.RawMessage) bool {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	return emptyEnumNode(value, 0)
+}
+
+func emptyEnumNode(value any, depth int) bool {
+	if depth > maxSchemaDepth {
+		return false
+	}
+	switch node := value.(type) {
+	case map[string]any:
+		if values, ok := node["enum"].([]any); ok && slices.Contains(values, any("")) {
+			return true
+		}
+		if constant, ok := node["const"].(string); ok && constant == "" {
+			return true
+		}
+		for _, item := range node {
+			if emptyEnumNode(item, depth+1) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range node {
+			if emptyEnumNode(item, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // normalizeBooleanItems 处理布尔形式的 items：true 不限制元素，按空 schema 处理；

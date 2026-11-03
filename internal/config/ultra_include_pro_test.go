@@ -37,8 +37,9 @@ func TestUltraIncludeProLoad(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.invalid {
-			if err == nil || err.Error() != "ULTRA_INCLUDE_PRO 必须是 true 或 false" {
-				t.Fatalf("%q 应报 ULTRA_INCLUDE_PRO 错误，得到 %v", test.content, err)
+			item := requireInvalidKey(t, test.content, cfg, err, "ULTRA_INCLUDE_PRO")
+			if item.Reason != "ULTRA_INCLUDE_PRO 必须是 true 或 false" || item.Value != "maybe" || cfg.UltraIncludePro {
+				t.Fatalf("%q：无效项 %+v，开关 %t，期望按默认 false 并记原值", test.content, item, cfg.UltraIncludePro)
 			}
 			continue
 		}

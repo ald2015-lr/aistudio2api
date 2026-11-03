@@ -31,8 +31,8 @@ func TestStreamDataHeartbeatConfig(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.fail {
-			if err == nil {
-				t.Fatalf("%q 应报错", test.content)
+			if requireInvalidKey(t, test.content, cfg, err, "STREAM_DATA_HEARTBEAT"); !cfg.StreamDataHeartbeat {
+				t.Fatalf("%q：无效时应取默认值 true", test.content)
 			}
 			continue
 		}

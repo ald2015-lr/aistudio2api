@@ -44,8 +44,10 @@ func TestPrimaryModelsConfig(t *testing.T) {
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "PRIMARY_QUEUE_WAIT") {
-			t.Fatalf("%q 应读取失败并指明 PRIMARY_QUEUE_WAIT，实际 err=%v", content, err)
+		// 写法无效或超过请求超时：按默认值（10s，不超过请求超时）启动并记入无效项
+		cfg, err := Load(path)
+		if requireInvalidKey(t, content, cfg, err, "PRIMARY_QUEUE_WAIT"); cfg.PrimaryQueueWait != 10*time.Second {
+			t.Fatalf("%q：无效时应取默认 10s，得到 %s", content, cfg.PrimaryQueueWait)
 		}
 	}
 

@@ -40,8 +40,8 @@ func TestAccountRPMLimitLoad(t *testing.T) {
 		}
 		cfg, err := Load(path)
 		if test.invalid {
-			if err == nil || !strings.Contains(err.Error(), "ACCOUNT_RPM_LIMIT") {
-				t.Fatalf("%q 应报 ACCOUNT_RPM_LIMIT 错误，得到 %v", test.content, err)
+			if requireInvalidKey(t, test.content, cfg, err, "ACCOUNT_RPM_LIMIT"); cfg.AccountRPMLimit != 10 {
+				t.Fatalf("%q：无效时应取默认 10，得到 %d", test.content, cfg.AccountRPMLimit)
 			}
 			continue
 		}

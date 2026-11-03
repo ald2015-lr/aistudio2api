@@ -159,7 +159,7 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `PROXY_POOL_PORT_START`、`PROXY_POOL_PORT_END` | 静态 IP 的端口段（含两端）：任何模式下都要 `1 <= 起 <= 止 <= 65535`，最多 5000 个端口（`MaxProxyPoolPorts`） | `10001`、`10200` |
 | `INIT_TIMEOUT` | 单账户初始化超时 | `2m` |
 | `REQUEST_TIMEOUT` | 生成请求在首个上游事件之前的总期限（排队、冷启动、WAA proof、文件复制与附件上传、等首字与首事件前的换号都计入，到时 504）；开始输出后改为空闲上限（上游连续这么久既没有事件也没有网络字节才以 504 结束）；整条生成请求最长 `max(1h, REQUEST_TIMEOUT)`。三段都在请求开始时取值，可热更新、只影响新请求，见下文[长生成与中转重试](#长生成与中转重试)。计数、视频、转写等其他请求整段受它限制 | `5m` |
-| `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
+| `FIRST_EVENT_TIMEOUT` | 每次尝试从向上游发送起（WAA proof 之后）等待首个上游事件的上限（同账号重新生成与续写回退的重发每次重新起算，见 [protocol.md](protocol.md)）：超时只取消这一次尝试的上下文、读完其事件流后释放租约，按可重试的上游超时换号（不额外冷却账号），不能再换号时返回 504；`0` 关闭，开启时必须小于 `REQUEST_TIMEOUT`，可热更新 | `0` |
 | `WARM_WORKER_LIMIT` | 普通分区（不属于 Ultra 号池的账户）的常驻预热账户数，可热更新 | `5` |
 | `MAX_ACTIVE_WORKERS` | 普通分区的活动 Worker 容量上限，必须不小于热池目标，可热更新；浏览器总数最多为两个分区上限之和 | `10` |
 | `ULTRA_EXCLUSIVE` | `true` 时 Ultra 号池的账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 号池的账户，`/ultra` 仍只用 Ultra 号池的账户；保存后立即生效，手动改 `.env` 后停止再启动生成服务时按重新读取的值生效（进程环境变量优先） | `true` |
@@ -177,13 +177,13 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 | `ULTRA_PRIMARY_MODELS` | Ultra 号池的主用模型 ID，逗号分隔：作用于 `/ultra` 请求（`PoolScopeUltra`，只查这份列表），以及 `ULTRA_EXCLUSIVE=false` 时普通路径上不在 `PRIMARY_MODELS` 里的这些模型；排队规则与 `PRIMARY_MODELS` 相同，另外没有额度时立即返回 429（候选全部冷却立即返回 `AllCoolingError`，额度 429 后每日类最多再换 2 次账号、限流类（分钟限额与限流）最多再换 5 次，额度失败后紧接着的那次选号只用已启动的 Worker，结束时返回 `PrimaryQuotaError`，见下文“主用模型按号池”一段）。键存在时按写的值（空值表示关闭），键不存在时取默认；进程环境变量的空值与其他配置项一样被忽略，关闭只能在 `.env` 写空值或在管理页清空，可热更新 | `gemini-4-argon` |
 | `ULTRA_PRIMARY_QUEUE_WAIT` | Ultra 主用模型的排队上限，规则与 `PRIMARY_QUEUE_WAIT` 相同（整个请求共用一份、按墙钟计；`0` 表示不排队，不能超过 `REQUEST_TIMEOUT`，未配置时取 `10s` 与 `REQUEST_TIMEOUT` 中较小者，保存时写具体值），可热更新 | `10s` |
 | `WAA_BACKEND` | WAA 后端 `camoufox` 或 `go` | `camoufox` |
-| `TEMPORARY_CHAT` | WAA 预热页是否使用临时对话 | `false` |
+| `TEMPORARY_CHAT` | WAA 预热页是否使用临时对话；只认 `true`/`false`，写错时启动即报错（不按默认值打开会自动保存历史的普通对话页） | `false` |
 | `MEDIA_OUTPUT` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 内联 data URI / `inlineData`，`url` 保存到 `runtime/media/` 并输出本服务 `/media/<文件名>` 链接（见下文“生成媒体目录”）；进程级设置，保存后立即生效 | `inline` |
 | `MEDIA_BASE_URL` | 媒体链接的服务地址，`http` 或 `https`，可带路径前缀，不能带账号密码、查询参数、片段、空白或括号，保存时去掉末尾的 `/`；留空时按请求的 `X-Forwarded-Proto`（只认 http/https）、`X-Forwarded-Host` 或 `Host` 生成，主机含不能写进链接的字符时链接为 `/media/` 开头的相对地址；可热更新 | 空 |
 | `MEDIA_RETENTION` | 媒体文件保存期限：Go 时长写法或整数天数加 `d`，`0` 不按时间清理，不为 0 时至少 1 小时，保存时写成 `7d`、`36h`、`90m` 这样的规范写法；可热更新 | `7d` |
 | `MEDIA_MAX_SIZE` | 媒体目录总量上限：整数加 `B`/`KB`/`MB`/`GB`/`TB`（不区分大小写，按 1024 进位），不写单位按字节，`0` 不限，不为 0 时至少 100MB，保存时写成能整除的最大单位；可热更新 | `20GB` |
-| `AUTO_START` | 管理进程启动后自动启动生成服务。生成服务期望运行却停在 STOPPED（启动失败或意外停止）时由监督协程自动重新启动：一般失败按 5 秒起、上限 1 分钟退避，没有可用账户时上限 5 分钟；手动停止后不再自动启动 | `true` |
-| `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值，修改后重启程序生效 | `false` |
+| `AUTO_START` | 管理进程启动后自动启动生成服务。生成服务期望运行却停在 STOPPED（启动失败或意外停止）时由监督协程自动重新启动：一般失败按 5 秒起、上限 1 分钟退避，没有可用账户时上限 5 分钟；手动停止后不再自动启动。只认 `true`/`false`，写错时启动即报错（不按默认 `true` 自动启动） | `true` |
+| `REQUEST_BODY_LOG` | 用量账本同时保存通过 API key 校验的 POST 请求与响应正文，各截断到 64 KiB，只保留最近 1000 条；管理页面保存配置时沿用现值（取值无效、按默认值生效时沿用 `.env` 里的原行），修改后重启程序生效 | `false` |
 | `ADMIN_PASSWORD` | 远程管理密码；非空时非回环请求经 HTTP Basic 认证后可访问管理页面与 `/api/`，同一 IP 10 分钟内错 10 次封禁 15 分钟；管理进程重启后生效 | 空 |
 
 `LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT`、`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`，两个主用模型排队上限都不超过 `REQUEST_TIMEOUT`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`，`ACCOUNT_RPM_LIMIT` 为 `0..1000` 的整数（超出时报 `ACCOUNT_RPM_LIMIT 必须是 0 到 1000 的整数`）。管理页面保存时没有带四个 Ultra 字段、`account_rpm_limit`、`stream_playground_models`、`primary_models`、`primary_queue_wait`、`ultra_primary_models` 或 `ultra_primary_queue_wait`（旧版页面）则沿用 `.env` 中的现值（省略排队上限而把 `request_timeout` 调到现值以下时按 `request_timeout` 封顶）；`stream_playground_models`、`primary_models` 与 `ultra_primary_models` 为空数组表示清空，排队上限为 `0s` 表示不排队。保存的配置 JSON 缺少 `ultra_primary_models`（旧版数据）时取默认列表，显式的空数组为关闭；缺少 `ultra_include_pro` 时按关闭处理；缺少 `account_rpm_limit` 时取默认值 10，显式的 `0` 为关闭。全局代理与账户代理的写法和规范化规则见 `config.NormalizeProxy` 与下文[代理写法与规范化](#代理写法与规范化)。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。

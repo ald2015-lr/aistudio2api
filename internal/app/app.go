@@ -55,6 +55,9 @@ func runCommand(args []string) error {
 	defer stop()
 
 	if len(args) != 0 && args[0] == "setup" {
+		for _, item := range cfg.Invalid {
+			slog.Warn(item.Summary())
+		}
 		return setup.Run(ctx, cfg, args[1:])
 	}
 	options, err := parseFlags(args, &cfg)
@@ -73,6 +76,10 @@ func runCommand(args []string) error {
 			return nil
 		}
 		return err
+	}
+	// .env 里取值无效、已按默认值启动的配置项逐项写一行（凭据键不写原值），管理页的服务配置顶部同样列出
+	for _, item := range cfg.Invalid {
+		manager.requests.logDurable("service", "WARN", item.Summary())
 	}
 	ledger := openRequestLedger(manager, filepath.Join("runtime", "requests.db"), cfg.RequestBodyLog)
 	// 媒体目录按保存期限与总量上限定期清理，随运行时生命周期结束
