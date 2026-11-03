@@ -508,7 +508,7 @@ type buildGrounding struct {
 }
 
 // buildChunkSources 把 Gemini API grounding chunk 字段映射为规范来源
-var buildChunkSources = map[string]string{"web": "web", "retrievedContext": "retrieved_context", "maps": "maps"}
+var buildChunkSources = map[string]string{"web": "web", "image": "image", "retrievedContext": "retrieved_context", "maps": "maps"}
 
 // BuildStreamDecoder 把 Build 代理返回的 Gemini API 响应块转换为规范事件
 type BuildStreamDecoder struct {
@@ -516,6 +516,16 @@ type BuildStreamDecoder struct {
 	finished bool
 	// modelVersion 为上游报告的实际服务模型
 	modelVersion string
+	// tolerance 为本请求的解码容错记录（见 decode_tolerance.go）；没有设置时第一次容错时新建
+	tolerance *decodeTolerance
+}
+
+// tol 返回本解码器的容错记录
+func (d *BuildStreamDecoder) tol() *decodeTolerance {
+	if d.tolerance == nil {
+		d.tolerance = newDecodeTolerance(nil, "")
+	}
+	return d.tolerance
 }
 
 // Decode 解码一个 Gemini API GenerateContentResponse JSON
@@ -563,14 +573,15 @@ func (d *BuildStreamDecoder) decodeChunk(raw []byte) ([]Event, error) {
 		}
 		return nil, nil
 	}
-	if len(response.Candidates) != 1 {
-		return nil, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$chunk.candidates", Detail: "候选数量不是 1", Raw: cloneRaw(raw)}
+	if len(response.Candidates) > 1 {
+		// 本服务只请求一个候选，客户端也只要一个：取第一个（原先按协议证据错误中止）
+		d.tol().note(buildProxyStreamedMethod, "$chunk.candidates", "多个候选，只取第一个", toleranceText("候选数=%d", len(response.Candidates)))
 	}
 	candidate := response.Candidates[0]
 	var events []Event
 	if candidate.Content != nil {
 		for index, part := range candidate.Content.Parts {
-			partEvents, err := decodeBuildPart(part, index, raw)
+			partEvents, err := decodeBuildPart(part, index, raw, d.tol())
 			if err != nil {
 				return nil, err
 			}
@@ -596,7 +607,7 @@ func (d *BuildStreamDecoder) decodeChunk(raw []byte) ([]Event, error) {
 		}
 	}
 	if grounding := candidate.GroundingMetadata; grounding != nil {
-		events = append(events, Event{Kind: EventGrounding, Grounding: decodeBuildGrounding(*grounding)})
+		events = append(events, Event{Kind: EventGrounding, Grounding: decodeBuildGrounding(*grounding, d.tol())})
 	}
 	if candidate.FinishReason != "" && !d.finished {
 		if d.usage != nil {
@@ -629,7 +640,7 @@ func buildEnumName(value string, prefix string) string {
 	return strings.ToLower(value)
 }
 
-func decodeBuildPart(part buildResponsePart, index int, raw []byte) ([]Event, error) {
+func decodeBuildPart(part buildResponsePart, index int, raw []byte, tolerance *decodeTolerance) ([]Event, error) {
 	signature := part.ThoughtSignature
 	var events []Event
 	if part.Text != nil && *part.Text != "" {
@@ -640,11 +651,17 @@ func decodeBuildPart(part buildResponsePart, index int, raw []byte) ([]Event, er
 		events = append(events, Event{Kind: kind, Text: *part.Text, ThoughtSignature: signature})
 	}
 	if part.InlineData != nil && !part.Thought {
-		data, err := base64.StdEncoding.DecodeString(part.InlineData.Data)
-		if err != nil {
+		// 标准与 URL 安全两种字母表、带或不带填充都接受（与 Playground 的 inline media 相同）
+		data, ok := decodeLenientBase64(part.InlineData.Data)
+		if !ok {
 			return nil, &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: fmt.Sprintf("$chunk.parts[%d].inlineData", index), Detail: "inline data 不是 Base64", Raw: cloneRaw(raw)}
 		}
-		events = append(events, Event{Kind: EventMedia, Media: &Media{MIME: part.InlineData.MIMEType, Data: data}, ThoughtSignature: signature})
+		mime := part.InlineData.MIMEType
+		if mime == "" && len(data) > 0 {
+			mime = sniffMediaMIME(data)
+			tolerance.note(buildProxyStreamedMethod, fmt.Sprintf("$chunk.parts[%d].inlineData.mimeType", index), "inline data 没有 MIME，按文件头判断为 "+mime, nil)
+		}
+		events = append(events, Event{Kind: EventMedia, Media: &Media{MIME: mime, Data: data}, ThoughtSignature: signature})
 	}
 	if part.ExecutableCode != nil {
 		code := *part.ExecutableCode
@@ -673,32 +690,56 @@ func decodeBuildPart(part buildResponsePart, index int, raw []byte) ([]Event, er
 	return events, nil
 }
 
-func decodeBuildGrounding(value buildGrounding) *GroundingMetadata {
+// decodeBuildGrounding 转换 Gemini API 的 groundingMetadata。每个 chunk 都留一个位置，support 的 chunk 索引照常对齐：取 web、image、
+// retrievedContext、maps 里第一个能读的来源（同时设置多个时取第一个），一个都没有或读不出时换成 unknown 占位项（原先跳过，后面 chunk 的
+// 索引整体错位）
+func decodeBuildGrounding(value buildGrounding, tolerance *decodeTolerance) *GroundingMetadata {
 	metadata := &GroundingMetadata{
 		WebSearchQueries: value.WebSearchQueries, MapsWidgetContextToken: value.GoogleMapsWidgetContextToken,
 	}
 	if value.SearchEntryPoint != nil {
 		metadata.SearchEntryPoint = &SearchEntryPoint{RenderedContent: value.SearchEntryPoint.RenderedContent, SDKBlob: value.SearchEntryPoint.SDKBlob}
 	}
-	for _, chunk := range value.GroundingChunks {
-		for _, key := range []string{"web", "retrievedContext", "maps"} {
+	for index, chunk := range value.GroundingChunks {
+		decoded := GroundingChunk{Source: groundingChunkUnknown}
+		found := 0
+		for _, key := range []string{"web", "image", "retrievedContext", "maps"} {
 			raw, exists := chunk[key]
-			if !exists {
+			if !exists || isJSONNull(raw) {
 				continue
 			}
 			var fields struct {
-				URI     string `json:"uri"`
-				Title   string `json:"title"`
-				Text    string `json:"text"`
-				PlaceID string `json:"placeId"`
+				URI       string `json:"uri"`
+				SourceURI string `json:"sourceUri"`
+				Title     string `json:"title"`
+				Text      string `json:"text"`
+				PlaceID   string `json:"placeId"`
+				Domain    string `json:"domain"`
 			}
 			if json.Unmarshal(raw, &fields) != nil {
 				continue
 			}
-			metadata.Chunks = append(metadata.Chunks, GroundingChunk{
+			found++
+			if found > 1 {
+				continue
+			}
+			decoded = GroundingChunk{
 				Source: buildChunkSources[key], URI: fields.URI, Title: fields.Title, Text: fields.Text, PlaceID: fields.PlaceID,
-			})
+			}
+			if key == "image" {
+				// Gemini API 的 GroundingChunk.Image：sourceUri 为图片所在网页，与 Playground 的图片来源一致
+				decoded.URI, decoded.Domain = fields.SourceURI, fields.Domain
+			}
 		}
+		path := fmt.Sprintf("$chunk.groundingMetadata.groundingChunks[%d]", index)
+		switch {
+		case found == 0:
+			encoded, _ := json.Marshal(chunk)
+			tolerance.note(buildProxyStreamedMethod, path, "grounding chunk 没有能读的来源，换成占位项", encoded)
+		case found > 1:
+			tolerance.note(buildProxyStreamedMethod, path, "grounding chunk 同时设置多个来源，取第一个", nil)
+		}
+		metadata.Chunks = append(metadata.Chunks, decoded)
 	}
 	for _, support := range value.GroundingSupports {
 		metadata.Supports = append(metadata.Supports, GroundingSupport{
@@ -752,7 +793,7 @@ func DecodeBuildStream(source io.Reader, decoder *BuildStreamDecoder, emit func(
 		if err := stream.Decode(&raw); err != nil {
 			return &ProtocolEvidenceError{Method: buildProxyStreamedMethod, Path: "$", Detail: err.Error(), Err: err}
 		}
-		if err := trailerError(buildProxyStreamedMethod, raw); err != nil {
+		if err := trailerError(buildProxyStreamedMethod, raw, decoder.tol()); err != nil {
 			return err
 		}
 	}
@@ -863,7 +904,7 @@ func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry m
 		return nil, nil, err
 	}
 	response.Body = trace.TeeUpstream(response.Body)
-	decoder := &BuildStreamDecoder{}
+	decoder := &BuildStreamDecoder{tolerance: decodeToleranceFrom(ctx)}
 	if unary {
 		return response, func(source io.Reader, emit func(Event) error) error {
 			return DecodeBuildUnary(source, decoder, emit)

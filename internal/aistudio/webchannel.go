@@ -97,6 +97,9 @@ type BidiSession struct {
 	closeOnce   sync.Once
 	// upstreamEnded 为上游已经结束会话（收到关闭或错误事件）：此时 Close 不再发送 terminate
 	upstreamEnded atomic.Bool
+	// tolerance 为本会话的解码容错记录：同一种容错整个会话只写一行（Live 音频每秒多条消息，按消息去重会逐个分片刷屏）；
+	// 为 nil 时每条 payload 各用一个
+	tolerance *decodeTolerance
 }
 
 // bidiOutboxLimit、bidiOutboxByteLimit 为等待前向发送的帧数与字节数上限；上游停止接收时拒绝新帧，而不是无限堆积
@@ -451,6 +454,7 @@ func (t *WorkerProtectedTransport) OpenBidiProtected(
 		accountID:           lease.Account().ID, rid: rid, latestResumptionToken: strings.TrimSpace(request.SessionToken),
 		events: make(chan BidiEvent, 32), wireEvents: make(chan BidiEvent, 32),
 		forwarding: make(chan bool, 1), forwardDone: make(chan struct{}), done: make(chan struct{}),
+		tolerance: decodeToleranceFrom(requestCtx),
 	}
 	if err := session.handshake(setupCtx, protocolHeaders); err != nil {
 		cancel()
@@ -952,7 +956,11 @@ func (s *BidiSession) consumeBackchannelFrame(raw json.RawMessage) (int, error) 
 		if err != nil {
 			return parsed, withBidiMethod(err)
 		}
-		events, err := ParseBidiServerPayload(envelope[1])
+		tolerance := s.tolerance
+		if tolerance == nil {
+			tolerance = newDecodeTolerance(nil, "")
+		}
+		events, err := parseBidiServerPayload(envelope[1], tolerance)
 		if err != nil {
 			return parsed, err
 		}

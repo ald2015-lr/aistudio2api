@@ -70,22 +70,31 @@ func encodeTranscriptionConfig(config *TranscriptionConfig) ([]any, error) {
 	return wire, nil
 }
 
-func decodeTranscriptMetadata(raw json.RawMessage, path string, evidence json.RawMessage) (TranscriptMetadata, error) {
+// decodeTranscriptMetadata 解码 Part field 23 的转写元数据 [text, speaker, timestamps]。text 按正文规则读取：null 为空串，数字与布尔值
+// 按原文转成文本，对象与数组读不出正文，按协议证据错误返回；speaker 与时间戳是辅助元数据：speaker 不是字符串时忽略，timestamps 不是数组
+// 时丢掉，某个时间戳读不出时丢掉该项（原先都按协议证据错误中止）。容错各写一行日志
+func decodeTranscriptMetadata(raw json.RawMessage, path string, evidence json.RawMessage, tolerance *decodeTolerance) (TranscriptMetadata, error) {
 	values, err := rawArray(raw, path, evidence)
 	if err != nil {
-		return TranscriptMetadata{}, withMethod(err, "GenerateContent")
+		return TranscriptMetadata{}, withMethod(err, gcMethod)
 	}
 	metadata := TranscriptMetadata{}
 	if textRaw := rawAt(values, 0); !isJSONNull(textRaw) {
-		metadata.Text, err = rawString(textRaw, path+"[0]", evidence)
-		if err != nil {
-			return TranscriptMetadata{}, withMethod(err, "GenerateContent")
+		text, converted, ok := lenientText(textRaw)
+		if !ok {
+			return TranscriptMetadata{}, &ProtocolEvidenceError{
+				Method: gcMethod, Path: path + "[0]", Detail: "转写正文不是字符串，读不出正文", Raw: cloneEvidence(textRaw, evidence),
+			}
 		}
+		if converted {
+			tolerance.note(gcMethod, path+"[0]", "转写正文不是字符串，按原文转成文本", textRaw)
+		}
+		metadata.Text = text
 	}
 	if speakerRaw := rawAt(values, 1); !isJSONNull(speakerRaw) {
-		metadata.Speaker, err = rawString(speakerRaw, path+"[1]", evidence)
-		if err != nil {
-			return TranscriptMetadata{}, withMethod(err, "GenerateContent")
+		if json.Unmarshal(speakerRaw, &metadata.Speaker) != nil {
+			metadata.Speaker = ""
+			tolerance.note(gcMethod, path+"[1]", "转写的说话人不是字符串，已忽略", speakerRaw)
 		}
 	}
 	timestampsRaw := rawAt(values, 2)
@@ -94,13 +103,16 @@ func decodeTranscriptMetadata(raw json.RawMessage, path string, evidence json.Ra
 	}
 	timestamps, err := rawArray(timestampsRaw, path+"[2]", evidence)
 	if err != nil {
-		return TranscriptMetadata{}, withMethod(err, "GenerateContent")
+		tolerance.note(gcMethod, path+"[2]", "转写时间戳列表不是数组，已丢弃", timestampsRaw)
+		return metadata, nil
 	}
 	metadata.Timestamps = make([]TranscriptTimestamp, 0, len(timestamps))
 	for index, timestampRaw := range timestamps {
-		timestamp, err := decodeTranscriptTimestamp(timestampRaw, fmt.Sprintf("%s[2][%d]", path, index), evidence)
+		itemPath := fmt.Sprintf("%s[2][%d]", path, index)
+		timestamp, err := decodeTranscriptTimestamp(timestampRaw, itemPath, evidence)
 		if err != nil {
-			return TranscriptMetadata{}, err
+			tolerance.note(gcMethod, itemPath, "转写时间戳读不出，已丢弃该项", timestampRaw)
+			continue
 		}
 		metadata.Timestamps = append(metadata.Timestamps, timestamp)
 	}

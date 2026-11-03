@@ -385,8 +385,13 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 			case <-ctx.Done():
 			}
 		}()
+		// output 收集交出的正文与思考：上游用量读不出时按它做本地估算（与 Playground 相同；媒体不计 token，不收集，免得多拷一份视频）
+		var output generatedOutputParts
 		send := func(event Event) error {
 			event = assignLocalCallID(event)
+			if event.Kind != EventMedia {
+				output.observe(event)
+			}
 			if request.Config.HideThinking && event.Kind == EventReasoning {
 				if event.ThoughtSignature == "" {
 					return nil
@@ -405,7 +410,9 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 				return ctx.Err()
 			}
 		}
-		err := DecodeInteractionStream(observeStreamActivity(ctx, response.Body), send)
+		err := decodeInteractionStream(observeStreamActivity(ctx, response.Body), send, decodeToleranceFrom(ctx), func() *Usage {
+			return localCompleteUsage(request, output)
+		})
 		if closeErr := response.Body.Close(); err == nil && ctx.Err() == nil {
 			err = closeErr
 		}
@@ -434,8 +441,17 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 	return events, nil
 }
 
-// DecodeInteractionStream 按网络顺序解码 CreateInteractionStream 事件与流尾状态
+// interactionMethod 为 CreateInteractionStream 写进协议证据与容错日志的方法名
+const interactionMethod = "CreateInteractionStream"
+
+// DecodeInteractionStream 按网络顺序解码 CreateInteractionStream 事件与流尾状态（容错只在这次解码内去重）
 func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
+	return decodeInteractionStream(source, emit, newDecodeTolerance(nil, ""), nil)
+}
+
+// decodeInteractionStream 为 DecodeInteractionStream 的实现，容错写进 tolerance（见 decode_tolerance.go）。estimate 返回本地估算的用量：
+// 最终 interaction 带着用量却读不出、或最终 interaction 为空时用它代替（generateInteraction 按已交出的正文与思考估算）；为 nil 时丢掉用量
+func decodeInteractionStream(source io.Reader, emit func(Event) error, tolerance *decodeTolerance, estimate func() *Usage) error {
 	decoder := json.NewDecoder(newSparseJSONReader(source))
 	decoder.UseNumber()
 	if token, err := decoder.Token(); err != nil || token != json.Delim('[') {
@@ -448,12 +464,20 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 		return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$[0]", Detail: "事件列表不是数组"}
 	}
 	finished := false
+	// delivered 表示已经交出过正文或媒体：最终状态读不出时据此决定按 other 结束还是报错
+	delivered := false
+	track := func(event Event) error {
+		if event.Kind == EventMedia || event.Kind == EventText && event.Text != "" {
+			delivered = true
+		}
+		return emit(event)
+	}
 	for index := 0; decoder.More(); index++ {
 		var raw json.RawMessage
 		if err := decoder.Decode(&raw); err != nil {
 			return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error(), Err: err}
 		}
-		done, err := decodeInteractionEvent(raw, emit)
+		done, err := decodeInteractionEvent(raw, track, tolerance, delivered, estimate)
 		if err != nil {
 			return err
 		}
@@ -471,21 +495,9 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 		trailing = append(trailing, raw)
 	}
 	if len(trailing) > 0 {
-		// 流尾 field 2 为 google.rpc.Status：[code, message, details]
-		status, err := rawArray(trailing[0], "$[1]", trailing[0])
-		if err != nil || len(status) == 0 {
-			return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$[1]", Detail: "流尾状态无效", Raw: cloneRaw(trailing[0])}
-		}
-		code, err := rawInt64(status[0], "$[1][0]", trailing[0])
-		if err != nil {
-			return withMethod(err, "CreateInteractionStream")
-		}
-		if code != 0 {
-			statusCode := http.StatusBadGateway
-			if mapped, ok := interactionStatusHTTP[code]; ok {
-				statusCode = mapped
-			}
-			return DecodeRPCError("CreateInteractionStream", statusCode, trailing[0])
+		// 流尾 field 2 为 google.rpc.Status：[code, message, details]；为 null、[] 或状态码为 null 时按 0（成功），与 Build 代理共用 trailerError
+		if err := trailerError(interactionMethod, trailing[0], tolerance); err != nil {
+			return err
 		}
 	}
 	if !finished {
@@ -494,14 +506,16 @@ func DecodeInteractionStream(source io.Reader, emit func(Event) error) error {
 	return nil
 }
 
-// decodeInteractionEvent 解码单个流事件，返回是否为最终 interaction
-func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error) (bool, error) {
+// decodeInteractionEvent 解码单个流事件，返回是否为最终 interaction。最终状态 3 为完成，4、5 为失败与取消；不在表里、为 null 或读不出时，
+// 已经交出过正文或媒体（delivered）就写一行容错日志、照常读取用量并按 other 结束（视频已生成、额度已扣，不让整份作废），否则仍按协议证据
+// 错误返回。最终 interaction 为 [] 时同样处理（没有用量可读，有 estimate 时交出本地估算）。用量读不出时有 estimate 就交出本地估算
+func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error, tolerance *decodeTolerance, delivered bool, estimate func() *Usage) (bool, error) {
 	event, err := rawArray(raw, "$event", raw)
 	if err != nil {
 		return false, withMethod(err, "CreateInteractionStream")
 	}
 	if delta := rawAt(event, 10); !isJSONNull(delta) {
-		return false, decodeInteractionDelta(delta, emit)
+		return false, decodeInteractionDelta(delta, emit, tolerance)
 	}
 	final := rawAt(event, 19)
 	if isJSONNull(final) {
@@ -511,45 +525,80 @@ func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error) (bool, 
 		return false, nil
 	}
 	wrapper, err := rawArray(final, "$event[19]", raw)
-	if err != nil || len(wrapper) == 0 {
+	if err != nil || len(wrapper) == 0 && !delivered {
 		return false, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$event[19]", Detail: "最终 interaction 为空", Raw: cloneRaw(raw)}
+	}
+	// finishEmpty 处理已经交出过内容、最终 interaction 却没有任何字段的情形：与状态读不出时一样按 other 结束（没有用量可读，有 estimate
+	// 时交出本地估算；原先报“最终 interaction 为空”或“未识别的最终状态”，正文或视频已交出也整次 500 或用量记 0）
+	finishEmpty := func(path string, value json.RawMessage) (bool, error) {
+		tolerance.note(interactionMethod, path, "最终 interaction 为空，已交出内容，按 other 结束", value)
+		if estimate != nil {
+			if usage := estimate(); usage != nil {
+				if err := emit(Event{Kind: EventUsage, Usage: usage}); err != nil {
+					return false, err
+				}
+			}
+		}
+		return true, emit(Event{Kind: EventFinish, FinishReason: "other"})
+	}
+	if len(wrapper) == 0 {
+		// event[19] 为外层 wrapper，Interaction 本身是 wrapper[0]：[] 是 wrapper 为空（没有 Interaction）
+		return finishEmpty("$event[19]", final)
 	}
 	interaction, err := rawArray(wrapper[0], "$event[19][0]", raw)
 	if err != nil {
 		return false, withMethod(err, "CreateInteractionStream")
 	}
-	status, err := optionalIntField(interaction, 1, "$event[19][0]", raw)
-	if err != nil {
-		return false, withMethod(err, "CreateInteractionStream")
+	if len(interaction) == 0 && delivered {
+		// [[]] 或 [null]：Interaction 的字段全为缺省值（JSON+protobuf 省略全部字段），与 wrapper 为空时一样处理
+		return finishEmpty("$event[19][0]", final)
 	}
-	switch status {
-	case 3:
-	case 4:
+	status, statusErr := optionalIntField(interaction, 1, "$event[19][0]", raw)
+	finishReason := "stop"
+	switch {
+	case statusErr == nil && status == 3:
+	case statusErr == nil && status == 4:
 		return false, &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Message: "interaction failed"}
-	case 5:
+	case statusErr == nil && status == 5:
 		return false, &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Message: "interaction cancelled"}
-	default:
+	case !delivered && statusErr != nil:
+		return false, withMethod(statusErr, "CreateInteractionStream")
+	case !delivered:
 		return false, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$event[19][0][1]", Detail: fmt.Sprintf("未识别的最终状态 %d", status), Raw: cloneRaw(raw)}
+	default:
+		tolerance.note(interactionMethod, "$event[19][0][1]", "最终状态不在表里，已交出内容，按 other 结束", rawAt(interaction, 1))
+		finishReason = "other"
 	}
 	if usage := rawAt(interaction, 12); !isJSONNull(usage) {
-		decoded, err := decodeInteractionUsage(usage, raw)
-		if err != nil {
-			return false, err
+		// 用量是辅助元数据：读不出时改用本地估算（没有 estimate 时丢掉），都写容错日志，结束事件照常发出
+		decoded, ok := decodeInteractionUsage(usage, tolerance)
+		switch {
+		case !ok && estimate != nil:
+			tolerance.note(interactionMethod, "$event[19][0][12]", "用量无法解码，改用本地估算", usage)
+			decoded = estimate()
+		case !ok:
+			tolerance.note(interactionMethod, "$event[19][0][12]", "用量无法解码，已丢弃", usage)
 		}
-		if err := emit(Event{Kind: EventUsage, Usage: decoded}); err != nil {
-			return false, err
+		if decoded != nil {
+			if err := emit(Event{Kind: EventUsage, Usage: decoded}); err != nil {
+				return false, err
+			}
 		}
 	}
-	return true, emit(Event{Kind: EventFinish, FinishReason: "stop"})
+	return true, emit(Event{Kind: EventFinish, FinishReason: finishReason})
 }
 
 // decodeInteractionDelta 解码 content delta：field 1 文本、field 2 图片、field 3 音频、field 4 文档、field 5 视频、field 6 思考摘要、
 // field 7 思考签名、field 10 引用（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植：媒体按官网前端的枚举表取 MIME 后作为媒体输出，
-// 引用为正文起止位置与来源网址）
-func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
+// 引用为正文起止位置与来源网址）。没有 content 的 delta 跳过，没见过的 content 字段跳过并写容错日志（原先按协议证据错误中止）
+func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error, tolerance *decodeTolerance) error {
 	delta, err := rawArray(raw, "$delta", raw)
-	if err != nil || len(delta) < 2 {
-		return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta", Detail: "content delta 字段不足", Raw: cloneRaw(raw)}
+	if err != nil {
+		return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta", Detail: "content delta 不是数组", Raw: cloneRaw(raw)}
+	}
+	if isJSONNull(rawAt(delta, 1)) {
+		tolerance.note(interactionMethod, "$delta[1]", "content delta 没有 content，已跳过", raw)
+		return nil
 	}
 	content, err := rawArray(delta[1], "$delta[1]", raw)
 	if err != nil {
@@ -562,18 +611,27 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 		switch index {
 		case 0:
 			text, err := rawArray(value, "$delta[1][0]", raw)
-			if err != nil || len(text) == 0 {
+			if err != nil {
 				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][0]", Detail: "文本 delta 无效", Raw: cloneRaw(raw)}
 			}
-			decoded, err := rawString(text[0], "$delta[1][0][0]", raw)
-			if err != nil {
-				return withMethod(err, "CreateInteractionStream")
+			if len(text) == 0 {
+				// TextContent 全为缺省值（JSON+protobuf 省略了空串 text）：没有正文，跳过（原先按“文本 delta 无效”中止）
+				tolerance.note(interactionMethod, "$delta[1][0]", "文本 delta 为空，已跳过", value)
+				continue
+			}
+			// 正文：null 为空串，数字与布尔值按原文转成文本；对象与数组读不出正文，仍按协议证据错误中止
+			decoded, converted, ok := lenientText(text[0])
+			if !ok {
+				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][0][0]", Detail: "正文不是字符串，读不出正文", Raw: cloneRaw(raw)}
+			}
+			if converted {
+				tolerance.note(interactionMethod, "$delta[1][0][0]", "正文不是字符串，按原文转成文本", text[0])
 			}
 			if err := emit(Event{Kind: EventText, Text: decoded}); err != nil {
 				return err
 			}
 		case 1, 2, 3, 4:
-			media, err := decodeInteractionMedia(value, index, raw)
+			media, err := decodeInteractionMedia(value, index, raw, tolerance)
 			if err != nil {
 				return err
 			}
@@ -589,75 +647,114 @@ func decodeInteractionDelta(raw json.RawMessage, emit func(Event) error) error {
 			}
 		case 6:
 		case 9:
-			if err := decodeInteractionCitations(value, raw, emit); err != nil {
+			if err := decodeInteractionCitations(value, raw, emit, tolerance); err != nil {
 				return err
 			}
 		default:
-			return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: fmt.Sprintf("$delta[1][%d]", index), Detail: "未识别的 content delta 字段", Raw: cloneRaw(raw)}
+			// 没见过的 content 字段（官网新增的内容类型）：跳过这一项，正文与媒体照常
+			tolerance.note(interactionMethod, fmt.Sprintf("$delta[1][%d]", index), fmt.Sprintf("未识别的 content delta 字段（下标 %d），已跳过", index), value)
 		}
 	}
 	return nil
 }
 
 // decodeInteractionMedia 解码图片（field 2）、音频（field 3）、文档（field 4）或视频（field 5）content：MIME 枚举与 Base64 数据。
-// 枚举为 null 或不在 interactionMediaMIME 表里时按官网前端取该类的缺省 MIME（图片 image/jpeg、音频 audio/wav、文档 application/pdf、
-// 视频 video/mp4），不按文件头另行判断；枚举不是整数、数据不是 Base64 时按协议证据错误返回
-func decodeInteractionMedia(value json.RawMessage, index int, raw json.RawMessage) (*Media, error) {
+// MIME 枚举按 decodeInteractionMediaMIME 取值，读不出时取该类的缺省 MIME，不中止（媒体已经生成、额度已扣）；数据不是 Base64 时按协议
+// 证据错误返回。Base64 接受标准与 URL 安全两种字母表、带或不带填充（标准带填充的写法最先尝试，官网现有的数据结果不变）
+func decodeInteractionMedia(value json.RawMessage, index int, raw json.RawMessage, tolerance *decodeTolerance) (*Media, error) {
 	kind := interactionMediaMIME[index]
 	path := fmt.Sprintf("$delta[1][%d]", index)
 	media, err := rawArray(value, path, raw)
 	if err != nil || len(media) < 2 {
 		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path, Detail: kind.name + " delta 无效", Raw: cloneRaw(raw)}
 	}
-	var code int64
-	if !isJSONNull(media[0]) {
-		if code, err = rawInt64(media[0], path+"[0]", raw); err != nil {
-			return nil, withMethod(err, "CreateInteractionStream")
-		}
-	}
-	mimeType, ok := kind.codes[code]
-	if !ok {
-		mimeType = kind.unlisted
-	}
+	mimeType := decodeInteractionMediaMIME(kind, media[0], path+"[0]", tolerance)
 	encoded, err := rawString(media[1], path+"[1]", raw)
 	if err != nil {
 		return nil, withMethod(err, "CreateInteractionStream")
 	}
 	data, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
-		return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[1]", Detail: kind.name + "数据不是 Base64", Raw: cloneRaw(raw)}
+		var ok bool
+		if data, ok = decodeLenientBase64(encoded); !ok {
+			return nil, &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: path + "[1]", Detail: kind.name + "数据不是 Base64", Raw: cloneRaw(raw)}
+		}
+		tolerance.note(interactionMethod, path+"[1]", kind.name+"数据不是标准带填充的 Base64，按 URL 安全或不带填充的写法解码", toleranceText("长度=%d", len(encoded)))
 	}
 	return &Media{MIME: mimeType, Data: data}, nil
 }
 
+// decodeInteractionMediaMIME 按 interactionMediaMIME 读取媒体的 MIME 枚举：表内整数按表；null 与 0（未设置，官网现有的视频即为
+// [null,<数据>]）取该类的缺省 MIME（图片 image/jpeg、音频 audio/wav、文档 application/pdf、视频 video/mp4，与官网前端相同，不按文件头
+// 另行判断），不写日志。其余写法不中止、各写一行容错日志：不在表里的整数取缺省 MIME；带小数的数与非整数写法的数字字符串按编号换算（整数写法的数字字符串
+// 如 "7" 按整数直接读取，不写日志）；写成表里的 MIME
+// 字符串（如 "image/png"）时按字符串；其他写法（枚举名称、对象等）取缺省 MIME（原先按协议证据错误中止整次生成，媒体已经生成、额度已扣）
+func decodeInteractionMediaMIME(kind interactionMediaKind, raw json.RawMessage, path string, tolerance *decodeTolerance) string {
+	if isJSONNull(raw) {
+		return kind.unlisted
+	}
+	code, err := rawInt64(raw, path, raw)
+	if err != nil {
+		var ok bool
+		if code, ok = lenientInt64(raw); ok {
+			tolerance.note(interactionMethod, path, kind.name+" MIME 枚举不是整数，按编号换算", raw)
+		} else {
+			var name string
+			if json.Unmarshal(raw, &name) == nil {
+				name = strings.ToLower(strings.TrimSpace(name))
+				for _, known := range kind.codes {
+					if known == name {
+						tolerance.note(interactionMethod, path, kind.name+" MIME 枚举写成 MIME 字符串，按字符串", raw)
+						return known
+					}
+				}
+			}
+			tolerance.note(interactionMethod, path, kind.name+" MIME 枚举不是整数，取缺省 MIME "+kind.unlisted, raw)
+			return kind.unlisted
+		}
+	}
+	if mimeType, ok := kind.codes[code]; ok {
+		return mimeType
+	}
+	if code != 0 {
+		tolerance.note(interactionMethod, path, kind.name+" MIME 枚举不在表里，取缺省 MIME "+kind.unlisted, raw)
+	}
+	return kind.unlisted
+}
+
 // decodeInteractionCitations 解码 content field 10 的引用（按上游的解码移植）：分组里的每项依次为正文中引用标记的起止字符位置与
-// field 4 的来源网址，按来源输出引用事件（各协议与 Playground 的引用一样写进 annotations、citationMetadata 等）
-func decodeInteractionCitations(value json.RawMessage, raw json.RawMessage, emit func(Event) error) error {
+// field 4 的来源网址，按来源输出引用事件（各协议与 Playground 的引用一样写进 annotations、citationMetadata 等）。引用是辅助元数据：
+// 分组读不出、条目字段不足或缺少网址时跳过（写容错日志），起止位置读不出时按 0
+func decodeInteractionCitations(value json.RawMessage, raw json.RawMessage, emit func(Event) error, tolerance *decodeTolerance) error {
 	groups, err := rawArray(value, "$delta[1][9]", raw)
 	if err != nil {
-		return withMethod(err, "CreateInteractionStream")
+		tolerance.note(interactionMethod, "$delta[1][9]", "引用列表不是数组，已丢弃", value)
+		return nil
 	}
 	for _, group := range groups {
 		items, err := rawArray(group, "$delta[1][9][]", raw)
 		if err != nil {
-			return withMethod(err, "CreateInteractionStream")
+			tolerance.note(interactionMethod, "$delta[1][9][]", "引用分组不是数组，已跳过", group)
+			continue
 		}
 		for _, item := range items {
 			fields, err := rawArray(item, "$delta[1][9][][]", raw)
 			if err != nil || len(fields) < 4 {
-				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][9][][]", Detail: "引用字段不足", Raw: cloneRaw(raw)}
+				tolerance.note(interactionMethod, "$delta[1][9][][]", "引用字段不足，已跳过该条目", item)
+				continue
 			}
-			start, err := optionalIntField(fields, 0, "$delta[1][9][][]", raw)
-			if err != nil {
-				return withMethod(err, "CreateInteractionStream")
+			start, ok := lenientInt64(fields[0])
+			if !ok && !isJSONNull(fields[0]) {
+				tolerance.note(interactionMethod, "$delta[1][9][][0]", "引用起始位置不是整数，按 0", fields[0])
 			}
-			end, err := optionalIntField(fields, 1, "$delta[1][9][][]", raw)
-			if err != nil {
-				return withMethod(err, "CreateInteractionStream")
+			end, ok := lenientInt64(fields[1])
+			if !ok && !isJSONNull(fields[1]) {
+				tolerance.note(interactionMethod, "$delta[1][9][][1]", "引用结束位置不是整数，按 0", fields[1])
 			}
 			urls := interactionStrings(fields[3])
 			if len(urls) == 0 {
-				return &ProtocolEvidenceError{Method: "CreateInteractionStream", Path: "$delta[1][9][][3]", Detail: "引用缺少网址", Raw: cloneRaw(raw)}
+				tolerance.note(interactionMethod, "$delta[1][9][][3]", "引用条目缺少网址，已跳过该条目", item)
+				continue
 			}
 			if err := emit(Event{Kind: EventCitation, Citation: &Citation{URL: urls[0], Start: int(start), End: int(end)}}); err != nil {
 				return err
@@ -689,25 +786,39 @@ func interactionStrings(raw json.RawMessage) []string {
 	return values
 }
 
-// decodeInteractionUsage 解码 Usage：输入、输出、思考与总 token 位于索引 0、4、8、9
-func decodeInteractionUsage(raw json.RawMessage, evidence json.RawMessage) (*Usage, error) {
-	values, err := rawArray(raw, "$usage", evidence)
+// decodeInteractionUsage 解码 Usage：输入、输出、思考与总 token 位于索引 0、4、8、9。各数为整数时与原先相同（整数写法的数字字符串
+// 如 "7" 同样按整数直接读取，不写日志）；带小数的数与非整数写法的数字字符串按整数换算（写一行容错日志）；总数缺位或为 0 时按输入、输出、思考三项之和（写一行容错日志，原先按缺少总数中止整次生成）。用量不是
+// 数组、某个数读不出、各数全为 0 时读不出用量（ok 为假），由调用方改用本地估算
+func decodeInteractionUsage(raw json.RawMessage, tolerance *decodeTolerance) (*Usage, bool) {
+	values, err := rawArray(raw, "$usage", raw)
 	if err != nil {
-		return nil, withMethod(err, "CreateInteractionStream")
+		return nil, false
 	}
 	usage := &Usage{}
 	for _, field := range []struct {
 		index  int
 		target *int64
 	}{{0, &usage.InputTokens}, {4, &usage.OutputTokens}, {8, &usage.ReasoningTokens}, {9, &usage.TotalTokens}} {
-		value, err := optionalIntField(values, field.index, "$usage", evidence)
-		if err != nil {
-			return nil, withMethod(err, "CreateInteractionStream")
+		value := rawAt(values, field.index)
+		if isJSONNull(value) {
+			continue
 		}
-		*field.target = value
+		number, err := rawInt64(value, "$usage", raw)
+		if err != nil {
+			var ok bool
+			if number, ok = lenientInt64(value); !ok {
+				return nil, false
+			}
+			tolerance.note(interactionMethod, fmt.Sprintf("$event[19][0][12][%d]", field.index), "用量不是整数，按整数换算", value)
+		}
+		*field.target = number
 	}
 	if usage.TotalTokens == 0 {
-		return nil, errors.New("CreateInteractionStream usage 缺少 total tokens")
+		usage.TotalTokens = usage.InputTokens + usage.OutputTokens + usage.ReasoningTokens
+		if usage.TotalTokens == 0 {
+			return nil, false
+		}
+		tolerance.note(interactionMethod, "$event[19][0][12][9]", "用量缺少总数，按输入、输出、思考之和", raw)
 	}
-	return usage, nil
+	return usage, true
 }

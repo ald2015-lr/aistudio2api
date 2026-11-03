@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -276,27 +277,20 @@ func encodePart(part Part) ([]any, error) {
 		return setPartThoughtSignature(wire, part.ThoughtSignature), nil
 	}
 	if part.ExecutableCode != nil {
-		language, ok := map[string]int64{"LANGUAGE_UNSPECIFIED": 0, "PYTHON": 1}[part.ExecutableCode.Language]
-		if !ok {
-			return nil, fmt.Errorf("未识别的 executable code language %q", part.ExecutableCode.Language)
-		}
+		language := encodeToolEnum(part.ExecutableCode.Language, executableCodeLanguages, "LANGUAGE")
 		wire := make([]any, 8)
 		wire[7] = []any{language, part.ExecutableCode.Code}
 		return setPartThoughtSignature(wire, part.ThoughtSignature), nil
 	}
-	outcome, ok := map[string]int64{
-		"OUTCOME_UNSPECIFIED":       0,
-		"OUTCOME_OK":                1,
-		"OUTCOME_FAILED":            2,
-		"OUTCOME_DEADLINE_EXCEEDED": 3,
-	}[part.CodeExecutionResult.Outcome]
-	if !ok {
-		return nil, fmt.Errorf("未识别的 code execution outcome %q", part.CodeExecutionResult.Outcome)
-	}
+	outcome := encodeToolEnum(part.CodeExecutionResult.Outcome, codeExecutionOutcomes, "OUTCOME")
 	result := []any{outcome}
-	value := part.CodeExecutionResult.Output
+	value, other := part.CodeExecutionResult.Output, part.CodeExecutionResult.Error
 	if outcome != 1 {
-		value = part.CodeExecutionResult.Error
+		value, other = other, value
+	}
+	if value == "" {
+		// 按 outcome 选中的字段为空时用另一个：outcome 不确定时解码器把文本同时放进 Output 与 Error，Gemini 客户端只回传标准的 output
+		value = other
 	}
 	if value != "" {
 		result = append(result, value)
@@ -304,6 +298,24 @@ func encodePart(part Part) ([]any, error) {
 	wire := make([]any, 9)
 	wire[8] = result
 	return setPartThoughtSignature(wire, part.ThoughtSignature), nil
+}
+
+// encodeToolEnum 把代码执行的枚举名换回编号，与 decodeToolEnum 对称：表里的名称（不分大小写）按表；解码器为不在表里的编号保留的
+// <prefix>_<n>（如 LANGUAGE_2、OUTCOME_4）按 n 原样发回；其他名称（解码器按名称保留的、客户端写的）按 0（*_UNSPECIFIED）发送，不报错
+// （原先报“未识别的 language/outcome”，客户端回放含这类枚举的历史时整轮 500）
+func encodeToolEnum(name string, table map[int64]string, prefix string) int64 {
+	name = strings.ToUpper(strings.TrimSpace(name))
+	for code, known := range table {
+		if known == name {
+			return code
+		}
+	}
+	if digits, ok := strings.CutPrefix(name, prefix+"_"); ok {
+		if code, err := strconv.ParseInt(digits, 10, 64); err == nil && digits == strconv.FormatInt(code, 10) {
+			return code
+		}
+	}
+	return 0
 }
 
 func encodeSystemInstruction(system string) []any {

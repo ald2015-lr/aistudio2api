@@ -78,11 +78,15 @@ type SearchEntryPoint struct {
 
 // GroundingChunk 表示 Google 工具检索到的一个来源
 type GroundingChunk struct {
+	// Source 为 web、image（图片来源，URI 为图片所在网页）、maps 或 retrieved_context（Build 通道）；读不出来源的 chunk 为 unknown 占位项，
+	// 只保持 support 的 chunk 索引对齐
 	Source  string `json:"source"`
 	URI     string `json:"uri,omitempty"`
 	Title   string `json:"title,omitempty"`
 	Text    string `json:"text,omitempty"`
 	PlaceID string `json:"place_id,omitempty"`
+	// Domain 为图片来源所在网站的域名
+	Domain string `json:"domain,omitempty"`
 }
 
 // GroundingSegment 表示正文中由来源支撑的片段

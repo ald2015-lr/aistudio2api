@@ -163,7 +163,7 @@ func TestQuotaCooldownUserMinuteSample(t *testing.T) {
 		"独立错误": DecodeRPCError("GenerateContent", http.StatusTooManyRequests, []byte(userMinuteQuotaPayload)),
 	}
 	var trailer *RPCError
-	if err := trailerError(buildProxyStreamedMethod, json.RawMessage(userMinuteQuotaPayload)); !errors.As(err, &trailer) {
+	if err := trailerError(buildProxyStreamedMethod, json.RawMessage(userMinuteQuotaPayload), nil); !errors.As(err, &trailer) {
 		t.Fatalf("Build 流尾错误=%v", err)
 	}
 	decoded["Build 流尾"] = trailer
@@ -257,7 +257,7 @@ func TestDecodeRPCRetryInfo(t *testing.T) {
 // TestStreamErrorsKeepQuotaMetadata Build 流尾与 Live 带内状态保留 ErrorInfo/RetryInfo，Live 状态码 8/14/16 有对应 HTTP 状态
 func TestStreamErrorsKeepQuotaMetadata(t *testing.T) {
 	details := `[["type.googleapis.com/google.rpc.ErrorInfo",["RATE_LIMIT_EXCEEDED","googleapis.com",[["quota_limit","GenerateRequestsPerMinutePerProjectPerModel"]]]],["type.googleapis.com/google.rpc.RetryInfo",[[9]]]]`
-	err := trailerError(buildProxyStreamedMethod, json.RawMessage(`[8,"quota",`+details+`]`))
+	err := trailerError(buildProxyStreamedMethod, json.RawMessage(`[8,"quota",`+details+`]`), nil)
 	var rpcError *RPCError
 	if !errors.As(err, &rpcError) || rpcError.StatusCode != http.StatusTooManyRequests ||
 		rpcError.Metadata["quota_limit"] == "" || rpcError.RetryDelay != 9*time.Second {

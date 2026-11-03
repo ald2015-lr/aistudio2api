@@ -30,6 +30,8 @@ const (
 	officialTooLargeMessage      = "Request payload size exceeds the limit."
 	// officialToolContractMessage 用于上游回复不满足客户端要求的工具约束（没有官方原文，措辞与官方风格一致）
 	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
+	// officialUnnamedFunctionCallMessage 用于上游返回的函数调用没有函数名、客户端无法执行（没有官方原文，措辞与官方风格一致）
+	officialUnnamedFunctionCallMessage = "The model returned a function call without a function name, so it cannot be executed. Please retry."
 	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
 	officialUltraUnavailableMessage = "The service is currently unavailable: no account in the Ultra pool is ready."
 	// officialBuildDisabledMessage 用于官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED）、又没有其他通道接下请求的兜底（没有官方原文）
@@ -120,6 +122,10 @@ func publicErrorFor(err error, model string) publicError {
 	var contract *aistudio.ToolContractError
 	if errors.As(err, &contract) {
 		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: officialToolContractMessage}
+	}
+	// 上游返回的函数调用没有函数名：无法交给客户端执行，按网关错误返回并写明原因（原先落到兜底的 500 通用措辞）
+	if errors.Is(err, aistudio.ErrFunctionCallMissingName) {
+		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: officialUnnamedFunctionCallMessage}
 	}
 	var blocked *aistudio.PromptFeedbackError
 	if errors.As(err, &blocked) {

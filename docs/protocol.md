@@ -550,7 +550,7 @@ AUDIO 采用独立输出模态。JSON Schema type code 为 string=`1`、number=`
 | `$[0][frame][2]` | usage |
 | `$[0][frame][7]` | response ID |
 | `$[0][frame][3]` 且 frame 0 为空 | interaction metadata |
-| `$[0][frame][1]` 且 frame 0 为 null | prompt feedback：`[0]` 为 block reason code，`[2]` 为拦截说明（block reason message，不是字符串时忽略） |
+| `$[0][frame][1]` 且 frame 0 为 null 或候选为空数组 | prompt feedback：`[0]` 为 block reason code，`[2]` 为拦截说明（block reason message，不是字符串时忽略） |
 
 传输正文是一个 JSON 根值，网络 chunk 提供字节；解码器在 `$[0]` 中每出现一个完整 repeated frame 时立即消费该 frame。每个内容帧包含一个 candidate，candidate content 为 `[[parts...], "model"]`。完成帧可以同时携带最后一组 Part、usage、response ID 和 finish reason，根数组解析完成后结束读取。
 
@@ -646,7 +646,7 @@ grounding metadata 字段：
 
 `oneof` 表示同组字段中最多选择一种值。
 
-grounding chunk 的 oneof 索引 `0/1/2` 分别为 web、retrieved context、maps；内部字段依次为 URI、title、text、place ID。support 为 `[segment, chunkIndices, confidenceScores]`，segment 为 `[partIndex,startIndex,endIndex,text]`。candidate citations 的 entries 位于 metadata 索引 0，每项 URL 在索引 2、title 在索引 3。
+grounding chunk 的 oneof 索引 `0/1/2` 分别为 web、图片来源（image）、maps；web 与 maps 的内部字段依次为 URI、title、text、place ID，图片来源依次为 source URI（图片所在网页）与 domain（按上游 Mag1cFall/AIStudio2API bd6c40f 的现场确认，原先把索引 1 当作 retrieved context）。来源为空、只有未知索引（3 及以上）或不是数组的 chunk 换成 `unknown` 占位项，保持 support 的 chunk 索引对齐（见[解码容错规则](#解码容错规则)）。support 为 `[segment, chunkIndices, confidenceScores]`，segment 为 `[partIndex,startIndex,endIndex,text]`。candidate citations 的 entries 位于 metadata 索引 0，每项 URL 在索引 2、title 在索引 3。
 
 包含 web chunk、maps chunk、正文 support、检索分数和查询词的 raw metadata：
 
@@ -667,7 +667,7 @@ grounding chunk 的 oneof 索引 `0/1/2` 分别为 web、retrieved context、map
 ]
 ```
 
-Code Execution 的 language code 为 `0=LANGUAGE_UNSPECIFIED`、`1=PYTHON`。执行结果 outcome code 为 `0=OUTCOME_UNSPECIFIED`、`1=OUTCOME_OK`、`2=OUTCOME_FAILED`、`3=OUTCOME_DEADLINE_EXCEEDED`。
+Code Execution 的 language code 为 `0=LANGUAGE_UNSPECIFIED`、`1=PYTHON`。执行结果 outcome code 为 `0=OUTCOME_UNSPECIFIED`、`1=OUTCOME_OK`、`2=OUTCOME_FAILED`、`3=OUTCOME_DEADLINE_EXCEEDED`；`OUTCOME_OK` 的文本为 output，其余为 error。枚举为 `null`、缺位或不在表中时的取值，以及客户端回放这些枚举时的编码，见[解码容错规则](#解码容错规则)。
 
 ### Usage
 
@@ -705,9 +705,9 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 | 18 | missing_thought_signature | 19 | `provider_19` |
 | 22 | continuation | 其他整数 | `provider_<code>` |
 
-错误响应根形状为 `[null,[code,message,...]]`。HTTP 200 的流在帧列表之后也可能带 google.rpc 状态：`[[帧...],[code,message,details]]`，code 不为 0 时按 Interaction 同一张表换算 HTTP 状态（3→400、4→504、5→404、7→403、8→429、9→400、13→500、14→503、16→401，其余 502），带 ErrorInfo 与 RetryInfo 的完整状态照常解码；完成帧之后的流尾错误同样交出，先于完成帧校验。流尾为 code 0、`[]`、`null` 或其他不是状态的形状（第一项不是整数）时照常结束，Build 代理的流尾按状态严格校验。原先 Playground 跳过流尾，429 不冷却、5xx 不重试、400 对外成了 502（Build 代理一直这样处理）。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
+错误响应根形状为 `[null,[code,message,...]]`。HTTP 200 的流在帧列表之后也可能带 google.rpc 状态：`[[帧...],[code,message,details]]`，code 不为 0 时按 Interaction 同一张表换算 HTTP 状态（3→400、4→504、5→404、7→403、8→429、9→400、13→500、14→503、16→401，其余 502），带 ErrorInfo 与 RetryInfo 的完整状态照常解码；完成帧之后的流尾错误同样交出，先于完成帧校验。流尾为 code 0、`[]`、`null` 或其他不是状态的形状（第一项不是整数）时照常结束；Build 代理与 Interaction 的流尾为 `null`、`[]` 或状态码为 `null`（JSON+protobuf 省略了默认值 0）时同样按 0（成功），其他不是状态的形状仍为协议错误。field 1 为 `null`（`[null,[code,message]]`）时没有帧，照常读取流尾：流尾是错误时交出上游错误，否则按缺少完成帧报错。原先 Playground 跳过流尾，429 不冷却、5xx 不重试、400 对外成了 502（Build 代理一直这样处理）。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
 
-frame 0 为 null 且带 prompt feedback 时表示上游拒绝当前输入（Build 为没有 candidate 而带 `promptFeedback.blockReason`），形成输入拦截错误。上游给出的拦截说明（Playground 的 prompt feedback `[2]`、Build 的 `promptFeedback.blockReasonMessage`）只附在内部错误与管理日志的 `request.error` 中（`AI Studio 拒绝当前输入: <reason>: <说明>`）；公开协议的错误消息仍按 block reason 统一生成官方措辞，不含这段原文。
+frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上游拒绝当前输入（Build 为没有 candidate 而带 `promptFeedback.blockReason`），形成输入拦截错误。上游给出的拦截说明（Playground 的 prompt feedback `[2]`、Build 的 `promptFeedback.blockReasonMessage`）只附在内部错误与管理日志的 `request.error` 中（`AI Studio 拒绝当前输入: <reason>: <说明>`）；公开协议的错误消息仍按 block reason 统一生成官方措辞，不含这段原文。
 
 客户端还没收到内容时重新生成（Playground 与 Build 代理，Interaction 不在此列）：上游以 `malformed_function_call` 或 `unexpected_tool_call` 结束，或流在完成帧之前中断（读取响应出错、响应在 JSON 结构中途结束即 `io.ErrUnexpectedEOF`/`io.EOF`、正常结束却没有完成帧）、流尾为 5xx 状态（504 `DEADLINE_EXCEEDED` 除外：上游在这个账号上超时，同账号再来多半还是超时，交给换号），而这次请求还没有向客户端交出任何事件（正文、思考、签名、工具调用、媒体、来源；协议层的数据型心跳不算）时，在同一租约、同一账号上重新发送同一请求。每个请求最多 2 次，同一请求换号后的尝试共用这 2 次；每次重新生成先像取得租约一样占用每账号每分钟名额（`ACCOUNT_RPM_LIMIT`）与出口令牌（`AccountLease.ReserveRegeneration`），账号已冷却、名额已满或出口不准入时不重新生成，原样交出结果（错误照旧由换号与冷却规则处理），说明里写明是哪一项（冷却截止与原因、窗口内已发出 + 预占 / 上限、出口的脱敏显示与限速）。因结束原因（`malformed_function_call`、`unexpected_tool_call`）重新生成时换一个输入：上游对完全相同的输入返回完全相同的回复，原样重发多半还是同一个错误调用，app 层在加过随机后缀的请求上挂换后缀的函数（`aistudio.ContextWithRegenerationVariant`，见 `app/duplicates.go` 的 `promptNonceVariant`），重发前把后缀换成新的、按第一次发送的步骤（媒体默认值、图片路由、语音台词分段、去掉停止序列）重建线格式请求；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE` 关闭）不因结束原因重新生成。流中断与流尾 5xx 不是确定性的，照旧原样重发。几次生成共用首事件前期限（`REQUEST_TIMEOUT`）：重新生成前按 `ctx.Deadline()` 比较，剩余时间不到这次耗时的 1.2 倍时不重新生成、按这次的结果结束，免得把本可以交出的结果拖成 504、白白多烧一次额度。首事件超时（`FIRST_EVENT_TIMEOUT`）由 app 层经 `aistudio.ContextWithFirstEventClock` 交来，按每次发送计：重发前与重发开始向上游发送时重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成，免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时并换号。确定性的格式不符不算中断、不重新生成：上游字段类型变了（`json.UnmarshalTypeError`）、函数调用缺少名称、JSON 语法错误，同账号重发只会得到同样的结果。前几次的用量与结束事件丢弃，只交出最后一次的，用量账本与访问日志只记一次；重新生成的发送不报告请求阶段（“WAA proof 完成”“上游已返回响应头”与首事件计时只按第一次），每次写一行请求说明（`ReportRequestNote`：有观察者时只交给观察者，经 `/trace/` 的请求只出现在排查记录的时间线里，不另写一份 notes；见 [logging.md](logging.md)），附上被放弃那次的耗时与原文（结束说明 `finishMessage`、流尾错误说明或中断时的错误，截断到 200 字）；降级判定从第一块正文起计时，不受影响。已经交出事件的照旧结束：429、400 等其他错误不重新生成。long- 请求（见“自动续写”）只在第一轮、还没交出事件时重新生成，重发的第一轮照旧按续写计划编码；续写决定发第二轮之后不再重新生成，重新生成次数与续写轮数互不占用。非流式请求同样以“已交出事件”为界：思考摘要先交给 app 层、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成（交出的事件已经过 app 层的首事件判定、降级判定与访问日志，四个协议的非流式汇总也没有撤回已收集思考的办法）。
 
@@ -722,6 +722,63 @@ frame 0 为 null 且带 prompt feedback 时表示上游拒绝当前输入（Buil
 | 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举（`MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`TOO_MANY_TOOL_CALLS`、`MISSING_THOUGHT_SIGNATURE` 等官方枚举名，`missing_thought_signature` 原先报成 `OTHER`）或 `OTHER` |
 
 内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
+
+### 解码容错规则
+
+官网的 JSON+protobuf 响应会省略末尾未设置的字段、把未设置的枚举写成 `null`，也会新增枚举值与来源类型。解码器原先“读不懂的位置一律中止”：按协议证据错误（`ProtocolEvidenceError`）结束整次生成，对外为 500 `An internal error has occurred`，正文往往已经生成、额度已扣（Omni 视频 MIME 枚举省略成 `null` 即为一例），非流式请求整份作废，流式请求在正文之后报错，也不重新生成。现在按下面的规则继续解码（`internal/aistudio/decode_tolerance.go`），只有正文本身读不出来时才报错：
+
+- 结构性问题跳过这一帧或元素：field 1 里的 `null` 与稀疏元素（`[[,<帧>]]`）、空帧 `[]`、候选为空数组（这一帧的用量照常读取）。多个候选取第一个：本服务只请求一个候选（OpenAI `n`、Gemini `candidateCount` 不是 1 时按 400 拒绝），客户端也只要一个；其余候选也必须是数组或 `null`，有标量时说明嵌套层次变了（如少一层 parts 时 `[content, 1]` 被当成候选列表），仍按协议证据错误返回，不把错位的数据当正文交出
+- 枚举为 `null`、缺位或不在表中取缺省值，不在表中的保留为 `*_<n>` 可读名，不丢正文
+- 辅助元数据（用量、引用、grounding、promptFeedback）解码失败时丢掉这一项或这一条目，继续解码其余内容；用量读不出时按读不出处理，生成服务改用本地估算（Playground 与上游没有返回用量时相同；Omni 见下表 Interaction 一行）。promptFeedback 是例外：它决定这一帧是不是输入拦截，还没有交出正文时读不出就按 `unspecified` 拦截，不按未拦截跳过（跳过后流里没有完成帧，会按“没有完成帧”在同账号重新生成）；已经交出过正文时不可能是输入拦截，读不出按未拦截继续
+- 每次容错写一行容错日志（见下文），能正常解码的响应逐事件结果不变
+
+| 位置 | 原先 | 现在 |
+| --- | --- | --- |
+| field 1 的 `null` 与稀疏元素、空帧 `[]` | 报“空流帧” | 跳过 |
+| 候选 `[]` | 报“候选数量不是现场确认的 1” | 跳过候选，读取本帧用量；frame `[1]` 的 promptFeedback 与 frame 0 为 `null` 时一样读取（`[[],[1,…]]` 照旧按输入拦截结束，不重新生成） |
+| 多个候选 | 同上 | 取第一个；其余候选有不是数组的元素时仍报错（嵌套层次变了） |
+| 响应角色缺失、为 `null` 或不是 `"model"` | 报“期望字符串”“响应角色不是 model” | 按 model 处理 |
+| promptFeedback 没有拦截原因（`null`、缺位或空白字符串，如只有安全评级 `[null,[[1,1],[2,1]]]`、`[null,[""]]`） | 报“期望整数” | 不是拦截，跳过这一帧；有拦截原因时照旧按拦截处理（写成名称时按名称，读不出时按 `unspecified` 拦截） |
+| promptFeedback 本身不是数组（如 `{"blockReason":1}`） | 报“期望数组” | 还没有交出正文时读不出有没有拦截，按 `unspecified` 拦截（对外 400，不重新生成）；已经交出过正文时不可能是输入拦截，按未拦截继续 |
+| 引用条目缺少 URI（只有起止位置的 `[[[0,10]]]`）、URI 为 `null` 或空串；标题不是字符串；引用元数据不是数组 | 报“期望字符串”或产生网址为空的引用 | 跳过该条目；忽略标题；丢掉引用 |
+| grounding chunk 来源为空、只有未知索引（3 及以上）、不是数组 | 报“grounding chunk 缺少来源” | 换成 `unknown` 占位项（不带网址，各协议不产生引用，Gemini 输出为 `{}`），support 的 chunk 索引对齐 |
+| grounding chunk 同时设置多个来源 | 报“同时设置多个来源” | 取第一个 |
+| grounding 的字符串字段不是字符串（chunk 字段、查询词、搜索入口、Maps token、segment 文本） | 报“期望字符串” | 忽略该字段或该查询词 |
+| support 的 chunk 索引为 `null` 或读不出 | 报“期望整数” | 跳过该索引，等长的置信度去掉同一位置；置信度读不出时丢掉这一组置信度；segment 位置读不出时忽略 |
+| grounding 本身、chunk 列表、support 列表不是数组 | 报“期望数组” | grounding 本身：只写日志、不发 grounding 事件；chunk 列表：丢掉 chunk 与 support；support 列表：丢掉 support |
+| executable code 的 language 为 `null` 或缺位；不在表中；code 缺位 | 报“期望整数”“未识别的 language”“字段不足” | `LANGUAGE_UNSPECIFIED`；`LANGUAGE_<n>`；空串 |
+| code execution result 为 `[]`、outcome 为 `null`；不在表中 | 报“字段不足”“期望整数”“未识别的 outcome” | `OUTCOME_UNSPECIFIED`；`OUTCOME_<n>`。outcome 不确定时文本同时放进 Output 与 Error：OpenAI、Responses 与 Anthropic 按 outcome 取 Error，Gemini 输出同时写标准的 `output` 与本服务一直输出的 `error`（Gemini API 只有 `outcome` 与 `output` 两个字段，new-api 的 Gemini 渠道与 google-genai SDK 只读 `output`），文本不丢；表内整数照旧（`OUTCOME_OK` 为 output，其余为 error，Gemini 输出不变）；写成名称时按名称 |
+| 客户端回放含这些枚举的历史（Gemini 原生客户端把上一轮的 `executableCode`、`codeExecutionResult` 原样发回） | 报“未识别的 executable code language”“未识别的 code execution outcome”，下一轮 500 | 编码与解码对称：表里的名称（不分大小写）按表；`LANGUAGE_<n>`、`OUTCOME_<n>` 按 n 原样发回；其他名称按 0（`*_UNSPECIFIED`）；按 outcome 选中的字段（`OUTCOME_OK` 为 output，其余为 error）为空时用另一个 |
+| executable code、code execution result 不是数组；代码或执行输出是对象或数组 | 报“期望数组”“期望字符串” | 仍报错（读不出代码或输出，与正文相同；不静默丢掉这一项或交出空代码块）。代码与输出为数字或布尔值时按原文转成文本 |
+| 函数参数 Struct 的 map entry 只有键 | 报“字段数量错误” | 该参数为 `null` |
+| map entry 多于两项、为空、键不是字符串 | 同上 | 只取键与值；跳过；跳过 |
+| Value 一个字段都没有（`[]`、`[null]`）、设置了多个、`null_value` 不是 `0`、不是数组 | 报“缺少 oneof”“多个 oneof”“null Value 枚举无效” | `null`；取第一个；`null`；`null` |
+| number 写成字符串（`"1.5"`）；`"NaN"`、`"Infinity"` | 报“number Value 无效” | 按数字解析；JSON 表示不了，按 `null` |
+| string 写成数字或布尔值；bool 写成 `"true"`、`2` | 报“期望字符串”“期望布尔值” | 按原文转成字符串；按“非 0、非 false 即为真” |
+| Struct、ListValue 不是数组 | 报“期望数组” | `{}`、`[]` |
+| 函数调用 ID 不是字符串 | 报“期望字符串” | 忽略（之后补发本地 ID） |
+| 函数名缺失、为 `null`、不是字符串或为空串 | 报“期望字符串”“缺少名称” | 仍是错误（无法交给客户端执行），带 `ErrFunctionCallMissingName`，对外 502 `The model returned a function call without a function name, so it cannot be executed. Please retry.`；不是流中断，不重新生成 |
+| 用量各数写成带小数的数（`10.0`）或数字字符串 | 前者报“期望整数” | 按整数换算（四舍五入） |
+| 用量不是数组、某个数读不出 | 报“期望数组”“期望整数” | 丢掉这一帧的用量（前面帧已记的用量一并丢掉，不交出偏小的数），改用本地估算 |
+| finishReason 写成名称（`"STOP"`、`"FINISH_REASON_MAX_TOKENS"`，不分大小写）、带小数的数；不在表中的枚举样式名称（大写字母、数字与下划线） | 报“期望整数” | 按名称或编号换算；保留为小写可读名。照常发完成事件，续写判断按换算出的编号（`"CONTINUATION"` 为 22，`"MAX_TOKENS"` 为 2） |
+| finishReason 为空白字符串 | 同上 | 等同这一帧没有结束原因（不结束，后面的完成帧照常结束与续写） |
+| finishReason 读不出（对象、数组、`"model"` 这类不像枚举名的字符串） | 同上 | 不在这一帧定终态：后面的帧出现能识别的结束原因时以后者为准；流正常结束（流尾不是错误）时仍只有读不出的，才在最后按 `unspecified` 结束（带那一帧的结束说明与最后的用量） |
+| thought 标记为 `2`、`"true"` 等；对象等读不出 | 报“期望布尔值” | 非 0、非 false 即为真；按 false |
+| 思考签名不是字符串 | 报“期望字符串” | 忽略签名 |
+| 正文为 `null`；为数字或布尔值 | 前者照常；后者报“期望字符串” | 空串；按原文转成文本 |
+| inline media 的 Base64 为 URL 安全或不带填充的写法；MIME 不是字符串或为空 | 报“不是有效 Base64”；MIME 为空时输出空 MIME | 接受（标准带填充的写法最先尝试，结果不变）；按文件头判断 MIME。Live 会话不按文件头判断：MIME 为空时照旧输出空 MIME（客户端按缺省的 PCM 处理） |
+| 转写元数据（Part field 23）的 speaker 不是字符串；时间戳列表不是数组；某个时间戳读不出；整段读不出而同一 Part 已有正文 | 报“期望字符串”“期望数组”“期望整数” | 忽略 speaker；丢掉时间戳；丢掉该项；丢掉元数据（正文照常）。转写正文按正文规则读取，读不出且 Part 没有别的正文时仍报错 |
+| field 1 为 `null`（`[null,[code,message]]`） | 报“field 1 不是 repeated 数组” | 照常读取流尾 |
+| Build 代理流尾为 `null`、`[]`、`[null]`、`[null,"OK"]`；多个候选 | 报“流尾状态无效”“期望整数”“候选数量不是 1” | 按 0（成功）；取第一个 |
+| Build 的 grounding chunk 没有能读的来源；同时有多个来源 | 跳过该 chunk（后面的索引整体错位）；每个来源各算一个 chunk | `unknown` 占位项；取第一个。`image` 来源按 `sourceUri`、`domain` |
+| Interaction 流尾为 `null`、`[]` 或状态码为 `null`；没见过的 content delta 字段；没有 content 的 delta；空文本 delta（content field 1 为 `[]`，TextContent 全为缺省值）；正文为数字或布尔值；引用字段不足或缺少网址 | 报“流尾状态无效”“未识别的 content delta 字段”“content delta 字段不足”“文本 delta 无效”“期望字符串”“引用缺少网址”等 | 按 0（成功）；跳过该字段；跳过；跳过；按原文转成文本；跳过该条目 |
+| Interaction 媒体的 MIME 枚举不在表中、带小数（`7.0`、`"7.0"`）、写成 MIME 字符串、写成名称等其他写法 | 表外整数取缺省 MIME 但不写日志；不是整数时报“期望整数”，整次生成中止（媒体已生成、额度已扣，与这次的线上事故相同） | 取该类的缺省 MIME；按编号；按字符串（只认表里有的 MIME）；取缺省 MIME。都写一行容错日志（整数写成的数字字符串 `"7"` 与原先一样直接按整数读）。`null` 与 `0`（未设置，官网现有的视频即为 `[null,<数据>]`）照旧取缺省 MIME、不写日志，免得每个正常的视频请求都写一行 |
+| Interaction 用量各数带小数（`5.0`、`"16.0"`）；总数缺位或为 0；用量不是数组、某个数读不出、各数全为 0 | 前两种报“期望整数”“缺少 total tokens”，整次生成中止 | 按整数换算；按输入、输出、思考三项之和；按已交出的正文与思考做本地估算（与 Playground 相同；视频本身不计 token，至少保住输入数与正文数，用量账本不记 0）。上游完全没有带用量时与原先相同（不估算） |
+| Interaction 最终状态不在表中（3 完成、4 失败、5 取消之外）、为 `null` 或不是整数；最终 interaction 为 `[]`、`[[]]` 或 `[null]`（字段全为缺省值） | 报“未识别的最终状态”“最终 interaction 为空” | 已经交出过正文或媒体时按 `other` 结束：前者照常读取 usage，后者没有 usage 可读，交出本地估算（视频已生成、额度已扣，不让非流式整份作废）；还没交出内容时仍报错 |
+
+仍按协议证据错误结束（读不出正文，或继续会交出错误内容）：帧、候选、content 或 Part 不是数组；正文是对象或数组；inline media 不是数组、缺少数据或数据不是 Base64；executable code、code execution result 不是数组，或代码、执行输出是对象或数组；函数调用不是数组或缺少函数名；其余候选有不是数组的元素（嵌套层次变了）；转写正文读不出且 Part 没有别的正文；Interaction 媒体 delta 字段不足或数据不是 Base64、文本 delta 不是数组或正文是对象或数组、还没交出内容时最终 interaction 为空或状态不在表中；Build 代理正文不是 JSON（字段类型变化仍整块失败，见 [Build 通道](build.md)）；流尾不是状态（Build 与 Interaction）；流结束前没有完成帧。重新生成、自动续写与流尾的判断不变：容错本身不产生错误，也不改变哪些错误会重新生成；但跳过整帧后流里可能没有完成帧（如每一帧都是空帧或候选为空数组），这时与原先流里没有完成帧时一样按“没有完成帧”处理，还没交出内容时在同账号重新生成。因此决定输入拦截的 promptFeedback 不按跳过处理：候选为空数组时照常读取，本身读不出时按 `unspecified` 拦截，真正的拦截照旧对外 400、不重新生成。
+
+容错日志：同一请求里同一种容错（方法、种类与去掉数组下标的位置）只写一行 WARN 到运行日志（`上游响应解码容错，已继续`，字段 `request_id`、`method`、`path`、`kind`、`raw`）与该请求的排查记录（`解码容错 | <方法> | 位置=<路径> | <种类> | 原文=<原文>`）；同一请求的换号、重新生成与续写各轮共用（app 层按请求挂 `ContextWithDecodeTolerance`）；Live 会话按会话去重（会话对象持有一份，整个会话的各条消息共用）。原文最多 240 字节，先脱敏再截断：每个 JSON 字符串按解码后的值判断（`\n` 换行、`\/` 等转义都已还原），去掉空白后 96 个字符以上、全是 Base64 字母的字符串（媒体数据、签名）只写长度（`"<N 字符>"`）；不全是 Base64 的字符串里 96 个字符以上的 Base64 字母连续段（data URL 的数据部分、夹在文本里的一段，分行的按换行连成一段）同样换成 `<N 字符>`，其余文字保留。请求的管理日志不写（不逐帧刷屏）；`/api/status` 不加字段。格式见 [logging.md](logging.md#解码容错)。
 
 ### 自动续写（long- 前缀）
 
@@ -1013,7 +1070,7 @@ thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_eff
 
 视频设置（官网 Run settings 的 Aspect ratio、Video duration、Resolution、Frame rate 与 Advanced 的 Video task）的公开写法见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀)。协议层按合并目录整理并留下请求日志说明，发送前再按所选账户的目录整理一次（合并目录的时长范围已取各账户的交集，一般不会再改；别名目录缓存还没刷新或协议层没有整理到时可能不同），这一次留下的新说明（协议层没有记过的）以该账户为来源写进同一请求的管理日志；视频任务是否可用以合并目录为准，所选账户目录没有列出时照发，由上游判断（不按单个账户返回 400，免得另一个账户能完成的请求直接失败）；编码时宽高比与分辨率取最接近的上游枚举，在上游能编码的取值上与上游 Mag1cFall/AIStudio2API 的 `interactionVideoFormat` 一致；有两处不同：所选账户目录的默认分辨率为空或为 `368p` 时本服务发 `1`（官网默认 360p），上游不带；另外本服务多接受 `auto`、`ASPECT_RATIO_UNSPECIFIED`、`16x9`、`VIDEO_RESOLUTION_` 与 `VIDEO_TASK_` 前缀、`unspecified` 等写法，上游会报错。帧率只校验不发送（官网只有 24fps 且不可选）。
 
-响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 2 至 5 为图片、音频、文档与视频 `[<MIME 枚举>,"<BASE64>"]`、field 6 为思考摘要、field 7 为思考签名（忽略）、field 10 为引用 `[[[<START>,<END>,…,["<URL>",…]]…]…]`（每项为正文中引用标记的起止字符位置与来源网址，取第一个网址），分别映射为 text、对应 MIME 的媒体、reasoning 与 citation 事件（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植，带图片输入后模型可能返回图片）；不是 Base64 的数据、枚举不是整数、字段不足或缺少网址的引用按协议证据错误返回；索引 19 的最终 interaction 状态 `3` 产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9）与 `stop` 终态，状态 `4`、`5` 返回错误。事件列表后的 google.rpc 状态按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
+响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 2 至 5 为图片、音频、文档与视频 `[<MIME 枚举>,"<BASE64>"]`、field 6 为思考摘要、field 7 为思考签名（忽略）、field 10 为引用 `[[[<START>,<END>,…,["<URL>",…]]…]…]`（每项为正文中引用标记的起止字符位置与来源网址，取第一个网址），分别映射为 text、对应 MIME 的媒体、reasoning 与 citation 事件（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植，带图片输入后模型可能返回图片）；不是 Base64 的数据（标准与 URL 安全两种字母表、带或不带填充都接受）或媒体字段不足时按协议证据错误返回，MIME 枚举为 `null` 或不在表里时取该类的缺省 MIME（不是整数等其他写法同样不中止，见[解码容错规则](#解码容错规则)），字段不足或缺少网址的引用只跳过该条目，没见过的 content 字段跳过并写一行容错日志（正文与媒体照常），没有 content 的 delta 与空文本 delta 跳过；索引 19 的最终 interaction 状态 `3` 产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9；带小数或数字字符串按整数换算，总数缺位时按三项之和）与 `stop` 终态，状态 `4`、`5` 返回错误，其他状态（含 `null`）与空的最终 interaction 在已经交出正文或媒体时按 `other` 结束、否则为协议错误；usage 读不出时生成服务按已交出的正文与思考做本地估算，结束事件照常发出。事件列表后的 google.rpc 状态（为 `null`、`[]` 或状态码为 `null` 时按 0）按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
 
 媒体 MIME 枚举与官网前端相同（按上游 45e33b4 移植），枚举为 `null` 或不在表中时取该类的默认 MIME，不按文件头另行判断；原先只认图片 `1`、`2` 与视频 `1`，视频返回 `[null,…]`、表外枚举或 field 3、4 时整次按协议证据错误返回 502（此时视频已经生成、额度已扣）。输入编码用同一张表（见上文的图片输入）：
 
@@ -2048,7 +2105,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | function call | `functionCall:{id,name,args}`；`args` 缺省或为 `null` 按 `{}` |
 | function response | `functionResponse:{id,name?,response,parts?}`；`name` 可以为空（按调用 ID 或唯一待返回的调用补名），`response` 为 `null` 按 `{}`，`parts` 为附带的媒体（`inlineData` 或 `fileData`） |
 | executable code | `executableCode:{language,code}` |
-| code result | `codeExecutionResult:{outcome,output,error}` |
+| code result | `codeExecutionResult:{outcome,output,error}`；输出时 `OUTCOME_OK` 写 output、其余写 error，outcome 不确定（上游为 `null` 或不在表中）时两个都写；回放时 `LANGUAGE_<n>`、`OUTCOME_<n>` 按编号发回，其他不认识的名称按 0 |
 
 函数结果的媒体与 OpenAI 入口一致拆分：`functionResponse.response` 里以 base64 内嵌的图片与文件（`{"result":[…]}`，即 new-api 把 OpenAI 的数组结果转成 Gemini 时的包装；`{"content":[…]}`，即 MCP 工具结果；内容块的写法见 OpenAI Chat 一节）与 `functionResponse.parts` 的媒体作为真正的媒体附在这组工具结果之后的用户消息里，结果原位置换成文字说明。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果 JSON>` 文字说明（名称为空时写 `(<调用 ID>)`），这一轮改为用户消息；各协议都经过同一步。
 
@@ -2151,7 +2208,7 @@ tool group 字段：
 }
 ```
 
-`groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`retrievedContext:{uri,title,text}` 或 `maps:{uri,title,text,placeId}`；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
+`groundingMetadata` 字段为 `searchEntryPoint`、`groundingChunks`、`groundingSupports`、`retrievalMetadata`、`webSearchQueries`、`googleMapsWidgetContextToken`。`searchEntryPoint` 包含 `renderedContent`、`sdkBlob`；`groundingChunks` 元素的 oneof 为 `web:{uri,title}`、`image:{sourceUri,title?,domain?}`、`retrievedContext:{uri,title,text}`（Build 通道）或 `maps:{uri,title,text,placeId}`，读不出来源的占位项输出为空对象 `{}`，`groundingChunkIndices` 照常对齐；`groundingSupports` 元素包含 `segment:{partIndex,startIndex,endIndex,text}`、`groundingChunkIndices` 和可选 `confidenceScores`；`retrievalMetadata` 包含 `googleSearchDynamicRetrievalScore`。`citationMetadata.citationSources` 的元素包含 `uri`、`title`、`startIndex`、`endIndex`。
 
 非流式响应把相邻的同类正文或思考片段合并为一个 Part，不论片段是否带签名；同一段里出现多个签名时保留最后一个（gemini-4 等模型给许多正文分片都带签名，按签名拆开时 new-api、SillyTavern 拼接多个 Part 会在句子中间断行）。工具调用、媒体与带转录元数据的 Part 保持独立；引用、搜索来源与用量不产生 Part，也不打断合并。正文或思考中途单独到达的签名挂到正在合并的 Part 上；输出开头的单个签名在合并完成后挂到随后的第一个 Part 上，该 Part 合并后已带签名时前置签名单独成 Part，不因前置签名拆开连续正文。其余无处可挂的独立签名（工具调用、媒体之后，以及流式响应中的独立签名）以 `{"text":"","thought":true,"thoughtSignature":"..."}` 承载，作为输入回传时还原为纯签名 Part。
 

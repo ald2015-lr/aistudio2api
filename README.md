@@ -1132,6 +1132,13 @@ bash tools/diag_cancel.sh                        # 最近 24 小时：谁断开�
 MINUTES=180 MODEL=gemini-3.8-flash bash tools/diag_cancel.sh
 ```
 
+### 官网响应格式变化与解码容错
+
+官网会把未设置的字段省略成 `null`、新增枚举值与来源类型。本服务解码时遇到读不懂、但不影响正文的位置，跳过这一项或取缺省值继续，正文照常返回：引用缺少网址、grounding 出现新的来源类型或空来源（占位保持索引对齐）、代码执行的语言与结果枚举为 `null` 或不在表中、函数参数的写法不常见（单个参数按 `null`，不丢掉整次调用）、响应角色缺失、promptFeedback 没有拦截原因、用量写成带小数的数或读不出（改用本地估算，Omni 同样按已交出的正文估算，视频本身不计；Omni 用量缺少总数时按各项之和）、多个候选（取第一个）、结束原因为空串或读不出、Omni 已交出视频后最终状态不在表中或最终结果为空（按 `other` 结束）、Omni 媒体的 MIME 枚举不在表中或不是整数（取缺省 MIME，如视频 `video/mp4`）、图片的 Base64 为 URL 安全或不带填充的写法、Build 与 Omni 的流尾状态码省略、Omni 没见过的内容字段与空的文本片段等。原先这些位置会让整次生成以 500 `An internal error has occurred` 结束（正文已经生成、额度已扣），非流式请求整份作废。
+
+- **还会报错的**：正文本身读不出来（正文、代码执行的代码或输出是对象或数组，帧或候选不是数组，图片数据不是 Base64）、函数调用没有函数名（对外 502，见上表）、流结束前没有完成帧。输入拦截读不出原因时按拦截处理（对外 400），不当作没有拦截
+- **日志**：每次容错在运行日志写一行 WARN `上游响应解码容错，已继续`（带请求 ID、协议位置、种类与截断的原文，不含媒体数据），同一请求同一种只写一行（Live 会话按整个会话计）；经排查路由的请求同样记进排查记录。某一种持续出现说明官网改了协议，把整行发给开发者。规则见 [docs/protocol.md](docs/protocol.md#解码容错规则)，日志格式见 [docs/logging.md](docs/logging.md#解码容错)
+
 ### 错误响应格式
 
 返回给客户端的错误统一使用各协议的官方结构（OpenAI 的 `error.message/type/param/code`，Anthropic 的 `type: error` 加 `request_id`，Gemini 的 `error.code/message/status`），消息使用 Google Gemini API 的官方英文措辞；内部详细原因（账号、上游协议细节、中文说明）只写管理日志。
@@ -1151,6 +1158,7 @@ MINUTES=180 MODEL=gemini-3.8-flash bash tools/diag_cancel.sh
 | 号池内部的账号认证（需要重新登录）、停用、占用、权限、目录问题，号池为空，服务未就绪或重启中 | 503 | `The service is currently unavailable.` |
 | 上游过载 | 503 | `The model is overloaded. Please try again later.` |
 | 超时 | 504 | `Deadline expired before operation could complete.` |
+| 上游返回的函数调用没有函数名（客户端无法执行） | 502 | `The model returned a function call without a function name, so it cannot be executed. Please retry.` |
 | 其他内部错误 | 500 | `An internal error has occurred. …` |
 
 429 另带响应头 `X-AIStudio2API-Reason`，区分本地排队超限（`local_queue`）、候选全部冷却（`local_cooling`）、上游额度或限流（`upstream_quota`）与出口限流（`egress_limited`），见[出口限流、目录缓存与“需要登录”](#出口限流目录缓存与需要登录)。

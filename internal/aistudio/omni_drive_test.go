@@ -179,8 +179,8 @@ func interactionDeltaEvent(content []any) []any {
 }
 
 // TestDecodeInteractionImageAndCitations 按上游移植的解码：content delta field 2 为图片（MIME 枚举 1 为 PNG）作为媒体输出，
-// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；不是 Base64 的图片、缺少网址或字段不足的引用按协议证据错误返回
-// （表外的 MIME 枚举取缺省 MIME，见 TestDecodeInteractionMediaMIME）
+// field 10 为引用（正文起止位置与来源网址），按网络顺序与正文、视频交错输出；不是 Base64 的图片按协议证据错误返回，缺少网址或字段不足的引用
+// 只跳过该条目（解码容错）；MIME 枚举不是整数时取缺省 MIME、媒体照常交出（解码容错，各种写法见 TestToleranceInteractionMediaMIME）
 func TestDecodeInteractionImageAndCitations(t *testing.T) {
 	image := []byte("\x89PNG\r\n\x1a\nimage")
 	video := []byte("\x00\x00\x00\x18ftypmp42video")
@@ -230,16 +230,39 @@ func TestDecodeInteractionImageAndCitations(t *testing.T) {
 		t.Fatalf("field 5 视频 = %+v", events[4].Media)
 	}
 	for name, content := range map[string][]any{
-		"图片不是 Base64":   {nil, []any{1, "%%%"}},
-		"图片枚举不是整数":      {nil, []any{"image/png", base64.StdEncoding.EncodeToString(image)}},
-		"视频 delta 字段不足": {nil, nil, nil, nil, []any{1}},
-		"引用缺少网址":        {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1, nil, []any{}}}}},
-		"引用字段不足":        {nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1}}}},
+		"图片不是 Base64":        {nil, []any{1, "%%%"}},
+		"图片枚举写成名称且不是 Base64": {nil, []any{"IMAGE_PNG", "%%%"}},
+		"视频 delta 字段不足":      {nil, nil, nil, nil, []any{1}},
 	} {
 		raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent(content), final}, []any{0}})
 		var evidence *ProtocolEvidenceError
 		if err := DecodeInteractionStream(bytes.NewReader(raw), func(Event) error { return nil }); !errors.As(err, &evidence) {
 			t.Fatalf("%s: 期望协议证据错误，实际 %v", name, err)
+		}
+	}
+	// MIME 枚举不是整数（原先按协议证据错误中止整次生成，媒体已经生成、额度已扣）：取图片的缺省 MIME，媒体照常交出，日志一行
+	log := captureToleranceLog(t)
+	raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent([]any{nil, []any{"IMAGE_PNG", base64.StdEncoding.EncodeToString(image)}}), final}, []any{0}})
+	var tolerated []Event
+	if err := DecodeInteractionStream(bytes.NewReader(raw), func(event Event) error {
+		tolerated = append(tolerated, event)
+		return nil
+	}); err != nil || len(tolerated) != 3 || tolerated[0].Media == nil || tolerated[0].Media.MIME != "image/jpeg" || !bytes.Equal(tolerated[0].Media.Data, image) {
+		t.Fatalf("图片枚举不是整数：事件 = %+v，错误 = %v", tolerated, err)
+	}
+	log.expectOne(t, "图片 MIME 枚举不是整数，取缺省 MIME image/jpeg")
+	// 引用是辅助元数据：条目缺少网址或字段不足时只跳过该条目（原先按协议证据错误中止），正文与结束事件照常
+	for name, content := range map[string][]any{
+		"引用缺少网址": {[]any{"正文"}, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1, nil, []any{}}}}},
+		"引用字段不足": {[]any{"正文"}, nil, nil, nil, nil, nil, nil, nil, nil, []any{[]any{[]any{0, 1}}}},
+	} {
+		raw, _ := json.Marshal([]any{[]any{interactionDeltaEvent(content), final}, []any{0}})
+		var kinds []EventKind
+		if err := DecodeInteractionStream(bytes.NewReader(raw), func(event Event) error {
+			kinds = append(kinds, event.Kind)
+			return nil
+		}); err != nil || !slices.Equal(kinds, []EventKind{EventText, EventUsage, EventFinish}) {
+			t.Fatalf("%s: 期望跳过引用、正文与结束照常，实际 %v %v", name, kinds, err)
 		}
 	}
 }

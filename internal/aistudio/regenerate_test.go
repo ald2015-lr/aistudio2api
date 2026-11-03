@@ -520,7 +520,7 @@ func TestGenerateNoRegenerateOnDeterministicProtocolError(t *testing.T) {
 		{
 			name:  "函数调用缺少名称",
 			first: streamResponse(regenStream("", `[[[[[[null,null,null,null,null,null,null,null,null,null,["",null]]],"model"]]]]`)),
-			check: func(err error) bool { return strings.Contains(err.Error(), "function call 缺少名称") },
+			check: func(err error) bool { return errors.Is(err, ErrFunctionCallMissingName) },
 		},
 		{
 			name:  "流尾 504",

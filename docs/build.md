@@ -259,7 +259,7 @@ Playground 私有字段在 Build 请求中不发送：账户时区、GenerateCon
 | --- | --- |
 | `text`（`thought` 为假） | text |
 | `text`（`thought: true`） | reasoning |
-| `inlineData`（`thought` 为假） | media，Base64 解码为字节 |
+| `inlineData`（`thought` 为假） | media，Base64 解码为字节（标准与 URL 安全两种字母表、带或不带填充都接受；`mimeType` 为空时按文件头判断） |
 | `executableCode` | executable code |
 | `codeExecutionResult` | code execution result；`OUTCOME_OK` 时 `output` 为输出，否则为错误 |
 | `functionCall` | tool call，`args` 缺失时为 `{}` |
@@ -271,12 +271,13 @@ Playground 私有字段在 Build 请求中不发送：账户时区、GenerateCon
 
 - Part 的 `thoughtSignature` 附在该 Part 产生的事件上
 - 带 `thought: true` 的 `inlineData` 是图片模型思考过程中的草图，不作为输出媒体
-- `groundingMetadata` 读取 `webSearchQueries`、`searchEntryPoint {renderedContent, sdkBlob}`、`groundingChunks` 的 `web`、`retrievedContext`、`maps`（`uri`、`title`、`text`、`placeId`）、`groundingSupports`（segment 的 `partIndex`、`startIndex`、`endIndex`、`text`，`groundingChunkIndices`，`confidenceScores`）与 `googleMapsWidgetContextToken`
+- `groundingMetadata` 读取 `webSearchQueries`、`searchEntryPoint {renderedContent, sdkBlob}`、`groundingChunks` 的 `web`、`retrievedContext`、`maps`（`uri`、`title`、`text`、`placeId`）与 `image`（`sourceUri`、`domain`）：每个 chunk 取第一个能读的来源，一个都没有时换成 `unknown` 占位项（原先跳过，后面 chunk 的索引整体错位）；`groundingSupports`（segment 的 `partIndex`、`startIndex`、`endIndex`、`text`，`groundingChunkIndices`，`confidenceScores`）与 `googleMapsWidgetContextToken`
 - `usageMetadata` 的 `totalTokenCount` 大于 0 时记录：`promptTokenCount` 为输入，`candidatesTokenCount` 为输出，`thoughtsTokenCount` 为思考，`toolUsePromptTokenCount` 为工具；缺少 `candidatesTokenCount` 时输出为总数减去其余三项
 - 第一次出现 `finishReason` 时先发出最近的 usage，再发出 finish；终止原因为去掉 `FINISH_REASON_` 前缀后的小写枚举名，与 Playground 的规范终止原因一致，`UNSPECIFIED` 为 `unspecified`
 - 没有 candidate 且带 `promptFeedback.blockReason` 时返回 prompt feedback 错误，原因为去掉 `BLOCK_REASON_` 前缀的小写枚举名；`promptFeedback.blockReasonMessage` 作为拦截说明附在内部错误与管理日志里，公开错误消息不含这段原文
 - candidate 的 `finishMessage`（上游对结束原因的说明）去掉首尾空白后随 finish 事件保留：写进管理日志的 `上游结束说明`，并作为 Gemini 响应的 `finishMessage` 返回
-- candidate 数量不是 1、正文不是 JSON 或 Base64 无效时返回带路径的协议错误；流结束时没有 `finishReason` 同样为协议错误
+- 多于一个 candidate 时取第一个并写一行容错日志（原先按协议错误中止）；正文不是 JSON（含字段类型变化，如用量写成字符串、`thought` 写成 `"true"`，整块失败，见下文）或 Base64 无效时返回带路径的协议错误；流结束时没有 `finishReason` 同样为协议错误。容错规则与日志见[解码容错规则](protocol.md#解码容错规则)
+- 未做的容错（通道目前被官网停用，重新启用前再改）：字段类型变化（`usageMetadata` 的数写成字符串或带小数、`thought` 写成字符串、`executableCode.language` 与 `codeExecutionResult.outcome` 写成数字、`groundingChunkIndices` 写成字符串）仍使整块解码失败；代理响应元素为 `[]` 或只带头部时仍报“代理响应缺少正文”
 
 ### 停止序列、usage 与终态
 
@@ -296,7 +297,7 @@ HTTP 非 200 响应解码为协议错误，保留 HTTP 状态、google.rpc code�
 [null, [7, "The caller does not have permission"]]
 ```
 
-`ProxyStreamedCall` 流尾状态的 code 为 0 表示成功，其他 code 按下表换算 HTTP 状态：
+`ProxyStreamedCall` 流尾状态的 code 为 0 表示成功（流尾为 `null`、`[]` 或 code 为 `null` 时同样按 0：JSON+protobuf 省略了默认值；原先报“流尾状态无效”，内容与完成事件已经解出，最后仍按错误结束），其他 code 按下表换算 HTTP 状态：
 
 | code | HTTP |
 | ---: | ---: |

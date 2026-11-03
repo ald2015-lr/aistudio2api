@@ -3,6 +3,7 @@ package aistudio
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -348,37 +349,33 @@ func validateFunctionCall(call *FunctionCall) error {
 	return nil
 }
 
-func decodeFunctionCall(raw json.RawMessage, path string, evidence json.RawMessage) (FunctionCall, error) {
+// ErrFunctionCallMissingName 表示上游返回的函数调用没有函数名：客户端无法执行这个调用，整次回复按错误结束（对外为 502，说明见 api 包）
+var ErrFunctionCallMissingName = errors.New("上游返回的函数调用缺少函数名，无法交给客户端执行")
+
+// decodeFunctionCall 解码 Part field 11 的函数调用 [name, Struct args, id?]。函数名缺失、为 null、不是字符串或为空串时无法调用，按带
+// ErrFunctionCallMissingName 的协议证据错误返回；参数按 decodeWireStruct 尽量解码（单个参数异常时该参数按 null），整个参数读不出时按 {}；
+// 调用 ID 不是字符串时忽略（之后补发本地 ID）。都写容错日志，不丢掉整次调用
+func decodeFunctionCall(raw json.RawMessage, path string, evidence json.RawMessage, tolerance *decodeTolerance) (FunctionCall, error) {
 	values, err := rawArray(raw, path, evidence)
 	if err != nil {
-		return FunctionCall{}, withMethod(err, "GenerateContent")
+		return FunctionCall{}, withMethod(err, gcMethod)
 	}
-	if len(values) == 0 {
-		return FunctionCall{}, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: "function call 缺少名称", Raw: raw}
-	}
-	name, err := rawString(values[0], path+"[0]", raw)
-	if err != nil {
-		return FunctionCall{}, withMethod(err, "GenerateContent")
+	var name string
+	if json.Unmarshal(rawAt(values, 0), &name) != nil || strings.TrimSpace(name) == "" {
+		return FunctionCall{}, &ProtocolEvidenceError{
+			Method: gcMethod, Path: path + "[0]", Detail: ErrFunctionCallMissingName.Error(), Err: ErrFunctionCallMissingName, Raw: raw,
+		}
 	}
 	arguments := json.RawMessage(`{}`)
 	if argumentsRaw := rawAt(values, 1); !isJSONNull(argumentsRaw) {
-		arguments, err = decodeWireStruct(argumentsRaw, path+"[1]", evidence)
-		if err != nil {
-			return FunctionCall{}, err
-		}
+		arguments = decodeWireStruct(argumentsRaw, path+"[1]", tolerance)
 	}
 	id := ""
-	if idRaw := rawAt(values, 2); !isJSONNull(idRaw) {
-		id, err = rawString(idRaw, path+"[2]", raw)
-		if err != nil {
-			return FunctionCall{}, withMethod(err, "GenerateContent")
-		}
+	if idRaw := rawAt(values, 2); !isJSONNull(idRaw) && json.Unmarshal(idRaw, &id) != nil {
+		id = ""
+		tolerance.note(gcMethod, path+"[2]", "函数调用 ID 不是字符串，已忽略（之后补发本地 ID）", idRaw)
 	}
-	call := FunctionCall{ID: id, Name: name, Arguments: arguments}
-	if err := validateFunctionCall(&call); err != nil {
-		return FunctionCall{}, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: err.Error(), Err: err, Raw: raw}
-	}
-	return call, nil
+	return FunctionCall{ID: id, Name: name, Arguments: arguments}, nil
 }
 
 func encodeWireStructJSON(raw json.RawMessage) ([]any, error) {
@@ -428,122 +425,160 @@ func encodeWireValue(value any) []any {
 	}
 }
 
-func decodeWireStruct(raw json.RawMessage, path string, evidence json.RawMessage) (json.RawMessage, error) {
-	object, err := decodeWireStructObject(raw, path, evidence)
+// decodeWireStruct 把 google.protobuf.Struct 的线格式解码为 JSON object。尽量按最合理的值解码，不返回错误：Struct 读不出时为 {}，
+// 单个参数异常时该参数按 null（见 decodeWireStructObject 与 decodeWireValue），都写容错日志
+func decodeWireStruct(raw json.RawMessage, path string, tolerance *decodeTolerance) json.RawMessage {
+	encoded, err := json.Marshal(decodeWireStructObject(raw, path, tolerance))
 	if err != nil {
-		return nil, err
+		// 解码出的值只有 JSON 能表示的类型（NaN 与无穷已按 null），这里只是兜底
+		tolerance.note(gcMethod, path, "函数参数无法编码为 JSON，按 {}", toleranceText("%v", err))
+		return json.RawMessage(`{}`)
 	}
-	encoded, err := json.Marshal(object)
-	if err != nil {
-		return nil, fmt.Errorf("编码 function arguments: %w", err)
-	}
-	return encoded, nil
+	return encoded
 }
 
-func decodeWireStructObject(raw json.RawMessage, path string, evidence json.RawMessage) (map[string]any, error) {
-	fields, err := rawArray(raw, path, evidence)
-	if err != nil {
-		return nil, withMethod(err, "GenerateContent")
-	}
+// decodeWireStructObject 解码 Struct [[[key, Value]...]]：不是数组时为空 object；map entry 不是数组、缺少键或键不是字符串时跳过该项；
+// 只有键没有值时该参数为 null，多于两项时只取前两项
+func decodeWireStructObject(raw json.RawMessage, path string, tolerance *decodeTolerance) map[string]any {
 	object := make(map[string]any)
+	fields, err := rawArray(raw, path, raw)
+	if err != nil {
+		tolerance.note(gcMethod, path, "函数参数 Struct 不是数组，按 {}", raw)
+		return object
+	}
 	entriesRaw := rawAt(fields, 0)
 	if isJSONNull(entriesRaw) {
-		return object, nil
+		return object
 	}
-	entries, err := rawArray(entriesRaw, path+"[0]", evidence)
+	entries, err := rawArray(entriesRaw, path+"[0]", raw)
 	if err != nil {
-		return nil, withMethod(err, "GenerateContent")
+		tolerance.note(gcMethod, path+"[0]", "函数参数 Struct 的字段列表不是数组，按 {}", entriesRaw)
+		return object
 	}
 	for index, entryRaw := range entries {
 		entryPath := fmt.Sprintf("%s[0][%d]", path, index)
-		entry, err := rawArray(entryRaw, entryPath, evidence)
-		if err != nil {
-			return nil, withMethod(err, "GenerateContent")
+		entry, err := rawArray(entryRaw, entryPath, raw)
+		if err != nil || len(entry) == 0 {
+			tolerance.note(gcMethod, entryPath, "函数参数的 map entry 不是数组或为空，已跳过", entryRaw)
+			continue
 		}
-		if len(entry) != 2 {
-			return nil, &ProtocolEvidenceError{Method: "GenerateContent", Path: entryPath, Detail: "Struct map entry 字段数量错误", Raw: evidence}
+		var key string
+		if json.Unmarshal(entry[0], &key) != nil || isJSONNull(entry[0]) {
+			tolerance.note(gcMethod, entryPath+"[0]", "函数参数的键不是字符串，已跳过该参数", entry[0])
+			continue
 		}
-		key, err := rawString(entry[0], entryPath+"[0]", evidence)
-		if err != nil {
-			return nil, withMethod(err, "GenerateContent")
+		switch {
+		case len(entry) == 1:
+			tolerance.note(gcMethod, entryPath, "函数参数只有键没有值，按 null", entryRaw)
+			object[key] = nil
+			continue
+		case len(entry) > 2:
+			tolerance.note(gcMethod, entryPath, "函数参数的 map entry 多于两项，只取键与值", entryRaw)
 		}
-		value, err := decodeWireValue(entry[1], entryPath+"[1]", evidence)
-		if err != nil {
-			return nil, err
-		}
-		object[key] = value
+		object[key] = decodeWireValue(entry[1], entryPath+"[1]", tolerance)
 	}
-	return object, nil
+	return object
 }
 
-func decodeWireValue(raw json.RawMessage, path string, evidence json.RawMessage) (any, error) {
-	fields, err := rawArray(raw, path, evidence)
+// decodeWireValue 解码 google.protobuf.Value 的 oneof [null_value, number, string, bool, Struct, ListValue]，按最合理的值解码，不返回错误：
+//   - 一个字段都没有设置（[]、[null]）时按 null；设置了多个时取第一个
+//   - null_value 不论写成 0 还是别的值都是 null
+//   - number 写成字符串时按数字解析，"NaN"、"Infinity" 等 JSON 表示不了的值按 null
+//   - string 写成数字或布尔值时按原文转成字符串，bool 按“非 0、非 false 即为真”
+//   - 读不出时该值按 null
+//
+// 除原本的写法（null 写成 [0]，其余各自的类型）外都写容错日志
+func decodeWireValue(raw json.RawMessage, path string, tolerance *decodeTolerance) any {
+	fields, err := rawArray(raw, path, raw)
 	if err != nil {
-		return nil, withMethod(err, "GenerateContent")
+		tolerance.note(gcMethod, path, "函数参数 Value 不是数组，按 null", raw)
+		return nil
 	}
-	variant := -1
-	for index := 0; index < 6; index++ {
-		if !isJSONNull(rawAt(fields, index)) {
-			if variant >= 0 {
-				return nil, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: "Value 同时设置多个 oneof 字段", Raw: evidence}
-			}
+	variant, count := -1, 0
+	for index := 0; index < 6 && index < len(fields); index++ {
+		if isJSONNull(fields[index]) {
+			continue
+		}
+		if variant < 0 {
 			variant = index
 		}
+		count++
 	}
+	if variant < 0 {
+		tolerance.note(gcMethod, path, "函数参数 Value 没有设置任何字段，按 null", raw)
+		return nil
+	}
+	if count > 1 {
+		tolerance.note(gcMethod, path, "函数参数 Value 同时设置多个字段，取第一个", raw)
+	}
+	value := fields[variant]
+	valuePath := fmt.Sprintf("%s[%d]", path, variant)
 	switch variant {
 	case 0:
-		code, err := rawInt64(fields[0], path+"[0]", evidence)
-		if err != nil || code != 0 {
-			return nil, &ProtocolEvidenceError{Method: "GenerateContent", Path: path + "[0]", Detail: "null Value 枚举无效", Raw: evidence}
+		if code, err := rawInt64(value, valuePath, raw); err != nil || code != 0 {
+			tolerance.note(gcMethod, valuePath, "函数参数的 null_value 写法不常见，按 null", value)
 		}
-		return nil, nil
+		return nil
 	case 1:
 		var number float64
-		if err := json.Unmarshal(fields[1], &number); err != nil {
-			return nil, &ProtocolEvidenceError{Method: "GenerateContent", Path: path + "[1]", Detail: "number Value 无效", Raw: evidence}
+		if json.Unmarshal(value, &number) == nil {
+			return number
 		}
-		return number, nil
+		var text string
+		if json.Unmarshal(value, &text) == nil {
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
+				tolerance.note(gcMethod, valuePath, "函数参数的数字写成字符串，按数字解析", value)
+				return parsed
+			}
+		}
+		tolerance.note(gcMethod, valuePath, "函数参数的数字无法用 JSON 表示或读不出（如 NaN、Infinity），按 null", value)
+		return nil
 	case 2:
-		value, err := rawString(fields[2], path+"[2]", evidence)
-		if err != nil {
-			return nil, withMethod(err, "GenerateContent")
+		text, converted, ok := lenientText(value)
+		if !ok {
+			tolerance.note(gcMethod, valuePath, "函数参数的字符串读不出，按 null", value)
+			return nil
 		}
-		return value, nil
+		if converted {
+			tolerance.note(gcMethod, valuePath, "函数参数的字符串写成其他类型，按原文转成字符串", value)
+		}
+		return text
 	case 3:
-		value, err := rawBool(fields[3], path+"[3]", evidence)
-		if err != nil {
-			return nil, withMethod(err, "GenerateContent")
+		if flag, err := rawBool(value, valuePath, raw); err == nil {
+			return flag
 		}
-		return value, nil
+		if flag, ok := lenientBool(value); ok {
+			tolerance.note(gcMethod, valuePath, "函数参数的布尔值写法不常见，按非 0 即真处理", value)
+			return flag
+		}
+		tolerance.note(gcMethod, valuePath, "函数参数的布尔值读不出，按 null", value)
+		return nil
 	case 4:
-		return decodeWireStructObject(fields[4], path+"[4]", evidence)
-	case 5:
-		return decodeWireList(fields[5], path+"[5]", evidence)
+		return decodeWireStructObject(value, valuePath, tolerance)
 	default:
-		return nil, &ProtocolEvidenceError{Method: "GenerateContent", Path: path, Detail: "Value 缺少 oneof 字段", Raw: evidence}
+		return decodeWireList(value, valuePath, tolerance)
 	}
 }
 
-func decodeWireList(raw json.RawMessage, path string, evidence json.RawMessage) ([]any, error) {
-	fields, err := rawArray(raw, path, evidence)
+// decodeWireList 解码 ListValue [[Value...]]：不是数组时为空列表，各元素按 decodeWireValue 解码
+func decodeWireList(raw json.RawMessage, path string, tolerance *decodeTolerance) []any {
+	fields, err := rawArray(raw, path, raw)
 	if err != nil {
-		return nil, withMethod(err, "GenerateContent")
+		tolerance.note(gcMethod, path, "函数参数的 ListValue 不是数组，按 []", raw)
+		return []any{}
 	}
 	itemsRaw := rawAt(fields, 0)
 	if isJSONNull(itemsRaw) {
-		return []any{}, nil
+		return []any{}
 	}
-	items, err := rawArray(itemsRaw, path+"[0]", evidence)
+	items, err := rawArray(itemsRaw, path+"[0]", raw)
 	if err != nil {
-		return nil, withMethod(err, "GenerateContent")
+		tolerance.note(gcMethod, path+"[0]", "函数参数的 ListValue 元素列表不是数组，按 []", itemsRaw)
+		return []any{}
 	}
 	values := make([]any, 0, len(items))
 	for index, item := range items {
-		value, err := decodeWireValue(item, fmt.Sprintf("%s[0][%d]", path, index), evidence)
-		if err != nil {
-			return nil, err
-		}
-		values = append(values, value)
+		values = append(values, decodeWireValue(item, fmt.Sprintf("%s[0][%d]", path, index), tolerance))
 	}
-	return values, nil
+	return values
 }

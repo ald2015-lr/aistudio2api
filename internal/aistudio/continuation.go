@@ -570,6 +570,8 @@ func (c *Client) decodeLongRounds(
 	}
 	for round := 0; ; round++ {
 		decoder := NewFrameDecoder()
+		// 各轮共用本请求的解码容错记录：同一种容错整个请求只写一行
+		decoder.tolerance = decodeToleranceFrom(ctx)
 		if plan.official {
 			decoder.continuable = true
 			decoder.continueAtMaxTokens = int64(round+1)*continuationRoundTokens < plan.total

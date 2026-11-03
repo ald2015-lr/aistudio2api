@@ -157,25 +157,29 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 	if err != nil {
 		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: err.Error(), Err: err}
 	}
-	if delimiter, ok := fieldStart.(json.Delim); !ok || delimiter != '[' {
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 不是 repeated 数组"}
-	}
-	index := 0
-	for decoder.More() {
-		var raw json.RawMessage
-		if err := decoder.Decode(&raw); err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error(), Err: err}
+	// field 1 为 null（[null,[code,message]] 这种只有流尾状态的形状）：没有帧，照常读取流尾，流尾是错误时交出上游错误，
+	// 否则由完成帧校验报“流结束前没有完成帧”（原先报“field 1 不是 repeated 数组”，丢掉了流尾的状态码）
+	if fieldStart != nil {
+		if delimiter, ok := fieldStart.(json.Delim); !ok || delimiter != '[' {
+			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 不是 repeated 数组"}
 		}
-		if err := consume(append(json.RawMessage(nil), raw...)); err != nil {
-			return err
+		index := 0
+		for decoder.More() {
+			var raw json.RawMessage
+			if err := decoder.Decode(&raw); err != nil {
+				return &ProtocolEvidenceError{Method: "GenerateContent", Path: fmt.Sprintf("$[0][%d]", index), Detail: err.Error(), Err: err}
+			}
+			if err := consume(append(json.RawMessage(nil), raw...)); err != nil {
+				return err
+			}
+			index++
 		}
-		index++
-	}
-	if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
-		if err != nil {
-			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: err.Error(), Err: err}
+		if token, err := decoder.Token(); err != nil || token != json.Delim(']') {
+			if err != nil {
+				return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: err.Error(), Err: err}
+			}
+			return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 没有正常结束"}
 		}
-		return &ProtocolEvidenceError{Method: "GenerateContent", Path: "$[0]", Detail: "field 1 没有正常结束"}
 	}
 	fieldIndex := 1
 	for decoder.More() {
@@ -209,11 +213,21 @@ func decodeGenerateItems(source io.Reader, consume func(json.RawMessage) error) 
 }
 
 // trailerError 解码流式响应列表之后的 google.rpc 状态 [code, message, details]：code 为 0 时返回 nil，否则按状态码换算的 HTTP 状态
-// 返回带 ErrorInfo 与 RetryInfo 的 RPCError；状态不是数组或缺少状态码时返回协议错误。Playground GenerateContent 与 Build 代理共用
-func trailerError(method string, raw json.RawMessage) error {
+// 返回带 ErrorInfo 与 RetryInfo 的 RPCError。流尾为 null、[] 或状态码为 null（JSON+protobuf 省略了默认值 0）时按 0（成功）处理，
+// 写一行容错日志（tolerance 为 nil 时不写）；状态不是数组或状态码不是整数时返回协议错误。Playground GenerateContent、Build 代理与
+// Interaction 共用
+func trailerError(method string, raw json.RawMessage, tolerance *decodeTolerance) error {
+	if isJSONNull(raw) {
+		tolerance.note(method, "$[1]", "流尾状态为 null，按 0（成功）", raw)
+		return nil
+	}
 	status, err := rawArray(raw, "$[1]", raw)
-	if err != nil || len(status) == 0 {
+	if err != nil {
 		return &ProtocolEvidenceError{Method: method, Path: "$[1]", Detail: "流尾状态无效", Raw: cloneRaw(raw)}
+	}
+	if len(status) == 0 || isJSONNull(status[0]) {
+		tolerance.note(method, "$[1][0]", "流尾状态码省略或为 null，按 0（成功）", raw)
+		return nil
 	}
 	code, err := rawInt64(status[0], "$[1][0]", raw)
 	if err != nil {
@@ -231,7 +245,7 @@ func trailerError(method string, raw json.RawMessage) error {
 }
 
 // playgroundTrailerError 解码 Playground GenerateContent 的流尾：是 google.rpc 状态（数组，第一项为整数状态码）时按 trailerError 处理；
-// null、空数组与其他形状照旧忽略，不因为没见过的流尾让原本正常的回复失败（Build 代理的流尾按 trailerError 严格校验）
+// null、空数组与其他形状照旧忽略，不因为没见过的流尾让原本正常的回复失败
 func playgroundTrailerError(raw json.RawMessage) error {
 	status, err := rawArray(raw, "$[1]", raw)
 	if err != nil || len(status) == 0 {
@@ -240,7 +254,7 @@ func playgroundTrailerError(raw json.RawMessage) error {
 	if _, err := rawInt64(status[0], "$[1][0]", raw); err != nil {
 		return nil
 	}
-	return trailerError("GenerateContent", raw)
+	return trailerError("GenerateContent", raw, nil)
 }
 
 // errMissingFinishFrame 表示生成流正常结束却没有完成帧（FrameDecoder.End、BuildStreamDecoder.End 的错误链上带着它）

@@ -663,6 +663,34 @@ WARN  account@example.com  下游已断开，结束转发 | 阶段=流中 | 已�
 
 运行日志另记一行带栈的 ERROR（`请求处理 panic，已恢复`、`生成请求后台 panic，已恢复` 或 `<步骤>时 panic，已恢复`，字段 `request_id`、`where`、`panic`、`stack`），生成请求的时间线写一行 `<步骤>时发生 panic，已恢复并结束本请求 | 错误=<panic 的值>`，`request.error` 为 `<步骤>时发生 panic（已恢复，栈见运行日志）: <panic 的值>`。处理函数主动中止连接（`http.ErrAbortHandler`）时同样写完请求日志后交给 net/http 断开。
 
+### 解码容错
+
+官网响应里有读不懂、但不影响正文的位置时（字段省略成 `null`、枚举不在表里、引用缺少网址、grounding 出现新的来源类型、函数参数的写法不常见、用量写成带小数的数、多个候选、Build 与 Interaction 的流尾状态码省略等，完整的规则见 [protocol.md](protocol.md#解码容错规则)），本服务跳过这一项或取缺省值继续解码，正文照常交给客户端；原先这些位置按协议证据错误中止整次生成，客户端拿到 500 `An internal error has occurred`。每次容错在运行日志写一行 WARN，同一请求里同一种容错（方法、种类与去掉数组下标的位置都相同）只写一行，换号、重新生成与 `long-` 续写的各轮共用；Live 与 Robotics 会话按会话去重（整个会话的各条消息共用一份，音频分片不逐条刷屏）：
+
+```json
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_42","method":"GenerateContent","path":"$[0][][0][0][6][0][0][2]","kind":"引用条目缺少 URI，已跳过该条目","raw":"[0,10]"}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_42","method":"GenerateContent","path":"$[0][][0][0][7][1][1]","kind":"grounding chunk 的来源类型未知（下标 3），换成占位项","raw":"[null,null,null,[\"https://new.example\"]]"}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_42","method":"GenerateContent","path":"$[0][][2]","kind":"用量不是数组，已丢弃，改用本地估算","raw":"\"broken\""}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_43","method":"CreateInteractionStream","path":"$delta[1][7]","kind":"未识别的 content delta 字段（下标 7），已跳过","raw":"[\"new kind\"]"}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_43","method":"CreateInteractionStream","path":"$event[19][0][1]","kind":"最终状态不在表里，已交出内容，按 other 结束","raw":"6"}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_43","method":"CreateInteractionStream","path":"$delta[1][4][0]","kind":"视频 MIME 枚举不是整数，取缺省 MIME video/mp4","raw":"\"VIDEO_MP4\""}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_43","method":"CreateInteractionStream","path":"$event[19][0][12]","kind":"用量无法解码，改用本地估算","raw":"\"broken\""}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_44","method":"ProxyStreamedCall","path":"$[1][0]","kind":"流尾状态码省略或为 null，按 0（成功）","raw":"[]"}
+{"time":"2026-11-03T13:10:48.66Z","level":"WARN","msg":"上游响应解码容错，已继续","request_id":"req_1762175448660000000_45","method":"GenerateContent","path":"$[0][][0][0][1]","kind":"结束原因为空串，按这一帧没有结束原因","raw":"\"\""}
+```
+
+| 字段 | 含义 |
+| --- | --- |
+| `request_id` | 请求 ID，与管理日志的 `request.id` 相同（经 `DecodeGenerateStream` 等直接解码、Live 会话时为空） |
+| `method` | 上游方法：`GenerateContent`（Playground）、`ProxyStreamedCall`（Build）、`CreateInteractionStream`（Omni） |
+| `path` | 第一次出现时的协议位置（`$[0][]` 为某一帧，路径规则同协议证据错误） |
+| `kind` | 容错的种类与处理（中文），按它统计 |
+| `raw` | 该位置的原文，最多 240 字节，超出部分写 `…（共 N 字节）`；先脱敏再截断：每个 JSON 字符串按解码后的值判断（`\n` 换行、`\/` 等转义已还原），去掉空白后 96 个字符以上、全是 Base64 字母的（媒体数据、签名）只写 `"<N 字符>"`；其他字符串里 96 个字符以上的 Base64 字母连续段（data URL 的数据部分、夹在文本或代码里的一段，分行的按换行连成一段）同样换成 `<N 字符>`、其余文字保留，如 `"data:image/png;base64,<480 字符>"`。不写媒体数据与提示词 |
+
+经排查路由（`/trace/`）的请求在排查记录的 `notes` 里同样只记一次：`解码容错 | GenerateContent | 位置=$[0][][0][0][6][0][0][2] | 引用条目缺少 URI，已跳过该条目 | 原文=[0,10]`。请求的管理日志（时间线）不写这一行，`/api/status` 不加字段，`request.finished` 照常为成功。
+
+怎么看：偶尔一行不用处理；某种 `kind` 持续出现说明官网改了协议，把这一行（含 `path` 与 `raw`）发给开发者，按新的字段补上解码。正文本身读不出来（正文、代码执行的代码或输出是对象或数组，帧、候选或代码执行 part 不是数组，函数调用缺少函数名，媒体数据不是 Base64）时仍按错误结束，`request.error` 带 `AI Studio <方法> 协议位置 …`；函数调用缺少函数名时为 `… 上游返回的函数调用缺少函数名，无法交给客户端执行`，对外 502 `The model returned a function call without a function name, so it cannot be executed. Please retry.`（原先为 500 通用措辞），不重新生成。
+
 ## 排队等待
 
 生成请求在选号时没有立即可用的账号或 Worker 就排队等待。一次尝试排队满 2 秒仍没有取得账号时，请求时间线写一条 INFO `排队等待`；之后仍在等待的，每个请求最多每 15 秒写一条 WARN。很快取得账号的请求不写。重复的 WARN 全进程限流：每秒最多 2 条，最多攒 30 条；被省略的条数在下一次放行时另写一条服务日志 `排队进度日志已省略 N 条`，不写进任何请求的时间线。主用模型（按请求的号池命中 `PRIMARY_MODELS` 或 `ULTRA_PRIMARY_MODELS`）因容量原因排队时不写这一行，超过排队上限时只写 `主用模型排队超过 Xs，立即返回 429`；普通号池的主用模型在候选全部冷却时的等待不受上限限制，照常写；Ultra 主用模型不等待冷却，写下一节的进度。不等待的选号（流式优先 Playground 的第一步）不写。

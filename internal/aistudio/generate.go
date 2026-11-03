@@ -613,6 +613,8 @@ func speakerSegments(part Part, pattern *regexp.Regexp) []Part {
 }
 
 func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
+	// 解码容错同一种只写一行：app 层按请求挂（换号的各次尝试共用），没有挂时这次 Generate 内的重新生成与续写各轮共用一个
+	ctx = ContextWithDecodeTolerance(ctx, request.ID)
 	lease, leased := AccountLeaseFromContext(ctx)
 	build := leased && lease.Channel() == ChannelBuild
 	var entry modelEntry
@@ -994,6 +996,7 @@ func (c *Client) sendPlayground(
 		}, nil
 	}
 	decoder := NewFrameDecoder()
+	decoder.tolerance = decodeToleranceFrom(ctx)
 	return response, func(source io.Reader, emit func(Event) error) error {
 		if err := DecodeGenerateStream(source, decoder, emit); err != nil {
 			return err
@@ -1002,9 +1005,10 @@ func (c *Client) sendPlayground(
 	}, nil
 }
 
-// DecodeGenerateStream 按网络到达顺序解码 GenerateContent repeated 帧
+// DecodeGenerateStream 按网络到达顺序解码 GenerateContent repeated 帧。流正常结束（流尾不是错误）时，只出现过读不出的结束原因的流在最后
+// 按 unspecified 结束（见 FrameDecoder.flushPendingFinish）
 func DecodeGenerateStream(source io.Reader, decoder *FrameDecoder, emit func(Event) error) error {
-	return decodeGenerateItems(source, func(raw json.RawMessage) error {
+	if err := decodeGenerateItems(source, func(raw json.RawMessage) error {
 		events, err := decoder.Decode(raw)
 		if err != nil {
 			return err
@@ -1015,7 +1019,15 @@ func DecodeGenerateStream(source io.Reader, decoder *FrameDecoder, emit func(Eve
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	for _, event := range decoder.flushPendingFinish() {
+		if err := emit(event); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // applyOutputFloor 客户端设置的最大输出低于下限时提高到下限，且不超过模型上限。

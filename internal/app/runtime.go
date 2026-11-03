@@ -4489,6 +4489,8 @@ func (service *trackedService) generateWithRetry(
 	trace := aistudio.TraceFromContext(requestCtx)
 	// regenerations 为本请求剩余的同账号重新生成次数（客户端还没收到内容时，见 aistudio/regenerate.go），各次尝试共用：换号后不再各来一轮
 	regenerations := aistudio.NewRegenerationBudget()
+	// 解码上游响应时的容错（跳过空帧、取缺省枚举、丢掉读不出的引用等）同一种每个请求只写一行运行日志与排查记录，各次尝试共用
+	requestCtx = aistudio.ContextWithDecodeTolerance(requestCtx, request.ID)
 	var lease *aistudio.AccountLease
 	var source <-chan aistudio.Event
 	// finishAttempt 为成功尝试的上下文取消函数，事件流转发结束后调用

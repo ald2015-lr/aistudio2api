@@ -347,8 +347,13 @@ func EncodeBidiToolResponseRequest(results []FunctionResult) ([]byte, string, er
 	return body, results[0].ID, nil
 }
 
-// ParseBidiServerPayload 解码一条 WebChannel 业务 payload
+// ParseBidiServerPayload 解码一条 WebChannel 业务 payload（容错只在这一条 payload 内去重；会话内按会话去重的见 BidiSession）
 func ParseBidiServerPayload(raw json.RawMessage) ([]BidiEvent, error) {
+	return parseBidiServerPayload(raw, newDecodeTolerance(nil, ""))
+}
+
+// parseBidiServerPayload 为 ParseBidiServerPayload 的实现，容错写进 tolerance：Live 会话传会话的容错记录，同一种容错整个会话只写一行
+func parseBidiServerPayload(raw json.RawMessage, tolerance *decodeTolerance) ([]BidiEvent, error) {
 	if event, matched, err := parseBidiStatusPayload(raw); matched {
 		if err != nil {
 			return nil, err
@@ -377,7 +382,7 @@ func ParseBidiServerPayload(raw json.RawMessage) ([]BidiEvent, error) {
 		if err != nil {
 			return nil, withBidiMethod(err)
 		}
-		decoded, err := parseBidiServerMessage(message, messageRaw)
+		decoded, err := parseBidiServerMessage(message, messageRaw, tolerance)
 		if err != nil {
 			return nil, err
 		}
@@ -448,7 +453,7 @@ func parseBidiStatusPayload(raw json.RawMessage) (BidiEvent, bool, error) {
 	}, true, nil
 }
 
-func parseBidiServerMessage(message []json.RawMessage, evidence json.RawMessage) ([]BidiEvent, error) {
+func parseBidiServerMessage(message []json.RawMessage, evidence json.RawMessage, tolerance *decodeTolerance) ([]BidiEvent, error) {
 	events := make([]BidiEvent, 0, 4)
 	if setup := rawAt(message, 1); !isJSONNull(setup) {
 		if _, err := rawArray(setup, "$message[1]", evidence); err != nil {
@@ -457,14 +462,14 @@ func parseBidiServerMessage(message []json.RawMessage, evidence json.RawMessage)
 		events = append(events, BidiEvent{Kind: BidiEventSetupComplete})
 	}
 	if serverContent := rawAt(message, 2); !isJSONNull(serverContent) {
-		decoded, err := parseBidiServerContent(serverContent, evidence)
+		decoded, err := parseBidiServerContent(serverContent, evidence, tolerance)
 		if err != nil {
 			return nil, err
 		}
 		events = append(events, decoded...)
 	}
 	if toolCall := rawAt(message, 3); !isJSONNull(toolCall) {
-		decoded, err := parseBidiToolCalls(toolCall, evidence)
+		decoded, err := parseBidiToolCalls(toolCall, evidence, tolerance)
 		if err != nil {
 			return nil, err
 		}
@@ -496,7 +501,7 @@ func parseBidiServerMessage(message []json.RawMessage, evidence json.RawMessage)
 	return events, nil
 }
 
-func parseBidiToolCalls(raw json.RawMessage, evidence json.RawMessage) ([]BidiEvent, error) {
+func parseBidiToolCalls(raw json.RawMessage, evidence json.RawMessage, tolerance *decodeTolerance) ([]BidiEvent, error) {
 	values, err := rawArray(raw, "$message[3]", evidence)
 	if err != nil {
 		return nil, withBidiMethod(err)
@@ -519,7 +524,7 @@ func parseBidiToolCalls(raw json.RawMessage, evidence json.RawMessage) ([]BidiEv
 	events := make([]BidiEvent, 0, len(calls))
 	for index, callRaw := range calls {
 		path := fmt.Sprintf("$message[3][1][%d]", index)
-		call, err := decodeFunctionCall(callRaw, path, evidence)
+		call, err := decodeFunctionCall(callRaw, path, evidence, tolerance)
 		if err != nil {
 			return nil, withBidiMethod(err)
 		}
@@ -570,14 +575,14 @@ func parseBidiToolCallCancellation(raw json.RawMessage, evidence json.RawMessage
 	return BidiEvent{Kind: BidiEventToolCallCancellation, ToolCallIDs: ids}, nil
 }
 
-func parseBidiServerContent(raw json.RawMessage, evidence json.RawMessage) ([]BidiEvent, error) {
+func parseBidiServerContent(raw json.RawMessage, evidence json.RawMessage, tolerance *decodeTolerance) ([]BidiEvent, error) {
 	content, err := rawArray(raw, "$message[2]", evidence)
 	if err != nil {
 		return nil, withBidiMethod(err)
 	}
 	events := make([]BidiEvent, 0, 6)
 	if modelContent := rawAt(content, 0); !isJSONNull(modelContent) {
-		decoded, err := parseBidiContent(modelContent, evidence)
+		decoded, err := parseBidiContent(modelContent, evidence, tolerance)
 		if err != nil {
 			return nil, err
 		}
@@ -629,7 +634,8 @@ func parseBidiServerContent(raw json.RawMessage, evidence json.RawMessage) ([]Bi
 	return events, nil
 }
 
-func parseBidiContent(raw json.RawMessage, evidence json.RawMessage) ([]BidiEvent, error) {
+// parseBidiContent 用 Playground 的 Part 解码规则解码 Live 的 model content；容错写进会话的 tolerance，inline media 没有 MIME 时保留为空
+func parseBidiContent(raw json.RawMessage, evidence json.RawMessage, tolerance *decodeTolerance) ([]BidiEvent, error) {
 	content, err := rawArray(raw, "$message[2][0]", evidence)
 	if err != nil {
 		return nil, withBidiMethod(err)
@@ -642,7 +648,7 @@ func parseBidiContent(raw json.RawMessage, evidence json.RawMessage) ([]BidiEven
 	if err != nil {
 		return nil, withBidiMethod(err)
 	}
-	decoder := NewFrameDecoder()
+	decoder := &FrameDecoder{tolerance: tolerance, live: true}
 	events := make([]BidiEvent, 0, len(parts))
 	for index, partRaw := range parts {
 		decoded, err := decoder.decodePart(partRaw, fmt.Sprintf("$message[2][0][0][%d]", index), evidence)

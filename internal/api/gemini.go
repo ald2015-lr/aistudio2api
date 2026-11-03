@@ -1257,11 +1257,15 @@ func geminiSignaturePart(signature string) map[string]any {
 	return map[string]any{"text": "", "thought": true, "thoughtSignature": signature}
 }
 
+// geminiCodeExecutionResult 输出 codeExecutionResult。Gemini API 只有 outcome 与 output 两个字段：OUTCOME_OK 写 output，其余写 error
+// （本服务一直这样输出）；Output 非空时（outcome 为 null 或不在表里，解码器把文本同时放进 Output 与 Error）也写 output，按标准字段读取的
+// 客户端（new-api 的 Gemini 渠道、google-genai SDK）才读得到这段文本。表内 outcome 的输出不变
 func geminiCodeExecutionResult(result aistudio.CodeExecutionResult) map[string]any {
 	output := map[string]any{"outcome": result.Outcome}
-	if result.Outcome == "OUTCOME_OK" {
+	if result.Outcome == "OUTCOME_OK" || result.Output != "" {
 		output["output"] = result.Output
-	} else {
+	}
+	if result.Outcome != "OUTCOME_OK" && (result.Error != "" || result.Output == "") {
 		output["error"] = result.Error
 	}
 	return output
@@ -1303,6 +1307,19 @@ func geminiGroundingMetadata(metadata aistudio.GroundingMetadata) map[string]any
 				value["text"] = chunk.Text
 				value["placeId"] = chunk.PlaceID
 				chunks = append(chunks, map[string]any{"maps": value})
+			case "image":
+				// 图片来源（Gemini API 的 GroundingChunk.Image）：sourceUri 为图片所在网页
+				image := map[string]any{"sourceUri": chunk.URI}
+				if chunk.Title != "" {
+					image["title"] = chunk.Title
+				}
+				if chunk.Domain != "" {
+					image["domain"] = chunk.Domain
+				}
+				chunks = append(chunks, map[string]any{"image": image})
+			default:
+				// 读不出来源的占位项（unknown）与没见过的来源：写空对象占住位置，groundingChunkIndices 照常对齐
+				chunks = append(chunks, map[string]any{})
 			}
 		}
 		output["groundingChunks"] = chunks
