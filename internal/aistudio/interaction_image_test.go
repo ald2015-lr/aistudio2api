@@ -11,6 +11,7 @@ import (
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -114,8 +115,8 @@ const omniDefaultVideo = `[null,null,null,null,null,1]`
 
 // TestInteractionImageOfficialCapture 按官网抓包的结构逐字节核对：用户附一张图片、输入“随机视频”（图片在前、文本在后）时，PNG 内联为
 // Content field 2 [1, Base64]、JPEG 为 [2, Base64]（原文件字节，image/jpg、image/pjpeg 等别名与大小写不同的 MIME 相同），没有 Drive 引用；
-// JPEG 那份另设了 10 秒时长。视频为 Drive 文件引用（Content field 9），文本“分析视频”。图片数据与文件 ID 不参与 binding；
-// PrepareInteractionImages 不改动 PNG、JPEG
+// JPEG 那份另设了 10 秒时长。视频为 Drive 文件引用（Content field 9），文本“分析视频”。请求体与 OMNI_IMAGE_BINDING 无关；文件 ID 不参与
+// binding，图片数据只在开关开启时参与（按 GenerateContent 的写法）；PrepareInteractionImages 不改动 PNG、JPEG
 func TestInteractionImageOfficialCapture(t *testing.T) {
 	pngData, jpegData := omniTestPNG(t), omniTestJPEG(t)
 	encode := base64.StdEncoding.EncodeToString
@@ -164,16 +165,32 @@ func TestInteractionImageOfficialCapture(t *testing.T) {
 				t.Fatal("没有要转换的图片时应原样返回内容")
 			}
 			request := GenerateRequest{Model: "gemini-omni-1.1-flash", Contents: prepared, Config: GenerationConfig{VideoConfig: test.video}}
-			body, binding, err := EncodeCreateInteractionStreamRequest(request, omniTestDefaults())
-			if err != nil {
-				t.Fatal(err)
+			// 请求体与 OMNI_IMAGE_BINDING 无关、与官网抓包逐字节相同；关闭时 binding 只含文本（与 a574e64 相同），开启时图片按请求体里的
+			// 位置（图片在前、文本在后）以 base64 原数据计入；Drive 文件 ID 两种情况都不计入
+			for _, imageBinding := range []bool{false, true} {
+				body, binding, err := EncodeCreateInteractionStreamRequestBinding(request, omniTestDefaults(), imageBinding)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(body) != test.want {
+					t.Fatalf("开关=%v 请求体与官网抓包结构不一致:\n得到 %s\n期望 %s", imageBinding, body, test.want)
+				}
+				encodedBinding, _ := json.Marshal(binding)
+				if want := `[{"role":"user","parts":[{"text":"` + test.parts[1].Text + `"}]}]`; !imageBinding && string(encodedBinding) != want {
+					t.Fatalf("关闭时 binding = %s，期望 %s", encodedBinding, want)
+				}
+				wantPrompt := test.parts[1].Text
+				if image := test.parts[0].InlineData; imageBinding && image != nil {
+					wantPrompt = encode(image.Data) + " " + wantPrompt
+				}
+				if prompt, err := bindingPrompt(GenerateRequest{Contents: binding}); err != nil || prompt != wantPrompt {
+					t.Fatalf("开关=%v bindingPrompt = %q，期望 %q（err=%v）", imageBinding, prompt, wantPrompt, err)
+				}
 			}
-			if string(body) != test.want {
-				t.Fatalf("请求体与官网抓包结构不一致:\n得到 %s\n期望 %s", body, test.want)
-			}
-			encodedBinding, _ := json.Marshal(binding)
-			if want := `[{"role":"user","parts":[{"text":"` + test.parts[1].Text + `"}]}]`; string(encodedBinding) != want {
-				t.Fatalf("binding = %s，期望 %s", encodedBinding, want)
+			// 不带开关的编码按默认开启
+			_, onBinding, _ := EncodeCreateInteractionStreamRequestBinding(request, omniTestDefaults(), true)
+			if _, binding, err := EncodeCreateInteractionStreamRequest(request, omniTestDefaults()); err != nil || !reflect.DeepEqual(binding, onBinding) {
+				t.Fatalf("EncodeCreateInteractionStreamRequest 应按默认开启: %+v err=%v", binding, err)
 			}
 		})
 	}
@@ -415,7 +432,8 @@ func TestPrepareInteractionImagesProtocolGIF(t *testing.T) {
 }
 
 // TestInteractionHistoryImagesInline 模型历史里的图片（回传的生成图片、从本服务链接恢复的图片）连同说明移到随后的用户 step 最前面，
-// PNG、JPEG 与用户附件一样内联为 Content field 2（不需要 Drive）；用户 step 里的 part 按客户端给的顺序编码；图片数据不参与 binding
+// PNG、JPEG 与用户附件一样内联为 Content field 2（不需要 Drive）；用户 step 里的 part 按客户端给的顺序编码；OMNI_IMAGE_BINDING 关闭时
+// 图片数据不参与 binding（与 a574e64 相同），开启时按请求体里的位置参与
 func TestInteractionHistoryImagesInline(t *testing.T) {
 	pngData, jpegData := omniTestPNG(t), omniTestJPEG(t)
 	encode := base64.StdEncoding.EncodeToString
@@ -428,7 +446,7 @@ func TestInteractionHistoryImagesInline(t *testing.T) {
 		}},
 		{Role: RoleUser, Parts: []Part{{Text: "先看这张"}, {InlineData: &Blob{MIME: "image/jpeg", Data: jpegData}}, {Text: "再动起来"}}},
 	}
-	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents)
+	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents, false)
 	if err != nil || !hasModelTurn {
 		t.Fatalf("hasModelTurn=%v err=%v", hasModelTurn, err)
 	}
@@ -443,6 +461,18 @@ func TestInteractionHistoryImagesInline(t *testing.T) {
 		`{"role":"user","parts":[{"text":"` + interactionModelMediaIntro + `"},{"text":"先看这张"},{"text":"再动起来"}]}]`
 	if string(encodedBinding) != wantBinding {
 		t.Fatalf("binding = %s\n期望 %s", encodedBinding, wantBinding)
+	}
+	// OMNI_IMAGE_BINDING 开启：请求体不变，移过去的图片按 step 里的位置（说明之后、随后用户消息的文本之前）与用户附件一起计入 binding
+	onSteps, onBinding, _, err := encodeInteractionSteps(contents, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onEncoded, _ := json.Marshal(onSteps); string(onEncoded) != want {
+		t.Fatalf("开关开启时请求体应不变: %s", onEncoded)
+	}
+	wantPrompt := strings.Join([]string{"画两张", "好了", interactionModelMediaIntro, encode(pngData), encode(jpegData), "先看这张", encode(jpegData), "再动起来"}, " ")
+	if prompt, err := bindingPrompt(GenerateRequest{Contents: onBinding}); err != nil || prompt != wantPrompt {
+		t.Fatalf("开关开启时 bindingPrompt = %q\n期望 %q（err=%v）", prompt, wantPrompt, err)
 	}
 }
 

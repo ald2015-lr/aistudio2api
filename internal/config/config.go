@@ -93,6 +93,7 @@ var configKeys = [...]string{
 	"MEDIA_RETENTION",
 	"MEDIA_MAX_SIZE",
 	"OMNI_IGNORE_SYSTEM_PROMPT",
+	"OMNI_IMAGE_BINDING",
 	"AUTO_START",
 	"REQUEST_BODY_LOG",
 	"ADMIN_PASSWORD",
@@ -174,6 +175,10 @@ type Config struct {
 	// 聊天客户端（如 Chatbox）每次都自动加 “You are a helpful assistant.” 一类的系统提示，Omni 带上它时只回一段文字、说自己无法生成视频；
 	// 关闭时与原先完全一致，其他模型不受影响
 	OmniIgnoreSystemPrompt bool `json:"omni_ignore_system_prompt"`
+	// OmniImageBinding 为视频模型带图校验值（OMNI_IMAGE_BINDING，默认开启，保存后立即生效）：发给 Interaction 模型（gemini-omni）、
+	// 请求体里有内联图片的请求，把这些图片按 GenerateContent 的写法（base64 原数据，按它在 step 里的位置）计入 WAA binding；
+	// 关闭时 binding 只含文本（与原先逐字节相同）。纯文字请求、Drive 文件引用与其他模型不受影响（见 aistudio/interaction_binding.go）
+	OmniImageBinding bool `json:"omni_image_binding"`
 	// UltraExclusive 为真（默认）时 Ultra 号池的账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 号池的账户
 	UltraExclusive bool `json:"ultra_exclusive"`
 	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
@@ -224,6 +229,7 @@ func Default() Config {
 		UltraIncludePro:        false,
 		StreamDataHeartbeat:    true,
 		OmniIgnoreSystemPrompt: true,
+		OmniImageBinding:       true,
 		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
@@ -354,6 +360,7 @@ func Load(path string) (Config, error) {
 	duration("ULTRA_PRIMARY_QUEUE_WAIT", true, parseOptionalDuration, &cfg.UltraPrimaryQueueWait)
 	boolean("STREAM_DATA_HEARTBEAT", true, &cfg.StreamDataHeartbeat)
 	boolean("OMNI_IGNORE_SYSTEM_PROMPT", true, &cfg.OmniIgnoreSystemPrompt)
+	boolean("OMNI_IMAGE_BINDING", true, &cfg.OmniImageBinding)
 	// TEMPORARY_CHAT 决定 Worker 打开的官网页面（预热页带不带 &temporary=true、预热提示词会不会自动保存进账号历史）：
 	// 写错时启动即报错，不悄悄按 false 打开普通对话页
 	if err := loader.field("TEMPORARY_CHAT", false, parseBool("TEMPORARY_CHAT", &cfg.TemporaryChat)); err != nil {
@@ -475,6 +482,7 @@ func (c Config) save(path string, kept map[string]string) error {
 		values[key] = value
 	}
 	values["OMNI_IGNORE_SYSTEM_PROMPT"] = strconv.FormatBool(c.OmniIgnoreSystemPrompt)
+	values["OMNI_IMAGE_BINDING"] = strconv.FormatBool(c.OmniImageBinding)
 	for key, value := range kept {
 		values[key] = value
 	}
@@ -579,6 +587,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt bool              `json:"omni_ignore_system_prompt"`
+		OmniImageBinding       bool              `json:"omni_image_binding"`
 		LongOutputEnabled      bool              `json:"long_output_enabled"`
 		LongOutputMaxTokens    int               `json:"long_output_max_tokens"`
 		DowngradeGuard         DowngradeGuard    `json:"downgrade_guard"`
@@ -616,6 +625,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		RepeatPromptNonce:      c.RepeatPromptNonce,
 		MinOutputTokens:        c.MinOutputTokens,
 		OmniIgnoreSystemPrompt: c.OmniIgnoreSystemPrompt,
+		OmniImageBinding:       c.OmniImageBinding,
 		LongOutputEnabled:      c.LongOutputEnabled,
 		LongOutputMaxTokens:    c.LongOutputMaxTokens,
 		DowngradeGuard:         c.DowngradeGuard,
@@ -657,6 +667,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
 		MinOutputTokens        *int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt *bool              `json:"omni_ignore_system_prompt"`
+		OmniImageBinding       *bool              `json:"omni_image_binding"`
 		LongOutputEnabled      *bool              `json:"long_output_enabled"`
 		LongOutputMaxTokens    *int               `json:"long_output_max_tokens"`
 		DowngradeGuard         *DowngradeGuard    `json:"downgrade_guard"`
@@ -676,7 +687,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理；
-	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段、视频模型忽略系统提示字段时按默认开启处理
+	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段、视频模型忽略系统提示字段、视频模型带图校验值字段时
+	// 按默认开启处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
 		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
@@ -736,6 +748,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,
 		MinOutputTokens:        intOrDefault(value.MinOutputTokens, defaultMinOutputTokens),
 		OmniIgnoreSystemPrompt: value.OmniIgnoreSystemPrompt == nil || *value.OmniIgnoreSystemPrompt,
+		OmniImageBinding:       value.OmniImageBinding == nil || *value.OmniImageBinding,
 		LongOutputEnabled:      value.LongOutputEnabled == nil || *value.LongOutputEnabled,
 		LongOutputMaxTokens:    intOrDefault(value.LongOutputMaxTokens, defaultLongOutputMaxTokens),
 		DowngradeGuard:         downgradeGuardOrDefault(value.DowngradeGuard),

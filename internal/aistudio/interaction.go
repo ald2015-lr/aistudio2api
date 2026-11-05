@@ -49,11 +49,19 @@ var interactionStatusHTTP = map[int64]int{
 	14: http.StatusServiceUnavailable, 16: http.StatusUnauthorized,
 }
 
-// EncodeCreateInteractionStreamRequest 编码官网 CreateInteractionStream 请求并返回参与 WAA 绑定的文本内容
+// EncodeCreateInteractionStreamRequest 编码官网 CreateInteractionStream 请求并返回参与 WAA 绑定的内容，binding 按 OMNI_IMAGE_BINDING 的默认值
+// （开启：请求体里的内联图片计入，见 EncodeCreateInteractionStreamRequestBinding）。
 // stop sequences 不发送：没有 CreateInteractionStream 停止序列字段的现场证据（上游 Mag1cFall/AIStudio2API 同样不发送，只在本地匹配正文），
 // 不猜字段号；协议层或 generateInteraction 已清空并在该请求的管理日志记一行（原先整次请求返回参数错误）
 func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults GenerationDefaults) ([]byte, []Content, error) {
-	encoded, err := encodeCreateInteractionStream(request, defaults)
+	return EncodeCreateInteractionStreamRequestBinding(request, defaults, true)
+}
+
+// EncodeCreateInteractionStreamRequestBinding 与 EncodeCreateInteractionStreamRequest 相同，imageBinding 为 OMNI_IMAGE_BINDING：
+// 为真时请求体里的内联图片按 GenerateContent 的写法计入 binding，为假时 binding 只含文本（与 a574e64 相同，见 encodeInteractionSteps）。
+// 请求体与开关无关，逐字节相同
+func EncodeCreateInteractionStreamRequestBinding(request GenerateRequest, defaults GenerationDefaults, imageBinding bool) ([]byte, []Content, error) {
+	encoded, err := encodeCreateInteractionStream(request, defaults, imageBinding)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -61,23 +69,34 @@ func EncodeCreateInteractionStreamRequest(request GenerateRequest, defaults Gene
 }
 
 // interactionEncoding 为编码好的 CreateInteractionStream 请求：请求体、参与 WAA binding 的内容，以及写请求结构摘要用的各部分
-// （input steps、是否多轮、thinking level、max output tokens、视频格式与任务；编辑任务没有视频格式，video 为 nil）
+// （input steps、是否多轮、thinking level、max output tokens、视频格式与任务；编辑任务没有视频格式，video 为 nil；
+// imageBinding 为这次编码时 OMNI_IMAGE_BINDING 的值，bindingImages 为计入 binding 的图片数）
 type interactionEncoding struct {
-	body         []byte
-	binding      []Content
-	steps        []any
-	hasModelTurn bool
-	level        int64
-	maxOutput    int64
-	video        []any
-	task         int64
+	body          []byte
+	binding       []Content
+	steps         []any
+	hasModelTurn  bool
+	level         int64
+	maxOutput     int64
+	video         []any
+	task          int64
+	imageBinding  bool
+	bindingImages int
 }
 
-// encodeCreateInteractionStream 为 EncodeCreateInteractionStreamRequest 的实现，另外返回请求结构摘要要用的各部分
-func encodeCreateInteractionStream(request GenerateRequest, defaults GenerationDefaults) (interactionEncoding, error) {
-	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents)
+// encodeCreateInteractionStream 为 EncodeCreateInteractionStreamRequestBinding 的实现，另外返回请求结构摘要要用的各部分
+func encodeCreateInteractionStream(request GenerateRequest, defaults GenerationDefaults, imageBinding bool) (interactionEncoding, error) {
+	steps, binding, hasModelTurn, err := encodeInteractionSteps(request.Contents, imageBinding)
 	if err != nil {
 		return interactionEncoding{}, err
+	}
+	bindingImages := 0
+	for _, content := range binding {
+		for _, part := range content.Parts {
+			if part.InlineData != nil {
+				bindingImages++
+			}
+		}
 	}
 	level, err := interactionThinkingLevel(request.Config, defaults)
 	if err != nil {
@@ -134,6 +153,7 @@ func encodeCreateInteractionStream(request GenerateRequest, defaults GenerationD
 	}
 	return interactionEncoding{
 		body: body, binding: binding, steps: steps, hasModelTurn: hasModelTurn, level: level, maxOutput: maxOutput, video: video, task: task,
+		imageBinding: imageBinding, bindingImages: bindingImages,
 	}, nil
 }
 
@@ -161,10 +181,15 @@ type interactionStep struct {
 // （与官网相同），视频等上传后为 Drive 引用；没有 Drive 授权、仍是 inline data 的视频与不能内联的图片与用户附件一样返回需要 Drive 授权的
 // 错误，外部地址不接受，不静默丢掉。错误说明为英文，按参数错误原样返回客户端（app 层在发送前已把这类请求交给有 Drive 授权的账号，
 // 外部地址在选号前按 400 返回，这里只是兜底）。binding 不随 step 合并：与合并前、与上游相同，每条编码出 part 的消息一条（以模型消息结尾时
-// 移过去的说明文字另成一条），只含文本（图片数据与文件 ID 不参与，移过去的说明文字参与，放在随后那条用户消息的开头）。bindingPrompt 按
+// 移过去的说明文字另成一条），含文本（移过去的说明文字参与，放在随后那条用户消息的开头），Drive 文件 ID 不参与。bindingPrompt 按
 // 消息处理 YouTube 链接（去掉链接文本、补一个占位，只在同一条消息内去重），合并后两条消息里同一个链接只剩一个占位，参与 WAA proof 的
-// 字符串就变了
-func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) {
+// 字符串就变了。
+// imageBinding 为 OMNI_IMAGE_BINDING（用户特许的唯一例外，只改 Interaction 交给 DoProtected 的 binding 内容）：为真时请求体里内联发送的图片
+// （Content field 2，含 GIF 转成的 PNG、从模型历史移到用户 step 的图片、从本服务链接恢复的图片）按它在 step 里的位置计入 binding，写法与
+// GenerateContent 的 bindingPrompt 相同（InlineData 按 base64.StdEncoding 写出，与请求体里发送的是同一段原字节）；为假时只含文本，与 a574e64
+// 逐字节相同。没有内联图片的请求两者相同。上游 Mag1cFall/AIStudio2API 的 Interaction 从不内联图片（一律要 Drive），只含文本的规则没有在
+// 内联图片时验证过：线上带图请求在多个账户上都被 403 PERMISSION_DENIED 拒绝、纯文字正常，推断官网页面算 proof 时计入了图片
+func encodeInteractionSteps(contents []Content, imageBinding bool) ([]any, []Content, bool, error) {
 	merged := make([]interactionStep, 0, len(contents)+1)
 	binding := make([]Content, 0, len(contents)+1)
 	hasModelTurn := false
@@ -177,32 +202,46 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		}
 		merged = append(merged, interactionStep{model: model, parts: parts})
 	}
-	// flushMedia 编码待移动的模型附件，返回放在用户消息最前面的 part 与参与 binding 的说明文字（图片数据与文件 ID 不参与 binding）
+	// bindingImage 返回内联图片参与 binding 的 part（imageBinding 为假或 part 不是内联图片时为 false）：只带 inline data，
+	// bindingPrompt 按 base64.StdEncoding 写出，与 encodeInteractionAttachment 发送的是同一段原字节
+	bindingImage := func(part Part) (Part, bool) {
+		if !imageBinding || !InteractionInlineImage(part) {
+			return Part{}, false
+		}
+		return Part{InlineData: part.InlineData}, true
+	}
+	// flushMedia 编码待移动的模型附件，返回放在用户消息最前面的 part 与参与 binding 的说明文字（imageBinding 时还有其中的内联图片，
+	// 按发送顺序；文件 ID 不参与 binding）
 	flushMedia := func() ([]any, []Part, error) {
 		if len(pendingMedia) == 0 {
 			return nil, nil, nil
 		}
 		parts := []any{[]any{[]any{interactionModelMediaIntro}}}
+		bound := []Part{{Text: interactionModelMediaIntro}}
 		for _, media := range pendingMedia {
 			encoded, err := encodeInteractionAttachment(media.index, media.part, RoleUser)
 			if err != nil {
 				return nil, nil, err
 			}
 			parts = append(parts, encoded)
+			if image, ok := bindingImage(media.part); ok {
+				bound = append(bound, image)
+			}
 		}
 		pendingMedia = nil
-		return parts, []Part{{Text: interactionModelMediaIntro}}, nil
+		return parts, bound, nil
 	}
 	for index, content := range contents {
 		parts := make([]any, 0, len(content.Parts))
-		texts := make([]Part, 0, len(content.Parts))
+		// bound 为这条消息参与 binding 的 part：文本，imageBinding 时还有内联图片，按发送顺序
+		bound := make([]Part, 0, len(content.Parts))
 		if content.Role == RoleUser {
 			media, intro, err := flushMedia()
 			if err != nil {
 				return nil, nil, false, err
 			}
 			parts = append(parts, media...)
-			texts = append(texts, intro...)
+			bound = append(bound, intro...)
 		}
 		for _, part := range content.Parts {
 			switch {
@@ -210,7 +249,7 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 				continue
 			case part.Text != "" && part.InlineData == nil && part.File == nil && part.FunctionCall == nil && part.FunctionResult == nil:
 				parts = append(parts, []any{[]any{part.Text}})
-				texts = append(texts, Part{Text: part.Text})
+				bound = append(bound, Part{Text: part.Text})
 			case content.Role == RoleAssistant && (part.InlineData != nil || part.File != nil || part.ExternalMedia != nil):
 				pendingMedia = append(pendingMedia, interactionModelMedia{index: index, part: part})
 			default:
@@ -219,6 +258,9 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 					return nil, nil, false, err
 				}
 				parts = append(parts, encoded)
+				if image, ok := bindingImage(part); ok {
+					bound = append(bound, image)
+				}
 			}
 		}
 		if len(parts) == 0 {
@@ -233,7 +275,7 @@ func encodeInteractionSteps(contents []Content) ([]any, []Content, bool, error) 
 		default:
 			return nil, nil, false, fmt.Errorf("contents[%d]: this model does not accept %s messages", index, content.Role)
 		}
-		binding = append(binding, Content{Role: content.Role, Parts: texts})
+		binding = append(binding, Content{Role: content.Role, Parts: bound})
 	}
 	media, intro, err := flushMedia()
 	if err != nil {
@@ -327,19 +369,21 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		ReportRequestNote(ctx, InteractionStopSequencesNote(count))
 		request.Config.StopSequences = nil
 	}
-	encoded, err := encodeCreateInteractionStream(request, entry.defaults)
+	// OMNI_IMAGE_BINDING：app 层每次尝试按当前设置挂在 ctx 上（保存后下一个请求立即按新值），没有挂时按默认开启；只改交给 DoProtected 的
+	// binding 内容，请求体不变
+	encoded, err := encodeCreateInteractionStream(request, entry.defaults, InteractionImageBindingFromContext(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 	}
-	// 请求结构摘要（各 step 的 part 种类、图片格式与字节数、Drive 引用、视频设置等，不含提示词正文与图片数据）写进该请求的管理日志，
-	// 上游返回笼统的 400 时与官网抓包逐项对照
+	// 请求结构摘要（各 step 的 part 种类、图片格式与字节数、Drive 引用、binding 是否计入图片、视频设置等，不含提示词正文与图片数据）写进
+	// 该请求的管理日志，上游返回笼统的 400 或带图请求返回 403 时与官网抓包逐项对照
 	ReportRequestInfo(ctx, encoded.summary(request))
 	rpc := newRPCRequest("CreateInteractionStream", request.AccountID, request.ID, encoded.body, true)
 	c.applyBenefitTier(rpc.Method, request.AccountID, rpc.Header)
 	bindingRequest := request
 	bindingRequest.Contents = encoded.binding
 	// 经排查路由（/trace/）的请求与 GenerateContent 一样记下发往上游的请求体与上游原始响应的开头（含错误响应：在读出错误之前接上），
-	// 另记 binding 的字节数与 sha256（只是证据，binding 的组成不变），便于与官网页面算 proof 时的输入对照
+	// 另记 binding 的字节数与 sha256（只是证据，不改 binding 的组成；是否计入图片见请求结构摘要），便于与官网页面算 proof 时的输入对照
 	trace := TraceFromContext(ctx)
 	trace.RecordRequest(rpc.Method, rpc.URL, encoded.body)
 	if trace != nil {

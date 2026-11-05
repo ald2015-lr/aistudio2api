@@ -19,7 +19,7 @@ func TestInteractionMovesModelAttachments(t *testing.T) {
 		{Role: RoleAssistant, Parts: []Part{{Text: "第二张"}, {File: &FileRef{ID: "drive-model-3"}}}},
 		{Role: RoleUser, Parts: []Part{{Text: "让它动起来"}}},
 	}
-	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents)
+	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents, false)
 	if err != nil {
 		t.Fatalf("模型消息里的 Drive 附件不应让请求失败: %v", err)
 	}
@@ -47,7 +47,7 @@ func TestInteractionMovesModelAttachments(t *testing.T) {
 	steps, binding, hasModelTurn, err = encodeInteractionSteps([]Content{
 		{Role: RoleUser, Parts: []Part{{Text: "画"}}},
 		{Role: RoleAssistant, Parts: []Part{{Text: "好了"}, {File: &FileRef{ID: "drive-last"}}}},
-	})
+	}, false)
 	encoded, _ = json.Marshal(steps)
 	if err != nil || !hasModelTurn || string(encoded) != `[[[[[["画"]]]]],[null,[[[["好了"]]]]],[[[`+intro+`,`+file("drive-last")+`]]]]` {
 		t.Fatalf("结尾的模型附件应单独成一条用户 step: steps=%s hasModelTurn=%v err=%v", encoded, hasModelTurn, err)
@@ -60,7 +60,7 @@ func TestInteractionMovesModelAttachments(t *testing.T) {
 	steps, binding, hasModelTurn, err = encodeInteractionSteps([]Content{
 		{Role: RoleUser, Parts: []Part{{Text: "画"}}},
 		{Role: RoleAssistant, Parts: []Part{{File: &FileRef{ID: "drive-last"}}}},
-	})
+	}, false)
 	encoded, _ = json.Marshal(steps)
 	if err != nil || hasModelTurn || string(encoded) != `[[[[[["画"]],`+intro+`,`+file("drive-last")+`]]]]` {
 		t.Fatalf("结尾的模型附件应并入前一条用户 step: steps=%s hasModelTurn=%v err=%v", encoded, hasModelTurn, err)
@@ -87,7 +87,7 @@ func TestInteractionMergesAdjacentSteps(t *testing.T) {
 		{Role: RoleAssistant, Parts: []Part{{File: &FileRef{ID: "drive-only"}}}},
 		{Role: RoleUser, Parts: []Part{{Text: "第四句"}}},
 	}
-	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents)
+	steps, binding, hasModelTurn, err := encodeInteractionSteps(contents, false)
 	if err != nil || !hasModelTurn {
 		t.Fatalf("hasModelTurn=%v err=%v", hasModelTurn, err)
 	}
@@ -120,7 +120,7 @@ func TestInteractionMergesAdjacentSteps(t *testing.T) {
 		{Role: RoleUser, Parts: []Part{{Text: "看 " + video}}},
 		{Role: RoleUser, Parts: []Part{{Text: "再看 " + video}}},
 	}
-	steps, binding, _, err = encodeInteractionSteps(youtube)
+	steps, binding, _, err = encodeInteractionSteps(youtube, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestInteractionMergesAdjacentSteps(t *testing.T) {
 	steps, _, hasModelTurn, err = encodeInteractionSteps([]Content{
 		{Role: RoleUser, Parts: []Part{{Text: "参考这张"}}},
 		{Role: RoleUser, Parts: []Part{{Text: "生成视频"}}},
-	})
+	}, false)
 	encoded, _ = json.Marshal(steps)
 	if err != nil || hasModelTurn || string(encoded) != `[[[[[["参考这张"]],[["生成视频"]]]]]]` {
 		t.Fatalf("连续用户消息: steps=%s hasModelTurn=%v err=%v", encoded, hasModelTurn, err)
@@ -170,7 +170,7 @@ func TestInteractionModelAttachmentErrorsEnglish(t *testing.T) {
 		{{Role: Role("system"), Parts: []Part{{Text: "x"}}}},
 		{},
 	} {
-		_, _, _, err := encodeInteractionSteps(contents)
+		_, _, _, err := encodeInteractionSteps(contents, false)
 		if err == nil {
 			t.Fatalf("%+v 应返回错误", contents)
 		}
@@ -236,7 +236,7 @@ func TestInteractionModelAttachmentErrors(t *testing.T) {
 			want: "contents[1]: this model only accepts inline or uploaded image and video input; external URLs are not supported",
 		},
 	} {
-		_, _, _, err := encodeInteractionSteps(test.contents)
+		_, _, _, err := encodeInteractionSteps(test.contents, false)
 		if err == nil || !strings.Contains(err.Error(), test.want) {
 			t.Fatalf("%s: 期望错误含 %q，实际 %v", test.name, test.want, err)
 		}

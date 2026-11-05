@@ -69,7 +69,8 @@ func noteWith(notes []string, fragment string) string {
 
 // TestGenerateInteractionTrace 经排查路由（/trace/）的 Interaction 请求与 GenerateContent 一样记下发往上游的 CreateInteractionStream 请求体
 // （URL、方法、请求体与编码结果逐字节相同）与上游原始响应的开头；上游返回 HTTP 400 时错误响应体同样记下（在读出错误之前接上）；
-// 另记 binding 的字节数与 sha256（与只含文本的 binding 一致）与请求结构摘要（没有请求信息观察者时写进 notes）
+// 另记 binding 的字节数与 sha256（OMNI_IMAGE_BINDING 开启时含图片 base64，关闭时只含文本）与请求结构摘要（没有请求信息观察者时写进 notes，
+// 写明校验值是否含图片）；请求体与开关无关
 func TestGenerateInteractionTrace(t *testing.T) {
 	pngData := omniTestPNG(t)
 	request := GenerateRequest{ID: "req-trace", Model: "gemini-omni-1.1-flash", Contents: []Content{
@@ -80,8 +81,14 @@ func TestGenerateInteractionTrace(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := modelEntry{model: omniTestModel(), defaults: omniTestDefaults()}
-	digest := sha256.Sum256([]byte("随机视频"))
-	wantBinding := fmt.Sprintf("CreateInteractionStream binding | 字节=%d | sha256=%s", len("随机视频"), hex.EncodeToString(digest[:]))
+	bindingNote := func(prompt string) string {
+		digest := sha256.Sum256([]byte(prompt))
+		return fmt.Sprintf("CreateInteractionStream binding | 字节=%d | sha256=%s", len(prompt), hex.EncodeToString(digest[:]))
+	}
+	// OMNI_IMAGE_BINDING 开启（默认，没有挂开关时同样）时 binding 为图片 base64 与文本（请求体里图片在前），关闭时只含文本（与 a574e64 相同）
+	textOnly := bindingNote("随机视频")
+	bindingOn, bindingOff := true, false
+	withImage := bindingNote(base64.StdEncoding.EncodeToString(pngData) + " 随机视频")
 
 	interaction := make([]any, 13)
 	interaction[1] = 3
@@ -94,12 +101,17 @@ func TestGenerateInteractionTrace(t *testing.T) {
 	}
 	const rejected = `[3,"Request contains an invalid argument.",[["type.googleapis.com/google.rpc.BadRequest",[[["contents[0].parts[0]","bad image"]]]]]]`
 	for _, test := range []struct {
-		name   string
-		status int
-		body   string
+		name    string
+		status  int
+		body    string
+		binding *bool
+		want    string
+		summary string
 	}{
-		{name: "成功", status: http.StatusOK, body: string(stream)},
-		{name: "上游 400", status: http.StatusBadRequest, body: rejected},
+		{name: "成功", status: http.StatusOK, body: string(stream), want: withImage, summary: "校验值含图片=是（1 张）"},
+		{name: "上游 400", status: http.StatusBadRequest, body: rejected, want: withImage, summary: "校验值含图片=是（1 张）"},
+		{name: "开关开启", status: http.StatusOK, body: string(stream), binding: &bindingOn, want: withImage, summary: "校验值含图片=是（1 张）"},
+		{name: "开关关闭", status: http.StatusOK, body: string(stream), binding: &bindingOff, want: textOnly, summary: "校验值含图片=关闭"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			replay := &interactionReplay{status: test.status, body: test.body}
@@ -109,7 +121,11 @@ func TestGenerateInteractionTrace(t *testing.T) {
 			}
 			trace := NewTrace()
 			trace.StartAttempt("omni@example.com", "playground")
-			events, err := client.generateInteraction(ContextWithTrace(context.Background(), trace), request, entry)
+			ctx := ContextWithTrace(context.Background(), trace)
+			if test.binding != nil {
+				ctx = ContextWithInteractionImageBinding(ctx, *test.binding)
+			}
+			events, err := client.generateInteraction(ctx, request, entry)
 			if test.status == http.StatusOK {
 				if err != nil {
 					t.Fatal(err)
@@ -142,10 +158,11 @@ func TestGenerateInteractionTrace(t *testing.T) {
 			if head := record.Attempts[0].UpstreamHead; head != test.body || record.Attempts[0].UpstreamBytes != int64(len(test.body)) {
 				t.Fatalf("上游原始响应 = %q（%d 字节），期望 %q", head, record.Attempts[0].UpstreamBytes, test.body)
 			}
-			if note := noteWith(record.Notes, "CreateInteractionStream binding"); note != wantBinding {
-				t.Fatalf("binding 说明 = %q，期望 %q；notes=%v", note, wantBinding, record.Notes)
+			if note := noteWith(record.Notes, "CreateInteractionStream binding"); note != test.want {
+				t.Fatalf("binding 说明 = %q，期望 %q；notes=%v", note, test.want, record.Notes)
 			}
-			if note := noteWith(record.Notes, "Interaction 请求结构"); !strings.Contains(note, "step=1（用户[图片 1、文本 1]）") {
+			if note := noteWith(record.Notes, "Interaction 请求结构"); !strings.Contains(note, "step=1（用户[图片 1、文本 1]）") ||
+				!strings.Contains(note, "| "+test.summary+" |") {
 				t.Fatalf("请求结构摘要 = %q", note)
 			}
 		})
@@ -163,10 +180,15 @@ func TestGenerateInteractionSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	entry := modelEntry{model: omniTestModel(), defaults: omniTestDefaults()}
+	// binding 为挂在 context 上的 OMNI_IMAGE_BINDING，nil 时不挂（按默认开启）
+	var binding *bool
 	run := func(request GenerateRequest) (string, []string) {
 		t.Helper()
 		var infos, notes []string
 		ctx := ContextWithRequestInfoObserver(context.Background(), func(message string) { infos = append(infos, message) })
+		if binding != nil {
+			ctx = ContextWithInteractionImageBinding(ctx, *binding)
+		}
 		ctx = ContextWithRequestNoteObserver(ctx, func(note string) { notes = append(notes, note) })
 		if _, err := client.generateInteraction(ctx, request, entry); err == nil || errors.Is(err, ErrInvalidArgument) {
 			t.Fatalf("应发往上游（测试上游返回错误），得到 %v", err)
@@ -182,7 +204,7 @@ func TestGenerateInteractionSummary(t *testing.T) {
 	}, Config: GenerationConfig{VideoConfig: &VideoConfig{DurationSeconds: 10, Task: "image_to_video"}}}
 	summary, notes := run(first)
 	want := fmt.Sprintf("Interaction 请求结构 | 方法=CreateInteractionStream | 模型=models/gemini-omni-1.1-flash | 多轮=否 | step=1（用户[图片 1、文本 1]） | "+
-		"图片=1 张（WebP 1 张 %dB） | Drive 引用=0 | 文本=1 段 12B | 系统指令=无 | 思考等级=4 | 输出上限=65536 | 视频设置=时长 10s、任务 image_to_video | "+
+		"图片=1 张（WebP 1 张 %dB） | Drive 引用=0 | 校验值含图片=是（1 张） | 文本=1 段 12B | 系统指令=无 | 思考等级=4 | 输出上限=65536 | 视频设置=时长 10s、任务 image_to_video | "+
 		"视频格式=[null,null,null,null,[10],1] | 任务=image_to_video（2） | 请求体=%dB", len(omniTestWebP), len(capture.bodies[0]))
 	if summary != want || len(notes) != 0 {
 		t.Fatalf("第一轮摘要 =\n%s\n期望\n%s\n说明 %v", summary, want, notes)
@@ -196,7 +218,7 @@ func TestGenerateInteractionSummary(t *testing.T) {
 	}}
 	summary, _ = run(multi)
 	want = fmt.Sprintf("Interaction 请求结构 | 方法=CreateInteractionStream | 模型=models/gemini-omni-1.1-flash | 多轮=是 | "+
-		"step=3（用户[文本 1] 模型[文本 1] 用户[说明 1、图片 1、Drive 1、文本 1]） | 图片=1 张（PNG 1 张 %dB） | Drive 引用=1 | 文本=3 段 27B | "+
+		"step=3（用户[文本 1] 模型[文本 1] 用户[说明 1、图片 1、Drive 1、文本 1]） | 图片=1 张（PNG 1 张 %dB） | Drive 引用=1 | 校验值含图片=是（1 张） | 文本=3 段 27B | "+
 		"系统指令=有 | 思考等级=4 | 输出上限=65536 | 视频设置=未设置 | 视频格式=[null,null,null,null,null,1] | 任务=未指定 | 请求体=%dB",
 		len(pngData), len(capture.bodies[1]))
 	if summary != want {
@@ -207,6 +229,26 @@ func TestGenerateInteractionSummary(t *testing.T) {
 			t.Fatalf("摘要不应含提示词、系统指令、文件 ID 与图片数据（%q）: %s", secret, summary)
 		}
 	}
+	// 校验值是否含图片：开关关闭为“关闭”，开启时没有内联图片（纯文字、只有 Drive 引用）为“否”，Drive 引用不计入
+	for _, test := range []struct {
+		binding *bool
+		parts   []Part
+		want    string
+	}{
+		{binding: &[]bool{false}[0], parts: []Part{{InlineData: &Blob{MIME: "image/png", Data: pngData}}, {Text: "随机视频"}}, want: "校验值含图片=关闭"},
+		{binding: &[]bool{true}[0], parts: []Part{{InlineData: &Blob{MIME: "image/png", Data: pngData}}, {InlineData: &Blob{MIME: "image/webp", Data: omniTestWebP}}, {Text: "随机视频"}},
+			want: "校验值含图片=是（2 张）"},
+		{binding: &[]bool{true}[0], parts: []Part{{Text: "随机视频"}}, want: "校验值含图片=否"},
+		{binding: &[]bool{false}[0], parts: []Part{{Text: "随机视频"}}, want: "校验值含图片=关闭"},
+		{parts: []Part{{File: &FileRef{ID: "drive-only", MIME: "video/mp4"}}, {Text: "分析视频"}}, want: "校验值含图片=否"},
+	} {
+		binding = test.binding
+		summary, _ := run(GenerateRequest{Model: "gemini-omni-1.1-flash", Contents: []Content{{Role: RoleUser, Parts: test.parts}}})
+		if !strings.Contains(summary, "| "+test.want+" |") {
+			t.Fatalf("摘要应写明 %s: %s", test.want, summary)
+		}
+	}
+	binding = nil
 
 	// part 按发送顺序列出：文本在前、图片在后（new-api 从 OpenAI 格式转换时的常见顺序）与官网抓包的图片在前不同；连续同类合并计数，
 	// 不连续的同类分开列

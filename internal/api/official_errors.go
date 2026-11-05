@@ -114,6 +114,14 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.As(err, &driveRequired) {
 		return publicError{Status: driveRequired.HTTPStatus(), RPC: driveRequired.RPCStatus(), Message: driveRequired.PublicMessage()}
 	}
+	// Interaction 模型（gemini-omni）的带图请求被上游以 HTTP 403 / 协议错误码 7 拒绝、本请求不再换号（见 aistudio.InteractionImageRejectedError）：
+	// 按 400 FAILED_PRECONDITION 返回英文说明（Omni 拒绝了带图请求，可以去掉图片重试）。不按上游的 403 映射成 503：401、403 与
+	// “does not have permission” 一类原文会让 new-api 等中转自动禁用整个渠道，5xx 又会让中转立即换渠道重发同一个带图请求；
+	// 400 不触发自动禁用，中转也不重发，客户端直接看到说明
+	var imageRejected *aistudio.InteractionImageRejectedError
+	if errors.As(err, &imageRejected) {
+		return publicError{Status: imageRejected.HTTPStatus(), RPC: imageRejected.RPCStatus(), Message: imageRejected.PublicMessage()}
+	}
 	// 兜底：Build 的 PROXY_GENERATION_DISABLED（400）不按请求本身的参数错误透给客户端
 	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
 		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialBuildDisabledMessage}

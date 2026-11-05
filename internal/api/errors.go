@@ -112,6 +112,11 @@ func statusFromError(err error) int {
 	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
 		return http.StatusServiceUnavailable
 	}
+	// Omni 带图请求被上游以 403 拒绝、不再换号：与 publicErrorFor 一致按 400，不按里面上游错误的 403
+	var imageRejected *aistudio.InteractionImageRejectedError
+	if errors.As(err, &imageRejected) {
+		return imageRejected.HTTPStatus()
+	}
 	// 号池暂时不可调度（503）与全部冷却（429，经 HTTPStatus）都是服务端原因；
 	// 其余 ErrNoEligibleAccount 表示没有账户能处理该请求，属于请求本身的原因
 	var notReady *aistudio.AccountsNotReadyError

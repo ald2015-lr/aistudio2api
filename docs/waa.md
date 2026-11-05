@@ -34,7 +34,7 @@ WAA（Web Application Attestation）为 AI Studio 的受保护 RPC 提供 BotGua
 | RPC | proof field | binding | 发送方 |
 | --- | ---: | --- | --- |
 | `GenerateContent` | 5 | contents 各 part 以空格连接 | Worker `SendProtected` |
-| `CreateInteractionStream` | 5 | 发送的全部文本以空格连接 | Worker `SendProtected` |
+| `CreateInteractionStream` | 5 | 发送的全部文本以空格连接；`OMNI_IMAGE_BINDING=true`（默认）时内联发送的图片按 `GenerateContent` 的写法（原字节的标准 Base64）在它的位置计入，file ID 不计入（见 [协议规范](protocol.md) 的“带图请求的 binding 与 403”） | Worker `SendProtected` |
 | `ProxyStreamedCall`、`ProxyUnaryCall` | 3 | `<路径> <请求体>` | Worker `SendProtected` |
 | `GenerateVideo` | 8 | 视频提示词 | MakerSuite Go HTTP transport |
 | Bidi setup | 6 | `models/<模型>` 与每个函数的 `名称 描述`，以空格连接 | WebChannel |

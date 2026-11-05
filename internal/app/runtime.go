@@ -142,6 +142,7 @@ func newRuntime(
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
 	service.setLongOutput(cfg.LongOutputEnabled, cfg.LongOutputMaxTokens)
+	service.setOmniImageBinding(cfg.OmniImageBinding)
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	service.setPrimaryModelSettings(cfg.PrimaryModels, cfg.PrimaryQueueWait, cfg.UltraPrimaryModels, cfg.UltraPrimaryQueueWait)
@@ -2669,6 +2670,9 @@ type trackedService struct {
 	// 模型在客户端没有给出输出上限时的输出总上限（LONG_OUTPUT_MAX_TOKENS，可热更新），见 long_output.go
 	longOutputEnabled   atomic.Bool
 	longOutputMaxTokens atomic.Int64
+	// omniImageBindingOff 为真时 OMNI_IMAGE_BINDING 关闭（可热更新）：Interaction 带图请求的 binding 只含文本，与 a574e64 相同；
+	// 按“关闭”存，零值即默认开启，见 omni_image_binding.go
+	omniImageBindingOff atomic.Bool
 	// firstEventTimeout 为每次尝试等待首个上游事件的上限（FIRST_EVENT_TIMEOUT，0 为关闭，可热更新）
 	firstEventTimeout atomic.Int64
 	// downgradeGuard 为降级判定的生效设置（服务配置页修改后立即替换，见 downgrade_guard.go）
@@ -4636,6 +4640,36 @@ func (service *trackedService) generateWithRetry(
 	pauses := service.buildPauses()
 	// authFailures：本请求遇到的登录失效（上游 401 / Code 16、登录页跳转）次数，超过 authFailureSwitchLimit 次换号后不再换号
 	authFailures := 0
+	// imageDenials：带内联图片的 Interaction 请求被上游以 403 拒绝的次数（见 omni_image_binding.go），到 imageDeniedLimit 不再换号；
+	// imageDeniedErr 为最近一次这样的上游错误，imageDeniedImages、imageDeniedBinding 为那次尝试的图片数与 OMNI_IMAGE_BINDING：
+	// 请求以它结束时按 aistudio.InteractionImageRejectedError 对外返回。imageDeniedEnded 为最近一次写的带图 403 日志已写明不再换号：
+	// 写的是“换一个账户再试”却没有换到其他账户就以这个 403 结束时，循环后补写一行（imageDeniedEndNote）
+	imageDenials, imageDeniedLimit := 0, imageDeniedLimitFor(unbound || fileBound)
+	var imageDeniedErr error
+	imageDeniedImages, imageDeniedBinding, imageDeniedEnded := 0, false, false
+	// imageDeniedSwitching：带图 403 的日志写了“换一个账户再试”，之后还没有尝试真正到达上游（见 attemptReachedUpstream）。请求级标志，
+	// 不看 err：中间取得了新租约、却没有向上游发出（账号没有 Drive 授权、发出前已冷却、准备 WAA proof 等发出前的本地步骤失败、
+	// 文件复制或附件上传失败等）时 err 已是那次的错误，仍算没有换到其他账户（准备 proof 失败、Worker 重建后在那个账号重放时同样如此）。
+	// 之后某次尝试真正到达上游并以别的结果结束（成功、5xx、额度 429 等）时清除，之后照原规则
+	imageDeniedSwitching := false
+	// imageDeniedPending：带图 403 写了“换一个账户再试”、还没有换到真正发出请求的账户，请求本身也没有超时或取消。这时换号的选号失败
+	// （Drive 选号用尽、主用模型排队超限、其余候选全部冷却、没有候选、额度失败后没有其他可换的账户等）、换号次数用完或到每请求换号硬上限
+	// 不按选号错误（号池繁忙 429、需要 Drive 授权 400、额度不足 429 等）或中间那次尝试的错误结束：保留这个 403（keepImageDeniedEnd），
+	// 循环后按带图被拒（400）返回并补写一行，原因写进 imageDeniedEndReason。被拒的账户不冷却，按 429 结束时中转重发多半又落到它上面再 403，
+	// 客户端一直看不到“去掉图片重试”的说明。能回到没等到关闭的原账号重放、文件所属账号不可用时复制文件再试、Worker 重建后的重放选号失败时换号，
+	// 这几种仍照常再试；中间那次尝试本身不可重试的错误（附件过大等）与连续失败上限照原来的错误结束
+	imageDeniedPending := func() bool {
+		return imageDeniedSwitching && imageDeniedErr != nil && requestCtx.Err() == nil
+	}
+	imageDeniedEndReason := ""
+	// keepImageDeniedEnd 让请求以那次带图 403 结束（循环后的 errors.Is 包装成立），reason 为没有换到其他账户的原因。err 仍是那次 403
+	// （可能并入了清理错误）时不动，与原先相同
+	keepImageDeniedEnd := func(reason string) {
+		imageDeniedEndReason = reason
+		if !errors.Is(err, imageDeniedErr) {
+			err = imageDeniedErr
+		}
+	}
 	// prefillRetries：本请求因原生续写被拒、本账号又不能马上重发（*aistudio.PrefillRetryError）而再试的次数，见 prefillRetryLimit
 	prefillRetries := 0
 	// hardFailures：既没有让账号进入冷却、也不是 Worker 重建或改走 Build 的失败次数（5xx、404、超时、带文件的 403 等；
@@ -4784,8 +4818,19 @@ func (service *trackedService) generateWithRetry(
 				request.Contents = originalContents
 				plan = drivePlan{}
 			} else if plan.exhausted {
-				err = drive.exhaustedError(modelID, scope)
+				exhaustedErr := drive.exhaustedError(modelID, scope)
 				var busy *aistudio.CapacityBusyError
+				if imageDeniedPending() {
+					// 带图 403 之后换号，Drive 选号没有本请求还能试的账号（中间换到的账号没有 Drive 授权时同样如此）：保留这个 403 结束
+					// （循环后按带图被拒返回 400 并补写一行），不按号池繁忙（429）或需要 Drive 授权（400）结束，见 imageDeniedPending
+					reason := "号池里没有其他已知或可能有 Drive 授权的账号"
+					if errors.As(exhaustedErr, &busy) {
+						reason = "可能有 Drive 授权的账号本请求都试过或现在用不了"
+					}
+					keepImageDeniedEnd(reason)
+					break
+				}
+				err = exhaustedErr
 				if errors.As(err, &busy) {
 					trace.Note("可能有 Drive 授权的账号本请求都试过或现在用不了，按号池繁忙返回")
 					service.requests.logRequestProgress(request.ID, "service", "WARN", fmt.Sprintf(
@@ -4995,8 +5040,15 @@ func (service *trackedService) generateWithRetry(
 				}
 				break
 			}
+			// keepImageDenied：带图 403 之后换号的这次选号失败，请求以那个 403 结束（按带图被拒返回 400），不换成下面的选号错误，
+			// 见 imageDeniedPending；回到原账号重放、复制文件再试与 Worker 重建后的重放选号失败照常处理
+			keepImageDenied := imageDeniedPending()
 			var capacityBusy *aistudio.CapacityBusyError
 			if errors.As(acquireErr, &capacityBusy) {
+				if keepImageDenied {
+					keepImageDeniedEnd(progressReason(acquireErr))
+					break
+				}
 				// 主用模型排队超过上限：立即按 429 结束，不换号、不复制文件、不冷却、不退避
 				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryQueueExceededMessage(capacityBusy))
 				err = acquireErr
@@ -5007,11 +5059,11 @@ func (service *trackedService) generateWithRetry(
 			ownerUnavailable := fileBound && !copyFiles && requestCtx.Err() == nil && fileOwnerUnavailable(acquireErr)
 			// replayUnavailable：不固定账号的请求在 Worker 重建后固定到原账号的重放选号失败，下面只排除这个账号、照常换号
 			replayUnavailable := recoveringAccount && unbound
-			if policy.counted && quota.hits() > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil {
+			if policy.counted && quota.hits() > 0 && !ownerUnavailable && !replayUnavailable && requestCtx.Err() == nil && !keepImageDenied {
 				// 额度失败后的换号没有可用的已启动 Worker、其余候选全部冷却或没有其他可换的账号：按额度不足立即返回 429，
 				// 不回到没等到关闭的原账号等待（returnToDeferred），也不回落到原地等待或冷启动。文件所属账号不可用时先照常复制文件到其他账号再试；
 				// Worker 重建后的重放选号只看了原账号一个（例如它在重建期间被其他请求的额度 429 冷却），不代表其余候选，
-				// 同样先排除它换号，下一次选号再按全部候选判断
+				// 同样先排除它换号，下一次选号再按全部候选判断。带图 403 之后还没有换到真正发出请求的账户时按带图被拒结束（keepImageDenied）
 				if reason, cooling, ok := primaryQuotaSelectionReason(acquireErr); ok {
 					meta.accounts = len(tried)
 					err = service.finishQuotaFailure(request.ID, "service", &quota, meta, reason, cooling, nil)
@@ -5032,9 +5084,14 @@ func (service *trackedService) generateWithRetry(
 			}
 			if ownerUnavailable {
 				// 文件所属账号不可用：改为把文件复制到其他账号再试一次。这次重试不占用换号次数，
-				// 否则只有一个可调度账号时循环直接结束，既没有错误也没有租约
+				// 否则只有一个可调度账号时循环直接结束，既没有错误也没有租约。带图 403 之后的这次选号（带着资源、排除了所属账号，
+				// 必然没有候选）同样复制文件再试，但保留那次 403：复制文件后的选号再失败时仍按带图被拒结束
 				copyFiles = true
-				err = acquireErr
+				if keepImageDenied {
+					keepImageDeniedEnd(progressReason(acquireErr))
+				} else {
+					err = acquireErr
+				}
 				maxAttempts++
 				continue
 			}
@@ -5044,7 +5101,10 @@ func (service *trackedService) generateWithRetry(
 				// 包装成 CapacityBusyError 会被上面的号池繁忙分支直接结束
 				acquireErr = newEgressColdStartBusy(selection.ModelID, scope, acquireErr)
 			}
-			if err == nil || !errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
+			if keepImageDenied {
+				// 原因先于下面 Worker 重建后重放的换号写入：换号后循环正常结束时补写的结束行同样带原因
+				keepImageDeniedEnd(progressReason(acquireErr))
+			} else if err == nil || !errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
 				err = acquireErr
 			}
 			if replayUnavailable && requestCtx.Err() == nil {
@@ -5223,8 +5283,15 @@ func (service *trackedService) generateWithRetry(
 		// streamed 为本次尝试已收到首个上游事件或 long- 自动续写已决定发第二轮：之后的阶段切换只来自续写的后续轮次（见 long_output.go），
 		// 不写阶段日志、不启动首事件计时（首事件计时只管第一轮，续写各轮不重新起算）
 		streamed := &atomic.Bool{}
+		// sentUpstream 为本次尝试已报告向上游发送（RequestPhaseSendingUpstream：WAA proof、Cookie 与签名都已就绪，发出前的冷却检查已通过）：
+		// 带图 403 之后的尝试是否真正到达上游按这个证据判断（见 attemptReachedUpstream），准备 proof 失败、读取 Cookie 或签名失败等
+		// 发出前的本地错误不算
+		sentUpstream := &atomic.Bool{}
 		// 阶段切换写入请求进度日志，便于把"分到账号 → 首字"拆成生成 proof、等上游响应头、响应头到首字三段
 		attemptCtx = aistudio.ContextWithRequestPhaseObserver(attemptCtx, func(phase aistudio.RequestPhase) {
+			if phase == aistudio.RequestPhaseSendingUpstream {
+				sentUpstream.Store(true)
+			}
 			if streamed.Load() {
 				// 续写的后续轮次：准备 proof、等响应头都算上游有进展，不触发首事件后空闲期限；每轮的进度另写一行，这里不再逐阶段写
 				activity.touch()
@@ -5271,6 +5338,14 @@ func (service *trackedService) generateWithRetry(
 				requestID: request.ID, accountLabel: accountLabel, modelID: modelID, pool: aistudio.PoolScopeFromContext(requestCtx),
 				lease: lease, phase: phase, activity: activity, notes: longNotes, rounds: streamed,
 			}))
+		}
+		// OMNI_IMAGE_BINDING 每次尝试读取一次（管理页保存后下一次尝试立即按新值），binding 与下面带图 403 的日志用同一个值；
+		// attemptImages 为这次请求体里内联发送的图片数（Interaction 模型，上传与放回之后），为 0 时 403 照原规则处理
+		imageBinding := service.omniImageBinding()
+		attemptCtx = aistudio.ContextWithInteractionImageBinding(attemptCtx, imageBinding)
+		attemptImages := 0
+		if interactionModel {
+			attemptImages = aistudio.InteractionInlineImageCount(request.Contents)
 		}
 		// generated 表示本次尝试已经向上游发出生成请求：之后的错误来自生成本身，不是文件复制或附件上传
 		generated := false
@@ -5499,6 +5574,39 @@ func (service *trackedService) generateWithRetry(
 				))
 			}
 		}
+		// imageDenied：带内联图片的 Interaction 请求（gemini-omni）被上游以 HTTP 403 / 协议错误码 7 拒绝（见 omni_image_binding.go，
+		// 错误体解析不出协议错误码的 403 不算，照原规则）。与账户无关：下面的单模型 403 冷却、多模型 403 暂停、403 无权限账户登记、号池级 403、
+		// 出口被拒判定与连续失败上限都不计入，不退避；到 imageDeniedLimit 个账户不再换号。只按本次生成本身的错误判断，与单模型 403 相同
+		imageDenied := attemptImages > 0 && generated && requestCtx.Err() == nil && interactionImagePermissionDenied(attemptErr) &&
+			!authFailure && !waaRuntimeFailed
+		if imageDenied {
+			imageDenials++
+			imageDeniedErr, imageDeniedImages, imageDeniedBinding = attemptErr, attemptImages, imageBinding
+			// 到上限不再换号；还没到上限、但这次之后循环本来也不会再换号（不可重试、换号次数已用完即号池里没有其他可试的账户、
+			// 已到每请求换号硬上限）时同样到此结束，日志写“没有其他可换的账户”，与对外的 tried on N accounts 一致。两种都不再回到
+			// 没等到关闭的原账号重放，也不在同账号重建后重放：日志写了不再换号，请求就在这里结束。写“换一个账户再试”时这个账号的
+			// Worker 正好失败（同账号其他请求准备 proof 失败、浏览器断开等）或已被替换，同样不在它上面重建后重放，也不记为没等到关闭的
+			// 原账号（见下文 recoverWorkerOnce 之后）：403 与 Worker 无关，在原账号重放多半又是 403，却会被算成第 2 个账户
+			next := imageDeniedSwitch
+			switch {
+			case imageDenials >= imageDeniedLimit:
+				next = imageDeniedLimitReached
+			case !retryable || attempt+1 >= maxAttempts || len(tried) >= generateSwitchCeiling:
+				next = imageDeniedNoOther
+			}
+			imageDeniedEnded = next != imageDeniedSwitch
+			imageDeniedSwitching = !imageDeniedEnded
+			if imageDeniedEnded {
+				retryable = false
+			}
+			note := imageDeniedNote(imageDenials, imageDeniedLimit, next, imageBinding, attemptImages)
+			trace.Note(note)
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", note)
+		} else if attemptReachedUpstream(generated, sentUpstream.Load() || source != nil, attemptErr) {
+			// 带图 403 之后换到的账户真正把请求发到了上游、以别的结果失败（5xx、额度 429、首事件超时等）：不再保留那次 403，
+			// 之后的选号失败与换号结束照原规则按各自的错误返回
+			imageDeniedSwitching = false
+		}
 		cooled, switchedToBuild, inputLimitRetry := false, false, false
 		// modelForbidden：本次尝试的单模型 403 已写入冷却。换号不退避，但仍计入连续失败上限：模型对整个号池都返回 403 时
 		// （号池里没有付费账号、纯 Go proof 稳定 403 等）不会一个请求把账号逐个试完，逐个冷却、登记淘汰并现场冷启动
@@ -5548,8 +5656,9 @@ func (service *trackedService) generateWithRetry(
 				}
 			}
 		}
-		// 已发往上游、与出口有关的其他失败（5xx、首事件超时、带指标的限额、403 等）计入出口被拒比例的分母（见 egressOtherOutcome）
-		if egressOtherOutcome(requestCtx, generated, coolingDown, bare, attemptErr) {
+		// 已发往上游、与出口有关的其他失败（5xx、首事件超时、带指标的限额、403 等）计入出口被拒比例的分母（见 egressOtherOutcome）；
+		// 带图 Interaction 请求的 403 与出口无关，不计
+		if !imageDenied && egressOtherOutcome(requestCtx, generated, coolingDown, bare, attemptErr) {
 			service.egress.observeOutcome(egressObservation{
 				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressOther, At: time.Now(),
 			})
@@ -5560,8 +5669,9 @@ func (service *trackedService) generateWithRetry(
 			warmOnlyNext = true
 		}
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度。与单模型 403 一样只按本次尝试本身的错误判断：
-		// 删除临时 Drive 副本时 DriveDelete 返回的 403 与模型权限无关，不计入（原先按并入清理错误后的 err，几次清理 403 就可能暂停正常账号）
-		if isPermissionDenied(attemptErr) {
+		// 删除临时 Drive 副本时 DriveDelete 返回的 403 与模型权限无关，不计入（原先按并入清理错误后的 err，几次清理 403 就可能暂停正常账号）；
+		// 带图 Interaction 请求的 403 与账户无关，不计入
+		if isPermissionDenied(attemptErr) && !imageDenied {
 			now := time.Now()
 			if pause, count, models := service.forbidden.record(request.AccountID, modelID, now); pause {
 				until := now.Add(forbiddenPause)
@@ -5582,9 +5692,10 @@ func (service *trackedService) generateWithRetry(
 		// （30 分钟、6 小时、到太平洋时间次日零点），该通道上该模型成功一次即从头计（见 forbidden_guard.go）。原先不冷却，账号一直留在
 		// 候选里，空出的槽位又最多，几乎每个新请求的第一次尝试都落在它上面白耗一次。冷却后换号不退避，但仍计入连续失败上限，
 		// 同一账号另一通道可用时在那里再试一次，驻留 Worker 因此成了死槽位时登记淘汰。只处理没有文件绑定、错误来自
-		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理；号池级 403 见下文
+		// 生成本身的尝试：文件复制与附件上传的 403 与模型权限无关；登录失效与 WAA 运行态失败另有处理；号池级 403 见下文；
+		// 带图 Interaction 请求的 403 见上文 imageDenied，不冷却、不登记
 		modelDenied := isPermissionDenied(attemptErr) && resourceID == "" && generated && requestCtx.Err() == nil &&
-			!authFailure && !waaRuntimeFailed
+			!authFailure && !waaRuntimeFailed && !imageDenied
 		// orgDisabled：上游返回 “AI Studio app is disabled”（账号所属组织停用了 AI Studio，见 org_disabled.go）。账户级，与单模型 403 分开：
 		// 租约释放后进入组织停用状态（不再参与任何调度，驻留 Worker 登记释放）；本请求按已冷却换号（不计连续失败上限、不退避），
 		// 只受每请求换号硬上限约束
@@ -5684,7 +5795,7 @@ func (service *trackedService) generateWithRetry(
 		// countsHard：这次失败换号时计入连续失败上限（hardFailures，见下文）。没等到关闭就换号时 recoverWorker 一定为 false，
 		// 是否计入只看这几项
 		countsHard := (!cooled || modelForbidden) && !switchedToBuild && !inputLimitRetry && !quotaFailure && !buildDisabled && !driveMissing &&
-			!prefillRetry
+			!prefillRetry && !imageDenied
 		// 最近一次额度失败所在类别超过它的换号上限：不再换号（租约照常由下面的 recoverWorkerOnce 释放），随后按额度不足结束
 		exhaustReason, exhausted := quota.exhaustedReason()
 		quotaExhausted := quotaFailure && exhausted
@@ -5697,9 +5808,10 @@ func (service *trackedService) generateWithRetry(
 		// 等不到就换号；固定账号与文件绑定的请求只能用这个账号，等关闭结束后在原账号重放。
 		// 还能换号要看换号次数与连续失败上限：这次失败计入上限后就到上限的请求不会再换号，同样一直等关闭结束后在原账号重放。
 		// 原先只看换号次数（不固定账号时为启用账号数，生产上几万），连续 5 个账号 Code 5 且都有其他请求在输出时每个只等 2 秒，
-		// 第 5 次换号到上限按 Code 5 失败，既没换号也没等原账号恢复
+		// 第 5 次换号到上限按 Code 5 失败，既没换号也没等原账号恢复。
+		// 带图 403（imageDenied）的账号不在它上面重放（见下文），同样只登记后台关闭、不等待
 		resetWait := workerResetWaitUnbounded
-		if requestCtx.Err() != nil || !retryable {
+		if requestCtx.Err() != nil || !retryable || imageDenied {
 			resetWait = 0
 		} else if unbound && attempt+1 < maxAttempts && (!countsHard || hardFailures+1 < generateFailureLimit) &&
 			len(tried) < generateSwitchCeiling {
@@ -5736,6 +5848,13 @@ func (service *trackedService) generateWithRetry(
 		} else {
 			resetDeferred = nil
 		}
+		if imageDenied {
+			// 带图 403 写了“换一个账户再试”（到上限或没有其他可换的账户时上面已经结束）：这个账号的 Worker 正好失败或已被替换时，
+			// 后台关闭照常登记（recoverWorkerOnce 已经做了），但不在它上面重建后重放，也不记为没等到关闭的原账号（之后不回到它等关闭后重放，
+			// 换号排队中它关闭完成时也不让它重新参与选号）：403 与 Worker 无关，在原账号重放多半又是 403，日志却会写成“第 2/2 个账户”、
+			// 对外 tried on 2 accounts。它留在已尝试里，下一次尝试照常换号
+			recoverWorker, resetDeferred = false, nil
+		}
 		if recoverWorker {
 			recoveryAccountID = request.AccountID
 			delete(attempted, request.AccountID)
@@ -5753,7 +5872,9 @@ func (service *trackedService) generateWithRetry(
 		// 不再换号（换号次数用完或到连续失败上限）时还有没等到关闭就换走的原账号：回到那里一直等关闭结束后重放，
 		// 与换号没有可用账号时相同，不按这次的失败结束（原先只在换号没有可用账号时回去）
 		if attempt+1 == maxAttempts {
-			if quotaFailure && requestCtx.Err() == nil {
+			// 带图 403 写了“换一个账户再试”之后换到的账户没有向上游发出（发出前已冷却等），换号次数随之用完：先照常回到没等到关闭的原账号，
+			// 回不去时以那次 403 结束（按带图被拒返回 400 并补写一行），不按这次尝试的错误或额度不足结束，见 imageDeniedPending
+			if quotaFailure && requestCtx.Err() == nil && !imageDeniedPending() {
 				// 最后一次尝试是额度失败、换号次数已用完：按额度不足返回 429（带 Retry-After），不回到原账号等待
 				meta.accounts = len(tried)
 				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonNoOther, nil, err)
@@ -5761,6 +5882,9 @@ func (service *trackedService) generateWithRetry(
 			}
 			if replay, _ := returnToDeferred("换号次数已用完", err); replay {
 				continue
+			}
+			if imageDeniedPending() {
+				keepImageDeniedEnd("换号次数已用完（号池里没有其他可试的账户）：" + progressReason(err))
 			}
 			break
 		}
@@ -5772,6 +5896,12 @@ func (service *trackedService) generateWithRetry(
 			replay, ended := returnToDeferred(fmt.Sprintf("已尝试 %d 个账号", len(tried)), err)
 			if replay {
 				continue
+			}
+			if !ended && imageDeniedPending() {
+				// 带图 403 写了“换一个账户再试”之后换到的账户都没有向上游发出（没有 Drive 授权、发出前已冷却等），到了换号上限：
+				// 以那次 403 结束（按带图被拒返回 400 并补写一行），不按额度不足或有 Drive 授权的账号都试过的号池繁忙（429）结束
+				keepImageDeniedEnd(fmt.Sprintf("已尝试 %d 个账号，到每请求换号上限：%s", len(tried), progressReason(err)))
+				break
 			}
 			if !ended && quotaFailure && requestCtx.Err() == nil {
 				meta.accounts = len(tried)
@@ -5829,6 +5959,10 @@ func (service *trackedService) generateWithRetry(
 			// 续写被拒后再试的进度上面已写；与账号无关，运行日志不写账号切换
 			continue
 		}
+		if imageDenied {
+			// 带图请求被 403 拒绝的进度上面已写；与账号无关，运行日志不写账号切换
+			continue
+		}
 		switchMessage := fmt.Sprintf(
 			"账号切换 | 模型=%s\n原因: %s",
 			modelID, strings.TrimSpace(err.Error()),
@@ -5840,6 +5974,20 @@ func (service *trackedService) generateWithRetry(
 		} else {
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "换号重试 | 原因="+progressReason(err))
 		}
+	}
+	// 带内联图片的 Interaction 请求以上游 403 结束（到 imageDeniedLimit 个账户、指定账号或没有其他可换的账户）：按
+	// aistudio.InteractionImageRejectedError 对外返回 400 的英文说明（Omni 拒绝了带图请求、可以去掉图片重试），不按上游 403 映射成 503。
+	// 请求超时或取消（回到原账号等待中结束）照原来的错误返回
+	// 最近一次带图 403 的日志写的是“换一个账户再试”、却没有换到其他真正发出请求的账户（换号的选号失败：没有候选、Drive 选号用尽、主用模型
+	// 排队超限、其余候选全部冷却等；换到的账户没有向上游发出后换号次数用完或到换号上限，见 imageDeniedPending；释放租约出错等）时补写一行，
+	// 与对外的 tried on N accounts 一致，没有换到的原因附在行尾
+	if imageDeniedErr != nil && errors.Is(err, imageDeniedErr) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		if !imageDeniedEnded {
+			note := imageDeniedEndNote(imageDenials, imageDeniedBinding, imageDeniedImages, imageDeniedEndReason)
+			trace.Note(note)
+			service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+		}
+		err = interactionImageRejected(modelID, imageDenials, imageDeniedImages, imageDeniedBinding, err)
 	}
 	// 不固定账户的选号没有候选、请求以此结束：写一行核对摘要（目录列出的账户数与按原因的分布、可用通道、选择条件、模型列表、候选索引，
 	// 见 aistudio.NoCandidateReport），对外按 aistudio.NoServingAccountError 返回：模型不在这个号池的模型列表里（权益、方法或启用的上游通道

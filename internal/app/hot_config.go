@@ -203,6 +203,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		saved.StreamDataHeartbeat == active.StreamDataHeartbeat && saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
+		saved.OmniImageBinding == active.OmniImageBinding &&
 		saved.LongOutputEnabled == active.LongOutputEnabled && saved.LongOutputMaxTokens == active.LongOutputMaxTokens &&
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
@@ -291,11 +292,16 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	admin.service.repeatNonce.Store(saved.RepeatPromptNonce)
 	admin.service.minOutputTokens.Store(int64(saved.MinOutputTokens))
 	admin.service.setLongOutput(saved.LongOutputEnabled, saved.LongOutputMaxTokens)
+	// OMNI_IMAGE_BINDING：下一次尝试立即按新值计算 Interaction 带图请求的 binding（见 omni_image_binding.go）
+	bindingChanged := admin.service.setOmniImageBinding(saved.OmniImageBinding)
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
 	admin.service.setPrimaryModelSettings(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait)
 	generation.config = saved
 	manager.mu.Unlock()
+	if bindingChanged {
+		manager.requests.log("service", "INFO", fmt.Sprintf("视频模型带图校验值设置已更新并立即生效 | 开启=%t（OMNI_IMAGE_BINDING）", saved.OmniImageBinding))
+	}
 
 	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 峰值与启动并发的变化同样要重新判断端口够不够。
 	// 运行中的 Worker 不受影响，新启动的 Worker 立即按新设置；没有浏览器的账户立即切到新的默认出口

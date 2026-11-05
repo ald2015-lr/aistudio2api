@@ -849,10 +849,12 @@ type interactionEncodingService struct {
 	modelListService
 	noDrive bool
 	// events 为编码成功后返回的生成事件，为空时返回一段正文
-	events  []aistudio.Event
-	last    *aistudio.GenerateRequest
-	body    []byte
-	binding []aistudio.Content
+	events []aistudio.Event
+	last   *aistudio.GenerateRequest
+	body   []byte
+	// binding 为按默认（OMNI_IMAGE_BINDING 开启，内联图片计入）编码出的 binding，textBinding 为开关关闭时的 binding（只含文本，与 a574e64 相同）
+	binding     []aistudio.Content
+	textBinding []aistudio.Content
 }
 
 func (service *interactionEncodingService) Generate(_ context.Context, request aistudio.GenerateRequest) (<-chan aistudio.Event, error) {
@@ -878,11 +880,16 @@ func (service *interactionEncodingService) Generate(_ context.Context, request a
 		}
 		uploaded.Contents[index] = content
 	}
-	body, binding, err := aistudio.EncodeCreateInteractionStreamRequest(uploaded, aistudio.GenerationDefaults{MaxOutputTokens: 8192, DefaultThinkingLevel: 3})
+	defaults := aistudio.GenerationDefaults{MaxOutputTokens: 8192, DefaultThinkingLevel: 3}
+	body, binding, err := aistudio.EncodeCreateInteractionStreamRequest(uploaded, defaults)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", aistudio.ErrInvalidArgument, err)
 	}
-	service.body, service.binding = body, binding
+	textBody, textBinding, err := aistudio.EncodeCreateInteractionStreamRequestBinding(uploaded, defaults, false)
+	if err != nil || string(textBody) != string(body) {
+		return nil, fmt.Errorf("请求体应与 OMNI_IMAGE_BINDING 无关: %v", err)
+	}
+	service.body, service.binding, service.textBinding = body, binding, textBinding
 	script := service.events
 	if len(script) == 0 {
 		script = []aistudio.Event{{Kind: aistudio.EventText, Text: "好的"}, {Kind: aistudio.EventFinish, FinishReason: "stop"}}
@@ -900,7 +907,8 @@ const interactionModelMediaIntro = "以下是上文模型回复里的图片或�
 
 // TestInteractionHistoryWithModelImage 先用图片模型出图（url 模式下历史里是本服务的图片链接，inline 模式下是 data URI），
 // 再在同一对话里让 Interaction 模型（Omni）“让它动起来”：模型消息里恢复出的图片连同说明移到随后的用户 step，按官网内联为
-// Content field 2 [1, Base64]（不上传 Drive），模型能看到这张图；模型 step 只带同一条消息里的文本，binding 与发送的文本一致。
+// Content field 2 [1, Base64]（不上传 Drive），模型能看到这张图；模型 step 只带同一条消息里的文本；binding 在 OMNI_IMAGE_BINDING 关闭时与发送的文本
+// 一致（与 a574e64 相同），开启（默认）时恢复出来的图片按请求体里的位置计入。
 // 只有图片的模型消息整条省略后前后两条用户消息相邻，合并为一条用户 step（图片仍在“让它动起来”这条消息的最前面）。
 // 账户没有 Drive 授权时同样内联发送成功，不再返回 400
 func TestInteractionHistoryWithModelImage(t *testing.T) {
@@ -915,6 +923,10 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 	movedImage := `[[["` + interactionModelMediaIntro + `"]],[null,[1,"` + encodedImage + `"]],[["让它动起来"]]]`
 	wantBinding := `[{"role":"user","parts":[{"text":"画一只猫"}]},{"role":"assistant","parts":[{"text":"\n"}]},` +
 		`{"role":"user","parts":[{"text":"` + interactionModelMediaIntro + `"},{"text":"让它动起来"}]}]`
+	// OMNI_IMAGE_BINDING 开启（默认）时恢复出来的图片按请求体里的位置（说明之后、“让它动起来”之前）计入 binding
+	wantImageBinding := `[{"role":"user","parts":[{"text":"画一只猫"}]},{"role":"assistant","parts":[{"text":"\n"}]},` +
+		`{"role":"user","parts":[{"text":"` + interactionModelMediaIntro + `"},{"inline_data":{"mime":"image/png","data":"` + encodedImage +
+		`"}},{"text":"让它动起来"}]}]`
 
 	gemini := map[string]any{"contents": []any{
 		map[string]any{"role": "user", "parts": []any{map[string]any{"text": "画一只猫"}}},
@@ -933,8 +945,11 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 		if !strings.Contains(string(service.body), movedImage) || strings.Contains(string(service.body), "drive-") {
 			t.Fatalf("%s: 模型消息里的图片应内联放在随后的用户 step 最前面、不上传 Drive: %s", method, service.body)
 		}
-		if got := mustJSONText(t, service.binding); got != wantBinding {
-			t.Fatalf("%s: binding = %s", method, got)
+		if got := mustJSONText(t, service.textBinding); got != wantBinding {
+			t.Fatalf("%s: 关闭时 binding = %s", method, got)
+		}
+		if got := mustJSONText(t, service.binding); got != wantImageBinding {
+			t.Fatalf("%s: 开启时 binding = %.300s", method, got)
 		}
 	}
 
@@ -952,9 +967,13 @@ func TestInteractionHistoryWithModelImage(t *testing.T) {
 	if !strings.Contains(string(service.body), mergedImage) {
 		t.Fatalf("Chat: 模型消息里的图片应内联放在随后的用户消息最前面，前后两条用户消息合并为一条 step: %s", service.body)
 	}
-	if got := mustJSONText(t, service.binding); got != `[{"role":"user","parts":[{"text":"画一只猫"}]},`+
+	if got := mustJSONText(t, service.textBinding); got != `[{"role":"user","parts":[{"text":"画一只猫"}]},`+
 		`{"role":"user","parts":[{"text":"`+interactionModelMediaIntro+`"},{"text":"让它动起来"}]}]` {
 		t.Fatalf("只有图片的模型消息应整条省略、图片移到随后的用户消息，binding 不随 step 合并（仍按消息逐条），binding = %s", got)
+	}
+	if got := mustJSONText(t, service.binding); got != `[{"role":"user","parts":[{"text":"画一只猫"}]},`+
+		`{"role":"user","parts":[{"text":"`+interactionModelMediaIntro+`"},{"inline_data":{"mime":"image/png","data":"`+encodedImage+`"}},{"text":"让它动起来"}]}]` {
+		t.Fatalf("开启时 data URI 图片应按请求体里的位置计入 binding: %.300s", got)
 	}
 
 	// 账户没有 Drive 授权：图片照样内联发送成功

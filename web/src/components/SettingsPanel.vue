@@ -81,6 +81,7 @@ type EditableKey =
   | 'media_retention'
   | 'media_max_size'
   | 'omni_ignore_system_prompt'
+  | 'omni_image_binding'
 
 const EDITABLE_KEYS: readonly EditableKey[] = [
   'auth_states',
@@ -121,6 +122,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'media_retention',
   'media_max_size',
   'omni_ignore_system_prompt',
+  'omni_image_binding',
 ]
 // 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存；
 // IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交；
@@ -250,6 +252,7 @@ const form = reactive<ServiceConfig>({
   media_retention: '7d',
   media_max_size: '20GB',
   omni_ignore_system_prompt: true,
+  omni_image_binding: true,
 })
 
 const upstreamChannelOptions: UpstreamChannel[] = ['playground', 'build']
@@ -1382,6 +1385,22 @@ onBeforeUnmount(() => {
           }}</span>
           <span class="mt-1 block text-xs text-gray-500">{{
             t('settings.omniIgnoreSystemPromptHelp')
+          }}</span>
+        </span>
+      </label>
+
+      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <input
+          v-model="form.omni_image_binding"
+          class="mt-0.5 h-4 w-4 accent-blue-500"
+          type="checkbox"
+        />
+        <span>
+          <span class="block text-sm font-medium text-gray-300">{{
+            t('settings.omniImageBinding')
+          }}</span>
+          <span class="mt-1 block text-xs text-gray-500">{{
+            t('settings.omniImageBindingHelp')
           }}</span>
         </span>
       </label>

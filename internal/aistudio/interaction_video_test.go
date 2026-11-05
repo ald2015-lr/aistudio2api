@@ -159,7 +159,7 @@ func TestInteractionVideoTaskTurns(t *testing.T) {
 		{Role: RoleAssistant, Parts: []Part{{Text: "想", Thought: true}, {ThoughtSignature: "sig"}}},
 		{Role: RoleUser, Parts: []Part{{Text: "b"}}},
 	}} {
-		_, _, hasModelTurn, err := encodeInteractionSteps(contents)
+		_, _, hasModelTurn, err := encodeInteractionSteps(contents, false)
 		if err != nil || hasModelTurn != interactionHasModelTurn(contents) {
 			t.Fatalf("interactionHasModelTurn 与编码规则不一致: %v err=%v", hasModelTurn, err)
 		}

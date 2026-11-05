@@ -495,6 +495,9 @@ type RuntimeConfig struct {
 	StreamDataHeartbeat *bool `json:"stream_data_heartbeat,omitempty"`
 	// OmniIgnoreSystemPrompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	OmniIgnoreSystemPrompt *bool `json:"omni_ignore_system_prompt,omitempty"`
+	// OmniImageBinding 为视频模型带图校验值（OMNI_IMAGE_BINDING，保存后立即生效）：开启时 Omni 带内联图片的请求按 GenerateContent 的写法把图片
+	// 计入 WAA 校验值，关闭时只含文本；读取时总是返回，保存时没有该字段（旧版页面）则沿用现值
+	OmniImageBinding *bool `json:"omni_image_binding,omitempty"`
 	// LongOutputEnabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED），LongOutputMaxTokens 为没有官网续写能力的模型的默认输出
 	// 总上限（LONG_OUTPUT_MAX_TOKENS，0 表示不模拟续写）；都保存后立即生效，读取时总是返回，保存时没有这些字段（旧版页面）则沿用现值
 	LongOutputEnabled   *bool `json:"long_output_enabled,omitempty"`

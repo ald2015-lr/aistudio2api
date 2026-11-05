@@ -272,6 +272,9 @@ const zhCN = {
   'settings.omniIgnoreSystemPrompt': '视频模型忽略系统提示',
   'settings.omniIgnoreSystemPromptHelp':
     '发给能输出视频的 Omni 模型（如 gemini-omni-1.1-flash，含带后缀的名称与目录别名）的请求去掉客户端的系统提示（各协议的 system、systemInstruction、instructions、system_instruction 与 system 角色消息），不发给上游，请求日志记一行去掉的字数。默认开启：Chatbox 等聊天客户端每次都自动加 “You are a helpful assistant.” 一类的系统提示，Omni 带上它时常常只回一段文字、说自己无法生成视频。开启时客户端设置的系统提示（如 Chatbox 的角色设定）对 Omni 不生效，要规定视频风格请写进用户消息；开启前已被拒绝过的对话可能仍只回文字，请新建对话再试。关闭后系统提示照常发送（与其他模型相同）；这是全局设置，对所有客户端生效，Chatbox 等客户端又会只回文字。除系统提示外没有其他消息时保留系统提示；文本、图片、Veo、Lyria 等其他模型不受影响。修改后立即生效，只影响新请求。',
+  'settings.omniImageBinding': '视频模型带图请求的校验值计入图片',
+  'settings.omniImageBindingHelp':
+    '发给 Omni 模型（如 gemini-omni-1.1-flash）、带内联图片的请求，把图片按文字模型带图的同一写法（图片原数据的 Base64，按它在请求里的位置）计入 WAA 校验值；Drive 上传的视频等文件不计入，纯文字请求与其他模型不受影响。默认开启：线上带图请求在多个账户上都被官网以 403（没有权限）拒绝、纯文字正常，推断官网算校验值时计入了图片。关闭后只有校验值回到只含文本（与原先相同）；无论开关取值，带图请求被 403 拒绝时都不冷却、不登记账户，最多试 2 个账户后按 400 返回说明（可以去掉图片重试）。修改后立即生效，只影响新请求。',
   'settings.temporaryChat': 'WAA 预热使用临时对话',
   'settings.ignoreClientSeed': '忽略客户端传入的 seed',
   'settings.ignoreClientSeedHelp':
@@ -1210,6 +1213,9 @@ const en: Record<TranslationKey, string> = {
   'settings.omniIgnoreSystemPrompt': 'Ignore system prompts for video models',
   'settings.omniIgnoreSystemPromptHelp':
     'Requests to Omni models that output video (such as gemini-omni-1.1-flash, including suffixed names and catalog aliases) drop the client system prompt (system, systemInstruction, instructions, system_instruction and system-role messages in every protocol) instead of sending it upstream, and the request log records how many characters were dropped. On by default: chat clients such as Chatbox add a system prompt like "You are a helpful assistant." to every request, and with it Omni often replies with text only, saying it cannot generate videos. While on, system prompts set in the client (such as a Chatbox persona) have no effect on Omni, so put style instructions in the user message; a conversation that was already refused before may keep replying with text only, so start a new one. When off, system prompts are sent as usual (as for other models); this is a global setting that applies to every client, and Chatbox-style requests go back to text-only. A system prompt is kept when the request has no other messages; text, image, Veo, Lyria and other models are not affected. Changes apply immediately to new requests only.',
+  'settings.omniImageBinding': 'Include images in the check value of Omni image requests',
+  'settings.omniImageBindingHelp':
+    'Requests to Omni models (such as gemini-omni-1.1-flash) with inline images include those images in the WAA check value the same way text models do (the Base64 of the original image data, at its position in the request); videos and other files uploaded to Drive are not included, and text-only requests and other models are not affected. On by default: in production, requests with images were refused with 403 (no permission) on several accounts while text-only requests worked, which suggests the website includes images in the check value. When off, only the check value goes back to text only (as before); whatever this setting, when a request with images is refused with 403, accounts are not cooled down or listed, at most 2 accounts are tried, and the request ends with a 400 explanation (remove the images and retry). Changes apply immediately to new requests only.',
   'settings.temporaryChat': 'Use temporary chat for WAA prewarming',
   'settings.ignoreClientSeed': 'Ignore seed sent by clients',
   'settings.ignoreClientSeedHelp':

@@ -711,6 +711,9 @@ export interface ServiceConfig {
   // omni_ignore_system_prompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT）：发给能输出视频的 Omni 模型的请求去掉客户端的系统提示，
   // 保存后立即生效。服务端总是返回该字段，因此这里不是可选字段
   omni_ignore_system_prompt: boolean
+  // omni_image_binding 为视频模型带图校验值（OMNI_IMAGE_BINDING）：开启时 Omni 带内联图片的请求把图片按 GenerateContent 的写法计入 WAA 校验值，
+  // 关闭时校验值只含文本（与原先相同），保存后立即生效。服务端总是返回该字段，因此这里不是可选字段
+  omni_image_binding: boolean
   // invalid_config 为 .env 或进程环境变量里取值无效、已按默认值生效的配置项，只读；没有时服务端不返回
   invalid_config?: InvalidConfigValue[]
 }

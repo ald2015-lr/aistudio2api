@@ -661,7 +661,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait, StreamDataHeartbeat: active.StreamDataHeartbeat,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
-		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt,
+		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -690,6 +690,10 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	// 视频模型忽略系统提示：提交时省略（旧版页面）按生效值比较
 	if value.OmniIgnoreSystemPrompt != nil {
 		saved.OmniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
+	}
+	// 视频模型带图校验值：提交时省略（旧版页面）按生效值比较
+	if value.OmniImageBinding != nil {
+		saved.OmniImageBinding = *value.OmniImageBinding
 	}
 	// 自动续写：提交时省略（旧版页面）按生效值比较
 	saved.LongOutputEnabled, saved.LongOutputMaxTokens = active.LongOutputEnabled, active.LongOutputMaxTokens
@@ -734,7 +738,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
-		saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
+		saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt && saved.OmniImageBinding == active.OmniImageBinding &&
 		saved.LongOutputEnabled == active.LongOutputEnabled && saved.LongOutputMaxTokens == active.LongOutputMaxTokens &&
 		saved.RoutingStrategy == active.RoutingStrategy &&
 		slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) && saved.WAABackend == active.WAABackend &&

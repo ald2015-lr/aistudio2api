@@ -1231,6 +1231,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.OmniIgnoreSystemPrompt != nil {
 		omniIgnoreSystemPrompt = *value.OmniIgnoreSystemPrompt
 	}
+	// 视频模型带图校验值（OMNI_IMAGE_BINDING）：旧版页面保存时不带该字段，沿用现值
+	omniImageBinding := saved.OmniImageBinding
+	if value.OmniImageBinding != nil {
+		omniImageBinding = *value.OmniImageBinding
+	}
 	// 自动续写：旧版页面保存时不带这些字段，沿用现值（默认总上限可以为 0，不能用零值判断是否缺省）
 	longOutputEnabled, longOutputMaxTokens := saved.LongOutputEnabled, saved.LongOutputMaxTokens
 	if value.LongOutputEnabled != nil {
@@ -1314,6 +1319,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		RepeatPromptNonce:      value.RepeatPromptNonce,
 		MinOutputTokens:        value.MinOutputTokens,
 		OmniIgnoreSystemPrompt: omniIgnoreSystemPrompt,
+		OmniImageBinding:       omniImageBinding,
 		LongOutputEnabled:      longOutputEnabled,
 		LongOutputMaxTokens:    longOutputMaxTokens,
 		WAABackend:             value.WAABackend,
@@ -2027,6 +2033,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		UltraIncludePro:        &cfg.UltraIncludePro,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
 		OmniIgnoreSystemPrompt: &cfg.OmniIgnoreSystemPrompt,
+		OmniImageBinding:       &cfg.OmniImageBinding,
 		LongOutputEnabled:      &cfg.LongOutputEnabled,
 		LongOutputMaxTokens:    &cfg.LongOutputMaxTokens,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,
