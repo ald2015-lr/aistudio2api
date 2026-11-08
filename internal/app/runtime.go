@@ -5280,6 +5280,10 @@ func (service *trackedService) generateWithRetry(
 		})
 		activity = &upstreamActivity{}
 		attemptCtx = aistudio.ContextWithStreamActivityObserver(attemptCtx, activity.observe)
+		// 生成服务扣住上游事件（工具约束要求必须调用，见 aistudio/tool_guard.go）时请求上下文退出首事件前的固定期限，改按本次尝试的
+		// 上游活动判空闲；同一尝试内重发时空闲计时重新起算（见 generateContext.holdUpstream）
+		attemptActivity := activity
+		firstEvent.observeHold(func() { phase.holdUpstream(attemptActivity.quietFor) }, phase.touchHold)
 		// streamed 为本次尝试已收到首个上游事件或 long- 自动续写已决定发第二轮：之后的阶段切换只来自续写的后续轮次（见 long_output.go），
 		// 不写阶段日志、不启动首事件计时（首事件计时只管第一轮，续写各轮不重新起算）
 		streamed := &atomic.Bool{}
@@ -5390,6 +5394,14 @@ func (service *trackedService) generateWithRetry(
 			firstEventDelayed := false
 			first, err = firstGenerateEvent(attemptCtx, source, func() {
 				firstEventDelayed = true
+				if firstEvent.holding() {
+					// 上游早已返回事件，只是生成服务扣住到工具调用出现（见 aistudio/tool_guard.go），不是上游慢
+					service.requests.logRequestProgress(request.ID, accountLabel, "INFO", fmt.Sprintf(
+						"生成服务扣住上游事件等待工具调用 | 已等待=%s | 模型=%s | %s",
+						streamStallThreshold, modelID, activity.logFields(time.Now()),
+					))
+					return
+				}
 				service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 					"上游首事件等待 | 已等待=%s | 模型=%s | %s",
 					streamStallThreshold, modelID, activity.logFields(time.Now()),
@@ -5399,9 +5411,13 @@ func (service *trackedService) generateWithRetry(
 				_ = firstEvent.stop()
 			})
 			if firstEventDelayed && err == nil {
+				arrived := "上游首事件到达"
+				if firstEvent.holding() {
+					arrived = "扣住的上游事件已交出"
+				}
 				service.requests.logRequestProgress(request.ID, accountLabel, "INFO", fmt.Sprintf(
-					"上游首事件到达 | 等待=%s | 事件=%s | 模型=%s",
-					time.Since(upstreamStartedAt).Round(time.Millisecond), first.Kind, modelID,
+					"%s | 等待=%s | 事件=%s | 模型=%s",
+					arrived, time.Since(upstreamStartedAt).Round(time.Millisecond), first.Kind, modelID,
 				))
 			}
 		}
@@ -5429,25 +5445,18 @@ func (service *trackedService) generateWithRetry(
 			}
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", "上游首事件到达时请求已结束，不转发 | 原因="+progressReason(err))
 		}
-		// 首事件前期限在这次尝试中到期：记下停在哪一步，写进最终错误（见 startDeadlineError）
-		if err != nil && startCutWhere == "" && phase.startExpired() &&
-			(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
-			startCutWhere = startCutStage(generated, source != nil, sameTime, prepareTiming)
-		}
-		if err == nil {
-			streamed.Store(true)
-			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
-			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
+		// upstreamResponded 为上游这次正常响应时账号、出口与权限的成功侧记账：收到首个上游事件，或首个事件就是工具约束违约
+		// （上游正常返回了回复，只是没照工具要求做，与账号、出口无关，见下文）
+		upstreamResponded := func() {
+			now := time.Now()
 			service.workers.ipPool().succeeded(request.AccountID)
 			service.quota.attemptSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
-			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
-			temporaryCopies = attemptCopies
 			service.forbidden.reset(request.AccountID)
 			service.forbidden.resetModel(request.AccountID, lease.CooldownScope(modelID))
-			service.forbidden.modelSucceeded(scope, modelID, time.Now())
-			service.rateLimits.succeeded(scope, modelID, time.Now())
+			service.forbidden.modelSucceeded(scope, modelID, now)
+			service.rateLimits.succeeded(scope, modelID, now)
 			service.egress.observeOutcome(egressObservation{
-				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressSuccess, At: time.Now(),
+				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressSuccess, At: now,
 			})
 			// 真正成功过的账户：清掉登录复核的退避（见 auth_recheck.go）与坏号记录，记为近期成功（预热与替补优先，见 bad_accounts.go）
 			service.authRecheck.noteSuccess(request.AccountID)
@@ -5457,12 +5466,31 @@ func (service *trackedService) generateWithRetry(
 				// Build 生成暂停中的试探成功，或暂停过的账号在 Build 上成功：解除暂停（见 build_pause.go）；没有暂停记录时不加锁
 				pauses.succeeded(request.AccountID, accountLabel, probeAttempt)
 			}
+		}
+		// 首事件前期限在这次尝试中到期：记下停在哪一步，写进最终错误（见 startDeadlineError）
+		if err != nil && startCutWhere == "" && phase.startExpired() &&
+			(errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) {
+			startCutWhere = startCutStage(generated, source != nil, sameTime, prepareTiming)
+			if cause := phase.deadlineCause(); cause != nil && cause.held {
+				// 扣住上游事件期间到期：错误文本已写明，进度日志的“停在”写扣住
+				startCutWhere = "扣住上游事件"
+			}
+		}
+		if err == nil {
+			streamed.Store(true)
+			api.SetAccessLogFirstEvent(requestCtx, time.Since(generationStartedAt))
+			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
+			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
+			temporaryCopies = attemptCopies
+			upstreamResponded()
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
 			finishAttempt = cancelAttempt
 			break
 		}
 		cancelAttempt(nil)
+		// 扣住过上游事件的尝试没有交出首事件就结束：退出扣住，之后的尝试照常受首事件前期限约束（扣住的时间不计入，见 endHold）
+		phase.endHold()
 		// attemptErr 为本次尝试本身的错误（文件复制、附件上传或生成），不含随后删除临时 Drive 副本的错误：是否换号、额度冷却与单模型 403
 		// 只按它判断。清理错误照旧并入 err 写日志与返回；Drive 删除返回的 429、403、404 与模型额度、模型权限无关，一次非额度的生成失败
 		// （连接重置、首事件超时、协议证据错误等）不能因为清理时的 DriveDelete 429 被当成生成本身的裸限流逐级冷却、同步冷却另一通道，
@@ -5470,6 +5498,12 @@ func (service *trackedService) generateWithRetry(
 		attemptErr := err
 		if attemptCopies != nil {
 			err = errors.Join(err, attemptCopies.Cleanup())
+		}
+		// 工具约束违约（必须调用时扣住事件，违约多半作为这次尝试的首个事件到达，见 aistudio/tool_guard.go）：上游账号与出口这次都正常
+		// 返回了回复，照收到首事件记成功侧（与违约在首事件之后到达时相同），不计入出口的其他失败（见 egressCountsOther）
+		var contractErr *aistudio.ToolContractError
+		if generated && requestCtx.Err() == nil && errors.As(attemptErr, &contractErr) {
+			upstreamResponded()
 		}
 		// 上游返回的 4xx（不只 429）在请求日志记一行证据：方法、状态、文案、details 类型与原文（见 upstream_error_log.go）
 		service.logUpstreamClientError(request.ID, accountLabel, attemptErr, "")
@@ -6022,8 +6056,8 @@ func (service *trackedService) generateWithRetry(
 			where = "-"
 		}
 		service.requests.logRequestProgress(request.ID, "service", "WARN", fmt.Sprintf(
-			"本服务期限截断 | 阶段=首事件前 | 期限=%s | 已用时=%s | 停在=%s | 原因=%s",
-			cut.limit, cut.elapsed.Round(time.Millisecond), where, reason))
+			"本服务期限截断 | 阶段=%s | 期限=%s | 已用时=%s | 停在=%s | 原因=%s",
+			cut.label(), cut.limit, cut.elapsed.Round(time.Millisecond), where, reason))
 		trace.Note("本服务首事件前期限到期: " + cut.Error())
 	}
 	if err != nil {
@@ -6224,14 +6258,21 @@ func (e *firstEventTimeoutError) Unwrap() error {
 }
 
 // firstEventDeadline 为一次尝试的首事件超时计时（FIRST_EVENT_TIMEOUT，0 为关闭）：开始向上游发送时启动，
-// 收到首事件或尝试结束时停止；到时只取消本次尝试的上下文
+// 收到首事件或尝试结束时停止，生成服务扣住上游已经返回的事件时暂停（见 PauseFirstEvent）；到时只取消本次尝试的上下文
 type firstEventDeadline struct {
 	timeout time.Duration
 	cancel  context.CancelCauseFunc
 	mu      sync.Mutex
 	timer   *time.Timer
 	stopped bool
-	fired   *firstEventTimeoutError
+	// paused 为生成服务扣住了上游已经返回的事件（见 PauseFirstEvent）：start 不再启动，RestartFirstEvent 照常重新起算
+	paused bool
+	// held 为本次尝试扣住过上游事件（不论是否开启首事件超时），写日志时据此区分“上游没有首事件”与“生成服务扣住中”
+	held  bool
+	fired *firstEventTimeoutError
+	// onHold、onRestart 为扣住上游事件、同一尝试内重发时的回调（见 observeHold）：通知请求上下文退出首事件前的固定期限、
+	// 重新起算扣住期间的空闲计时。在 mu 内调用（锁顺序为 mu → 请求上下文的锁）
+	onHold, onRestart func()
 }
 
 func newFirstEventDeadline(timeout time.Duration, cancel context.CancelCauseFunc) *firstEventDeadline {
@@ -6242,7 +6283,7 @@ func newFirstEventDeadline(timeout time.Duration, cancel context.CancelCauseFunc
 func (deadline *firstEventDeadline) start() {
 	deadline.mu.Lock()
 	defer deadline.mu.Unlock()
-	if deadline.timeout <= 0 || deadline.timer != nil || deadline.stopped {
+	if deadline.timeout <= 0 || deadline.timer != nil || deadline.stopped || deadline.paused {
 		return
 	}
 	deadline.timer = time.AfterFunc(deadline.timeout, deadline.expire)
@@ -6272,6 +6313,9 @@ func (deadline *firstEventDeadline) RestartFirstEvent() bool {
 	deadline.mu.Lock()
 	defer deadline.mu.Unlock()
 	if deadline.timeout <= 0 {
+		if !deadline.stopped && deadline.onRestart != nil {
+			deadline.onRestart()
+		}
 		return true
 	}
 	if deadline.stopped {
@@ -6281,8 +6325,50 @@ func (deadline *firstEventDeadline) RestartFirstEvent() bool {
 		// 计时恰好到期，expire 正在等锁：照旧按首事件超时处理
 		return false
 	}
+	deadline.paused = false
 	deadline.timer = time.AfterFunc(deadline.timeout, deadline.expire)
+	if deadline.onRestart != nil {
+		deadline.onRestart()
+	}
 	return true
+}
+
+// PauseFirstEvent 暂停首事件计时（见 aistudio.FirstEventClock）：工具约束要求必须调用时生成服务扣住上游已经返回的事件、等调用出现
+// （见 aistudio/tool_guard.go），上游已经有了响应，不再按首事件超时放弃这次尝试；同一尝试内的重发照常经 RestartFirstEvent 重新起算。
+// 不论是否开启首事件超时，都经 onHold 通知请求上下文退出首事件前的固定期限（见 generateContext.holdUpstream）。
+// 已触发或已停止时不做任何事
+func (deadline *firstEventDeadline) PauseFirstEvent() {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	if deadline.stopped {
+		return
+	}
+	if deadline.timeout > 0 {
+		if deadline.timer != nil && !deadline.timer.Stop() {
+			// 计时恰好到期，expire 正在等锁：照旧按首事件超时处理
+			return
+		}
+		deadline.timer = nil
+		deadline.paused = true
+	}
+	deadline.held = true
+	if deadline.onHold != nil {
+		deadline.onHold()
+	}
+}
+
+// observeHold 登记扣住上游事件与同一尝试内重发时的回调（发送之前调用）
+func (deadline *firstEventDeadline) observeHold(onHold, onRestart func()) {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	deadline.onHold, deadline.onRestart = onHold, onRestart
+}
+
+// holding 判断本次尝试扣住过上游事件（见 PauseFirstEvent）
+func (deadline *firstEventDeadline) holding() bool {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	return deadline.held
 }
 
 // stop 停止计时，返回已经触发的超时错误（没有触发时为 nil）。停止与触发互斥：stop 返回 nil 后本次尝试不会再被取消

@@ -28,8 +28,6 @@ const (
 	officialNotFoundMessage      = "Requested entity was not found."
 	officialInvalidKeyMessage    = "API key not valid. Please pass a valid API key."
 	officialTooLargeMessage      = "Request payload size exceeds the limit."
-	// officialToolContractMessage 用于上游回复不满足客户端要求的工具约束（没有官方原文，措辞与官方风格一致）
-	officialToolContractMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
 	// officialUnnamedFunctionCallMessage 用于上游返回的函数调用没有函数名、客户端无法执行（没有官方原文，措辞与官方风格一致）
 	officialUnnamedFunctionCallMessage = "The model returned a function call without a function name, so it cannot be executed. Please retry."
 	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
@@ -126,10 +124,11 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.Is(err, aistudio.ErrBuildGenerationDisabled) {
 		return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialBuildDisabledMessage}
 	}
-	// 上游回复违反了客户端要求的工具约束：按网关错误返回，客户端与中转可以重试
+	// 上游回复违反了客户端要求的工具约束（同账号重新生成之后仍不满足）：按网关错误返回，客户端与中转可以重试；说明写明是哪种违约
+	// （没有调用要求的函数、调用了没选的函数、参数不符合 strict Schema）与共生成了几次（没有官方原文，措辞与官方风格一致）
 	var contract *aistudio.ToolContractError
 	if errors.As(err, &contract) {
-		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: officialToolContractMessage}
+		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: contract.PublicMessage()}
 	}
 	// 上游返回的函数调用没有函数名：无法交给客户端执行，按网关错误返回并写明原因（原先落到兜底的 500 通用措辞）
 	if errors.Is(err, aistudio.ErrFunctionCallMissingName) {

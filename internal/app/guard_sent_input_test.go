@@ -48,7 +48,7 @@ func TestGuardInputSizeFollowsSentInput(t *testing.T) {
 		t.Fatalf("普通请求的比例 = %v/%v，应与准备判定时的 %v/%v 相同", ratio, upper, preparedRatio, preparedUpper)
 	}
 
-	hint := "\nUse one of these tools in this response: get_weather. Use the tool before answering."
+	hint := "\nYou must call the function get_weather in this response with arguments that match its schema. Do not reply with plain text."
 	gate.observeSentInput(aistudio.SentInput{
 		Channel: aistudio.ChannelPlayground, System: request.System + hint, Contents: request.Contents,
 		Tools: request.Tools, SchemaHintChars: 120,

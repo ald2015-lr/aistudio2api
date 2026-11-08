@@ -430,6 +430,7 @@ Interaction（`CreateInteractionStream`）交给 `DoProtected` 的 binding 由 `
 | 阶段 | 期限 | 计入 | 到期 |
 | --- | --- | --- | --- |
 | 首事件前 | `REQUEST_TIMEOUT` | 排队、选号、现场冷启动、回到原账号等 Worker 关闭、文件复制与附件上传、WAA proof、等首个上游事件与首事件前的换号重试 | 504，换号规则与原来相同；`request.error` 以 `本服务首事件前期限 <期限> 到期` 开头，在某次尝试中到期时带 `（停在 <位置>）`，文件资源刷新时到期带 `（停在 文件资源刷新）`。期限在换号退避中到期时按上一次尝试的错误区分：满足 `context.DeadlineExceeded`（首事件超时、BiDi 等待回复超时、协议位置读取超时等）时照样加前缀，截断日志的 `停在` 为 `-`；上一次是上游 RPC 错误（5xx、协议错误码等，不满足 `DeadlineExceeded`）时保留原错误与状态码，不加前缀，也不写截断日志 |
+| 扣住上游事件（仍在首事件前） | 空闲 `REQUEST_TIMEOUT`，整段受总时长上限约束 | 强制调用工具时生成服务扣住上游已经返回的事件、等调用出现（`aistudio/tool_guard.go`），经 `FirstEventClock.PauseFirstEvent` → `firstEventDeadline` 的 `onHold` 调用 `holdUpstream`：`Deadline()` 改为总时长上限，计时器到时按本次尝试的 `upstreamActivity`（`long-` 两轮之间暂停）复查上游实际空闲，同一尝试内的重发（`RestartFirstEvent` → `touchHold`）从开始发送重新计；`long-` 各轮照常 `renewTotal`，`beginLongRound` 登记的结束函数同样生效。交出首事件时 `beginStreaming` 沿用这个期限；尝试以错误结束时 `endHold` 恢复首事件前期限并顺延扣住的累计时长 | 504，`本服务扣住期间空闲期限 <期限> 到期（…）` 或 `本服务总时长上限 <期限> 到期（生成服务扣住上游事件等待工具调用）`，截断日志 `阶段=扣住期间空闲`/`扣住期间总时长上限`、`停在=扣住上游事件` |
 | 首事件后 | 空闲 `REQUEST_TIMEOUT` | `forwardEvents` 的看门狗：上游连续这么久既没有事件也没有网络字节（`upstreamActivity`，单调时钟）才到期；向下游交付被阻塞的时间（客户端读得慢）不算上游空闲 | 504（流式在流内），`本服务首事件后空闲期限 <期限> 到期（已输出 推理=N 正文=M）` |
 | 整条请求 | `max(1h, REQUEST_TIMEOUT)`（`generateMaxDuration`，不是配置项） | 从建立上下文算起 | 504，`本服务总时长上限 <期限> 到期（已输出 推理=N 正文=M）` |
 

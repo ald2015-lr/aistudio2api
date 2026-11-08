@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"slices"
 	"strings"
@@ -141,5 +142,14 @@ func TestToolContractErrorIsBadGateway(t *testing.T) {
 	}
 	if statusFromError(err) != http.StatusBadGateway {
 		t.Fatal("statusFromError 应为 502")
+	}
+	if got := publicErrorFor(err, "m"); got.Message != aistudio.ToolContractPublicMessage {
+		t.Fatalf("没有违约种类时用笼统的说明: %q", got.Message)
+	}
+	// 写明违约种类与次数（原样用 aistudio 给出的英文说明），状态仍为 502
+	missing := &aistudio.ToolContractError{Kind: aistudio.ToolContractMissingCall, Required: []string{"Kei_Workflow"}, SingleFunction: true, Attempts: 3}
+	if got := publicErrorFor(fmt.Errorf("包装: %w", missing), "m"); got.Status != http.StatusBadGateway ||
+		got.Message != "The model did not call the required function Kei_Workflow (tried 3 times). Please retry." {
+		t.Fatalf("public error=%+v", got)
 	}
 }

@@ -9,19 +9,134 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/dlclark/regexp2/v2"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
+// ToolContractViolation 为工具约束违约的种类
+type ToolContractViolation string
+
+const (
+	// ToolContractMissingCall 为要求调用工具（tool_choice 为 required/any 或指定了函数），上游到结束都没有调用
+	ToolContractMissingCall ToolContractViolation = "missing_call"
+	// ToolContractUnselectedFunction 为上游调用了没有选择的函数
+	ToolContractUnselectedFunction ToolContractViolation = "unselected_function"
+	// ToolContractSchemaMismatch 为 strict 函数的参数不符合 Schema
+	ToolContractSchemaMismatch ToolContractViolation = "schema_mismatch"
+)
+
 // ToolContractError 表示上游回复违反了客户端显式要求的工具约束（必须调用、指定函数、strict 参数）
 type ToolContractError struct {
+	// Detail 为写进日志的中文原因
 	Detail string
+	// Kind 为违约的种类，为空时对外按笼统的说明返回
+	Kind ToolContractViolation
+	// Function 为参数不符合 strict Schema 的函数（客户端声明的函数名）
+	Function string
+	// Required 为要求调用的工具（被选中的函数，声明了内置工具时含内置工具名）；SingleFunction 为只要求这一个函数
+	Required       []string
+	SingleFunction bool
+	// Attempts 为这次 Generate 内共生成的次数（含同账号重新生成），写进日志与对外说明
+	Attempts int
+	// Blocked 为要求调用却没有调用、上游以内容拦截类原因结束时的结束原因（safety、recitation 等）：不重新生成，对外说明写出它
+	Blocked string
 }
 
 // Error 返回违约原因
 func (e *ToolContractError) Error() string {
-	return "上游回复不满足工具约束: " + e.Detail
+	message := "上游回复不满足工具约束: " + e.Detail
+	if e.Attempts > 1 {
+		message += fmt.Sprintf("（共生成 %d 次）", e.Attempts)
+	}
+	return message
+}
+
+// ToolContractPublicMessage 为没有具体违约种类时对外的说明（没有官方原文，措辞与官方风格一致）
+const ToolContractPublicMessage = "The model response did not satisfy the requested tool constraints (tool_choice, parallel tool calls or strict schema). Please retry."
+
+// PublicMessage 返回对客户端的英文说明：写明是哪种违约与共生成了几次，不含会让中转自动禁用渠道的字样。
+// 未选择的函数名来自上游输出，不写进说明；客户端声明的函数名含这类单词时同样不写（见 publicToolName），日志照常写原名
+func (e *ToolContractError) PublicMessage() string {
+	tried := ""
+	if e.Attempts > 1 {
+		tried = fmt.Sprintf(" (tried %d times)", e.Attempts)
+	}
+	switch e.Kind {
+	case ToolContractMissingCall:
+		required := publicToolNames(e.Required)
+		if e.Blocked != "" {
+			// 内容拦截：重试同一内容多半同样被拦截，不写 Please retry
+			stopped := "The model stopped (" + e.Blocked + ") without calling "
+			switch {
+			case len(required) == 1 && e.SingleFunction:
+				return stopped + "the required function " + required[0] + tried + "."
+			case len(required) > 0:
+				return stopped + "any of the required tools (" + strings.Join(required, ", ") + ")" + tried + "."
+			case len(e.Required) == 1 && e.SingleFunction:
+				return stopped + "the required function" + tried + "."
+			case len(e.Required) > 0:
+				return stopped + "any of the required tools" + tried + "."
+			}
+			return stopped + "a required tool" + tried + "."
+		}
+		switch {
+		case len(required) == 1 && e.SingleFunction:
+			return "The model did not call the required function " + required[0] + tried + ". Please retry."
+		case len(required) > 0:
+			return "The model did not call any of the required tools (" + strings.Join(required, ", ") + ")" + tried + ". Please retry."
+		case len(e.Required) == 1 && e.SingleFunction:
+			return "The model did not call the required function" + tried + ". Please retry."
+		case len(e.Required) > 0:
+			return "The model did not call any of the required tools" + tried + ". Please retry."
+		}
+		return "The model did not call a required tool" + tried + ". Please retry."
+	case ToolContractUnselectedFunction:
+		return "The model called a function that was not selected" + tried + ". Please retry."
+	case ToolContractSchemaMismatch:
+		if name := publicToolName(e.Function); name != "" {
+			return "The model's arguments for " + name + " did not match the strict schema" + tried + ". Please retry."
+		}
+		return "The model's function arguments did not match the strict schema" + tried + ". Please retry."
+	}
+	return ToolContractPublicMessage
+}
+
+// relayDisableWords 为 new-api、one-api 等中转据以自动禁用渠道的单词（它们按错误消息做子串匹配，不看状态码；one-api 一类单独匹配
+// credit、balance 等单词）。比较时去掉空格、下划线、连字符等分隔符，按小写匹配
+var relayDisableWords = []string{
+	"permission", "denied", "quota", "insufficient", "credit", "balance", "billing", "unauthorized", "authorized", "forbidden",
+	"disabled", "deactivated", "suspended", "terminated", "expired", "violation", "restricted", "organization", "apikey",
+	"notallowed", "欠费",
+}
+
+// publicToolName 返回可以写进对外说明的工具名：客户端声明的函数名可以是任意单词（check_quota、get_balance、insufficient_stock_alert 等），
+// 原样写进 502 的说明会让中转把整个渠道禁掉；名字里含 relayDisableWords 中的单词时返回空串，调用方改用不带名字的写法
+func publicToolName(name string) string {
+	var compact strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			compact.WriteRune(r)
+		}
+	}
+	folded := compact.String()
+	for _, word := range relayDisableWords {
+		if strings.Contains(folded, word) {
+			return ""
+		}
+	}
+	return name
+}
+
+// publicToolNames 返回 names 都能写进对外说明时的原名单；其中任何一个不能写时为 nil（只列一部分会让人误以为只要求这几个）
+func publicToolNames(names []string) []string {
+	for _, name := range names {
+		if publicToolName(name) == "" {
+			return nil
+		}
+	}
+	return names
 }
 
 // toolContract 保存客户端显式要求的调用模式与参数契约
@@ -31,6 +146,12 @@ type toolContract struct {
 	names      map[string]bool
 	schemas    map[string]*jsonschema.Schema
 	serverSide bool
+	// searchHints 为按搜索偏好追加的要求，toolNames 为必须调用时写进要求的工具名（被选中的函数，必须调用且声明了内置工具时含内置工具）。
+	// 同账号重新生成时据此重写系统指令里的工具要求（见 tool_guard.go 的 toolHintsFor）
+	searchHints []string
+	toolNames   []string
+	// functionNames 为被选中的函数（按声明顺序）
+	functionNames []string
 }
 
 // ValidateToolChoice 检查工具选择本身是否成立（函数重名、指定了未声明的函数、要求调用却没有工具）。
@@ -94,6 +215,7 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 		required: config.Mode == "required",
 		single:   config.ParallelCalls != nil && !*config.ParallelCalls && len(request.Tools.Functions) > 0,
 		names:    map[string]bool{}, schemas: map[string]*jsonschema.Schema{},
+		searchHints: slices.Clone(hints),
 	}
 	functions := make([]FunctionDeclaration, 0, len(request.Tools.Functions))
 	for _, declaration := range request.Tools.Functions {
@@ -104,6 +226,7 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 			declaration.Strict = true
 		}
 		contract.names[declaration.Name] = true
+		contract.functionNames = append(contract.functionNames, declaration.Name)
 		functions = append(functions, declaration)
 		if !declaration.Strict {
 			continue
@@ -132,10 +255,13 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 				names = append(names, "google_search")
 			}
 		}
-		hints = append(hints, "Use one of these tools in this response: "+strings.Join(names, ", ")+". Use the tool before answering.")
-	}
-	if contract.single {
-		hints = append(hints, "Call at most one function in this response.")
+		contract.toolNames = names
+		// 第一次发送就用明确的写法（第 1 级：必须调用、参数符合 Schema、不要只回复文字，见 toolHintsFor）：原先第一次发送写
+		// “Use one of these tools in this response: …. Use the tool before answering.”，gemini-4 等走 Playground 时常不照做，
+		// 几乎每次都要在同账号多跑一整次生成。Build 通道另有 functionCallingConfig 原生强制，多这句要求无害
+		hints, _ = contract.toolHintsFor(contract.firstLevel())
+	} else if contract.single {
+		hints = append(hints, toolSingleHint)
 	}
 	if len(hints) > 0 {
 		// 记下客户端的系统提示与追加的要求：发送前补做视频模型忽略系统提示时只去掉客户端的部分（见 ignoreOmniSystemPromptBeforeSend）
@@ -145,7 +271,22 @@ func prepareToolRequest(request GenerateRequest) (GenerateRequest, *toolContract
 	if !contract.required && len(config.AllowedFunctionNames) == 0 && len(contract.schemas) == 0 && !contract.single {
 		contract = nil
 	}
+	// 契约随请求交给 Client.Generate：Playground 通道在解码循环里核对（必须调用时扣住事件，违约且还没交出事件时同账号重新生成，
+	// 见 tool_guard.go），Build 与 Interaction 通道照旧经 forward 核对
+	request.toolContract = contract
 	return request, contract, nil
+}
+
+// toolSingleHint 为要求单次调用时追加的要求
+const toolSingleHint = "Call at most one function in this response."
+
+// firstLevel 返回第一次发送的工具要求级别（见 toolHintsFor）：必须调用时为 1（第一次发送就写明必须调用），其余为 0
+// （auto 模式的 strict 或单次调用照旧只写搜索偏好与单次调用，与原先逐字节相同）
+func (contract *toolContract) firstLevel() int {
+	if contract != nil && contract.required {
+		return 1
+	}
+	return 0
 }
 
 // joinToolHints 把工具要求（以换行连接）追加在系统提示之后
@@ -281,27 +422,20 @@ func (contract *toolContract) forward(ctx context.Context, source <-chan Event) 
 			if event.Kind == EventGrounding || event.Kind == EventExecutableCode || event.Kind == EventCodeExecutionResult {
 				serverSideUsed = true
 			}
-			var violation string
+			var violation *ToolContractError
 			if event.Kind == EventToolCall && event.ToolCall != nil {
 				calls++
-				call := event.ToolCall
 				if contract.single && calls > 1 {
 					// 要求单次调用而上游返回了多个：只保留第一个，其余丢弃
 					continue
 				}
-				if !contract.names[call.Name] {
-					violation = fmt.Sprintf("上游调用了未选择的函数 %q", call.Name)
-				} else if schema := contract.schemas[call.Name]; schema != nil {
-					if err := validateToolArguments(schema, call.Arguments); err != nil {
-						violation = fmt.Sprintf("函数 %q 的参数不符合 strict Schema: %v", call.Name, err)
-					}
-				}
+				violation = contract.check(*event.ToolCall)
 			}
 			if event.Kind == EventFinish && contract.required && calls == 0 && !(contract.serverSide && serverSideUsed) {
-				violation = "要求调用工具，上游没有返回工具调用"
+				violation = contract.missingCall("")
 			}
-			if violation != "" {
-				event = Event{Kind: EventError, Err: &ToolContractError{Detail: violation}}
+			if violation != nil {
+				event = Event{Kind: EventError, Err: violation}
 				failed = true
 			}
 			select {
@@ -315,6 +449,45 @@ func (contract *toolContract) forward(ctx context.Context, source <-chan Event) 
 		}
 	}()
 	return destination
+}
+
+// check 核对一个函数调用：调用了未选择的函数、strict 参数不符时返回违约
+func (contract *toolContract) check(call FunctionCall) *ToolContractError {
+	if !contract.names[call.Name] {
+		return &ToolContractError{Kind: ToolContractUnselectedFunction, Detail: fmt.Sprintf("上游调用了未选择的函数 %q", call.Name)}
+	}
+	if schema := contract.schemas[call.Name]; schema != nil {
+		if err := validateToolArguments(schema, call.Arguments); err != nil {
+			reason := err.Error()
+			if runes := []rune(reason); len(runes) > regenerationNoteLimit {
+				reason = string(runes[:regenerationNoteLimit]) + "…"
+			}
+			return &ToolContractError{
+				Kind: ToolContractSchemaMismatch, Function: call.Name,
+				Detail: fmt.Sprintf("函数 %q 的参数不符合 strict Schema: %s", call.Name, reason),
+			}
+		}
+	}
+	return nil
+}
+
+// missingCall 返回要求调用却没有调用的违约；ending 为结束的情形（例如“结束原因=stop”），写进日志
+func (contract *toolContract) missingCall(ending string) *ToolContractError {
+	detail := "要求调用工具，上游没有返回工具调用"
+	if len(contract.toolNames) > 0 {
+		detail = "要求调用工具 " + strings.Join(contract.toolNames, ", ") + "，上游没有返回工具调用"
+	}
+	if ending != "" {
+		detail += "（" + ending + "）"
+	}
+	return &ToolContractError{
+		Kind: ToolContractMissingCall, Detail: detail, Required: slices.Clone(contract.toolNames), SingleFunction: contract.singleFunction(),
+	}
+}
+
+// singleFunction 判断必须调用的只有一个工具，且它就是唯一被选中的函数（不是内置工具）
+func (contract *toolContract) singleFunction() bool {
+	return len(contract.toolNames) == 1 && len(contract.functionNames) == 1 && contract.toolNames[0] == contract.functionNames[0]
 }
 
 func validateToolArguments(schema *jsonschema.Schema, arguments []byte) error {

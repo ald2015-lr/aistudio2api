@@ -469,6 +469,9 @@ func (round *longRound) usageOrEstimate(request GenerateRequest, first bool) Usa
 type longOutputRounds struct {
 	continued atomic.Bool
 	delivered atomic.Bool
+	// holdsTools 为工具约束要求必须调用（Generate 扣住事件到第一个通过核对的调用，见 tool_guard.go）：还没调用就结束的第一轮
+	// 是违约，可能被重新生成放弃
+	holdsTools bool
 }
 
 // started 判断续写已决定发第二轮
@@ -484,9 +487,9 @@ func (rounds *longOutputRounds) markDelivered() {
 }
 
 // mayRegenerate 判断只有一轮就结束的第一轮可能被 Generate 重新生成放弃：还没向下游交出任何事件，结束原因又是 Generate 因之重新生成的
-// （regenerableFinish：函数调用格式错误、意外的工具调用）
+// （regenerableFinish：函数调用格式错误、意外的工具调用），或工具约束要求必须调用（扣住事件时还没交出事件就是还没有调用）
 func (rounds *longOutputRounds) mayRegenerate(finishReason string) bool {
-	return rounds != nil && !rounds.delivered.Load() && regenerableFinish(finishReason)
+	return rounds != nil && !rounds.delivered.Load() && (regenerableFinish(finishReason) || rounds.holdsTools)
 }
 
 // decodeLongRounds 解码 long- 请求的第一轮并按计划续写（见文件开头说明），各轮输出依次交给 emit；用量与结束事件只在最后发出一次。

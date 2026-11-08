@@ -107,6 +107,8 @@ func ignoreOmniSystemPromptBeforeSend(request *GenerateRequest, model Model) (st
 	}
 	drop := DropClientSystemPrompt(&system, &request.Contents)
 	if hints != "" {
+		// 客户端的系统提示同样记下去掉之后的样子：同账号重新生成时按它重写工具要求（见 tool_guard.go），不能把去掉的系统提示又加回来
+		request.clientSystem = system
 		system = joinToolHints(system, hints)
 	}
 	request.System = system

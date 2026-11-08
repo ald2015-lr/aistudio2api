@@ -491,3 +491,182 @@ func TestUpstreamActivityMonotonic(t *testing.T) {
 		t.Fatalf("logFields = %q，格式应不变", fields)
 	}
 }
+
+// heldActivity 为扣住测试用的上游活动：touch 记一次上游字节，quiet 与 upstreamActivity.quietFor 的口径相同
+type heldActivity struct {
+	mu   sync.Mutex
+	last time.Time
+}
+
+func (activity *heldActivity) touch() {
+	activity.mu.Lock()
+	activity.last = time.Now()
+	activity.mu.Unlock()
+}
+
+func (activity *heldActivity) quiet(now, progress time.Time) time.Duration {
+	activity.mu.Lock()
+	defer activity.mu.Unlock()
+	quiet := now.Sub(progress)
+	if !activity.last.IsZero() && now.Sub(activity.last) < quiet {
+		quiet = now.Sub(activity.last)
+	}
+	return quiet
+}
+
+// keepActive 在 done 关闭之前每 interval 记一次上游活动
+func (activity *heldActivity) keepActive(interval time.Duration, done <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				activity.touch()
+			case <-done:
+				return
+			}
+		}
+	}()
+}
+
+// TestGenerateContextHoldUpstream 扣住上游事件期间退出首事件前的固定期限：上游持续活动时越过首事件前期限的数倍仍不结束，期限为总时长上限；
+// 上游停下后约一个空闲期限按扣住期间空闲到期（仍算首事件前：startExpired、startDeadlineError 照常标注），错误文本写明扣住
+func TestGenerateContextHoldUpstream(t *testing.T) {
+	const start, total = 100 * time.Millisecond, 10 * time.Second
+	startedAt := time.Now()
+	gc := newGenerateContext(context.Background(), startedAt, start, total)
+	defer gc.cancel()
+	activity := &heldActivity{}
+	if !gc.holdUpstream(activity.quiet) {
+		t.Fatal("首事件前应能扣住")
+	}
+	if deadline, _ := gc.Deadline(); !deadline.Equal(startedAt.Add(total)) {
+		t.Fatalf("扣住期间期限 = %v，期望总时长上限 %v", deadline, startedAt.Add(total))
+	}
+	done := make(chan struct{})
+	activity.keepActive(20*time.Millisecond, done)
+	time.Sleep(4 * start)
+	if !stillRunning(gc) {
+		t.Fatalf("上游持续活动时不应到期: %v %+v", gc.Err(), gc.deadlineCause())
+	}
+	close(done)
+	stoppedAt := time.Now()
+	awaitDone(t, gc, start+deadlineSlack, "扣住期间空闲")
+	if quiet := time.Since(stoppedAt); quiet < start-deadlineEarly-20*time.Millisecond {
+		t.Fatalf("上游停下 %s 就到期，期望约一个空闲期限 %s", quiet, start)
+	}
+	cause := gc.deadlineCause()
+	if gc.Err() != context.DeadlineExceeded || cause == nil || !cause.held || cause.stage != serviceDeadlineIdle || cause.limit != start || !gc.startExpired() {
+		t.Fatalf("Err=%v cause=%+v，期望扣住期间空闲", gc.Err(), cause)
+	}
+	cut, ok := gc.startDeadlineError(context.Canceled, "扣住上游事件")
+	if !ok || cut.label() != "扣住期间空闲" ||
+		cut.Error() != "本服务扣住期间空闲期限 100ms 到期（生成服务扣住上游事件等待工具调用，上游没有动静）: context deadline exceeded" {
+		t.Fatalf("标注 = %v %v", ok, cut)
+	}
+	if gc.holdUpstream(activity.quiet) || gc.beginStreaming() {
+		t.Fatal("已结束时不应再扣住或切到首事件后")
+	}
+}
+
+// TestGenerateContextHoldEnd 扣住的尝试没有交出首事件就结束（endHold）：首事件前期限恢复并顺延扣住的时长（不立即到期），之后按首事件前到期，
+// 错误文本写明扣住的时间不计入；扣住之后交出首事件（beginStreaming）时期限为总时长上限
+func TestGenerateContextHoldEnd(t *testing.T) {
+	const start, total = 150 * time.Millisecond, 10 * time.Second
+	startedAt := time.Now()
+	gc := newGenerateContext(context.Background(), startedAt, start, total)
+	defer gc.cancel()
+	activity := &heldActivity{}
+	gc.holdUpstream(activity.quiet)
+	done := make(chan struct{})
+	activity.keepActive(20*time.Millisecond, done)
+	time.Sleep(2 * start)
+	close(done)
+	gc.endHold()
+	gc.endHold()
+	if deadline, _ := gc.Deadline(); deadline.Before(startedAt.Add(3*start)) || deadline.After(time.Now().Add(start)) {
+		t.Fatalf("退出扣住后期限 = %v，期望首事件前期限顺延扣住的时长", deadline.Sub(startedAt))
+	}
+	if !stillRunning(gc) {
+		t.Fatalf("退出扣住后不应立即到期: %v", gc.Err())
+	}
+	awaitDone(t, gc, start+deadlineSlack, "顺延后的首事件前期限")
+	cause := gc.deadlineCause()
+	if cause == nil || cause.held || cause.stage != serviceDeadlineStart || cause.heldFor < 2*start-deadlineEarly {
+		t.Fatalf("cause=%+v，期望首事件前且记下扣住时长", cause)
+	}
+	if text := cause.Error(); !regexp.MustCompile(`^本服务首事件前期限 150ms 到期（扣住上游事件的 \d+ms 不计入）: context deadline exceeded$`).MatchString(text) {
+		t.Fatalf("错误文本 = %q", text)
+	}
+
+	streaming := newGenerateContext(context.Background(), startedAt, time.Second, total)
+	defer streaming.cancel()
+	streaming.holdUpstream(activity.quiet)
+	if !streaming.beginStreaming() {
+		t.Fatal("扣住后应能交出首事件")
+	}
+	if deadline, _ := streaming.Deadline(); !deadline.Equal(startedAt.Add(total)) {
+		t.Fatalf("交出首事件后期限 = %v，期望总时长上限", deadline.Sub(startedAt))
+	}
+	streaming.endHold()
+	if deadline, _ := streaming.Deadline(); !deadline.Equal(startedAt.Add(total)) || streaming.holdUpstream(activity.quiet) {
+		t.Fatal("首事件后不应再扣住或退出扣住")
+	}
+}
+
+// TestGenerateContextHoldTotal 扣住期间上游一直活动、到总时长上限时按扣住期间的总时长上限到期
+func TestGenerateContextHoldTotal(t *testing.T) {
+	const start, total = 50 * time.Millisecond, 300 * time.Millisecond
+	startedAt := time.Now()
+	gc := newGenerateContext(context.Background(), startedAt, start, total)
+	defer gc.cancel()
+	activity := &heldActivity{}
+	done := make(chan struct{})
+	defer close(done)
+	activity.keepActive(10*time.Millisecond, done)
+	gc.holdUpstream(activity.quiet)
+	awaitDone(t, gc, total+deadlineSlack, "扣住期间的总时长上限")
+	if elapsed := time.Since(startedAt); elapsed < total-deadlineEarly {
+		t.Fatalf("用时 %s 就结束，期望不早于总时长上限 %s", elapsed, total)
+	}
+	cause := gc.deadlineCause()
+	if cause == nil || !cause.held || cause.stage != serviceDeadlineTotal || cause.label() != "扣住期间总时长上限" ||
+		cause.Error() != "本服务总时长上限 300ms 到期（生成服务扣住上游事件等待工具调用）: context deadline exceeded" {
+		t.Fatalf("cause=%+v %v", cause, cause)
+	}
+}
+
+// TestGenerateContextHoldLongRound long- 续写在扣住期间开始下一轮：总时长上限照常从此刻重新计算，登记的这一轮结束函数在扣住期间同样生效
+// （空闲到期只结束这一轮，之后仍没有动静才结束整个请求）
+func TestGenerateContextHoldLongRound(t *testing.T) {
+	const start, total = 100 * time.Millisecond, 10 * time.Second
+	startedAt := time.Now()
+	gc := newGenerateContext(context.Background(), startedAt, start, total)
+	defer gc.cancel()
+	activity := &heldActivity{}
+	gc.holdUpstream(activity.quiet)
+	time.Sleep(20 * time.Millisecond)
+	interrupted := make(chan error, 1)
+	if _, ok := gc.beginLongRound(func(err error) { interrupted <- err }); !ok {
+		t.Fatal("扣住期间应能登记下一轮")
+	}
+	if deadline, _ := gc.Deadline(); !deadline.After(startedAt.Add(total)) {
+		t.Fatalf("开始下一轮后总时长上限应从此刻重新计算：%v", deadline.Sub(startedAt))
+	}
+	select {
+	case err := <-interrupted:
+		if err == nil || err.Error() != "本服务扣住期间空闲期限 100ms 到期（生成服务扣住上游事件等待工具调用，上游没有动静）" {
+			t.Fatalf("结束这一轮的原因 = %v", err)
+		}
+	case <-time.After(start + deadlineSlack):
+		t.Fatal("扣住期间空闲到期时应只结束这一轮")
+	}
+	if !stillRunning(gc) {
+		t.Fatalf("只结束这一轮时请求不应结束: %v", gc.Err())
+	}
+	awaitDone(t, gc, start+deadlineSlack, "这一轮结束后仍没有动静")
+	if cause := gc.deadlineCause(); cause == nil || !cause.held || cause.stage != serviceDeadlineIdle {
+		t.Fatalf("cause=%+v，期望扣住期间空闲", cause)
+	}
+}

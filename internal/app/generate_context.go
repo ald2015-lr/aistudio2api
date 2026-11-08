@@ -18,6 +18,11 @@ import (
 //     整段不超过总时长上限的 longOutputDurationFactor 倍（见 renewTotal）。long- 自动续写第二轮起登记了这一轮的结束函数
 //     （beginLongRound）时，首事件后空闲期限与总时长上限（含绝对总时长上限）到期只结束这一轮，续写按这一轮失败体面结束
 //     （已输出的内容完整返回、按 max_tokens 结束），longRoundGrace 后整个请求仍没有结束时才按期限到期结束。
+//   - 扣住上游事件（holdUpstream）：工具约束要求必须调用时生成服务把上游已经返回的正文、思考扣住到调用出现（见 aistudio/tool_guard.go），
+//     app 层收不到首事件，但上游正在输出。这时仍在首事件前（换号、首事件判定不变），只是退出首事件前的固定期限：期限（Deadline）改为
+//     总时长上限，上游连续 REQUEST_TIMEOUT 既没有网络字节也没有新的发送（同一尝试内的重新生成，touchHold）时按扣住期间空闲到期；
+//     long- 续写的各轮照常重新计算总时长上限，登记的这一轮结束函数同样生效。扣住的尝试没有交出首事件就结束（换号再试）时
+//     退出扣住（endHold），首事件前期限恢复，扣住的时间不计入（期限顺延扣住的时长，不超过总时长上限）。
 //
 // 三种期限到期时 Err() 都是 context.DeadlineExceeded 本身（不包装），deadlineCause 给出是哪一段；
 // 父上下文取消、管理端取消、生成服务停止时为父上下文的错误或 context.Canceled。三段期限都在创建时取值，热更新只影响新请求。
@@ -92,22 +97,38 @@ type serviceDeadlineError struct {
 	// inner 为首事件前到期时原来的错误（带等待原因的 ctx 错误，如“排队 … 后请求超时（最后原因=…）”）；只在它满足
 	// DeadlineExceeded 且不含 context.Canceled 时保留
 	inner error
+	// held 为期限在生成服务扣住上游事件期间到期（还没有交出首事件，见 holdUpstream）：stage 为空闲或总时长上限
+	held bool
+	// heldFor 为首事件前期限到期时此前扣住上游事件的累计时长（不计入首事件前期限，见 endHold）
+	heldFor time.Duration
 }
 
 func (e *serviceDeadlineError) Error() string {
+	return e.head() + ": " + e.Unwrap().Error()
+}
+
+// head 为错误文本里原错误之前的部分：哪一段期限、多长，首事件前期限到期时停在哪一步（扣住期间到期时文本已写明，不另写）
+func (e *serviceDeadlineError) head() string {
 	var head string
-	switch e.stage {
-	case serviceDeadlineStart:
+	switch {
+	case e.held && e.stage == serviceDeadlineIdle:
+		head = fmt.Sprintf("本服务扣住期间空闲期限 %s 到期（生成服务扣住上游事件等待工具调用，上游没有动静）", e.limit)
+	case e.held:
+		head = fmt.Sprintf("本服务总时长上限 %s 到期（生成服务扣住上游事件等待工具调用）", e.limit)
+	case e.stage == serviceDeadlineStart:
 		head = fmt.Sprintf("本服务首事件前期限 %s 到期", e.limit)
+		if e.heldFor > 0 {
+			head += fmt.Sprintf("（扣住上游事件的 %s 不计入）", e.heldFor.Round(time.Millisecond))
+		}
 		if e.where != "" {
 			head += "（停在 " + e.where + "）"
 		}
-	case serviceDeadlineIdle:
+	case e.stage == serviceDeadlineIdle:
 		head = fmt.Sprintf("本服务首事件后空闲期限 %s 到期（已输出 推理=%d 正文=%d）", e.limit, e.reasoning, e.content)
 	default:
 		head = fmt.Sprintf("本服务总时长上限 %s 到期（已输出 推理=%d 正文=%d）", e.limit, e.reasoning, e.content)
 	}
-	return head + ": " + e.Unwrap().Error()
+	return head
 }
 
 func (e *serviceDeadlineError) Unwrap() error {
@@ -115,6 +136,22 @@ func (e *serviceDeadlineError) Unwrap() error {
 		return e.inner
 	}
 	return context.DeadlineExceeded
+}
+
+// label 为写进进度日志的阶段名：扣住上游事件期间到期时另标出
+func (e *serviceDeadlineError) label() string {
+	if !e.held {
+		return e.stage.label()
+	}
+	if e.stage == serviceDeadlineIdle {
+		return "扣住期间空闲"
+	}
+	return "扣住期间总时长上限"
+}
+
+// beforeFirstEvent 判断期限在交出首事件之前到期：首事件前期限，或扣住上游事件期间的空闲、总时长上限
+func (e *serviceDeadlineError) beforeFirstEvent() bool {
+	return e != nil && (e.stage == serviceDeadlineStart || e.held)
 }
 
 // withOutput 返回带已输出事件数的副本
@@ -161,6 +198,15 @@ type generateContext struct {
 	// 调用过（之后到期按原规则结束整个请求）
 	longRound      func(error)
 	longRoundFired bool
+	// held 为首事件前生成服务扣住了上游已经返回的事件（见 holdUpstream）：期限（deadline）为总时长上限，计时器按上游活动判空闲；
+	// heldSince 为这次扣住的开始时刻，heldProgress 为最近一次新的发送（扣住开始、同一尝试内重新生成，见 touchHold），
+	// heldQuiet 返回上游从 progress 起连续没有活动的时间（本次尝试的网络字节，long- 两轮之间暂停计时）；
+	// heldFor 为此前各次扣住的累计时长（退出扣住后不计入首事件前期限）
+	held         bool
+	heldSince    time.Time
+	heldProgress time.Time
+	heldQuiet    func(now, progress time.Time) time.Duration
+	heldFor      time.Duration
 }
 
 var _ context.Context = (*generateContext)(nil)
@@ -186,7 +232,8 @@ func newGenerateContext(parent context.Context, startedAt time.Time, requestTime
 	return c
 }
 
-// Deadline 返回当前期限：首事件前为首事件前期限，首事件后为总时长上限；父上下文的期限更早时按父上下文
+// Deadline 返回当前期限：首事件前为首事件前期限（扣住上游事件期间为总时长上限，见 holdUpstream），首事件后为总时长上限；
+// 父上下文的期限更早时按父上下文
 func (c *generateContext) Deadline() (time.Time, bool) {
 	c.mu.Lock()
 	deadline := c.deadline
@@ -283,22 +330,76 @@ func (c *generateContext) finishLocked(err error, cause *serviceDeadlineError) f
 // armLocked 把期限设为 deadline 并重设计时器；旧计时器的回调因代数改变而作废
 func (c *generateContext) armLocked(deadline time.Time) {
 	c.deadline = deadline
+	c.armTimerLocked(deadline)
+}
+
+// armTimerLocked 只重设计时器（到 at 时检查期限），不改期限
+func (c *generateContext) armTimerLocked(at time.Time) {
 	c.timerGen++
 	gen := c.timerGen
 	if c.timer != nil {
 		c.timer.Stop()
 	}
-	c.timer = time.AfterFunc(time.Until(deadline), func() { c.deadlineReached(gen) })
+	c.timer = time.AfterFunc(time.Until(at), func() { c.deadlineReached(gen) })
 }
 
-// deadlineReached 为第 gen 代计时器到时：首事件前为首事件前期限到期，首事件后为总时长上限到期
+// heldQuietLocked 返回扣住期间上游从最近一次新的发送起连续没有活动的时间
+func (c *generateContext) heldQuietLocked(now time.Time) time.Duration {
+	if c.heldQuiet != nil {
+		return c.heldQuiet(now, c.heldProgress)
+	}
+	return now.Sub(c.heldProgress)
+}
+
+// armHeldLocked 扣住期间重设计时器：到空闲期限（按上游实际活动算出的剩余）与总时长上限中较早的一个时检查
+func (c *generateContext) armHeldLocked(now time.Time) {
+	at := c.deadline
+	if idleAt := now.Add(max(c.idleLimit-c.heldQuietLocked(now), 0)); idleAt.Before(at) {
+		at = idleAt
+	}
+	c.armTimerLocked(at)
+}
+
+// deadlineReached 为第 gen 代计时器到时：首事件前为首事件前期限到期（扣住上游事件期间为空闲或总时长上限，见 holdUpstream），
+// 首事件后为总时长上限到期
 func (c *generateContext) deadlineReached(gen uint64) {
 	c.mu.Lock()
 	if c.err != nil || gen != c.timerGen {
 		c.mu.Unlock()
 		return
 	}
-	cause := &serviceDeadlineError{stage: serviceDeadlineStart, limit: c.startLimit, elapsed: time.Since(c.startedAt)}
+	now := time.Now()
+	cause := &serviceDeadlineError{stage: serviceDeadlineStart, limit: c.startLimit, elapsed: now.Sub(c.startedAt), heldFor: c.heldFor}
+	if c.stage == generateStarting && c.held {
+		// 扣住上游事件期间：上游仍有活动时只把检查推后；空闲或到总时长上限时到期
+		cause.held, cause.heldFor = true, 0
+		if now.Before(c.deadline) {
+			if c.heldQuietLocked(now) < c.idleLimit {
+				c.armHeldLocked(now)
+				c.mu.Unlock()
+				return
+			}
+			cause.stage, cause.limit = serviceDeadlineIdle, c.idleLimit
+		} else {
+			cause.stage, cause.limit = serviceDeadlineTotal, c.totalLimit
+		}
+		if interrupt := c.longRound; interrupt != nil && !c.longRoundFired {
+			// long- 自动续写第二轮起：只结束当前这一轮（与首事件后相同），之后仍没有结束时再按原规则结束整个请求
+			c.longRoundFired = true
+			if cause.stage == serviceDeadlineTotal {
+				c.deadline = now.Add(longRoundGrace)
+			}
+			c.heldProgress = now
+			c.armHeldLocked(now)
+			c.mu.Unlock()
+			interrupt(errors.New(cause.head()))
+			return
+		}
+		after := c.finishLocked(context.DeadlineExceeded, cause)
+		c.mu.Unlock()
+		after()
+		return
+	}
 	if c.stage == generateStreaming {
 		cause.stage, cause.limit = serviceDeadlineTotal, c.totalLimit
 		if interrupt := c.longRound; interrupt != nil && !c.longRoundFired {
@@ -328,9 +429,73 @@ func (c *generateContext) beginStreaming() bool {
 	}
 	if c.stage == generateStarting {
 		c.stage = generateStreaming
-		c.armLocked(c.startedAt.Add(c.maxDuration))
+		if c.held {
+			// 扣住上游事件之后交出首事件：期限已是总时长上限（long- 续写的各轮可能已重新计算过），照用
+			c.held, c.heldQuiet = false, nil
+			c.armLocked(c.deadline)
+		} else {
+			c.armLocked(c.startedAt.Add(c.maxDuration))
+		}
 	}
 	return true
+}
+
+// holdUpstream 在生成服务扣住上游已经返回的事件时调用（app 层经 firstEventDeadline.PauseFirstEvent，见 aistudio/tool_guard.go）：
+// 仍在首事件前，但退出首事件前的固定期限，期限改为总时长上限，上游连续一个 REQUEST_TIMEOUT 没有活动（quiet 返回从 progress 起
+// 连续没有活动的时间）时按扣住期间空闲到期。同一尝试内再次扣住（重新生成之后）只刷新空闲计时。首事件后、已结束或为 nil 时
+// 不做任何事并返回 false
+func (c *generateContext) holdUpstream(quiet func(now, progress time.Time) time.Duration) bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil || c.stage != generateStarting {
+		return false
+	}
+	now := time.Now()
+	if !c.held {
+		c.held, c.heldSince = true, now
+		c.deadline, c.totalLimit = c.startedAt.Add(c.maxDuration), c.maxDuration
+	}
+	c.heldQuiet, c.heldProgress = quiet, now
+	c.armHeldLocked(now)
+	return true
+}
+
+// touchHold 在扣住上游事件的尝试内重新发送时调用（重新生成、续写回退的重发，见 firstEventDeadline.RestartFirstEvent）：
+// 空闲计时从此刻重新计（准备 WAA proof、等响应头与首个字节合计仍受 REQUEST_TIMEOUT 约束）。没有扣住或为 nil 时不做任何事
+func (c *generateContext) touchHold() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil || c.stage != generateStarting || !c.held {
+		return
+	}
+	c.heldProgress = time.Now()
+}
+
+// endHold 在扣住过上游事件的尝试没有交出首事件就结束时调用（以错误结束、换号再试）：退出扣住，首事件前期限恢复并顺延扣住的时长
+// （扣住期间上游在正常输出，不算等首事件的时间），不超过总时长上限；已到时立即按首事件前期限到期。没有扣住或为 nil 时不做任何事
+func (c *generateContext) endHold() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil || c.stage != generateStarting || !c.held {
+		return
+	}
+	c.heldFor += time.Since(c.heldSince)
+	c.held, c.heldQuiet = false, nil
+	c.totalLimit = c.maxDuration
+	deadline := c.startedAt.Add(c.startLimit + c.heldFor)
+	if ceiling := c.startedAt.Add(c.maxDuration); deadline.After(ceiling) {
+		deadline = ceiling
+	}
+	c.armLocked(deadline)
 }
 
 // renewTotal 在 long- 自动续写开始新一轮时调用（见 long_output.go）：首事件后的总时长上限从此刻重新计算（照上游每轮重新计时的做法），
@@ -345,16 +510,23 @@ func (c *generateContext) renewTotal() bool {
 	return c.renewTotalLocked()
 }
 
-// renewTotalLocked 为 renewTotal 在 mu 内的部分
+// renewTotalLocked 为 renewTotal 在 mu 内的部分；扣住上游事件期间（见 holdUpstream）同样重新计算总时长上限
 func (c *generateContext) renewTotalLocked() bool {
-	if c.err != nil || c.stage != generateStreaming {
+	held := c.stage == generateStarting && c.held
+	if c.err != nil || c.stage != generateStreaming && !held {
 		return false
 	}
-	deadline, limit := time.Now().Add(c.maxDuration), c.maxDuration
+	now := time.Now()
+	deadline, limit := now.Add(c.maxDuration), c.maxDuration
 	if ceiling := c.startedAt.Add(c.longLimit); deadline.After(ceiling) {
 		deadline, limit = ceiling, c.longLimit
 	}
 	c.totalLimit = limit
+	if held {
+		c.deadline = deadline
+		c.armHeldLocked(now)
+		return true
+	}
 	c.armLocked(deadline)
 	return true
 }
@@ -426,10 +598,9 @@ func (c *generateContext) deadlineCause() *serviceDeadlineError {
 	return c.cause
 }
 
-// startExpired 判断是否因首事件前期限到期而结束，nil 安全
+// startExpired 判断是否在交出首事件之前因本服务期限到期而结束（首事件前期限，或扣住上游事件期间的空闲、总时长上限），nil 安全
 func (c *generateContext) startExpired() bool {
-	cause := c.deadlineCause()
-	return cause != nil && cause.stage == serviceDeadlineStart
+	return c.deadlineCause().beforeFirstEvent()
 }
 
 // idleTimeout 返回首事件后空闲期限；nil 时为 0，表示不检查空闲
@@ -448,7 +619,7 @@ func (c *generateContext) startDeadlineError(err error, where string) (*serviceD
 		return nil, false
 	}
 	cause := c.deadlineCause()
-	if cause == nil || cause.stage != serviceDeadlineStart {
+	if !cause.beforeFirstEvent() {
 		return nil, false
 	}
 	var marked *serviceDeadlineError

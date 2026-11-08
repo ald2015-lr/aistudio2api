@@ -110,7 +110,7 @@ func TestSentInputReflectsRewrites(t *testing.T) {
 	if input.Channel != ChannelPlayground || len(input.Contents) != 1 || input.Contents[0].Parts[0].Text != "latest" {
 		t.Fatalf("实际输入应为截断后的最新一轮，得到 %d 条消息", len(input.Contents))
 	}
-	if !strings.HasPrefix(input.System, "be brief\n") || !strings.Contains(input.System, "Use one of these tools in this response: get_weather") {
+	if !strings.HasPrefix(input.System, "be brief\n") || !strings.Contains(input.System, "You must call the function get_weather in this response") {
 		t.Fatalf("实际系统指令应包含工具约束提示: %q", input.System)
 	}
 	if len(input.Tools.Functions) != 1 || input.Tools.Functions[0].Name != "get_weather" {

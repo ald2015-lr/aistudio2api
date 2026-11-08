@@ -658,16 +658,33 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 	// 以模型轮原样发送（原生续写）：Interaction 模型与近期在该通道拒绝过的模型改回补用户消息
 	request = applyPrefillMemory(ctx, request, channel, entry.model.ID, interaction)
 	reportSentInput(ctx, channel, request)
+	// contract 为需要在事件流上核对的工具约束（见 prepareToolRequest）：Interaction 与 Build 通道照旧经 forward 核对；
+	// Playground 通道在下面的解码循环里核对，必须调用时扣住事件，违约且还没交出事件时同账号重新生成（见 tool_guard.go）
+	contract := request.toolContract
 	if interaction {
-		return c.generateInteraction(ctx, request, entry)
+		events, err := c.generateInteraction(ctx, request, entry)
+		if err != nil {
+			return nil, err
+		}
+		return contract.forward(ctx, events), nil
+	}
+	var guard *toolGuard
+	if !build {
+		guard = newToolGuard(contract)
 	}
 	// source 为整理成线格式之前的请求：改回补用户消息与因结束原因换输入都在它上面改，再按第一次发送的步骤重建
+	// （因工具约束重新生成时另把工具要求写得更明确，见 rebuild）
 	source := request
 	var wireRequest GenerateRequest
 	request, wireRequest = playgroundWireRequest(source, entry)
+	// rebuild 按 source 与工具要求的级别重建发往上游的请求（级别与第一次发送相同时与第一次发送的步骤相同）
+	rebuild := func() {
+		request, wireRequest = playgroundWireRequest(guard.apply(source), entry)
+	}
 	// rounds 记录 long- 请求的续写是否已决定发第二轮（见 continuation.go）：之后不再重新生成、不再按原生续写被拒改回补用户消息。
-	// 续写的后续轮次在原始上下文 ctx 上发送：重发的上下文（resendCtx）每次开始发送都重新起算首事件计时，续写各轮不能这样
-	rounds := &longOutputRounds{}
+	// 续写的后续轮次在原始上下文 ctx 上发送：重发的上下文（resendCtx）每次开始发送都重新起算首事件计时，续写各轮不能这样。
+	// 必须调用工具时第一轮的事件先扣住，还没调用就结束的第一轮可能被重新生成放弃（见 longOutputRounds.mayRegenerate）
+	rounds := &longOutputRounds{holdsTools: guard.holds()}
 	sendRequest := func(sendCtx context.Context) (*RPCResponse, func(io.Reader, func(Event) error) error, error) {
 		if build {
 			return c.sendBuild(sendCtx, wireRequest, entry)
@@ -689,7 +706,7 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		}
 		ReportRequestNote(ctx, prefillFallbackNote(entry.model.ID, channel, cause))
 		source = withPrefillContinuation(source)
-		request, wireRequest = playgroundWireRequest(source, entry)
+		rebuild()
 		reportSentInput(ctx, channel, request)
 		return ""
 	}
@@ -762,6 +779,8 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		matchedStopSequence := ""
 		// delivered 为已经向客户端交出过内容（正文、思考、工具调用、媒体等任何事件）：之后不再重新生成
 		delivered := false
+		// attemptStarted 为本次发送的开始时刻：重新生成前按它估计再来一次要多久，剩余期限不够时不重新生成
+		attemptStarted := sendStarted
 		emitEvent := func(event Event) error {
 			switch event.Kind {
 			case EventUsage:
@@ -784,12 +803,25 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 					}
 					event = hiddenThought(event)
 				}
-				if !delivered {
-					delivered = true
-					// long- 请求的第一轮据此判断这次结果还会不会被重新生成放弃（见 continuation.go 的 decodeLongRounds）
-					rounds.markDelivered()
+				// 工具约束：必须调用时扣住到第一个通过核对的调用，违约时结束这次解码（见 tool_guard.go）
+				pass, held, violation := guard.admit(event)
+				if violation != nil {
+					return violation
 				}
-				return send(event)
+				if held {
+					guard.pauseOnHold(ctx, attemptStarted)
+				}
+				for _, next := range pass {
+					if !delivered {
+						delivered = true
+						// long- 请求的第一轮据此判断这次结果还会不会被重新生成放弃（见 continuation.go 的 decodeLongRounds）
+						rounds.markDelivered()
+					}
+					if err := send(next); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 		}
 		emit := func(event Event) error {
@@ -818,17 +850,42 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			return nil
 		}
 		regenerations := regenerationBudgetFrom(ctx)
-		// attemptStarted 为本次发送的开始时刻：重新生成前按它估计再来一次要多久，剩余期限不够时不重新生成
-		attemptStarted := sendStarted
 		var err error
 		for {
 			reader := &streamReadFailure{source: observeStreamActivity(ctx, response.Body)}
 			err = decodeStream(reader, emit)
-			// 已交出内容、续写已发过第二轮（第二轮起的失败按续写规则体面结束，不重新生成）时照旧结束
-			if errors.Is(err, errStopSequenceMatched) || delivered || rounds.started() || ctx.Err() != nil {
+			if violation := guard.violation(err, finish); violation != nil {
+				// 工具约束未满足：还没交出事件时同账号重新生成（工具要求写得更明确），否则以 *ToolContractError 结束（扣住的事件不交出）
+				err = violation
+				if ctx.Err() != nil {
+					break
+				}
+				elapsed := time.Since(attemptStarted)
+				// 有随机后缀时换一个新的，工具要求还没到第 2 级时再加强一级；两样都不能变时（没有随机后缀、要求已是第 2 级）这次发送会与
+				// 上一次逐字节相同，与批次 B 一样不再重新生成（见 toolRegeneration）。换后缀的函数有状态（记着换过的后缀），只调用这一次，
+				// 结果留着重新生成时用
+				varied, variedOK := regenerationVariant(ctx, source)
+				sequence, ok := toolRegeneration(ctx, toolRegenerationInput{
+					violation: violation, finish: finish, delivered: delivered, continued: rounds.started(),
+					unchanged: !variedOK && !guard.canStrengthen(),
+					elapsed:   elapsed, firstEventElapsed: guard.firstEventElapsed(elapsed), budget: regenerations, model: entry.model.ID,
+				})
+				if !ok {
+					break
+				}
+				var changed []string
+				if variedOK {
+					source, changed = varied, append(changed, "已换随机后缀")
+				}
+				if guard.strengthen() {
+					changed = append(changed, "已加强工具要求")
+				}
+				rebuild()
+				ReportRequestNote(ctx, toolRegenerationNote(violation, finish, elapsed, sequence, strings.Join(changed, "，")))
+			} else if errors.Is(err, errStopSequenceMatched) || delivered || rounds.started() || ctx.Err() != nil {
+				// 已交出内容、续写已发过第二轮（第二轮起的失败按续写规则体面结束，不重新生成）时照旧结束
 				break
-			}
-			if err != nil && request.PrefillTail && prefillRejectedError(err) {
+			} else if err != nil && request.PrefillTail && prefillRejectedError(err) {
 				// 原生续写在流里被拒（流尾 400）：改回补用户消息重发一次，不占重新生成次数；本账号不能马上重发时交出 *PrefillRetryError，
 				// 作为首个事件交给 app 层换号再试
 				if denied := prefillFallback(err); denied != "" {
@@ -843,8 +900,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				elapsed := time.Since(attemptStarted)
 				reason += " | " + regenerationDetail(err, finish, elapsed)
 				// 三次生成共用首事件前期限（REQUEST_TIMEOUT），首事件超时每次重发重新起算：剩余时间不够再来一次（按本次耗时的 1.2 倍估计）
-				// 就按这次的结果结束，免得长思考模型把本可以交出的结果拖成 504、白白多烧一次额度
-				if short := regenerationTimeShort(ctx, elapsed); short != "" {
+				// 就按这次的结果结束，免得长思考模型把本可以交出的结果拖成 504、白白多烧一次额度。必须调用时扣住过事件的这次，
+				// 首事件超时按到扣住第一个事件的耗时判断（见 toolGuard.firstEventElapsed）
+				if short := regenerationTimeShort(ctx, elapsed, guard.firstEventElapsed(elapsed)); short != "" {
 					ReportRequestNote(ctx, "客户端还没收到内容，"+short+" | "+reason)
 					break
 				}
@@ -871,15 +929,17 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				input := "原样重发"
 				if variedOK {
 					source, input = varied, "已换随机后缀"
-					request, wireRequest = playgroundWireRequest(source, entry)
+					rebuild()
 				}
 				ReportRequestNote(ctx, fmt.Sprintf("客户端还没收到内容，同账号重新生成 | 第 %d/%d 次 | %s | 输入=%s", sequence, regenerationLimit, reason, input))
 			}
 			stopClose()
 			_ = response.Body.Close()
-			// 只交出最后一次的用量与结束事件；输出与停止序列从头计（停止序列暂存的正文属于丢弃的这次，没有交出过）
+			// 只交出最后一次的用量与结束事件；输出与停止序列从头计（停止序列暂存的正文属于丢弃的这次，没有交出过），
+			// 工具约束的核对从头计（扣住的事件属于丢弃的这次）
 			usage, usageModel, finish = nil, "", nil
 			output = generatedOutputParts{}
+			guard.reset()
 			matcher = newStopSequenceMatcher(request.Config.StopSequences)
 			matchedStopSequence = ""
 			attemptStarted = time.Now()
@@ -947,6 +1007,10 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 			_ = send(*finish)
 		}
 	}()
+	if build {
+		// Build 通道按 functionCallingConfig 原生执行，照旧在事件流上核对，不扣住、不重新生成
+		return contract.forward(ctx, events), nil
+	}
 	return events, nil
 }
 

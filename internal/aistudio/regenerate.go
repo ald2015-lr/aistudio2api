@@ -30,13 +30,19 @@ import (
 //     重新生成次数与续写轮数互不占用
 //   - 只交出最后一次的用量（前面几次的用量与结束事件丢弃），用量账本与访问日志只记一次；降级判定的计时从第一块正文开始，
 //     重新生成发生在任何正文之前，不受影响
-//   - 三次生成共用首事件前期限（REQUEST_TIMEOUT）：剩余期限不到本次耗时的 1.2 倍时不重新生成，按这次的结果结束；
+//   - 三次生成共用首事件前期限（REQUEST_TIMEOUT；必须调用时扣住上游事件期间为总时长上限，见 tool_guard.go）：剩余期限不到本次耗时的
+//     1.2 倍时不重新生成，按这次的结果结束；
 //     流尾 504（DEADLINE_EXCEEDED）不在同账号重来，交给 app 层换号
 //   - 首事件超时（FIRST_EVENT_TIMEOUT，app 层经 ContextWithFirstEventClock 交来）按每次发送计：每次重发重新起算（重发前与开始向上游
-//     发送时），FIRST_EVENT_TIMEOUT 不到本次耗时的 1.2 倍时不重新生成（重发多半被首事件计时打断，原本能交出的结果反倒成了首事件超时）
+//     发送时），FIRST_EVENT_TIMEOUT 不到本次等首事件耗时的 1.2 倍时不重新生成（重发多半被首事件计时打断，原本能交出的结果反倒成了
+//     首事件超时）。等首事件的耗时一般就是本次耗时；工具约束要求必须调用、本次发送扣住过事件时为到扣住第一个事件的耗时（首事件计时
+//     那时已暂停，见 tool_guard.go），剩余期限仍按整段耗时判断
 //   - 重新生成的发送不报告请求阶段（app 层的“WAA proof 完成”“上游已返回响应头”只写一次），每次重新生成写一行请求说明
 //     （ReportRequestNote：有观察者时只交给观察者，app 层写进该请求的进度日志与排查记录的时间线；没有观察者时写排查记录），
 //     附上被放弃那次的耗时与原文（结束说明、流尾错误说明或中断时的错误）
+//   - 工具约束违约（要求必须调用却只回复文字、调用了未选择的函数、strict 参数不符，见 tool_guard.go）同样在还没交出事件时同账号重新生成，
+//     共用这里的次数、准入、时间判断与首事件计时；必须调用时事件先扣住到调用出现，扣住的事件不算交出。这次的输入会与上一次相同
+//     （没有随机后缀可换、工具要求已是最高的第 2 级）时同样不原样重发
 //   - 已经交出内容的照旧结束：思考、正文或工具调用已经交给 app 层就不再重新生成。非流式请求同样以此为界：思考摘要先交出、之后才
 //     以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成（交出的事件已经过 app 层的首事件判定、
 //     降级判定与访问日志，没有撤回的办法）
@@ -130,6 +136,10 @@ type FirstEventClock interface {
 	FirstEventWindow() time.Duration
 	// RestartFirstEvent 为重发重新起算首事件计时；计时已到（这次尝试正被取消）或已停止时返回假
 	RestartFirstEvent() bool
+	// PauseFirstEvent 暂停首事件计时：生成服务扣住了上游已经返回的事件（工具约束要求必须调用、调用还没出现，见 tool_guard.go），
+	// 上游已经有了响应；同一尝试内的重发照常经 RestartFirstEvent 重新起算。app 层同时让请求上下文退出首事件前的固定期限、
+	// 改按上游活动判空闲（不论是否开启首事件超时）。计时已到或已停止时不做任何事
+	PauseFirstEvent()
 }
 
 type firstEventClockContextKey struct{}
@@ -169,18 +179,23 @@ func resendContext(ctx context.Context) context.Context {
 	})
 }
 
-// regenerationTimeShort 判断剩余时间够不够再来一次（按本次耗时的 1.2 倍估计）：首事件前期限（REQUEST_TIMEOUT）的剩余与
-// 首事件超时（FIRST_EVENT_TIMEOUT，每次重发重新起算）都要够，不够时返回写进说明的原因，够时为空
-func regenerationTimeShort(ctx context.Context, elapsed time.Duration) string {
-	need := elapsed + elapsed/5
+// regenerationTimeShort 判断剩余时间够不够再来一次（按耗时的 1.2 倍估计）：请求上下文期限的剩余（首事件前为 REQUEST_TIMEOUT，
+// 扣住上游事件期间为总时长上限，见 app/generate_context.go）要够本次发送的整段耗时 elapsed，首事件超时（FIRST_EVENT_TIMEOUT，
+// 每次重发重新起算）要够等首事件的耗时 firstEvent（没有扣住过事件时与 elapsed 相同；扣住过时为到扣住第一个事件的耗时，首事件计时
+// 那时已暂停）。不够时返回写进说明的原因，够时为空
+func regenerationTimeShort(ctx context.Context, elapsed, firstEvent time.Duration) string {
 	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < need {
+		if remaining := time.Until(deadline); remaining < elapsed+elapsed/5 {
 			return fmt.Sprintf("剩余期限不足（不到本次耗时的 1.2 倍），不重新生成 | 剩余=%s", max(remaining, 0).Round(time.Millisecond))
 		}
 	}
 	if clock := firstEventClockFrom(ctx); clock != nil {
-		if window := clock.FirstEventWindow(); window > 0 && window < need {
-			return fmt.Sprintf("首事件超时不到本次耗时的 1.2 倍（重发多半被首事件计时打断），不重新生成 | FIRST_EVENT_TIMEOUT=%s", window)
+		if window := clock.FirstEventWindow(); window > 0 && window < firstEvent+firstEvent/5 {
+			what := "本次耗时"
+			if firstEvent != elapsed {
+				what = "本次到扣住首个事件的耗时（" + firstEvent.Round(time.Millisecond).String() + "）"
+			}
+			return fmt.Sprintf("首事件超时不到%s的 1.2 倍（重发多半被首事件计时打断），不重新生成 | FIRST_EVENT_TIMEOUT=%s", what, window)
 		}
 	}
 	return ""

@@ -931,14 +931,17 @@ func TestGenerateRegenerationNeedsVariant(t *testing.T) {
 	}
 }
 
-// fakeFirstEventClock 为测试用的首事件计时：window 为首事件超时，restartOK 为重新起算的结果，记下重新起算的次数
+// fakeFirstEventClock 为测试用的首事件计时：window 为首事件超时，restartOK 为重新起算的结果，记下重新起算与暂停的次数
 type fakeFirstEventClock struct {
 	window    time.Duration
 	restartOK bool
 	restarts  atomic.Int32
+	pauses    atomic.Int32
 }
 
 func (clock *fakeFirstEventClock) FirstEventWindow() time.Duration { return clock.window }
+
+func (clock *fakeFirstEventClock) PauseFirstEvent() { clock.pauses.Add(1) }
 
 func (clock *fakeFirstEventClock) RestartFirstEvent() bool {
 	clock.restarts.Add(1)
