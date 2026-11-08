@@ -16,7 +16,8 @@ import (
 )
 
 // mediaOutput 决定 Chat Completions、Messages 与 Gemini 原生接口的正文引用生成媒体的方式（MEDIA_OUTPUT）：
-// 零值为 inline，与原先一样内联 data URI（Gemini 为 inlineData）；links 为真时把媒体按内容保存到媒体目录，正文改为本服务的链接。
+// 零值为 inline，与原先一样内联 data URI（Gemini 为 inlineData）；links 为真时把视频与音频按内容保存到媒体目录，正文改为本服务的链接。
+// 图片（gemini-3-pro-image 等画图模型，以及任何模型输出的 image/* 媒体）不论设置如何都按官网原样以 Base64 内联返回（见 linkableMedia）。
 // Responses、Interactions、Live 等其他协议不使用它，输出保持不变
 type mediaOutput struct {
 	links bool
@@ -89,10 +90,11 @@ func firstHeaderValue(value string) string {
 	return strings.TrimSpace(first)
 }
 
-// link 在链接模式下保存带内容的媒体并返回链接。PCM 音频（audio/l16）先包装成 WAV：裸 PCM 没有文件头，浏览器与播放器都打不开。
-// 不是链接模式、媒体只有地址没有内容或保存失败时 ok 为 false，调用方按 inline 输出；保存失败的原因写进请求日志
+// link 在链接模式下保存带内容的视频与音频并返回链接。PCM 音频（audio/l16）先包装成 WAV：裸 PCM 没有文件头，浏览器与播放器都打不开。
+// 不是链接模式、不是视频或音频（图片等，见 linkableMedia）、媒体只有地址没有内容或保存失败时 ok 为 false，调用方按 inline 输出（与
+// MEDIA_OUTPUT=inline 时完全相同）；保存失败的原因写进请求日志
 func (output mediaOutput) link(media aistudio.Media) (mediaLink, bool) {
-	if !output.links || output.store == nil || len(media.Data) == 0 {
+	if !output.links || output.store == nil || len(media.Data) == 0 || !linkableMedia(media.MIME) {
 		return mediaLink{}, false
 	}
 	mimeType, data := media.MIME, media.Data
@@ -111,6 +113,14 @@ func (output mediaOutput) link(media aistudio.Media) (mediaLink, bool) {
 		return mediaLink{}, false
 	}
 	return mediaLink{url: output.base + "/media/" + name, mime: mimeType, label: mediaLinkLabel(mimeType)}, true
+}
+
+// linkableMedia 判断链接模式下要保存成链接的媒体：只有视频（video/*）与音频（audio/*，含 PCM）。图片按官网原样以 Base64 内联返回：
+// 画图请求的客户端多半直接展示或保存 data URI 与 inlineData，换成本服务的链接后要再下载一次，前置中转与客户端不一定能访问本服务的地址，
+// 图片也不像视频那样动辄几十 MB；历史里已有的图片链接照常由 restoreMediaLinks 恢复
+func linkableMedia(mimeType string) bool {
+	mimeType = strings.ToLower(strings.TrimSpace(mimeType))
+	return strings.HasPrefix(mimeType, "video/") || strings.HasPrefix(mimeType, "audio/")
 }
 
 // mediaLinkLabel 返回链接文字：图片 image、视频 video、音频 audio，其他 file

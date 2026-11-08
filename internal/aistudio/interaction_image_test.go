@@ -197,12 +197,15 @@ func TestInteractionImageOfficialCapture(t *testing.T) {
 }
 
 // TestInteractionImageFormatByMagic 图片格式以文件头为准，按官网前端的枚举表取枚举：PNG 1、JPEG 2、WebP 3、HEIC 4、HEIF 5、BMP 8、TIFF 9
-// 原字节内联；MIME 不分大小写、带参数与 JPEG 别名都按文件头判断，标错 MIME 的图片按实际格式发送；HEIC 与 HEIF 按 ftyp 品牌区分，声明了
-// image/heic 或 image/heif 时按声明；MIME 为空或 octet-stream 一类的附件文件头是这些图片格式时按图片内联。官网枚举表里没有的格式（AVIF）、
-// 未转换的 GIF、数据与声明不符的图片，以及视频、MIME 明确不是图片的文件（即使数据是 PNG）都要上传 Drive
+// 原字节内联，InteractionInlineImageMIME 按识别出的格式返回标准 MIME；MIME 不分大小写、带参数与 JPEG 别名都按文件头判断，标错 MIME 的图片
+// （含声明为 SVG 的 PNG）按实际格式发送；HEIC 与 HEIF 按 ftyp 品牌区分，声明了 image/heic 或 image/heif 时按声明；MIME 为空或 octet-stream
+// 一类的附件文件头是这些图片格式时按图片内联。官网枚举表里没有的格式（AVIF）、未转换的 GIF、数据与声明不符的图片，以及视频、MIME 明确
+// 不是图片的文件（即使数据是 PNG）都要上传 Drive
 func TestInteractionImageFormatByMagic(t *testing.T) {
 	pngData, jpegData, gifData := omniTestPNG(t), omniTestJPEG(t), omniTestGIF(t)
 	bmpData := omniTestBMP()
+	// standardMIME 为各枚举对应的标准 MIME（InteractionInlineImageMIME），0 为不能内联
+	standardMIME := map[int64]string{0: "", 1: "image/png", 2: "image/jpeg", 3: "image/webp", 4: "image/heic", 5: "image/heif", 8: "image/bmp", 9: "image/tiff"}
 	for _, test := range []struct {
 		name  string
 		blob  Blob
@@ -215,6 +218,8 @@ func TestInteractionImageFormatByMagic(t *testing.T) {
 		{name: "image/pjpeg", blob: Blob{MIME: "image/pjpeg", Data: jpegData}, enum: 2},
 		{name: "标成 PNG 的 JPEG", blob: Blob{MIME: "image/png", Data: jpegData}, enum: 2},
 		{name: "标成 JPEG 的 PNG", blob: Blob{MIME: "image/jpeg", Data: pngData}, enum: 1},
+		{name: "标成 SVG 的 PNG", blob: Blob{MIME: "image/svg+xml", Data: pngData}, enum: 1},
+		{name: "image/jpg 别名", blob: Blob{MIME: "image/jpg", Data: jpegData}, enum: 2},
 		{name: "WebP", blob: Blob{MIME: "image/webp", Data: omniTestWebP}, enum: 3},
 		{name: "HEIC", blob: Blob{MIME: "image/heic", Data: omniTestHEIC}, enum: 4},
 		{name: "HEIF", blob: Blob{MIME: "image/heif", Data: omniTestHEIF}, enum: 5},
@@ -249,9 +254,16 @@ func TestInteractionImageFormatByMagic(t *testing.T) {
 		if enum != test.enum || ok != (test.enum != 0) || InteractionInlineImage(part) != (test.enum != 0) || InteractionDriveMedia(part) != test.drive {
 			t.Fatalf("%s: 枚举=%d/%v 内联=%v Drive=%v", test.name, enum, ok, InteractionInlineImage(part), InteractionDriveMedia(part))
 		}
+		// 标准 MIME 按识别出的格式，与声明的类型无关
+		if mimeType, ok := InteractionInlineImageMIME(part); mimeType != standardMIME[test.enum] || ok != (test.enum != 0) {
+			t.Fatalf("%s: 标准 MIME = %q/%v，期望 %q", test.name, mimeType, ok, standardMIME[test.enum])
+		}
 	}
 	if InteractionInlineImage(Part{Text: "x"}) || InteractionDriveMedia(Part{File: &FileRef{ID: "f"}}) {
 		t.Fatal("没有 inline data 的 part 既不是内联图片也不需要上传")
+	}
+	if mimeType, ok := InteractionInlineImageMIME(Part{Text: "x"}); ok || mimeType != "" {
+		t.Fatalf("没有 inline data 的 part 不应有标准 MIME: %q", mimeType)
 	}
 }
 

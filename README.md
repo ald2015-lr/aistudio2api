@@ -637,7 +637,7 @@ Gemini Omni 经 CreateInteractionStream 生成。**图片直接内联发送，�
 
 经 new-api 编辑或延长上一轮生成的视频、参考一段视频生成时（new-api 的 Gemini 渠道把 OpenAI 格式的 `image_url`、`file` 与字符串写法的 `video_url` 下载或解码成 `inlineData`，顶层 `video_config` 不转发）：
 
-- **上一轮的视频链接自动恢复**：`MEDIA_OUTPUT=url` 时上一轮回复里的 `[video](https://ai.example.com/media/<哈希>.mp4)` 在 new-api 回传的历史里只剩链接文本，目标模型是 Omni 时恢复为视频输入（移到这一轮用户消息的最前面上传发送），模型能看到原视频；图片链接同样恢复（PNG、JPEG、WebP 等直接内联）。
+- **上一轮的视频链接自动恢复**：`MEDIA_OUTPUT=url` 时上一轮回复里的 `[video](https://ai.example.com/media/<哈希>.mp4)` 在 new-api 回传的历史里只剩链接文本，目标模型是 Omni 时恢复为视频输入（移到这一轮用户消息的最前面上传发送），模型能看到原视频；历史里旧版本留下的图片链接同样恢复（PNG、JPEG、WebP 等直接内联；现在的回复里图片本来就是内联的 data URI）。
 - **粘贴本服务的链接**：用户正文里粘贴本服务 `/media/` 的图片或视频链接（裸地址或 Markdown 链接，例如 `把这个视频的天空换成晚霞 https://ai.example.com/media/<哈希>.mp4`）同样恢复为附件。
 - **直接发送视频**：OpenAI 格式写成 `{"type":"file","file":{"file_data":"data:video/mp4;base64,…"}}` 或 `{"type":"video_url","video_url":"data:video/mp4;base64,…"}`；new-api 只转换字符串写法的 `video_url`，`{"video_url":{"url":…}}` 对象写法不转换。
 - **经 new-api 发视频返回 404 `Invalid URL (POST /v1beta/interactions)`**：这是 new-api 对它不认识的路径返回的 404（new-api 不转发 Interactions 接口），说明客户端调用的是 new-api 的 `/v1beta/interactions`，请求没有到本服务（本服务自己有 `/v1beta/interactions`，也没有这句文案）。与模型、视频本身无关，任何发到这个路径的请求都会这样，new-api 里也没有能把这个路径转成 generateContent 的渠道设置。要改的是客户端调用的路径：改为调用 new-api 的 `/v1beta/models/<模型>:generateContent`（或 `:streamGenerateContent`），或 OpenAI 格式的 `/v1/chat/completions`，由 new-api 的 Gemini 渠道转发到本服务；客户端只会用 Interactions API（例如 SDK 的 interactions 调用）时，让它直连本服务的 `/v1beta/interactions`。
@@ -660,9 +660,9 @@ MEDIA_OUTPUT=url
 MEDIA_BASE_URL=https://ai.example.com
 ```
 
-保存后立即生效，不用重启。生成的媒体按内容（SHA-256）命名保存到 `runtime/media/`，同一内容只存一份，正文改为本服务的链接：
+保存后立即生效，不用重启。生成的视频与音频按内容（SHA-256）命名保存到 `runtime/media/`，同一内容只存一份，正文改为本服务的链接；图片（`gemini-3-pro-image` 等画图模型，以及任何模型输出的 `image/*`）不论设置如何都按官网原样以 Base64 内联返回（Chat Completions 与 Messages 为 `![media](data:image/png;base64,…)`，Gemini 原生接口为 `inlineData`，与 `MEDIA_OUTPUT=inline` 完全相同），不保存：
 
-- Chat Completions 与 Messages：图片 `![image](https://ai.example.com/media/<64 位哈希>.png)`，视频 `[video](…/media/<哈希>.mp4)`，音频 `[audio](…/media/<哈希>.wav)`（PCM 音频合并后包装成 WAV）
+- Chat Completions 与 Messages：视频 `[video](https://ai.example.com/media/<64 位哈希>.mp4)`，音频 `[audio](…/media/<哈希>.wav)`（PCM 音频合并后包装成 WAV）
 - Gemini 原生接口（`generateContent`、`streamGenerateContent`，含 `/ultra` 前缀）：每个媒体输出两个 part，先是链接文本 `{"text":"\n[video](https://ai.example.com/media/<哈希>.mp4)\n"}`（new-api 等按文本转换，能把链接带给用户），再是 `{"fileData":{"mimeType":"video/mp4","fileUri":"https://ai.example.com/media/<哈希>.mp4"}}`（原生 SDK 从这里取地址；new-api 把它当作空文本，不会报错）
 
 `GET /media/<文件名>` 不校验 API key，拿到链接的人都能打开（文件名是内容哈希，无法枚举），只读、支持 Range（视频可拖动进度）与一年的缓存头；不是 url 模式时一律 404。反向代理要放行 `/media/`，例如 nginx：
@@ -677,7 +677,7 @@ location /media/ {
 
 `MEDIA_BASE_URL` 留空时按每个请求访问的地址生成链接（`X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`），只适合客户端直接访问本服务的场景。媒体文件按 `MEDIA_RETENTION`（默认 7 天）与 `MEDIA_MAX_SIZE`（默认 20GB）在后台每小时清理一次，过期或超出总量的文件删除后链接返回 404。
 
-客户端把带链接的回复作为历史回传时：assistant 正文里的本服务图片链接恢复为图片输入（与 inline 模式回传 data URI 时一样，可以继续改图），视频、音频链接保持文本（目标模型是 Omni 时视频链接也恢复，用户正文里粘贴的本服务图片、视频链接同样恢复，见 [Omni 的图片与视频输入](#omni-的图片与视频输入)）；用户消息里指向本服务媒体的 `image_url`、`fileData` 恢复为内联媒体。同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB，超出时较早的引用保持链接；该恢复却没能恢复的（文件已清理、超出上限）在请求日志记一行说明。换成 Omni 等 Interaction 模型继续对话时（例如先出图，再让 Omni “让它动起来”），模型消息里的 PNG、JPEG、WebP 等图片与用户附件一样直接内联，放到随后的用户消息最前面发给模型，模型能看到这张图，不需要 Drive（官网格式表里没有的图片如 AVIF 要先上传 Drive，只交给有 Drive 授权的账户，见上节）。url 模式只作用于 Chat Completions、Messages 与 Gemini 原生接口，Responses、Interactions、Live 以及图片、语音、视频接口的输出不变。
+客户端把回复作为历史回传时：assistant 正文里内联的 data URI 图片在 Chat Completions（`content` 为字符串或数组里的 text 块）、Messages（字符串或 text 块）与 Gemini 原生接口（model 轮文本）都恢复为图片输入（经 new-api 的 Gemini 渠道多轮改图时，中转把 `inlineData` 转成的 `![image](data:…)` 作为模型文本回传，同样恢复，不会把几 MB 的 Base64 当作文本发给模型）；只恢复能识别为 PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF 的图片（GIF 转成 PNG；按识别出的格式发送，不沿用客户端标错的类型），SVG、解码不出或数据不是图片的，以及写在代码块、行内代码里的 Markdown 源码（按 CommonMark 判断：行内代码只在同一段落里配对，转义的反引号不算）保持文本照样发送，不返回 400（免得这段每轮回传的历史让整段会话从此每轮失败），旧版本留下的本服务图片链接同样恢复为图片输入，视频、音频链接保持文本（目标模型是 Omni 时视频链接也恢复，用户正文里粘贴的本服务图片、视频链接同样恢复，见 [Omni 的图片与视频输入](#omni-的图片与视频输入)）；用户消息里指向本服务媒体的 `image_url`、`fileData` 恢复为内联媒体。同一文件一次请求只恢复一处（较新的消息优先），合计不超过 64MB，超出时较早的引用保持链接；该恢复却没能恢复的（文件已清理、超出上限）在请求日志记一行说明。换成 Omni 等 Interaction 模型继续对话时（例如先出图，再让 Omni “让它动起来”），模型消息里的 PNG、JPEG、WebP 等图片与用户附件一样直接内联，放到随后的用户消息最前面发给模型，模型能看到这张图，不需要 Drive（官网格式表里没有的图片如 AVIF 要先上传 Drive，只交给有 Drive 授权的账户，见上节）。url 模式只作用于 Chat Completions、Messages 与 Gemini 原生接口，Responses、Interactions、Live 以及图片、语音、视频接口的输出不变。
 
 ## 模型
 
@@ -780,7 +780,7 @@ cp .env.example .env
 | `LONG_OUTPUT_MAX_TOKENS` | `262144` | `long-` 请求没有给出最大输出时，不支持官网续写的模型最多输出的 token 数（正文与思考合计，约为常见单轮上限 65536 的 4 倍）；`0` 表示不模拟续写，最大 `1048576`。轮数约为 总上限 ÷ 模型单轮上限：单轮 65536 的模型最多约 4 轮（多占 3 次请求额度），单轮更小的模型轮数更多（一个请求最多 64 轮），每轮占一次请求额度并计入 `ACCOUNT_RPM_LIMIT`。支持官网续写的模型按官网总量，客户端给出最大输出时以客户端为准。模拟续写把已输出的正文发回上游，输入上限为 131072 的账号到不了更大的值（超过时按 `max_tokens` 结束）。保存后立即生效 |
 | `WAA_BACKEND` | `camoufox` | `camoufox` 在 Camoufox 页面运行 WAA；`go` 在服务进程内运行 WAA，不下载也不启动 Camoufox |
 | `TEMPORARY_CHAT` | `false` | WAA 预热页是否使用临时对话（只认 `true`/`false`，写错时启动即报错） |
-| `MEDIA_OUTPUT` | `inline` | Chat Completions、Messages 与 Gemini 原生接口回复里生成媒体的输出方式：`inline` 与原先一样内联（data URI / `inlineData`）；`url` 按内容保存到 `runtime/media/`，正文改为本服务 `/media/<文件名>` 的链接（Gemini 原生接口为链接文本加 `fileData`），该路径不校验 API key。经 new-api 等中转使用、或生成视频时设为 `url`，见[生成视频与媒体链接](#生成视频与媒体链接omni)。保存后立即生效 |
+| `MEDIA_OUTPUT` | `inline` | Chat Completions、Messages 与 Gemini 原生接口回复里生成视频与音频的输出方式（只对视频与音频生效，图片总是按官网原样以 Base64 内联）：`inline` 与原先一样内联（data URI / `inlineData`）；`url` 按内容保存到 `runtime/media/`，正文改为本服务 `/media/<文件名>` 的链接（Gemini 原生接口为链接文本加 `fileData`），该路径不校验 API key。经 new-api 等中转使用、或生成视频时设为 `url`，见[生成视频与媒体链接](#生成视频与媒体链接omni)。保存后立即生效 |
 | `MEDIA_BASE_URL` | 空 | 媒体链接使用的服务地址，例如 `https://ai.example.com`（可带路径前缀，不能带账号密码、查询参数）；经 new-api、nginx 等转发时必须填用户能访问到的公网地址，并让反向代理放行 `/media/`。留空时按每个请求的 `X-Forwarded-Proto`、`X-Forwarded-Host` 或 `Host`。保存后立即生效 |
 | `MEDIA_RETENTION` | `7d` | 媒体文件的保存期限（如 `7d`、`72h`），按文件修改时间计算，后台每小时清理；`0` 不按时间清理，不为 0 时至少 1 小时。保存后立即生效 |
 | `MEDIA_MAX_SIZE` | `20GB` | `runtime/media/` 的总量上限（如 `20GB`、`500MB`，按 1024 进位），超过时从最旧的文件开始删除，最近 10 分钟内生成的不删；`0` 不限，不为 0 时至少 100MB。只删除以内容哈希命名的媒体文件。保存后立即生效 |

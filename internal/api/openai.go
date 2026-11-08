@@ -291,10 +291,8 @@ func chatMessageContent(message chatMessage) (aistudio.Content, error) {
 		return aistudio.Content{}, fmt.Errorf("%s message content: %w", message.Role, err)
 	}
 	if role == aistudio.RoleAssistant {
-		parts, err = openAIAssistantContentParts(message.Content, parts)
-		if err != nil {
-			return aistudio.Content{}, fmt.Errorf("assistant message content: %w", err)
-		}
+		// assistant 正文（字符串或数组的 text 块）里内联的 Markdown 图片拆回图片，见 restoreAssistantInlineImages
+		parts = restoreAssistantInlineImages(parts)
 	}
 	for _, call := range message.ToolCalls {
 		if call.Type != "" && call.Type != "function" {
@@ -324,32 +322,323 @@ func historyFunctionArguments(arguments string) json.RawMessage {
 	return encoded
 }
 
-func openAIAssistantContentParts(raw json.RawMessage, fallback []aistudio.Part) ([]aistudio.Part, error) {
-	var text string
-	if json.Unmarshal(raw, &text) != nil {
-		return fallback, nil
-	}
+// assistantImageParts 把 assistant 正文里内联的 Markdown 图片（![…](data:image/…;base64,…)，本服务输出图片的写法，见 renderMediaMarkdown）
+// 拆成文本与图片 part，回传历史时上游看到的是图片而不是几 MB 的 Base64 文本。只拆上游能收的图片：Base64 解码得出、按文件头识别为 PNG、
+// JPEG、WebP、HEIC、HEIF、BMP 或 TIFF 的（GIF 先由 normalizedImageBlob 转成 PNG，判断与 Omni 直接内联的图片相同，见
+// aistudio.InteractionInlineImage），拆出的 part 按识别出的格式写标准 MIME（声明为 image/svg+xml、image/jpg 等而数据是 PNG、JPEG 的，
+// Playground 与 Build 会把声明的类型原样发给上游）。解码不出、SVG、声明为图片而数据不是这些格式的，以及落在围栏代码块或行内代码里的
+// （模型写给用户看的 Markdown 源码，规则按 CommonMark，见 markdownCodeRanges）留在原文本里照样发送：这段历史每轮都会回传，拆成上游不收的
+// 图片会让整段会话从此每轮失败，拆掉代码里的源码模型也看不到自己写过什么。一个 part 里能拆的与不能拆的各按各的处理；一处都不能拆时 ok 为 false
+func assistantImageParts(text string) ([]aistudio.Part, bool) {
 	matches := assistantImagePattern.FindAllStringSubmatchIndex(text, -1)
 	if len(matches) == 0 {
-		return fallback, nil
+		return nil, false
 	}
-	parts := make([]aistudio.Part, 0, len(matches)*2+1)
+	code := markdownCodeRanges(text)
+	var parts []aistudio.Part
+	// position 为已经写进 parts 的位置，不拆的图片留在之后的文本里
 	position := 0
 	for _, match := range matches {
-		if match[0] > position {
-			parts = append(parts, aistudio.Part{Text: text[position:match[0]]})
+		for len(code) > 0 && code[0][1] <= match[0] {
+			code = code[1:]
+		}
+		if len(code) > 0 && code[0][0] <= match[0] {
+			continue
 		}
 		part, err := fileOrInlinePart(text[match[2]:match[3]], "")
 		if err != nil {
-			return nil, err
+			continue
+		}
+		mimeType, ok := aistudio.InteractionInlineImageMIME(part)
+		if !ok {
+			continue
+		}
+		part.InlineData.MIME = mimeType
+		if match[0] > position {
+			parts = append(parts, aistudio.Part{Text: text[position:match[0]]})
 		}
 		parts = append(parts, part)
 		position = match[1]
 	}
+	if len(parts) == 0 {
+		return nil, false
+	}
 	if position < len(text) {
 		parts = append(parts, aistudio.Part{Text: text[position:]})
 	}
-	return parts, nil
+	return parts, true
+}
+
+// markdownCodeRanges 返回文本里 Markdown 代码的字节区间（按位置排序、互不重叠，右端不含），规则按 CommonMark：
+//   - 围栏代码块：行首（最多缩进 3 个空格）三个以上反引号或波浪号起，到行首（最多缩进 3 个空格）同样的字符不少于起始个数、之后只有空白的
+//     一行止，没有闭合时到文本末尾（与 Markdown 的渲染相同）；反引号围栏起始行的其余部分里还有反引号时不是围栏。写在列表项标记之后的
+//     围栏（“- ```go”“1. ```”）以标记与之后空格的宽度为内容列，闭合行的缩进比内容列多不超过 3 个空格，遇到缩进不到内容列的非空行
+//     （列表项结束）时止于前一行。不认这种围栏时，它缩进不到 4 个空格的闭合行会被当成没有闭合的起始围栏，之后的图片全被当成代码
+//   - 行内代码：n 个反引号起，到同一段落里之后恰好 n 个反引号止；没有配对的反引号按普通字符。紧挨在奇数个反斜杠之后的一串反引号第一个
+//     已被转义，其余的才作为起点（结尾不看反斜杠：行内代码里的反斜杠是普通字符）。段落在围栏、空行（只有空白的行）、ATX 标题行、分隔线
+//     与 setext 标题的下划线处结束，列表项开头与引用开头（引用层数比上一行多）另起一段，引用标记（>）之后的内容按同样规则判断
+//
+// 段落边界宁多勿少：多算一处只会少认一段行内代码（代价是拆走代码里的图片、模型看不到这段源码），少算则会把正常显示的图片当成代码，
+// 几 MB 的 Base64 每轮按文本回传。所以 CommonMark 里不能打断段落的列表标记（段落中间以 2. 开头或缩进 4 个空格以上的一行等）也算另起
+// 一段，这些少数写法会少认行内代码。整段只扫描一遍（配对按每种长度的下一串预先算好），文本再长、反引号再多也是线性时间
+func markdownCodeRanges(text string) [][2]int {
+	if !strings.ContainsAny(text, "`~") {
+		return nil
+	}
+	var ranges [][2]int
+	// segment 为当前段落（行内代码配对的范围）的起点，depth 为上一行的引用层数
+	segment, depth := 0, 0
+	split := func(at int) {
+		ranges = append(ranges, markdownInlineCode(text, segment, at)...)
+		segment = at
+	}
+	for lineStart := 0; lineStart < len(text); {
+		lineEnd := markdownLineEnd(text, lineStart)
+		line := text[lineStart:lineEnd]
+		if fence, ok := markdownFenceOpen(line); ok {
+			split(lineStart)
+			end := markdownFenceEnd(text, lineEnd, fence)
+			ranges = append(ranges, [2]int{lineStart, end})
+			segment, lineStart, depth = end, end+1, 0
+			continue
+		}
+		lineDepth, content := markdownQuoteContent(line)
+		before, alone := markdownParagraphBreak(content)
+		if before || alone || lineDepth > depth {
+			split(lineStart)
+		}
+		if alone {
+			split(lineEnd)
+		}
+		depth, lineStart = lineDepth, lineEnd+1
+	}
+	split(len(text))
+	return ranges
+}
+
+// markdownLineEnd 返回从 lineStart 起这一行的行尾（换行符的位置，最后一行为文本长度）
+func markdownLineEnd(text string, lineStart int) int {
+	if end := strings.IndexByte(text[lineStart:], '\n'); end >= 0 {
+		return lineStart + end
+	}
+	return len(text)
+}
+
+// markdownFence 为围栏代码块的起始围栏：marker 为围栏字符，run 为个数，indent 为内容列（写在列表项标记之后时为行首到围栏的宽度，否则为 0）
+type markdownFence struct {
+	marker      byte
+	run, indent int
+}
+
+// markdownFenceOpen 判断一行是围栏代码块的起始行：行首最多缩进 3 个空格，或列表项标记（前面缩进不限，嵌套列表）之后 1 到 4 个空格
+func markdownFenceOpen(line string) (markdownFence, bool) {
+	trimmed := strings.TrimLeft(line, " ")
+	indent := 0
+	if marker := markdownListMarker(trimmed); marker > 0 {
+		content := strings.TrimLeft(trimmed[marker:], " ")
+		if spaces := len(trimmed) - marker - len(content); spaces >= 1 && spaces <= 4 {
+			indent, trimmed = len(line)-len(content), content
+		}
+	} else if len(line)-len(trimmed) > 3 {
+		return markdownFence{}, false
+	}
+	if trimmed == "" || trimmed[0] != '`' && trimmed[0] != '~' {
+		return markdownFence{}, false
+	}
+	marker := trimmed[0]
+	run := len(trimmed) - len(strings.TrimLeft(trimmed, string(marker)))
+	if run < 3 || marker == '`' && strings.Contains(trimmed[run:], "`") {
+		return markdownFence{}, false
+	}
+	return markdownFence{marker: marker, run: run, indent: indent}, true
+}
+
+// markdownFenceEnd 返回起始围栏那一行的行尾 openLineEnd 之后代码块的结尾：闭合围栏那一行的行尾；写在列表项里的遇到缩进不到内容列的
+// 非空行时为前一行的行尾（这一行照常判断，可能另起围栏）；没有闭合时为文本末尾
+func markdownFenceEnd(text string, openLineEnd int, fence markdownFence) int {
+	for lineStart := openLineEnd + 1; lineStart < len(text); {
+		lineEnd := markdownLineEnd(text, lineStart)
+		line := text[lineStart:lineEnd]
+		trimmed := strings.TrimLeft(line, " ")
+		indent := len(line) - len(trimmed)
+		if indent < fence.indent && strings.TrimSpace(trimmed) != "" {
+			return lineStart - 1
+		}
+		run := len(trimmed) - len(strings.TrimLeft(trimmed, string(fence.marker)))
+		if indent-fence.indent <= 3 && run >= fence.run && strings.TrimSpace(trimmed[run:]) == "" {
+			return lineEnd
+		}
+		lineStart = lineEnd + 1
+	}
+	return len(text)
+}
+
+// markdownListMarker 返回一行（已去掉行首空格）开头列表项标记的长度：-、*、+，或 1 到 9 位数字加 . 或 )，之后是空白或行尾；不是时为 0
+func markdownListMarker(line string) int {
+	length := 0
+	if line != "" && strings.IndexByte("-*+", line[0]) >= 0 {
+		length = 1
+	} else {
+		for length < len(line) && length < 9 && line[length] >= '0' && line[length] <= '9' {
+			length++
+		}
+		if length == 0 || length == len(line) || line[length] != '.' && line[length] != ')' {
+			return 0
+		}
+		length++
+	}
+	if length < len(line) && strings.IndexByte(" \t\r", line[length]) < 0 {
+		return 0
+	}
+	return length
+}
+
+// markdownQuoteContent 返回一行的引用层数与引用标记（最多缩进 3 个空格的 >，以及之后的一个空格）之后的内容
+func markdownQuoteContent(line string) (int, string) {
+	depth := 0
+	for {
+		trimmed := strings.TrimLeft(line, " ")
+		if len(line)-len(trimmed) > 3 || !strings.HasPrefix(trimmed, ">") {
+			return depth, line
+		}
+		depth++
+		line = strings.TrimPrefix(trimmed[1:], " ")
+	}
+}
+
+// markdownParagraphBreak 判断一行（引用标记之后的内容）在哪里结束段落：before 为这一行另起一段（列表项开头），alone 为这一行自成一段
+// （空行、ATX 标题行、分隔线与 setext 标题的下划线）
+func markdownParagraphBreak(content string) (before, alone bool) {
+	trimmed := strings.TrimLeft(content, " \t")
+	if strings.TrimSpace(trimmed) == "" {
+		return false, true
+	}
+	if len(content)-len(trimmed) <= 3 && (markdownATXHeading(trimmed) || markdownRuleLine(trimmed)) {
+		return false, true
+	}
+	return markdownListMarker(trimmed) > 0, false
+}
+
+// markdownATXHeading 判断一行（已去掉行首空格）是 ATX 标题：1 到 6 个 #，之后是空白或行尾
+func markdownATXHeading(line string) bool {
+	level := len(line) - len(strings.TrimLeft(line, "#"))
+	return level >= 1 && level <= 6 && (level == len(line) || strings.IndexByte(" \t\r", line[level]) >= 0)
+}
+
+// markdownRuleLine 判断一行（已去掉行首空格）是分隔线（三个以上 -、* 或 _，之间可有空白）或 setext 标题的下划线（只有 = 或只有 -）
+func markdownRuleLine(line string) bool {
+	line = strings.TrimRight(line, " \t\r")
+	if line == "" {
+		return false
+	}
+	marker := line[0]
+	if (marker == '=' || marker == '-') && strings.Trim(line, string(marker)) == "" {
+		return true
+	}
+	if marker != '-' && marker != '*' && marker != '_' {
+		return false
+	}
+	count := 0
+	for index := 0; index < len(line); index++ {
+		switch line[index] {
+		case marker:
+			count++
+		case ' ', '\t':
+		default:
+			return false
+		}
+	}
+	return count >= 3
+}
+
+// markdownInlineCode 返回 text[from:to]（一个段落）里成对反引号的行内代码区间：紧挨在奇数个反斜杠之后的一串反引号第一个已被转义，
+// 其余的才作为起点（只有一个时不是起点）；结尾不看反斜杠
+func markdownInlineCode(text string, from, to int) [][2]int {
+	type backtickRun struct {
+		start, end int
+		escaped    bool
+	}
+	var runs []backtickRun
+	for index := from; index < to; {
+		next := strings.IndexByte(text[index:to], '`')
+		if next < 0 {
+			break
+		}
+		start := index + next
+		end := start
+		for end < to && text[end] == '`' {
+			end++
+		}
+		backslashes := 0
+		for start-backslashes > from && text[start-backslashes-1] == '\\' {
+			backslashes++
+		}
+		runs = append(runs, backtickRun{start, end, backslashes%2 == 1})
+		index = end
+	}
+	if len(runs) < 2 {
+		return nil
+	}
+	// same[i]、shorter[i] 为第 i 串之后第一串与它同样长度、比它少一个反引号的位置（没有时为 -1）：转义的一串按少一个的配对
+	same, shorter := make([]int, len(runs)), make([]int, len(runs))
+	latest := make(map[int]int)
+	for index := len(runs) - 1; index >= 0; index-- {
+		length := runs[index].end - runs[index].start
+		same[index], shorter[index] = -1, -1
+		if found, ok := latest[length]; ok {
+			same[index] = found
+		}
+		if found, ok := latest[length-1]; ok {
+			shorter[index] = found
+		}
+		latest[length] = index
+	}
+	var ranges [][2]int
+	for index := 0; index < len(runs); {
+		start, closer := runs[index].start, same[index]
+		if runs[index].escaped {
+			start, closer = start+1, shorter[index]
+		}
+		if closer < 0 {
+			index++
+			continue
+		}
+		ranges = append(ranges, [2]int{start, runs[closer].end})
+		index = closer + 1
+	}
+	return ranges
+}
+
+// restoreAssistantInlineImages 把 assistant（Gemini 原生为 model）轮文本 part 里内联的 Markdown 图片拆回图片 part（规则见 assistantImageParts），
+// Chat Completions（content 为字符串或数组的 text 块）、Messages 与 Gemini 原生三个入口共用。图片总是以 data URI 内联返回（MEDIA_OUTPUT 只对
+// 视频与音频生效）：new-api 等中转把 Gemini 的 inlineData 转成 ![image](data:…) 交给客户端，下一轮这段 Markdown 作为 model 文本回到 Gemini
+// 原生入口；Chat Completions 与 Messages 的图片本来就以这种 Markdown 写在正文里。原先 Gemini 原生与 Messages 把整段 Base64 当作文本发给上游，
+// 输入 token 暴涨、模型也看不到原图。只处理 assistant 轮（用户消息里的同样文本照原样发送），思考与语音元数据 part 不动，思考签名留在拆出的
+// 第一个 part 上；不能拆的保留原文本，不返回 400（Chat Completions 的字符串 content 原先对解码不出的 data URI 返回 400，这段历史每轮回传，
+// 整段会话从此每轮失败，现在同样按文本发送）
+func restoreAssistantInlineImages(parts []aistudio.Part) []aistudio.Part {
+	var restored []aistudio.Part
+	for index, part := range parts {
+		var split []aistudio.Part
+		if part.Text != "" && !part.Thought && part.SpeechMetadata == nil && strings.Contains(part.Text, "data:image/") {
+			split, _ = assistantImageParts(part.Text)
+		}
+		if split == nil {
+			if restored != nil {
+				restored = append(restored, part)
+			}
+			continue
+		}
+		if restored == nil {
+			restored = append(make([]aistudio.Part, 0, len(parts)+len(split)), parts[:index]...)
+		}
+		split[0].ThoughtSignature = part.ThoughtSignature
+		restored = append(restored, split...)
+	}
+	if restored == nil {
+		return parts
+	}
+	return restored
 }
 
 func openAIRole(role string) (aistudio.Role, error) {

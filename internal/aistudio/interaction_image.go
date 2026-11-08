@@ -281,6 +281,16 @@ func InteractionInlineImage(part Part) bool {
 	return ok
 }
 
+// InteractionInlineImageMIME 返回 InteractionInlineImage 为真的图片按文件头识别出的标准 MIME（image/png、image/jpeg、image/webp、
+// image/heic、image/heif、image/bmp、image/tiff），不是这类图片时 ok 为 false。客户端或中转标错类型的（声明为 image/svg+xml 而数据是
+// PNG、image/jpg 一类别名等）按实际格式取：Playground 与 Build 把 inline data 的 MIME 原样发给官网，标错的类型会被拒绝
+func InteractionInlineImageMIME(part Part) (string, bool) {
+	if !InteractionInlineImage(part) {
+		return "", false
+	}
+	return interactionImageInputMIME[imageFormatOf(part.InlineData)].mime, true
+}
+
 // InteractionDriveMedia 判断 part 是 Interaction 模型要先上传到账号 Drive 再以文件引用发送的内联附件：视频、音频、PDF 等其他文件，
 // 以及不能内联的图片（官网枚举表里没有的格式如 AVIF、数据与声明的格式不符、超过像素或体积上限或解码失败而没能转成 PNG 的 GIF）
 func InteractionDriveMedia(part Part) bool {

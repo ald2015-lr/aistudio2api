@@ -69,10 +69,14 @@ func expectedWAV() []byte {
 	return pcmWAV(append(append([]byte(nil), testPCM1...), testPCM2...), 24000, 1)
 }
 
-// mediaLinks 返回 base 下三个媒体的链接
-func mediaLinks(base string) (video string, image string, audio string) {
-	return base + "/media/" + sha256Hex(testVideo) + ".mp4", base + "/media/" + sha256Hex(testImage) + ".png",
-		base + "/media/" + sha256Hex(expectedWAV()) + ".wav"
+// mediaLinks 返回 base 下视频与音频的链接（url 模式只把视频与音频存成链接）
+func mediaLinks(base string) (video string, audio string) {
+	return base + "/media/" + sha256Hex(testVideo) + ".mp4", base + "/media/" + sha256Hex(expectedWAV()) + ".wav"
+}
+
+// testImageMarkdown 为图片按官网原样内联的 Markdown（url 与 inline 模式相同）
+func testImageMarkdown() string {
+	return "![media](data:image/png;base64," + base64.StdEncoding.EncodeToString(testImage) + ")"
 }
 
 // fetchMedia 不带 API Key 读取链接，返回状态、响应头与正文
@@ -87,15 +91,21 @@ func fetchMedia(t *testing.T, handler http.Handler, link string, header map[stri
 	return recorder
 }
 
-// assertSavedMedia 确认三个链接都能不带 API Key 取回与生成内容相同的字节
-func assertSavedMedia(t *testing.T, handler http.Handler, base string) {
+// assertSavedMedia 确认视频与音频的链接都能不带 API Key 取回与生成内容相同的字节，图片没有保存（按官网原样内联返回）
+func assertSavedMedia(t *testing.T, handler http.Handler, dir string, base string) {
 	t.Helper()
-	video, image, audio := mediaLinks(base)
+	video, audio := mediaLinks(base)
+	if _, err := os.Stat(filepath.Join(dir, sha256Hex(testImage)+".png")); !os.IsNotExist(err) {
+		t.Fatalf("图片不应保存到媒体目录: %v", err)
+	}
+	if count := countFiles(t, dir); count != 2 {
+		t.Fatalf("媒体目录应只有视频与音频 2 个文件，实际 %d 个", count)
+	}
 	for _, item := range []struct {
 		link        string
 		contentType string
 		data        []byte
-	}{{video, "video/mp4", testVideo}, {image, "image/png", testImage}, {audio, "audio/wav", expectedWAV()}} {
+	}{{video, "video/mp4", testVideo}, {audio, "audio/wav", expectedWAV()}} {
 		recorder := fetchMedia(t, handler, item.link, nil)
 		if recorder.Code != http.StatusOK || recorder.Header().Get("Content-Type") != item.contentType ||
 			!bytes.Equal(recorder.Body.Bytes(), item.data) {
@@ -134,8 +144,8 @@ func countFiles(t *testing.T, dir string) int {
 	return len(entries)
 }
 
-// TestChatMediaOutput Chat Completions：inline 与原先一样内联 data URI、不写文件；url 模式下正文为本服务链接
-// （图片 ![image]、视频 [video]、音频 [audio]，PCM 合并为一个 WAV），流式与非流式正文一致，链接不带 API Key 能取回相同字节
+// TestChatMediaOutput Chat Completions：inline 与原先一样内联 data URI、不写文件；url 模式下视频与音频为本服务链接
+// （视频 [video]、音频 [audio]，PCM 合并为一个 WAV），图片照旧内联 data URI，流式与非流式正文一致，链接不带 API Key 能取回相同字节
 func TestChatMediaOutput(t *testing.T) {
 	body := `{"model":"gemini-omni-1.1-flash","messages":[{"role":"user","content":"做个视频"}]}`
 	streamBody := `{"model":"gemini-omni-1.1-flash","stream":true,"messages":[{"role":"user","content":"做个视频"}]}`
@@ -176,9 +186,9 @@ func TestChatMediaOutput(t *testing.T) {
 		{name: "反向代理头", header: map[string]string{"X-Forwarded-Proto": "https", "X-Forwarded-Host": "public.example.org"}, want: "https://public.example.org"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			handler, _ := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: test.base})
-			video, image, audio := mediaLinks(test.want)
-			want := "Here:\n[video](" + video + ")\n![image](" + image + ")\n[audio](" + audio + ")"
+			handler, dir := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: test.base})
+			video, audio := mediaLinks(test.want)
+			want := "Here:\n[video](" + video + ")\n" + testImageMarkdown() + "\n[audio](" + audio + ")"
 			recorder := postJSON(t, handler, "/v1/chat/completions", body, test.header)
 			var response struct {
 				Choices []struct {
@@ -194,7 +204,7 @@ func TestChatMediaOutput(t *testing.T) {
 			if got := response.Choices[0].Message.Content; got != want || response.Choices[0].Message.ReasoningContent != "先想一想" {
 				t.Fatalf("非流式正文 = %q，期望 %q", got, want)
 			}
-			assertSavedMedia(t, handler, test.want)
+			assertSavedMedia(t, handler, dir, test.want)
 
 			stream := postJSON(t, handler, "/v1/chat/completions", streamBody, test.header)
 			var content strings.Builder
@@ -212,7 +222,8 @@ func TestChatMediaOutput(t *testing.T) {
 	}
 }
 
-// TestAnthropicMediaOutput Messages：url 模式下媒体各成一个 text block，内容为本服务链接；流式 text_delta 同样是链接；inline 不变
+// TestAnthropicMediaOutput Messages：url 模式下媒体各成一个 text block，视频与音频为本服务链接、图片照旧内联 data URI；
+// 流式 text_delta 相同；inline 不变
 func TestAnthropicMediaOutput(t *testing.T) {
 	header := map[string]string{"Anthropic-Version": "2023-06-01"}
 	body := `{"model":"gemini-omni-1.1-flash","max_tokens":64,"messages":[{"role":"user","content":"做个视频"}]}`
@@ -224,8 +235,8 @@ func TestAnthropicMediaOutput(t *testing.T) {
 		t.Fatalf("inline 应与原先一样内联: %.300s", recorder.Body.String())
 	}
 
-	handler, _ := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
-	video, image, audio := mediaLinks("https://ai.example.com")
+	handler, dir := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+	video, audio := mediaLinks("https://ai.example.com")
 	recorder = postJSON(t, handler, "/v1/messages", body, header)
 	var response struct {
 		Content []struct {
@@ -242,11 +253,11 @@ func TestAnthropicMediaOutput(t *testing.T) {
 			texts = append(texts, block.Text)
 		}
 	}
-	want := []string{"Here:", "[video](" + video + ")", "![image](" + image + ")", "[audio](" + audio + ")"}
+	want := []string{"Here:", "[video](" + video + ")", testImageMarkdown(), "[audio](" + audio + ")"}
 	if strings.Join(texts, "|") != strings.Join(want, "|") {
 		t.Fatalf("text block = %q，期望 %q", texts, want)
 	}
-	assertSavedMedia(t, handler, "https://ai.example.com")
+	assertSavedMedia(t, handler, dir, "https://ai.example.com")
 
 	stream := postJSON(t, handler, "/v1/messages", streamBody, header)
 	var deltas []string
@@ -278,21 +289,21 @@ func geminiResponseParts(t *testing.T, response map[string]any) []map[string]any
 	return parts
 }
 
-// expectedGeminiLinkParts 为 url 模式下媒体对应的 part：链接文本在前、fileData 在后，签名在 fileData 上
+// expectedGeminiLinkParts 为 url 模式下媒体对应的 part：视频与音频为链接文本在前、fileData 在后，签名在 fileData 上；
+// 图片照旧为 inlineData
 func expectedGeminiLinkParts(base string) []map[string]any {
-	video, image, audio := mediaLinks(base)
+	video, audio := mediaLinks(base)
 	return []map[string]any{
 		{"text": "\n[video](" + video + ")\n"},
 		{"fileData": map[string]any{"mimeType": "video/mp4", "fileUri": video}, "thoughtSignature": "sig-video"},
-		{"text": "![image](" + image + ")\n"},
-		{"fileData": map[string]any{"mimeType": "image/png", "fileUri": image}},
+		{"inlineData": map[string]any{"mimeType": "image/png", "data": base64.StdEncoding.EncodeToString(testImage)}},
 		{"text": "[audio](" + audio + ")\n"},
 		{"fileData": map[string]any{"mimeType": "audio/wav", "fileUri": audio}},
 	}
 }
 
-// TestGeminiMediaOutput Gemini 原生接口（含 /ultra 前缀）：inline 与原先一样输出 inlineData；url 模式下每个媒体为链接文本与
-// fileData 两个 part，流式时两者在同一块里、文本在前；链接能取回相同字节
+// TestGeminiMediaOutput Gemini 原生接口（含 /ultra 前缀）：inline 与原先一样输出 inlineData；url 模式下视频与音频为链接文本与
+// fileData 两个 part，流式时两者在同一块里、文本在前，图片照旧为 inlineData；链接能取回相同字节
 func TestGeminiMediaOutput(t *testing.T) {
 	body := `{"contents":[{"role":"user","parts":[{"text":"做个视频"}]}]}`
 
@@ -312,7 +323,7 @@ func TestGeminiMediaOutput(t *testing.T) {
 	}
 
 	for _, path := range []string{"/v1beta/models/gemini-omni-1.1-flash", "/ultra/v1beta/models/gemini-omni-1.1-flash"} {
-		handler, _ := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+		handler, dir := newMediaHandler(t, &scriptedService{events: mediaEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
 		recorder := postJSON(t, handler, path+":generateContent", body, nil)
 		var response map[string]any
 		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
@@ -322,7 +333,7 @@ func TestGeminiMediaOutput(t *testing.T) {
 		if got := mustJSONText(t, geminiResponseParts(t, response)); got != mustJSONText(t, want) {
 			t.Fatalf("%s 非流式 parts:\n%s\n期望:\n%s", path, got, mustJSONText(t, want))
 		}
-		assertSavedMedia(t, handler, "https://ai.example.com")
+		assertSavedMedia(t, handler, dir, "https://ai.example.com")
 
 		stream := postJSON(t, handler, path+":streamGenerateContent?alt=sse", body, nil)
 		var streamed []map[string]any
@@ -337,7 +348,7 @@ func TestGeminiMediaOutput(t *testing.T) {
 			}
 			streamed = append(streamed, chunkParts...)
 		}
-		if mediaChunks != 3 || mustJSONText(t, streamed) != mustJSONText(t, want) {
+		if mediaChunks != 2 || mustJSONText(t, streamed) != mustJSONText(t, want) {
 			t.Fatalf("%s 流式 parts:\n%s", path, mustJSONText(t, streamed))
 		}
 	}
@@ -905,7 +916,7 @@ func (service *interactionEncodingService) Generate(_ context.Context, request a
 // interactionModelMediaIntro 与 aistudio 里移到用户 step 的模型附件前的说明一致
 const interactionModelMediaIntro = "以下是上文模型回复里的图片或视频："
 
-// TestInteractionHistoryWithModelImage 先用图片模型出图（url 模式下历史里是本服务的图片链接，inline 模式下是 data URI），
+// TestInteractionHistoryWithModelImage 先用图片模型出图（历史里是旧版本 url 模式输出的本服务图片链接，或 data URI），
 // 再在同一对话里让 Interaction 模型（Omni）“让它动起来”：模型消息里恢复出的图片连同说明移到随后的用户 step，按官网内联为
 // Content field 2 [1, Base64]（不上传 Drive），模型能看到这张图；模型 step 只带同一条消息里的文本；binding 在 OMNI_IMAGE_BINDING 关闭时与发送的文本
 // 一致（与 a574e64 相同），开启（默认）时恢复出来的图片按请求体里的位置计入。
@@ -1215,9 +1226,10 @@ func TestInlineStreamMediaUnchanged(t *testing.T) {
 	}
 }
 
-// TestRestoreOmniTableMediaLinks url 模式下 Omni 输出枚举解码出的 BMP 图片与 MPEG 视频按 .bmp、.mpg 保存并输出链接，下一轮经 Chat 回传时
-// （new-api 回传的历史只剩链接文本）：目标为 Omni 时 assistant 正文里的这两个链接、用户正文里粘贴的 .avi 裸地址都在原位置恢复为内联媒体，
-// MIME 按扩展名提供时的类型；其他模型只恢复 assistant 正文里的图片链接（HEIC 同样），视频链接保持文本
+// TestRestoreOmniTableMediaLinks url 模式下 Omni 输出枚举解码出的 MPEG 视频按 .mpg 保存并输出链接，BMP 图片按官网原样内联（不保存）；
+// 下一轮经 Chat 回传时（new-api 回传的历史只剩链接文本，旧版本 url 模式输出的 .bmp、.heic 图片链接仍在历史里）：目标为 Omni 时
+// assistant 正文里的这些链接、用户正文里粘贴的 .avi 裸地址都在原位置恢复为内联媒体，MIME 按扩展名提供时的类型；其他模型只恢复
+// assistant 正文里的图片链接，视频链接保持文本
 func TestRestoreOmniTableMediaLinks(t *testing.T) {
 	bmp := append([]byte{'B', 'M', 58, 0, 0, 0, 0, 0, 0, 0, 54, 0, 0, 0, 40, 0, 0, 0}, bytes.Repeat([]byte{0x33}, 64)...)
 	mpeg := append([]byte{0x00, 0x00, 0x01, 0xba}, bytes.Repeat([]byte{0x44}, 256)...)
@@ -1245,12 +1257,20 @@ func TestRestoreOmniTableMediaLinks(t *testing.T) {
 		t.Fatalf("响应: %v %s", err, recorder.Body.String())
 	}
 	reply := response.Choices[0].Message.Content
-	if !strings.Contains(reply, "![image]("+imageLink+")") || !strings.Contains(reply, "[video]("+videoLink+")") {
-		t.Fatalf("url 模式应输出 .bmp 图片与 .mpg 视频链接: %q", reply)
+	if !strings.Contains(reply, "![media](data:image/bmp;base64,"+base64.StdEncoding.EncodeToString(bmp)+")") || !strings.Contains(reply, "[video]("+videoLink+")") {
+		t.Fatalf("url 模式应内联 .bmp 图片、输出 .mpg 视频链接: %q", reply)
+	}
+	if countFiles(t, dir) != 1 {
+		t.Fatalf("url 模式只保存视频，媒体目录有 %d 个文件", countFiles(t, dir))
 	}
 	aviData := append([]byte("RIFF\x10\x00\x00\x00AVI LIST"), bytes.Repeat([]byte{0x55}, 128)...)
 	heicData := append([]byte("\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic"), bytes.Repeat([]byte{0x66}, 64)...)
 	store := mediastore.New(dir)
+	// 旧版本 url 模式保存的图片：历史里只剩它的链接
+	if name, err := store.Save(bmp, "image/bmp"); err != nil || "https://ai.example.com/media/"+name != imageLink {
+		t.Fatalf("保存 BMP: %q %v", name, err)
+	}
+	reply = "生成好了：\n![image](" + imageLink + ")\n[video](" + videoLink + ")"
 	aviName, err := store.Save(aviData, "video/avi")
 	if err != nil || !strings.HasSuffix(aviName, ".avi") {
 		t.Fatalf("保存 AVI: %q %v", aviName, err)
@@ -1298,5 +1318,489 @@ func TestRestoreOmniTableMediaLinks(t *testing.T) {
 	}
 	if user := strings.Join(describeParts(service.last.Contents[2].Parts), "|"); user != "text:参考 "+aviLink+" 再改一下" {
 		t.Fatalf("其他模型用户正文不应改动: %q", user)
+	}
+}
+
+// imageEvents 为画图模型（gemini-3-pro-image 等）的事件流：一段正文、一张带签名的图片与另一张图片
+func imageEvents() []aistudio.Event {
+	return []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "画好了"},
+		{Kind: aistudio.EventMedia, Media: &aistudio.Media{MIME: "image/png", Data: testImage}, ThoughtSignature: "sig-image"},
+		{Kind: aistudio.EventMedia, Media: &aistudio.Media{MIME: "image/jpeg", Data: append([]byte{0xff, 0xd8, 0xff}, testImage...)}},
+		{Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}
+}
+
+// TestImageMediaAlwaysInline MEDIA_OUTPUT=url 时画图模型的图片仍按官网原样以 Base64 内联返回：Chat Completions 与 Messages 为 data URI 的
+// Markdown，Gemini 原生为 inlineData（签名在 inlineData 上），流式与非流式都与 inline 模式完全相同，不写媒体文件、不出现 /media/ 链接；
+// Responses 与 Interactions 本来就不使用链接，同样内联
+func TestImageMediaAlwaysInline(t *testing.T) {
+	anthropic := map[string]string{"Anthropic-Version": "2023-06-01"}
+	chatText := func(t *testing.T, recorder *httptest.ResponseRecorder, stream bool) string {
+		t.Helper()
+		if !stream {
+			var response struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || len(response.Choices) != 1 {
+				t.Fatalf("响应: %s", recorder.Body.String())
+			}
+			return response.Choices[0].Message.Content
+		}
+		var content strings.Builder
+		for _, chunk := range sseData(t, recorder.Body.String()) {
+			for _, choice := range chunk["choices"].([]any) {
+				if text, ok := choice.(map[string]any)["delta"].(map[string]any)["content"].(string); ok {
+					content.WriteString(text)
+				}
+			}
+		}
+		return content.String()
+	}
+	messagesText := func(t *testing.T, recorder *httptest.ResponseRecorder, stream bool) string {
+		t.Helper()
+		var texts []string
+		if !stream {
+			var response struct {
+				Content []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			}
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("响应: %s", recorder.Body.String())
+			}
+			for _, block := range response.Content {
+				texts = append(texts, block.Type+":"+block.Text)
+			}
+			return strings.Join(texts, "|")
+		}
+		for _, event := range sseData(t, recorder.Body.String()) {
+			if delta, ok := event["delta"].(map[string]any); ok && delta["type"] == "text_delta" {
+				texts = append(texts, delta["text"].(string))
+			}
+		}
+		return strings.Join(texts, "|")
+	}
+	geminiText := func(t *testing.T, recorder *httptest.ResponseRecorder, stream bool) string {
+		t.Helper()
+		if !stream {
+			var response map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+				t.Fatalf("响应: %s", recorder.Body.String())
+			}
+			return mustJSONText(t, geminiResponseParts(t, response))
+		}
+		var parts []map[string]any
+		for _, chunk := range withoutGeminiHeartbeats(t, sseData(t, recorder.Body.String())) {
+			parts = append(parts, geminiResponseParts(t, chunk)...)
+		}
+		return mustJSONText(t, parts)
+	}
+	for _, test := range []struct {
+		name    string
+		path    string
+		body    string
+		header  map[string]string
+		stream  bool
+		extract func(*testing.T, *httptest.ResponseRecorder, bool) string
+	}{
+		{name: "Chat 非流式", path: "/v1/chat/completions", body: `{"model":"gemini-3-pro-image","messages":[{"role":"user","content":"画一只猫"}]}`, extract: chatText},
+		{name: "Chat 流式", path: "/v1/chat/completions", body: `{"model":"gemini-3-pro-image","stream":true,"messages":[{"role":"user","content":"画一只猫"}]}`, stream: true, extract: chatText},
+		{name: "Messages 非流式", path: "/v1/messages", header: anthropic,
+			body: `{"model":"gemini-3-pro-image","max_tokens":64,"messages":[{"role":"user","content":"画一只猫"}]}`, extract: messagesText},
+		{name: "Messages 流式", path: "/v1/messages", header: anthropic, stream: true,
+			body: `{"model":"gemini-3-pro-image","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"画一只猫"}]}`, extract: messagesText},
+		{name: "Gemini 非流式", path: "/v1beta/models/gemini-3-pro-image:generateContent", body: `{"contents":[{"role":"user","parts":[{"text":"画一只猫"}]}]}`, extract: geminiText},
+		{name: "Gemini 流式", path: "/v1beta/models/gemini-3-pro-image:streamGenerateContent?alt=sse", stream: true,
+			body: `{"contents":[{"role":"user","parts":[{"text":"画一只猫"}]}]}`, extract: geminiText},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			inlineHandler, _ := newMediaHandler(t, &scriptedService{events: imageEvents()}, &mediaSettingsStub{})
+			linkHandler, dir := newMediaHandler(t, &scriptedService{events: imageEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+			inline := postJSON(t, inlineHandler, test.path, test.body, test.header)
+			linked := postJSON(t, linkHandler, test.path, test.body, test.header)
+			if inline.Code != http.StatusOK || linked.Code != http.StatusOK {
+				t.Fatalf("状态 inline=%d url=%d: %s", inline.Code, linked.Code, linked.Body.String())
+			}
+			want, got := test.extract(t, inline, test.stream), test.extract(t, linked, test.stream)
+			if got != want {
+				t.Fatalf("url 模式的图片输出应与 inline 完全相同:\n%.400s\n期望:\n%.400s", got, want)
+			}
+			if !strings.Contains(got, base64.StdEncoding.EncodeToString(testImage)) {
+				t.Fatalf("图片应以 Base64 内联: %.300s", got)
+			}
+			if strings.Contains(linked.Body.String(), "/media/") || countFiles(t, dir) != 0 {
+				t.Fatalf("图片不应存成媒体链接（媒体目录 %d 个文件）: %.300s", countFiles(t, dir), linked.Body.String())
+			}
+		})
+	}
+	// Gemini 原生：签名照旧在 inlineData 上
+	linkHandler, _ := newMediaHandler(t, &scriptedService{events: imageEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+	recorder := postJSON(t, linkHandler, "/v1beta/models/gemini-3-pro-image:generateContent", `{"contents":[{"role":"user","parts":[{"text":"画一只猫"}]}]}`, nil)
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	parts := geminiResponseParts(t, response)
+	if len(parts) != 3 || parts[1]["inlineData"].(map[string]any)["mimeType"] != "image/png" || parts[1]["thoughtSignature"] != "sig-image" ||
+		parts[2]["inlineData"].(map[string]any)["mimeType"] != "image/jpeg" {
+		t.Fatalf("Gemini parts = %s", mustJSONText(t, parts))
+	}
+	// Responses 与 Interactions 不使用链接：url 模式下图片同样内联
+	for _, item := range []struct{ path, body string }{
+		{"/v1/responses", `{"model":"gemini-3-pro-image","input":"画一只猫"}`},
+		{"/v1/responses", `{"model":"gemini-3-pro-image","stream":true,"input":"画一只猫"}`},
+		{"/v1beta/interactions", `{"model":"gemini-3-pro-image","input":"画一只猫"}`},
+	} {
+		handler, dir := newMediaHandler(t, &scriptedService{events: imageEvents()}, &mediaSettingsStub{enabled: true, base: "https://ai.example.com"})
+		recorder := postJSON(t, handler, item.path, item.body, nil)
+		if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), base64.StdEncoding.EncodeToString(testImage)) ||
+			strings.Contains(recorder.Body.String(), "/media/") || countFiles(t, dir) != 0 {
+			t.Fatalf("%s %s: 状态 %d，图片应内联: %.300s", item.path, item.body, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+// TestLinkableMedia 链接模式只把视频与音频（含 PCM）存成链接，图片与其他类型照旧内联
+func TestLinkableMedia(t *testing.T) {
+	for mimeType, want := range map[string]bool{
+		"video/mp4": true, "VIDEO/WEBM": true, "audio/wav": true, testPCMMIME: true, " audio/mpeg": true,
+		"image/png": false, "image/jpeg": false, "Image/WebP": false, "application/pdf": false, "": false,
+	} {
+		if got := linkableMedia(mimeType); got != want {
+			t.Fatalf("linkableMedia(%q) = %v，期望 %v", mimeType, got, want)
+		}
+	}
+}
+
+// TestInlineImageHistoryRestored 多轮改图：图片总是以 data URI 内联返回，下一轮客户端把它原样回传时，Chat Completions、Messages 与 Gemini 原生
+// 三个入口都把 assistant（model）文本里的 ![…](data:image/…;base64,…) 拆回图片发给上游，而不是把整段 Base64 当作文本：Messages 用上一轮
+// 实际返回的 text 块回传，Gemini 原生按 new-api 把 inlineData 转成 Markdown 后再转回 Gemini 的写法回传（model 轮的文本 part，签名留在
+// 拆出的第一个 part 上），用户消息里的同样文本不拆。inline 与 url 两种模式相同；Base64 解码不出时三个入口都按文本发送，不返回 400
+func TestInlineImageHistoryRestored(t *testing.T) {
+	anthropic := map[string]string{"Anthropic-Version": "2023-06-01"}
+	encoded := base64.StdEncoding.EncodeToString(testImage)
+	imageHash := sha256Hex(testImage)[:8]
+	// noBase64Text 确认没有文本 part 带着图片的 Base64
+	noBase64Text := func(t *testing.T, parts []aistudio.Part) {
+		t.Helper()
+		for _, part := range parts {
+			if strings.Contains(part.Text, encoded[:64]) {
+				t.Fatalf("图片的 Base64 不应作为文本发给上游: %q", describeParts(parts))
+			}
+		}
+	}
+	for _, settings := range []*mediaSettingsStub{{}, {enabled: true, base: "https://ai.example.com"}} {
+		name := "inline"
+		if settings.enabled {
+			name = "url"
+		}
+		t.Run(name, func(t *testing.T) {
+			// 上一轮：画图模型的 Messages 回复（图片为 data URI 的 Markdown，写在 text 块里）
+			producer, _ := newMediaHandler(t, &scriptedService{events: imageEvents()}, settings)
+			previous := postJSON(t, producer, "/v1/messages",
+				`{"model":"gemini-3-pro-image","max_tokens":64,"messages":[{"role":"user","content":"画一只猫"}]}`, anthropic)
+			var reply struct {
+				Content []json.RawMessage `json:"content"`
+			}
+			if previous.Code != http.StatusOK || json.Unmarshal(previous.Body.Bytes(), &reply) != nil || !strings.Contains(previous.Body.String(), encoded) {
+				t.Fatalf("上一轮 Messages: %d %.300s", previous.Code, previous.Body.String())
+			}
+			service := &recordingService{}
+			handler, _ := newMediaHandler(t, service, settings)
+			messages := map[string]any{"model": "gemini-3-pro-image", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": "画一只猫"},
+				map[string]any{"role": "assistant", "content": reply.Content},
+				map[string]any{"role": "user", "content": "把背景改成蓝色"},
+			}}
+			if recorder := postJSON(t, handler, "/v1/messages", mustJSONText(t, messages), anthropic); recorder.Code != http.StatusOK {
+				t.Fatalf("Messages: %d %s", recorder.Code, recorder.Body.String())
+			}
+			parts := service.last.Contents[1].Parts
+			if got := strings.Join(describeParts(parts), "|"); !strings.HasPrefix(got, "text:画好了|inline:image/png:"+imageHash+"|inline:image/jpeg:") {
+				t.Fatalf("Messages assistant 回传 = %q，期望拆回两张图片", got)
+			}
+			noBase64Text(t, parts)
+			// assistant 为字符串时同样拆分
+			messages["messages"].([]any)[1] = map[string]any{"role": "assistant", "content": "画好了\n" + testImageMarkdown()}
+			if recorder := postJSON(t, handler, "/v1/messages", mustJSONText(t, messages), anthropic); recorder.Code != http.StatusOK {
+				t.Fatalf("Messages 字符串: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if got := strings.Join(describeParts(service.last.Contents[1].Parts), "|"); got != "text:画好了\n|inline:image/png:"+imageHash {
+				t.Fatalf("Messages 字符串 assistant 回传 = %q", got)
+			}
+
+			// Gemini 原生：new-api 把 inlineData 转成 ![image](data:…) 后再转回 Gemini，model 轮为带签名的文本 part
+			// 用户消息里放同样的 Markdown 图片：只拆 model 轮，用户消息照原样作为一个文本 part 发送
+			userImage := "画好了\n" + testImageMarkdown()
+			gemini := map[string]any{"contents": []any{
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": userImage}}},
+				map[string]any{"role": "model", "parts": []any{
+					map[string]any{"text": "画好了\n" + testImageMarkdown() + "\n喜欢吗？", "thoughtSignature": "sig-text"},
+				}},
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "把背景改成蓝色"}}},
+			}}
+			if recorder := postJSON(t, handler, "/v1beta/models/gemini-3-pro-image:generateContent", mustJSONText(t, gemini), nil); recorder.Code != http.StatusOK {
+				t.Fatalf("Gemini: %d %s", recorder.Code, recorder.Body.String())
+			}
+			parts = service.last.Contents[1].Parts
+			if got := strings.Join(describeParts(parts), "|"); got != "text:画好了\n|inline:image/png:"+imageHash+"|text:\n喜欢吗？" {
+				t.Fatalf("Gemini model 回传 = %q，期望拆回图片", got)
+			}
+			if parts[0].ThoughtSignature != "sig-text" || parts[1].ThoughtSignature != "" || parts[2].ThoughtSignature != "" {
+				t.Fatalf("签名应留在拆出的第一个 part 上: %+v", parts)
+			}
+			noBase64Text(t, parts)
+			// 用户消息里的同样文本不拆（与 Chat Completions 入口相同，只处理 assistant 轮）
+			if got := service.last.Contents[0].Parts; len(got) != 1 || got[0].Text != userImage || got[0].InlineData != nil {
+				t.Fatalf("Gemini 用户消息 = %q，期望原样的一个文本 part", describeParts(got))
+			}
+			messages["messages"].([]any)[0] = map[string]any{"role": "user", "content": userImage}
+			if recorder := postJSON(t, handler, "/v1/messages", mustJSONText(t, messages), anthropic); recorder.Code != http.StatusOK {
+				t.Fatalf("Messages 用户消息带图片 Markdown: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if got := service.last.Contents[0].Parts; len(got) != 1 || got[0].Text != userImage || got[0].InlineData != nil {
+				t.Fatalf("Messages 用户消息 = %q，期望原样的一个文本 part", describeParts(got))
+			}
+			if got := strings.Join(describeParts(service.last.Contents[1].Parts), "|"); got != "text:画好了\n|inline:image/png:"+imageHash {
+				t.Fatalf("Messages assistant 回传 = %q", got)
+			}
+
+			// Chat Completions：原本就拆分，两种模式相同
+			chat := map[string]any{"model": "gemini-3-pro-image", "messages": []any{
+				map[string]any{"role": "user", "content": "画一只猫"},
+				map[string]any{"role": "assistant", "content": "画好了\n" + testImageMarkdown()},
+				map[string]any{"role": "user", "content": "把背景改成蓝色"},
+			}}
+			if recorder := postJSON(t, handler, "/v1/chat/completions", mustJSONText(t, chat), nil); recorder.Code != http.StatusOK {
+				t.Fatalf("Chat: %d %s", recorder.Code, recorder.Body.String())
+			}
+			if got := strings.Join(describeParts(service.last.Contents[1].Parts), "|"); got != "text:画好了\n|inline:image/png:"+imageHash {
+				t.Fatalf("Chat assistant 回传 = %q", got)
+			}
+
+			// Base64 解码不出：三个入口都按文本发送，不返回 400（Chat Completions 原先返回 400，这段历史每轮回传，整段会话从此每轮失败）
+			broken := "看 ![image](data:image/png;base64,a)"
+			gemini["contents"].([]any)[1] = map[string]any{"role": "model", "parts": []any{map[string]any{"text": broken}}}
+			if recorder := postJSON(t, handler, "/v1beta/models/gemini-3-pro-image:generateContent", mustJSONText(t, gemini), nil); recorder.Code != http.StatusOK ||
+				strings.Join(describeParts(service.last.Contents[1].Parts), "|") != "text:"+broken {
+				t.Fatalf("Gemini 解码不出时应保留原文本: %d %q", recorder.Code, describeParts(service.last.Contents[1].Parts))
+			}
+			messages["messages"].([]any)[1] = map[string]any{"role": "assistant", "content": broken}
+			if recorder := postJSON(t, handler, "/v1/messages", mustJSONText(t, messages), anthropic); recorder.Code != http.StatusOK ||
+				strings.Join(describeParts(service.last.Contents[1].Parts), "|") != "text:"+broken {
+				t.Fatalf("Messages 解码不出时应保留原文本: %d %q", recorder.Code, describeParts(service.last.Contents[1].Parts))
+			}
+			chat["messages"].([]any)[1] = map[string]any{"role": "assistant", "content": broken}
+			if recorder := postJSON(t, handler, "/v1/chat/completions", mustJSONText(t, chat), nil); recorder.Code != http.StatusOK ||
+				strings.Join(describeParts(service.last.Contents[1].Parts), "|") != "text:"+broken {
+				t.Fatalf("Chat 解码不出时应保留原文本: %d %q", recorder.Code, describeParts(service.last.Contents[1].Parts))
+			}
+		})
+	}
+}
+
+// TestInlineImageHistoryRules 回传的 data URI 图片只在 assistant（model）轮、且是上游能收的图片时拆回，Chat Completions（content 为字符串
+// 或数组的 text 块）、Messages（字符串或 text 块）与 Gemini 原生三个入口规则相同：SVG、声明为 PNG 而数据不是图片的、Base64 解码不出的保留
+// 原文本（不返回 400），GIF 转成 PNG 后拆回，标错类型的图片按文件头写标准 MIME；同一段里能拆的照拆、不能拆的留在文本里；``` 与 ~~~ 围栏
+// 代码块（含列表项标记之后的）、成对反引号的行内代码里的不拆（模型写给用户看的 Markdown 源码），没有配对的、转义的反引号以及隔着空行、
+// 标题、列表项的落单反引号不影响；用户消息里的同样文本不拆
+func TestInlineImageHistoryRules(t *testing.T) {
+	_, _, gifData := omniImageFixtures(t)
+	gifPNG, ok := aistudio.GIFFirstFramePNG(gifData)
+	if !ok {
+		t.Fatal("测试用 GIF 应能转成 PNG")
+	}
+	encode := func(data []byte) string { return base64.StdEncoding.EncodeToString(data) }
+	png := testImageMarkdown()
+	pngPart := "inline:image/png:" + sha256Hex(testImage)[:8]
+	svg := "![logo](data:image/svg+xml;base64," + encode([]byte(`<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>`)) + ")"
+	fake := "![image](data:image/png;base64," + encode([]byte("this decodes but is not an image")) + ")"
+	broken := "![image](data:image/png;base64,a)"
+	gif := "![anim](data:image/gif;base64," + encode(gifData) + ")"
+	// 标错类型的 PNG：拆出的 part 按文件头写标准 MIME，Playground 与 Build 不会把 image/svg+xml、image/jpeg 原样发给上游
+	svgPNG := "![x](data:image/svg+xml;base64," + encode(testImage) + ")"
+	jpegPNG := "![x](data:image/jpeg;base64," + encode(testImage) + ")"
+	cases := []struct {
+		name, text string
+		// want 为拆分结果（describeParts 以 | 连接），为空时期望原样的一个文本 part
+		want string
+	}{
+		{name: "SVG", text: "看 " + svg},
+		{name: "声明为 PNG 的非图片数据", text: "看 " + fake},
+		{name: "Base64 解码不出", text: "看 " + broken},
+		{name: "GIF 转成 PNG", text: "看 " + gif, want: "text:看 |inline:image/png:" + sha256Hex(gifPNG)[:8]},
+		{name: "能拆的与不能拆的", text: png + "\n" + svg, want: pngPart + "|text:\n" + svg},
+		{name: "反引号围栏", text: "写法：\n```markdown\n" + png + "\n```\n"},
+		{name: "波浪号围栏", text: "写法：\n~~~\n" + png + "\n~~~"},
+		{name: "没有闭合的围栏", text: "写法：\n  ```md\n" + png},
+		{name: "行内代码", text: "写法 `" + png + "` 即可"},
+		{name: "双反引号行内代码", text: "写法 `` ` " + png + " `` 即可"},
+		{name: "代码之后的图片", text: "```\n" + png + "\n```\n画好了\n" + png, want: "text:```\n" + png + "\n```\n画好了\n|" + pngPart},
+		{name: "没有配对的反引号", text: "a ` b\n" + png, want: "text:a ` b\n|" + pngPart},
+		{name: "声明为 SVG 的 PNG 数据", text: "看 " + svgPNG, want: "text:看 |" + pngPart},
+		{name: "声明为 JPEG 的 PNG 数据", text: jpegPNG + " 好了", want: pngPart + "|text: 好了"},
+		// 行内代码只在同一段落里配对（CommonMark）：空行、标题行、列表项隔开的落单反引号不把中间正常显示的图片当成代码
+		{name: "跨空行的单个反引号", text: "注意 ` 符号\n\n" + png + "\n\n用 ` 包起来", want: "text:注意 ` 符号\n\n|" + pngPart + "|text:\n\n用 ` 包起来"},
+		{name: "标题里的单个反引号", text: "# 标题 `\n" + png + "\n结尾 `", want: "text:# 标题 `\n|" + pngPart + "|text:\n结尾 `"},
+		{name: "列表项里的单个反引号", text: "- 按 ` 键\n- " + png + "\n- 再按 ` 键", want: "text:- 按 ` 键\n- |" + pngPart + "|text:\n- 再按 ` 键"},
+		{name: "同一段落里成对的反引号", text: "按 ` 键\n" + png + "\n再按 ` 键"},
+		{name: "转义的反引号", text: "用 \\` 转义\n" + png + "\n然后 `x`", want: "text:用 \\` 转义\n|" + pngPart + "|text:\n然后 `x`"},
+		{name: "前后都是转义的反引号", text: "\\`" + png + "\\`", want: "text:\\`|" + pngPart + "|text:\\`"},
+		// 列表项标记之后的围栏：里面的源码不拆，闭合行不被当成没有闭合的起始围栏、把之后的图片都当成代码
+		{name: "列表项里的围栏", text: "- ```markdown\n  " + png + "\n  ```\n画好了\n" + png, want: "text:- ```markdown\n  " + png + "\n  ```\n画好了\n|" + pngPart},
+	}
+	anthropic := map[string]string{"Anthropic-Version": "2023-06-01"}
+	service := &recordingService{}
+	handler, _ := newMediaHandler(t, service, &mediaSettingsStub{})
+	userImage := "画好了\n" + png
+	entries := []struct {
+		name string
+		send func(assistant string) *httptest.ResponseRecorder
+	}{
+		{"Chat 字符串", func(assistant string) *httptest.ResponseRecorder {
+			return postJSON(t, handler, "/v1/chat/completions", mustJSONText(t, map[string]any{"model": "gemini-3-pro-image", "messages": []any{
+				map[string]any{"role": "user", "content": userImage},
+				map[string]any{"role": "assistant", "content": assistant},
+				map[string]any{"role": "user", "content": "继续"},
+			}}), nil)
+		}},
+		{"Chat 数组", func(assistant string) *httptest.ResponseRecorder {
+			return postJSON(t, handler, "/v1/chat/completions", mustJSONText(t, map[string]any{"model": "gemini-3-pro-image", "messages": []any{
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": userImage}}},
+				map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": assistant}}},
+				map[string]any{"role": "user", "content": "继续"},
+			}}), nil)
+		}},
+		{"Messages 字符串", func(assistant string) *httptest.ResponseRecorder {
+			return postJSON(t, handler, "/v1/messages", mustJSONText(t, map[string]any{"model": "gemini-3-pro-image", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": userImage},
+				map[string]any{"role": "assistant", "content": assistant},
+				map[string]any{"role": "user", "content": "继续"},
+			}}), anthropic)
+		}},
+		{"Messages text 块", func(assistant string) *httptest.ResponseRecorder {
+			return postJSON(t, handler, "/v1/messages", mustJSONText(t, map[string]any{"model": "gemini-3-pro-image", "max_tokens": 64, "messages": []any{
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": userImage}}},
+				map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": assistant}}},
+				map[string]any{"role": "user", "content": "继续"},
+			}}), anthropic)
+		}},
+		{"Gemini 原生", func(assistant string) *httptest.ResponseRecorder {
+			return postJSON(t, handler, "/v1beta/models/gemini-3-pro-image:generateContent", mustJSONText(t, map[string]any{"contents": []any{
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": userImage}}},
+				map[string]any{"role": "model", "parts": []any{map[string]any{"text": assistant}}},
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "继续"}}},
+			}}), nil)
+		}},
+	}
+	for _, entry := range entries {
+		t.Run(entry.name, func(t *testing.T) {
+			for _, test := range cases {
+				recorder := entry.send(test.text)
+				if recorder.Code != http.StatusOK || service.last == nil || len(service.last.Contents) != 3 {
+					t.Fatalf("%s：状态 %d %.300s", test.name, recorder.Code, recorder.Body.String())
+				}
+				want := test.want
+				if want == "" {
+					want = "text:" + test.text
+				}
+				if got := strings.Join(describeParts(service.last.Contents[1].Parts), "|"); got != want {
+					t.Fatalf("%s：assistant 回传 = %.400q，期望 %.400q", test.name, got, want)
+				}
+				if got := service.last.Contents[0].Parts; len(got) != 1 || got[0].Text != userImage || got[0].InlineData != nil {
+					t.Fatalf("%s：用户消息 = %.200q，期望原样的一个文本 part", test.name, describeParts(got))
+				}
+			}
+		})
+	}
+}
+
+// TestRestoreAssistantInlineImages 拆分只改带内联图片的文本 part，其他 part（思考、语音元数据、函数调用、没有图片的文本）原样保留；
+// 没有可拆的图片时返回原切片
+func TestRestoreAssistantInlineImages(t *testing.T) {
+	image := testImageMarkdown()
+	plain := []aistudio.Part{{Text: "hello"}, {FunctionCall: &aistudio.FunctionCall{Name: "f"}}}
+	if got := restoreAssistantInlineImages(plain); &got[0] != &plain[0] {
+		t.Fatal("没有内联图片时应返回原切片")
+	}
+	parts := []aistudio.Part{
+		{Text: "before"},
+		{Text: image, Thought: true},
+		{Text: image, SpeechMetadata: &aistudio.SpeechMetadata{Speaker: "A"}},
+		{Text: "a" + image + "b" + image},
+		{FunctionCall: &aistudio.FunctionCall{Name: "f"}},
+	}
+	got := restoreAssistantInlineImages(parts)
+	hash := sha256Hex(testImage)[:8]
+	want := []string{"text:before", "text:" + image, "text:" + image, "text:a", "inline:image/png:" + hash, "text:b", "inline:image/png:" + hash}
+	if described := describeParts(got); strings.Join(described, "|") != strings.Join(want, "|") || len(got) != 8 || got[7].FunctionCall == nil ||
+		!got[1].Thought || got[2].SpeechMetadata == nil {
+		t.Fatalf("拆分结果 = %q", described)
+	}
+	if parts[3].Text != "a"+image+"b"+image {
+		t.Fatal("不应修改调用方的切片")
+	}
+}
+
+// TestMarkdownCodeRanges 代码区间按 CommonMark：反引号与波浪号围栏（最多缩进 3 个空格，缩进 4 个的不是围栏；闭合行的字符不少于起始个数，
+// 没有闭合时到末尾；列表项标记之后的围栏按内容列）、成对反引号的行内代码（长度相同才配对，没有配对的与转义的按普通字符，只在同一段落里
+// 配对），围栏起始行里还有反引号时不是围栏，行内代码不跨围栏
+func TestMarkdownCodeRanges(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		want [][2]int
+	}{
+		{text: "plain", want: nil},
+		{text: "a `b` c", want: [][2]int{{2, 5}}},
+		{text: "a `` x ` y `` z", want: [][2]int{{2, 13}}},
+		{text: "a ` b", want: nil},
+		{text: "a ` b `` c", want: nil},
+		{text: "```go\nx\n```\ny", want: [][2]int{{0, 11}}},
+		{text: "   ~~~~\nx\n~~~\n~~~~\ny", want: [][2]int{{0, 18}}},
+		{text: "    ```\nx\n```", want: [][2]int{{10, 13}}},
+		{text: "x\n```\nopen", want: [][2]int{{2, 10}}},
+		{text: "```a`b\n```", want: [][2]int{{7, 10}}},
+		{text: "`a\n```\nb\n```\n`c`", want: [][2]int{{3, 12}, {13, 16}}},
+		// 行内代码只在同一段落里配对：换行不结束段落，空行（含只有空白的行）、ATX 标题、分隔线与 setext 下划线结束，列表项与引用另起一段
+		{text: "a ` b\nc ` d", want: [][2]int{{2, 9}}},
+		{text: "a ` b\n\nc ` d", want: nil},
+		{text: "a ` b\n \t\nc ` d", want: nil},
+		{text: "a `\r\n\r\nb `", want: nil},
+		{text: "# h `\nx ` y", want: nil},
+		{text: "#h `\nx ` y", want: [][2]int{{3, 8}}},
+		{text: "a `\n---\nb `", want: nil},
+		{text: "a `\n* * *\nb `", want: nil},
+		{text: "a `\n==\nb `", want: nil},
+		{text: "- a `\n- b `", want: nil},
+		{text: "1. a `\n2) b `", want: nil},
+		{text: "- a `\n  b `", want: [][2]int{{4, 11}}},
+		{text: "> a `\n> b `", want: [][2]int{{4, 11}}},
+		{text: "> a `\nb `", want: [][2]int{{4, 9}}},
+		{text: "a `\n> b `", want: nil},
+		{text: "> a `\n>\n> b `", want: nil},
+		// 反斜杠转义：奇数个反斜杠之后的一串第一个反引号是普通字符，其余的仍可作为起点；结尾不看反斜杠
+		{text: "\\`a`", want: nil},
+		{text: "\\\\`a`", want: [][2]int{{2, 5}}},
+		{text: "\\``a`", want: [][2]int{{2, 5}}},
+		{text: "`a\\`", want: [][2]int{{0, 4}}},
+		// 列表项标记之后的围栏：内容列为标记与空格的宽度，闭合行比内容列多缩进不超过 3 个空格，缩进不到内容列的非空行结束列表项与代码块
+		{text: "- ```md\n  x\n  ```\ny", want: [][2]int{{0, 17}}},
+		{text: "1. ```\n   x\n\n   ```", want: [][2]int{{0, 19}}},
+		{text: "  - ```\n    x\n     ```\n`a`", want: [][2]int{{0, 22}, {23, 26}}},
+		{text: "1) ~~~\n   ~~~", want: [][2]int{{0, 13}}},
+		{text: "- ```\n  x\ny `z`", want: [][2]int{{0, 9}, {12, 15}}},
+		{text: "- ```md\nx\n```", want: [][2]int{{0, 7}, {10, 13}}},
+		{text: "-```\nx", want: nil},
+		{text: "-      ```\nx", want: nil},
+	} {
+		if got := markdownCodeRanges(test.text); fmt.Sprint(got) != fmt.Sprint(test.want) {
+			t.Errorf("markdownCodeRanges(%q) = %v，期望 %v", test.text, got, test.want)
+		}
 	}
 }

@@ -491,6 +491,10 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 		if hasResult {
 			role = aistudio.RoleTool
 		}
+		if role == aistudio.RoleAssistant {
+			// 模型轮文本里内联的 Markdown 图片（中转把 inlineData 转成的 data URI）拆回图片，见 restoreAssistantInlineImages
+			parts = restoreAssistantInlineImages(parts)
+		}
 		contents = append(contents, aistudio.Content{Role: role, Parts: parts})
 	}
 	tools, err := mapGeminiTools(request.Tools, request.ToolConfig)

@@ -252,12 +252,12 @@ const zhCN = {
   'models.channels': '通道',
   'settings.mediaTitle': '生成媒体输出',
   'settings.mediaHelp':
-    'Chat Completions、Messages 与 Gemini 原生接口（generateContent、streamGenerateContent，含 /ultra 前缀）回复里的图片、视频与音频的输出方式；Responses、Interactions、Live 等其他接口不受影响。修改后立即生效。',
+    'Chat Completions、Messages 与 Gemini 原生接口（generateContent、streamGenerateContent，含 /ultra 前缀）回复里视频与音频的输出方式；图片（画图模型的输出）总是按官网原样以 Base64 内联返回，不受这里影响；Responses、Interactions、Live 等其他接口不受影响。修改后立即生效。',
   'settings.mediaOutput': '输出方式',
   'settings.mediaOutputInline': '内联 data URI / inlineData（默认）',
   'settings.mediaOutputURL': '本服务链接（保存到 runtime/media/）',
   'settings.mediaOutputHelp':
-    '经 new-api 等中转使用、或生成视频时选“本服务链接”：中转把 Gemini 回复转成 OpenAI 格式时会丢掉视频与音频，几 MB 的 data URI 也很难用。链接模式下媒体按内容保存，正文写成 Markdown 链接（图片 ![image](…)、视频 [video](…)、音频 [audio](…)），Gemini 原生接口另附 fileData。/media/ 链接不校验 API 密钥，拿到链接的人都能打开。',
+    '经 new-api 等中转使用、或生成视频时选“本服务链接”：中转把 Gemini 回复转成 OpenAI 格式时会丢掉视频与音频，几 MB 的 data URI 也很难用。链接模式只对视频与音频生效：按内容保存，正文写成 Markdown 链接（视频 [video](…)、音频 [audio](…)），Gemini 原生接口另附 fileData；图片照旧内联。/media/ 链接不校验 API 密钥，拿到链接的人都能打开。',
   'settings.mediaBaseURL': '媒体链接地址',
   'settings.mediaBaseURLHelp':
     '链接使用的服务地址，填用户能访问到的公网地址，例如 https://ai.example.com（可带路径前缀）；经 new-api、nginx 等转发时必须填写，并让反向代理放行 /media/。留空时按每个请求访问的地址（X-Forwarded-Proto、X-Forwarded-Host 或 Host），经中转时多半是内网地址，用户打不开。',
@@ -1191,12 +1191,12 @@ const en: Record<TranslationKey, string> = {
   'models.channels': 'Channels',
   'settings.mediaTitle': 'Generated media output',
   'settings.mediaHelp':
-    'How images, video and audio appear in replies from Chat Completions, Messages and the native Gemini API (generateContent, streamGenerateContent, including the /ultra prefix). Responses, Interactions, Live and other APIs are unchanged. Changes apply immediately.',
+    'How video and audio appear in replies from Chat Completions, Messages and the native Gemini API (generateContent, streamGenerateContent, including the /ultra prefix). Images (image model output) are always returned inline as Base64 like the official API and are not affected. Responses, Interactions, Live and other APIs are unchanged. Changes apply immediately.',
   'settings.mediaOutput': 'Output',
   'settings.mediaOutputInline': 'Inline data URI / inlineData (default)',
   'settings.mediaOutputURL': 'Link to this service (saved under runtime/media/)',
   'settings.mediaOutputHelp':
-    'Choose links when clients go through new-api or similar gateways, or when generating video: those gateways drop video and audio when converting Gemini replies to the OpenAI format, and data URIs of several MB are hard to use. In link mode media is saved by content and the reply carries a Markdown link (image ![image](…), video [video](…), audio [audio](…)); the native Gemini API also adds a fileData part. /media/ links do not check the API key, so anyone with a link can open it.',
+    'Choose links when clients go through new-api or similar gateways, or when generating video: those gateways drop video and audio when converting Gemini replies to the OpenAI format, and data URIs of several MB are hard to use. Link mode applies to video and audio only: they are saved by content and the reply carries a Markdown link (video [video](…), audio [audio](…)); the native Gemini API also adds a fileData part. Images stay inline. /media/ links do not check the API key, so anyone with a link can open it.',
   'settings.mediaBaseURL': 'Media link address',
   'settings.mediaBaseURLHelp':
     'Service address used in links. Enter the public address users can reach, such as https://ai.example.com (a path prefix is allowed). It is required behind new-api, nginx and other proxies, and the reverse proxy must pass /media/ through. When empty, the address of each request is used (X-Forwarded-Proto, X-Forwarded-Host or Host), which behind a gateway is usually an internal address users cannot open.',

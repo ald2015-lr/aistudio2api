@@ -243,6 +243,10 @@ func (request anthropicRequest) toGenerateRequest(id string) (aistudio.GenerateR
 		if len(parts) == 0 {
 			continue
 		}
+		if role == aistudio.RoleAssistant {
+			// assistant 文本里内联的 Markdown 图片（本服务输出图片的写法）拆回图片，见 restoreAssistantInlineImages
+			parts = restoreAssistantInlineImages(parts)
+		}
 		contents = append(contents, aistudio.Content{Role: role, Parts: parts})
 	}
 	tools, err := mapAnthropicTools(request.Tools, request.ToolChoice)

@@ -595,6 +595,8 @@ WARN  service        视频模型带图请求被官网拒绝（没有权限）�
 
 生成服务的运行日志在管理页保存 `OMNI_IMAGE_BINDING` 且取值变化时写一行 INFO `视频模型带图校验值设置已更新并立即生效 | 开启=<BOOL>（OMNI_IMAGE_BINDING）`，下一次尝试起按新值计算 binding。
 
+管理页保存生成媒体输出设置且取值变化时写一行 INFO `媒体输出设置已更新并立即生效 | 输出=<inline/url> | 链接地址=<地址/按请求地址> | 保存期限=<时长/不清理> | 总量上限=<大小/不限>`，之后进入的请求按新设置输出。`MEDIA_OUTPUT=url` 只对视频与音频生效：图片（画图模型的输出与任何 `image/*` 媒体）总是按官网原样以 Base64 内联返回，不保存到 `runtime/media/`，媒体目录与清理日志里只会有视频与音频；视频或音频保存失败时这一个媒体改为内联输出，访问日志的错误写 `媒体保存失败，本次改为内联输出: <原因>`，请求照常成功。
+
 经排查路由（`/trace/`）的 Omni 请求，排查记录的 `attempts[].requests` 有发往上游的 CreateInteractionStream 请求体（图片 Base64 只留长度、指纹与开头），`attempts[].upstream_head` 为上游原始响应开头（上游返回 HTTP 错误时为错误响应体），`timeline` 有上面的请求结构摘要与 4xx 证据行（与请求日志同一行，来源为执行账号），`notes` 有 `CreateInteractionStream binding | 字节=<N> | sha256=<HEX>`（参与 WAA proof 的 binding 字符串的字节数与摘要，与官网页面算 proof 时的输入对照用；`OMNI_IMAGE_BINDING` 开启且带图时字节数含图片 Base64，是否计入见请求结构摘要的 `校验值含图片`）。
 
 启用账户的 Drive 授权状态计数见 `GET /api/status` 的 `drive`（`available` 换到过 Drive token 或经本服务登录时完成了 Drive 授权、`unavailable` 没有 Drive 授权、`unknown` 还没试过或记录已过期；可用、不可用各 24 小时，写在 `runtime/model-catalogs/drive-accounts.json`，重启后沿用），管理页侧栏写 `Drive 授权 · 可用 N · 不可用 N · 未知 N`（有启用账户却没有可用也没有未知的账户时标黄），`bash tools/diag_start.sh` 状态段写一行 `Drive 授权：可用 N，不可用 N，未知 N`（没有可用或未知的账户时附一句 gemini-omni 的视频输入（及不能内联的图片）会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）。
