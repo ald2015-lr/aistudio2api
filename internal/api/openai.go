@@ -193,6 +193,8 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	events = withHiddenReasoning(r.Context(), events, hideThought)
 	created := time.Now().Unix()
 	if request.Stream {
+		// 额度用完改用了其他模型时报告实际使用的模型（流式收到首个事件后才确定，流内各块另按它更新，见 servedModel）
+		request.Model = servedModel(r.Context(), request.Model)
 		// 隐藏思维链时首个事件（思考）在过滤中被丢掉：按首个事件没到处理，提交时照样写一块心跳（见 handleGeminiGenerate）
 		s.streamChatCompletion(w, r, request, requestID, created, events, eventReady && !hideThought)
 		return
@@ -204,7 +206,9 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	s.thoughtSignatures.Remember(s.thoughtSignatureScope(r.Context(), generateRequest.Model), result.toolCalls)
+	// 额度用完改用了其他模型时：响应报告实际使用的模型，函数调用的签名登记在目标模型的作用域下
+	request.Model = servedModel(r.Context(), request.Model)
+	s.thoughtSignatures.Remember(s.thoughtSignatureScope(r.Context(), servedModel(r.Context(), generateRequest.Model)), result.toolCalls)
 	writeJSON(w, http.StatusOK, buildChatCompletion(requestID, created, request.Model, result, s.mediaOutputFor(r)))
 }
 
@@ -1095,7 +1099,21 @@ func (s *server) streamChatCompletion(
 		return
 	}
 	dataHeartbeat := s.config.streamDataHeartbeat()
-	heartbeat := chatHeartbeat(w, dataHeartbeat, id, created, request.Model, request.StreamOptions.IncludeUsage)
+	signatureModel := request.Model
+	signatureScope := s.thoughtSignatureScope(r.Context(), request.Model)
+	// currentModel 返回之后各块报告的模型：提交响应头之后才决定改用其他模型（额度用完）时，之后的块（含心跳块）与签名登记按实际使用的模型，
+	// 已写出的 role 块保留请求的模型
+	currentModel := func() string {
+		request.Model = servedModel(r.Context(), request.Model)
+		if request.Model != signatureModel {
+			signatureModel = request.Model
+			signatureScope = s.thoughtSignatureScope(r.Context(), request.Model)
+		}
+		return request.Model
+	}
+	heartbeat := func() error {
+		return chatHeartbeat(w, dataHeartbeat, id, created, currentModel(), request.StreamOptions.IncludeUsage)()
+	}
 	if dataHeartbeat && !eventReady {
 		// 首个事件还没到就提交了响应头：紧跟 role 块再写一块空 delta。new-api 的 OpenAI 渠道落后一块转发（relay-openai.go 的 OaiStreamHandler
 		// 收到下一条 data 时才把上一条写给它的客户端），不写这一块时 role 块要等到下一次心跳或首个事件才到它的客户端
@@ -1103,12 +1121,12 @@ func (s *server) streamChatCompletion(
 			return
 		}
 	}
-	signatureScope := s.thoughtSignatureScope(r.Context(), request.Model)
 	toolIndex := 0
 	hasContent := false
 	contentEndsWithNewline := false
 	media := s.mediaOutputFor(r)
 	result, err := consumeStreamEvents(r.Context(), events, media.joinStreamAudio(func(event aistudio.Event) error {
+		currentModel()
 		switch event.Kind {
 		case aistudio.EventText:
 			hasContent = hasContent || event.Text != ""

@@ -547,6 +547,13 @@ button[aria-busy='true']::before {
     white-space: nowrap;
   }
 
+  /* 额度用完改用其他模型（MODEL_FALLBACKS）的标记：请求日志与活动请求共用 */
+  .tag-fallback {
+    border-color: rgb(234 179 8 / 55%);
+    background: rgb(234 179 8 / 12%);
+    color: #fde68a;
+  }
+
   /* Ultra 号池的标记：账户权益、请求日志、请求摘要与用量记录共用 */
   .tag-ultra {
     border-color: rgb(217 70 239 / 55%);

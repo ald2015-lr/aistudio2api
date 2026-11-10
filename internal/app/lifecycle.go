@@ -662,6 +662,14 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait, StreamDataHeartbeat: active.StreamDataHeartbeat,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
 		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
+		ModelFallbacks: active.ModelFallbacks, ModelFallbackScope: active.ModelFallbackScope,
+	}
+	// 额度用完改用其他模型：提交时省略（旧版页面）按生效值比较，规则按规范写法比较
+	if value.ModelFallbacks != nil {
+		saved.ModelFallbacks, _ = config.NormalizeModelFallbacks(*value.ModelFallbacks)
+	}
+	if scope := config.NormalizeModelFallbackScope(value.ModelFallbackScope); scope != "" {
+		saved.ModelFallbackScope = scope
 	}
 	if value.DowngradeGuard != nil {
 		saved.DowngradeGuard = downgradeGuardFromAPI(*value.DowngradeGuard)
@@ -746,6 +754,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
+		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 

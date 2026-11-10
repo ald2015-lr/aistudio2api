@@ -205,6 +205,8 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	events = withHiddenReasoning(r.Context(), events, hideThought)
 	created := time.Now().Unix()
 	if request.Stream {
+		// 额度用完改用了其他模型时报告实际使用的模型（见 servedModel）
+		request.Model = servedModel(r.Context(), request.Model)
 		s.streamResponses(w, r, request, currentContents, currentInlineInstructions, responseID, created, events)
 		return
 	}
@@ -215,6 +217,7 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	request.Model = servedModel(r.Context(), request.Model)
 	response, err := buildResponsesObject(responseID, created, request, result)
 	if err != nil {
 		writeOpenAIRequestError(w, err)
@@ -787,7 +790,14 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 	}
 	// 心跳仍为 SSE 注释（不受 STREAM_DATA_HEARTBEAT 影响）：Responses 的事件都有官方语义并带递增的 sequence_number，没有官方客户端会忽略的
 	// 空数据事件，重复 response.in_progress 会打乱客户端按事件推进的状态；响应头提交时已写出 response.created 与 response.in_progress 两条数据
-	result, err := consumeStreamEvents(r.Context(), events, writer.live, func() error { return writeSSEHeartbeat(w) })
+	// 提交响应头之后才决定改用其他模型（额度用完）时，之后的输出项与 response.completed 按实际使用的模型（见 servedModel）；
+	// 已写出的 response.created、response.in_progress 保留请求的模型
+	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
+		writer.request.Model = servedModel(r.Context(), writer.request.Model)
+		return writer.live(event)
+	}, func() error { return writeSSEHeartbeat(w) })
+	request.Model = servedModel(r.Context(), request.Model)
+	writer.request.Model = request.Model
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
 			_ = writer.flushPendingText()

@@ -246,6 +246,18 @@ const zhCN = {
   'channel.build': 'Build',
   'logs.channel': '通道',
   'logs.pool': '号池',
+  'logs.fallback': '改用',
+  'logs.fallbackHelp': '模型 {model} 额度用完，已按 MODEL_FALLBACKS 改用这个模型',
+  'settings.modelFallbackTitle': '额度用完自动改用其他模型',
+  'settings.modelFallbacks': '改用规则',
+  'settings.modelFallbackScope': '生效范围',
+  'settings.modelFallbackScopeUltra': '只对 /ultra 请求',
+  'settings.modelFallbackScopeAll': '普通路径与 /ultra',
+  'settings.modelFallbackScopeOff': '关闭',
+  'settings.modelFallbackHelp':
+    '请求的模型在这个号池里没有可用额度（候选账户全部冷却、额度不足立即返回、换号到最后仍是每日或分钟额度 429、账户发出前已冷却），而且还没有向客户端交出任何内容时，按规则改用另一个模型，响应里的模型名写实际使用的模型。每日限额按模型分开计，gemini-4-argon 用完时 gemini-4-carbon 往往还能用。每条规则写成 源模型=目标1|目标2，规则之间用逗号分隔，目标按顺序尝试，不再套用目标自己的规则；模型名写目录 ID（也可以写目录别名），请求的模型名带的后缀与 long- 前缀照常生效。目标要在这个号池的模型目录里、支持请求带的工具，不支持或在降级判定里就跳过。改用后思考等级、输出上限、自动续写与排队规则都按目标模型，历史里别的模型签发的思考签名换成跳过校验的占位值或去掉（目标模型在改用期间自己签发的保留）。号池繁忙排队超限、参数错误、内容拦截、上游 5xx、超时等不改用；指定账户与带文件的请求不改用。所有目标也都不可用时按原模型的 429 返回，Retry-After 取原模型与各目标建议重试中最早的时刻。生效范围：只对 /ultra 请求（默认）、普通路径与 /ultra、关闭。默认 gemini-4-argon=gemini-4-carbon；清空规则或选关闭即停用。修改后立即生效。',
+  'settings.invalidModelFallbacks':
+    '改用规则无效：每条写成 源模型=目标模型（多个目标用 | 分隔，规则之间用逗号分隔），源与目标不能相同，同一个源模型只能写一条，同一条里的目标不能重复，模型名不能为空或包含空白',
   'pool.ultra': 'Ultra',
   'pool.normal': '普通号池',
   'pool.ultraHelp': '经 /ultra 前缀进入，只用 Ultra 号池的账户',
@@ -1185,6 +1197,19 @@ const en: Record<TranslationKey, string> = {
   'channel.build': 'Build',
   'logs.channel': 'Channel',
   'logs.pool': 'Pool',
+  'logs.fallback': 'Fallback',
+  'logs.fallbackHelp':
+    'Model {model} ran out of quota; MODEL_FALLBACKS switched the request to this model',
+  'settings.modelFallbackTitle': 'Switch models when quota runs out',
+  'settings.modelFallbacks': 'Fallback rules',
+  'settings.modelFallbackScope': 'Scope',
+  'settings.modelFallbackScopeUltra': 'Only /ultra requests',
+  'settings.modelFallbackScopeAll': 'Normal paths and /ultra',
+  'settings.modelFallbackScopeOff': 'Off',
+  'settings.modelFallbackHelp':
+    'When the requested model has no quota left in this pool (every candidate account is cooling down, the quota fail-fast returns, the last account switch still gets a daily or per-minute quota 429, or the account cooled down before sending) and nothing has been sent to the client yet, the request switches to another model by these rules, and the response reports the model actually used. Daily limits are counted per model, so gemini-4-carbon often still works when gemini-4-argon is used up. Write each rule as source=target1|target2 and separate rules with commas; targets are tried in order, and the rule of a target is not applied again. Use catalog model IDs (catalog aliases also work); suffixes and the long- prefix in the requested name still apply. A target must be in the model catalog of this pool and support the tools the request uses, and is skipped otherwise or when it is under the downgrade guard. After switching, the thinking level, output limits, automatic continuation and queuing follow the target model, and thought signatures in the history issued by other models are replaced with the skip-validation placeholder or dropped (signatures the target issued while switched are kept). A full pool queue, invalid arguments, blocked content, upstream 5xx errors and timeouts do not switch; requests pinned to an account or carrying files do not switch either. When every target is unavailable too, the 429 of the original model is returned with Retry-After set to the earliest suggested retry among the original model and the targets. Scope: only /ultra requests (default), normal paths and /ultra, or off. Defaults to gemini-4-argon=gemini-4-carbon; clear the rules or choose off to turn this off. Changes apply immediately.',
+  'settings.invalidModelFallbacks':
+    'Invalid fallback rules: write each rule as source=target (separate several targets with | and rules with commas); the source and a target cannot be the same, each source model can have only one rule, targets in a rule cannot repeat, and model names cannot be empty or contain spaces',
   'pool.ultra': 'Ultra',
   'pool.normal': 'Normal pool',
   'pool.ultraHelp': 'Sent through the /ultra prefix and served only by Ultra-pool accounts',

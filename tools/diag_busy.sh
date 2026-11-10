@@ -283,6 +283,29 @@ def strip_page(text):
     return PAGE_SNAPSHOT_RE.sub("", text or "")
 
 
+# 额度用完改用其他模型（MODEL_FALLBACKS，app/model_fallback.go）：所有目标都不可用时 request.error 为源模型的错误后接
+# "（已按 MODEL_FALLBACKS 改用其他模型：<目标> 额度用完；<目标> 不可用…）"，按源模型的错误分类前先去掉；改用成功或失败时账本的 attempts
+# 里另有一条账户为空、以"模型 "开头的改用备注（不是上游尝试），不计入此前失败的上游尝试；这类请求的每次上游尝试带自己的模型
+# （attempts[].model：源模型与目标模型各记各的），按尝试的模型统计（见 attempt_model）
+FALLBACK_SUFFIX = "（已按 MODEL_FALLBACKS 改用其他模型："
+
+
+def strip_fallback(text):
+    text = text or ""
+    cut = text.find(FALLBACK_SUFFIX)
+    return text[:cut] if cut >= 0 else text
+
+
+def fallback_note(attempt):
+    error = attempt.get("error") or ""
+    return not attempt.get("account") and error.startswith("模型 ") and "按 MODEL_FALLBACKS 改用" in error
+
+
+def attempt_model(row, attempt):
+    # 上游尝试所用的模型：改用过其他模型的请求里尝试带自己的模型，其他请求的尝试按请求的模型
+    return model_key(attempt.get("model")) or row["model"]
+
+
 Q_MIN, Q_DAY, Q_BARE, Q_RES, Q_INPUT, Q_QUOTA, Q_OTHER = (
     "分钟限额", "每日限额", "裸 Quota exceeded", "Resource exhausted", "输入超长（不是额度）", "其他额度文案", "其他 429")
 BUILD_METHODS = ("ProxyStreamedCall", "ProxyUnaryCall")
@@ -365,7 +388,7 @@ def attempt_class(error):
 
 def row_class(row):
     # 请求最终结果的分类（成功返回 None）
-    state, status, error = row["state"], row["status"] or 0, strip_page(row["error"])
+    state, status, error = row["state"], row["status"] or 0, strip_fallback(strip_page(row["error"]))
     if state in SUCCESS:
         return None
     if state == "cancelled" or status == 499:
@@ -421,7 +444,7 @@ def busy_fields(error):
     # 号池繁忙文案（aistudio/accounts.go CapacityBusyError.Error）：已排队、上限、总耗时、现场冷启动、等后台扩容、第几次尝试、最后等待原因；
     # 总耗时后的括号写成“（含现场冷启动 X、等后台扩容 Y）”，两项都可能单独出现；
     # 出口限速排队超限的文案以“出口限速：”开头、不写最后等待原因，原因按“出口限速”计
-    error = error or ""
+    error = strip_fallback(error)
     egress = error.startswith("出口限速：") or "所在出口每分钟请求已满" in error
     if "号池繁忙" not in error and not egress:
         return None
@@ -516,7 +539,7 @@ def load_rows(connection):
             "model": model_key(model), "account": account or "", "channel": channel or "", "status": status or 0,
             "state": state or "", "duration": (duration or 0) / 1000, "first": (first or 0) / 1000,
             "queue": (queue or 0) / 1000, "reasoning": reasoning or 0, "reply": reply or 0, "tools": tools or 0,
-            "error": error or "", "attempts": [a for a in attempts if isinstance(a, dict)], "pool": pool or "",
+            "error": error or "", "attempts": [a for a in attempts if isinstance(a, dict) and not fallback_note(a)], "pool": pool or "",
         })
     latest = connection.execute("SELECT max(time) FROM requests WHERE time <= ?", (bounds[1],)).fetchone()[0]
     return rows, (ms_to_time(latest) if latest else None)
@@ -1042,7 +1065,7 @@ section("3. 上游 429 按文案分类（账本中每次失败的尝试）")
 attempt_records = []
 for row in window_rows:
     for attempt in row["attempts"]:
-        attempt_records.append((row["model"], attempt.get("channel") or "?", attempt.get("account") or "",
+        attempt_records.append((attempt_model(row, attempt), attempt.get("channel") or "?", attempt.get("account") or "",
                                 attempt_class(attempt.get("error")), attempt.get("error") or ""))
 if connection is None:
     print("  没有账本，改用日志里的“账号切换”行（会丢条）：")
@@ -1447,19 +1470,19 @@ def model_events():
     # 账本只记录请求完成时间与每次尝试的耗时：第 i 次尝试的时间按“请求开始 + 前 i 次尝试耗时之和”估算（不含两次之间的排队，偏早几秒）
     events = collections.defaultdict(list)
     for row in rows:
-        if row["end"] < QE_SINCE or not is_model(row["model"]):
+        if row["end"] < QE_SINCE:
             continue
         cursor = row["start"]
         for attempt in row["attempts"]:
             cursor = min(cursor + TD(milliseconds=attempt.get("duration_ms") or 0), row["end"])
             account = attempt.get("account") or ""
-            if not account:
+            if not account or not is_model(attempt_model(row, attempt)):
                 continue
             cls = attempt_class(attempt.get("error"))
             kind = ("bare" if cls == "429·" + Q_BARE else "blocked" if cls.startswith("发出前") else
                     "quota" if cls.startswith("429·") else "fail")
             events[account].append((cursor, kind, attempt.get("channel") or ""))
-        if row["success"] and row["account"]:
+        if row["success"] and row["account"] and is_model(row["model"]):
             moment = min(row["start"] + TD(seconds=row["first"]), row["end"]) if row["first"] else row["end"]
             events[row["account"]].append((moment, "ok", row["channel"]))
     if connection is None:

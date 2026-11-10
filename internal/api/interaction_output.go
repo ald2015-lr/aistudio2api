@@ -363,6 +363,8 @@ func (s *server) streamInteraction(w http.ResponseWriter, r *http.Request, reque
 	if request.Store == nil || *request.Store {
 		s.storeInteractionState(generate.ID, request.PreviousID, current, result)
 	}
+	// 提交响应头之后才决定改用其他模型（额度用完）时，interaction.completed 按实际使用的模型（见 servedModel）；已写出的 interaction.created 保留请求的模型
+	model = servedModel(r.Context(), model)
 	if err := send("interaction.completed", map[string]any{"interaction": interactionObject(generate.ID, model, created, interactionStatus(result), result.usage)}); err != nil {
 		SetAccessLogError(r.Context(), fmt.Errorf("interaction completion: %w", err))
 	}

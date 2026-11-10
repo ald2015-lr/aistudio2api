@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1058,6 +1059,8 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 	}
 	events = withHiddenReasoning(r.Context(), events, hideThought)
 	if stream {
+		// 额度用完改用了其他模型时 modelVersion 报告实际使用的模型（流式收到首个事件后才确定，流内各块另按它更新，见 servedModel）
+		request.Model = servedModel(r.Context(), request.Model)
 		// 隐藏思维链时首个事件（思考）在过滤中被丢掉，提交响应头后要等下一个可见事件或一个心跳间隔才有数据：按首个事件没到处理，
 		// 提交时照样写一块心跳（多一块对客户端没有副作用）
 		s.streamGemini(w, r, request, events, eventReady && !hideThought)
@@ -1070,6 +1073,8 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		}
 		return
 	}
+	// 额度用完改用了其他模型时：modelVersion 报告实际使用的模型，函数调用的签名登记在目标模型的作用域下
+	request.Model = servedModel(r.Context(), request.Model)
 	// 登记输出的函数调用：客户端或中转下一轮没有原样带回签名时按调用还原（见 handleGeminiAction）
 	s.thoughtSignatures.Remember(s.thoughtSignatureScope(r.Context(), request.Model), result.toolCalls)
 	writeJSON(w, http.StatusOK, buildGeminiResponse(request, result, s.mediaOutputFor(r)))
@@ -1451,6 +1456,8 @@ type geminiChunkWriter struct {
 	// responseID、model 为本流各块的 responseId 与 modelVersion，心跳块与它们一致
 	responseID string
 	model      string
+	// ctx 为请求的 context（streamGemini 设置）：提交响应头之后才决定改用其他模型（额度用完）时，之后的心跳块按实际使用的模型（见 servedModel）
+	ctx context.Context
 	// thought 记录本流上一块是不是思考（thought:true 的 part）：心跳块随之用空思考 part，中转转成的空增量与上一块同类，
 	// 客户端的思考界面状态不变（正在思考时不会被当成开始正文）
 	thought bool
@@ -1524,6 +1531,9 @@ func (writer *geminiChunkWriter) heartbeat() error {
 // delta.reasoning_content=""）的增量原样写给它的客户端，与它自己在流开头写的 role 块（content 同样为 ""）同形，
 // 没有 finishReason 不会被当成回复结束，也不计入用量
 func (writer *geminiChunkWriter) heartbeatChunk() map[string]any {
+	if writer.ctx != nil {
+		writer.model = servedModel(writer.ctx, writer.model)
+	}
 	part := map[string]any{"text": ""}
 	if writer.thought {
 		part["thought"] = true
@@ -1556,12 +1566,18 @@ func (s *server) streamGemini(w http.ResponseWriter, r *http.Request, request ai
 	if err != nil {
 		return
 	}
+	chunks.ctx = r.Context()
 	signatureScope := s.thoughtSignatureScope(r.Context(), request.Model)
 	defer chunks.close()
 	media := s.mediaOutputFor(r)
 	// textOpen 记录已输出的正文没有以换行结尾，随后的媒体链接先换行
 	textOpen := false
 	result, err := consumeStreamEvents(r.Context(), events, media.joinStreamAudio(func(event aistudio.Event) error {
+		// 提交响应头之后才决定改用其他模型（额度用完）时，之后的块与签名登记按实际使用的模型
+		if model := servedModel(r.Context(), request.Model); model != request.Model {
+			request.Model = model
+			signatureScope = s.thoughtSignatureScope(r.Context(), model)
+		}
 		response := map[string]any{"responseId": request.ID, "modelVersion": responseModel(request)}
 		switch event.Kind {
 		case aistudio.EventText:

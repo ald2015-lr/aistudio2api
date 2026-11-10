@@ -172,6 +172,10 @@ func (c *Config) resetKey(key string) {
 		c.UltraPrimaryModels = slices.Clone(defaults.UltraPrimaryModels)
 	case "ULTRA_PRIMARY_QUEUE_WAIT":
 		c.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(c.RequestTimeout)
+	case "MODEL_FALLBACKS":
+		c.ModelFallbacks = defaults.ModelFallbacks
+	case "MODEL_FALLBACK_SCOPE":
+		c.ModelFallbackScope = defaults.ModelFallbackScope
 	case "WAA_BACKEND":
 		c.WAABackend = defaults.WAABackend
 	case "DOWNGRADE_GUARD":
@@ -347,6 +351,8 @@ var configChecks = []configCheck{
 		}
 		return nil
 	}},
+	{keys: []string{"MODEL_FALLBACKS"}, check: func(c Config) error { return validateModelFallbacks(c.ModelFallbacks) }},
+	{keys: []string{"MODEL_FALLBACK_SCOPE"}, check: func(c Config) error { return validateModelFallbackScope(c.ModelFallbackScope) }},
 	// 写错时不按默认值（Camoufox）启动：纯 Go 部署不能悄悄改成浏览器发送，TLS、HTTP/2 指纹与发送路径都会改变
 	{keys: []string{"WAA_BACKEND"}, fatal: true, check: func(c Config) error {
 		if c.WAABackend != WAABackendCamoufox && c.WAABackend != WAABackendGo {

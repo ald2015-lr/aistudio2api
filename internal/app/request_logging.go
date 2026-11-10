@@ -26,7 +26,7 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		InputMedia: entry.InputMedia, InputMediaBytes: entry.InputMediaBytes, InputFiles: entry.InputFiles,
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
-		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect,
+		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect, FallbackFrom: entry.FallbackFrom,
 	}
 	if entry.Generation {
 		data.Parameters = map[string]string{

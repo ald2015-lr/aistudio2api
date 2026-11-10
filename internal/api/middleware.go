@@ -56,6 +56,8 @@ type accessLogMetadata struct {
 	maxOutputTokens string
 	seed            string
 	requestID       string
+	// fallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时为空
+	fallbackFrom string
 	// startedAt 为请求进入服务的时间；queueWait 为进入服务到取得最终执行账户的时间
 	startedAt time.Time
 	queueWait time.Duration
@@ -99,6 +101,7 @@ type accessLogSnapshot struct {
 	finishReason    string
 	replyHash       string
 	servedModel     string
+	fallbackFrom    string
 	downgrade       *aistudio.DowngradeDecision
 	requestErr      string
 	canceled        bool
@@ -349,6 +352,62 @@ func SetAccessLogServedModel(ctx context.Context, model string) {
 	}
 }
 
+// SetAccessLogModelFallback 记下额度用完改用其他模型（MODEL_FALLBACKS，见 app/model_fallback.go）：请求日志与用量账本的模型改记 target，
+// 请求日志另记改用前的 from。target 为空时只把模型恢复为 from、清除改用标记（改用之后仍按源模型的错误结束时用 RestoreAccessLogSource，
+// 模型、改用标记与账户、通道在同一把锁内一起恢复）
+func SetAccessLogModelFallback(ctx context.Context, from string, target string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		if target == "" {
+			metadata.model, metadata.fallbackFrom = strings.TrimPrefix(strings.TrimSpace(from), "models/"), ""
+		} else {
+			metadata.model, metadata.fallbackFrom = strings.TrimPrefix(strings.TrimSpace(target), "models/"), strings.TrimSpace(from)
+		}
+		metadata.mu.Unlock()
+	}
+}
+
+// AccessLogTarget 返回请求日志当前记下的账户与通道（额度用完改用其他模型时记下源模型运行结束时的值，见 RestoreAccessLogSource）
+func AccessLogTarget(ctx context.Context) (string, string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		defer metadata.mu.Unlock()
+		return metadata.account, metadata.channel
+	}
+	return "", ""
+}
+
+// RestoreAccessLogSource 把请求日志与用量账本的模型恢复为源模型 model、清除改用标记（fallback_from），账户与通道恢复为 account、channel
+// （可以为空）：额度用完改用其他模型、所有目标也都不可用而按源模型的错误结束时，恢复为源模型运行结束时的值（源模型候选全部冷却、一次也没有
+// 发出时为空），不记成目标模型最后用过的账户与通道。四项在同一把锁内写入：访问日志随时可能取快照（例如客户端断开 499 时立即取），
+// 不会记下模型已是源模型、没有 fallback_from，账户与通道却还是目标模型的一半状态
+func RestoreAccessLogSource(ctx context.Context, model string, account string, channel string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.model, metadata.fallbackFrom = strings.TrimPrefix(strings.TrimSpace(model), "models/"), ""
+		metadata.account, metadata.channel = strings.TrimSpace(account), strings.TrimSpace(channel)
+		metadata.mu.Unlock()
+	}
+}
+
+// TagAccessLogAttempts 给已记下、还没有写模型的上游尝试记上 model：额度用完改用其他模型时，第一次真正改用时（追加改用备注之前）把改用前
+// 源模型的尝试记源模型，之后目标模型的尝试在记下时就写目标模型（见 RequestAttempt.Model）；目标都被跳过、没有改用时不调用
+func TagAccessLogAttempts(ctx context.Context, model string) {
+	model = strings.TrimPrefix(strings.TrimSpace(model), "models/")
+	if model == "" {
+		return
+	}
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		for index := range metadata.attempts {
+			if metadata.attempts[index].Model == "" {
+				metadata.attempts[index].Model = model
+			}
+		}
+		metadata.mu.Unlock()
+	}
+}
+
 // SetAccessLogDowngrade 写入降级判定的依据（只有被拦截的模型才有；同一请求多次写入时保留最后一次）
 func SetAccessLogDowngrade(ctx context.Context, decision aistudio.DowngradeDecision) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
@@ -490,7 +549,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 	snapshot := accessLogSnapshot{
 		generation: metadata.generation,
 		model:      metadata.model, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
-		requestErr: metadata.err, canceled: metadata.canceled,
+		requestErr: metadata.err, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
 		failureStatus: metadata.failureStatus,
 		firstEvent:    metadata.firstEvent,
 		upstreamBytes: metadata.upstreamBytes, usage: metadata.usage, toolCalls: metadata.toolCalls,
@@ -683,7 +742,9 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		}
 		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, pool: pool, requestID: newID("req"), startedAt: started}
 		writer := &accessLogResponseWriter{ResponseWriter: w, metadata: metadata}
-		request := r.WithContext(context.WithValue(r.Context(), accessLogContextKey{}, metadata))
+		// 每个请求另挂一份改用模型的记录：生成服务额度用完改用其他模型时写入，协议层据此在响应里报告实际使用的模型（见 servedModel）
+		ctx := aistudio.ContextWithModelSwitch(context.WithValue(r.Context(), accessLogContextKey{}, metadata), aistudio.NewModelSwitch())
+		request := r.WithContext(ctx)
 		// 客户端断开（请求的 context 被取消）那一刻记下现场：是否已提交响应头、已写出多少、多久没写出、上游多久没有事件。
 		// 处理函数返回后 net/http 也会取消 context，所以返回前先停止观察；观察已经开始时等它记完
 		watched := make(chan struct{})
@@ -734,7 +795,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				RequestID: snapshot.requestID, Pool: pool,
 				Method: r.Method, Path: path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
-				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade,
+				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
 				Authorized: snapshot.authorized, Disconnect: disconnect,
 			})

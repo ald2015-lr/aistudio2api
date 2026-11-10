@@ -131,6 +131,8 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		events = withHiddenReasoning(r.Context(), events, hideThought)
+		// 额度用完改用了其他模型时 message_start 报告实际使用的模型（见 servedModel）
+		request.Model = servedModel(r.Context(), request.Model)
 		if err := streamHeaders(w); err != nil {
 			return
 		}
@@ -161,6 +163,7 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 		return
 	}
+	request.Model = servedModel(r.Context(), request.Model)
 	writeJSON(w, http.StatusOK, buildAnthropicResponse(messageID, request.Model, result, s.config.currentAPIKey(), s.mediaOutputFor(r)))
 }
 

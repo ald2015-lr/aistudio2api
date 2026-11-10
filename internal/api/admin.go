@@ -272,6 +272,8 @@ type RequestLog struct {
 	ReplyHash    string           `json:"reply_hash,omitempty"`
 	// ServedModel 为上游标明的实际服务模型，只在与请求的模型系列不同时出现
 	ServedModel string `json:"served_model,omitempty"`
+	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时不出现
+	FallbackFrom string `json:"fallback_from,omitempty"`
 	// Downgrade 为降级判定的依据（只有被拦截的模型才有）
 	Downgrade       *aistudio.DowngradeDecision `json:"downgrade,omitempty"`
 	Error           string                      `json:"error,omitempty"`
@@ -363,9 +365,11 @@ type AccessLog struct {
 	ReplyHash       string
 	ServedModel     string
 	Downgrade       *aistudio.DowngradeDecision
-	Error           string
-	Canceled        bool
-	Generation      bool
+	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时为空
+	FallbackFrom string
+	Error        string
+	Canceled     bool
+	Generation   bool
 	// Attempts 为最终结果之前未成功的上游尝试
 	Attempts []RequestAttempt
 	// Authorized 表示请求通过了公开 API key 校验
@@ -513,6 +517,10 @@ type RuntimeConfig struct {
 	// （可以为空数组）；UltraPrimaryQueueWait 为它的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，时长文本）；保存时没有这些字段（旧版页面）则沿用现值
 	UltraPrimaryModels    *[]string `json:"ultra_primary_models,omitempty"`
 	UltraPrimaryQueueWait string    `json:"ultra_primary_queue_wait,omitempty"`
+	// ModelFallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规则 源模型=目标1|目标2，逗号分隔，空字符串表示没有规则），ModelFallbackScope 为
+	// 生效范围（MODEL_FALLBACK_SCOPE：ultra、all、off）；都保存后立即生效，读取时总是返回，保存时没有这些字段（旧版页面）则沿用现值
+	ModelFallbacks     *string `json:"model_fallbacks,omitempty"`
+	ModelFallbackScope string  `json:"model_fallback_scope,omitempty"`
 	// ProxyPool 为 IP 池设置（PROXY_POOL_*，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	ProxyPool *ProxyPoolConfig `json:"proxy_pool,omitempty"`
 	// MediaOutput、MediaBaseURL、MediaRetention、MediaMaxSize 为生成媒体的输出与保存设置（MEDIA_OUTPUT、MEDIA_BASE_URL、
@@ -624,6 +632,8 @@ type AdminRequest struct {
 	StartedAt    time.Time `json:"started_at"`
 	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
 	Pool string `json:"pool,omitempty"`
+	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后的模型；没有改用时为空
+	FallbackFrom string `json:"fallback_from,omitempty"`
 }
 
 // AdminEvent 表示管理端增量事件

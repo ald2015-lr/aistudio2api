@@ -69,6 +69,8 @@ var configKeys = [...]string{
 	"PRIMARY_QUEUE_WAIT",
 	"ULTRA_PRIMARY_MODELS",
 	"ULTRA_PRIMARY_QUEUE_WAIT",
+	"MODEL_FALLBACKS",
+	"MODEL_FALLBACK_SCOPE",
 	"TEMPORARY_CHAT",
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
@@ -146,7 +148,14 @@ type Config struct {
 	// UltraPrimaryQueueWait 为 Ultra 主用模型的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，规则与 PrimaryQueueWait 相同：默认 10s，
 	// 未配置时不超过 REQUEST_TIMEOUT，保存时写具体值）；0 表示不排队；不能超过 RequestTimeout
 	UltraPrimaryQueueWait time.Duration `json:"-"`
-	TemporaryChat         bool          `json:"temporary_chat"`
+	// ModelFallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规范写法 源模型=目标1|目标2，逗号分隔，默认 gemini-4-argon=gemini-4-carbon，
+	// 保存后立即生效，见 model_fallback.go 与 app/model_fallback.go）：请求的模型在号池里没有可用额度、还没有交出任何事件时按顺序改用目标模型。
+	// 写空值表示没有规则；进程环境变量的空值不生效（与其他配置项相同），清空只能在 .env 里写空值或在管理页清空
+	ModelFallbacks string `json:"model_fallbacks"`
+	// ModelFallbackScope 为改用其他模型的生效范围（MODEL_FALLBACK_SCOPE）：ultra（默认，只对 /ultra 路径的请求）、all（普通路径与 /ultra）、
+	// off（关闭，所有请求与没有这项设置时相同）
+	ModelFallbackScope string `json:"model_fallback_scope"`
+	TemporaryChat      bool   `json:"temporary_chat"`
 	// IgnoreClientSeed 为真时忽略客户端传入的 seed，每次请求都使用随机种子
 	IgnoreClientSeed bool `json:"ignore_client_seed"`
 	// RepeatPromptNonce 为真时，在最后一条用户消息末尾加入不可见随机后缀（客户端指定 seed 或温度为 0 时除外）。
@@ -240,6 +249,8 @@ func Default() Config {
 		PrimaryQueueWait:       defaultPrimaryQueueWait,
 		UltraPrimaryModels:     slices.Clone(defaultUltraPrimaryModels),
 		UltraPrimaryQueueWait:  defaultPrimaryQueueWait,
+		ModelFallbacks:         DefaultModelFallbacks,
+		ModelFallbackScope:     ModelFallbackScopeUltra,
 		WAABackend:             WAABackendCamoufox,
 		RepeatPromptNonce:      true,
 		MinOutputTokens:        defaultMinOutputTokens,
@@ -358,6 +369,24 @@ func Load(path string) (Config, error) {
 	models("ULTRA_PRIMARY_MODELS", &cfg.UltraPrimaryModels)
 	cfg.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(cfg.RequestTimeout)
 	duration("ULTRA_PRIMARY_QUEUE_WAIT", true, parseOptionalDuration, &cfg.UltraPrimaryQueueWait)
+	// 额度用完改用其他模型：MODEL_FALLBACKS 键存在时按写的值（空值表示没有规则），写法无效时按默认值并记入无效项；
+	// MODEL_FALLBACK_SCOPE 空值沿用默认 ultra
+	_ = loader.field("MODEL_FALLBACKS", false, func(value string) error {
+		normalized, err := NormalizeModelFallbacks(value)
+		if err != nil {
+			return err
+		}
+		cfg.ModelFallbacks = normalized
+		return nil
+	})
+	_ = loader.field("MODEL_FALLBACK_SCOPE", true, func(value string) error {
+		scope := NormalizeModelFallbackScope(value)
+		if err := validateModelFallbackScope(scope); err != nil {
+			return err
+		}
+		cfg.ModelFallbackScope = scope
+		return nil
+	})
 	boolean("STREAM_DATA_HEARTBEAT", true, &cfg.StreamDataHeartbeat)
 	boolean("OMNI_IGNORE_SYSTEM_PROMPT", true, &cfg.OmniIgnoreSystemPrompt)
 	boolean("OMNI_IMAGE_BINDING", true, &cfg.OmniImageBinding)
@@ -461,6 +490,8 @@ func (c Config) save(path string, kept map[string]string) error {
 		"PRIMARY_QUEUE_WAIT":       c.PrimaryQueueWait.String(),
 		"ULTRA_PRIMARY_MODELS":     strings.Join(c.UltraPrimaryModels, ","),
 		"ULTRA_PRIMARY_QUEUE_WAIT": c.UltraPrimaryQueueWait.String(),
+		"MODEL_FALLBACKS":          c.ModelFallbacks,
+		"MODEL_FALLBACK_SCOPE":     c.ModelFallbackScope,
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
@@ -582,6 +613,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PrimaryQueueWait       string            `json:"primary_queue_wait"`
 		UltraPrimaryModels     []string          `json:"ultra_primary_models"`
 		UltraPrimaryQueueWait  string            `json:"ultra_primary_queue_wait"`
+		ModelFallbacks         string            `json:"model_fallbacks"`
+		ModelFallbackScope     string            `json:"model_fallback_scope"`
 		TemporaryChat          bool              `json:"temporary_chat"`
 		IgnoreClientSeed       bool              `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
@@ -620,6 +653,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		PrimaryQueueWait:       c.PrimaryQueueWait.String(),
 		UltraPrimaryModels:     ultraPrimaryModels,
 		UltraPrimaryQueueWait:  c.UltraPrimaryQueueWait.String(),
+		ModelFallbacks:         c.ModelFallbacks,
+		ModelFallbackScope:     c.ModelFallbackScope,
 		TemporaryChat:          c.TemporaryChat,
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
@@ -662,6 +697,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PrimaryQueueWait       string             `json:"primary_queue_wait"`
 		UltraPrimaryModels     *[]string          `json:"ultra_primary_models"`
 		UltraPrimaryQueueWait  string             `json:"ultra_primary_queue_wait"`
+		ModelFallbacks         *string            `json:"model_fallbacks"`
+		ModelFallbackScope     string             `json:"model_fallback_scope"`
 		TemporaryChat          bool               `json:"temporary_chat"`
 		IgnoreClientSeed       bool               `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
@@ -712,6 +749,15 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 			return err
 		}
 	}
+	// 额度用完改用其他模型：旧版数据没有这些字段（或为 null）时按默认值处理，显式的空字符串表示没有规则；规则按规范写法整理
+	modelFallbacks := DefaultModelFallbacks
+	if value.ModelFallbacks != nil {
+		modelFallbacks, _ = NormalizeModelFallbacks(*value.ModelFallbacks)
+	}
+	modelFallbackScope := NormalizeModelFallbackScope(value.ModelFallbackScope)
+	if modelFallbackScope == "" {
+		modelFallbackScope = ModelFallbackScopeUltra
+	}
 	// 媒体设置：旧版数据没有该字段时按默认值处理
 	media, err := mediaSettingsOrDefault(value.Media)
 	if err != nil {
@@ -743,6 +789,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		PrimaryQueueWait:       primaryQueueWait,
 		UltraPrimaryModels:     ultraPrimaryModels,
 		UltraPrimaryQueueWait:  ultraPrimaryQueueWait,
+		ModelFallbacks:         modelFallbacks,
+		ModelFallbackScope:     modelFallbackScope,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,

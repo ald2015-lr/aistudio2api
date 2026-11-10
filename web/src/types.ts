@@ -508,6 +508,8 @@ export interface RequestLog {
     average_tokens_per_second: number
   }
   downgrade?: DowngradeDecision
+  // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时不出现
+  fallback_from?: string
 }
 
 // RequestDisconnect 对应请求日志里取消请求的断开现场
@@ -603,6 +605,8 @@ export interface RequestSummary {
   started_at: string
   // pool 为 ultra 表示请求经 /ultra 进入
   pool?: 'ultra'
+  // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后的模型；没有改用时不出现
+  fallback_from?: string
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（服务配置页，修改后立即生效）
@@ -688,6 +692,11 @@ export interface ServiceConfig {
   // 规则与 primary_queue_wait 相同。旧版服务端不返回这两个字段
   ultra_primary_models?: string[]
   ultra_primary_queue_wait?: string
+  // model_fallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规则 源模型=目标1|目标2，逗号分隔，空字符串表示没有规则），
+  // model_fallback_scope 为生效范围（MODEL_FALLBACK_SCOPE：ultra 只对 /ultra 请求、all 普通路径与 /ultra、off 关闭）；都保存后立即生效。
+  // 服务端总是返回这两个字段，因此这里不是可选字段
+  model_fallbacks: string
+  model_fallback_scope: 'ultra' | 'all' | 'off'
   waa_backend: 'camoufox' | 'go'
   temporary_chat: boolean
   ignore_client_seed: boolean
@@ -900,6 +909,8 @@ export interface RequestAttempt {
   channel: string
   error: string
   duration_ms: number
+  // 这次尝试所用的模型：只在额度用完改用了其他模型（MODEL_FALLBACKS）的请求里有，源模型与目标模型的尝试各记各的
+  model?: string
 }
 
 export interface UsageRecord {

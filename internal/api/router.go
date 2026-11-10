@@ -112,7 +112,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	}
 	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文
 	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey,
-		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, public)))))
+		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, s.withThoughtSignatureRestore(public))))))
 	// 号池标记在最外层：/ultra 入口已标记为 Ultra 号池时保留，其余请求按 ULTRA_EXCLUSIVE 标记为普通号池或不限号池
 	publicChain := poolScopeMiddleware(config.ultraExclusive, requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
 	root.Handle("/v1/", publicChain)

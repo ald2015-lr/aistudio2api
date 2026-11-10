@@ -429,11 +429,78 @@ func (s *server) applyModelAlias(ctx context.Context, request *aistudio.Generate
 		return false, nil
 	}
 	request.Model = model.ID
+	// 记下按名称改写之前的客户端思考参数与名称里的选项：生成服务额度用完改用其他模型时按目标模型重新整理（见 RetargetGenerateRequest）
+	plan := &aistudio.RequestAlias{
+		ReasoningEffort: request.Config.ReasoningEffort, ThinkingBudget: cloneInt64(request.Config.ThinkingBudget),
+		Level: alias.level, Online: alias.online, Long: long,
+	}
 	applyThinkingAlias(&request.Config, model, alias.level)
 	if alias.online && model.Capabilities["google_search"] && request.Tools.ToolConfig.Mode != "none" {
+		plan.OnlineAppended = !slices.Contains(request.Tools.Google, "google_search")
 		request.Tools.Google = appendUnique(request.Tools.Google, "google_search")
 	}
+	request.Alias = plan
 	return alias.hideThought && modelThinks(model), nil
+}
+
+// cloneInt64 复制一个可空整数
+func cloneInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	copied := *value
+	return &copied
+}
+
+// RetargetGenerateRequest 按目标模型重新整理协议层按模型名做过的设置（生成服务额度用完改用其他模型时调用，见 app/model_fallback.go），
+// 结果与客户端带同样的后缀直接请求目标模型时相同：思考强度按名称后缀与客户端原来的思考参数重新映射（思考等级或预算按目标模型的能力，
+// 见 applyThinkingAlias）；-online 的联网搜索按目标模型是否支持重新决定（协议层追加的 google_search 先去掉）；long- 前缀按目标模型
+// 是否能经 Playground 续写重新决定；按原生续写原样发送的预填充（PrefillTail）在目标模型不在原生续写名单里时改为补用户消息。
+// 没有经协议层按模型名整理的请求（Alias 为 nil）只处理预填充。返回要写进请求日志的说明。target 为目标模型在请求号池目录里的条目
+func RetargetGenerateRequest(request *aistudio.GenerateRequest, target aistudio.Model) []string {
+	var notes []string
+	request.Model = target.ID
+	if plan := request.Alias; plan != nil {
+		request.Config.ReasoningEffort, request.Config.ThinkingBudget = plan.ReasoningEffort, cloneInt64(plan.ThinkingBudget)
+		applyThinkingAlias(&request.Config, target, plan.Level)
+		next := *plan
+		next.OnlineAppended = false
+		if plan.OnlineAppended {
+			google := slices.DeleteFunc(slices.Clone(request.Tools.Google), func(tool string) bool { return tool == "google_search" })
+			if len(google) == 0 {
+				google = nil
+			}
+			request.Tools.Google = google
+		}
+		if plan.Online && target.Capabilities["google_search"] && request.Tools.ToolConfig.Mode != "none" &&
+			!slices.Contains(request.Tools.Google, "google_search") {
+			request.Tools.Google = append(slices.Clone(request.Tools.Google), "google_search")
+			next.OnlineAppended = true
+		}
+		request.Alias = &next
+		request.LongOutput, request.LongOutputDefaultTokens = false, 0
+		if plan.Long {
+			if longOutputModel(target) {
+				request.LongOutput = true
+			} else {
+				notes = append(notes, fmt.Sprintf(
+					"模型名带 long- 前缀，但 %s 不是能经 Playground 调用的文本对话模型，不自动续写，按普通请求处理", target.ID))
+			}
+		}
+	}
+	if request.PrefillTail && !aistudio.NativePrefillModel(target.ID) {
+		request.Contents = aistudio.AppendPrefillContinuation(request.Contents)
+		request.PrefillTail = false
+		notes = append(notes, fmt.Sprintf(
+			"客户端最后一条是模型消息（预填充）：%s 不接受以模型轮结尾的请求，已在末尾补一条请模型从这里接着写的用户消息", target.ID))
+	}
+	return notes
+}
+
+// servedModel 返回响应里报告的模型：生成服务额度用完改用了其他模型（见 aistudio.ModelSwitch，公开 API 的每个请求都挂了一份）时为
+// 实际使用的目标模型，否则原样返回 model。改用在交出首个事件之前决定：非流式读完结果后、流式收到首个事件后取到的一定是最终结果
+func servedModel(ctx context.Context, model string) string {
+	return aistudio.ModelSwitchFromContext(ctx).Model(model)
 }
 
 // responseModel 返回响应里报告的模型名（OpenAI、Anthropic、Responses 的 model，Gemini 的 modelVersion，Interactions 的 model），

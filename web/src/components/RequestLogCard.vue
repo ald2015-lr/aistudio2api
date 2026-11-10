@@ -5,7 +5,7 @@ import type { LogRow } from '@/logs'
 import UiIcon from './UiIcon.vue'
 
 const props = defineProps<{ row: LogRow }>()
-const { t, locale } = useI18n()
+const { t, tf, locale } = useI18n()
 const request = computed(() => props.row.entry.request!)
 
 // number 按当前语言格式化统计数值
@@ -24,6 +24,12 @@ function number(value: number, digits = 0): string {
         t('pool.ultra')
       }}</span>
       <strong>{{ request.model || `${request.method} ${request.path}` }}</strong>
+      <span
+        v-if="request.fallback_from"
+        v-tooltip="tf('logs.fallbackHelp', { model: request.fallback_from })"
+        class="tag tag-fallback"
+        >{{ t('logs.fallback') }}</span
+      >
       <span v-if="request.duration_ms !== undefined" class="request-duration"
         >{{ number(request.duration_ms / 1000, 2) }} s</span
       >

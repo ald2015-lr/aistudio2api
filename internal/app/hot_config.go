@@ -208,6 +208,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
+		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 
@@ -297,10 +298,16 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
 	admin.service.setPrimaryModelSettings(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait)
+	// MODEL_FALLBACKS、MODEL_FALLBACK_SCOPE：下一个以额度用完结束的请求立即按新规则（见 model_fallback.go）
+	fallbackChanged := admin.service.setModelFallbacks(saved.ModelFallbacks, saved.ModelFallbackScope)
 	generation.config = saved
 	manager.mu.Unlock()
 	if bindingChanged {
 		manager.requests.log("service", "INFO", fmt.Sprintf("视频模型带图校验值设置已更新并立即生效 | 开启=%t（OMNI_IMAGE_BINDING）", saved.OmniImageBinding))
+	}
+	if fallbackChanged {
+		manager.requests.log("service", "INFO", "额度用完改用其他模型的设置已更新并立即生效 | "+
+			modelFallbackSummary(saved.ModelFallbacks, saved.ModelFallbackScope))
 	}
 
 	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 峰值与启动并发的变化同样要重新判断端口够不够。

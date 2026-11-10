@@ -1281,6 +1281,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	} else if ultraPrimaryQueueWait > requestTimeout {
 		ultraPrimaryQueueWait = requestTimeout
 	}
+	// 额度用完改用其他模型：旧版页面保存时不带这些字段，沿用现值；规则按规范写法保存，写法无效时由下面的 Validate 拒绝
+	modelFallbacks, modelFallbackScope := saved.ModelFallbacks, saved.ModelFallbackScope
+	if value.ModelFallbacks != nil {
+		modelFallbacks, _ = config.NormalizeModelFallbacks(*value.ModelFallbacks)
+	}
+	if scope := config.NormalizeModelFallbackScope(value.ModelFallbackScope); scope != "" {
+		modelFallbackScope = scope
+	}
 	// 媒体设置：旧版页面保存时不带这些字段，沿用现值；期限与大小按文本解析，写进 .env 与返回给页面的都是规范写法
 	media, err := mediaSettingsFromInput(saved.Media, value)
 	if err != nil {
@@ -1314,6 +1322,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		PrimaryQueueWait:       primaryQueueWait,
 		UltraPrimaryModels:     ultraPrimaryModels,
 		UltraPrimaryQueueWait:  ultraPrimaryQueueWait,
+		ModelFallbacks:         modelFallbacks,
+		ModelFallbackScope:     modelFallbackScope,
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
@@ -2013,6 +2023,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
+	modelFallbacks := cfg.ModelFallbacks
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
@@ -2043,6 +2054,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		PrimaryQueueWait:       cfg.PrimaryQueueWait.String(),
 		UltraPrimaryModels:     &ultraPrimaryModels,
 		UltraPrimaryQueueWait:  cfg.UltraPrimaryQueueWait.String(),
+		ModelFallbacks:         &modelFallbacks,
+		ModelFallbackScope:     cfg.ModelFallbackScope,
 		ProxyPool:              proxyPoolToAPI(cfg.ProxyPool),
 		MediaOutput:            media.Output,
 		MediaBaseURL:           &media.BaseURL,

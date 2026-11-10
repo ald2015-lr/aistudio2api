@@ -148,6 +148,9 @@ type RequestAttempt struct {
 	Channel    string `json:"channel"`
 	Error      string `json:"error"`
 	DurationMS int64  `json:"duration_ms"`
+	// Model 为这次尝试所用的模型：只在额度用完改用了其他模型（MODEL_FALLBACKS，见 app/model_fallback.go）的请求里写，
+	// 源模型与各个目标模型的尝试各记各的模型（请求本身的模型只有一个）；其他请求为空，与没有这项设置时相同
+	Model string `json:"model,omitempty"`
 }
 
 // UsageRecordQuery 选择请求记录的时间范围、筛选、状态码、关键字与分页位置

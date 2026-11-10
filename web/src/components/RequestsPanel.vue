@@ -21,7 +21,7 @@ const emit = defineEmits<{
   notice: [message: string, tone: 'success' | 'error']
 }>()
 
-const { locale, t } = useI18n()
+const { locale, t, tf } = useI18n()
 const cancelling = ref('')
 const refreshing = ref(false)
 const cooldownQuery = ref('')
@@ -295,6 +295,12 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                           >{{ t('pool.ultra') }}</span
                         >
                         <span class="cell-truncate text-gray-200">{{ request.model || '—' }}</span>
+                        <span
+                          v-if="request.fallback_from"
+                          v-tooltip="tf('logs.fallbackHelp', { model: request.fallback_from })"
+                          class="tag tag-fallback shrink-0"
+                          >{{ t('logs.fallback') }}</span
+                        >
                       </div>
                       <div class="cell-truncate text-xs text-gray-500">
                         {{ accountLabel(request.account_id, request.account_label)

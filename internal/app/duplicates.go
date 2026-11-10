@@ -38,6 +38,9 @@ type generationDiagnostics struct {
 	promptNonce string
 	// downgrade 为降级判定（只有被拦截的模型才有，见 downgrade_guard.go）
 	downgrade *downgradeGate
+	// fallbackModel 为额度用完改用其他模型后实际使用的目标模型（见 model_fallback.go），没有改用时为空：forwardEvents 把它交出的思考签名
+	// 记进 fallbackSignatures
+	fallbackModel string
 }
 
 // replyRecord 为一次完成生成的指纹记录

@@ -319,6 +319,9 @@ type GenerateRequest struct {
 	// LongOutputDefaultTokens 为 long- 请求没有给出输出上限时、模型目录没有官网续写能力（能力码 91）的模型的输出总上限
 	// （LONG_OUTPUT_MAX_TOKENS，由生成服务填写）；0 表示按模型单轮上限，不模拟续写
 	LongOutputDefaultTokens int64 `json:"-"`
+	// Alias 为协议层按模型名整理之前的客户端设置与名称里的选项（只在文本对话模型上设置，见 RequestAlias）：额度用完改用其他模型时
+	// 按目标模型重新整理（MODEL_FALLBACKS，见 app/model_fallback.go），不参与编码
+	Alias *RequestAlias `json:"-"`
 	// continuation 为官网自动续写本轮的编码设置（轮次、续写 token 与输出总上限），只在 Client 的续写循环内设置
 	continuation *officialContinuation
 }

@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,12 +26,7 @@ const (
 
 // placeholderThoughtSignature 判断函数调用上的签名是不是缺失或占位值：是时可以按本进程签发过的签名还原
 func placeholderThoughtSignature(signature string) bool {
-	switch strings.TrimSpace(signature) {
-	case "", placeholderSignatureNewAPI, skipThoughtSignature:
-		return true
-	default:
-		return false
-	}
+	return aistudio.PlaceholderThoughtSignature(signature)
 }
 
 // thoughtSignatureStore 保存本进程各协议响应中工具调用的思考签名（OpenAI Chat 与 Gemini 原生入口共用），
@@ -71,6 +67,19 @@ func (s *server) thoughtSignatureScope(ctx context.Context, model string) string
 	model = strings.ToLower(s.resolveModelName(ctx, strings.TrimPrefix(strings.TrimSpace(model), "models/")))
 	key := sha256.Sum256([]byte(s.config.currentAPIKey()))
 	return model + "\x00" + strconv.Itoa(int(aistudio.PoolScopeFromContext(ctx))) + "\x00" + hex.EncodeToString(key[:8])
+}
+
+// withThoughtSignatureRestore 给每个公开 API 请求挂上按模型还原签名的函数（aistudio.ThoughtSignatureRestore）：生成服务额度用完改用其他模型时
+// 按目标模型的作用域再还原一次（协议层只按请求的模型还原过，改用期间目标模型签发、登记在它作用域下的签名要这样才找得回）
+func (s *server) withThoughtSignatureRestore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(aistudio.ContextWithThoughtSignatureRestore(r.Context(), s.restoreThoughtSignatures)))
+	})
+}
+
+// restoreThoughtSignatures 按 model 的作用域还原 contents 里函数调用的签名（见 Restore）
+func (s *server) restoreThoughtSignatures(ctx context.Context, model string, contents []aistudio.Content) int {
+	return s.thoughtSignatures.Restore(s.thoughtSignatureScope(ctx, model), contents)
 }
 
 // Remember 登记一次响应中带 ID 的工具调用：带真实签名的按调用 ID 记下签名；签名为空或占位值的登记为“已签发、没有签名”

@@ -72,10 +72,13 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	events = withHiddenReasoning(r.Context(), withLocalCallIDs(r.Context(), events), hideThought)
 	created := time.Now().UTC().Format(time.RFC3339)
 	if request.Stream {
+		// 额度用完改用了其他模型时交互资源报告实际使用的模型（见 servedModel）
+		model = servedModel(r.Context(), model)
 		s.streamInteraction(w, r, request, generate, model, current, created, events)
 		return
 	}
 	result, err := consumeEvents(r.Context(), events, nil)
+	model = servedModel(r.Context(), model)
 	if err == nil {
 		err = validateInteractionResult(generate, result)
 	}

@@ -67,6 +67,8 @@ type EditableKey =
   | 'primary_queue_wait'
   | 'ultra_primary_models'
   | 'ultra_primary_queue_wait'
+  | 'model_fallbacks'
+  | 'model_fallback_scope'
   | 'waa_backend'
   | 'temporary_chat'
   | 'ignore_client_seed'
@@ -108,6 +110,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'primary_queue_wait',
   'ultra_primary_models',
   'ultra_primary_queue_wait',
+  'model_fallbacks',
+  'model_fallback_scope',
   'waa_backend',
   'temporary_chat',
   'ignore_client_seed',
@@ -126,7 +130,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
 ]
 // 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存；
 // IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交；
-// 媒体链接地址、保存期限与总量上限输入到一半时不合法（例如期限只写了 7、地址只写了 https://），同样失焦时保存
+// 媒体链接地址、保存期限与总量上限输入到一半时不合法（例如期限只写了 7、地址只写了 https://），同样失焦时保存；
+// 额度用完改用其他模型的规则输入到一半时也不合法（例如只写了 gemini-4-argon=），同样失焦时保存
 const BLUR_KEYS: readonly EditableKey[] = [
   'auth_states',
   'listen_addr',
@@ -136,6 +141,7 @@ const BLUR_KEYS: readonly EditableKey[] = [
   'media_base_url',
   'media_retention',
   'media_max_size',
+  'model_fallbacks',
 ]
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
@@ -166,6 +172,8 @@ function cloneDowngradeGuard(value: DowngradeGuardConfig | undefined): Downgrade
 
 // DEFAULT_ULTRA_PRIMARY_MODELS 与服务端 ULTRA_PRIMARY_MODELS 的默认值一致；旧版服务端不返回该字段时按它显示
 const DEFAULT_ULTRA_PRIMARY_MODELS: readonly string[] = ['gemini-4-argon']
+// DEFAULT_MODEL_FALLBACKS 与服务端 MODEL_FALLBACKS 的默认值一致（配置加载前表单的初始值）
+const DEFAULT_MODEL_FALLBACKS = 'gemini-4-argon=gemini-4-carbon'
 
 // parseModelList 与服务端一致：逗号或空白分隔，去掉 models/ 前缀并去重
 function parseModelList(value: string): string[] {
@@ -239,6 +247,8 @@ const form = reactive<ServiceConfig>({
   primary_queue_wait: '10s',
   ultra_primary_models: [...DEFAULT_ULTRA_PRIMARY_MODELS],
   ultra_primary_queue_wait: '10s',
+  model_fallbacks: DEFAULT_MODEL_FALLBACKS,
+  model_fallback_scope: 'ultra',
   waa_backend: 'camoufox',
   temporary_chat: false,
   ignore_client_seed: false,
@@ -464,6 +474,38 @@ function isMediaBaseURL(value: string): boolean {
   }
 }
 
+// fallbackModelName 与服务端一致整理改用规则里的一个模型名：去掉首尾空白与 models/ 前缀；为空、含空白或 = | 逗号时返回 null
+function fallbackModelName(name: string): string | null {
+  let text = name.trim()
+  if (text.startsWith('models/')) text = text.slice('models/'.length)
+  if (text === '' || /[\s=|,，]/.test(text)) return null
+  return text
+}
+
+// modelFallbacksValid 与服务端 ParseModelFallbacks 一致：规则以逗号（或全角逗号、换行）分隔，每条为 源模型=目标1|目标2；
+// 源与目标相同、源模型重复、同一条规则里目标重复、空名或名字里有空白时无效（比较不分大小写）；空值表示没有规则
+function modelFallbacksValid(value: string): boolean {
+  const sources = new Set<string>()
+  for (const raw of value.split(/[,，\n\r]/)) {
+    const item = raw.trim()
+    if (item === '') continue
+    const index = item.indexOf('=')
+    if (index < 0) return false
+    const source = fallbackModelName(item.slice(0, index))
+    if (source === null || sources.has(source.toLowerCase())) return false
+    sources.add(source.toLowerCase())
+    const targets = new Set<string>()
+    for (const part of item.slice(index + 1).split('|')) {
+      const target = fallbackModelName(part)
+      if (target === null) return false
+      const key = target.toLowerCase()
+      if (key === source.toLowerCase() || targets.has(key)) return false
+      targets.add(key)
+    }
+  }
+  return true
+}
+
 function isListenAddress(value: string): boolean {
   const match = /^(\[[^\]]+\]|[^:]*):(\d{1,5})$/.exec(value)
   if (match === null) return false
@@ -503,6 +545,7 @@ function validate(value: ServiceConfig): string {
   if (Number.isNaN(ultraPrimaryWait) || ultraPrimaryWait > durationMillis(value.request_timeout)) {
     return t('settings.invalidUltraPrimaryQueueWait')
   }
+  if (!modelFallbacksValid(value.model_fallbacks)) return t('settings.invalidModelFallbacks')
   const numbers: [unknown, TranslationKey][] = [
     [value.warm_worker_limit, 'settings.warmWorkerLimit'],
     [value.max_active_workers, 'settings.maxActiveWorkers'],
@@ -742,6 +785,15 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
       form.media_base_url.trim().replace(/\/+$/, '') === saved.media_base_url
     ) {
       form.media_base_url = saved.media_base_url
+    }
+    // 额度用完改用其他模型的规则同样由服务端写成规范形式（去掉名字两边与逗号后的空白、全角逗号改成半角、去掉 models/ 前缀），
+    // 提交后没有再改动时表单同步显示，避免一直提示未保存；自动保存时提交的是已保存的值，form 里可能是还没提交的编辑，不能覆盖
+    if (
+      includeBlurFields &&
+      typeof saved.model_fallbacks === 'string' &&
+      form.model_fallbacks === submitted.model_fallbacks
+    ) {
+      form.model_fallbacks = saved.model_fallbacks
     }
     // 两个主用模型排队上限在旧版服务端可能没有返回，只在两边都有值时同步
     for (const key of ['primary_queue_wait', 'ultra_primary_queue_wait'] as const) {
@@ -1533,6 +1585,42 @@ onBeforeUnmount(() => {
           </div>
           <span class="mt-2 block text-xs text-gray-500">{{ t('settings.ultraPrimaryHelp') }}</span>
         </div>
+      </div>
+
+      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <span class="mb-2 block text-sm font-medium text-gray-300">{{
+          t('settings.modelFallbackTitle')
+        }}</span>
+        <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <label class="block md:col-span-2">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.modelFallbacks')
+            }}</span>
+            <input
+              v-model.trim="form.model_fallbacks"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 font-mono text-white transition focus:border-blue-500 focus:outline-none"
+              type="text"
+              spellcheck="false"
+              autocomplete="off"
+              placeholder="gemini-4-argon=gemini-4-carbon"
+              @change="commitBlurField"
+            />
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.modelFallbackScope')
+            }}</span>
+            <UiSelect
+              v-model="form.model_fallback_scope"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            >
+              <option value="ultra">{{ t('settings.modelFallbackScopeUltra') }}</option>
+              <option value="all">{{ t('settings.modelFallbackScopeAll') }}</option>
+              <option value="off">{{ t('settings.modelFallbackScopeOff') }}</option>
+            </UiSelect>
+          </label>
+        </div>
+        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.modelFallbackHelp') }}</span>
       </div>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">

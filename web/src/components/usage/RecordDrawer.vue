@@ -212,6 +212,9 @@ async function copy(kind: string, text: string): Promise<void> {
               ></span>
               <div class="flex flex-wrap gap-x-3 text-gray-300">
                 <span>{{ attempt.account || '—' }}</span>
+                <span v-if="attempt.model" class="font-mono text-gray-400">{{
+                  attempt.model
+                }}</span>
                 <span class="text-gray-500">{{ dimensionLabel('channel', attempt.channel) }}</span>
                 <span class="text-gray-500 tabular-nums">{{ duration(attempt.duration_ms) }}</span>
               </div>

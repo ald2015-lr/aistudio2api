@@ -146,6 +146,7 @@ func newRuntime(
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	service.setPrimaryModelSettings(cfg.PrimaryModels, cfg.PrimaryQueueWait, cfg.UltraPrimaryModels, cfg.UltraPrimaryQueueWait)
+	service.setModelFallbacks(cfg.ModelFallbacks, cfg.ModelFallbackScope)
 	// 模型目录写盘缓存：一次加锁恢复账户池与 Client 的目录与权益（含 Pro/Ultra 的权益头），启动时不发目录请求即可预热，
 	// 后台只低速刷新缺失与过期的账户（见 catalog_cache.go、catalog_sync.go）。要在账户目录扫描与新账户处理开始之前
 	catalogCache := openCatalogCache(catalogCacheDir, requests)
@@ -2698,6 +2699,11 @@ type trackedService struct {
 	// primaryModels 为两份主用模型列表与排队上限（普通号池 PRIMARY_MODELS / PRIMARY_QUEUE_WAIT 与 Ultra 号池
 	// ULTRA_PRIMARY_MODELS / ULTRA_PRIMARY_QUEUE_WAIT，可热更新，见 primary_models.go）
 	primaryModels atomic.Pointer[primaryModelSettings]
+	// modelFallbacks 为额度用完改用其他模型的规则与范围（MODEL_FALLBACKS、MODEL_FALLBACK_SCOPE，可热更新，见 model_fallback.go）；
+	// 为 nil 时不改用（测试直接构造的服务）
+	modelFallbacks atomic.Pointer[modelFallbackSettings]
+	// fallbackSignatures 为改用期间目标模型签发的思考签名（只存摘要，见 model_fallback.go）
+	fallbackSignatures fallbackSignatureRegistry
 	// queueProgress 为重复的排队进度日志全进程共用的限流（见 queue_progress.go）
 	queueProgress queueProgressLimiter
 	// unparsedQuotaDetails 为“额度 429 详情未识别”日志的去重状态（见 quota_detail_log.go）
@@ -4490,7 +4496,37 @@ func (service *trackedService) generateWithRetry(
 	destination chan<- aistudio.Event,
 	diag *generationDiagnostics,
 ) {
+	service.generateForModel(clientCtx, requestCtx, cancel, generationStartedAt, request, resourceID, destination, diag, nil)
+}
+
+// generateForModel 按请求的模型选号、排队与换号重试，成功时交给 forwardEvents 转发事件流，失败时以错误结束请求。以额度类错误结束、
+// 还没有交出任何事件时可能改用其他模型（MODEL_FALLBACKS，见 model_fallback.go）：按目标模型的请求再调用一次自己，fallback 为改用进度
+// （源模型的运行为 nil）
+func (service *trackedService) generateForModel(
+	clientCtx context.Context,
+	requestCtx context.Context,
+	cancel context.CancelFunc,
+	generationStartedAt time.Time,
+	request aistudio.GenerateRequest,
+	resourceID string,
+	destination chan<- aistudio.Event,
+	diag *generationDiagnostics,
+	fallback *modelFallbackRun,
+) {
+	// entry 为这次运行入口时的请求：改用其他模型时按它整理目标模型的请求（下面的循环会改写 request 的内容与账户）
+	entry := request
 	trace := aistudio.TraceFromContext(requestCtx)
+	if fallback == nil {
+		// 历史里有之前额度用完改用其他模型时由别的模型签发的思考签名（源模型恢复后的下一轮等）：发给这个模型前换成占位值或去掉，
+		// 不把目标模型的签名发给源模型（见 model_fallback.go）；entry 保留原样，这次再改用时目标模型自己的签名照常保留
+		if contents, replaced, issuers := service.fallbackSignatures.foreign(request.Contents, request.Model); replaced > 0 {
+			request.Contents = contents
+			note := fmt.Sprintf("历史里的 %d 个思考签名是额度用完改用其他模型时由 %s 签发的，发给 %s 前换成跳过校验的占位值或去掉",
+				replaced, strings.Join(issuers, "、"), strings.TrimPrefix(request.Model, "models/"))
+			trace.Note(note)
+			service.requests.logRequestProgress(request.ID, "service", "WARN", note)
+		}
+	}
 	// regenerations 为本请求剩余的同账号重新生成次数（客户端还没收到内容时，见 aistudio/regenerate.go），各次尝试共用：换号后不再各来一轮
 	regenerations := aistudio.NewRegenerationBudget()
 	// 解码上游响应时的容错（跳过空帧、取缺省枚举、丢掉读不出的引用等）同一种每个请求只写一行运行日志与排查记录，各次尝试共用
@@ -4722,7 +4758,8 @@ func (service *trackedService) generateWithRetry(
 	meta := quotaFailureMeta{modelID: modelID, pool: scope, startedAt: generationStartedAt}
 	// 流式请求：自己现场冷启动时推迟写出响应头，启动结束后才遇到的额度不足仍以 429 返回（见 holdStreamStart）
 	budget.holdStreamStart(aistudio.StreamStartHoldFromContext(clientCtx))
-	quota := primaryQuotaTracker{policy: policy}
+	// 以额度用完结束后还会交给 MODEL_FALLBACKS 时（源模型可能改用、目标模型之后还有目标或按源模型的错误返回），选号日志不写“立即返回 429”
+	quota := primaryQuotaTracker{policy: policy, fallback: fallback != nil || service.modelFallbackPending(requestCtx, entry, resourceID, diag)}
 	// warmOnlyNext：上一次尝试是额度失败，下一次选号只用已启动的 Worker（withoutColdStart），取得租约后清除；
 	// 标记只加在那次选号的 context 上，不进整个请求共用的 acquireCtx
 	warmOnlyNext := false
@@ -5122,7 +5159,7 @@ func (service *trackedService) generateWithRetry(
 			var cooling *aistudio.AllCoolingError
 			if failFast && errors.As(err, &cooling) {
 				// Ultra 主用模型候选全部冷却：不原地等恢复，立即按 429 返回（Retry-After 为最早恢复，见 acquireLease）
-				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryAllCoolingMessage(cooling))
+				service.requests.logRequestProgress(request.ID, "service", "WARN", primaryAllCoolingMessage(cooling, quota.fallback))
 			}
 			break
 		}
@@ -5508,10 +5545,15 @@ func (service *trackedService) generateWithRetry(
 		// 上游返回的 4xx（不只 429）在请求日志记一行证据：方法、状态、文案、details 类型与原文（见 upstream_error_log.go）
 		service.logUpstreamClientError(request.ID, accountLabel, attemptErr, "")
 		trace.FinishAttempt(err)
-		api.AddAccessLogAttempt(requestCtx, api.RequestAttempt{
+		failedAttempt := api.RequestAttempt{
 			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
 			DurationMS: time.Since(attemptStartedAt).Milliseconds(),
-		})
+		}
+		if fallback != nil {
+			// 额度用完改用了其他模型：目标模型的尝试记上模型（改用前源模型的尝试在改用时补记，见 model_fallback.go）
+			failedAttempt.Model = modelID
+		}
+		api.AddAccessLogAttempt(requestCtx, failedAttempt)
 		workerFailed := service.workers.WorkerFailed(request.AccountID)
 		waaRuntimeFailed := aistudio.DefinitiveWAARuntimeFailure(err)
 		workerReplaced := errors.Is(err, errAccountWorkerReplaced)
@@ -6061,6 +6103,14 @@ func (service *trackedService) generateWithRetry(
 		trace.Note("本服务首事件前期限到期: " + cut.Error())
 	}
 	if err != nil {
+		// 额度用完、还没有交出任何事件：按 MODEL_FALLBACKS 改用其他模型（见 model_fallback.go），按目标模型重新走一遍；
+		// 不改用时 err 不变，改用过而所有目标都不可用时换成按源模型原来的错误、Retry-After 取最早恢复的包装
+		next, run, finalErr := service.continueWithModelFallback(requestCtx, entry, resourceID, diag, generationStartedAt, fallback, err)
+		if next != nil {
+			service.generateForModel(clientCtx, requestCtx, cancel, generationStartedAt, *next, resourceID, destination, diag, run)
+			return
+		}
+		err = finalErr
 		if activity != nil {
 			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		}
@@ -6637,6 +6687,10 @@ func (service *trackedService) forwardEvents(
 	trace := aistudio.TraceFromContext(requestCtx)
 	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，不检查空闲
 	phase := generateContextFrom(requestCtx)
+	fallbackModel := ""
+	if diag != nil {
+		fallbackModel = diag.fallbackModel
+	}
 	replyBytes := 0
 	terminal := false
 	accountLabel = lease.Account().Config.Label
@@ -6896,6 +6950,10 @@ func (service *trackedService) forwardEvents(
 		if event.Kind == aistudio.EventError {
 			// 上游错误之后事件流可能迟迟不关闭：先写访问日志的结果字段，再交给下游
 			publishResult()
+		}
+		if fallbackModel != "" {
+			// 额度用完改用了其他模型：记下目标模型交出的思考签名，之后发给别的模型时不原样带上（见 model_fallback.go）
+			service.fallbackSignatures.rememberEvent(fallbackModel, event)
 		}
 		select {
 		case destination <- event:

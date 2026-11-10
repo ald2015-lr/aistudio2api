@@ -133,7 +133,7 @@ func (service *trackedService) finishQuotaFailure(
 	if failure.Reason == primaryQuotaReasonEgress {
 		service.egress.noteLocalReject(tracker.egressKey, time.Now())
 	}
-	service.requests.logRequestProgress(requestID, label, "WARN", primaryQuotaMessage(failure))
+	service.requests.logRequestProgress(requestID, label, "WARN", primaryQuotaMessage(failure, tracker.fallback))
 	return failure
 }
 

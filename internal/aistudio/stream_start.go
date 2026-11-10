@@ -22,6 +22,11 @@ type StreamStartHold struct {
 	extension time.Duration
 	starting  int
 	pending   time.Duration
+	// restartedAt 为生成服务改用其他模型（额度用完，见 RestartWait）的时刻，零值表示没有改用；restartWait 为目标模型要等首个事件多久，
+	// restartBase 为改用时已结束的现场冷启动延长的等待（改用之后只再加之后的启动延长的部分）
+	restartedAt time.Time
+	restartWait time.Duration
+	restartBase time.Duration
 	// changed 在状态变化时非阻塞地写入（容量 1），唤醒等待方复查
 	changed chan struct{}
 }
@@ -93,6 +98,39 @@ func (hold *StreamStartHold) Extension() time.Duration {
 		return hold.extension + hold.pending
 	}
 	return hold.extension
+}
+
+// RestartWait 记下生成服务在首个事件之前改用了其他模型（额度用完，MODEL_FALLBACKS，见 app 包 model_fallback.go）：API 层写出响应头前的等待
+// 从现在起重新计，至少再等 wait（目标模型的 StreamStartWait；不大于 0 时按 API 层给请求的模型的等待）与 API 层原来的等待中较长的一个，
+// 合计仍不超过 API 层的上限（streamStartHoldMax）。原先只按源模型等：源模型很晚才额度用完、或目标模型还要排队时，响应头先按源模型提交，
+// 目标模型首事件前的错误也变成 200 之后的流内错误
+func (hold *StreamStartHold) RestartWait(wait time.Duration) {
+	if hold == nil {
+		return
+	}
+	hold.mu.Lock()
+	hold.restartedAt = time.Now()
+	hold.restartWait = max(wait, 0)
+	hold.restartBase = hold.extension
+	hold.mu.Unlock()
+	hold.notify()
+}
+
+// Limit 返回从 startedAt（调用生成服务的时刻）起写出响应头前最多等多久，不含 API 层的总上限：wait（API 层按请求的模型给出的等待）加当前要
+// 延长的等待（见 Extension）；改用过其他模型时取它与“改用时刻起 max(wait, 目标模型的等待) 加改用之后的现场冷启动延长”中较晚的一个。nil 上为 wait
+func (hold *StreamStartHold) Limit(startedAt time.Time, wait time.Duration) time.Duration {
+	if hold == nil {
+		return wait
+	}
+	extension := hold.Extension()
+	limit := wait + extension
+	hold.mu.Lock()
+	restartedAt, restartWait, base := hold.restartedAt, hold.restartWait, hold.restartBase
+	hold.mu.Unlock()
+	if !restartedAt.IsZero() {
+		limit = max(limit, restartedAt.Sub(startedAt)+max(wait, restartWait)+max(extension-base, 0))
+	}
+	return limit
 }
 
 // State 返回已延长的等待与是否有现场冷启动在进行中

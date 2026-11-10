@@ -238,7 +238,8 @@ func generateWithin(ctx context.Context, service aistudio.Service, request aistu
 // awaitStreamStart 在写出流式响应头前最多等待 wait 等首个事件：首个事件为错误时返回该错误，由调用方按非流式返回
 // HTTP 状态和错误对象（参数错误、无可用账号、全部冷却、号池繁忙、降级拒绝等不再变成 200 之后的流内错误）；
 // wait 内没有事件时照常开始推流，返回的事件流从首个事件开始重放。ctx 里有 aistudio.StreamStartHold 时，等待截止时间按它当前要延长的
-// 等待延后（生成服务现场冷启动进行中为这次启动最多还能延长的等待，结束后为实测时长），合计不超过 streamStartHoldMax
+// 等待延后（生成服务现场冷启动进行中为这次启动最多还能延长的等待，结束后为实测时长；额度用完改用其他模型时从改用时刻起按目标模型重新等，
+// 见 StreamStartHold.Limit），合计不超过 streamStartHoldMax
 func awaitStreamStart(ctx context.Context, events <-chan aistudio.Event, wait time.Duration) (<-chan aistudio.Event, error) {
 	return awaitStreamStartWithin(ctx, events, wait, streamStartHoldMax)
 }
@@ -262,7 +263,7 @@ func awaitStreamStartSince(
 	defer timer.Stop()
 	// expired 复查等待是否已到：截止时间为 wait 加当前要延长的等待、不超过 holdMax；没到时按它重设计时器，已到时返回 true
 	expired := func() bool {
-		remaining := min(wait+hold.Extension(), holdMax) - time.Since(startedAt)
+		remaining := min(hold.Limit(startedAt, wait), holdMax) - time.Since(startedAt)
 		if remaining <= 0 {
 			return true
 		}

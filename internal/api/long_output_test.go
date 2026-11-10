@@ -97,6 +97,13 @@ func TestApplyModelAliasLongOutput(t *testing.T) {
 				t.Fatalf("%s%s: 应开启续写: %+v hide=%v %v", prefix, name, long, longHide, err)
 			}
 			long.LongOutput = false
+			// 名称里的选项另记在 Alias 上（额度用完改用其他模型时按目标模型重新整理），long- 只多一个 Long
+			if long.Alias != nil {
+				if !long.Alias.Long || plain.Alias == nil || plain.Alias.Long {
+					t.Fatalf("%s%s: Alias 应只在带 long- 时记 Long: long=%+v plain=%+v", prefix, name, long.Alias, plain.Alias)
+				}
+				long.Alias.Long = false
+			}
 			if !reflect.DeepEqual(long, plain) {
 				t.Fatalf("%s%s 去掉续写标记后应与不带前缀的请求相同:\n%+v\n%+v", prefix, name, long, plain)
 			}

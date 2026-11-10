@@ -481,6 +481,8 @@ type primaryQuotaTracker struct {
 	policy           quotaSwitchPolicy
 	egress           egressVerdict
 	egressKey        string
+	// fallback 为以额度用完结束后还会交给 MODEL_FALLBACKS（见 model_fallback.go modelFallbackPending）：结束日志不写“立即返回 429”
+	fallback bool
 }
 
 // hits 返回两类额度失败的总次数
@@ -627,11 +629,16 @@ func earlierTime(left time.Time, right time.Time) time.Time {
 
 // primaryQuotaMessage 为额度不足立即返回时写进请求进度的一句话。Ultra 主用模型：额度失败为遇到每日类额度失败的账号数，
 // 有限流类失败时另写限流失败；普通号池的换号上限与上游出口限流各有一句（首段固定，诊断脚本按首段匹配）
-func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError) string {
+func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError, fallback bool) string {
+	// 额度用完后还会交给 MODEL_FALLBACKS（出口限流不改用，照写 429）：结果看之后的改用日志
+	ending := "立即返回 429"
+	if fallback && quota.Reason != aistudio.QuotaReasonEgress {
+		ending = modelFallbackEnding
+	}
 	switch quota.Kind {
 	case aistudio.QuotaFailSwitchLimit:
-		return fmt.Sprintf("换号上限，立即返回 429 | 原因=%s | 额度失败=%d | 限流失败=%d | 尝试账号=%d | 总耗时=%s | 建议重试=%s",
-			quota.Reason, quota.QuotaHits, quota.RateHits, quota.Accounts, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
+		return fmt.Sprintf("换号上限，%s | 原因=%s | 额度失败=%d | 限流失败=%d | 尝试账号=%d | 总耗时=%s | 建议重试=%s",
+			ending, quota.Reason, quota.QuotaHits, quota.RateHits, quota.Accounts, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
 	case aistudio.QuotaFailEgress:
 		return fmt.Sprintf("上游出口限流，换号已达上限，立即返回 429 | 出口=%s | 限速=%s | 限流失败=%d | 尝试账号=%d | 总耗时=%s | 建议重试=%s",
 			quota.Egress, egressLimitText(quota.EgressLimit), quota.RateHits, quota.Accounts, quota.Elapsed.Round(time.Millisecond),
@@ -641,9 +648,13 @@ func primaryQuotaMessage(quota *aistudio.PrimaryQuotaError) string {
 	if quota.RateHits > 0 {
 		hits += fmt.Sprintf(" | 限流失败=%d", quota.RateHits)
 	}
-	return fmt.Sprintf("Ultra 主用模型额度不足，立即返回 429 | 原因=%s | %s | 总耗时=%s | 建议重试=%s",
-		quota.Reason, hits, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
+	return fmt.Sprintf("Ultra 主用模型额度不足，%s | 原因=%s | %s | 总耗时=%s | 建议重试=%s",
+		ending, quota.Reason, hits, quota.Elapsed.Round(time.Millisecond), retryAfterText(quota.Until))
 }
+
+// modelFallbackEnding 为以额度用完结束、之后还会交给 MODEL_FALLBACKS 时选号日志的结尾（代替“立即返回 429”）：改用成功时请求不返回 429，
+// 结果看紧接着的 `模型 … 额度用完（…），按 MODEL_FALLBACKS 改用 …` 或 `…改用其他模型也没有成功，按源模型的错误返回` 一行
+const modelFallbackEnding = "结束这个模型的选号，交给 MODEL_FALLBACKS 改用其他模型"
 
 // primaryQuotaSwitchMessage 为额度失败后换号时写进请求进度的一句话：按最近一次额度失败的类别写，两类各按 计数/换号上限
 // （每日类为账号数：同账号换通道的探测与紧接着的换号同为 N），第 N 次某类失败后是这一类的第 N 次换号，超过该类换号上限的那次失败
@@ -698,8 +709,12 @@ func normalQuotaSwitchMessage(tracker *primaryQuotaTracker, kind string, sameAcc
 
 // primaryAllCoolingMessage 为 Ultra 主用模型还没遇到额度 429 时选号就遇到候选全部冷却、立即返回时写进请求进度的一句话：
 // 最早恢复写还剩多久（与 Retry-After 一致）
-func primaryAllCoolingMessage(cooling *aistudio.AllCoolingError) string {
-	return "Ultra 主用模型候选全部冷却，立即返回 429 | 最早恢复=" + retryAfterText(cooling.Until)
+func primaryAllCoolingMessage(cooling *aistudio.AllCoolingError, fallback bool) string {
+	ending := "立即返回 429"
+	if fallback {
+		ending = modelFallbackEnding
+	}
+	return "Ultra 主用模型候选全部冷却，" + ending + " | 最早恢复=" + retryAfterText(cooling.Until)
 }
 
 // retryAfterText 返回建议重试时间距现在多久（按秒取整，至少 1 秒），与对外的 Retry-After 一致
