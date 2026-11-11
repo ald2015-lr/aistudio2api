@@ -1708,7 +1708,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 | Responses `parallel_tool_calls` | 写入响应元数据；`false` 时一次回复最多一个函数调用 |
 | Responses `truncation` | 省略、`disabled` 或 `auto`；`auto` 在本地估算超过模型输入上限一半时按 CountTokens 权威计数，超出上限则从最早的完整轮次开始删除（不拆开工具调用与结果，最多计数 6 次），最新一轮本身超限时返回 400 |
 | Responses function `strict` | `true` 时核对上游返回的参数 |
-| Responses `store` | 省略或 `true` 时保存当前进程会话节点；`false` 只返回本次结果 |
+| Responses `store` | 省略或 `true` 时保存续接节点：写进状态库（`runtime/requests.db` 的 `response_states` 表），服务重启后仍可续接，表里是明文对话（见下文“续接状态”）；`false` 只返回本次结果，不保存节点、也不写库（不让对话落盘的唯一办法） |
 | Gemini frequency / presence penalty | 上游没有对应参数，任何取值都忽略 |
 | Gemini `candidateCount` | 仅接受省略或 `1` |
 | Gemini `responseLogprobs` / `logprobs` | 上游没有对应参数，任何取值都忽略，响应不含 `logprobsResult` |
@@ -1859,11 +1859,11 @@ Chat SSE 顺序：
 | `temperature`、`top_p`、`max_output_tokens` | 生成参数 |
 | `reasoning` | `{"effort":"..."}` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
-| `previous_response_id` | 当前进程内已保存的前一响应 ID |
+| `previous_response_id` | 已保存的前一响应 ID（节点写进状态库，服务重启后仍可续接，见下文“续接状态”） |
 | `parallel_tool_calls` | `false` 时一次回复最多一个函数调用 |
 | `truncation` | 省略、`disabled` 或 `auto`（见上文） |
 | `metadata` | string-to-string object |
-| `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
+| `store` | 省略/`true` 保存续接节点（写进状态库 `response_states`，重启后仍可续接，表里是明文对话，见下文“续接状态”）；`false` 只返回本次结果，也不写库 |
 | `video_config` | Omni 视频设置扩展字段，与 Chat 相同 |
 
 input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output`、reasoning 与 `agent_message` item（Codex 多智能体会话里智能体之间的消息，按 user 轮发送：`content` 中 `input_text` 的 `text` 与 `encrypted_content` 的 `encrypted_content` 依次作为文本 Part，空文本与普通 message 一样省略（全部为空时这一轮不发送），其他类型返回 400；与上游 Mag1cFall/AIStudio2API 42fa603 相同，原先整个请求返回 400）；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
@@ -2100,7 +2100,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 | 语音配置 | `speech_config:[{voice}]`；多说话人使用 `{speakers:[{speaker,voice}],mode?}`，`mode` 为 `verbatim` 或 `conversational` |
 | 语音文本 | 文本块 `annotations` 中的 `{type:"speech_metadata",speaker?,style?}` 保留说话人与风格 |
 | 函数与工具 | `tools:[{type:"function",name,description?,parameters?}]`；另接受 `google_search`、`url_context`、`code_execution`、`google_maps`；`tool_choice` 为 `auto` 或 `none` |
-| 续接 | 默认保存；`previous_interaction_id` 重建前序内容，`store:false` 仅返回本次响应。与 Responses 共用当前服务实例内最多 256 个响应节点，只接受 `int_` 开头的交互 ID，`resp_` 开头的 Responses ID 返回 400；音频输出不保存进节点（只保留音频分片带的签名）。续接请求的交互资源回显 `previous_interaction_id`（非流式资源与流式的 `interaction.created`、`interaction.completed`），不续接的请求没有这个字段 |
+| 续接 | 默认保存；`previous_interaction_id` 重建前序内容，`store:false` 仅返回本次响应。与 Responses 共用最多 256 个响应节点（写进状态库，服务重启后仍可续接），只接受 `int_` 开头的交互 ID，`resp_` 开头的 Responses ID 返回 400；音频输出不保存进节点（只保留音频分片带的签名）。续接请求的交互资源回显 `previous_interaction_id`（非流式资源与流式的 `interaction.created`、`interaction.completed`），不续接的请求没有这个字段 |
 
 音频输出为 24 kHz、16-bit 小端、单声道。非流式默认 `audio/wav`，流式默认 `audio/l16`；显式 WAV 流在音频汇总完成后发送一个有效 WAV 块。`sample_rate` 可省略或设为 `24000`，`delivery` 可省略或设为 `inline`。创建请求在当前连接内执行，`background` 可省略或设为 `false`。
 
@@ -2555,9 +2555,9 @@ Gemini：每个媒体输出两个 Part，先是链接文本（前面的正文没
 
 用户文本中的 `youtu.be/<ID>`、`youtube.com/watch?v=<ID>`、`/shorts/<ID>`、`/live/<ID>` 和 `/embed/<ID>` 会转换为 `video/*` 外部媒体 part，并从用户 text part 中移除；重复 URL 合并为一个附件。链接只由 ASCII URL 字符组成（字母、数字与 ``-._~:/?#[]@!$&()*+,;=%``），遇到空白、引号、尖括号、反引号与非 ASCII 字符（汉字、全角标点）结束：“看下https://youtu.be/<ID>讲了什么”只取到 ID 为止，后面的汉字留在正文里（原先按“非空白、非引号尖括号”匹配，汉字、全角括号、反引号会被吞进链接，视频 ID 无效，这段汉字又随链接一起删掉）。只有视频 ID 恰好 11 位（`[A-Za-z0-9_-]`）的链接才转换，`VIDEO_ID`、`${videoId}` 这类示例占位与太短的 ID 原样保留为文本。请求编码与 WAA binding（`bindingPrompt`）调用同一个函数，发送的正文与 binding 按同一份结果一起变化，binding 的组成规则不变。OpenAI `video_url`/`input_video`、Anthropic URL source 与 Gemini `fileData.fileUri` 使用相同的外部媒体编码。
 
-OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 在进程内共用最多 256 个响应节点并重建完整 contents；重启后客户端重新提交完整上下文。Drive 与 Veo 资源绑定持久化到磁盘。
+OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 共用最多 256 个响应节点并重建完整 contents（续接状态）。节点按保存顺序淘汰，淘汰时把上下文并入以它为续接起点的子节点；存入前去掉 GIF 转 PNG 留下的原 GIF。节点的每次变化写进请求账本的 SQLite（`runtime/requests.db` 的 `response_states` 表：`seq` 保存顺序、`id` 响应 ID、`data` 为 gob 编码的节点，含 JSON 不序列化的 `FromSystem`、`FromToolResult`、`RestoredLink` 标记，内联数据按原字节保存），经账本的写入协程排队、与用量记录合并成事务，不阻塞请求；服务启动创建处理器时按保存顺序读回，`start.sh` 自动拉起或崩溃自愈后仍能续接。表里是明文的对话内容（含 4 MiB 以内的内联附件），与 `REQUEST_BODY_LOG` 无关、默认保存；`store: false` 的请求不保存节点，也不写库。单个节点超过 4 MiB（通常是带大图片、视频等内联附件，或被并入了很长的上文；编码前先按文本与内联数据的字节数粗估，粗估已超限的不编码）时不写入，它与它当时的后代一起从状态库删除，之后以它们为续接起点保存的节点也不写库（重启后都接不上），只留在内存，重启后从它们续接返回 not found；每条续接链只记一行日志。读回时先解码所有行，再按整条续接链判定：编码读不出、续接链上有节点不在库里的节点丢弃并从库里删除（续接起点在库里但排在子节点之后的不算），超过 256 个时照常淘汰；排队的续接状态超过 64 MiB 时丢弃这一次改动（状态库停在之前的一致状态）。总量最坏约 256 × 4 MiB ≈ 1 GiB，SQLite 复用删除留下的空闲页，文件不会自动缩小（清空方法见 [logging.md](logging.md)）。只新建表、不改动已有的表：回滚到旧版本时旧版本不认识这张表，原样留着、不报错，再升级回来时读回。账本打开失败时续接状态只在内存里保存（与原先相同）。Drive 与 Veo 资源绑定持久化到磁盘。
 
-`store` 省略或为 `true` 时建立响应节点；`store=false` 返回当前响应并保持既有续接链。
+`store` 省略或为 `true` 时建立响应节点（同时写进状态库）；`store=false` 返回当前响应并保持既有续接链，这次的对话不保存、也不写库。
 
 模型、参数、账户与上游错误按下方状态表投影。客户端取消会关闭上游 reader并释放账户租约。
 

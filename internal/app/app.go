@@ -192,7 +192,7 @@ func publicAPIConfig(manager *runtimeManager, cfg config.Config, adminToken stri
 	return api.Config{
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
 		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
-		Ledger: manager.requestLedger(), UltraExclusive: manager.activeUltraExclusive,
+		Ledger: manager.requestLedger(), ResponseStates: manager.responseStatePersister(), UltraExclusive: manager.activeUltraExclusive,
 		StreamDataHeartbeat: manager.activeStreamDataHeartbeat, OmniIgnoreSystemPrompt: manager.activeOmniIgnoreSystemPrompt,
 		MediaDir: mediaDir, MediaLinks: manager.mediaLinks,
 	}

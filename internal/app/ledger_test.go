@@ -107,6 +107,34 @@ func TestRequestLedgerNilInterface(t *testing.T) {
 	}
 }
 
+// TestResponseStatePersisterUsesLedger 续接状态的状态库与用量账本是同一个 SQLite：账本没有打开时为 nil 接口（续接状态只在内存里），
+// 打开时公开 API 配置带上它，写进去的续接节点关闭后重新打开账本仍能读出
+func TestResponseStatePersisterUsesLedger(t *testing.T) {
+	if persister := (&runtimeManager{}).responseStatePersister(); persister != nil {
+		t.Fatalf("没有账本时返回了非 nil 接口: %#v", persister)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "runtime", "requests.db")
+	manager := &runtimeManager{requests: newRequestRegistry(ctx), current: &runtimeGeneration{admin: recordingAdmin{}}}
+	ledger := openRequestLedger(manager, path, false)
+	if ledger == nil || publicAPIConfig(manager, config.Config{}, "token", nil).ResponseStates == nil {
+		t.Fatal("账本打开时公开 API 配置应带上续接状态库")
+	}
+	manager.responseStatePersister().SaveResponseStates([]api.SavedResponseState{{ID: "resp_1", Data: []byte("state")}}, nil)
+	if err := ledger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := requestdb.Open(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if states, err := reopened.LoadResponseStates(); err != nil || len(states) != 1 || states[0].ID != "resp_1" {
+		t.Fatalf("续接状态 = %+v, %v", states, err)
+	}
+}
+
 // TestOpenRequestLedgerFailureContinues 账本打开失败只写 WARN，管理器不持有账本，记录请求时不崩溃
 func TestOpenRequestLedgerFailureContinues(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())

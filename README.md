@@ -388,7 +388,7 @@ env_key = "AISTUDIO2API_KEY"
 wire_api = "responses"
 ```
 
-Codex 读流时 5 分钟没有收到事件就断开，`: ping` 注释不算；Responses 流连续 30 秒没有写出事件时（强制调用扣住、重新生成、`long-` 续写换轮等），心跳改发一次 `response.in_progress`，平时仍是注释。
+Codex 读流时 5 分钟没有收到事件就断开，`: ping` 注释不算；Responses 流连续 30 秒没有写出事件时（强制调用扣住、重新生成、`long-` 续写换轮等），心跳改发一次 `response.in_progress`，平时仍是注释。`previous_response_id` 指向的续接状态写进 `runtime/requests.db`，服务重启后仍可续接。
 
 [omp](https://github.com/can1357/oh-my-pi) 的 `web_search` 工具按自身的搜索来源顺序执行。设置 `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` 与 `GEMINI_API_KEY=<PROXY_API_KEY>`，并在 omp 配置中优先使用 Gemini 来源：
 
@@ -483,7 +483,7 @@ for event in stream:
         print(event.delta.data)
 ```
 
-流式音频默认为 Base64 编码的 24 kHz、16-bit 小端、单声道 PCM；非流式默认为完整 WAV，`response_format.mime_type` 可显式选择 `audio/l16` 或 `audio/wav`。模型名后缀、函数调用（`id` 一定非空，原样回传即可对应结果）与 `previous_interaction_id` 续接均可用；续接与 Responses 共用当前进程内的响应节点，不接受 `resp_` 开头的 Responses ID，语音输出不保存。字段与事件见 [Interactions 协议](docs/protocol.md#gemini-interactions)。
+流式音频默认为 Base64 编码的 24 kHz、16-bit 小端、单声道 PCM；非流式默认为完整 WAV，`response_format.mime_type` 可显式选择 `audio/l16` 或 `audio/wav`。模型名后缀、函数调用（`id` 一定非空，原样回传即可对应结果）与 `previous_interaction_id` 续接均可用；续接与 Responses 共用最多 256 个响应节点（写进 `runtime/requests.db` 的 `response_states` 表，服务重启后仍可续接，`store: false` 时不保存），不接受 `resp_` 开头的 Responses ID，语音输出不保存。字段与事件见 [Interactions 协议](docs/protocol.md#gemini-interactions)。
 
 ### TTS 语音生成
 
@@ -797,12 +797,12 @@ cp .env.example .env
 | `OMNI_IGNORE_SYSTEM_PROMPT` | `true` | 视频模型忽略系统提示：发给能输出视频的 Omni 模型（含带后缀的名称与目录别名）的请求去掉客户端的系统提示（各协议的 `system`、`systemInstruction`、`instructions`、`system_instruction` 与 `system` 角色消息），不发给上游，请求日志记一行去掉的字数。默认开启是因为 Chatbox 等客户端自动加的 “You are a helpful assistant.” 会让 Omni 只回文字、说无法生成视频；`false` 时系统提示照常发送，与原先完全一致。开启时客户端设置的系统提示（如 Chatbox 的角色设定）对 Omni 不生效，要规定视频风格请写进用户消息；关闭是全局的，对所有客户端生效。除系统提示外没有其他消息时保留；其他模型不受影响。管理页“服务配置”可改，保存后立即生效，只影响新请求，见 [Omni 视频参数](#omni-视频参数) |
 | `OMNI_IMAGE_BINDING` | `true` | 视频模型带图请求的校验值计入图片：发给 Omni 模型、带内联图片的请求，把图片按文字模型带图的同一写法（原数据 Base64，按它在请求里的位置）计入 WAA 校验值；Drive 文件引用不计入，纯文字请求与其他模型不受影响，请求体不变。`false` 时只有校验值回到只含文本（与原先相同）；无论开关取值，带图请求被 403 拒绝时都不冷却、不登记账户，最多试 2 个账户后按 400 返回说明。取值无效时按默认值启动并在管理页提示；管理页“服务配置”可改，保存后立即生效，见 [Omni 的图片与视频输入](#omni-的图片与视频输入) |
 | `AUTO_START` | `true` | 管理进程启动后自动启动生成服务；启动失败或意外停止时自动重新启动（5 秒起、最长 1 分钟退避，手动停止后不再自动启动）；`false` 时保持 `STOPPED`，需在管理页面手动启动（只认 `true`/`false`，写错时启动即报错） |
-| `REQUEST_BODY_LOG` | `false` | 用量账本同时保存公开 API POST 请求与响应的正文（各截断到 64 KiB，只保留最近 1000 条），在用量页的请求详情中查看；正文以明文保存在本机，修改后重启程序生效 |
+| `REQUEST_BODY_LOG` | `false` | 用量账本同时保存公开 API POST 请求与响应的正文（各截断到 64 KiB，只保留最近 1000 条），在用量页的请求详情中查看；正文以明文保存在本机，修改后重启程序生效。与这一项无关，Responses 与 Interactions 的续接节点（最多 256 个，含对话与 4 MiB 以内的内联附件）总是以明文保存在同一个账本的 `response_states` 表，请求带 `store: false` 时不保存，见下文 |
 | `ADMIN_PASSWORD` | 空 | 设置后除管理令牌外也可以用密码打开管理页面，浏览器弹出登录框（用户名随意，密码为此值）；同一 IP 10 分钟内错 10 次封禁 15 分钟；留空时只能用管理令牌（`.admin-token`）登录。纯 HTTP 下令牌与密码均为明文传输，建议配合 HTTPS |
 
 取值无效的配置项按默认值启动：`.env` 或进程环境变量里某一项写法无效（时长、整数、布尔值解析不了等），或几项组合起来不成立（如 `MAX_ACTIVE_WORKERS` 小于 `WARM_WORKER_LIMIT`、`FIRST_EVENT_TIMEOUT` 不小于 `REQUEST_TIMEOUT`）时，涉及的项改用默认值，进程照常启动：启动日志逐项写一行 `配置项取值无效，已按默认值启动 | 键=… | 原值=… | 来源=.env|环境变量 | 原因=…`（`PROXY_API_KEY`、`ADMIN_PASSWORD`、`MEDIA_BASE_URL` 等可能带凭据的键不写原值），管理页“服务配置”顶部同样列出，在管理页修改后保存即写入有效值（管理页不编辑的 `REQUEST_BODY_LOG` 写错时，保存其他设置保留 `.env` 里的原行，要在 `.env` 里改正）。决定发往 Google 的网络形态、通道与是否自动启动的键例外，取值无效时仍然启动即报错：代理相关的 `PROXY`、`PROXY_POOL_*` 绝不悄悄改成直连；`WAA_BACKEND` 写错时不悄悄从纯 Go 改成 Camoufox 浏览器（发送路径与 TLS、HTTP/2 指纹都会变）；`UPSTREAM_CHANNELS` 写错时不悄悄打开本想停用的 Build 通道；`TEMPORARY_CHAT` 写错（如 `yes`、`on`，只认 `true`/`false`）时不悄悄按 `false` 打开普通对话页（预热页不再带 `&temporary=true`，官网会把预热提示词自动保存进账号历史）；`AUTO_START` 写错（如 `off`、`no`，只认 `true`/`false`）时不悄悄按 `true` 自动启动生成服务、为账号预热 Worker 连官网。管理页保存设置时无效值照旧直接报错。
 
-管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。
+管理页面的“用量”页读取本地账本 `runtime/requests.db`：通过 API key 校验的每个 POST 请求完成后记录一行（token 计数请求与 Anthropic `max_tokens` 为 `0` 的预热请求不计入），提供请求数、成功率、token、耗时分位、降级拦截率、重复回复率、分项排行、请求记录与 CSV 导出；记录与汇总保留 90 天。账本打开失败时只写 WARN，服务照常运行。同一个账本还保存 Responses 与 Interactions 的续接状态（`response_states` 表，`previous_response_id`、`previous_interaction_id` 指向的最近 256 个节点）：表里是明文的对话内容（提示词、回复、函数结果与 4 MiB 以内的内联附件），与 `REQUEST_BODY_LOG` 无关、默认就保存，请求带 `store: false` 时不保存；最坏约 256 × 4 MiB ≈ 1 GiB，删除的节点留下的空闲页由 SQLite 复用，文件不会自动缩小。多人共用 key 的中转部署，拷贝、备份 `runtime/requests.db` 时会带上最近这些终端用户的对话；要清空并回收空间，先停止服务，再执行 `sqlite3 runtime/requests.db "DELETE FROM response_states; VACUUM;"`（之后这些响应不能再续接）。
 
 服务启动时会载入 `AISTUDIO_AUTH_STATES` 中的全部账户；`WARM_WORKER_LIMIT` 控制普通号池的常驻预热规模，`MAX_ACTIVE_WORKERS` 控制普通号池的峰值 Worker 上限，Ultra 号池由 `ULTRA_WARM_WORKER_LIMIT` 与 `ULTRA_MAX_ACTIVE_WORKERS` 单独控制（见 [Ultra 号池](#ultra-号池ultra-前缀)），这些 Worker 设置与 `ULTRA_EXCLUSIVE`、`ULTRA_INCLUDE_PRO` 在管理页保存后立即生效；`WARM_STARTUP_CONCURRENCY` 控制 Camoufox 冷启动并发（预热最多用满，请求现场冷启动另保留 1 个名额），`PER_ACCOUNT_CONCURRENCY` 控制单账户请求槽位，`ACCOUNT_RPM_LIMIT` 控制单账号每分钟最多发出的生成请求数。
 
@@ -964,7 +964,7 @@ Go 负责编码、调度、流式解码与公开协议；受 WAA 保护的 `Gene
 
 - **客户端管理历史**: Chat、Anthropic 和 Gemini 请求由客户端提交完整对话上下文
 - **AI Studio 历史**: API 请求不保存到官网历史；`TEMPORARY_CHAT=true` 还会关闭 WAA 预热页的自动保存
-- **Responses 与 Interactions 会话**: `previous_response_id` 与 `previous_interaction_id` 仅在当前进程内保存，重启后不会保留
+- **Responses 与 Interactions 会话**: `previous_response_id` 与 `previous_interaction_id` 指向的最近 256 个响应节点写进 `runtime/requests.db` 的 `response_states` 表，服务重启后仍可续接；表里是明文的对话内容（含 4 MiB 以内的内联附件），与 `REQUEST_BODY_LOG` 无关、默认保存，请求带 `store: false` 时不保存；最坏约 1 GiB，文件不会自动缩小（清空方法见[环境变量配置](#环境变量配置)后的用量账本说明）。单个节点超过 4 MiB（带大图片、视频等内联附件，或并入了很长的上文）时只保留在内存，重启后不能从它及以它为续接起点的节点续接；请求账本打开失败时只在当前进程内保存
 - **认证有效期**: Chrome 导入账户保留 DBSC 续签材料；隔离登录账户失效后在账户页重新登录
 
 ## 故障排除

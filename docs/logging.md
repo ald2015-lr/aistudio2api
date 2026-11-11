@@ -1168,9 +1168,33 @@ ERROR service  请求账本写入失败 | 记录=<COUNT> | 错误=<ERROR>
 ERROR service  请求账本清理失败 | 错误=<ERROR>
 ```
 
+同一个数据库的 `response_states` 表保存 Responses 与 Interactions 的续接状态（`previous_response_id`、`previous_interaction_id` 指向的最多 256 个节点，规则见 [protocol.md](protocol.md)）：节点的改动经同一个写入协程排队写入，服务启动时读回，重启后仍可续接。
+
+注意这张表与上面的正文记录不同：
+
+- 表里是明文的对话内容（提示词、回复、函数调用与结果、4 MiB 以内的内联图片与文件原字节），按 gob 编码保存；与 `REQUEST_BODY_LOG` 无关，默认就保存。多人共用 key 的中转部署里，库里留着最近 256 个节点的终端用户对话，拷贝、备份 `requests.db` 时会一起带走。
+- 请求带 `store: false`（Responses 与 Interactions 都支持）时不保存节点，也就不写库。
+- 总量受 256 个节点与单个节点 4 MiB 限制，最坏约 256 × 4 MiB ≈ 1 GiB（内存里同一批节点没有单个上限，只会更大）。删除的节点留下的空闲页由 SQLite 复用，文件不会自动缩小；要清空并回收空间，先停止服务，再执行 `sqlite3 runtime/requests.db "DELETE FROM response_states; VACUUM;"`（之后这些响应不能再续接）。
+
+日志只写节点 ID、个数与字节数，不写提示词与回复：
+
+```text
+INFO  service  已读回 Responses 与 Interactions 的续接状态（状态库以明文保存这些节点的对话内容）| 节点=<COUNT>
+INFO  service  已读回 Responses 与 Interactions 的续接状态（状态库以明文保存这些节点的对话内容）| 节点=<COUNT> | 丢弃读不出的节点=<COUNT> | 丢弃续接起点已不在的节点=<COUNT>
+WARN  service  读取续接状态失败，本次运行从空状态开始，previous_response_id 与 previous_interaction_id 指向重启前的响应时返回 not found | 错误=<ERROR>
+INFO  service  续接状态节点内容至少 <BYTES> 字节，超过 4 MiB，不写入状态库（只留在内存，重启后不能从它续接）| 节点=<ID>
+INFO  service  续接状态节点编码后 <BYTES> 字节，超过 4 MiB，不写入状态库（只留在内存，重启后不能从它续接）| 节点=<ID> | 一并从状态库删除以它为续接起点的节点=<COUNT>
+WARN  service  续接状态节点编码失败（<ERROR>），不写入状态库（只留在内存，重启后不能从它续接）| 节点=<ID>
+WARN  service  续接状态写入排队已满，丢弃 <COUNT> 次改动（状态库停在之前的状态，重启后从这些响应续接可能返回 not found）
+```
+
+读回时丢弃的节点：编码读不出（版本不认识或数据损坏），或续接链上有节点已不在库里（续接起点超过 4 MiB 没有写入、或那次写入被丢弃）；它们同时从库里删除。续接起点只要在库里就不丢，不论它排在子节点前面还是后面（起点的首次写入被丢弃、之后在淘汰时重新写入的，排在子节点之后）。
+
+超过 4 MiB 的节点通常带大图片、视频等内联附件，或在淘汰最早的节点时被并入了很长的上文。这是常规情形，按 INFO 记，每条续接链只记一行：节点与它当时的后代一起从库里删除（重启后都接不上，`一并从状态库删除以它为续接起点的节点` 为后代个数，没有后代时不写这一段），之后以它们为续接起点保存的节点不再写库、不再记日志。编码前先按文本与内联数据的字节数粗估，粗估已超限的不编码（记 `内容至少 <BYTES> 字节`），不在持锁时为注定丢弃的节点编码几 MiB。编码失败不该发生，按 WARN 记。排队的续接状态合计超过 64 MiB 时丢弃新的改动（落盘后释放排队字节）。账本打开失败时续接状态只在内存里保存，与原先相同。
+
 管理页的用量看板通过 `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv` 与 `GET /api/requests/{id}/body` 查询，与其他控制面接口一样需要管理令牌。
 
-`REQUEST_BODY_LOG=true` 时，账本同时保存通过 API key 校验的 POST 请求与响应的原始正文（token 计数请求除外），各截断到 64 KiB 并记录原始字节数，只保留最近 1000 条；流式响应保存 SSE 原文。正文包含提示词与模型输出，以明文保存在本机。用量页的请求详情中按请求 ID 查看正文。
+`REQUEST_BODY_LOG=true` 时，账本同时保存通过 API key 校验的 POST 请求与响应的原始正文（token 计数请求与 `max_tokens` 为 `0` 的预热请求除外），各截断到 64 KiB 并记录原始字节数，只保留最近 1000 条；流式响应保存 SSE 原文。正文包含提示词与模型输出，以明文保存在本机。用量页的请求详情中按请求 ID 查看正文。
 
 ## 管理事件流
 

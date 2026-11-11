@@ -34,6 +34,9 @@ type Config struct {
 	OmniIgnoreSystemPrompt func() bool
 	// MediaDir 为生成媒体的保存目录（MEDIA_OUTPUT=url 时保存、/media/ 路由读取、回传的本服务媒体链接从这里恢复）；为空时不启用这些功能
 	MediaDir string
+	// ResponseStates 为 Responses 与 Interactions 续接状态的状态库（见 response_state_persist.go），创建处理器时读回、之后的变化写进它；
+	// 为 nil 时只在内存里保存（重启后不能续接）。必须是 nil 接口值，不能是包着 nil 指针的接口
+	ResponseStates ResponseStatePersister
 	// MediaLinks 每次请求读取媒体输出设置：是否以本服务链接输出生成的媒体，与链接使用的服务地址（MEDIA_BASE_URL，为空时按请求地址）；
 	// 为 nil 时按 inline
 	MediaLinks func() (enabled bool, base string)
@@ -60,6 +63,9 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	s := &server{service: service, config: config, responseStates: newResponseStateStore(), thoughtSignatures: newThoughtSignatureStore(), traces: newTraceStore(config.TraceDir)}
 	if config.MediaDir != "" {
 		s.mediaStore = mediastore.New(config.MediaDir)
+	}
+	if config.ResponseStates != nil {
+		s.responseStates.restore(config.ResponseStates)
 	}
 	public := http.NewServeMux()
 	public.HandleFunc("GET /v1/models", s.handleOpenAIModels)

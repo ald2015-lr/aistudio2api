@@ -73,6 +73,11 @@ type responseStateStore struct {
 	mu     sync.Mutex
 	states map[string]responseState
 	order  []string
+	// persist 非空时把节点的变化写进状态库（见 response_state_persist.go），服务重启后读回；为 nil 时只在内存里保存
+	persist ResponseStatePersister
+	// unpersisted 为不写进状态库的节点：超过单个节点的上限或编码失败的，以及续接起点在其中的（见 markUnpersisted）。
+	// 只在 persist 非空时使用，节点淘汰时去掉
+	unpersisted map[string]bool
 }
 
 func newResponseStateStore() *responseStateStore {
@@ -108,15 +113,29 @@ func (store *responseStateStore) Store(id string, state responseState) {
 	state.InlineInstructions = append([]string(nil), state.InlineInstructions...)
 	store.states[id] = state
 	store.order = append(store.order, id)
-	for len(store.order) > responseStateCapacity {
-		store.evictOldest()
+	if store.persist != nil {
+		// 续接起点不入库时它也不入库：重启后接不上，写了也用不上（见 markUnpersisted）
+		if store.unpersisted[state.ParentID] {
+			store.unpersisted[id] = true
+		} else {
+			delete(store.unpersisted, id)
+		}
 	}
+	touched, removed := []string{id}, []string(nil)
+	for len(store.order) > responseStateCapacity {
+		evicted, children := store.evictOldest()
+		removed = append(removed, evicted)
+		touched = append(touched, children...)
+	}
+	store.persistLocked(touched, removed)
 }
 
-func (store *responseStateStore) evictOldest() {
+// evictOldest 淘汰最早保存的节点，把它的上下文并入以它为续接起点的子节点；返回淘汰的节点与改动过的子节点
+func (store *responseStateStore) evictOldest() (string, []string) {
 	id := store.order[0]
 	store.order = store.order[1:]
 	parent := store.states[id]
+	var children []string
 	for childID, child := range store.states {
 		if child.ParentID != id {
 			continue
@@ -125,8 +144,11 @@ func (store *responseStateStore) evictOldest() {
 		child.Contents = append(cloneResponseContents(parent.Contents), child.Contents...)
 		child.InlineInstructions = append(append([]string(nil), parent.InlineInstructions...), child.InlineInstructions...)
 		store.states[childID] = child
+		children = append(children, childID)
 	}
 	delete(store.states, id)
+	delete(store.unpersisted, id)
+	return id, children
 }
 
 // dropSourceGIF 去掉协议层把 GIF 转成 PNG 时留下的原 GIF（Blob.SourceGIF，只用于本次请求计 Interaction 模型的转换额度）：

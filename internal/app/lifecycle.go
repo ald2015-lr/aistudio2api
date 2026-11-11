@@ -610,6 +610,15 @@ func (manager *runtimeManager) requestLedger() api.RequestLedger {
 	return manager.ledger
 }
 
+// responseStatePersister 返回 Responses 与 Interactions 续接状态的状态库：与用量账本同一个 SQLite（runtime/requests.db 的
+// response_states 表）；账本没有打开时返回 nil 接口值，续接状态只在内存里保存
+func (manager *runtimeManager) responseStatePersister() api.ResponseStatePersister {
+	if manager.ledger == nil {
+		return nil
+	}
+	return manager.ledger
+}
+
 // decorateRuntimeConfig 标记配置所属的进程级与生成服务生效时机
 func (manager *runtimeManager) decorateRuntimeConfig(value api.RuntimeConfig, active config.Config) api.RuntimeConfig {
 	value.ActiveListenAddr = manager.activeManagement.ListenAddr
