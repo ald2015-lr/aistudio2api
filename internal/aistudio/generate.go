@@ -1055,8 +1055,12 @@ func (c *Client) sendPlayground(
 		return nil, nil, err
 	}
 	if plan != nil {
+		// 第一轮的响应体由 decodeLongRounds 在发送第二轮之前关闭，Generate 结束（或取消）时还会再关：换成只关一次的包装，几处关的是同一个
+		// （WAA_BACKEND=go 的 HTTP/2 响应体重复关闭会对已结束的流多发一个 RST_STREAM，见 onceCloseBody）
+		response.Body = newOnceCloseBody(response.Body)
+		first := response.Body
 		return response, func(source io.Reader, emit func(Event) error) error {
-			return c.decodeLongRounds(longCtx, plan, request, entry.defaults, runtime, source, emit, rounds)
+			return c.decodeLongRounds(longCtx, plan, request, entry.defaults, runtime, source, first, emit, rounds)
 		}, nil
 	}
 	decoder := NewFrameDecoder()

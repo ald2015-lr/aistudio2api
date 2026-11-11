@@ -104,6 +104,10 @@ func finishReasonAdvice(reason string) string {
 			"（中转丢掉了签名、客户端改写了调用，或服务重启后本服务记的签名已不在）" +
 			" | 建议=让客户端或中转原样回传 functionCall 的 thoughtSignature（OpenAI 格式为 extra_content.google.thought_signature）；" +
 			"经 new-api 时保留调用 ID 原样回传，本服务按调用 ID 还原本进程签发的签名（服务重启后还原不到）"
+	case "malformed_response":
+		return "上游以响应格式异常结束（MALFORMED_RESPONSE，AI Studio 页面显示 Content blocked） | 原因=上游生成的响应格式异常，通常没有正文；" +
+			"不算内容拦截，客户端还没收到内容时本服务会换随机后缀同账号重新生成（每请求最多 2 次，是否重新生成与原因见上面的请求说明）" +
+			" | 建议=重试一次；反复出现时缩短或拆分输入、减少附件，或换一个模型"
 	case "too_many_tool_calls":
 		return "上游以工具调用过多结束（TOO_MANY_TOOL_CALLS） | 原因=模型在这一轮连续或并行调用工具的次数超过上游上限" +
 			" | 建议=减少一次回复内的工具调用（限制客户端的检索轮数、合并工具或缩小每次返回的结果），或在提示词里要求先根据已有结果作答"

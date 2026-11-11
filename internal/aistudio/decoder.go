@@ -57,9 +57,13 @@ func (e *PromptFeedbackError) Unwrap() error {
 	return ErrInvalidArgument
 }
 
+// sparseJSONReader 把官网 JSON+protobuf 的稀疏数组（[,1]、[1,,2]、[1,]）补成标准 JSON（[null,1]、[1,null,2]、[1,null]）：数组空位前
+// 补 "null"，其余字节原样输出。非空位的字节直接写进调用方的缓冲区，空位时 "null" 与后面的逗号或右括号放在固定数组 hole 里输出
+// （与上游 Mag1cFall/AIStudio2API 4427292 相同）；原先每个字节都分配一个新切片，带图与长回复的流解码有几百万次分配
 type sparseJSONReader struct {
 	source        *bufio.Reader
 	pending       []byte
+	hole          [5]byte
 	inString      bool
 	escaped       bool
 	previousToken byte
@@ -88,12 +92,20 @@ func (r *sparseJSONReader) Read(destination []byte) (int, error) {
 			}
 			return 0, err
 		}
-		r.pending = r.normalize(value)
+		if r.emptySlot(value) {
+			// pending 指向 hole：下一次读取新字节之前一定先把它输出完，hole 不会被提前覆盖
+			r.pending = append(append(r.hole[:0], "null"...), value)
+			continue
+		}
+		destination[written] = value
+		written++
 	}
 	return written, nil
 }
 
-func (r *sparseJSONReader) normalize(value byte) []byte {
+// emptySlot 按 value 更新扫描状态（是否在字符串里、转义、上一个非空白字符），返回 value 之前是否为数组空位：
+// 字符串外的逗号紧跟在左括号或逗号之后，或右括号紧跟在逗号之后
+func (r *sparseJSONReader) emptySlot(value byte) bool {
 	if r.inString {
 		if r.escaped {
 			r.escaped = false
@@ -102,25 +114,16 @@ func (r *sparseJSONReader) normalize(value byte) []byte {
 		} else if value == '"' {
 			r.inString = false
 		}
-		return []byte{value}
+		return false
 	}
 	if value == '"' {
 		r.inString = true
-		r.previousToken = value
-		return []byte{value}
 	}
-	if value == ',' && (r.previousToken == '[' || r.previousToken == ',') {
-		r.previousToken = value
-		return []byte("null,")
-	}
-	if value == ']' && r.previousToken == ',' {
-		r.previousToken = value
-		return []byte("null]")
-	}
+	empty := value == ',' && (r.previousToken == '[' || r.previousToken == ',') || value == ']' && r.previousToken == ','
 	if !unicode.IsSpace(rune(value)) {
 		r.previousToken = value
 	}
-	return []byte{value}
+	return empty
 }
 
 func decodeJSONValue(raw []byte) (json.RawMessage, error) {

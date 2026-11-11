@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1120,4 +1121,119 @@ func TestLongOutputRoundInterrupted(t *testing.T) {
 		t.Fatalf("调用=%d %+v，期望不再发送第二轮、按 max_tokens 结束", len(calls), summary)
 	}
 	assertInterrupted(true)
+}
+
+// trackedBody 为记下关闭次数的响应体。底层响应体只应关一次：WAA_BACKEND=go 的 HTTP/2 响应体第二次 Close 会对已结束的流再发一个
+// RST_STREAM(CANCEL)（见 onceCloseBody）
+type trackedBody struct {
+	io.Reader
+	closes atomic.Int32
+}
+
+func (body *trackedBody) Close() error {
+	body.closes.Add(1)
+	return nil
+}
+
+// TestLongOutputClosesPreviousRound 续写每发送一轮之前先关闭上一轮已读完的响应体：发第二轮时第一轮（Generate 持有的响应）已关闭，
+// 发第三轮时第二轮已关闭；模拟续写的原生预填充在流尾被拒、在同一轮内补用户消息重发时，被拒的那一次同样先关闭。原先第一轮的响应体
+// 挂到整个请求结束，第二轮起要等下一轮的上下文取消后在另一个 goroutine 里关。请求结束时全部关闭，输出与不改时相同。
+// 每个响应体的底层恰好关闭一次：第一轮由 decodeLongRounds 关过之后 Generate 结束时不再关，第二轮起取消这一轮的回调与 closePrevious
+// 不重复关闭（底层 Close 不一定能重复，见 onceCloseBody）
+func TestLongOutputClosesPreviousRound(t *testing.T) {
+	model, defaults := longPlainModel("gemini-3-flash-preview")
+	forgetPrefillRejection(t, model.ID)
+	streams := []string{
+		longStream(longTextFrame("第一段", false), longFinishFrame(2, "", 10, 100, 110)),
+		// 第二轮以模型轮原样发送：流尾 400 拒绝，在这一轮内改补用户消息重发
+		`[[],[3,"Requests ending with a model turn are not supported"]]`,
+		longStream(longTextFrame("第二段", false), longFinishFrame(2, "", 10, 100, 110)),
+		longStream(longTextFrame("第三段", false), longFinishFrame(1, "", 10, 5, 15)),
+	}
+	tracked := make([]*trackedBody, len(streams))
+	bodies := make(map[int]io.ReadCloser, len(streams))
+	for index, stream := range streams {
+		tracked[index] = &trackedBody{Reader: strings.NewReader(stream)}
+		bodies[index] = tracked[index]
+	}
+	var mu sync.Mutex
+	var open []string
+	upstream := &longUpstream{bodies: bodies}
+	upstream.send = func(context.Context) {
+		upstream.mu.Lock()
+		index := len(upstream.calls) - 1
+		upstream.mu.Unlock()
+		mu.Lock()
+		defer mu.Unlock()
+		for previous := range index {
+			if closes := tracked[previous].closes.Load(); closes != 1 {
+				open = append(open, fmt.Sprintf("发送第 %d 次时第 %d 次的响应体关闭了 %d 次", index+1, previous+1, closes))
+			}
+		}
+	}
+	request := longRequest(model.ID, true)
+	request.LongOutputDefaultTokens = 1000
+	summary, calls, _ := runLong(t, longClient(t, upstream, model, defaults), upstream, context.Background(), request)
+	if len(calls) != len(streams) || summary.text != "第一段第二段第三段" || len(summary.errs) != 0 || summary.finishes[len(summary.finishes)-1] != "stop" {
+		t.Fatalf("调用=%d 正文=%q 结束=%v 错误=%v", len(calls), summary.text, summary.finishes, summary.errs)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(open) != 0 {
+		t.Fatalf("续写发下一轮之前应先关闭上一轮的响应体（恰好一次）：%v", open)
+	}
+	for index, body := range tracked {
+		if closes := body.closes.Load(); closes != 1 {
+			t.Fatalf("请求结束后第 %d 次的响应体关闭了 %d 次，期望恰好 1 次", index+1, closes)
+		}
+	}
+}
+
+// onceCloseRecorder 为不能重复关闭的底层响应体：关闭次数用普通字段记（并发关闭时 -race 报数据竞争），第二次关闭记为错误
+type onceCloseRecorder struct {
+	io.Reader
+	closes int
+}
+
+func (body *onceCloseRecorder) Close() error {
+	body.closes++
+	if body.closes > 1 {
+		return errors.New("重复关闭")
+	}
+	return nil
+}
+
+// TestOnceCloseBody 只关一次的包装：读取原样转发；多次关闭（含并发）只关底层一次，之后都返回第一次的结果
+func TestOnceCloseBody(t *testing.T) {
+	recorder := &onceCloseRecorder{Reader: strings.NewReader("data")}
+	body := newOnceCloseBody(recorder)
+	if data, err := io.ReadAll(body); err != nil || string(data) != "data" {
+		t.Fatalf("读取=%q err=%v", data, err)
+	}
+	var wait sync.WaitGroup
+	for range 8 {
+		wait.Go(func() {
+			if err := body.Close(); err != nil {
+				t.Errorf("Close 返回 %v", err)
+			}
+		})
+	}
+	wait.Wait()
+	if err := body.Close(); err != nil || recorder.closes != 1 {
+		t.Fatalf("底层关闭 %d 次（期望 1 次），err=%v", recorder.closes, err)
+	}
+	failing := newOnceCloseBody(&failingCloser{})
+	if first, second := failing.Close(), failing.Close(); first == nil || second != first {
+		t.Fatalf("底层关闭失败时每次都应返回第一次的错误：%v %v", first, second)
+	}
+}
+
+// failingCloser 为关闭失败的底层响应体
+type failingCloser struct{ calls int }
+
+func (closer *failingCloser) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (closer *failingCloser) Close() error {
+	closer.calls++
+	return fmt.Errorf("关闭失败（第 %d 次）", closer.calls)
 }

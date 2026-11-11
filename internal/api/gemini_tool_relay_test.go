@@ -566,9 +566,11 @@ func TestGeminiFunctionResponseMediaSplit(t *testing.T) {
 }
 
 // TestGeminiMissingThoughtSignatureFinishReason 缺少思考签名的结束原因按 Gemini 官方枚举名 MISSING_THOUGHT_SIGNATURE 输出（原先为 OTHER），
-// 工具调用过多为 TOO_MANY_TOOL_CALLS
+// 工具调用过多为 TOO_MANY_TOOL_CALLS，响应格式异常（Playground 终止原因 19）为 MALFORMED_RESPONSE（原先为 OTHER）
 func TestGeminiMissingThoughtSignatureFinishReason(t *testing.T) {
-	for reason, want := range map[string]string{"missing_thought_signature": "MISSING_THOUGHT_SIGNATURE", "too_many_tool_calls": "TOO_MANY_TOOL_CALLS"} {
+	for reason, want := range map[string]string{
+		"missing_thought_signature": "MISSING_THOUGHT_SIGNATURE", "too_many_tool_calls": "TOO_MANY_TOOL_CALLS", "malformed_response": "MALFORMED_RESPONSE",
+	} {
 		if got := geminiFinishReason(reason); got != want {
 			t.Fatalf("%s → %s，期望 %s", reason, got, want)
 		}

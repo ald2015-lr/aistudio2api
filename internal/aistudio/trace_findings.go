@@ -371,6 +371,8 @@ func traceFinishExplanation(reason string) string {
 		return "回复与已有的受版权保护内容过于相似，被上游拦截"
 	case "malformed_function_call", "unexpected_tool_call", "too_many_tool_calls":
 		return "模型生成的工具调用不符合要求"
+	case "malformed_response":
+		return "上游生成的响应格式异常（AI Studio 页面显示 Content blocked），不是内容拦截"
 	case "language":
 		return "使用了上游不支持的语言"
 	case "other":

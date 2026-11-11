@@ -7,6 +7,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -487,23 +488,41 @@ func (rounds *longOutputRounds) markDelivered() {
 }
 
 // mayRegenerate 判断只有一轮就结束的第一轮可能被 Generate 重新生成放弃：还没向下游交出任何事件，结束原因又是 Generate 因之重新生成的
-// （regenerableFinish：函数调用格式错误、意外的工具调用），或工具约束要求必须调用（扣住事件时还没交出事件就是还没有调用）
+// （regenerableFinish：函数调用格式错误、意外的工具调用、响应格式异常），或工具约束要求必须调用（扣住事件时还没交出事件就是还没有调用）
 func (rounds *longOutputRounds) mayRegenerate(finishReason string) bool {
 	return rounds != nil && !rounds.delivered.Load() && (regenerableFinish(finishReason) || rounds.holdsTools)
 }
 
 // decodeLongRounds 解码 long- 请求的第一轮并按计划续写（见文件开头说明），各轮输出依次交给 emit；用量与结束事件只在最后发出一次。
-// ctx 为 Generate 的原始上下文（续写的后续轮次在它上面发送，不用重发的上下文，见文件开头说明），rounds 为本次 Generate 的续写记录
+// ctx 为 Generate 的原始上下文（续写的后续轮次在它上面发送，不用重发的上下文，见文件开头说明），rounds 为本次 Generate 的续写记录；
+// first 为第一轮的响应体（source 读的就是它，Generate 持有，可以为 nil；sendPlayground 已换成只关一次的包装，见 onceCloseBody）：
+// 发送第二轮之前先关闭它（见 closePrevious）
 func (c *Client) decodeLongRounds(
 	ctx context.Context, plan *longOutputPlan, request GenerateRequest, defaults GenerationDefaults, runtime RequestContext,
-	source io.Reader, emit func(Event) error, rounds *longOutputRounds,
+	source io.Reader, first io.Closer, emit func(Event) error, rounds *longOutputRounds,
 ) error {
-	var bodies []io.Closer
+	// attached 为第二轮起正在读的这一轮的响应体（关闭时一并注销取消时关闭的登记），请求结束时关闭
+	var attached io.Closer
 	defer func() {
-		for _, body := range bodies {
-			_ = body.Close()
+		if attached != nil {
+			_ = attached.Close()
 		}
 	}()
+	// closePrevious 在发送下一轮（含模拟续写的预填充被拒、在同一轮内的重发）之前关闭上一轮已读完的响应体：第一轮为 Generate 持有的响应
+	// （Generate 结束或取消时还会再关，包装保证底层只关一次），第二轮起为 attach 接上的那一轮。原先各轮的响应体都留到整个请求结束才关
+	// （第二轮起要等下一轮的上下文取消后在另一个 goroutine 里关），N 轮续写在等号池准入、准备 WAA proof 与发送时一直挂着前面已读完的连接。
+	// 每个响应体的底层只关一次：WAA_BACKEND=go 的 HTTP/2 响应体（fhttp transportResponseBody）的 Close 不能重复，第二次会对已结束的流
+	// 再写一个 RST_STREAM(CANCEL)，浏览器不会这样发帧
+	closePrevious := func() {
+		switch {
+		case attached != nil:
+			_ = attached.Close()
+			attached = nil
+		case first != nil:
+			_ = first.Close()
+			first = nil
+		}
+	}
 	var merged *Usage
 	var text strings.Builder
 	// output 为之前各轮的输出 token（正文与思考），计入总上限
@@ -544,6 +563,7 @@ func (c *Client) decodeLongRounds(
 	}
 	// sendRound 发送续写的第 round 轮（从 1 计，至少第 2 轮）：先为租约预占、等号池准入，再发送
 	sendRound := func(round int, nextRequest GenerateRequest) (*RPCResponse, error) {
+		closePrevious()
 		if err := waitNextRound(roundCtx, plan, round); err != nil {
 			return nil, err
 		}
@@ -559,16 +579,19 @@ func (c *Client) decodeLongRounds(
 		ReportRequestNote(ctx, fmt.Sprintf("自动续写第 %d 轮：", round)+prefillFallbackNote(plan.model, ChannelPlayground, cause))
 		return sendRound(round, plan.simulatedRound(request, text.String(), roundLimit))
 	}
-	// attach 把续写一轮的响应接上：取消这一轮时关闭它的响应体，整个请求结束时一并关闭
+	// attach 把续写一轮的响应接上（上一轮的响应体已在发送这一轮之前关闭，见 closePrevious）：取消这一轮时关闭它的响应体，
+	// 发送下一轮之前或整个请求结束时关闭。两处关的是同一个只关一次的包装：转入下一轮时先取消这一轮的上下文（回调在另一个 goroutine 里关），
+	// 紧接着 closePrevious 又关，原先两次关闭几乎同时、底层并发 Close
 	attach := func(response *RPCResponse) {
-		body := response.Body
+		closePrevious()
+		body := newOnceCloseBody(response.Body)
 		stopClose := context.AfterFunc(roundCtx, func() {
 			_ = body.Close()
 		})
-		bodies = append(bodies, closerFunc(func() error {
+		attached = closerFunc(func() error {
 			stopClose()
 			return body.Close()
-		}))
+		})
 		source = observeStreamActivity(roundCtx, body)
 	}
 	for round := 0; ; round++ {
@@ -864,4 +887,25 @@ type closerFunc func() error
 
 func (f closerFunc) Close() error {
 	return f()
+}
+
+// onceCloseBody 为只关一次的响应体：读取原样转发，Close 只在第一次关闭底层响应体，之后（含并发调用，等第一次关完）返回第一次的结果。
+// long- 续写的响应体有几处会关（发送下一轮之前、取消时的回调、请求结束），底层的 Close 不一定能重复：WAA_BACKEND=go 的 HTTP/2 响应体
+// （fhttp transportResponseBody）第一次 Close 后流的状态变成“已关闭”，第二次 Close 会把读完的流当成没结束，再写一个 RST_STREAM(CANCEL)；
+// 并发 Close 还会同时改写同一个 trailer。默认 Camoufox 后端的响应体自己记着是否已关，包一层不改它的行为
+type onceCloseBody struct {
+	io.ReadCloser
+	once sync.Once
+	err  error
+}
+
+func newOnceCloseBody(body io.ReadCloser) *onceCloseBody {
+	return &onceCloseBody{ReadCloser: body}
+}
+
+func (body *onceCloseBody) Close() error {
+	body.once.Do(func() {
+		body.err = body.ReadCloser.Close()
+	})
+	return body.err
 }

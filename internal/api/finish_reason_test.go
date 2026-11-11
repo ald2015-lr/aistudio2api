@@ -26,6 +26,8 @@ func TestFinishReasonMapping(t *testing.T) {
 		{reason: "prohibited_content", tools: true, openAI: "content_filter", anthropic: "refusal", providerVisible: true},
 		{reason: "malformed_function_call", openAI: "stop", anthropic: "end_turn", providerVisible: true},
 		{reason: "unexpected_tool_call", tools: true, openAI: "tool_calls", anthropic: "tool_use", providerVisible: true},
+		// Playground 终止原因 19（原先为 provider_19）：不算内容拦截
+		{reason: "malformed_response", openAI: "stop", anthropic: "end_turn", providerVisible: true},
 		{reason: "other", openAI: "stop", anthropic: "end_turn", providerVisible: true},
 		{reason: "provider_99", openAI: "stop", anthropic: "end_turn", providerVisible: true},
 	} {

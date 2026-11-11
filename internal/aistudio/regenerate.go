@@ -13,7 +13,8 @@ import (
 
 // 客户端还没收到内容时重新生成
 //
-// 上游以函数调用格式错误（MALFORMED_FUNCTION_CALL）或意外的工具调用（UNEXPECTED_TOOL_CALL）结束，或流在完成帧之前中断、
+// 上游以函数调用格式错误（MALFORMED_FUNCTION_CALL）、意外的工具调用（UNEXPECTED_TOOL_CALL）或响应格式异常（MALFORMED_RESPONSE，
+// Playground 终止原因 19，AI Studio 页面显示 Content blocked，与上游 Mag1cFall/AIStudio2API 0008880 相同）结束，或流在完成帧之前中断、
 // 流尾为 5xx 状态，而这次请求还没有向客户端交出任何正文、思考或工具调用时（协议层的数据型心跳不算内容），在同一租约、同一账号上
 // 重新发送，客户端只看到最后一次的结果：
 //   - 因结束原因重新生成时换一个输入：上游对完全相同的输入返回完全相同的回复（见 app/duplicates.go 的排查结论），原样重发多半还是
@@ -107,7 +108,7 @@ func regenerationBudgetFrom(ctx context.Context) *RegenerationBudget {
 
 type regenerationVariantContextKey struct{}
 
-// ContextWithRegenerationVariant 挂上因结束原因（MALFORMED_FUNCTION_CALL、UNEXPECTED_TOOL_CALL）重新生成时换输入的函数：
+// ContextWithRegenerationVariant 挂上因结束原因（MALFORMED_FUNCTION_CALL、UNEXPECTED_TOOL_CALL、MALFORMED_RESPONSE）重新生成时换输入的函数：
 // 传入整理成线格式之前的请求，返回换好输入的请求与真；返回假或没有挂时不因结束原因重新生成（原样重发多半得到同样的结果）
 func ContextWithRegenerationVariant(ctx context.Context, variant func(GenerateRequest) (GenerateRequest, bool)) context.Context {
 	if variant == nil {
@@ -202,9 +203,11 @@ func regenerationTimeShort(ctx context.Context, elapsed, firstEvent time.Duratio
 }
 
 // regenerableFinish 判断结束原因可以在客户端还没收到内容时同账号重新生成：函数调用格式错误（MALFORMED_FUNCTION_CALL）、
-// 意外的工具调用（UNEXPECTED_TOOL_CALL）
+// 意外的工具调用（UNEXPECTED_TOOL_CALL）、响应格式异常（MALFORMED_RESPONSE，Playground 终止原因 19，Build 通道同名）。
+// 响应格式异常不算内容拦截（不在 tool_guard.go 的 contentBlockedFinish 里），换随机后缀重来有机会拿到正常回复；
+// 它若是确定性的，代价是每请求最多多 2 次（与其他原因共用次数与准入）
 func regenerableFinish(reason string) bool {
-	return reason == "malformed_function_call" || reason == "unexpected_tool_call"
+	return reason == "malformed_function_call" || reason == "unexpected_tool_call" || reason == "malformed_response"
 }
 
 // regenerationReason 返回可以在同一账号重新生成的原因（写进请求说明），不能重新生成时为空。readErr 为读取上游响应时的非 EOF 错误

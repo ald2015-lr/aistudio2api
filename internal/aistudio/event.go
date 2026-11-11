@@ -380,6 +380,10 @@ func decodeFinishReason(code int64) string {
 		return "image_recitation"
 	case 18:
 		return "missing_thought_signature"
+	case 19:
+		// 响应格式异常（Gemini API FINISH_REASON_MALFORMED_RESPONSE，Build 通道经 buildEnumName 得到同一个名字）：AI Studio 页面显示
+		// Content blocked，通常没有正文；不算内容拦截，客户端还没收到内容时可以重新生成（见 regenerate.go）。原先为 provider_19
+		return "malformed_response"
 	case 22:
 		// 官网自动续写要求下一轮（只在 long- 请求按续写编码时出现）；续写循环不再续写时按 max_tokens 结束，协议层同样按长度截断映射
 		return "continuation"

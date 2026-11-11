@@ -1405,6 +1405,10 @@ func geminiFinishReason(reason string) string {
 	case "missing_thought_signature":
 		// Gemini API FinishReason 的官方枚举名（编号 18，与 AI Studio 的编号相同）；原先报成 OTHER，客户端分不出是缺少思考签名
 		return "MISSING_THOUGHT_SIGNATURE"
+	case "malformed_response":
+		// Gemini API FinishReason 的官方枚举名（编号 19，与 AI Studio 的编号相同）；原先报成 OTHER（Playground 另以 finishMessage
+		// 写出 AI Studio finish reason 19）
+		return "MALFORMED_RESPONSE"
 	default:
 		return "OTHER"
 	}

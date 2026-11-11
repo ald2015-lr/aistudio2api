@@ -414,7 +414,7 @@ func (service *trackedService) maybeAddPromptNonce(request *aistudio.GenerateReq
 	return true
 }
 
-// promptNonceVariant 返回因结束原因（函数调用格式错误、意外的工具调用）重新生成时换输入的函数（见 aistudio.ContextWithRegenerationVariant）：
+// promptNonceVariant 返回因结束原因（函数调用格式错误、意外的工具调用、响应格式异常）重新生成时换输入的函数（见 aistudio.ContextWithRegenerationVariant）：
 // 上游对完全相同的输入返回完全相同的回复（见上面的排查结论），原样重发多半还是同一个错误调用，所以把请求里的随机后缀换成新的一个。
 // 每次尝试各建一个（每次尝试发出的请求都带本请求原来的后缀），只在这次尝试的生成 goroutine 里调用。没加随机后缀的请求（nonce 为空：
 // 客户端指定了 seed、温度为 0、最后一轮是工具结果、REPEAT_PROMPT_NONCE 关闭）返回 nil，不因结束原因重新生成

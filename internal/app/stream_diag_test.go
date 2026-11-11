@@ -192,11 +192,12 @@ func TestForwardEventsPanicRecovered(t *testing.T) {
 	assertLeasesReleased(t, pool)
 }
 
-// TestFinishReasonAdviceLogged 上游以缺少思考签名、工具调用过多结束时，请求进度写一行 WARN 说明原因与建议；正常结束不写
+// TestFinishReasonAdviceLogged 上游以缺少思考签名、工具调用过多、响应格式异常结束时，请求进度写一行 WARN 说明原因与建议；正常结束不写
 func TestFinishReasonAdviceLogged(t *testing.T) {
 	for reason, fragment := range map[string]string{
 		"missing_thought_signature": "上游以缺少思考签名结束（MISSING_THOUGHT_SIGNATURE） | 原因=",
 		"too_many_tool_calls":       "上游以工具调用过多结束（TOO_MANY_TOOL_CALLS） | 原因=",
+		"malformed_response":        "上游以响应格式异常结束（MALFORMED_RESPONSE，AI Studio 页面显示 Content blocked） | 原因=",
 	} {
 		upstream := &scriptedUpstream{events: []aistudio.Event{
 			{Kind: aistudio.EventText, Text: "x"}, {Kind: aistudio.EventFinish, FinishReason: reason},

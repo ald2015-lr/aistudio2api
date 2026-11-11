@@ -704,14 +704,14 @@ Anthropic 流式 `message_start` 写入即时输入估算，最终 `message_delt
 | 12 | unexpected_tool_call | 13 | too_many_tool_calls |
 | 14 | image_prohibited_content | 15 | image_other |
 | 16 | no_image | 17 | image_recitation |
-| 18 | missing_thought_signature | 19 | `provider_19` |
+| 18 | missing_thought_signature | 19 | malformed_response |
 | 22 | continuation | 其他整数 | `provider_<code>` |
 
 错误响应根形状为 `[null,[code,message,...]]`。HTTP 200 的流在帧列表之后也可能带 google.rpc 状态：`[[帧...],[code,message,details]]`，code 不为 0 时按 Interaction 同一张表换算 HTTP 状态（3→400、4→504、5→404、7→403、8→429、9→400、13→500、14→503、16→401，其余 502），带 ErrorInfo 与 RetryInfo 的完整状态照常解码；完成帧之后的流尾错误同样交出，先于完成帧校验。流尾为 code 0、`[]`、`null` 或其他不是状态的形状（第一项不是整数）时照常结束；Build 代理与 Interaction 的流尾为 `null`、`[]` 或状态码为 `null`（JSON+protobuf 省略了默认值 0）时同样按 0（成功），其他不是状态的形状仍为协议错误。field 1 为 `null`（`[null,[code,message]]`）时没有帧，照常读取流尾：流尾是错误时交出上游错误，否则按缺少完成帧报错。原先 Playground 跳过流尾，429 不冷却、5xx 不重试、400 对外成了 502（Build 代理一直这样处理）。协议核心保留 HTTP 状态、协议 code 与 message；公开适配器映射为 OpenAI、Anthropic 或 Gemini 错误对象。Chat、Responses、Anthropic Messages 与 Gemini GenerateContent 将媒体模型的普通文本作为文本结果输出；专用图片端点要求图片结果。HTTP/协议错误或缺失完成帧形成失败；上游 finish reason 作为正常终态保留并映射到各公开协议。
 
 frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上游拒绝当前输入（Build 为没有 candidate 而带 `promptFeedback.blockReason`），形成输入拦截错误。上游给出的拦截说明（Playground 的 prompt feedback `[2]`、Build 的 `promptFeedback.blockReasonMessage`）只附在内部错误与管理日志的 `request.error` 中（`AI Studio 拒绝当前输入: <reason>: <说明>`）；公开协议的错误消息仍按 block reason 统一生成官方措辞，不含这段原文。
 
-客户端还没收到内容时重新生成（Playground 与 Build 代理，Interaction 不在此列）：上游以 `malformed_function_call` 或 `unexpected_tool_call` 结束，或流在完成帧之前中断（读取响应出错、响应在 JSON 结构中途结束即 `io.ErrUnexpectedEOF`/`io.EOF`、正常结束却没有完成帧）、流尾为 5xx 状态（504 `DEADLINE_EXCEEDED` 除外：上游在这个账号上超时，同账号再来多半还是超时，交给换号），而这次请求还没有向客户端交出任何事件（正文、思考、签名、工具调用、媒体、来源；协议层的数据型心跳不算）时，在同一租约、同一账号上重新发送同一请求。每个请求最多 2 次，同一请求换号后的尝试共用这 2 次；每次重新生成先像取得租约一样占用每账号每分钟名额（`ACCOUNT_RPM_LIMIT`）与出口令牌（`AccountLease.ReserveRegeneration`），账号已冷却、名额已满或出口不准入时不重新生成，原样交出结果（错误照旧由换号与冷却规则处理），说明里写明是哪一项（冷却截止与原因、窗口内已发出 + 预占 / 上限、出口的脱敏显示与限速）。因结束原因（`malformed_function_call`、`unexpected_tool_call`）重新生成时换一个输入：上游对完全相同的输入返回完全相同的回复，原样重发多半还是同一个错误调用，app 层在加过随机后缀的请求上挂换后缀的函数（`aistudio.ContextWithRegenerationVariant`，见 `app/duplicates.go` 的 `promptNonceVariant`），重发前把后缀换成新的、按第一次发送的步骤（媒体默认值、图片路由、语音台词分段、去掉停止序列）重建线格式请求；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE` 关闭）不因结束原因重新生成。流中断与流尾 5xx 不是确定性的，照旧原样重发。几次生成共用首事件前期限（`REQUEST_TIMEOUT`）：重新生成前按 `ctx.Deadline()` 比较，剩余时间不到这次耗时的 1.2 倍时不重新生成、按这次的结果结束，免得把本可以交出的结果拖成 504、白白多烧一次额度。首事件超时（`FIRST_EVENT_TIMEOUT`）由 app 层经 `aistudio.ContextWithFirstEventClock` 交来，按每次发送计：重发前与重发开始向上游发送时重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成，免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时并换号。确定性的格式不符不算中断、不重新生成：上游字段类型变了（`json.UnmarshalTypeError`）、函数调用缺少名称、JSON 语法错误，同账号重发只会得到同样的结果。前几次的用量与结束事件丢弃，只交出最后一次的，用量账本与访问日志只记一次；重新生成的发送不报告请求阶段（“WAA proof 完成”“上游已返回响应头”与首事件计时只按第一次），每次写一行请求说明（`ReportRequestNote`：有观察者时只交给观察者，经 `/trace/` 的请求只出现在排查记录的时间线里，不另写一份 notes；见 [logging.md](logging.md)），附上被放弃那次的耗时与原文（结束说明 `finishMessage`、流尾错误说明或中断时的错误，截断到 200 字）；降级判定从第一块正文起计时，不受影响。已经交出事件的照旧结束：429、400 等其他错误不重新生成。long- 请求（见“自动续写”）只在第一轮、还没交出事件时重新生成，重发的第一轮照旧按续写计划编码；续写决定发第二轮之后不再重新生成，重新生成次数与续写轮数互不占用。非流式请求同样以“已交出事件”为界：思考摘要先交给 app 层、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成（交出的事件已经过 app 层的首事件判定、降级判定与访问日志，四个协议的非流式汇总也没有撤回已收集思考的办法）。
+客户端还没收到内容时重新生成（Playground 与 Build 代理，Interaction 不在此列）：上游以 `malformed_function_call`、`unexpected_tool_call` 或 `malformed_response`（Playground 终止原因 19、Build 的 `FINISH_REASON_MALFORMED_RESPONSE`，AI Studio 页面显示 `Content blocked`，与上游 Mag1cFall/AIStudio2API 0008880 相同；不算内容拦截）结束，或流在完成帧之前中断（读取响应出错、响应在 JSON 结构中途结束即 `io.ErrUnexpectedEOF`/`io.EOF`、正常结束却没有完成帧）、流尾为 5xx 状态（504 `DEADLINE_EXCEEDED` 除外：上游在这个账号上超时，同账号再来多半还是超时，交给换号），而这次请求还没有向客户端交出任何事件（正文、思考、签名、工具调用、媒体、来源；协议层的数据型心跳不算）时，在同一租约、同一账号上重新发送同一请求。每个请求最多 2 次，同一请求换号后的尝试共用这 2 次；每次重新生成先像取得租约一样占用每账号每分钟名额（`ACCOUNT_RPM_LIMIT`）与出口令牌（`AccountLease.ReserveRegeneration`），账号已冷却、名额已满或出口不准入时不重新生成，原样交出结果（错误照旧由换号与冷却规则处理），说明里写明是哪一项（冷却截止与原因、窗口内已发出 + 预占 / 上限、出口的脱敏显示与限速）。因结束原因（`malformed_function_call`、`unexpected_tool_call`、`malformed_response`）重新生成时换一个输入：上游对完全相同的输入返回完全相同的回复，原样重发多半还是同一个错误调用，app 层在加过随机后缀的请求上挂换后缀的函数（`aistudio.ContextWithRegenerationVariant`，见 `app/duplicates.go` 的 `promptNonceVariant`），重发前把后缀换成新的、按第一次发送的步骤（媒体默认值、图片路由、语音台词分段、去掉停止序列）重建线格式请求；没加随机后缀的请求（客户端指定了 seed、温度为 0、最后一轮是工具结果、`REPEAT_PROMPT_NONCE` 关闭）不因结束原因重新生成。流中断与流尾 5xx 不是确定性的，照旧原样重发。几次生成共用首事件前期限（`REQUEST_TIMEOUT`）：重新生成前按 `ctx.Deadline()` 比较，剩余时间不到这次耗时的 1.2 倍时不重新生成、按这次的结果结束，免得把本可以交出的结果拖成 504、白白多烧一次额度。首事件超时（`FIRST_EVENT_TIMEOUT`）由 app 层经 `aistudio.ContextWithFirstEventClock` 交来，按每次发送计：重发前与重发开始向上游发送时重新起算，`FIRST_EVENT_TIMEOUT` 不到这次耗时的 1.2 倍时不重新生成，免得重发被首事件计时打断、把上游按时返回的结果记成首事件超时并换号。确定性的格式不符不算中断、不重新生成：上游字段类型变了（`json.UnmarshalTypeError`）、函数调用缺少名称、JSON 语法错误，同账号重发只会得到同样的结果。前几次的用量与结束事件丢弃，只交出最后一次的，用量账本与访问日志只记一次；重新生成的发送不报告请求阶段（“WAA proof 完成”“上游已返回响应头”与首事件计时只按第一次），每次写一行请求说明（`ReportRequestNote`：有观察者时只交给观察者，经 `/trace/` 的请求只出现在排查记录的时间线里，不另写一份 notes；见 [logging.md](logging.md)），附上被放弃那次的耗时与原文（结束说明 `finishMessage`、流尾错误说明或中断时的错误，截断到 200 字）；降级判定从第一块正文起计时，不受影响。已经交出事件的照旧结束：429、400 等其他错误不重新生成。long- 请求（见“自动续写”）只在第一轮、还没交出事件时重新生成，重发的第一轮照旧按续写计划编码；续写决定发第二轮之后不再重新生成，重新生成次数与续写轮数互不占用。非流式请求同样以“已交出事件”为界：思考摘要先交给 app 层、之后才以函数调用格式错误结束或断流的，虽然客户端要等全部收齐才看到响应，也不重新生成（交出的事件已经过 app 层的首事件判定、降级判定与访问日志，四个协议的非流式汇总也没有撤回已收集思考的办法）。
 
 各协议的具体终态转换如下：
 
@@ -721,9 +721,9 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 | `stop_sequence` | `stop` | `completed` | `stop_sequence` 与实际序列 | `STOP` |
 | `max_tokens`、`continuation`（官网自动续写的终止原因 22，只在按官网自动续写编码时出现；续写循环不再续写时已按 `max_tokens` 结束） | `length` | `incomplete/max_output_tokens` | `max_tokens` | `MAX_TOKENS` |
 | 内容拦截：`safety`、`recitation`、`blocklist`、`prohibited_content`、`spii`、`image_safety`、`image_prohibited_content`、`image_recitation` | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举 |
-| 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举（`MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`TOO_MANY_TOOL_CALLS`、`MISSING_THOUGHT_SIGNATURE` 等官方枚举名，`missing_thought_signature` 原先报成 `OTHER`）或 `OTHER` |
+| 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`malformed_response`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举（`MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`MALFORMED_RESPONSE`、`TOO_MANY_TOOL_CALLS`、`MISSING_THOUGHT_SIGNATURE` 等官方枚举名，`missing_thought_signature` 与 `malformed_response` 原先报成 `OTHER`）或 `OTHER` |
 
-内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`provider_19` 对应 AI Studio 页面的 `Content blocked`。
+内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`malformed_response`（Playground 终止原因 19，与 Build 通道 `FINISH_REASON_MALFORMED_RESPONSE` 同名；原先 Playground 报成 `provider_19`，Gemini 输出 `OTHER` 与 `finishMessage` `AI Studio finish reason 19`）对应 AI Studio 页面的 `Content blocked`，不算内容拦截，客户端还没收到内容时按上文的规则重新生成。
 
 ### 解码容错规则
 
@@ -795,7 +795,7 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 
 各轮的正文、思考与工具事件按顺序接成一条事件流，用量与结束事件只在最后发一次：官网续写的用量以最后一轮为基础（输入取最后一轮，正文、思考与工具 token 逐轮累加，total 为最后一轮 total 加之前各轮的这三项）；模拟续写以第一轮为基础（输入取第一轮：后续轮次的输入含发回上游的已输出正文，不是客户端的输入；total 为之前的 total 加新一轮的这三项），各轮实际的输入写在每轮的进度日志里。结束原因取最后一轮，不再续写时的 22 按 `max_tokens`。第一轮失败与普通请求相同（以该错误结束）；第二轮起发送失败（含发出前被账号冷却拦下）或输出中途失败（连接重置、帧解析错误、流内错误帧、没有完成帧）时不报错：模拟续写先交出扣住待比对接缝的正文，再发合并后的用量（失败的这一轮按已收到的输出估算）与 `max_tokens` 结束，已输出的内容不重发也不丢；生成服务照流内错误的规则处理账号状态（额度 429 写回冷却、401 经复核标记登录失效）并记一行原因（上游 4xx 另记一行证据，末尾带 `| 自动续写第 <N> 轮`，见 [logging.md](logging.md)），这次结束也不算模型资格验证成功（不清掉刚写回的冷却）。续写后的输入超过账号输入上限（模拟续写把已输出的正文发回上游，部分账号的上限为 131072，按 429 返回）同样按 `max_tokens` 结束，不冷却。
 
-与重新生成（见“客户端还没收到内容时重新生成”）的嵌套：重新生成只在还没向下游交出任何事件时发生，只可能落在第一轮的正文之前。第一轮的每次发送（含重新生成换了随机后缀、改回补用户消息的重发）都按同一份请求重新生成续写计划，官网续写的编码（generation config field 46、省略根 field 11）照旧；各轮的合并用量在每次发送的解码里从头计，被放弃那次的用量与结束事件不会并进来；第一轮还没交出事件就以 `malformed_function_call` 或 `unexpected_tool_call` 结束时不写“第 1 轮结束”进度行（这次结果可能被重新生成放弃，不重新生成时只有一轮，等同普通请求，原因另有请求说明）。续写决定发第二轮之后不再重新生成、也不再按原生续写被拒换号，第二轮起的失败按上文的续写规则结束；重新生成次数（每个请求 2 次）与续写轮数（64 轮）互不占用。重新生成、续写回退的重发与续写的下一轮共用同一套号池准入（预占每分钟名额与出口令牌、按其他租约的预占判断、自己的预占不挡自己、同一租约不重复预占、没发出的随租约释放退还，不准入的原因写法相同）：重新生成与回退重发不准入时不发，续写的下一轮先预占再等到准入。
+与重新生成（见“客户端还没收到内容时重新生成”）的嵌套：重新生成只在还没向下游交出任何事件时发生，只可能落在第一轮的正文之前。第一轮的每次发送（含重新生成换了随机后缀、改回补用户消息的重发）都按同一份请求重新生成续写计划，官网续写的编码（generation config field 46、省略根 field 11）照旧；各轮的合并用量在每次发送的解码里从头计，被放弃那次的用量与结束事件不会并进来；第一轮还没交出事件就以 `malformed_function_call`、`unexpected_tool_call` 或 `malformed_response` 结束时不写“第 1 轮结束”进度行（这次结果可能被重新生成放弃，不重新生成时只有一轮，等同普通请求，原因另有请求说明）。续写决定发第二轮之后不再重新生成、也不再按原生续写被拒换号，第二轮起的失败按上文的续写规则结束；接上新一轮之前先关闭上一轮已读完的响应体（第一轮的响应体同样提前关闭，原先各轮都挂到整个请求结束）；每个响应体只关一次（发下一轮之前、取消这一轮与请求结束几处关的是同一个只关一次的包装：`WAA_BACKEND=go` 的 HTTP/2 响应体重复关闭会对已结束的流多发一个 `RST_STREAM(CANCEL)`，浏览器不会这样发帧）；重新生成次数（每个请求 2 次）与续写轮数（64 轮）互不占用。重新生成、续写回退的重发与续写的下一轮共用同一套号池准入（预占每分钟名额与出口令牌、按其他租约的预占判断、自己的预占不挡自己、同一租约不重复预占、没发出的随租约释放退还，不准入的原因写法相同）：重新生成与回退重发不准入时不发，续写的下一轮先预占再等到准入。
 
 流尾：每一轮的流尾 google.rpc 状态在这一轮的帧之后、续写判断之前处理。同一个响应既以终止原因 22 要求续写、流尾又是错误（状态码不为 0）时按错误处理，不再续写：第一轮与普通请求相同（已交出的正文之后以该错误结束，429 照常冷却换号、5xx 在没有交出事件时重新生成）；第二轮起按这一轮失败体面结束（`max_tokens`、合并用量，账号状态照流内错误处理）。流尾状态码为 0 时照常续写。
 
@@ -1815,7 +1815,7 @@ function tool 使用 `{"type":"function","function":{"name","description","param
     },
     "logprobs": null,
     "finish_reason": "stop",
-    "provider_finish_reason": "provider_19"
+    "provider_finish_reason": "malformed_response"
   }],
   "usage": {
     "prompt_tokens": 10,
@@ -2036,7 +2036,7 @@ server tool 的 `cache_control`、`defer_loading` 等只影响 Anthropic 自身�
   "stop_reason": "end_turn",
   "stop_sequence": null,
   "provider_model": "gemini-provider-id",
-  "provider_finish_reason": "provider_19",
+  "provider_finish_reason": "malformed_response",
   "usage": {"input_tokens":10,"output_tokens":20}
 }
 ```

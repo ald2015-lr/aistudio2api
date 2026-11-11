@@ -280,6 +280,8 @@ func TestGenerateRegeneratesBeforeContent(t *testing.T) {
 	}{
 		{name: "malformed", first: streamResponse(regenStream("", regenMalformedFrame)), reason: "结束原因=malformed_function_call", varied: true},
 		{name: "unexpected", first: streamResponse(regenStream("", `[[[null,12]]]`)), reason: "结束原因=unexpected_tool_call", varied: true},
+		// Playground 终止原因 19（响应格式异常，官网显示 Content blocked）：原先解成 provider_19，不重新生成
+		{name: "malformedResponse", first: streamResponse(regenStream("", `[[[null,19]]]`)), reason: "结束原因=malformed_response", varied: true},
 		{name: "trailer5xx", first: streamResponse(regenStream(`[14,"The service is currently unavailable."]`)), reason: "流尾错误=HTTP 503"},
 		{name: "interrupted", first: interruptedResponse(`[[` + regenStopFrame[:5]), reason: "流中断"},
 		{name: "missingFinish", first: streamResponse(regenStream("")), reason: "流中断"},
@@ -1063,5 +1065,118 @@ func TestTraceFindingIgnoresContinuationProgress(t *testing.T) {
 	}
 	if strings.Contains(string(data), "最后一条消息是模型消息（预填充）") {
 		t.Fatalf("续写进度不应让排查结论报预填充：%s", data)
+	}
+}
+
+// TestGenerateRegeneratesMalformedResponse 响应格式异常（Playground 终止原因 19 解成 malformed_response，Build 通道
+// FINISH_REASON_MALFORMED_RESPONSE 得到同一个名字）在客户端还没收到内容时按批次 B 的规则重新生成：换随机后缀、占每请求次数；
+// 没有随机后缀时不原样重发、写一行说明；已交出正文后照旧结束。它不算内容拦截：协议层不映射为 content_filter，工具约束违约时
+// 照常按违约重新生成（不在 contentBlockedFinish 里）
+func TestGenerateRegeneratesMalformedResponse(t *testing.T) {
+	if got := decodeFinishReason(19); got != "malformed_response" {
+		t.Fatalf("终止原因 19 = %q，期望 malformed_response", got)
+	}
+	if got := buildEnumName("FINISH_REASON_MALFORMED_RESPONSE", "FINISH_REASON_"); got != "malformed_response" {
+		t.Fatalf("Build 终止原因 = %q", got)
+	}
+	if !regenerableFinish("malformed_response") || contentBlockedFinish("malformed_response") {
+		t.Fatal("malformed_response 应可重新生成、不算内容拦截")
+	}
+	if !(&longOutputRounds{}).mayRegenerate("malformed_response") {
+		t.Fatal("long- 第一轮以 malformed_response 结束、还没交出事件时可能被重新生成放弃")
+	}
+
+	const (
+		buildText = `{"candidates":[{"content":{"role":"model","parts":[{"text":"hi"}]}}]}`
+		buildStop = `{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":1,"totalTokenCount":4}}`
+	)
+	// 空串为 Playground（终止原因 19），其余为 Build 通道的 finishReason（Gemini API 的枚举名，带不带 FINISH_REASON_ 前缀都一样）
+	for _, buildFinish := range []string{"", "MALFORMED_RESPONSE", "FINISH_REASON_MALFORMED_RESPONSE"} {
+		build := buildFinish != ""
+		first := streamResponse(regenStream("", `[[[null,19]]]`))
+		second := streamResponse(regenStream("", regenTextFrame, regenStopFrame))
+		if build {
+			first = streamResponse(guardBuildStream(t, `{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"`+buildFinish+`"}]}`))
+			second = streamResponse(guardBuildStream(t, buildText, buildStop))
+		}
+		upstream := &regenUpstream{responses: []func() (*RPCResponse, error){first, second}}
+		notes := &noteRecorder{}
+		budget := NewRegenerationBudget()
+		ctx := variantContext(ContextWithRegenerationBudget(notes.context(context.Background()), budget))
+		if build {
+			ctx = ContextWithAccountLease(ctx, &AccountLease{channel: ChannelBuild, account: &Account{ID: "alice@example.com"}})
+		}
+		events, err := regenClient(t, "test", upstream).Generate(ctx, regenRequest("test"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := collectEvents(t, events)
+		if last := got[len(got)-1]; last.Kind != EventFinish || last.FinishReason != "stop" || got[0].Kind != EventText || got[0].Text != "hi" {
+			t.Fatalf("Build finishReason=%q：事件 = %v，期望重新生成后的正文与 stop", buildFinish, eventKinds(got))
+		}
+		if upstream.calls() != 2 || budget.Used() != 1 ||
+			notes.count("同账号重新生成 | 第 1/2 次 | 结束原因=malformed_response | ") != 1 || notes.count("输入=已换随机后缀") != 1 {
+			t.Fatalf("Build finishReason=%q：发送 %d 次、占用 %d 次，说明 %v", buildFinish, upstream.calls(), budget.Used(), notes.notes)
+		}
+		if !strings.Contains(upstream.bodies[1], variantMarker+"1") {
+			t.Fatalf("Build finishReason=%q：重新生成应换随机后缀", buildFinish)
+		}
+	}
+
+	// 没有随机后缀：不原样重发，写一行说明，按 malformed_response 结束
+	upstream := &regenUpstream{responses: []func() (*RPCResponse, error){
+		streamResponse(regenStream("", `[[[null,19]]]`)), streamResponse(regenStream("", regenTextFrame, regenStopFrame)),
+	}}
+	notes := &noteRecorder{}
+	budget := NewRegenerationBudget()
+	events, err := regenClient(t, "test", upstream).Generate(ContextWithRegenerationBudget(notes.context(context.Background()), budget), regenRequest("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := collectEvents(t, events)
+	if last := got[len(got)-1]; last.Kind != EventFinish || last.FinishReason != "malformed_response" || upstream.calls() != 1 || budget.Used() != 0 ||
+		notes.count(regenerationNoVariantNote+" | 结束原因=malformed_response") != 1 {
+		t.Fatalf("没有随机后缀：事件 %v、发送 %d 次、说明 %v", eventKinds(got), upstream.calls(), notes.notes)
+	}
+
+	// 已交出正文：不重新生成
+	upstream = &regenUpstream{responses: []func() (*RPCResponse, error){
+		streamResponse(regenStream("", regenTextFrame, `[[[null,19]]]`)), streamResponse(regenStream("", regenTextFrame, regenStopFrame)),
+	}}
+	events, err = regenClient(t, "test", upstream).Generate(variantContext(context.Background()), regenRequest("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = collectEvents(t, events)
+	if last := got[len(got)-1]; last.FinishReason != "malformed_response" || upstream.calls() != 1 {
+		t.Fatalf("已交出正文：事件 %v、发送 %d 次，期望不重新生成", eventKinds(got), upstream.calls())
+	}
+
+	// 必须调用工具而上游以 malformed_response 结束、没有调用：不按内容拦截处理，照常按工具约束违约重新生成
+	guarded := &regenUpstream{responses: []func() (*RPCResponse, error){
+		streamResponse(regenStream("", `[[[null,19]]]`)), streamResponse(regenStream("", guardCallFrame, regenStopFrame)),
+	}}
+	notes = &noteRecorder{}
+	events, err = guardClient(t, "test", guarded).Generate(notes.context(context.Background()), guardRequest(t, guardTools("required", guardFunction, false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := collectEvents(t, events); got[0].Kind != EventToolCall || guarded.calls() != 2 ||
+		notes.count("工具约束未满足，同账号重新生成 | 原因=要求调用工具 Kei_Workflow，上游没有返回工具调用（结束原因=malformed_response）") != 1 {
+		t.Fatalf("必须调用时以 malformed_response 结束应按违约重新生成：事件 %v，发送 %d 次，请求说明 %v", eventKinds(got), guarded.calls(), notes.notes)
+	}
+
+	// 次数用完：两次重新生成后仍是 malformed_response，按它结束
+	malformed := streamResponse(regenStream("", `[[[null,19]]]`))
+	upstream = &regenUpstream{responses: []func() (*RPCResponse, error){malformed, malformed, malformed, malformed}}
+	notes = &noteRecorder{}
+	events, err = regenClient(t, "test", upstream).Generate(variantContext(notes.context(context.Background())), regenRequest("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = collectEvents(t, events)
+	if last := got[len(got)-1]; last.FinishReason != "malformed_response" || upstream.calls() != regenerationLimit+1 ||
+		notes.count(fmt.Sprintf("重新生成次数已用完（%d 次），按上游结果结束 | 结束原因=malformed_response", regenerationLimit)) != 1 {
+		t.Fatalf("次数用完：事件 %v、发送 %d 次、说明 %v", eventKinds(got), upstream.calls(), notes.notes)
 	}
 }
