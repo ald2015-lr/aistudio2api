@@ -17,7 +17,7 @@ import (
 const (
 	// DefaultModelFallbacks 为 MODEL_FALLBACKS 的默认值：/ultra 上 gemini-4-argon 每个账号每天上限 50 次，额度按模型分开计，
 	// argon 用完时 gemini-4-carbon 往往还能用
-	DefaultModelFallbacks = "gemini-4-argon=gemini-4-carbon"
+	DefaultModelFallbacks = "gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon"
 	// ModelFallbackScopeUltra 为只对 /ultra 路径的请求改用（默认）
 	ModelFallbackScopeUltra = "ultra"
 	// ModelFallbackScopeAll 为普通路径与 /ultra 都改用

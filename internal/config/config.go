@@ -148,7 +148,7 @@ type Config struct {
 	// UltraPrimaryQueueWait 为 Ultra 主用模型的排队上限（ULTRA_PRIMARY_QUEUE_WAIT，规则与 PrimaryQueueWait 相同：默认 10s，
 	// 未配置时不超过 REQUEST_TIMEOUT，保存时写具体值）；0 表示不排队；不能超过 RequestTimeout
 	UltraPrimaryQueueWait time.Duration `json:"-"`
-	// ModelFallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规范写法 源模型=目标1|目标2，逗号分隔，默认 gemini-4-argon=gemini-4-carbon，
+	// ModelFallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规范写法 源模型=目标1|目标2，逗号分隔，默认 gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon，
 	// 保存后立即生效，见 model_fallback.go 与 app/model_fallback.go）：请求的模型在号池里没有可用额度、还没有交出任何事件时按顺序改用目标模型。
 	// 写空值表示没有规则；进程环境变量的空值不生效（与其他配置项相同），清空只能在 .env 里写空值或在管理页清空
 	ModelFallbacks string `json:"model_fallbacks"`

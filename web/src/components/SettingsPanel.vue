@@ -173,7 +173,7 @@ function cloneDowngradeGuard(value: DowngradeGuardConfig | undefined): Downgrade
 // DEFAULT_ULTRA_PRIMARY_MODELS 与服务端 ULTRA_PRIMARY_MODELS 的默认值一致；旧版服务端不返回该字段时按它显示
 const DEFAULT_ULTRA_PRIMARY_MODELS: readonly string[] = ['gemini-4-argon']
 // DEFAULT_MODEL_FALLBACKS 与服务端 MODEL_FALLBACKS 的默认值一致（配置加载前表单的初始值）
-const DEFAULT_MODEL_FALLBACKS = 'gemini-4-argon=gemini-4-carbon'
+const DEFAULT_MODEL_FALLBACKS = 'gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon'
 
 // parseModelList 与服务端一致：逗号或空白分隔，去掉 models/ 前缀并去重
 function parseModelList(value: string): string[] {
@@ -1602,7 +1602,7 @@ onBeforeUnmount(() => {
               type="text"
               spellcheck="false"
               autocomplete="off"
-              placeholder="gemini-4-argon=gemini-4-carbon"
+              placeholder="gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon"
               @change="commitBlurField"
             />
           </label>

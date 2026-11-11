@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// TestModelFallbacksConfig MODEL_FALLBACKS 默认为 gemini-4-argon=gemini-4-carbon、MODEL_FALLBACK_SCOPE 默认为 ultra；键不存在时保持默认，
+// TestModelFallbacksConfig MODEL_FALLBACKS 默认为 gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon、MODEL_FALLBACK_SCOPE 默认为 ultra；键不存在时保持默认，
 // MODEL_FALLBACKS 写空值表示没有规则；规则整理成规范写法；写法无效时按默认值启动并记入无效项，Validate（管理页保存）拒绝；
 // 保存与 JSON 往返保留两项
 func TestModelFallbacksConfig(t *testing.T) {
@@ -17,7 +17,7 @@ func TestModelFallbacksConfig(t *testing.T) {
 		os.Unsetenv(key)
 	}
 	defaults := Default()
-	if defaults.ModelFallbacks != "gemini-4-argon=gemini-4-carbon" || defaults.ModelFallbackScope != ModelFallbackScopeUltra {
+	if defaults.ModelFallbacks != "gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon" || defaults.ModelFallbackScope != ModelFallbackScopeUltra {
 		t.Fatalf("默认值 = %q / %q", defaults.ModelFallbacks, defaults.ModelFallbackScope)
 	}
 	load := func(t *testing.T, content string) (Config, error) {

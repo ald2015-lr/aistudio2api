@@ -803,7 +803,7 @@ WARN  service  Ultra 主用模型额度不足，立即返回 429 | 原因=额度
 
 ## 额度用完改用其他模型
 
-`MODEL_FALLBACKS`（默认 `gemini-4-argon=gemini-4-carbon`）在范围内（`MODEL_FALLBACK_SCOPE`，默认只对 `/ultra`）的请求以额度用完结束、还没有交出任何内容时改用规则里的目标模型（触发与不触发的条件见 README“额度用完自动改用其他模型”），请求时间线写下面几种进度，来源都是 `service`：
+`MODEL_FALLBACKS`（默认 `gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon`）在范围内（`MODEL_FALLBACK_SCOPE`，默认只对 `/ultra`）的请求以额度用完结束、还没有交出任何内容时改用规则里的目标模型（触发与不触发的条件见 README“额度用完自动改用其他模型”），请求时间线写下面几种进度，来源都是 `service`：
 
 | 进度 | 级别 | 何时写 |
 | --- | --- | --- |
