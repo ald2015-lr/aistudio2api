@@ -844,6 +844,8 @@ Anthropic 接受的具体 server tool type 为：
 
 编码器将全部函数声明合并为一个 Tool entry；Google Search 与 Image Search 合并为一个 search entry 并分别占用 `searchTypes` 索引 `0/1`；Code Execution、URL Context 与 Maps 各占一个 entry。Google Maps 与 Code Execution/URL Context 构成互斥工具组，每个请求选择其中一组。
 
+函数名最长 63 字节（ASCII 名字即 63 个字符；与上游 Mag1cFall/AIStudio2API c57d06e 相同；声明里有更长的名字时上游拒绝整个请求，Codex 的 namespace、MCP 与 apps 工具拼成的 `命名空间.函数名`、Claude Code 的 `mcp__<server>__<tool>` 常超过）。更长的名称在 Playground `GenerateContent` 与 `CountTokens` 的函数声明、历史函数调用与函数结果中统一编码为原名的前 50 个字节、`_` 与原名 SHA-256 前 6 字节的十六进制，共 63 字节（截取处落在多字节字符中间时退到这个字符之前，截短名始终是合法 UTF-8：切开的字符在请求体里会变成 U+FFFD，上游按它调用时就换不回原名；ASCII 名字与上游逐字节相同）；Build 通道（Gemini API 的函数名同样有长度上限）的 `functionDeclarations`、`functionCallingConfig.allowedFunctionNames`、历史 `functionCall` 与 `functionResponse` 用同一个名字；必须调用、指定函数时写进系统指令与最后一条用户消息的工具要求（见“工具选择”）也写这个名字，与声明一致（工具要求在选通道之前写成，两个通道用同一个名字才对得上）。上游返回的函数调用在交给生成链路之前换回声明的原名（普通请求与 `long-` 续写的各轮都换），本地调用 ID、工具约束核对、停止序列匹配、公开协议与思考签名登记看到的都是原名；上游万一按原名调用，对不上截短名，原样交出。不超过 63 字节的名称原样发送（请求逐字节不变）；有名称被截短时，每次尝试在请求日志写一行 INFO 截短名与原名的对照（见 [logging.md](logging.md)），上游结束说明、重新生成说明与排查记录里引用的截短名据此对应；Live 会话（BidiGenerateContent）的函数名参与它的 WAA binding，照旧按原名发送。函数名不参与 GenerateContent 的 WAA binding（只拼正文、内联数据与文件 ID），binding 不变。
+
 Anthropic server tool 的 `name` 必须分别为 `web_search`、`image_search`、`web_fetch`、`code_execution`、`url_context` 或 `google_maps`。这些定义接受 `type` 与对应 `name`，各 type 的文档化选项见 Anthropic Messages 一节，其余选项与 custom tool 一样忽略；`description` 或 `input_schema` 返回 `400 invalid_request_error`。被忽略的 `tool_search_tool_*` 与 toolset 定义不做这些检查。
 
 函数 JSON Struct 使用 protobuf `Struct/Value` 数组：map 为 `[[[key,value],...]]`；Value oneof 索引 `0..5` 分别表示 null、number、string、bool、Struct、ListValue。对象键排序后编码。
@@ -1860,7 +1862,7 @@ Chat SSE 顺序：
 | `store` | 省略/`true` 保存节点，`false` 只返回本次结果 |
 | `video_config` | Omni 视频设置扩展字段，与 Chat 相同 |
 
-input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output` 与 reasoning item；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
+input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output`、reasoning 与 `agent_message` item（Codex 多智能体会话里智能体之间的消息，按 user 轮发送：`content` 中 `input_text` 的 `text` 与 `encrypted_content` 的 `encrypted_content` 依次作为文本 Part，空文本与普通 message 一样省略（全部为空时这一轮不发送），其他类型返回 400；与上游 Mag1cFall/AIStudio2API 42fa603 相同，原先整个请求返回 400）；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
 
 | type | 字段 |
 | --- | --- |

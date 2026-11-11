@@ -244,7 +244,8 @@ func encodePart(part Part) ([]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("function call arguments: %w", err)
 		}
-		call := []any{part.FunctionCall.Name, arguments}
+		// 函数名与声明一样截短（见 wireFunctionName）
+		call := []any{wireFunctionName(part.FunctionCall.Name), arguments}
 		if id := upstreamCallID(part.FunctionCall.ID); id != "" {
 			call = append(call, id)
 		}
@@ -268,7 +269,7 @@ func encodePart(part Part) ([]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("function result content: %w", err)
 		}
-		result := []any{name, response}
+		result := []any{wireFunctionName(name), response}
 		if id := upstreamCallID(part.FunctionResult.ID); id != "" {
 			result = append(result, id)
 		}

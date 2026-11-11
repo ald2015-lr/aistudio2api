@@ -210,7 +210,8 @@ func encodeBuildPart(part Part) (map[string]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("function call arguments: %w", err)
 		}
-		call := map[string]any{"name": part.FunctionCall.Name, "args": arguments}
+		// 函数名与声明一样截短（见 wireFunctionName）
+		call := map[string]any{"name": wireFunctionName(part.FunctionCall.Name), "args": arguments}
 		if id := upstreamCallID(part.FunctionCall.ID); id != "" {
 			call["id"] = id
 		}
@@ -229,7 +230,7 @@ func encodeBuildPart(part Part) (map[string]any, error) {
 		if err != nil {
 			return nil, fmt.Errorf("function result content: %w", err)
 		}
-		result := map[string]any{"name": part.FunctionResult.Name, "response": response}
+		result := map[string]any{"name": wireFunctionName(part.FunctionResult.Name), "response": response}
 		if id := upstreamCallID(part.FunctionResult.ID); id != "" {
 			result["id"] = id
 		}
@@ -288,7 +289,8 @@ func encodeBuildTools(tools Tools) ([]any, bool, error) {
 			if declaration.Name == "" {
 				return nil, false, fmt.Errorf("function declaration %d 缺少名称", index)
 			}
-			encoded := map[string]any{"name": declaration.Name}
+			// 超过 63 字节的函数名与 Playground 一样截短后发送（Gemini API 的函数名同样有长度上限），回传的调用换回原名（见 wireFunctionName）
+			encoded := map[string]any{"name": wireFunctionName(declaration.Name)}
 			if declaration.Description != "" {
 				encoded["description"] = declaration.Description
 			}
@@ -866,7 +868,7 @@ func buildFunctionCallingConfig(tools Tools) map[string]any {
 	case mode == "required":
 		calling["mode"] = "ANY"
 		if names := tools.ToolConfig.AllowedFunctionNames; len(names) > 0 {
-			calling["allowedFunctionNames"] = names
+			calling["allowedFunctionNames"] = wireFunctionNames(names)
 		}
 	case mode == "validated" || strict:
 		calling["mode"] = "VALIDATED"
@@ -905,13 +907,15 @@ func (c *Client) sendBuild(ctx context.Context, request GenerateRequest, entry m
 	}
 	response.Body = trace.TeeUpstream(response.Body)
 	decoder := &BuildStreamDecoder{tolerance: decodeToleranceFrom(ctx)}
+	// 超过 63 字节的函数名按截短名发送：上游返回的调用先换回原名再交给 Generate（见 restoreFunctionNames）
+	functions := request.Tools.Functions
 	if unary {
 		return response, func(source io.Reader, emit func(Event) error) error {
-			return DecodeBuildUnary(source, decoder, emit)
+			return DecodeBuildUnary(source, decoder, restoreFunctionNames(functions, emit))
 		}, nil
 	}
 	return response, func(source io.Reader, emit func(Event) error) error {
-		return DecodeBuildStream(source, decoder, emit)
+		return DecodeBuildStream(source, decoder, restoreFunctionNames(functions, emit))
 	}, nil
 }
 

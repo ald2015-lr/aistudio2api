@@ -668,6 +668,11 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		}
 		return contract.forward(ctx, events), nil
 	}
+	// 超过 63 字节的函数名按截短名发往上游（Playground 与 Build 通道相同，见 wireFunctionName）：每次尝试（换号时每个账号各一行）写一行
+	// 截短名与原名的对照（INFO），上游结束说明、重新生成说明与排查记录里引用的截短名据此对应到客户端的函数
+	if info := wireFunctionNamesInfo(request.Tools.Functions); info != "" {
+		ReportRequestInfo(ctx, info)
+	}
 	var guard *toolGuard
 	if !build {
 		guard = newToolGuard(contract)
@@ -1054,18 +1059,21 @@ func (c *Client) sendPlayground(
 	if err != nil {
 		return nil, nil, err
 	}
+	// 超过 63 字节的函数名按截短名发送（见 wireFunctionName）：上游返回的调用先换回原名再交给 Generate（续写各轮同样）
+	functions := request.Tools.Functions
 	if plan != nil {
 		// 第一轮的响应体由 decodeLongRounds 在发送第二轮之前关闭，Generate 结束（或取消）时还会再关：换成只关一次的包装，几处关的是同一个
 		// （WAA_BACKEND=go 的 HTTP/2 响应体重复关闭会对已结束的流多发一个 RST_STREAM，见 onceCloseBody）
 		response.Body = newOnceCloseBody(response.Body)
 		first := response.Body
 		return response, func(source io.Reader, emit func(Event) error) error {
-			return c.decodeLongRounds(longCtx, plan, request, entry.defaults, runtime, source, first, emit, rounds)
+			return c.decodeLongRounds(longCtx, plan, request, entry.defaults, runtime, source, first, restoreFunctionNames(functions, emit), rounds)
 		}, nil
 	}
 	decoder := NewFrameDecoder()
 	decoder.tolerance = decodeToleranceFrom(ctx)
 	return response, func(source io.Reader, emit func(Event) error) error {
+		emit = restoreFunctionNames(functions, emit)
 		if err := DecodeGenerateStream(source, decoder, emit); err != nil {
 			return err
 		}

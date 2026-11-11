@@ -232,28 +232,31 @@ func (guard *toolGuard) apply(source GenerateRequest) GenerateRequest {
 
 // toolHintsFor 返回第 level 级（至少 1）的工具要求与其中的核心一句：搜索偏好照旧；必须调用时为“必须调用、参数符合 Schema、
 // 不要只回复文字”（只要求内置工具时为“回答前必须使用这个工具”，不称为函数；必须调用的第一次发送就是第 1 级，见 prepareToolRequest），
-// 只有 strict Schema 或指定函数的 auto 模式写明只能调用哪些函数、参数要符合 Schema；单次调用照旧；第二级另加一句
+// 只有 strict Schema 或指定函数的 auto 模式写明只能调用哪些函数、参数要符合 Schema；单次调用照旧；第二级另加一句。
+// 要求里写发往上游的函数名（超过 63 字节时为截短名，见 wireFunctionName）：与函数声明一致，模型照着要求里的名字调用也对得上
+// （Playground 与 Build 通道的声明都用截短名，prepareToolRequest 在选通道之前写要求）；回传时换回原名，核对按原名
 func (contract *toolContract) toolHintsFor(level int) ([]string, string) {
 	hints := slices.Clone(contract.searchHints)
+	toolNames, functionNames := wireFunctionNames(contract.toolNames), wireFunctionNames(contract.functionNames)
 	var requirement, extra string
 	switch {
 	case contract.required && contract.singleFunction():
-		requirement = "You must call the function " + contract.toolNames[0] + " in this response with arguments that match its schema. Do not reply with plain text."
+		requirement = "You must call the function " + toolNames[0] + " in this response with arguments that match its schema. Do not reply with plain text."
 		extra = "Reply with the function call only."
 	case contract.required && len(contract.functionNames) == 0:
 		// 只要求内置工具（如只声明了 google_search）：它不是函数，不写 function、schema，也不要求只回复调用，免得模型输出同名的函数调用
-		if len(contract.toolNames) == 1 {
-			requirement = "You must use the tool " + contract.toolNames[0] + " in this response before answering. Do not answer from memory."
+		if len(toolNames) == 1 {
+			requirement = "You must use the tool " + toolNames[0] + " in this response before answering. Do not answer from memory."
 		} else {
-			requirement = "You must use one of these tools in this response before answering: " + strings.Join(contract.toolNames, ", ") + ". Do not answer from memory."
+			requirement = "You must use one of these tools in this response before answering: " + strings.Join(toolNames, ", ") + ". Do not answer from memory."
 		}
 		extra = "Base the answer on the tool results."
 	case contract.required:
-		requirement = "You must call one of these tools in this response: " + strings.Join(contract.toolNames, ", ") +
+		requirement = "You must call one of these tools in this response: " + strings.Join(toolNames, ", ") +
 			". The arguments must match the tool's schema. Do not reply with plain text."
 		extra = "Reply with the tool call only."
 	default:
-		requirement = "If you call a function in this response, call only these functions: " + strings.Join(contract.functionNames, ", ") +
+		requirement = "If you call a function in this response, call only these functions: " + strings.Join(functionNames, ", ") +
 			", with arguments that match the function's schema exactly."
 		extra = "Check the arguments against the function's schema before calling it."
 	}

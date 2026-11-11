@@ -346,6 +346,8 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 - **Anthropic 服务端工具**：`web_search_*`、`web_fetch_*`、`code_execution_*` 按前缀识别任何日期版本；`tool_search_tool_*` 与 MCP toolset 定义直接忽略。`web_fetch` 的 `allowed_domains`、`blocked_domains` 仍返回 400。
 - **Anthropic 历史**：更换 API key、或会话从别的 Claude 渠道切过来时，web_search 历史按文本保留标题与 URL（摘要只从本服务签发的来源恢复），调用与结果缺一半、搜索失败结果，以及 web_fetch、code_execution、tool_search 等其他服务端工具的历史也都转成文本，不再返回 400；`document` 支持 `text`、`content` 与 `file`（`file_id`）来源，`image` 支持 `file` 来源。
 - **Anthropic 结构化输出**：`output_config.format` 与 beta 写法 `output_format` 的 `json_schema` 按 JSON 模式与 Schema 输出（原先被静默忽略，客户端拿到自由文本）。
+- **超长工具函数名**：超过 63 字节（ASCII 名字即 63 个字符）的函数名，例如 Codex 的 namespace、MCP 与 apps 工具拼成的 `命名空间.函数名` 与 Claude Code 的 `mcp__<server>__<tool>`，原先让带这些工具的请求整个被上游拒绝。现在发往 Playground（含 CountTokens）与 Build 通道时，函数声明、历史里的函数调用与函数结果、必须调用时写进系统指令与用户消息的工具要求统一写成原名前 50 个字节（截取处落在多字节字符中间时退到字符边界）加 `_` 与原名 SHA-256 前 6 字节的十六进制（ASCII 名字共 63 个字符，与上游 Mag1cFall/AIStudio2API 相同），上游返回的调用在交给客户端之前换回原名（`long-` 续写各轮同样），客户端、工具约束核对与思考签名看到的都是原名；不超过 63 字节的名字与 Live 会话照旧按原名发送。
+- **Codex 多智能体**：Responses 的 `agent_message` 输入项（智能体之间的消息）按 user 轮发送，`content` 里的 `input_text` 与 `encrypted_content` 依次作为文本；原先整个请求返回 400 `unsupported input item type`。
 - **工具参数 Schema**：`required` 列出未定义的属性时补上 `{}`，上游不再以 `property is not defined` 拒绝整个请求（Playground、Build 与 `strict` 核对一致）；Playground 上 `"5"`、`5.0` 这类整数写法与 `TYPE_UNSPECIFIED` 不再让 Schema 降级。
 - **Gemini 小兼容**：`MODALITY_UNSPECIFIED`、`MODE_UNSPECIFIED` 按未设置处理；带 `dynamicRetrievalConfig` 的 `googleSearchRetrieval` 照常开启 Google Search；`fileData` 可以省略 `mimeType`（按 `displayName` 或 `fileUri` 的扩展名推断）。
 - **上游结束说明**：Google 给出 `finishMessage`（如 `MALFORMED_FUNCTION_CALL` 的具体问题）时，Gemini 响应的 `finishMessage` 原样带上，管理日志另记一行 `上游结束说明`；输入被拦截时的上游说明只写进管理日志，客户端收到的错误不变。

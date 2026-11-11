@@ -372,6 +372,15 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 				return nil, nil, err
 			}
 			contents = append(contents, aistudio.Content{Role: role, Parts: parts})
+		case "agent_message":
+			// Codex 多智能体会话里智能体之间的消息（与上游 Mag1cFall/AIStudio2API 42fa603 相同）：按 user 轮发送。原先按不支持的类型返回 400，
+			// 这类会话一出现这种历史就整个请求失败
+			pendingSignature = ""
+			parts, err := agentMessageParts(item.Content)
+			if err != nil {
+				return nil, nil, fmt.Errorf("agent_message: %w", err)
+			}
+			contents = append(contents, aistudio.Content{Role: aistudio.RoleUser, Parts: parts})
 		case "function_call":
 			// 命名空间内的函数以 "命名空间.函数名" 的全名发给上游，不同命名空间可以有同名函数
 			if item.Namespace != "" {
@@ -406,6 +415,37 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 		}
 	}
 	return contents, instructions, nil
+}
+
+// agentMessageParts 把 Codex 智能体间消息（agent_message）的 content 转为文本片段：input_text 取 text，encrypted_content 取
+// encrypted_content（里面是本服务的模型写出的消息原文，与上游 Mag1cFall/AIStudio2API 的 agentMessageParts 相同），其他类型返回错误
+// （说明为英文，原样返回客户端）。空文本与普通 message 一样省略（见 openAIContentParts）：空的文本 Part 编码时按“必须且只能设置一种内容”
+// 拒绝，整个请求会以 400 结束（上游 42fa603 同样没有省略）；全部为空时这一轮没有 Part，发送时跳过
+func agentMessageParts(raw json.RawMessage) ([]aistudio.Part, error) {
+	var content []struct {
+		Type             string `json:"type"`
+		Text             string `json:"text"`
+		EncryptedContent string `json:"encrypted_content"`
+	}
+	if err := json.Unmarshal(raw, &content); err != nil {
+		return nil, fmt.Errorf("content must be an array of content parts")
+	}
+	parts := make([]aistudio.Part, 0, len(content))
+	for _, part := range content {
+		switch part.Type {
+		case "input_text":
+			if part.Text != "" {
+				parts = append(parts, aistudio.Part{Text: part.Text})
+			}
+		case "encrypted_content":
+			if part.EncryptedContent != "" {
+				parts = append(parts, aistudio.Part{Text: part.EncryptedContent})
+			}
+		default:
+			return nil, fmt.Errorf("unsupported content type %q", part.Type)
+		}
+	}
+	return parts, nil
 }
 
 func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.Tools, error) {

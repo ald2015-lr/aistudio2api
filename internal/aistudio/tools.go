@@ -2,10 +2,13 @@ package aistudio
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +31,8 @@ func encodeRequestedTools(tools Tools) ([]any, bool, error) {
 	if len(tools.Functions) > 0 {
 		declarations := make([]any, 0, len(tools.Functions))
 		for index, declaration := range tools.Functions {
+			// 超过 63 字节的函数名截短后发送（见 wireFunctionName）；Live 会话直接调用 encodeFunctionDeclaration，照旧按原名
+			declaration.Name = wireFunctionName(declaration.Name)
 			encoded, err := encodeFunctionDeclaration(declaration)
 			if err != nil {
 				return nil, false, fmt.Errorf("编码 function declaration %d: %w", index, err)
@@ -109,6 +114,105 @@ func encodeGoogleSearchTimeRange(value GoogleSearchTimeRange) []any {
 
 func encodeGoogleTimestamp(value time.Time) []any {
 	return []any{strconv.FormatInt(value.Unix(), 10)}
+}
+
+// maxWireFunctionNameLength 为 Playground GenerateContent 与 CountTokens 接受的最长函数名（与上游 Mag1cFall/AIStudio2API c57d06e 相同，
+// 按字节计，ASCII 名字即 63 个字符）：声明里有更长的名字时上游拒绝整个请求。Codex 的 namespace、MCP 与 apps 工具拼成“命名空间.函数名”，
+// Claude Code 的 mcp__<server>__<tool> 也常超过这个长度
+const maxWireFunctionNameLength = 63
+
+// wireFunctionName 返回发往上游（Playground 与 Build 通道）的函数名：不超过 63 字节时原样返回；更长时为原名的前 50 个字节、"_" 与
+// 原名 SHA-256 前 6 字节的十六进制，共 63 字节（与上游 Mag1cFall/AIStudio2API 的 wireFunctionName 相同）。截取处落在多字节字符中间时
+// 退到这个字符之前（ASCII 名字与上游逐字节相同）：切开的字符是非法 UTF-8，编码成 JSON 时换成 U+FFFD，上游看到的名字就与还原对照的键
+// 对不上。函数声明、历史里的函数调用与函数结果、必须调用时写进系统指令与用户消息的工具要求都用它，上游看到的名字前后一致；上游返回的
+// 调用在交给公开协议前换回原名（见 restoreFunctionNames）。函数名不参与 WAA binding（bindingPrompt 只拼正文、内联数据与文件 ID），
+// 改名不改 binding
+func wireFunctionName(name string) string {
+	if len(name) <= maxWireFunctionNameLength {
+		return name
+	}
+	digest := sha256.Sum256([]byte(name))
+	suffix := "_" + hex.EncodeToString(digest[:6])
+	cut := maxWireFunctionNameLength - len(suffix)
+	for cut > 0 && !utf8.RuneStart(name[cut]) {
+		cut--
+	}
+	return name[:cut] + suffix
+}
+
+// wireFunctionNamesInfoLimit 为请求日志的截短名对照最多列出的函数数（Codex、Claude Code 一次可能带几十个 MCP 工具）
+const wireFunctionNamesInfoLimit = 5
+
+// wireFunctionNamesInfo 返回写进请求日志（INFO）的截短名与原名对照（见 wireFunctionName）：上游的结束说明（finishMessage）、重新生成
+// 说明与排查记录里的原始请求、响应引用的是截短名，客户端与请求日志里的工具要求写的是原名，据此对应。按声明顺序列出前几个并写总数；
+// 没有超长函数名时为空串。函数名不是提示词原文，也不是凭据
+func wireFunctionNamesInfo(functions []FunctionDeclaration) string {
+	var pairs []string
+	total := 0
+	for _, declaration := range functions {
+		wire := wireFunctionName(declaration.Name)
+		if wire == declaration.Name {
+			continue
+		}
+		total++
+		if len(pairs) < wireFunctionNamesInfoLimit {
+			pairs = append(pairs, wire+"="+declaration.Name)
+		}
+	}
+	if total == 0 {
+		return ""
+	}
+	info := fmt.Sprintf("函数名超过 63 字节，按截短名发送（上游返回的调用换回原名） | 函数=%d 个 | %s", total, strings.Join(pairs, "；"))
+	if total > len(pairs) {
+		info += fmt.Sprintf("；…另有 %d 个", total-len(pairs))
+	}
+	return info
+}
+
+// wireFunctionNames 对 names 逐个取 wireFunctionName（内置工具名不超过 63 字节，原样保留）；都不需要改时返回 names 本身
+func wireFunctionNames(names []string) []string {
+	var wire []string
+	for index, name := range names {
+		if converted := wireFunctionName(name); converted != name {
+			if wire == nil {
+				wire = slices.Clone(names)
+			}
+			wire[index] = converted
+		}
+	}
+	if wire == nil {
+		return names
+	}
+	return wire
+}
+
+// restoreFunctionNames 在 emit 之前把上游返回的函数调用里截短的函数名（见 wireFunctionName）换回声明的原名，其他事件原样交出；
+// 没有超长函数名时直接返回 emit（逐事件不变）。包在 sendPlayground、sendBuild 返回的解码函数上（普通路径与 long- 续写都包），
+// Generate 里的本地调用 ID、工具约束核对（按客户端声明的原名）、停止序列匹配与协议层的思考签名登记拿到的都是原名。
+// 上游万一输出原名（例如照着工具要求里的名字），对不上截短名，原样交出
+func restoreFunctionNames(functions []FunctionDeclaration, emit func(Event) error) func(Event) error {
+	var originals map[string]string
+	for _, declaration := range functions {
+		if wire := wireFunctionName(declaration.Name); wire != declaration.Name {
+			if originals == nil {
+				originals = make(map[string]string)
+			}
+			originals[wire] = declaration.Name
+		}
+	}
+	if originals == nil {
+		return emit
+	}
+	return func(event Event) error {
+		if event.ToolCall != nil {
+			if name, ok := originals[event.ToolCall.Name]; ok {
+				call := *event.ToolCall
+				call.Name = name
+				event.ToolCall = &call
+			}
+		}
+		return emit(event)
+	}
 }
 
 // encodeFunctionDeclaration 编码 Playground 函数声明。
