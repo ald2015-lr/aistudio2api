@@ -301,6 +301,9 @@ type GenerateRequest struct {
 	// Notes 为协议层整理请求时留下的说明（例如 Omni 模型忽略的 stop sequences、按模型范围调整的视频时长），
 	// 生成服务在选号前逐条写进该请求的管理日志
 	Notes []string `json:"-"`
+	// InfoNotes 与 Notes 相同，但按 INFO 写：协议层的常规整理（如删除 Claude Code 的计费行，这类客户端的每个请求都带），
+	// 不是偏离客户端要求的调整，不按 WARN 淹没真正的告警
+	InfoNotes []string `json:"-"`
 	// IgnoreOmniSystemPrompt 为协议层开启了视频模型忽略系统提示（api 层 OMNI_IGNORE_SYSTEM_PROMPT）、请求带了客户端的系统提示，
 	// 但按别名目录没有认出能输出视频的 Omni 模型（启动期间取不到、缓存还没刷新等）：生成服务按所选账户的目录判定为 Omni 时
 	// 在发送前按同一规则去掉并记说明（见 omni_system.go）。协议层已去掉或开关关闭时为假，不参与编码

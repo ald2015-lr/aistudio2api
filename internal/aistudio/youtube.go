@@ -6,7 +6,16 @@ import (
 	"strings"
 )
 
-var youtubeURLPattern = regexp.MustCompile(`https?://[^\s<>"']+`)
+// youtubeURLPattern 匹配文本中由 ASCII URL 字符组成的链接，遇到空白、引号、尖括号、反引号与非 ASCII 字符（汉字、全角标点）结束。
+// 原先按“非空白、非引号尖括号”匹配，“看下https://youtu.be/xxx讲了什么”会把链接后面的汉字、全角括号、代码里的反引号一起吞进链接：
+// 视频 ID 无效，这段汉字又随链接一起从正文里删掉
+var youtubeURLPattern = regexp.MustCompile(`https?://[A-Za-z0-9\-._~:/?#\[\]@!$&()*+,;=%]+`)
+
+// youtubeVideoIDPattern 匹配 11 位的 YouTube 视频 ID：只有这样的链接才转为视频，示例里的 VIDEO_ID、${videoId} 这类占位写法原样保留为文本
+var youtubeVideoIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{11}$`)
+
+// youtubeWatchURL 是发往 AI Studio 的 YouTube 视频地址前缀
+const youtubeWatchURL = "https://www.youtube.com/watch?v="
 
 // ExternalMediaForURL 返回 AI Studio 可直接读取的外部媒体
 func ExternalMediaForURL(raw string) (*ExternalMedia, bool) {
@@ -40,9 +49,11 @@ func ExternalMediaForURL(raw string) (*ExternalMedia, bool) {
 	if videoID == "" {
 		return nil, false
 	}
-	return &ExternalMedia{MIME: "video/*", URL: "https://www.youtube.com/watch?v=" + url.QueryEscape(videoID)}, true
+	return &ExternalMedia{MIME: "video/*", URL: youtubeWatchURL + url.QueryEscape(videoID)}, true
 }
 
+// attachYouTubeMedia 把用户消息文本里的 YouTube 链接（视频 ID 恰好 11 位）转为视频外部媒体并从正文删去链接文本。
+// 请求编码（encodeContent）与 WAA binding（bindingPrompt）调用的是同一个函数，两边按同一份结果整体变化，binding 的组成规则不变
 func attachYouTubeMedia(content Content) Content {
 	if content.Role != RoleUser {
 		return content
@@ -61,7 +72,7 @@ func attachYouTubeMedia(content Content) Content {
 			if len(matches) > 0 {
 				for _, raw := range matches {
 					media, ok := ExternalMediaForURL(raw)
-					if !ok {
+					if !ok || !youtubeVideoIDPattern.MatchString(strings.TrimPrefix(media.URL, youtubeWatchURL)) {
 						continue
 					}
 					if _, duplicate := existing[media.URL]; !duplicate {

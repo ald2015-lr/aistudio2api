@@ -511,7 +511,9 @@ func requestBodyMiddleware(ledger RequestLedger, next http.Handler) http.Handler
 		r.Body = &captureReader{ReadCloser: r.Body, capture: request}
 		next.ServeHTTP(&captureWriter{ResponseWriter: w, capture: response}, r)
 		metadata, ok := r.Context().Value(accessLogContextKey{}).(*accessLogMetadata)
-		if !ok {
+		if !ok || metadata.isWarmup() {
+			// max_tokens 为 0 的预热请求不写入用量账本（见 MarkAccessLogWarmup），正文也不保存：没有对应的账本记录，
+			// 还会把有记录的正文挤出保留数
 			return
 		}
 		body := RequestBody{ID: metadata.id(), Time: time.Now().UTC()}

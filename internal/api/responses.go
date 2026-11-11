@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -185,8 +187,9 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		instructions = append(instructions, inlineInstructions...)
 		generateRequest.System = strings.Join(instructions, "\n")
 	}
-	// 按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（含续接带上的系统指令，见 omni_system.go）；续接用的状态已在上面存下，不受影响
-	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
+	// 整理客户端的系统提示（含续接带上的系统指令）：删除计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示
+	// （见 omni_system.go）；续接用的状态已在上面存下原样的系统指令，每次续接都重新整理
+	s.prepareClientSystem(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
 	if err != nil {
 		writeOpenAIInvalid(w, err)
@@ -798,6 +801,8 @@ type responsesStreamWriter struct {
 	pendingBytes  int
 	pendingSince  time.Time
 	pendingCode   *responsesPendingCode
+	// lastData 为上一次写出事件（data）的时间，SSE 注释心跳不算；静默满 responsesProgressInterval 时改发 response.in_progress（见 keepProgress）
+	lastData time.Time
 }
 
 // 声明了 web_search 时先暂存正文，让搜索调用项排在消息之前（与官方输出顺序一致）；
@@ -807,6 +812,24 @@ const (
 	responsesSearchHoldTime  = time.Second
 	responsesSearchHoldBytes = 300
 )
+
+// responsesProgressAfter 为 Responses 流连续这么久没有写出任何事件（data）时，改发一次 response.in_progress 代替 SSE 注释心跳。
+// Codex 读 SSE 时空闲 5 分钟就断开，计时只看事件，": ping" 注释不算；new-api 等只转发 data 行的中转还会丢掉注释，中转后面的客户端
+// 那一段连接一直零字节。强制调用扣住、重新生成、long- 续写换轮、隐藏思考（只有签名与用量、不写出事件）期间都可能长时间没有事件。
+// 取 30 秒：低于常见的 60 秒读超时（nginx proxy_read_timeout 的默认值），离 Codex 的 5 分钟也有充足余量；平时事件不断的流不受影响，
+// 静默时仍先按心跳间隔（10 秒）写注释，静默满 30 秒那一次心跳改发 response.in_progress，之后每满 30 秒再发一次
+const responsesProgressAfter = 30 * time.Second
+
+// responsesProgressAfterOverride 非 0 时代替 responsesProgressAfter（纳秒），只供测试缩短
+var responsesProgressAfterOverride atomic.Int64
+
+// responsesProgressInterval 返回 Responses 流静默多久后改发 response.in_progress
+func responsesProgressInterval() time.Duration {
+	if override := responsesProgressAfterOverride.Load(); override > 0 {
+		return time.Duration(override)
+	}
+	return responsesProgressAfter
+}
 
 type responsesPendingCode struct {
 	id    string
@@ -828,14 +851,26 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 	if err := writer.emit("response.in_progress", map[string]any{"response": responseShell(id, created, "in_progress", request)}); err != nil {
 		return
 	}
-	// 心跳仍为 SSE 注释（不受 STREAM_DATA_HEARTBEAT 影响）：Responses 的事件都有官方语义并带递增的 sequence_number，没有官方客户端会忽略的
-	// 空数据事件，重复 response.in_progress 会打乱客户端按事件推进的状态；响应头提交时已写出 response.created 与 response.in_progress 两条数据
+	// 心跳平时为 SSE 注释（不受 STREAM_DATA_HEARTBEAT 影响：Responses 的事件都有官方语义并带递增的 sequence_number，没有官方客户端会
+	// 忽略的空数据事件）。连续 responsesProgressAfter（30 秒）没有写出任何事件时改发一次 response.in_progress（带当前的响应对象，
+	// sequence_number 接着递增）：Codex 只按事件计空闲、5 分钟就断开，只转发 data 行的中转会丢掉注释。官方 SDK 与 Codex 对重复的
+	// response.in_progress 都只当作状态提示（Codex 落在未处理事件分支、直接忽略），不推进输出项。上游事件只有签名、用量这类不写出事件的
+	// 内容时心跳计时会被重置，所以每处理完一个事件也按同一阈值检查一次。
 	// 提交响应头之后才决定改用其他模型（额度用完）时，之后的输出项与 response.completed 按实际使用的模型（见 servedModel）；
 	// 已写出的 response.created、response.in_progress 保留请求的模型
 	result, err := consumeStreamEvents(r.Context(), events, func(event aistudio.Event) error {
 		writer.request.Model = servedModel(r.Context(), writer.request.Model)
-		return writer.live(event)
-	}, func() error { return writeSSEHeartbeat(w) })
+		if err := writer.live(event); err != nil {
+			return err
+		}
+		_, err := writer.keepProgress(r.Context())
+		return err
+	}, func() error {
+		if sent, err := writer.keepProgress(r.Context()); sent || err != nil {
+			return err
+		}
+		return writeSSEHeartbeat(w)
+	})
 	request.Model = servedModel(r.Context(), request.Model)
 	writer.request.Model = request.Model
 	if err != nil {
@@ -862,7 +897,20 @@ func (writer *responsesStreamWriter) emit(eventType string, payload map[string]a
 	payload["type"] = eventType
 	payload["sequence_number"] = writer.sequence
 	writer.sequence++
+	writer.lastData = time.Now()
 	return writeSSE(writer.w, eventType, payload)
+}
+
+// keepProgress 距上一次写出事件已满 responsesProgressInterval 时重发一次 response.in_progress（当前的响应对象、状态 in_progress，
+// model 为此刻实际使用的模型），返回是否写出；不满时什么也不写
+func (writer *responsesStreamWriter) keepProgress(ctx context.Context) (bool, error) {
+	if time.Since(writer.lastData) < responsesProgressInterval() {
+		return false, nil
+	}
+	writer.request.Model = servedModel(ctx, writer.request.Model)
+	return true, writer.emit("response.in_progress", map[string]any{
+		"response": responseShell(writer.id, writer.created, "in_progress", writer.request),
+	})
 }
 
 func (writer *responsesStreamWriter) live(event aistudio.Event) error {

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
@@ -342,10 +343,38 @@ func multipartStreamMIME(file io.Reader, value string) (string, io.Reader, error
 			return "", nil, err
 		}
 		if mediaType != "application/octet-stream" {
-			return mediaType, stream, nil
+			return attachmentMIME(mediaType, probe[:count]), stream, nil
 		}
 	}
 	return http.DetectContentType(probe[:count]), stream, nil
+}
+
+// attachmentMIME 返回附件发往上游的 MIME：内容是文本（见 textContent）而声明的类型不是 text/*、application/json 与
+// application/x-ipynb+json 时改为 text/plain，其余原样返回。编码客户端常把代码文件标成 application/octet-stream、application/x-sh，
+// .ts 按扩展名会被认成 video/mp2t（MPEG 传输流），不带 data: 前缀的 file_data 按文件名推断不出类型时默认 application/pdf：
+// AI Studio 对这些类型拒收或按二进制误判。只改 MIME，附件字节不变（WAA binding 按内联数据的 base64 计算，不受影响）；
+// 图片、PDF、音视频等二进制内容的开头不是 UTF-8 文本，不会被改判
+func attachmentMIME(mimeType string, data []byte) string {
+	mediaType, _, _ := mime.ParseMediaType(mimeType)
+	if strings.HasPrefix(mediaType, "text/") || mediaType == "application/json" || mediaType == "application/x-ipynb+json" || !textContent(data) {
+		return mimeType
+	}
+	return "text/plain"
+}
+
+// textContent 判断内容开头 512 字节是不含二进制控制字符的 UTF-8 文本（http.DetectContentType 判为 text/*）；512 字节截断处
+// 不完整的多字节字符不计，空内容不算文本。以 PDF 文件头 %PDF 开头的不算文本：DetectContentType 只认 "%PDF-"，
+// 很短或截断的 PDF 片段会被它判成纯文本
+func textContent(data []byte) bool {
+	if len(data) == 0 || bytes.HasPrefix(data, []byte("%PDF")) {
+		return false
+	}
+	head := data[:min(len(data), 512)]
+	valid := utf8.Valid(head)
+	for cut := 1; !valid && len(head) == 512 && cut < utf8.UTFMax; cut++ {
+		valid = utf8.Valid(head[:len(head)-cut])
+	}
+	return valid && strings.HasPrefix(http.DetectContentType(head), "text/")
 }
 
 func multipartFileMIME(file io.ReadSeeker, value string) (string, error) {

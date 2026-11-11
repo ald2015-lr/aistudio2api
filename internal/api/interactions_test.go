@@ -711,3 +711,37 @@ func TestInteractionDeferredSignatureSkipsUnsignedThought(t *testing.T) {
 		}
 	}
 }
+
+// TestInteractionEchoesPreviousID 续接请求的交互资源回显 previous_interaction_id（非流式资源、流式的 interaction.created 与
+// interaction.completed 都带），不续接的请求没有这个字段
+func TestInteractionEchoesPreviousID(t *testing.T) {
+	service := &scriptedService{events: []aistudio.Event{
+		{Kind: aistudio.EventText, Text: "ok"}, {Kind: aistudio.EventFinish, FinishReason: "stop"},
+	}}
+	handler := NewHandler(service, Config{APIKey: "sk-test"})
+	first := decodeInteraction(t, postJSON(t, handler, "/v1/interactions", `{"model":"test-model","input":"hi"}`, nil))
+	if _, ok := first["previous_interaction_id"]; ok {
+		t.Fatalf("不续接的请求不应带 previous_interaction_id: %v", first)
+	}
+	id, _ := first["id"].(string)
+	second := decodeInteraction(t, postJSON(t, handler, "/v1/interactions",
+		fmt.Sprintf(`{"model":"test-model","input":"again","previous_interaction_id":%q}`, id), nil))
+	if second["previous_interaction_id"] != id {
+		t.Fatalf("非流式续接应回显 previous_interaction_id=%q: %v", id, second["previous_interaction_id"])
+	}
+	stream := postJSON(t, handler, "/v1beta/interactions",
+		fmt.Sprintf(`{"model":"test-model","input":"more","stream":true,"previous_interaction_id":%q}`, second["id"]), nil)
+	echoed := 0
+	for _, event := range interactionSSE(t, stream.Body.String()) {
+		if event.name != "interaction.created" && event.name != "interaction.completed" {
+			continue
+		}
+		if object := event.data["interaction"].(map[string]any); object["previous_interaction_id"] != second["id"] {
+			t.Fatalf("%s 的 previous_interaction_id = %v，期望 %v", event.name, object["previous_interaction_id"], second["id"])
+		}
+		echoed++
+	}
+	if echoed != 2 {
+		t.Fatalf("流式应在 interaction.created 与 interaction.completed 回显，实际 %d 处: %s", echoed, stream.Body.String())
+	}
+}

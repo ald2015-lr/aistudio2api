@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -101,5 +102,56 @@ func TestResponseSchemaNullMeansUnset(t *testing.T) {
 	}
 	if config.ResponseMIMEType != "application/json" || config.ResponseSchema != nil {
 		t.Fatalf("mime=%q schema=%s", config.ResponseMIMEType, config.ResponseSchema)
+	}
+}
+
+// TestGeminiModelObjectMethods Gemini 模型对象带 baseModelId（不带 models/ 前缀的模型 ID），supportedGenerationMethods 只列本服务提供的
+// 方法（generateContent、streamGenerateContent、countTokens、bidiGenerateContent、predictLongRunning），按目录顺序，去掉
+// createCachedContent、embedContent、batchGenerateContent 等本服务没有的方法；列表（含 long- 自动续写条目）与单个模型一致；
+// bidiGenerateContent 只对应自定义协议的 /v1/live，官方 Live WebSocket 端点返回 404
+func TestGeminiModelObjectMethods(t *testing.T) {
+	handler := NewHandler(modelListService{models: []aistudio.Model{
+		{ID: "gemini-2.5-flash", Name: "Gemini 2.5 Flash", Capabilities: map[string]bool{"chat_model": true},
+			Methods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent", "streamGenerateContent"}},
+		{ID: "gemini-live-2.5-flash", Name: "Live", Methods: []string{"bidiGenerateContent", "embedContent"}},
+		{ID: "veo-3.1-generate-preview", Name: "Veo", Methods: []string{"predictLongRunning", "predict"}},
+	}}, Config{APIKey: "sk-test"})
+	want := map[string][]any{
+		"gemini-2.5-flash":         {"generateContent", "countTokens", "streamGenerateContent"},
+		"long-gemini-2.5-flash":    {"generateContent", "countTokens", "streamGenerateContent"},
+		"gemini-live-2.5-flash":    {"bidiGenerateContent"},
+		"veo-3.1-generate-preview": {"predictLongRunning"},
+	}
+	check := func(item map[string]any) {
+		t.Helper()
+		id := item["baseModelId"]
+		if item["name"] != "models/"+id.(string) {
+			t.Fatalf("baseModelId = %v，name = %v", id, item["name"])
+		}
+		methods, _ := item["supportedGenerationMethods"].([]any)
+		if expected := want[id.(string)]; len(methods) != len(expected) || fmt.Sprint(methods) != fmt.Sprint(expected) {
+			t.Fatalf("%v 的 supportedGenerationMethods = %v，期望 %v", id, methods, expected)
+		}
+	}
+	status, body := getModel(t, handler, "/v1beta/models", false)
+	models, _ := body["models"].([]any)
+	if status != http.StatusOK || len(models) != 4 {
+		t.Fatalf("status=%d body=%v", status, body)
+	}
+	for _, item := range models {
+		check(item.(map[string]any))
+	}
+	status, single := getModel(t, handler, "/v1beta/models/gemini-2.5-flash", false)
+	if status != http.StatusOK {
+		t.Fatalf("status=%d body=%v", status, single)
+	}
+	check(single)
+	// bidiGenerateContent 只表示本服务自定义协议的 GET /v1/live：官方 Gemini Live 的 WebSocket 端点不存在，返回 404（文档写明）
+	request := httptest.NewRequest(http.MethodGet, "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=sk-test", nil)
+	request.Header.Set("Authorization", "Bearer sk-test")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("官方 Live WebSocket 端点应返回 404，实际 %d: %s", recorder.Code, recorder.Body.String())
 	}
 }

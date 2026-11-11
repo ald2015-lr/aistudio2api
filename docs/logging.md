@@ -500,6 +500,26 @@ WARN  account@example.com  上游以工具调用过多结束（TOO_MANY_TOOL_CAL
 WARN  account@example.com  上游以响应格式异常结束（MALFORMED_RESPONSE，AI Studio 页面显示 Content blocked） | 原因=上游生成的响应格式异常，通常没有正文；不算内容拦截，客户端还没收到内容时本服务会换随机后缀同账号重新生成（每请求最多 2 次，是否重新生成与原因见上面的请求说明） | 建议=重试一次；反复出现时缩短或拆分输入、减少附件，或换一个模型
 ```
 
+系统提示里有 Claude Code 的计费行（行首为 `x-anthropic-billing-header:`，Claude Code 写在开头的计费归属行，内容随客户端版本变化）时，删去后再发送，所有生成入口都在选号前写一条进度 `已删除系统提示里 Claude Code 的计费行（x-anthropic-billing-header，<N> 处）：随客户端版本变化、对 Gemini 没有意义，删去后系统提示前缀可复用上游缓存`（INFO，来源 `service`，进入排查记录的 `timeline`，不写提示原文）；删除后系统提示为空时另写 `；删除后系统提示为空，不再发送系统提示`。只删前缀与其后的 `key=value;` 字段：这一行没有别的内容时整行删除，多段系统提示首尾相连、计费块和下一段粘成一行时保留同一行其后的文本（规则见 [protocol.md](protocol.md)）。Claude Code 的每个请求都带这一行，这是常规整理，按 INFO 写，不按 WARN 淹没告警。计数接口同样删除、不记这一行。
+
+```text
+INFO  service  已删除系统提示里 Claude Code 的计费行（x-anthropic-billing-header，1 处）：随客户端版本变化、对 Gemini 没有意义，删去后系统提示前缀可复用上游缓存
+```
+
+协议层整理请求时留下的其他说明同样在选号前写一条进度（WARN，来源 `service`），进入排查记录的 `timeline`，不影响响应（不写提示原文）。这些说明表示请求按与客户端要求不同的方式发送（例如图片尺寸按最接近的一档），所以按 WARN 写：
+
+| 消息 | 含义 |
+| --- | --- |
+| `图片 size <WxH> 按最接近的宽高比 <W:H> 发送（不缩放、不裁切）` | `/v1/images/generations` 的 `size` 不是原先接受的三种、宽高比又不精确对应模型可选的宽高比：按最接近的一种发送，返回的图片是模型这一档的实际尺寸 |
+| `图片 size <WxH> 按最接近的分辨率 <512/2K/4K> 发送` | 同上，按面积推断出的分辨率不是模型默认的 1K（客户端写了 `quality` 时以 `quality` 为准，不记这一行） |
+| `图片 output_format=<格式>：本服务不转码，按模型输出的格式原样返回（响应的 output_format 为实际格式）` | gpt-image 客户端要求 `jpeg`、`webp` 等格式：不转码，响应顶层 `output_format` 写实际格式（通常为 `png`） |
+
+```text
+WARN  service  图片 size 1024x1792 按最接近的宽高比 9:16 发送（不缩放、不裁切）
+```
+
+Anthropic `max_tokens` 为 `0` 的预热请求不调用上游、不进入生成服务，没有请求进度；请求结果写一行 INFO `预热完成（max_tokens 为 0，未调用上游，不计入用量账本）`（带模型、没有账户，状态 `completed`；模型不存在的 404 照常记“请求失败”），预热请求（含这类 404）都不写入用量账本，开启 `REQUEST_BODY_LOG` 时也不保存正文；排查记录（`/trace/`）的时间线写一行 `max_tokens 为 0：只做提示缓存预热，不调用上游，返回空内容、stop_reason 为 max_tokens（input_tokens 为本地估算）`。
+
 Omni 视频模型的请求在协议层整理时，每条说明在选号前写一条进度（WARN，来源 `service`）；发送前按所选账户的目录再整理时留下的新说明（协议层所用的合并目录与所选账户的目录不一致，例如别名目录缓存还没刷新；或协议层没有整理到的请求，例如启动期间别名目录取不到、目录没有列出视频选项的 Interaction 模型）同样写一条进度（WARN，来源为该账户，换号重试时每个账户各记各的）。两种都进入排查记录的 `timeline`，不影响响应（规则见 [protocol.md](protocol.md#omni-视频设置与模型名后缀)）：
 
 | 消息 | 含义 |
@@ -684,8 +704,8 @@ WARN  service  请求已取消 | 服务端取消（管理端取消请求或服�
 
 怎么看（直连与经 new-api 等中转统一按下面的规则）：
 
-- **先看 `距最近数据`**。几十秒、`已用时` 扎堆在 60 秒或 100 秒附近：连接这么久没有中转会转发的数据，被前置 nginx（`proxy_read_timeout` 默认 60 秒）、Cloudflare（100 秒）或手机系统、VPN、运营商掐断。开启数据型心跳（`STREAM_DATA_HEARTBEAT`，默认开启）；Responses、Interactions 只有 `: ping` 注释心跳，经中转时这一段同样没有数据，靠中转自己的 ping。`距最近写出` 很短而 `距最近数据` 很长，说明换行或 `: ping` 心跳一直在写，但中转把它们丢了，传不到它后面的客户端。
-- **`响应头=已提交` 而 `距最近数据=无`**：响应头提交后一块中转会转发的数据都没写出，只有换行或 `: ping` 心跳（关闭数据型心跳、官方 SDK 直连，或 Responses、Interactions 在响应头之后一直没有事件）。经中转时等同于从进入服务到断开，中转后面的客户端一直零字节（本次事故的形状：响应头已提交、只有换行心跳、`已用时` 约 60 秒），按 `已用时` 代替 `距最近数据` 套用上一条。直连的客户端能收到这些心跳，不在此列。
+- **先看 `距最近数据`**。几十秒、`已用时` 扎堆在 60 秒或 100 秒附近：连接这么久没有中转会转发的数据，被前置 nginx（`proxy_read_timeout` 默认 60 秒）、Cloudflare（100 秒）或手机系统、VPN、运营商掐断。开启数据型心跳（`STREAM_DATA_HEARTBEAT`，默认开启）；Interactions 只有 `: ping` 注释心跳，经中转时这一段同样没有数据，靠中转自己的 ping。Responses 平时也写 `: ping`，但连续 30 秒没有写出事件时那一次心跳改发 `response.in_progress`（data，中转会转发），所以 Responses 的 `距最近数据` 正常不超过约 40 秒（30 秒阈值加 10 秒心跳间隔）：更长本身就是异常（例如写出被阻塞），不要靠打开中转的 ping 解决。`距最近写出` 很短而 `距最近数据` 很长，说明换行或 `: ping` 心跳一直在写，但中转把它们丢了，传不到它后面的客户端。
+- **`响应头=已提交` 而 `距最近数据=无`**：响应头提交后一块中转会转发的数据都没写出，只有换行或 `: ping` 心跳（关闭数据型心跳或官方 SDK 直连）。Responses、Interactions 提交响应头后立即写出 `response.created`、`interaction.created`（data），不会是 `无`；它们按上一条看 `距最近数据` 的长短（Responses 超过约 40 秒即为异常）。经中转时等同于从进入服务到断开，中转后面的客户端一直零字节（本次事故的形状：响应头已提交、只有换行心跳、`已用时` 约 60 秒），按 `已用时` 代替 `距最近数据` 套用上一条。直连的客户端能收到这些心跳，不在此列。
 - **`距最近数据` 在 10 秒以内仍断开**：数据型心跳已经写到下一跳，客户端那一段仍断开，多半是客户端自己走了（转入后台、切网、用户取消），或中转没把数据转给它的客户端（Claude 格式的客户端经 new-api 时，第一块心跳让 new-api 写出 `message_start`，之后的空心跳块被丢弃），对照中转与客户端的日志。带 `写响应头后立即断开` 的先按下一条看。
 - **“写响应头后立即断开”**（摘要末尾带这一句，`right_after_headers` 为真：`响应头=已提交（断开前 0s 左右）`，提交后 1 秒内断开，已写出的块很少）：与阶段无关。经 new-api 时多为手机在本服务写响应头之前就断开了：new-api 发上游请求时不绑定手机那条连接，要等收到本服务的响应头、进入读流的循环后，才发现手机那条连接的 context 已取消，随即关闭上游响应体（到本服务的连接），所以这里看到的断开时刻晚于手机真实断开的时刻。首个事件在等待时长（默认 10 秒，主用模型 15 秒）到时之前没到时，响应头随一块心跳提交，表现为 `阶段=首事件前`、`已用时` 接近等待时长；首个事件在等待内就到了（多数第 4 轮这类请求，首个思考几秒内就到）时，响应头随首个事件提交，表现为 `阶段=流中`、`距上游最近事件≈0`、`已用时` 为首个事件的时刻，已写出的是首个事件的块，**不代表手机收到过数据**，不要按上一条当成“收到数据后客户端自己走了”。真实断开时刻看 new-api 日志里的 `stream ended … reason=client_gone` 及其时间；这类断开发生在本服务写响应头之前，只能靠 new-api 自己的 ping 保活。
 - **`距上游最近事件` 很长而 `距最近数据` 很短**：上游在长思考或排队，数据型心跳一直在写。
@@ -1006,7 +1026,7 @@ data: {"choices":[{"delta":{},"finish_reason":null,"index":0}],"created":1700000
 
 ```
 
-new-api 等中转逐行读取上游 SSE，只转发 `data:` 行：空候选块被转成 `delta.content=""`（空思考为 `delta.reasoning_content=""`）的空增量写给它 OpenAI 格式的客户端，与它自己在流开头写的 role 块同形；没有 `finishReason` 不会被当成回复结束，也不带用量（Claude 格式的客户端经 new-api 时，第一块心跳让 new-api 写出 `message_start`，之后的空心跳块被丢弃）。new-api 在收到第一条 data 时记首字时间：首个事件晚于响应头等待时，它的首字时间与模型性能 TTFT 反映的是本服务提交响应头的时刻，真实首字时间看本服务请求日志的 `first_event_ms`。new-api 收到过 data（心跳块也算）后，流结束时没有带 token 的 `usageMetadata`（客户端断开、流被截断）就按估算的输入 token 计费，所以首个事件之前就断开的请求在 new-api 里不再计 0（见 [protocol.md](protocol.md)）。关闭数据型心跳时与原先一致，OpenAI Chat、OpenAI Responses 与 Gemini Interactions 发送 SSE 注释帧（Responses 与 Interactions 不论开关都发送注释帧：它们的事件都有官方语义，没有客户端会忽略的空数据事件）：
+new-api 等中转逐行读取上游 SSE，只转发 `data:` 行：空候选块被转成 `delta.content=""`（空思考为 `delta.reasoning_content=""`）的空增量写给它 OpenAI 格式的客户端，与它自己在流开头写的 role 块同形；没有 `finishReason` 不会被当成回复结束，也不带用量（Claude 格式的客户端经 new-api 时，第一块心跳让 new-api 写出 `message_start`，之后的空心跳块被丢弃）。new-api 在收到第一条 data 时记首字时间：首个事件晚于响应头等待时，它的首字时间与模型性能 TTFT 反映的是本服务提交响应头的时刻，真实首字时间看本服务请求日志的 `first_event_ms`。new-api 收到过 data（心跳块也算）后，流结束时没有带 token 的 `usageMetadata`（客户端断开、流被截断）就按估算的输入 token 计费，所以首个事件之前就断开的请求在 new-api 里不再计 0（见 [protocol.md](protocol.md)）。关闭数据型心跳时与原先一致，OpenAI Chat、OpenAI Responses 与 Gemini Interactions 发送 SSE 注释帧（Responses 与 Interactions 不论开关都发送注释帧：它们的事件都有官方语义，没有客户端会忽略的空数据事件；例外是 Responses 连续 30 秒没有写出事件时，那一次心跳改发 `response.in_progress`，中转会转发，见 [protocol.md](protocol.md) 的流式心跳表）：
 
 ```text
 : ping
@@ -1133,7 +1153,7 @@ INFO  account@example.com  账号每分钟请求已满 | 上限=10 次/60 秒 | 
 
 ## 用量账本
 
-`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta`、`/trace/` 与 `/ultra/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、号池（按请求入口记录：`/ultra` 请求为 `ultra`，其余为空，用量接口中显示为 `normal`；并入 Ultra 号池的 Pro 账户服务的 `/ultra` 请求同样为 `ultra`，`ULTRA_INCLUDE_PRO` 切换前写入的记录不改写）、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试（额度用完改用其他模型时另有一条改用备注，模型记实际使用的目标模型，见[额度用完改用其他模型](#额度用完改用其他模型)），以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）不写入，避免抬高请求数；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由与 Ultra 路由的请求按去掉 `/trace`、`/ultra` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
+`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta`、`/trace/` 与 `/ultra/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、号池（按请求入口记录：`/ultra` 请求为 `ultra`，其余为空，用量接口中显示为 `normal`；并入 Ultra 号池的 Pro 账户服务的 `/ultra` 请求同样为 `ultra`，`ULTRA_INCLUDE_PRO` 切换前写入的记录不改写）、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试（额度用完改用其他模型时另有一条改用备注，模型记实际使用的目标模型，见[额度用完改用其他模型](#额度用完改用其他模型)），以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）与 Anthropic `max_tokens` 为 `0` 的预热请求（不调用上游，见 [API 请求](#api-请求)的预热说明）不写入，避免抬高请求数、拉低耗时分位；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由与 Ultra 路由的请求按去掉 `/trace`、`/ultra` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
 
 同一事务按 UTC 小时与服务器本地日累加汇总与耗时分布（汇总键包含号池）：完整落在范围与单个分桶内的本地日读取日汇总，其余整小时读取小时汇总，范围边缘与跨分桶的部分读取原始记录。服务器时区变化后，下次启动时从小时汇总与原始记录重建本地日汇总。写入由后台协程批量提交，不阻塞响应：等待写入的记录超过 4096 条时丢弃新记录，写入恢复后输出丢弃数。记录与汇总按服务器本地日整日保留 90 天，启动时与之后每天清理一次。账本打开失败时写一条 WARN，本次运行不记录用量、不注册用量接口，服务照常运行。
 

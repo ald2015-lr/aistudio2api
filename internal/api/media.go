@@ -2,9 +2,11 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"mime"
 	"net/http"
 	"strconv"
@@ -21,6 +23,9 @@ type openAIImageRequest struct {
 	Size           string `json:"size"`
 	Quality        string `json:"quality"`
 	ResponseFormat string `json:"response_format"`
+	// OutputFormat 为 gpt-image 的输出格式（png、jpeg、webp）：本服务不转码，按模型输出的原样返回，客户端写了这个字段时响应的
+	// output_format 写实际格式。output_compression、background、moderation、style、user 等其他 gpt-image 字段接受并忽略
+	OutputFormat string `json:"output_format"`
 }
 
 type openAISpeechRequest struct {
@@ -49,10 +54,13 @@ func (s *server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "AI Studio image models generate one image per request")
 		return
 	}
-	imageConfig, err := openAIImageConfig(request.Size, request.Quality)
+	imageConfig, notes, err := openAIImageConfig(request.Size, request.Quality, s.imageModelOptions(r.Context(), request.Model))
 	if err != nil {
 		writeOpenAIInvalid(w, err)
 		return
+	}
+	if format := strings.ToLower(strings.TrimSpace(request.OutputFormat)); format != "" && format != "png" {
+		notes = append(notes, fmt.Sprintf("图片 output_format=%s：本服务不转码，按模型输出的格式原样返回（响应的 output_format 为实际格式）", format))
 	}
 	events, err := s.service.Generate(r.Context(), aistudio.GenerateRequest{
 		ID:    newID("image"),
@@ -64,6 +72,7 @@ func (s *server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 			ResponseModalities: []aistudio.ResponseModality{aistudio.ResponseModalityImage},
 			ImageConfig:        imageConfig,
 		},
+		Notes: notes,
 	})
 	if err != nil {
 		if shouldWriteRequestError(r, err) {
@@ -78,20 +87,28 @@ func (s *server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// 每张图同时带 b64_json 与 url（data URI，图片总是内联返回、不存成本服务链接）：gpt-image 客户端默认读 b64_json，
+	// 旧的 DALL·E 写法读 url；response_format 明确要求其中一种时只给那一种（其他取值与原先一样只给 url）
+	format := strings.ToLower(strings.TrimSpace(request.ResponseFormat))
 	data := make([]map[string]any, 0, len(result.media))
+	actualFormat := ""
 	for _, media := range result.media {
 		if !strings.HasPrefix(media.MIME, "image/") || len(media.Data) == 0 {
 			continue
 		}
 		encoded := base64.StdEncoding.EncodeToString(media.Data)
 		item := map[string]any{}
-		if request.ResponseFormat == "b64_json" {
+		if format == "" || format == "b64_json" {
 			item["b64_json"] = encoded
-		} else {
+		}
+		if format != "b64_json" {
 			item["url"] = "data:" + media.MIME + ";base64," + encoded
 		}
 		if result.text.Len() > 0 {
 			item["revised_prompt"] = result.text.String()
+		}
+		if actualFormat == "" {
+			actualFormat = imageOutputFormat(media.MIME)
 		}
 		data = append(data, item)
 	}
@@ -103,24 +120,123 @@ func (s *server) handleOpenAIImages(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadGateway, "upstream_error", message)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+	response := map[string]any{"created": time.Now().Unix(), "data": data}
+	if strings.TrimSpace(request.OutputFormat) != "" && actualFormat != "" {
+		response["output_format"] = actualFormat
+	}
+	if usage := openAIImageUsage(result.usage); usage != nil {
+		response["usage"] = usage
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
-func openAIImageConfig(size string, quality string) (*aistudio.ImageConfig, error) {
+// imageOutputFormat 返回图片 MIME 对应的 gpt-image output_format 写法（png、jpeg、webp 等，即 image/ 之后的子类型）
+func imageOutputFormat(mimeType string) string {
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimPrefix(mediaType, "image/")
+}
+
+// openAIImageUsage 按 gpt-image 的写法返回用量：输入只有文字提示词（input_tokens_details 的 image_tokens 为 0），输出为图片
+// （含思考）的 token；上游没有给用量时返回 nil，响应不带 usage
+func openAIImageUsage(usage *aistudio.Usage) map[string]any {
+	if usage == nil {
+		return nil
+	}
+	input, output := inputTokens(usage), outputTokens(usage)
+	total := usage.TotalTokens
+	if total <= 0 {
+		total = input + output
+	}
+	return map[string]any{
+		"input_tokens": input, "output_tokens": output, "total_tokens": total,
+		"input_tokens_details": map[string]int64{"text_tokens": input, "image_tokens": 0},
+	}
+}
+
+// legacyImageSizes 为原先就接受的三种 size 与宽高比：照原样发送（只写宽高比、不写分辨率），与改动之前逐字节相同
+var legacyImageSizes = map[string]string{"1024x1024": "1:1", "1536x1024": "3:2", "1024x1536": "2:3"}
+
+// geminiImageAspectRatios 为模型目录没有列出宽高比选项（或取不到目录）时可选的宽高比，即 Gemini 图片模型通用的 10 种
+var geminiImageAspectRatios = []string{"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+
+// imageResolutionEdges 为图片分辨率档的标称边长（1:1 时的像素），按面积比较远近
+var imageResolutionEdges = map[string]float64{"512": 512, "1K": 1024, "2K": 2048, "4K": 4096}
+
+// imageModelOptions 返回请求模型在别名目录里的图片选项（image_aspect_ratios、image_output_resolutions）；目录取不到或没有这个模型时为 nil
+func (s *server) imageModelOptions(ctx context.Context, name string) map[string][]string {
+	models, err := s.aliasCatalog(ctx)
+	if err != nil {
+		return nil
+	}
+	if model, _, _, _, ok := resolveLongRequestModel(models, name); ok {
+		return model.CapabilityOptions
+	}
+	return nil
+}
+
+// parseImageSize 解析 WIDTHxHEIGHT 写法的 size（不区分 x 的大小写），宽高都要在 1–16384 之间
+func parseImageSize(size string) (int, int, bool) {
+	widthText, heightText, ok := strings.Cut(strings.ToLower(size), "x")
+	width, widthErr := strconv.Atoi(strings.TrimSpace(widthText))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(heightText))
+	if !ok || widthErr != nil || heightErr != nil || width < 1 || height < 1 || width > 16384 || height > 16384 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+// openAIImageConfig 把 OpenAI 图片请求的 size 与 quality 换成 AI Studio 的图片设置，返回要写进请求日志的说明。
+// size：auto 与空不指定；1024x1024、1536x1024、1024x1536 照原样只写宽高比；其他 WIDTHxHEIGHT（gpt-image、DALL·E 的 1792x1024、
+// 1024x1792、512x512 等）按宽高比取模型目录里最接近的一种（目录没有列出时取 Gemini 通用的 10 种，按比值的对数比较），分辨率按面积取
+// 目录 image_output_resolutions 里最接近的一档（512、1K、2K、4K；1K 是模型默认，不写；目录没有列出分辨率时不写）。只换成最接近的
+// 宽高比与分辨率档，不缩放、不裁切、不转码：返回的图片尺寸是模型这一档的实际尺寸，不一定等于请求的像素。宽高比不是精确对应、
+// 或按 size 写了分辨率时记一行说明。quality 照原样映射分辨率（low/standard 1K、medium/hd 2K、high 4K），写了时优先于按 size 推断的分辨率
+func openAIImageConfig(size string, quality string, options map[string][]string) (*aistudio.ImageConfig, []string, error) {
 	config := &aistudio.ImageConfig{}
-	switch strings.ToLower(strings.TrimSpace(size)) {
-	case "", "auto":
-	case "1024x1024":
-		config.AspectRatio = "1:1"
-	case "1536x1024":
-		config.AspectRatio = "3:2"
-	case "1024x1536":
-		config.AspectRatio = "2:3"
-	default:
-		return nil, fmt.Errorf("size must be auto, 1024x1024, 1536x1024 or 1024x1536")
+	sized := false
+	var notes []string
+	size = strings.ToLower(strings.TrimSpace(size))
+	if ratio, ok := legacyImageSizes[size]; ok {
+		config.AspectRatio = ratio
+	} else if size != "" && size != "auto" {
+		width, height, ok := parseImageSize(size)
+		if !ok {
+			return nil, nil, fmt.Errorf("size must be auto or WIDTHxHEIGHT, for example 1024x1024, 1536x1024 or 1024x1792")
+		}
+		ratios := options["image_aspect_ratios"]
+		if len(ratios) == 0 {
+			ratios = geminiImageAspectRatios
+		}
+		divisor := gcd(width, height)
+		exact := fmt.Sprintf("%d:%d", width/divisor, height/divisor)
+		target := math.Log(float64(width)) - math.Log(float64(height))
+		config.AspectRatio = aistudio.NearestOption(target, ratios, aistudio.AspectRatioLog)
+		if config.AspectRatio == "" {
+			// 目录列出的宽高比都读不出时按通用的 10 种
+			config.AspectRatio = aistudio.NearestOption(target, geminiImageAspectRatios, aistudio.AspectRatioLog)
+		}
+		if config.AspectRatio != exact {
+			notes = append(notes, fmt.Sprintf("图片 size %s 按最接近的宽高比 %s 发送（不缩放、不裁切）", size, config.AspectRatio))
+		}
+		if resolutions := options["image_output_resolutions"]; len(resolutions) > 0 {
+			area := math.Log(float64(width) * float64(height))
+			nearest := aistudio.NearestOption(area, resolutions, func(option string) (float64, bool) {
+				edge, ok := imageResolutionEdges[option]
+				return math.Log(edge * edge), ok
+			})
+			if nearest != "" && nearest != "1K" {
+				config.ImageSize, sized = nearest, true
+			}
+		}
 	}
 	switch strings.ToLower(strings.TrimSpace(quality)) {
 	case "", "auto":
+		if sized {
+			notes = append(notes, fmt.Sprintf("图片 size %s 按最接近的分辨率 %s 发送", size, config.ImageSize))
+		}
 	case "low", "standard":
 		config.ImageSize = "1K"
 	case "medium", "hd":
@@ -128,12 +244,20 @@ func openAIImageConfig(size string, quality string) (*aistudio.ImageConfig, erro
 	case "high":
 		config.ImageSize = "4K"
 	default:
-		return nil, fmt.Errorf("quality must be auto, low, medium or high")
+		return nil, nil, fmt.Errorf("quality must be auto, low, medium or high")
 	}
 	if config.AspectRatio == "" && config.ImageSize == "" {
-		return nil, nil
+		return nil, notes, nil
 	}
-	return config, nil
+	return config, notes, nil
+}
+
+// gcd 返回两个正整数的最大公约数
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }
 
 func (s *server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {

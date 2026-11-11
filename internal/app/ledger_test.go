@@ -45,7 +45,7 @@ func TestRequestProtocol(t *testing.T) {
 	}
 }
 
-// TestLedgerEntrySelection 只有通过密钥校验的 POST 写入账本，token 计数请求不计入
+// TestLedgerEntrySelection 只有通过密钥校验的 POST 写入账本，token 计数请求与 max_tokens 为 0 的预热请求不计入
 func TestLedgerEntrySelection(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -58,6 +58,7 @@ func TestLedgerEntrySelection(t *testing.T) {
 		{name: "GET 请求", entry: api.AccessLog{Method: http.MethodGet, Path: "/v1/models", Authorized: true}},
 		{name: "Anthropic 计数", entry: api.AccessLog{Method: http.MethodPost, Path: "/v1/messages/count_tokens", Authorized: true}},
 		{name: "Gemini 计数", entry: api.AccessLog{Method: http.MethodPost, Path: "/trace/v1beta/models/x:countTokens", Authorized: true}},
+		{name: "max_tokens 为 0 的预热", entry: api.AccessLog{Method: http.MethodPost, Path: "/v1/messages", Authorized: true, Warmup: true}},
 	} {
 		if got := ledgerEntry(test.entry); got != test.want {
 			t.Fatalf("%s: ledgerEntry = %v，期望 %v", test.name, got, test.want)
@@ -212,5 +213,22 @@ func TestUltraLedgerRows(t *testing.T) {
 	}
 	if row := requestRow(api.AccessLog{RequestID: "req_normal", Method: http.MethodPost, Path: "/v1/chat/completions"}, time.Now().UTC()); row.Pool != "" {
 		t.Fatalf("普通请求的账本号池应为空，实际 %q", row.Pool)
+	}
+}
+
+// TestWarmupRequestLog max_tokens 为 0 的预热请求在请求日志里单独写明“预热完成”（INFO、状态 completed），不记成普通的请求完成；
+// 预热请求出错（如模型不存在）仍按失败记录
+func TestWarmupRequestLog(t *testing.T) {
+	data, level, message := finishedRequestLog(api.AccessLog{
+		Method: http.MethodPost, Path: "/v1/messages", Status: http.StatusOK, Model: "gemini-2.5-flash", Authorized: true, Warmup: true,
+	})
+	if data.State != "completed" || level != "INFO" || !strings.Contains(message, "预热完成") || data.Model != "gemini-2.5-flash" {
+		t.Fatalf("预热请求日志不对: state=%q level=%q message=%q model=%q", data.State, level, message, data.Model)
+	}
+	data, level, _ = finishedRequestLog(api.AccessLog{
+		Method: http.MethodPost, Path: "/v1/messages", Status: http.StatusNotFound, Authorized: true, Warmup: true,
+	})
+	if data.State != "failed" || level != "ERROR" {
+		t.Fatalf("预热请求出错应按失败记录: state=%q level=%q", data.State, level)
 	}
 }

@@ -52,8 +52,8 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	}
 	current := cloneResponseContents(contents[start:])
 	generate.Contents = contents
-	// 按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go）
-	s.ignoreOmniSystemPrompt(r.Context(), &generate)
+	// 整理客户端的系统提示：删除计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go）
+	s.prepareClientSystem(r.Context(), &generate)
 	hideThought, err := s.prepareGenerate(r.Context(), &generate)
 	if err != nil {
 		writeGeminiInvalid(w, err)
@@ -95,7 +95,7 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 	if request.Store == nil || *request.Store {
 		s.storeInteractionState(generate.ID, request.PreviousID, current, result)
 	}
-	response := interactionObject(generate.ID, model, created, interactionStatus(result), result.usage)
+	response := interactionObject(generate.ID, request.PreviousID, model, created, interactionStatus(result), result.usage)
 	response["steps"] = steps
 	writeJSON(w, http.StatusOK, response)
 }
@@ -177,11 +177,15 @@ func resolveInteractionResults(contents []aistudio.Content) error {
 	return nil
 }
 
-// interactionObject 构造 SDK 使用的资源标识、状态与用量；model 为请求的模型名去掉后缀（见 responseModel）
-func interactionObject(id string, model string, created string, status string, usage *aistudio.Usage) map[string]any {
+// interactionObject 构造 SDK 使用的资源标识、状态与用量；model 为请求的模型名去掉后缀（见 responseModel）；previousID 为请求的
+// previous_interaction_id，非空时与官方 Interaction 对象一样回显，不续接的请求不带这个字段
+func interactionObject(id string, previousID string, model string, created string, status string, usage *aistudio.Usage) map[string]any {
 	object := map[string]any{
 		"id": id, "object": "interaction", "model": model,
 		"created": created, "updated": time.Now().UTC().Format(time.RFC3339), "status": status,
+	}
+	if previousID != "" {
+		object["previous_interaction_id"] = previousID
 	}
 	if usage != nil {
 		object["usage"] = map[string]any{

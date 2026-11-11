@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -354,12 +355,34 @@ func (s *server) handleGeminiModel(w http.ResponseWriter, r *http.Request) {
 	writeGeminiError(w, http.StatusNotFound, "NOT_FOUND", fmt.Sprintf("model %q is unavailable", modelID))
 }
 
+// geminiServedMethods 为本服务提供的模型方法（见 router.go）：generateContent、streamGenerateContent、countTokens
+// （POST /v1beta/models/{model}:方法）、bidiGenerateContent（Live，GET /v1/live）与 Veo 的 predictLongRunning（:predictLongRunning 与
+// GET /v1beta/operations/{id}）。模型目录里本服务没有的方法（createCachedContent、embedContent、batchGenerateContent 等）不列出，
+// 按方法筛选模型的客户端不会选到调用后才报 unknown method 的方法。
+// bidiGenerateContent 只表示本服务自定义协议的 GET /v1/live（首帧 type=setup，见 live.go 的 bidiClientSetup），用来标出 Live 模型：
+// 本服务没有官方 Gemini Live 的 WebSocket 端点（/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent），
+// 官方 SDK 的 Live 连接（如 google-genai 的 client.aio.live.connect）按这个方法选中模型后连接会返回 404，与改动前相同
+var geminiServedMethods = []string{"generateContent", "streamGenerateContent", "countTokens", "bidiGenerateContent", "predictLongRunning"}
+
+// geminiModelMethods 返回模型目录方法中本服务提供的方法，保持目录的顺序
+func geminiModelMethods(methods []string) []string {
+	served := make([]string, 0, len(methods))
+	for _, method := range methods {
+		if slices.Contains(geminiServedMethods, method) {
+			served = append(served, method)
+		}
+	}
+	return served
+}
+
+// geminiModelObject 返回 Gemini 模型对象：baseModelId 与官方一样为不带 models/ 前缀的模型 ID，supportedGenerationMethods 只列本服务提供的方法
 func geminiModelObject(model aistudio.Model) map[string]any {
 	item := map[string]any{
 		"name":                       "models/" + model.ID,
+		"baseModelId":                model.ID,
 		"displayName":                model.Name,
 		"description":                model.Description,
-		"supportedGenerationMethods": model.Methods,
+		"supportedGenerationMethods": geminiModelMethods(model.Methods),
 		"inputTokenLimit":            model.InputTokenLimit,
 		"outputTokenLimit":           model.OutputTokenLimit,
 	}
@@ -440,9 +463,9 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 	if restored := s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents); restored > 0 {
 		aistudio.TraceFromContext(r.Context()).Note(fmt.Sprintf("已为 %d 个历史函数调用还原本服务签发的思考签名（客户端带回的签名缺失或为占位值）", restored))
 	}
-	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go；countTokens 同样，计数与实际发送的内容一致），
-	// 之后恢复媒体与整理分轮都按去掉后的对话进行
-	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
+	// 先整理客户端的系统提示：删除 Claude Code 的计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go；
+	// countTokens 同样，计数与实际发送的内容一致），之后恢复媒体与整理分轮都按整理后的对话进行
+	s.prepareClientSystem(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接与 fileData 恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	switch method {
@@ -739,7 +762,8 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 				return nil, false, fmt.Errorf("inlineData.data: %w", err)
 			}
 			parts = append(parts, aistudio.Part{
-				InlineData:       normalizedImageBlob(mime, data),
+				// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）
+				InlineData:       normalizedImageBlob(attachmentMIME(mime, data), data),
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case file != nil:

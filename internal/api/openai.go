@@ -170,8 +170,9 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents)
-	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），之后恢复媒体与整理分轮都按去掉后的对话进行
-	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
+	// 先删除系统提示里 Claude Code 的计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go 的
+	// prepareClientSystem），之后恢复媒体与整理分轮都按整理后的对话进行
+	s.prepareClientSystem(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
@@ -822,7 +823,7 @@ func mimeForFilename(name string, fallback string) string {
 	return fallback
 }
 
-// fileDataPart 解析文件内容：data URL，或不带前缀的 base64（按文件名推断类型，默认 PDF）
+// fileDataPart 解析文件内容：data URL，或不带前缀的 base64（按文件名推断类型，默认 PDF；内容是文本时按 text/plain，见 attachmentMIME）
 func fileDataPart(value string, filename string) (aistudio.Part, error) {
 	if strings.HasPrefix(value, "data:") {
 		return fileOrInlinePart(value, filename)
@@ -831,7 +832,7 @@ func fileDataPart(value string, filename string) (aistudio.Part, error) {
 	if err != nil {
 		return aistudio.Part{}, fmt.Errorf("file_data must be a data URL or base64: %w", err)
 	}
-	return aistudio.Part{InlineData: &aistudio.Blob{MIME: mimeForFilename(filename, "application/pdf"), Data: data}}, nil
+	return aistudio.Part{InlineData: &aistudio.Blob{MIME: attachmentMIME(mimeForFilename(filename, "application/pdf"), data), Data: data}}, nil
 }
 
 func firstNonEmpty(values ...string) string {
@@ -858,7 +859,8 @@ func fileOrInlinePart(value string, name string) (aistudio.Part, error) {
 	if err != nil {
 		return aistudio.Part{}, fmt.Errorf("data URL: %w", err)
 	}
-	return aistudio.Part{InlineData: normalizedImageBlob(strings.TrimSuffix(metadata, ";base64"), data)}, nil
+	// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）
+	return aistudio.Part{InlineData: normalizedImageBlob(attachmentMIME(strings.TrimSuffix(metadata, ";base64"), data), data)}, nil
 }
 
 func audioMIME(format string) string {

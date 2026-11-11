@@ -374,6 +374,8 @@ type AccessLog struct {
 	Attempts []RequestAttempt
 	// Authorized 表示请求通过了公开 API key 校验
 	Authorized bool
+	// Warmup 表示 Anthropic max_tokens 为 0 的预热请求：不调用上游，不写入用量账本（见 MarkAccessLogWarmup）
+	Warmup bool
 	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
 	Pool string
 	// Disconnect 为请求取消（状态 499）时的现场，其余请求为 nil

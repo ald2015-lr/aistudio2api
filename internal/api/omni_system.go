@@ -40,6 +40,20 @@ func (config Config) omniIgnoreSystemPrompt() bool {
 	return config.OmniIgnoreSystemPrompt()
 }
 
+// prepareClientSystem 在协议转换之后、恢复媒体链接与整理分轮之前统一整理一次客户端的系统提示（各生成入口与 Gemini countTokens、
+// Anthropic count_tokens 都调用它，计数与实际发送的内容一致；本服务的 Live 不接受系统提示，不涉及）：先删除 Claude Code 的计费行
+// （aistudio.DropClientBillingHeader，只删计费字段，同一行粘在其后的文本保留；删除时在该请求的管理日志按 INFO 记一行、不写原文），
+// 再按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（ignoreOmniSystemPrompt）。都在生成服务按工具设置追加要求、
+// 记下客户端系统提示（clientSystem）之前，重新生成与额度用完改用其他模型时重写工具要求用的也是删除之后的系统提示。
+// 只改 GenerateRequest.System，不涉及 WAA binding（binding 只取对话内容）
+func (s *server) prepareClientSystem(ctx context.Context, request *aistudio.GenerateRequest) {
+	if system, removed := aistudio.DropClientBillingHeader(request.System); removed > 0 {
+		request.System = system
+		request.InfoNotes = append(request.InfoNotes, aistudio.BillingHeaderNote(removed, system == ""))
+	}
+	s.ignoreOmniSystemPrompt(ctx, request)
+}
+
 // ignoreOmniSystemPrompt 开启 OMNI_IGNORE_SYSTEM_PROMPT 时去掉发给能输出视频的 Omni 模型的系统提示，并在该请求的管理日志记一行（见本文件开头）。
 // 开关关闭或没有系统提示时不查模型目录、不改动请求；别名目录没有认出 Omni 时标记交给生成服务在发送前再判定。
 // 每个请求只调用一次，在恢复媒体链接与整理分轮之前

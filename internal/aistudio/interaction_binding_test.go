@@ -66,7 +66,7 @@ func TestInteractionTextBindingUnchanged(t *testing.T) {
 		want     string
 	}{
 		{name: "多轮与合并", contents: []Content{
-			{Role: RoleUser, Parts: []Part{{Text: "第一轮 https://youtu.be/abc123 看看"}}},
+			{Role: RoleUser, Parts: []Part{{Text: "第一轮 https://youtu.be/jNQXAC9IVRw 看看"}}},
 			{Role: RoleAssistant, Parts: []Part{{Text: "好的"}}},
 			{Role: RoleUser, Parts: []Part{{Text: "再来"}}},
 			{Role: RoleUser, Parts: []Part{{Text: "继续"}}},
@@ -146,7 +146,7 @@ func TestInteractionImageBindingPrompt(t *testing.T) {
 		{name: "与 Drive 引用并存", contents: []Content{{Role: RoleUser, Parts: []Part{
 			png(), {File: &FileRef{ID: "drive-video-together", MIME: "video/mp4"}}, {Text: "参考图片和视频"},
 		}}}, on: []string{encode(pngData), "参考图片和视频"}, off: []string{"参考图片和视频"}},
-		{name: "YouTube 链接", contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "看 https://youtu.be/xyz789 这个"}, png()}}},
+		{name: "YouTube 链接", contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "看 https://youtu.be/dQw4w9WgXcQ 这个"}, png()}}},
 			on: []string{"", "看  这个", encode(pngData)}, off: []string{"", "看  这个"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

@@ -185,7 +185,9 @@ func encodePart(part Part) ([]any, error) {
 		variants++
 	}
 	if variants == 0 && part.ThoughtSignature != "" {
-		return setPartThoughtSignature([]any{}, part.ThoughtSignature), nil
+		// 只带签名的 Part 按官网的写法发送空正文 [null,""]（field 2 text 为空串）再附签名：上游流里这类 Part 就是空正文加签名，
+		// 官网回传时原样带回；Build 通道（Gemini API）同样写 text:""。binding 不受影响（bindingPrompt 对它照旧计一个空占位）
+		return setPartThoughtSignature([]any{nil, ""}, part.ThoughtSignature), nil
 	}
 	if variants != 1 {
 		return nil, fmt.Errorf("part 必须且只能设置一种内容")

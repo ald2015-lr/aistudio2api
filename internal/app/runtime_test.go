@@ -202,7 +202,8 @@ func TestStartGenerateSkipsUnknownSafetySettings(t *testing.T) {
 	t.Fatalf("没有记录跳过安全设置的 WARN: %+v", requests.logs)
 }
 
-// TestStartGenerateLogsRequestNotes 协议层整理请求时留下的说明（如 Omni 模型忽略的 stop sequences、按范围调整的视频时长）在选号前逐条写进该请求的管理日志
+// TestStartGenerateLogsRequestNotes 协议层整理请求时留下的说明（如 Omni 模型忽略的 stop sequences、按范围调整的视频时长）在选号前逐条写进该请求的管理日志；
+// 常规整理的说明（InfoNotes，如删除 Claude Code 的计费行）按 INFO 写
 func TestStartGenerateLogsRequestNotes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -212,8 +213,9 @@ func TestStartGenerateLogsRequestNotes(t *testing.T) {
 		forbidden: newForbiddenTracker(), quota: newQuotaSharing("", requests),
 	}
 	notes := []string{aistudio.InteractionStopSequencesNote(1), "视频时长 30 秒不是模型可选的时长（4–15 秒、步长 1），按最接近的 15 秒发送"}
+	infoNote := aistudio.BillingHeaderNote(1, false)
 	request := aistudio.GenerateRequest{
-		ID: "req-notes", Model: "gemini-omni-1.1-flash", Notes: notes,
+		ID: "req-notes", Model: "gemini-omni-1.1-flash", Notes: notes, InfoNotes: []string{infoNote},
 		Contents: []aistudio.Content{{Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: "hi"}}}},
 	}
 	var stopped *serviceStoppedError
@@ -222,15 +224,24 @@ func TestStartGenerateLogsRequestNotes(t *testing.T) {
 	}
 	requests.mu.Lock()
 	defer requests.mu.Unlock()
-	found := 0
+	found, info := 0, 0
 	for _, entry := range requests.logs {
+		if entry.Request == nil || entry.Request.ID != "req-notes" {
+			continue
+		}
 		for _, note := range notes {
-			if entry.Level == "WARN" && entry.Message == note && entry.Request != nil && entry.Request.ID == "req-notes" {
+			if entry.Level == "WARN" && entry.Message == note {
 				found++
 			}
 		}
+		if entry.Message == infoNote {
+			if entry.Level != "INFO" {
+				t.Fatalf("常规整理的说明应按 INFO 写: %+v", entry)
+			}
+			info++
+		}
 	}
-	if found != len(notes) {
+	if found != len(notes) || info != 1 {
 		t.Fatalf("请求日志应逐条记下说明: %+v", requests.logs)
 	}
 }

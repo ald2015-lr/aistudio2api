@@ -96,6 +96,76 @@ func TestFunctionCallThoughtSignature(t *testing.T) {
 	}
 }
 
+// TestSignatureOnlyPartWire 只带签名的 Part（Anthropic thinking/redacted_thinking、Responses reasoning、Gemini 原生只带 thoughtSignature
+// 的部分）按官网写法编码为空正文加签名 [null,"",…,签名]；带正文的签名 Part 不变；binding 照旧为这个 Part 计一个空占位
+func TestSignatureOnlyPartWire(t *testing.T) {
+	wire, err := encodePart(Part{ThoughtSignature: "sig-only"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(wire)
+	if want := `[null,"",null,null,null,null,null,null,null,null,null,null,null,null,"sig-only"]`; string(encoded) != want {
+		t.Fatalf("只带签名的 Part = %s，期望 %s", encoded, want)
+	}
+	wire, err = encodePart(Part{Text: "answer", ThoughtSignature: "sig-text"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if encoded, _ = json.Marshal(wire); string(encoded) != `[null,"answer",null,null,null,null,null,null,null,null,null,null,null,null,"sig-text"]` {
+		t.Fatalf("带正文的签名 Part = %s", encoded)
+	}
+	contents := []Content{
+		{Role: RoleUser, Parts: []Part{{Text: "hi"}}},
+		{Role: RoleAssistant, Parts: []Part{{ThoughtSignature: "sig-only"}, {Text: "answer"}}},
+		{Role: RoleUser, Parts: []Part{{Text: "next"}}},
+	}
+	if prompt, err := bindingPrompt(GenerateRequest{Contents: contents}); err != nil || prompt != "hi  answer next" {
+		t.Fatalf("bindingPrompt = %q, %v；只带签名的 Part 应计一个空占位", prompt, err)
+	}
+}
+
+// TestSignatureOnlyPartWithLongFunctionName 只带签名的 Part 与超过 63 字节的函数名（wireFunctionName）出现在同一段历史里时两条规则
+// 各自成立：签名 Part 编码为空正文加签名 [null,"",…,签名]，同一轮后面的函数调用与之后的函数结果用截短名（Playground 与 Build 都一样，
+// Build 的签名 Part 为 text:"" 加签名）；binding 对签名 Part 与函数调用、结果都只计空占位，与函数名长短无关
+func TestSignatureOnlyPartWithLongFunctionName(t *testing.T) {
+	name := longFunctionPrefix + "command"
+	wireName := wireFunctionName(name)
+	if wireName == name || len(wireName) != maxWireFunctionNameLength {
+		t.Fatalf("测试用的函数名应被截短: %q", wireName)
+	}
+	contents := []Content{
+		{Role: RoleUser, Parts: []Part{{Text: "run"}}},
+		{Role: RoleAssistant, Parts: []Part{
+			{ThoughtSignature: "sig-only"},
+			{FunctionCall: &FunctionCall{ID: "call-1", Name: name, Arguments: json.RawMessage(`{}`), ThoughtSignature: "sig-call"}},
+		}},
+		{Role: RoleUser, Parts: []Part{{FunctionResult: &FunctionResult{ID: "call-1", Name: name, Content: json.RawMessage(`{"ok":true}`)}}}},
+	}
+	wire, err := encodeContents(contents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	playground, _ := json.Marshal(wire)
+	if !strings.Contains(string(playground), `[null,"",null,null,null,null,null,null,null,null,null,null,null,null,"sig-only"]`) {
+		t.Fatalf("只带签名的 Part 应为空正文加签名: %s", playground)
+	}
+	if strings.Count(string(playground), `"`+wireName+`"`) != 2 || strings.Contains(string(playground), name) ||
+		!strings.Contains(string(playground), `"sig-call"`) {
+		t.Fatalf("函数调用与结果应为截短名、调用保留自己的签名: %s", playground)
+	}
+	_, build, err := EncodeBuildGenerateRequest(GenerateRequest{Model: "test", Contents: contents}, GenerationDefaults{MaxOutputTokens: 8192}, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(build), `{"text":"","thoughtSignature":"sig-only"}`) ||
+		strings.Count(string(build), `"`+wireName+`"`) != 2 || strings.Contains(string(build), name) {
+		t.Fatalf("Build 请求的签名 Part 应为 text:\"\" 加签名，函数名为截短名: %s", build)
+	}
+	if prompt, err := bindingPrompt(GenerateRequest{Contents: contents}); err != nil || prompt != "run   " {
+		t.Fatalf("bindingPrompt = %q, %v；签名 Part、函数调用与结果各计一个空占位", prompt, err)
+	}
+}
+
 // TestRPCErrorCompatibility 验证真实错误帧解码和 Drive 授权边界
 func TestRPCErrorCompatibility(t *testing.T) {
 	t.Run("direct", func(t *testing.T) {
@@ -178,6 +248,56 @@ func TestAttachYouTubeMediaPreservesText(t *testing.T) {
 		if len(got.Parts) != 1 || got.Parts[0].Text != text {
 			t.Errorf("ordinary text changed: %#v", got)
 		}
+	}
+}
+
+// TestAttachYouTubeMediaVideoIDs 文本里只有视频 ID 恰好 11 位的 YouTube 链接转为视频；链接在汉字、全角标点与反引号处结束，
+// 后面的汉字保留在正文里；示例里的占位写法（VIDEO_ID、${videoId}）与太短的 ID 原样保留为文本
+func TestAttachYouTubeMediaVideoIDs(t *testing.T) {
+	for _, test := range []struct{ text, media, rest string }{
+		{"用一句话总结https://youtu.be/jNQXAC9IVRw这个视频", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "用一句话总结这个视频"},
+		{"看下https://youtu.be/dQw4w9WgXcQ讲了什么", "https://www.youtube.com/watch?v=dQw4w9WgXcQ", "看下讲了什么"},
+		{"看看 https://www.youtube.com/watch?v=jNQXAC9IVRw，讲了什么", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "看看 ，讲了什么"},
+		{"视频（https://youtu.be/jNQXAC9IVRw）", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "视频（）"},
+		{"打开 `https://youtu.be/jNQXAC9IVRw` 看看", "https://www.youtube.com/watch?v=jNQXAC9IVRw", "打开 `` 看看"},
+		{"Embed players with `https://www.youtube.com/embed/${videoId}`.", "", "Embed players with `https://www.youtube.com/embed/${videoId}`."},
+		{"Template: https://www.youtube.com/watch?v=VIDEO_ID", "", "Template: https://www.youtube.com/watch?v=VIDEO_ID"},
+		{"See https://youtu.be/abc", "", "See https://youtu.be/abc"},
+	} {
+		got := attachYouTubeMedia(Content{Role: RoleUser, Parts: []Part{{Text: test.text}}})
+		var media, rest string
+		for _, part := range got.Parts {
+			if part.ExternalMedia != nil {
+				media = part.ExternalMedia.URL
+			}
+			rest += part.Text
+		}
+		if media != test.media || rest != test.rest {
+			t.Errorf("%q: media=%q text=%q，期望 media=%q text=%q", test.text, media, rest, test.media, test.rest)
+		}
+	}
+}
+
+// TestYouTubeBindingMatchesRequestBody 链接后紧跟汉字时，发送的正文与 WAA binding 用的是同一份整理结果：请求体里的文本与外部视频
+// 与 bindingPrompt 的文本、占位一致（两边都保留链接后的汉字），binding 的组成规则不变（文本按顺序以空格连接，外部视频为空占位）
+func TestYouTubeBindingMatchesRequestBody(t *testing.T) {
+	request := GenerateRequest{Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "看下https://youtu.be/dQw4w9WgXcQ讲了什么"}}}}}
+	prompt, err := bindingPrompt(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prompt != " 看下讲了什么" {
+		t.Fatalf("bindingPrompt = %q，期望 %q（外部视频为空占位，链接后的汉字保留）", prompt, " 看下讲了什么")
+	}
+	var pending []FunctionCall
+	wire, err := encodeContent(request.Contents[0], &pending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(wire)
+	want := `[[[null,null,null,null,null,null,["video/*","https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],[null,"看下讲了什么"]],"user"]`
+	if string(encoded) != want {
+		t.Fatalf("请求体 = %s\n期望 %s", encoded, want)
 	}
 }
 

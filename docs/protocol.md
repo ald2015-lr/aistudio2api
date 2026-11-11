@@ -423,6 +423,8 @@ system instruction：
 [[[null, "<SYSTEM_TEXT>"]], "user"]
 ```
 
+客户端的系统提示在协议转换之后、按工具设置追加要求之前统一整理一次（协议层 `prepareClientSystem`，各生成入口与 Gemini `countTokens`、Anthropic `count_tokens` 相同，计数与实际发送的内容一致）：删除 Claude Code 写在系统提示开头的计费归属行（`x-anthropic-billing-header: cc_version=…; cc_entrypoint=…;`，随客户端版本变化、对 Gemini 没有意义，一变就让整段系统提示前缀无法复用上游缓存）。只按行首前缀匹配，只删前缀与其后以分号结尾的 `key=value` 字段（值里没有空白；最后一个字段没有分号时只在它一直到行尾时才删）：这一行没有别的内容时整行删除；同一行在字段之后还有文本时保留这些文本——OpenAI Chat、Responses 与 Gemini 把多段系统提示首尾相连，经 claude-code-router、LiteLLM 等转换器转来的计费块（不以换行结尾）会和下一段（身份句或正文）粘成一行，整行删除会连带删掉它们。其余内容逐字节不变，删除后只剩空白时不发送系统提示；删除时在该请求的管理日志按 INFO 记一行（不写原文，见 [logging.md](logging.md)）。之后再按 `OMNI_IGNORE_SYSTEM_PROMPT` 处理 Omni 视频模型。不带这一行的请求不变。本服务的 Live 不接受系统提示，不涉及。系统提示不参与 WAA binding。
+
 ### GenerateContent
 
 根消息字段：
@@ -608,7 +610,7 @@ AUDIO 采用独立输出模态。JSON Schema type code 为 string=`1`、number=`
 | frame usage | `$[0][frame][2]` | usage array |
 | frame response ID | `$[0][frame][7]` | response ID |
 
-Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于可见正文；带 `part[12]=true` 的内联图片是图片模型思考过程中的草图，不作为输出媒体返回，最终图片以普通 Part 另行返回；`part[14]` 是 thought signature。签名可以附在文本、函数调用或独立空 Part 上，下一轮必须原样回传：
+Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于可见正文；带 `part[12]=true` 的内联图片是图片模型思考过程中的草图，不作为输出媒体返回，最终图片以普通 Part 另行返回；`part[14]` 是 thought signature。签名可以附在文本、函数调用或独立空 Part 上，下一轮必须原样回传。只带签名、没有其他内容的 Part（Anthropic `thinking`/`redacted_thinking` 块、Responses `reasoning` 项、Gemini 原生只带 `thoughtSignature` 的部分）按官网写法编码为空正文加签名 `[null,"",null,…,null,"<signature>"]`（`part[1]` 为空串、`part[14]` 为签名；上游流里这类 Part 就是空正文加签名，Build 通道同样写 `text:""`）；原先 `part[1]` 也省略，只有 `part[14]`。WAA binding 对这个 Part 照旧计一个空占位，不受影响：
 
 | 公开协议 | 签名输入 | 签名输出 |
 | --- | --- | --- |
@@ -1639,7 +1641,7 @@ OpenAI `GET /v1/models`：
 }
 ```
 
-Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返回一个对象。字段为 `name`、`displayName`、`description`、`supportedGenerationMethods`、`inputTokenLimit`、`outputTokenLimit`、可选 `capabilities`、`capabilityOptions`、`accessModes`、`paid`、`channels`。
+Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返回一个对象。字段为 `name`、`baseModelId`（不带 `models/` 前缀的模型 ID）、`displayName`、`description`、`supportedGenerationMethods`、`inputTokenLimit`、`outputTokenLimit`、可选 `capabilities`、`capabilityOptions`、`accessModes`、`paid`、`channels`。`supportedGenerationMethods` 只列模型目录里本服务提供的方法，按目录顺序：`generateContent`、`streamGenerateContent`、`countTokens`（`POST /v1beta/models/{model}:方法`）、`bidiGenerateContent`（Live，只表示本服务自定义协议的 `GET /v1/live`，首帧 `type:"setup"`，见“Live 与 Robotics 公开帧”；本服务没有官方 Gemini Live 的 WebSocket 端点 `/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`，官方 SDK 的 Live 连接（如 google-genai 的 `client.aio.live.connect`）按这个方法选中模型后连接返回 404，与原先相同）与 `predictLongRunning`（Veo，`:predictLongRunning` 与 `GET /v1beta/operations/{id}`）；`createCachedContent`、`embedContent`、`batchGenerateContent` 等本服务没有的方法不列出，按方法筛选模型的客户端不会选到调用后才返回 `unknown method` 的方法。
 
 `GET /v1beta/models/{model}` 只按 canonical model ID 查找；生成、计数、视频、转录与 Bidi 同时接受 canonical ID 和 `capability_options.aliases` 中的 alias；alias 在调度和发送上游前换成对应的 canonical ID。
 
@@ -1654,9 +1656,9 @@ Gemini `GET /v1beta/models` 返回 `{"models":[...]}`，单模型路由直接返
 | `/v1/chat/completions` | `model`、非空 `messages` | Chat completion 或增量 chunk |
 | `/v1/responses` | `model`、`input` | Response object 或 `response.*` 事件 |
 | `/v1/files` | multipart `file`、`purpose` | OpenAI file object |
-| `/v1/messages` | `model`、非空 `messages`、`max_tokens` | Anthropic message 或 message 事件 |
+| `/v1/messages` | `model`、非空 `messages`、`max_tokens`（`0` 只做预热、不调用上游） | Anthropic message 或 message 事件 |
 | `:generateContent` / `:streamGenerateContent` | 非空 `contents` | Gemini candidates、usage 与 grounding metadata |
-| `/v1/images/generations` | `model`、`prompt`、固定 `n=1` | `b64_json` 或 data URL |
+| `/v1/images/generations` | `model`、`prompt`、固定 `n=1` | 默认同时带 `b64_json` 与 data URL，`response_format` 明确要求时只给一种 |
 | `/v1/audio/speech` | `model`、`input` | WAV、PCM 或 MP3 body |
 | `/v1/audio/transcriptions` | multipart `file`；`model` 默认 `gemini-3.5-transcribe` | 文本或转录 JSON |
 | `/v1/videos` | `model`、`prompt` | 长任务对象，随后轮询并下载内容 |
@@ -1794,6 +1796,8 @@ message 字段为 `role`、`content`、可选 `name`、`tool_call_id`、`tool_ca
 | `input_audio` | `input_audio.data`、`input_audio.format` |
 
 OpenAI `image_url` / `input_image` 值为 Base64 data URL 时形成 inline data，值为 YouTube URL 时形成 external media，其他 http/https 地址同样作为 external media 交给上游读取（媒体类型按扩展名推断，未知时为 `image/*`，与 Anthropic URL source 一致；适配器自己不下载），其余字符串按已上传 file ID 解析。`video_url` / `input_video` 只接受 YouTube URL。Chat 的 file part 为 `{"type":"file","file":{"file_id"|"file_data","filename"}}`，Responses 的 `input_file` 把这些字段放在顶层并可用 `file_url`；`file_data` 接受 Base64 data URL 或不带前缀的 Base64（类型按文件名推断，默认 PDF）。
+
+文本类附件按内容以 `text/plain` 发送：OpenAI `file_data`（data URL 与不带前缀的 Base64）与其他 data URL、Anthropic base64 source、Gemini `inlineData` 与 `/v1/files` 上传，内容是文本（开头 512 字节为不含二进制控制字符的 UTF-8，`http.DetectContentType` 判为 `text/*`；截断处不完整的多字节字符不计，以 PDF 文件头 `%PDF` 开头的不算）而声明的类型不是 `text/*`、`application/json`、`application/x-ipynb+json` 时，MIME 改为 `text/plain`。编码客户端常把代码文件标成 `application/octet-stream`、`application/x-sh`，`.ts` 按 Debian 系的 MIME 表会被认成 `video/mp2t`，推断不出类型的 `file_data` 默认 `application/pdf`，AI Studio 对这些类型拒收或按二进制误判。只改 MIME，附件字节不变（WAA binding 按内联数据的 base64 计算，不受影响）；图片、PDF、音视频等二进制内容与已经是文本类型的附件原样发送。
 
 function tool 使用 `{"type":"function","function":{"name","description","parameters","strict"}}`。`strict:true` 时核对上游返回的参数。Google tool type 为 `web_search`、`web_search_preview`、`image_search`、`url_context`、`code_interpreter`、`google_maps`。
 
@@ -1944,7 +1948,7 @@ Responses usage：
 
 | 事件 | 事件字段 |
 | --- | --- |
-| `response.created`、`response.in_progress` | `response` shell |
+| `response.created`、`response.in_progress` | `response` shell；`response.in_progress` 在开头写一次，流里连续 30 秒没有写出任何事件时再发一次（见下文心跳） |
 | `response.output_item.added`、`response.output_item.done` | `output_index`、`item` |
 | `response.reasoning_summary_part.added`、`response.reasoning_summary_part.done` | `item_id`、`output_index`、`summary_index`、`part` |
 | `response.reasoning_summary_text.delta` | `item_id`、`output_index`、`summary_index`、`delta` |
@@ -1973,7 +1977,7 @@ web search 发生时，search call item 排在 message 前；无 grounding query
 | `model` | 必需模型 ID |
 | `messages` | 必需非空 `{role,content}` 数组；role 为 `user`、`assistant` 或 `system`，`system` 消息在原位置以 `<system-reminder>` 包裹的用户内容发送 |
 | `system` | string 或 text block 数组 |
-| `max_tokens` | 必需正整数 |
+| `max_tokens` | 必需非负整数；`0` 只做提示缓存预热（见下文） |
 | `stop_sequences` | string array |
 | `stream` | boolean |
 | `temperature`、`top_p`、`top_k` | 生成参数 |
@@ -1982,6 +1986,8 @@ web search 发生时，search call item 排在 message 前；无 grounding query
 | `output_config` | `{effort:"...",format:{type:"json_schema",schema}}`；`format` 为结构化输出（见上文生成参数映射） |
 | `output_format` | 结构化输出的 beta 写法 `{type:"json_schema",schema}`；与 `output_config.format` 同时出现时以后者为准 |
 | `video_config` | Omni 视频设置扩展字段，与 Chat 相同，见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀) |
+
+`max_tokens` 为 `0` 时与官方 Messages API 一样只做提示缓存预热，不生成内容：请求照常整理（参数错误同样返回 400），别名目录取得到且不为空、模型却不在其中时与生成请求一样返回 404；本服务不调用上游，返回 `content:[]`、`stop_reason:"max_tokens"`，`usage.input_tokens` 为本地估算（与流式 `message_start` 相同）、`output_tokens` 为 0；流式为 `message_start` → `message_delta`（`stop_reason:"max_tokens"`）→ `message_stop`，没有内容块。原先 `0` 被当作没有设置，按模型上限完整生成一次。上游 Mag1cFall/AIStudio2API 改为发一次只输出 1 个 token 的生成；本服务不发：AI Studio 没有客户端能写入的提示缓存，号池按账户分散选号，预热落到的账户与下一次请求多半不是同一个，发出去也预热不到什么，却同样占一次请求额度、一次选号与 WAA proof。预热请求不计入用量账本，请求日志写一行“预热完成”（见 [logging.md](logging.md#api-请求)）。`max_tokens` 为正数时不变。
 
 message content 可以是 string 或 block 数组：
 
@@ -2094,11 +2100,11 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 | 语音配置 | `speech_config:[{voice}]`；多说话人使用 `{speakers:[{speaker,voice}],mode?}`，`mode` 为 `verbatim` 或 `conversational` |
 | 语音文本 | 文本块 `annotations` 中的 `{type:"speech_metadata",speaker?,style?}` 保留说话人与风格 |
 | 函数与工具 | `tools:[{type:"function",name,description?,parameters?}]`；另接受 `google_search`、`url_context`、`code_execution`、`google_maps`；`tool_choice` 为 `auto` 或 `none` |
-| 续接 | 默认保存；`previous_interaction_id` 重建前序内容，`store:false` 仅返回本次响应。与 Responses 共用当前服务实例内最多 256 个响应节点，只接受 `int_` 开头的交互 ID，`resp_` 开头的 Responses ID 返回 400；音频输出不保存进节点（只保留音频分片带的签名） |
+| 续接 | 默认保存；`previous_interaction_id` 重建前序内容，`store:false` 仅返回本次响应。与 Responses 共用当前服务实例内最多 256 个响应节点，只接受 `int_` 开头的交互 ID，`resp_` 开头的 Responses ID 返回 400；音频输出不保存进节点（只保留音频分片带的签名）。续接请求的交互资源回显 `previous_interaction_id`（非流式资源与流式的 `interaction.created`、`interaction.completed`），不续接的请求没有这个字段 |
 
 音频输出为 24 kHz、16-bit 小端、单声道。非流式默认 `audio/wav`，流式默认 `audio/l16`；显式 WAV 流在音频汇总完成后发送一个有效 WAV 块。`sample_rate` 可省略或设为 `24000`，`delivery` 可省略或设为 `inline`。创建请求在当前连接内执行，`background` 可省略或设为 `false`。
 
-非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps` 与 `usage`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
+非流式响应包含 `id`、`object:"interaction"`、`model`、`created`、`updated`、`status`、`steps`、`usage`，续接请求另有 `previous_interaction_id`。`steps` 的 `model_output.content` 保存文本或媒体，音频位于 `{type:"audio",data,mime_type,sample_rate,channels}`。函数调用作为 `function_call` 步骤返回，`id` 一定非空：上游没有给调用 ID 时为 `call_local_` 开头的本地 ID，客户端原样回传即可对应结果，发回上游时去掉；调用携带的思考签名在调用之前作为 `thought` 步骤返回。有函数调用时状态为 `requires_action`；输出上限与内容拦截为 `incomplete`；停止序列、`malformed_function_call` 等其他结束原因与其他协议一样为 `completed`。
 
 SSE 使用相同的事件名与 JSON `event_type`：`interaction.created` → `step.start` → `step.delta` → `step.stop` → `interaction.completed`。步骤以 `index` 对应，思考的增量为 `thought_summary` 与 `thought_signature`，已带签名的思考再遇到签名时另起一步；`model_output` 进行中到达的只带签名的思考（流式与非流式）暂存到这段正文结束后再作为 thought 步骤输出，与上一个相同的签名只输出一次，正文保持一个步骤；随后是不带签名的函数调用或不带签名的思考摘要时排在它们之后，回传时不会成为不带签名的调用的签名；音频增量为 `{type:"audio",data,mime_type,sample_rate,channels}`。与其他流式入口一样，写出响应头前最多等待首个事件 10 秒，首个事件就是错误时返回 Gemini HTTP 错误对象；开始推流后，10 秒无语义事件时发送 `: ping`，上游错误或缺失终态发送 `error` 事件 `{"event_type":"error","error":{"code":"<RPC 状态名>","message":"..."}}` 并结束，消息与 HTTP 错误一样按官方措辞脱敏；客户端断开会取消上游生成。
 
@@ -2303,11 +2309,13 @@ File object：
 | --- | --- |
 | `model`、`prompt` | 必需 |
 | `n` | 默认与唯一值 `1` |
-| `size` | `auto`、`1024x1024`、`1536x1024`、`1024x1536` |
-| `quality` | `auto`；`low/standard=1K`、`medium/hd=2K`、`high=4K` |
-| `response_format` | `b64_json` 返回 Base64；其他值返回 data URL |
+| `size` | `auto`、`1024x1024`、`1536x1024`、`1024x1536` 照原样（只写宽高比 1:1、3:2、2:3）；其他 `WIDTHxHEIGHT`（宽高 1–16384，如 gpt-image、DALL·E 的 `1024x1792`、`1792x1024`、`512x512`）按宽高比取模型目录 `image_aspect_ratios` 里最接近的一种（目录没有列出时取 Gemini 通用的 1:1、2:3、3:2、3:4、4:3、4:5、5:4、9:16、16:9、21:9，按比值的对数比较），分辨率按面积取目录 `image_output_resolutions` 里最接近的一档（512、1K、2K、4K；1K 是模型默认、不写；目录没有分辨率选项时不写）。只换成最接近的档位，不缩放、不裁切、不转码，返回的图片是模型这一档的实际尺寸；宽高比不是精确对应、或按 size 写了分辨率时请求日志记一行说明。写法不对的 size 返回 400 |
+| `quality` | `auto`；`low/standard=1K`、`medium/hd=2K`、`high=4K`；写了时优先于按 size 推断的分辨率 |
+| `response_format` | 省略时每张图同时带 `b64_json` 与 `url`（data URL，同一份数据）；`b64_json` 只给 Base64；`url` 与其他值只给 data URL |
+| `output_format` | gpt-image 的 `png`、`jpeg`、`webp`：不转码，按模型输出的格式原样返回，响应顶层 `output_format` 为实际格式；不是 `png` 时请求日志记一行说明 |
+| `output_compression`、`background`、`moderation`、`style`、`user` 等 | 接受并忽略 |
 
-响应为 `{"created":<UNIX>,"data":[{"b64_json":"...","revised_prompt":"..."}]}` 或 `{"created":<UNIX>,"data":[{"url":"data:<MIME>;base64,...","revised_prompt":"..."}]}`。`revised_prompt` 只在上游同时返回文本时出现。上游未返回最终图片时返回 HTTP 502 `upstream_error`，结束原因不是正常结束时写入错误消息，例如 `image_recitation`。
+响应为 `{"created":<UNIX>,"data":[{"b64_json":"...","url":"data:<MIME>;base64,...","revised_prompt":"..."}],"usage":{...}}`（`response_format` 明确要求时只有其中一个字段）。gpt-image 客户端默认读 `b64_json`，旧的 DALL·E 写法读 `url`，同时带两个字段时两类客户端都能用（原先省略 `response_format` 时只有 `url`）。图片总是以 Base64 内联返回，不存成本服务链接。`usage` 为 gpt-image 写法 `{"input_tokens","output_tokens","total_tokens","input_tokens_details":{"text_tokens","image_tokens":0}}`（输入只有文字提示词，输出为图片与思考的 token），上游没有给用量时省略。`revised_prompt` 只在上游同时返回文本时出现。上游未返回最终图片时返回 HTTP 502 `upstream_error`，结束原因不是正常结束时写入错误消息，例如 `image_recitation`。
 
 `POST /v1/audio/speech`：
 
@@ -2474,7 +2482,8 @@ setup 之后的客户端对象统一字段为 `type`、可选 `text`、`mime_typ
 | 协议 | 心跳（`STREAM_DATA_HEARTBEAT=true`，默认） | 关闭时 |
 | --- | --- | --- |
 | OpenAI Chat | 空 delta 块：`id`、`model`、`created` 与本流一致，`choices[0].delta` 为 `{}`，`finish_reason` 为 `null`（`include_usage` 时带 `"usage":null`） | SSE 注释帧 `: ping` |
-| OpenAI Responses、Gemini Interactions | SSE 注释帧 `: ping`（事件都有官方语义并带序号或步骤，没有客户端会忽略的空数据事件） | 同左 |
+| OpenAI Responses | SSE 注释帧 `: ping`；连续 30 秒没有写出任何事件时，那一次心跳改发 `response.in_progress`（当前的 `response` shell，`sequence_number` 接着递增），之后每满 30 秒再发一次 | 同左 |
+| Gemini Interactions | SSE 注释帧 `: ping`（事件都带步骤，没有客户端会忽略的空数据事件） | 同左 |
 | Anthropic | 官方 ping 事件 `event: ping` 加 `data: {"type":"ping"}`；Anthropic SDK 识别并跳过，new-api 按官方事件转发 | 同左 |
 | Gemini `:streamGenerateContent` SSE | 空候选块（part 为空文本，上一块是思考时为空思考）；首个事件还没到就提交响应头时，提交时另写一块。官方 SDK 直连（`x-goog-api-client` 带 `google-genai-sdk/`、`genai-py/`、`genai-js/` 或 `gl-python/`）时与关闭时相同 | 一个空行 |
 | Gemini `:streamGenerateContent` JSON 数组 | 一个空行 | 同左 |
@@ -2482,6 +2491,8 @@ setup 之后的客户端对象统一字段为 `type`、可选 `text`、`mime_typ
 new-api 等中转逐行读取上游 SSE，只转发 `data:` 行，并且在收到第一条 data 之前不给它的客户端写任何字节：空行与 `: ping` 只能保住本服务到中转这一段，数据型心跳能一直传到中转后面 OpenAI 格式的客户端（Gemini 空候选块被转成 `delta.content=""` 或 `delta.reasoning_content=""` 的空增量，与 new-api 自己在流开头写的 role 块同形；没有 `finishReason`，不会被当成回复结束）。Claude 格式的客户端经 new-api 时，提交响应头时写的第一块心跳会让 new-api 先写出 `message_start`（new-api 收到第一条 data 时先补一个起始块，Claude 格式由它生成 `message_start`），之后的空心跳块在转换时被丢弃，流中保活仍要靠 new-api 自己的 ping。new-api 的 OpenAI 渠道落后一块转发（收到下一条 data 才把上一条写给它的客户端），所以首个事件还没到就提交响应头时，OpenAI Chat 在 role 块之后立刻再写一块空 delta，把 role 块顶出去；首个事件已到时不另写。
 
 数据型心跳会改变 new-api 的首字时间统计：new-api 在收到第一条 data 时记首字时间，首个事件晚于响应头等待时，它日志里的首字时间与模型性能的 TTFT、生成速度反映的是本服务提交响应头（写出第一块心跳）的时刻，约 10–15 秒，而不是真实首字；真实首字时间看本服务请求日志的 `first_event_ms`。数据型心跳还会改变 new-api 的计费：new-api 每读到一条 data 都计一次上游响应（心跳块也算），流结束时没有带 token 的 `usageMetadata`（客户端断开、流被截断）且已收到过 data 时，按估算的输入 token 计费；原先首个事件之前只有换行心跳、没有 data，这类请求计 0。开启后，首个事件之前就断开的请求在 new-api 里按估算的输入计费（第 4 轮工具调用约 16k token，重试 6 次约 96k）。介意时可以关闭 `STREAM_DATA_HEARTBEAT`，只依赖 new-api 的 ping。
+
+Responses 静默时改发 `response.in_progress`：Codex 读 SSE 时空闲 5 分钟就断开，计时只看事件，`: ping` 注释不算；new-api 等只转发 data 行的中转还会丢掉注释，中转后面的客户端那一段一直零字节。强制调用扣住、重新生成、`long-` 续写换轮、隐藏思考（只有签名与用量、不写出事件）期间都可能长时间没有事件。阈值取 30 秒：低于常见的 60 秒读超时（nginx `proxy_read_timeout` 默认值），离 Codex 的 5 分钟也有充足余量；事件不断的流不受影响，仍只有开头那一条 `response.in_progress`。静默按“上一次写出事件”计：心跳计时被只有签名、用量的上游事件重置时，处理完每个事件也按同一阈值检查一次。官方 OpenAI SDK 与 Codex 对重复的 `response.in_progress` 只当作状态提示（Codex 落在未处理事件分支、直接忽略），不推进输出项；原先为避免“打乱按事件推进的状态”不重复发送，现在只在长时间静默时发。
 
 官方 SDK 直连时 Gemini SSE 不写数据型心跳：直连不经过只转发 data 行的中转，换行心跳就能保活，也不再多写一种 SDK 判为无效的块。google-genai Python 的 chats 对流里每一块做 `_validate_response`：没有 `content` 的块都判为无效（1.55 与 2.34 相同），1.55 及以前还把 text 为 `""` 的 part（不论是不是思考）判为无效（2.x 不再这样判）；`send_message_stream` 里任一块无效，这一轮就不写进精选对话历史。本服务 Gemini SSE 的结束块只带 `finishReason` 与 `usageMetadata`、没有 `content`，所以官方 SDK 的 chats 流式这一轮本来就不记历史，换行回退并不能保住对话历史，根因在结束块的形状（与心跳无关，另行处理）。经 new-api 的 Gemini 原生格式中转时，new-api 原样转发 data、默认也不透传 `x-goog-api-client`，中转后面的官方 SDK 同样会收到空心跳块。
 
@@ -2542,7 +2553,7 @@ Gemini：每个媒体输出两个 Part，先是链接文本（前面的正文没
 
 回传恢复（不区分是否为 url 模式）：Chat、Messages 与 Gemini 的 assistant 文本里指向本服务的 Markdown 图片（`![…](…/media/<哈希>.png|jpg|webp|gif|heic|heif|bmp|tiff)`，绝对或相对地址；扩展名与媒体目录按图片提供的扩展名一致）恢复为 inline data Part，前后文本保持原顺序，视频与音频链接保持文本；用户消息的 `image_url`、`fileData` 等外部地址指向已保存的媒体时恢复为 inline data Part（含视频）；模型消息的 `fileData` 只恢复图片，视频与音频在同一条消息里已有文本链接时去掉（签名单独保留），没有时改为文本链接；文件已清理时图片链接保持原样，`fileData` 改为文本链接。同一文件一次请求只恢复一处：从最新的消息往前选，同一条消息里 `fileData` 与外部地址先于文本链接，其余引用不恢复（文本链接保持文本，`fileData` 与外部地址按上面的规则去掉或改为文本链接）；一次请求恢复的内容合计不超过 64MB，超出时较早的引用不恢复（文本链接保持文本，`fileData` 改为文本链接，外部地址保持原样）。目标模型（按模型名后缀与目录别名解析后）是能输出视频的 Omni 时另有：assistant 文本里的 Markdown 视频链接（`[video](…/media/<哈希>.mp4|webm|mov|mpg|avi|flv|wmv|3gp)`，Omni 输出枚举解码出的 MPEG、AVI 等视频按这些扩展名保存）与 assistant 消息的视频 `fileData` 同样恢复为 inline data Part（编辑或延长上一轮的视频要让模型看到原视频；new-api 回传的历史只剩链接文本），用户文本里的本服务图片与视频链接（Markdown 链接，或裸地址：前面是开头、空白、非 ASCII 字符或括号引号等分隔符，后面不接查询串、片段与更长路径）在原位置拆成文本与 inline data Part；不能恢复的外部地址改为文本链接（Omni 不接受外部地址）。按规则该恢复却没能恢复的文件（不在媒体目录：已清理、读取失败或不是本服务的链接；超出 64MB）在该请求的管理日志记一行（见 [logging.md](logging.md)），不再静默；其他模型的恢复规则不变。
 
-用户文本中的 `youtu.be/<ID>`、`youtube.com/watch?v=<ID>`、`/shorts/<ID>`、`/live/<ID>` 和 `/embed/<ID>` 会转换为 `video/*` 外部媒体 part，并从用户 text part 中移除；重复 URL 合并为一个附件。OpenAI `video_url`/`input_video`、Anthropic URL source 与 Gemini `fileData.fileUri` 使用相同的外部媒体编码。
+用户文本中的 `youtu.be/<ID>`、`youtube.com/watch?v=<ID>`、`/shorts/<ID>`、`/live/<ID>` 和 `/embed/<ID>` 会转换为 `video/*` 外部媒体 part，并从用户 text part 中移除；重复 URL 合并为一个附件。链接只由 ASCII URL 字符组成（字母、数字与 ``-._~:/?#[]@!$&()*+,;=%``），遇到空白、引号、尖括号、反引号与非 ASCII 字符（汉字、全角标点）结束：“看下https://youtu.be/<ID>讲了什么”只取到 ID 为止，后面的汉字留在正文里（原先按“非空白、非引号尖括号”匹配，汉字、全角括号、反引号会被吞进链接，视频 ID 无效，这段汉字又随链接一起删掉）。只有视频 ID 恰好 11 位（`[A-Za-z0-9_-]`）的链接才转换，`VIDEO_ID`、`${videoId}` 这类示例占位与太短的 ID 原样保留为文本。请求编码与 WAA binding（`bindingPrompt`）调用同一个函数，发送的正文与 binding 按同一份结果一起变化，binding 的组成规则不变。OpenAI `video_url`/`input_video`、Anthropic URL source 与 Gemini `fileData.fileUri` 使用相同的外部媒体编码。
 
 OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previous_interaction_id` 在进程内共用最多 256 个响应节点并重建完整 contents；重启后客户端重新提交完整上下文。Drive 与 Veo 资源绑定持久化到磁盘。
 

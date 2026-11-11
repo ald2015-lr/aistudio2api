@@ -107,8 +107,9 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicInvalid(w, err)
 		return
 	}
-	// 先按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go），之后恢复媒体与整理分轮都按去掉后的对话进行
-	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
+	// 先删除系统提示里 Claude Code 的计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go 的
+	// prepareClientSystem），之后恢复媒体与整理分轮都按整理后的对话进行
+	s.prepareClientSystem(r.Context(), &generateRequest)
 	// 回传历史里本服务的媒体链接恢复为媒体输入（见 restoreMediaLinks）
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	hideThought, err := s.prepareGenerate(r.Context(), &generateRequest)
@@ -118,6 +119,11 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	// 响应里的 model 报告去掉后缀的目录模型名（见 responseModel）
 	request.Model = responseModel(generateRequest)
+	if *request.MaxTokens == 0 {
+		// max_tokens 为 0 只做提示缓存预热，不调用上游（见 writeAnthropicWarmup）
+		s.writeAnthropicWarmup(w, r, request, messageID, generateRequest)
+		return
+	}
 	generateRequest.Stream = request.Stream
 	if request.Stream {
 		// 先拿到事件流再写响应头与 message_start：降级判定（流式严格模式）要在判定之前保留返回 400 的机会；
@@ -167,6 +173,44 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, buildAnthropicResponse(messageID, request.Model, result, s.config.currentAPIKey(), s.mediaOutputFor(r)))
 }
 
+// anthropicWarmupNote 为 max_tokens 为 0 的预热请求写进排查记录的说明
+const anthropicWarmupNote = "max_tokens 为 0：只做提示缓存预热，不调用上游，返回空内容、stop_reason 为 max_tokens（input_tokens 为本地估算）"
+
+// writeAnthropicWarmup 处理 max_tokens 为 0 的请求。官方 Messages API 用它只处理提示词、写入提示缓存（缓存预热），不生成内容：
+// 响应不含内容块，stop_reason 为 max_tokens。原先 0 被当作没有设置，按模型上限完整生成一次，白占一次请求额度。
+// 上游 Mag1cFall/AIStudio2API 改为发一次只输出 1 个 token 的生成；本服务不调用上游：AI Studio 没有客户端能写入的提示缓存，
+// 号池按账户分散选号，预热落到的账户与下一次请求多半不是同一个，发出去也预热不到什么，却同样占一次请求额度、一次选号与 WAA proof。
+// 请求照常整理（参数错误与生成请求一样返回 400）；别名目录取得到且不为空、模型却不在其中时与生成请求一样返回模型不存在。
+// usage.input_tokens 为本地估算（与流式 message_start 的估算相同），output_tokens 为 0。流式按 message_start → message_delta
+// （stop_reason=max_tokens）→ message_stop 输出，没有内容块
+func (s *server) writeAnthropicWarmup(w http.ResponseWriter, r *http.Request, request anthropicRequest, id string, generateRequest aistudio.GenerateRequest) {
+	// 请求日志记下模型与预热标记，用量账本不记这次请求（模型不存在的 404 也不记，见 MarkAccessLogWarmup）
+	MarkAccessLogWarmup(r.Context(), generateRequest.Model)
+	if models, err := s.aliasCatalog(r.Context()); err == nil && len(models) > 0 {
+		if _, _, _, _, ok := resolveLongRequestModel(models, generateRequest.Model); !ok {
+			writeAnthropicRequestError(w, fmt.Errorf("%w: %s", aistudio.ErrModelNotFound, generateRequest.Model))
+			return
+		}
+	}
+	aistudio.TraceFromContext(r.Context()).Note(anthropicWarmupNote)
+	result := generationResult{finishReason: "max_tokens", usage: &aistudio.Usage{InputTokens: aistudio.EstimatedInputTokens(generateRequest)}}
+	if !request.Stream {
+		writeJSON(w, http.StatusOK, buildAnthropicResponse(id, request.Model, result, s.config.currentAPIKey(), s.mediaOutputFor(r)))
+		return
+	}
+	if err := streamHeaders(w); err != nil {
+		return
+	}
+	writer := &anthropicStreamWriter{
+		w: w, id: id, model: request.Model, inputTokens: result.usage.InputTokens,
+		searchKey: s.config.currentAPIKey(), media: s.mediaOutputFor(r),
+	}
+	if err := writer.start(); err != nil {
+		return
+	}
+	_ = writer.finish(result)
+}
+
 func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Request) {
 	var request anthropicRequest
 	if err := decodeJSON(r, &request); err != nil {
@@ -186,8 +230,8 @@ func (s *server) handleAnthropicCountTokens(w http.ResponseWriter, r *http.Reque
 		writeAnthropicInvalid(w, err)
 		return
 	}
-	// 与生成请求一样先去掉发给 Omni 视频模型的系统提示（OMNI_IGNORE_SYSTEM_PROMPT，见 omni_system.go），计数与实际发送的内容一致
-	s.ignoreOmniSystemPrompt(r.Context(), &generateRequest)
+	// 与生成请求一样先整理客户端的系统提示（删除计费行、OMNI_IGNORE_SYSTEM_PROMPT，见 omni_system.go），计数与实际发送的内容一致
+	s.prepareClientSystem(r.Context(), &generateRequest)
 	s.restoreMediaLinks(r.Context(), &generateRequest)
 	// 与生成请求一样整理对话轮次（包括把工具结果中的图片移到之后的用户消息），计数与实际发送的内容一致
 	contents, _ := normalizeTurns(generateRequest.Contents)
@@ -500,7 +544,8 @@ func anthropicSourceParts(blockType string, raw json.RawMessage) ([]aistudio.Par
 		if err != nil {
 			return nil, fmt.Errorf("%s source data: %w", blockType, err)
 		}
-		return []aistudio.Part{{InlineData: normalizedImageBlob(source.MediaType, data)}}, nil
+		// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）
+		return []aistudio.Part{{InlineData: normalizedImageBlob(attachmentMIME(source.MediaType, data), data)}}, nil
 	case source.Type == "url":
 		if media, ok := aistudio.ExternalMediaForURL(source.URL); ok {
 			return []aistudio.Part{{ExternalMedia: media}}, nil

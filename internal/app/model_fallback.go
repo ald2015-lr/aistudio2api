@@ -478,7 +478,7 @@ func (service *trackedService) switchModelFallback(
 ) aistudio.GenerateRequest {
 	request := run.source
 	request.AccountID = ""
-	request.Notes = nil
+	request.Notes, request.InfoNotes = nil, nil
 	notes := api.RetargetGenerateRequest(&request, target)
 	// 思考签名：目标模型在之前改用时签发的原样保留，其余换成占位值或去掉（只有签名的部分）；签名缺失或为占位值的函数调用再按目标模型的作用域
 	// 按调用 ID 还原（见文件开头）。还原按下标改写，先复制每条消息的部分，不改动源模型的请求

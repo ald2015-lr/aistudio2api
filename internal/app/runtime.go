@@ -4363,7 +4363,11 @@ func (service *trackedService) startGenerate(
 			service.requests.logRequestProgress(request.ID, "service", "WARN", "安全设置已跳过无法识别的条目 | "+strings.Join(skipped, "；"))
 		}
 	}
-	// 协议层整理请求时留下的说明（Omni 模型忽略的 stop sequences、按模型选项调整的视频时长等）逐条写进该请求的管理日志
+	// 协议层整理请求时留下的说明（Omni 模型忽略的 stop sequences、按模型选项调整的视频时长等）逐条写进该请求的管理日志；
+	// 常规整理（删除 Claude Code 的计费行）按 INFO 写，在偏离客户端要求的调整之前
+	for _, note := range request.InfoNotes {
+		service.requests.logRequestProgress(request.ID, "service", "INFO", note)
+	}
 	for _, note := range request.Notes {
 		service.requests.logRequestProgress(request.ID, "service", "WARN", note)
 	}

@@ -67,6 +67,8 @@ type accessLogMetadata struct {
 	attempts []RequestAttempt
 	// authorized 表示请求已通过公开 API key 校验，只有这类请求写入用量账本
 	authorized bool
+	// warmup 表示 Anthropic max_tokens 为 0 的预热请求（见 MarkAccessLogWarmup）：不调用上游，请求日志照写，不写入用量账本
+	warmup bool
 	// lastUpstreamEvent 为上游最近一次事件的时刻（UnixNano，0 为还没有事件），由生成服务逐个事件写入（MarkAccessLogUpstreamEvent），
 	// 客户端断开时读取，不加锁
 	lastUpstreamEvent atomic.Int64
@@ -126,6 +128,7 @@ type accessLogSnapshot struct {
 	proof           time.Duration
 	attempts        []RequestAttempt
 	authorized      bool
+	warmup          bool
 	disconnect      *accessDisconnect
 }
 
@@ -558,7 +561,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 		temperature: metadata.temperature, topP: metadata.topP, topK: metadata.topK,
 		thinking: metadata.thinking, maxOutputTokens: metadata.maxOutputTokens, seed: metadata.seed, requestID: metadata.requestID,
 		queueWait: metadata.queueWait, proof: metadata.proof,
-		attempts: slices.Clone(metadata.attempts), authorized: metadata.authorized, disconnect: metadata.disconnect,
+		attempts: slices.Clone(metadata.attempts), authorized: metadata.authorized, warmup: metadata.warmup, disconnect: metadata.disconnect,
 	}
 	metadata.mu.Unlock()
 	return snapshot
@@ -569,6 +572,13 @@ func (metadata *accessLogMetadata) id() string {
 	metadata.mu.Lock()
 	defer metadata.mu.Unlock()
 	return metadata.requestID
+}
+
+// isWarmup 判断请求是否已标记为预热请求（见 MarkAccessLogWarmup）
+func (metadata *accessLogMetadata) isWarmup() bool {
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	return metadata.warmup
 }
 
 // MarkAccessLogScheduled 记录请求从进入服务到取得本次执行账户的排队时间（换号重试时以最后一次为准）
@@ -588,6 +598,18 @@ func markAccessLogAuthorized(ctx context.Context) {
 		metadata.mu.Lock()
 		metadata.authorized = true
 		metadata.mu.Unlock()
+	}
+}
+
+// MarkAccessLogWarmup 标记请求为 Anthropic max_tokens 为 0 的预热请求，并写入请求的模型（没有账户）：预热不调用上游、不占额度，
+// 请求日志照常写一行（带模型，便于辨认），用量账本不记（与 token 计数请求一样，见 app 的 ledgerEntry），
+// 不然用量页的请求数与成功数虚增、耗时分位被约 1 ms 的记录拉低，请求记录里还会多出没有账户的“请求完成”
+func MarkAccessLogWarmup(ctx context.Context, model string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.warmup = true
+		metadata.mu.Unlock()
+		metadata.setTarget(model, "")
 	}
 }
 
@@ -805,7 +827,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
-				Authorized: snapshot.authorized, Disconnect: disconnect,
+				Authorized: snapshot.authorized, Warmup: snapshot.warmup, Disconnect: disconnect,
 			})
 		}
 		if aborted {

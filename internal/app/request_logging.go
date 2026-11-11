@@ -70,6 +70,9 @@ func requestOutcome(entry api.AccessLog) (string, string, string) {
 		return "cancelled", "WARN", "请求已取消"
 	case entry.Status >= http.StatusBadRequest || entry.Error != "":
 		return "failed", "ERROR", "请求失败"
+	case entry.Warmup:
+		// 预热没有调用上游：单独写明，不与普通的“请求完成”混在一起
+		return "completed", "INFO", "预热完成（max_tokens 为 0，未调用上游，不计入用量账本）"
 	case entry.FinishReason == "max_tokens" || entry.FinishReason == "max_output_tokens" || entry.FinishReason == "length":
 		return "limited", "WARN", "达到输出上限"
 	case entry.FinishReason != "" && entry.FinishReason != "stop" && entry.FinishReason != "stop_sequence":
@@ -190,9 +193,10 @@ func (admin *runtimeAdmin) RecordAccessLog(entry api.AccessLog) {
 	admin.recordRequestLog(entry.Account, level, "request.finished", message, data)
 }
 
-// ledgerEntry 判断请求是否写入用量账本：通过 API key 校验的 POST 请求，token 计数请求除外
+// ledgerEntry 判断请求是否写入用量账本：通过 API key 校验的 POST 请求，token 计数请求与 Anthropic max_tokens 为 0 的预热请求
+// （不调用上游，见 api.MarkAccessLogWarmup）除外
 func ledgerEntry(entry api.AccessLog) bool {
-	return entry.Method == http.MethodPost && entry.Authorized && requestProtocol(entry.Path) != "count_tokens"
+	return entry.Method == http.MethodPost && entry.Authorized && !entry.Warmup && requestProtocol(entry.Path) != "count_tokens"
 }
 
 // requestRow 将 POST 请求结果投影为用量账本记录；账户、错误与请求日志显示的内容相同，不含密钥与请求头

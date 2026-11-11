@@ -41,7 +41,7 @@
 - **TTS 语音生成**: 支持 Gemini TTS 模型的单/多说话人音频生成
 - **图片生成**: 支持 Nano Banana 图片生成
 - **视频生成**: 支持 Veo 视频生成和图片转视频；Gemini Omni 通过四套生成接口接收文本、图片与视频输入，输出文本与 MP4 视频，支持官网的宽高比、时长、分辨率与视频任务设置（也可写在模型名后缀里）
-- **YouTube 输入**: 粘贴视频 URL 即可作为外部视频附件读取
+- **YouTube 输入**: 粘贴视频 URL 即可作为外部视频附件读取（链接在汉字、全角标点与反引号处结束，只认 11 位视频 ID）
 - **智能模型切换**: 从 AI Studio 实时发现模型并按 `model` 字段路由
 - **Google 工具**: 支持 Search、Image Search、URL Context、Code Execution 和 Maps
 - **Files 与 Transcribe**: 支持文件上传、查询、内容读取、删除和音频转录
@@ -351,7 +351,7 @@ curl http://127.0.0.1:2048/v1/chat/completions \
 - **工具参数 Schema**：`required` 列出未定义的属性时补上 `{}`，上游不再以 `property is not defined` 拒绝整个请求（Playground、Build 与 `strict` 核对一致）；Playground 上 `"5"`、`5.0` 这类整数写法与 `TYPE_UNSPECIFIED` 不再让 Schema 降级。
 - **Gemini 小兼容**：`MODALITY_UNSPECIFIED`、`MODE_UNSPECIFIED` 按未设置处理；带 `dynamicRetrievalConfig` 的 `googleSearchRetrieval` 照常开启 Google Search；`fileData` 可以省略 `mimeType`（按 `displayName` 或 `fileUri` 的扩展名推断）。
 - **上游结束说明**：Google 给出 `finishMessage`（如 `MALFORMED_FUNCTION_CALL` 的具体问题）时，Gemini 响应的 `finishMessage` 原样带上，管理日志另记一行 `上游结束说明`；输入被拦截时的上游说明只写进管理日志，客户端收到的错误不变。
-- **流式心跳**：10 秒没有新内容时写一次心跳。默认开启数据型心跳（`STREAM_DATA_HEARTBEAT=true`）：Gemini SSE 每次心跳都写一块空候选块，首个事件还没到就提交响应头时提交时也写一块（`responseId`、`modelVersion` 与本流其他块一致，part 为空文本 `{"text":""}`，上一块是思考时为空思考 `{"text":"","thought":true}`，不带 `finishReason` 与 `usageMetadata`），OpenAI Chat 写与本流 `id`、`model`、`created` 一致的空 delta 块（`choices[0].delta` 为 `{}`，`finish_reason` 为 `null`；首个事件还没到就提交响应头时 role 块之后也写一块）；首个事件已到时提交响应头不写心跳块，快速返回的流里没有多余的块。官方 SDK 直连（`x-goog-api-client` 带 `google-genai-sdk/`、`genai-py/`、`genai-js/` 或 `gl-python/`）时 Gemini SSE 退回只写换行（直连不经过中转，换行就能保活，也不再多写一种 SDK 判为无效的块：google-genai Python 1.55 及以前的 chats 把空文本块判为无效；不过本服务 Gemini SSE 的结束块没有 `content`，官方 SDK chats 流式的这一轮本来就不写进对话历史，与心跳无关；经 new-api 的 Gemini 原生格式中转时，中转后面的官方 SDK 同样会收到空心跳块）。new-api 等中转只转发 data 行，原先的空行与 `: ping` 传不到它后面的客户端，见[经 new-api 中转时连接被中止](#经-new-api-中转时连接被中止或工具调用后续请求失败)。Gemini 的 JSON 数组模式（不带 `alt=sse`）仍写一个换行；Responses 与 Interactions 没有官方客户端会忽略的空数据事件，仍发送 `: ping`（响应头提交时已有 `response.created` 或 `interaction.created` 等数据）；Anthropic 发送官方 `event: ping`。关闭时 Gemini SSE 写一个空行（google-genai Python SDK 会把 `: ping` 当作 JSON 解析而报错）、OpenAI Chat 写 `: ping`，与原先完全一致。
+- **流式心跳**：10 秒没有新内容时写一次心跳。默认开启数据型心跳（`STREAM_DATA_HEARTBEAT=true`）：Gemini SSE 每次心跳都写一块空候选块，首个事件还没到就提交响应头时提交时也写一块（`responseId`、`modelVersion` 与本流其他块一致，part 为空文本 `{"text":""}`，上一块是思考时为空思考 `{"text":"","thought":true}`，不带 `finishReason` 与 `usageMetadata`），OpenAI Chat 写与本流 `id`、`model`、`created` 一致的空 delta 块（`choices[0].delta` 为 `{}`，`finish_reason` 为 `null`；首个事件还没到就提交响应头时 role 块之后也写一块）；首个事件已到时提交响应头不写心跳块，快速返回的流里没有多余的块。官方 SDK 直连（`x-goog-api-client` 带 `google-genai-sdk/`、`genai-py/`、`genai-js/` 或 `gl-python/`）时 Gemini SSE 退回只写换行（直连不经过中转，换行就能保活，也不再多写一种 SDK 判为无效的块：google-genai Python 1.55 及以前的 chats 把空文本块判为无效；不过本服务 Gemini SSE 的结束块没有 `content`，官方 SDK chats 流式的这一轮本来就不写进对话历史，与心跳无关；经 new-api 的 Gemini 原生格式中转时，中转后面的官方 SDK 同样会收到空心跳块）。new-api 等中转只转发 data 行，原先的空行与 `: ping` 传不到它后面的客户端，见[经 new-api 中转时连接被中止](#经-new-api-中转时连接被中止或工具调用后续请求失败)。Gemini 的 JSON 数组模式（不带 `alt=sse`）仍写一个换行；Responses 与 Interactions 没有官方客户端会忽略的空数据事件，仍发送 `: ping`（响应头提交时已有 `response.created` 或 `interaction.created` 等数据），Responses 流连续 30 秒没有写出事件时那一次心跳改发 `response.in_progress`（Codex 只按事件计空闲，5 分钟就断开）；Anthropic 发送官方 `event: ping`。关闭时 Gemini SSE 写一个空行（google-genai Python SDK 会把 `: ping` 当作 JSON 解析而报错）、OpenAI Chat 写 `: ping`，与原先完全一致。
 - **工具调用经中转**：Gemini 原生入口与 OpenAI Chat 一样记下本服务签发的函数调用思考签名；客户端或中转带回的调用签名为空、`context_engineering_is_the_way_to_go`（new-api 的占位值）或 `skip_thought_signature_validator` 时，按调用 ID 与函数名还原同一模型、号池、API key 下本服务签发的真签名，Gemini 3 才能接上前几步的思考；并行调用的第二个及以后本来就没有签名，保持缺失。不带调用 ID 的调用不还原（照原样发送占位值或跳过校验值）：经中转时所有终端用户共用本服务的同一把 API key，按函数名与参数还原会把别的对话里同名同参调用的签名套上来。`functionResponse` 没有名称时按调用 ID 或唯一待返回的调用补名，`functionCall.args` 为 `null` 按 `{}` 处理，历史开头没有对应调用的工具结果改写成 `Tool result <名称>: <结果>` 文字说明，不再返回 400。
 
 以 Cherry Studio 为例：
@@ -373,6 +373,8 @@ $env:ANTHROPIC_DEFAULT_SONNET_MODEL = "gemini-3.8-flash"
 $env:ANTHROPIC_DEFAULT_HAIKU_MODEL = "gemini-3.5-flash-lite"
 ```
 
+Claude Code 写在系统提示开头的计费行（`x-anthropic-billing-header: …`，随客户端版本变化）在发送前删掉，对 Gemini 没有意义，删去后系统提示前缀可复用上游缓存，请求日志记一行说明；`max_tokens` 为 `0` 的提示缓存预热请求不调用上游、不占额度，直接返回空内容与 `stop_reason: max_tokens`，也不计入用量账本。
+
 [Codex](https://github.com/openai/codex) 使用 Responses 接口，在 `~/.codex/config.toml` 中添加 provider，并把 `PROXY_API_KEY` 写入 `AISTUDIO2API_KEY` 环境变量；Codex 的 `web_search` 工具由 Google Search 执行：
 
 ```toml
@@ -385,6 +387,8 @@ base_url = "http://127.0.0.1:2048/v1"
 env_key = "AISTUDIO2API_KEY"
 wire_api = "responses"
 ```
+
+Codex 读流时 5 分钟没有收到事件就断开，`: ping` 注释不算；Responses 流连续 30 秒没有写出事件时（强制调用扣住、重新生成、`long-` 续写换轮等），心跳改发一次 `response.in_progress`，平时仍是注释。
 
 [omp](https://github.com/can1357/oh-my-pi) 的 `web_search` 工具按自身的搜索来源顺序执行。设置 `GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:2048` 与 `GEMINI_API_KEY=<PROXY_API_KEY>`，并在 omp 配置中优先使用 Gemini 来源：
 
@@ -419,7 +423,7 @@ providers:
 
 生成请求中的内联附件会优先上传为临时 Drive 文件，随请求结束清理（Gemini Omni 的 PNG、JPEG、WebP 等图片按官网直接内联、不上传，见 [Omni 的图片与视频输入](#omni-的图片与视频输入)）；账户未授予 Drive 权限时保持内联数据发送（不冷却、不换号，服务记住这个账户 24 小时，记录写盘、重启后沿用，期间不再先换 Drive token），过大的文件可能被上游以 400 拒绝。图片、音频、视频、PDF 等输入仍需所选模型支持。重复使用的附件可通过 Files 接口上传一次并复用文件 ID。
 
-Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。
+Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileData` / `file_data`、`mimeType` / `mime_type` 和 `fileUri` / `file_uri`。媒体 Base64 数据支持标准与 URL-safe 字母表、带填充与无填充形式，以及 `data:<MIME>;base64,` 前缀。OpenAI 助手历史中的 Markdown 图片同样支持 URL-safe Base64 和 CR/LF 换行。内联 GIF 和视频表单上传的 GIF 按首帧静态图片转换为 PNG，保留逻辑画布、帧位置与透明背景。内容是文本的附件（代码、脚本、配置文件等）声明的类型不是文本类时（编码客户端常标成 `application/octet-stream`、`application/x-sh`，`.ts` 可能被认成 `video/mp2t`，推断不出类型的 `file_data` 默认按 PDF），按 `text/plain` 发送，OpenAI、Anthropic、Gemini 的内联附件与 `/v1/files` 上传都一样；附件内容不变。
 
 ### Ultra 号池（/ultra 前缀）
 
@@ -533,6 +537,8 @@ curl http://127.0.0.1:2048/v1/images/generations \
     "size": "1024x1024"
   }'
 ```
+
+`size` 接受任意 `宽x高`（如 gpt-image、DALL·E 的 `1024x1792`、`1792x1024`、`512x512`），按模型目录取最接近的宽高比与分辨率档（1K、2K、4K 等）发送，不缩放、不裁切、不转码，返回的图片是模型这一档的实际尺寸；`1024x1024`、`1536x1024`、`1024x1536` 与 `auto` 与原先相同。不写 `response_format` 时每张图同时带 `b64_json` 与 `url`（data URI），写了 `b64_json` 或 `url` 时只给那一种；响应带 `usage`。`output_format`（`png`、`jpeg`、`webp`）不转码，响应的 `output_format` 写实际格式；`output_compression`、`background` 等其他 gpt-image 字段接受并忽略。
 
 ### 视频生成 (Veo)
 
