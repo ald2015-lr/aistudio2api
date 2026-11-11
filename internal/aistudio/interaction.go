@@ -122,9 +122,12 @@ func encodeCreateInteractionStream(request GenerateRequest, defaults GenerationD
 		return interactionEncoding{}, errors.New(videoTaskFirstTurnMessage)
 	}
 	// GenerationConfig：field 6 thinking level、field 7 thinking summaries、field 8 max output tokens；
-	// 历史中没有模型输出时 field 25 为视频任务，未指定任务时为 []
+	// 历史中没有模型输出时 field 25 为视频任务，未指定任务时为 []。模型目录没有思考等级（能力码 52，如 gemini-omni-1.2-flash）时
+	// level 为 0，与官网一样不发送 field 6（见 interactionThinkingLevel）
 	config := make([]any, 8)
-	config[5] = level
+	if level != 0 {
+		config[5] = level
+	}
 	config[6] = int64(1)
 	config[7] = maxOutput
 	if !hasModelTurn {
@@ -322,8 +325,13 @@ func encodeInteractionAttachment(index int, part Part, role Role) ([]any, error)
 	}
 }
 
-// interactionThinkingLevel 按请求的思考强度或预算选择模型支持的 Interaction thinking level
+// interactionThinkingLevel 按请求的思考强度或预算选择模型支持的 Interaction thinking level。模型目录没有思考等级能力（能力码 52，
+// 如 gemini-omni-1.2-flash，官网页面没有 Thinking level）时与官网一样不发送，返回 0：请求的思考强度、预算与模型名的等级后缀都不起作用
+// （请求日志的说明见 InteractionThinkingIgnoredNote 与 InteractionThinkingSuffixIgnoredNote）
 func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaults) (int64, error) {
+	if !defaults.ThinkingLevel {
+		return 0, nil
+	}
 	level := defaults.DefaultThinkingLevel
 	switch normalizeReasoningEffort(config.ReasoningEffort) {
 	case "":
@@ -363,6 +371,11 @@ func (c *Client) generateInteraction(ctx context.Context, request GenerateReques
 		}
 	}
 	request.Config.VideoConfig = video
+	// 模型目录没有思考等级（能力码 52）时请求体不带思考等级，客户端的思考参数不起作用：写一行说明（模型名的等级后缀协议层没有写进思考参数，
+	// 另记了一行；同一条说明已在 request.Notes 里时不重复）
+	if note := InteractionThinkingIgnoredNote(entry.model.ID, entry.defaults, request.Config); note != "" && !slices.Contains(request.Notes, note) {
+		ReportRequestNote(ctx, note)
+	}
 	// 协议层对能输出视频的 Omni 模型已清空 stop sequences 并记过说明；协议层没有处理到的请求（目录没有列出视频选项的 Interaction 模型、
 	// 别名目录取不到等）在这里补记
 	if count := len(request.Config.StopSequences); count > 0 {

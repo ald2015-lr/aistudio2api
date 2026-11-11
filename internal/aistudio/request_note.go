@@ -3,6 +3,7 @@ package aistudio
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 type requestNoteContextKey struct{}
@@ -29,6 +30,33 @@ func ReportRequestNote(ctx context.Context, note string) {
 // 没有确认 CreateInteractionStream 的停止序列字段，不猜字段号，也不在本地匹配（见 EncodeCreateInteractionStreamRequest）
 func InteractionStopSequencesNote(count int) string {
 	return fmt.Sprintf("未确认 CreateInteractionStream 的停止序列字段，已忽略 %d 个停止序列", count)
+}
+
+// InteractionThinkingSuffixIgnoredNote 为模型名的思考等级后缀（-minimal、-low、-medium、-high、-128）对经 CreateInteractionStream
+// 生成、模型目录却没有思考等级（能力码 52，如 gemini-omni-1.2-flash）的模型不生效时写进请求日志的说明（协议层整理模型名时留下）。
+// level 为后缀对应的等级（minimal、low、medium、high）
+func InteractionThinkingSuffixIgnoredNote(modelID string, level string) string {
+	return fmt.Sprintf("模型名后缀指定的思考等级 %s 对 %s 不生效：模型目录没有思考等级（能力码 52），与官网一样不发送思考等级，已忽略后缀", level, modelID)
+}
+
+// InteractionThinkingIgnoredNote 为客户端的思考参数（reasoning_effort、思考预算）对模型目录没有思考等级（能力码 52）的 Interaction 模型
+// 不生效时写进请求日志的说明；模型有思考等级或请求没有思考参数时返回空串。请求体与官网一样不带 GenerationConfig field 6
+// （见 interactionThinkingLevel）
+func InteractionThinkingIgnoredNote(modelID string, defaults GenerationDefaults, config GenerationConfig) string {
+	if defaults.ThinkingLevel {
+		return ""
+	}
+	var params []string
+	if effort := strings.TrimSpace(config.ReasoningEffort); normalizeReasoningEffort(effort) != "" {
+		params = append(params, "reasoning_effort="+effort)
+	}
+	if config.ThinkingBudget != nil {
+		params = append(params, fmt.Sprintf("思考预算=%d", *config.ThinkingBudget))
+	}
+	if len(params) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("客户端的思考参数（%s）对 %s 不生效：模型目录没有思考等级（能力码 52），与官网一样不发送思考等级", strings.Join(params, "、"), modelID)
 }
 
 type requestInfoContextKey struct{}

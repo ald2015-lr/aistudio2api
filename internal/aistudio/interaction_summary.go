@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -66,7 +67,7 @@ func base64DecodedLen(encoded string) int64 {
 // summary 返回写进管理日志的请求结构摘要（见文件开头），按编码出的 input steps 统计，即发往上游的结构（相邻同角色已合并、模型历史媒体已移到
 // 用户 step；每条 step 的 part 种类按发送顺序列出，连续同类合并计数）。例如
 // Interaction 请求结构 | 方法=CreateInteractionStream | 模型=models/gemini-omni-1.1-flash | 多轮=否 | step=1（用户[图片 1、文本 1]） |
-// 图片=1 张（PNG 1 张 1234B） | Drive 引用=0 | 校验值含图片=是（1 张） | 文本=1 段 12B | 系统指令=无 | 思考等级=4 | 输出上限=65536 |
+// 图片=1 张（PNG 1 张 1234B） | Drive 引用=0 | 校验值含图片=是（1 张） | 文本=1 段 12B | 系统指令=无 | 思考等级=4（目录没有思考等级时为“不发送”） | 输出上限=65536 |
 // 视频设置=时长 10s | 视频格式=[null,null,null,null,[10],1] | 任务=未指定 | 请求体=2345B
 func (encoded interactionEncoding) summary(request GenerateRequest) string {
 	descriptions := make([]string, 0, len(encoded.steps))
@@ -169,10 +170,19 @@ func (encoded interactionEncoding) summary(request GenerateRequest) string {
 		}
 	}
 	return fmt.Sprintf("Interaction 请求结构 | 方法=CreateInteractionStream | 模型=%s | 多轮=%s | step=%d（%s） | 图片=%s | Drive 引用=%d | "+
-		"校验值含图片=%s | 文本=%d 段 %dB | 系统指令=%s | 思考等级=%d | 输出上限=%d | 视频设置=%s | 视频格式=%s | 任务=%s | 请求体=%dB",
+		"校验值含图片=%s | 文本=%d 段 %dB | 系统指令=%s | 思考等级=%s | 输出上限=%d | 视频设置=%s | 视频格式=%s | 任务=%s | 请求体=%dB",
 		wireModelName(request.Model), multiTurn, len(encoded.steps), strings.Join(descriptions, " "), imageText, driveCount,
-		encoded.bindingImageText(), textCount, textBytes, system, encoded.level, encoded.maxOutput, videoSettingsText(request.Config.VideoConfig),
+		encoded.bindingImageText(), textCount, textBytes, system, encoded.levelText(), encoded.maxOutput, videoSettingsText(request.Config.VideoConfig),
 		videoFormat, task, len(encoded.body))
+}
+
+// levelText 为请求结构摘要里的思考等级：GenerationConfig field 6 的 Interaction 枚举值；模型目录没有思考等级（能力码 52）、
+// 请求体不带 field 6 时为“不发送”
+func (encoded interactionEncoding) levelText() string {
+	if encoded.level == 0 {
+		return "不发送"
+	}
+	return strconv.FormatInt(encoded.level, 10)
 }
 
 // bindingImageText 为请求结构摘要里 binding 是否计入了图片：OMNI_IMAGE_BINDING 关闭时为“关闭”（binding 只含文本，与 a574e64 相同），

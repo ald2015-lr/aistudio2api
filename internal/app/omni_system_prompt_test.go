@@ -135,7 +135,7 @@ type omniPromptService struct {
 func (service *omniPromptService) Models(context.Context) ([]aistudio.Model, error) {
 	return []aistudio.Model{{
 		ID: "gemini-omni-1.1-flash", Name: "Gemini Omni 1.1 Flash", Methods: []string{"generateContent"},
-		Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true, "interaction_route": true, "interactions_api": true},
+		Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true, "thinking_summaries": true, "interactions_api": true},
 		CapabilityOptions: map[string][]string{
 			"video_aspect_ratios": {"16:9", "9:16"}, "video_output_resolutions": {"360p", "720p"},
 			"video_duration_range": {"min=4", "max=15", "step=1", "default=10"}, "video_frame_rates": {"24fps"},

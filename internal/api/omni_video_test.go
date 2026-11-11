@@ -17,7 +17,7 @@ func omniAliasModels() []aistudio.Model {
 	return append(aliasTestModels(),
 		aistudio.Model{
 			ID: "gemini-omni-1.1-flash", Name: "Gemini Omni 1.1 Flash", Methods: []string{"countTokens", "generateContent"},
-			Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true, "interaction_route": true, "interactions_api": true},
+			Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true, "thinking_summaries": true, "interactions_api": true},
 			CapabilityOptions: map[string][]string{
 				"video_aspect_ratios":      {"16:9", "9:16"},
 				"video_output_resolutions": {"360p", "720p", "1080p", "4k"},

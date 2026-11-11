@@ -201,12 +201,13 @@ func ThoughtSignatureRestoreFromContext(ctx context.Context) ThoughtSignatureRes
 	return restore
 }
 
-// TextChatModel 判断模型是文本对话模型：目录标为对话模型，且不是图片、语音、音乐、视频、实时或 Interaction（Omni）模型
+// TextChatModel 判断模型是文本对话模型：目录标为对话模型，且不是图片、语音、音乐、视频、实时或 Interaction（Omni）模型。
+// Interaction 只看目录 field 79（interactions_api）：能力码 59 是思考摘要（thinking_summaries），会思考的文本模型也会带，不据此排除
 func TextChatModel(model Model) bool {
 	if !model.Capabilities["chat_model"] || model.Capabilities["interactions_api"] {
 		return false
 	}
-	for _, route := range []string{"image_route", "speech_route", "music_route", "video_route", "live_route", "interaction_route"} {
+	for _, route := range []string{"image_route", "speech_route", "music_route", "video_route", "live_route"} {
 		if model.Capabilities[route] {
 			return false
 		}
@@ -236,7 +237,7 @@ func FallbackTargetUnsupported(model Model, request GenerateRequest) string {
 	if len(model.Methods) > 0 && !slices.Contains(model.Methods, "generateContent") {
 		return "不支持 generateContent"
 	}
-	if model.Capabilities["interactions_api"] || model.Capabilities["interaction_route"] {
+	if model.Capabilities["interactions_api"] {
 		return "是 Interaction（Omni）模型，请求方式不同"
 	}
 	if !TextChatModel(model) {

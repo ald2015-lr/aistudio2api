@@ -204,14 +204,15 @@ func resolveModelAliasWith(models []aistudio.Model, name string, video bool) (ai
 	}
 }
 
-// isTextChatModel 判断模型是否为文本对话模型；图片、语音、音乐、视频、实时等模型不适用后缀
+// isTextChatModel 判断模型是否为文本对话模型；图片、语音、音乐、视频、实时与经 Interaction 生成（目录 field 79，interactions_api，
+// 如 Omni）的模型不适用后缀。能力码 59 是思考摘要（thinking_summaries），会思考的文本模型也会带，不据此排除
 func isTextChatModel(model aistudio.Model) bool {
 	capabilities := model.Capabilities
-	if !capabilities["chat_model"] {
+	if !capabilities["chat_model"] || capabilities["interactions_api"] {
 		return false
 	}
 	for _, route := range []string{
-		"image_route", "speech_route", "music_route", "video_route", "live_route", "interaction_route",
+		"image_route", "speech_route", "music_route", "video_route", "live_route",
 	} {
 		if capabilities[route] {
 			return false

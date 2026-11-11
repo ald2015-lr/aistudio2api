@@ -689,6 +689,8 @@ OpenAI Responses 的 `previous_response_id` 与 Gemini Interactions 的 `previou
 
 新增上游能力从 `internal/aistudio` 开始：编码真实数组槽位、解码服务器事件，再由 `internal/api` 投影到公开协议。模型方法、上下文、输出上限、工具、声音、图片规格和视频规格均来自实时 `ListModels`。
 
+模型是否经 Interaction（CreateInteractionStream）生成只看目录 field 79（`interactions_api`，`models.go`）：能力码 59 是思考摘要（`thinking_summaries`），会思考的普通文本模型也会带，不能拿来判 Omni。用到这个判断的地方有 `aistudio.TextChatModel` 与 `FallbackTargetUnsupported`（`model_fallback.go`，额度用完改用其他模型的目标筛选）、`buildExcludedPlaygroundModel`（`channel.go`，Build 通道索引）与协议层的 `isTextChatModel`（`api/model_alias.go`，后缀别名与 `long-`）。
+
 函数参数 Schema 的 `required` 补齐（`defineRequiredProperties`，`internal/aistudio/schema.go`）有三个调用点：Playground 的 `encodeFunctionDeclarationHint`（`tools.go`）、Build 的 `parametersJsonSchema`（`build.go`）与 `strict` 核对的 `compileToolSchema`（`tool_contract.go`，在其大小检查之后）；改动补齐规则时三处要一起测，保证发给上游的 Schema 与核对用的 Schema 一致。整数字段规范化（`canonicalSchemaIntegers`）与 `TYPE_UNSPECIFIED` 处理只在 Playground 的 `encodeSchemaNode` 中进行，Build 与 `strict` 核对不做这两项（改动会改变发给 Google 的 Build 请求）。上游结束说明解码为 `Event.FinishMessage`（Playground 读 candidate `[3]`，Build 读 `finishMessage`），由 `internal/app` 的 `forwardEvents` 写进请求进度、由 `internal/api` 的 `setGeminiFinish` 写进 Gemini `finishMessage`；拦截说明进 `PromptFeedbackError.Message`，公开错误文案（`official_errors.go`）只按 `Reason` 生成。
 
 流式心跳由各协议的写入器提供给 `consumeStreamEvents`：OpenAI Chat、Responses 与 Interactions 用 `writeSSEHeartbeat`（`: ping`），Anthropic 用 `anthropicStreamWriter.heartbeat`（`event: ping`），Gemini 用 `geminiChunkWriter.heartbeat`（SSE 与 JSON 数组都写一个空行）。新增流式协议时按该协议官方 SDK 能跳过的格式选择心跳。

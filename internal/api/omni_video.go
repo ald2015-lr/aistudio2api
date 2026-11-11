@@ -233,7 +233,8 @@ func videoDurationSuffix(token string) int64 {
 }
 
 // applyOmniVideoAlias 处理能输出视频的 Omni 模型：换成去掉后缀的模型名（目录 ID，或按目录别名调用时的别名，调度前再换成目录 ID）；
-// 名称里的思考等级后缀优先于请求参数（不带时沿用模型默认等级，不像文本模型那样强制最高）；视频后缀优先于请求里的视频设置，
+// 名称里的思考等级后缀优先于请求参数（不带时沿用模型默认等级，不像文本模型那样强制最高；模型目录没有思考等级即能力码 52 时，
+// 如 gemini-omni-1.2-flash，与官网一样不发送思考等级，后缀忽略并记一行请求日志）；视频后缀优先于请求里的视频设置，
 // 再按模型目录整理（见 aistudio.NormalizeVideoConfig），说明写进请求日志；没有确认 CreateInteractionStream 的停止序列字段，
 // stop sequences 清空并记一行请求日志（见 aistudio.InteractionStopSequencesNote）。返回是否隐藏思维链，视频设置不成立时返回参数错误。
 // 视频任务只能在对话第一轮使用（官网 Video task 的提示）：任务只来自模型名后缀（-edit、-extend、-i2v 等，new-api 的静态模型映射
@@ -242,7 +243,10 @@ func videoDurationSuffix(token string) int64 {
 // （见 aistudio.InteractionHasModelTurn），结果不随文件能否恢复、发送时是否换回链接文本变化
 func applyOmniVideoAlias(request *aistudio.GenerateRequest, model aistudio.Model, alias modelAlias) (bool, error) {
 	request.Model = alias.base
-	if alias.level != "" {
+	switch {
+	case alias.level != "" && !model.Capabilities["thinking_level"]:
+		request.Notes = append(request.Notes, aistudio.InteractionThinkingSuffixIgnoredNote(model.ID, alias.level))
+	case alias.level != "":
 		request.Config.ReasoningEffort = alias.level
 		request.Config.ThinkingBudget = nil
 	}

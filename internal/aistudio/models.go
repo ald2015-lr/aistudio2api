@@ -29,7 +29,9 @@ var capabilityNames = map[int64]string{
 	53: "music_route",
 	54: "image_search",
 	58: "google_maps",
-	59: "interaction_route",
+	// 59 为思考摘要（官网 Deep Research 等的 Thinking summaries 开关，上游 Mag1cFall/AIStudio2API 591c81f 起称 thinking_summaries）：
+	// 会思考的普通文本模型也会带，不表示经 Interaction 生成；是否经 Interaction 生成只看 field 79（interactions_api）
+	59: "thinking_summaries",
 	74: "transcription_word_timestamps",
 	76: "transcription_language_codes",
 	77: "transcription_output",

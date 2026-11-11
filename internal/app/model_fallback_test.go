@@ -1449,3 +1449,74 @@ func TestModelFallbackLedgerAttempts(t *testing.T) {
 		}
 	})
 }
+
+// wireFallbackCatalog 为按官网 ListModels 的位置解码出的 argon 与 carbon（aistudio.ParseModels）：两者都带思考摘要（能力码 59，
+// thinking_summaries）与对话、函数声明、Google 搜索、思考、思考等级，没有 field 79（不经 Interaction 生成）
+func wireFallbackCatalog(t *testing.T) []aistudio.Model {
+	t.Helper()
+	row := func(id string) []any {
+		row := make([]any, 65)
+		row[0] = "models/" + id
+		row[3] = id
+		row[5] = 1048576
+		row[6] = 65536
+		row[7] = []string{"generateContent", "countTokens"}
+		row[64] = []int{1, 10, 12, 25, 52, 59}
+		return row
+	}
+	raw, err := json.Marshal([]any{[]any{row(fallbackSource), row(fallbackTarget)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := aistudio.ParseModels(strings.NewReader(string(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range models {
+		if !model.Capabilities["capability_code_59"] || model.Capabilities["interactions_api"] {
+			t.Fatalf("%s 的能力 %v：应带能力码 59、没有 field 79", model.ID, model.Capabilities)
+		}
+	}
+	return models
+}
+
+// TestModelFallbackThinkingSummariesBothWays 默认规则 gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon 下，argon 与 carbon 的目录
+// 都带能力码 59（思考摘要）：argon 额度用完改用 carbon、carbon 额度用完改用 argon 都成立，目标不因 59 被当成 Interaction（Omni）模型跳过
+// （原先 59 记为 interaction_route，两个方向都以“是 Interaction（Omni）模型”跳过目标、按源模型的 429 返回）
+func TestModelFallbackThinkingSummariesBothWays(t *testing.T) {
+	if config.DefaultModelFallbacks != fallbackSource+"="+fallbackTarget+","+fallbackTarget+"="+fallbackSource {
+		t.Fatalf("默认规则 %q", config.DefaultModelFallbacks)
+	}
+	for _, test := range []struct{ source, target string }{
+		{source: fallbackSource, target: fallbackTarget},
+		{source: fallbackTarget, target: fallbackSource},
+	} {
+		t.Run(test.source, func(t *testing.T) {
+			accounts := ultraTestIDs(2)
+			upstream := &fallbackUpstream{}
+			service, pool := runningGenerateService(t, upstream, context.Background(), time.Minute, accounts...)
+			catalog := wireFallbackCatalog(t)
+			for _, accountID := range accounts {
+				if err := pool.SetCatalog(accountID, aistudio.BenefitTierUltra, catalog); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service.replaceModelSnapshot(catalog)
+			setUltraPrimaryModels(service, []string{test.source}, 10*time.Second)
+			service.setModelFallbacks(config.DefaultModelFallbacks, config.ModelFallbackScopeUltra)
+			coolAll(t, pool, test.source, 3*time.Hour, accounts...)
+			request := aistudio.GenerateRequest{Model: test.source, Tools: aistudio.Tools{Functions: []aistudio.FunctionDeclaration{{Name: "lookup"}}}}
+			result := runFallbackRequest(t, service, aistudio.PoolScopeUltra, request)
+			if result.err != nil || result.served != test.target || result.text != "reply from "+test.target {
+				t.Fatalf("%s 额度用完：text=%q err=%v served=%q，期望改用 %s", test.source, result.text, result.err, result.served, test.target)
+			}
+			if models := upstream.models(); !slices.Equal(models, []string{test.target}) {
+				t.Fatalf("上游收到 %v，期望只有 %s", models, test.target)
+			}
+			if progressLogged(service, "是 Interaction（Omni）模型") || progressCountAll(service, "按 MODEL_FALLBACKS 改用 "+test.target) != 1 {
+				t.Fatal("带 59 的目标不应被当成 Interaction 模型跳过，改用日志应恰好一行")
+			}
+			assertNoBusyAccounts(t, pool)
+		})
+	}
+}

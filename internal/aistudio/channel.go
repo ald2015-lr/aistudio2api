@@ -308,10 +308,10 @@ func (p *AccountPool) playgroundIndexCurrentLocked() bool {
 	return p.playgroundIndexVersion == p.catalogVersion
 }
 
-// buildExcludedPlaygroundModel 判断 Playground 目录模型是否使用 Build 未接入的专用路由
+// buildExcludedPlaygroundModel 判断 Playground 目录模型是否使用 Build 未接入的专用路由：经 Interaction 生成（目录 field 79，
+// interactions_api）或转写输出。能力码 59 是思考摘要（thinking_summaries），不据此排除
 func buildExcludedPlaygroundModel(model Model) bool {
-	return model.Capabilities["interactions_api"] || model.Capabilities["interaction_route"] ||
-		model.Capabilities["transcription_output"]
+	return model.Capabilities["interactions_api"] || model.Capabilities["transcription_output"]
 }
 
 // buildRequiresSpecialTool 判断 Build 独有模型是否只能配合 Computer Use 等专用工具调用

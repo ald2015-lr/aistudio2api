@@ -32,7 +32,7 @@ func omniProductionModel() aistudio.Model {
 		ID: omniDriveModel, Name: "Gemini Omni 1.1 Flash", Methods: []string{"countTokens", "generateContent"},
 		InputTokenLimit: 131072, OutputTokenLimit: 65536,
 		Capabilities: map[string]bool{
-			"chat_model": true, "thinking": true, "thinking_level": true, "interaction_route": true, "interactions_api": true,
+			"chat_model": true, "thinking": true, "thinking_level": true, "thinking_summaries": true, "interactions_api": true,
 			"capability_code_1": true, "capability_code_25": true, "capability_code_52": true, "capability_code_59": true,
 		},
 		CapabilityOptions: map[string][]string{

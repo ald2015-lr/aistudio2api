@@ -21,7 +21,7 @@ func longTestModels() []aistudio.Model {
 			Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true, "google_search": true}},
 		aistudio.Model{ID: "long-context-model", Name: "Long Context", Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true}},
 		aistudio.Model{ID: "build-only-chat", Name: "Build Only", Channels: []string{"build"}, Capabilities: map[string]bool{"chat_model": true}},
-		aistudio.Model{ID: "gemini-omni-1.1-flash", Name: "Omni", Capabilities: map[string]bool{"chat_model": true, "interaction_route": true}},
+		aistudio.Model{ID: "gemini-omni-1.1-flash", Name: "Omni", Capabilities: map[string]bool{"chat_model": true, "thinking_summaries": true, "interactions_api": true}},
 	)
 }
 
