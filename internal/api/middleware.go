@@ -753,8 +753,16 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 			metadata.markDisconnect(writer.disconnectSnapshot(true))
 		})
 		aborted := serveRecovering(next, writer, request)
-		if !stopWatch() {
+		// 停止观察之后只读一次 r.Context() 的结果，下面的补记与 499 判定都按它：处理函数正常返回之后才断开的不算取消
+		watchStopped := stopWatch()
+		requestErr := r.Context().Err()
+		if !watchStopped {
 			<-watched
+		} else if requestErr != nil {
+			// 观察还没被通知到就被停下：r.Context() 取消时先设好 Err、关闭 Done，再按 map 顺序逐个通知子 context，
+			// 处理函数可能先看到取消并返回，赶在这个观察被通知之前。r.Context() 已经取消（本服务不设 BaseContext，处理函数
+			// 返回之前只有客户端断开会取消它），同样按客户端断开记下现场，不当成服务端取消
+			metadata.markDisconnect(writer.disconnectSnapshot(true))
 		}
 		status := writer.status
 		if status == 0 {
@@ -762,7 +770,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		}
 		snapshot := metadata.snapshot()
 		var disconnect *RequestDisconnect
-		if snapshot.canceled || errors.Is(r.Context().Err(), context.Canceled) {
+		if snapshot.canceled || errors.Is(requestErr, context.Canceled) {
 			status = 499
 			// 客户端没有断开却以取消结束：管理端取消了请求，或服务正在停止、重启
 			moment := snapshot.disconnect

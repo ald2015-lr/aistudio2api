@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -421,5 +422,80 @@ func TestStreamHoldCappedWhenGenerateBlocks(t *testing.T) {
 	elapsed := time.Since(startedAt)
 	if err != nil || stream == nil || elapsed < 70*time.Millisecond || elapsed > time.Second {
 		t.Fatalf("stream=%v err=%v 用时 %s，期望约 80ms 时开始推流", stream, err, elapsed)
+	}
+}
+
+// lateWatchContext 模拟 r.Context() 取消时断开观察还没被通知到：它实现 AfterFunc，context.AfterFunc 经 propagateCancel
+// 把观察登记在这里，登记了却一直不调用（标准库先关闭 Done、再按子 context 的 map 顺序逐个通知，处理函数可能先看到取消并返回）。
+// 直接作为请求的 context 使用：外面再包一层 WithValue 就不再转发 AfterFunc，标准库会改起 goroutine 等 Done，测试不再确定
+type lateWatchContext struct {
+	context.Context
+	done       chan struct{}
+	canceled   atomic.Bool
+	registered atomic.Int32
+}
+
+func (ctx *lateWatchContext) Done() <-chan struct{} { return ctx.done }
+
+func (ctx *lateWatchContext) Err() error {
+	if ctx.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// AfterFunc 只登记不调用，context.AfterFunc 的 stop 因此总是返回 true（观察被停下、从未运行）
+func (ctx *lateWatchContext) AfterFunc(func()) func() bool {
+	ctx.registered.Add(1)
+	return func() bool { return true }
+}
+
+func (ctx *lateWatchContext) disconnect() {
+	ctx.canceled.Store(true)
+	close(ctx.done)
+}
+
+// TestCancelDiagnosticsWatchNotStarted 客户端断开时处理函数先返回、断开观察还没被通知到就被停下：仍记为客户端断开（不是服务端取消），
+// 现场与观察正常运行时相同
+func TestCancelDiagnosticsWatchNotStarted(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		write bool
+		phase string
+	}{
+		{name: "首事件前", phase: "before_first_event"},
+		{name: "流中", write: true, phase: "mid_stream"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			admin := &capturingAdmin{}
+			ctx := &lateWatchContext{Context: context.Background(), done: make(chan struct{})}
+			handler := requestLoggingMiddleware(admin, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if test.write {
+					SetAccessLogFirstEvent(r.Context(), time.Millisecond)
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: {}\n\n")
+					_ = http.NewResponseController(w).Flush()
+				}
+				ctx.disconnect()
+				<-r.Context().Done()
+			}))
+			request := httptest.NewRequest(http.MethodPost, "/v1beta/models/gemini-3.8-flash:streamGenerateContent?alt=sse", nil)
+			handler.ServeHTTP(httptest.NewRecorder(), request.WithContext(ctx))
+			if registered := ctx.registered.Load(); registered != 1 {
+				t.Fatalf("断开观察登记了 %d 次，期望经 AfterFunc 恰好登记 1 次（请求 context 被包了一层时测试不再确定）", registered)
+			}
+			entries := admin.finished()
+			if len(entries) != 1 {
+				t.Fatalf("请求完成记录 %d 条，期望 1 条", len(entries))
+			}
+			entry := entries[0]
+			disconnect := entry.Disconnect
+			if entry.Status != 499 || disconnect == nil {
+				t.Fatalf("status=%d disconnect=%+v，期望 499 并带断开现场", entry.Status, disconnect)
+			}
+			if disconnect.Initiator != "client" || disconnect.Phase != test.phase || disconnect.HeadersSent != test.write {
+				t.Fatalf("断开现场 = %+v，期望客户端断开、%s", disconnect, test.phase)
+			}
+		})
 	}
 }
