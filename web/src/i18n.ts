@@ -643,7 +643,7 @@ const zhCN = {
   'settings.helpExpand': '展开说明',
   'settings.helpCollapse': '收起说明',
   'settings.liveHint':
-    'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、临时对话、IP 池保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
+    'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、上游通道、临时对话、IP 池、API 密钥等保存后立即生效；账户目录、默认代理、WAA 后端需要重启生成服务；监听地址需要重启管理进程。',
   'logs.categoryAll': '全部',
   'logs.categoryRequest': '请求',
   'logs.categoryAccount': '账户',
@@ -1652,7 +1652,7 @@ const en: Record<TranslationKey, string> = {
   'settings.helpExpand': 'Show more',
   'settings.helpCollapse': 'Show less',
   'settings.liveHint':
-    'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts, temporary chat and the IP pool apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
+    'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts, upstream channels, temporary chat, the IP pool, the API key and the like apply immediately; the account directory, default proxy and WAA backend need a generation service restart; the listen address needs a restart of the management process.',
   'logs.categoryAll': 'All',
   'logs.categoryRequest': 'Requests',
   'logs.categoryAccount': 'Accounts',
