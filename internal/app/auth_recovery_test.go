@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -439,6 +440,107 @@ func TestStartupRecoveryWithRequestWaitingForOpening(t *testing.T) {
 	}
 	if status := authTestStatus(t, pool); status.State == aistudio.AccountAuthRequired {
 		t.Fatalf("有续签材料的账户不应因等待超时被标为需要登录（%s）", status.Message)
+	}
+}
+
+// TestStartupRecoveryDoesNotWaitForOpeningWaiter 同账户另一个请求只是在等本次 Worker 启动结束（ensureWorker 已标记，
+// beginOpeningWait）：启动里的续签不等它、立即续签并重新启动，不再白等 authRefreshWaitLimit 兜底上限。
+// 等待请求拿到 Worker 后标记随即撤销（不等租约释放）：这时它可能正在流式输出，之后的续签必须等它结束，不能在它下面重置 WAA runtime
+func TestStartupRecoveryDoesNotWaitForOpeningWaiter(t *testing.T) {
+	pool, account := authTestPool(t, true)
+	firstLaunch := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	manager, launches := authTestManager(t, pool, account, func(call int32) (*aistudio.NativeWorker, error) {
+		if call == 1 {
+			close(firstLaunch)
+			<-releaseFirst
+			return nil, loginRedirectError()
+		}
+		worker, _ := aistudio.NewStubWorker(authTestAccount, 0)
+		return worker, nil
+	})
+	// 断言失败提前结束时也放行第一次启动：否则启动一直卡在这里，清理时关闭管理器要等它，整个 go test 挂到超时
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseFirst) }) }
+	t.Cleanup(release)
+	counts := &authTestCounts{}
+	refresher := newAuthTestRefresher(t, counts)
+	// 兜底上限远大于测试期限：续签若还在等那个请求，下面的等待按期限失败（不靠 go test 的总超时）
+	refresher.waitLimit = time.Minute
+	refresher.reset = func(accountID string) error {
+		counts.resets.Add(1)
+		return manager.Reset(accountID)
+	}
+	manager.refresher = refresher
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	starterLease, starterCtx := authTestLease(t, pool)
+	waiterLease, waiterCtx := authTestLease(t, pool)
+	starterCtx, starterCancel := context.WithTimeout(starterCtx, 10*time.Second)
+	defer starterCancel()
+	waiterCtx, waiterCancel := context.WithTimeout(waiterCtx, 10*time.Second)
+	defer waiterCancel()
+	starter := make(chan error, 1)
+	go func() {
+		_, err := manager.Worker(starterCtx, authTestAccount, "gemini-test")
+		starter <- err
+	}()
+	select {
+	case <-firstLaunch:
+	case <-ctx.Done():
+		t.Fatal("Worker 没有开始启动")
+	}
+	waiter := make(chan error, 1)
+	go func() {
+		_, err := manager.Worker(waiterCtx, authTestAccount, "gemini-test")
+		waiter <- err
+	}()
+	// 确认第二个请求已进入等待、挂上标记（之后才放行启动，断言才覆盖“标记撤销”）：探测续签在 2 个请求、1 个续签、1 个等待时立即放行
+	endProbe, ok := starterLease.BeginAuthRefresh()
+	if !ok {
+		t.Fatal("应能开始探测续签")
+	}
+	waitFor(t, "等待请求挂上标记", func() bool {
+		probeCtx, probeCancel := context.WithTimeout(ctx, 20*time.Millisecond)
+		defer probeCancel()
+		return starterLease.WaitForAuthRefresh(probeCtx) == nil
+	})
+	endProbe()
+	startedAt := time.Now()
+	release()
+	resultLimit := time.After(5 * time.Second)
+	for name, result := range map[string]chan error{"启动请求": starter, "等待请求": waiter} {
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("%s应拿到 Worker，实际 %v", name, err)
+			}
+		case <-resultLimit:
+			t.Fatalf("%s：续签仍在等待只是在等 Worker 启动的请求", name)
+		}
+	}
+	if elapsed := time.Since(startedAt); elapsed > 5*time.Second {
+		t.Fatalf("续签不应等待在等 Worker 启动的请求，耗时 %s", elapsed)
+	}
+	if launches.Load() != 2 || counts.refreshes.Load() != 1 || authTestSAPISID(t, account) != "NEW" {
+		t.Fatalf("应续签一次后重新启动: 启动=%d 续签=%d", launches.Load(), counts.refreshes.Load())
+	}
+	// 两个请求都拿到了 Worker、租约还没释放：等待请求的标记已撤销，这时的续签要等它结束
+	endRefresh, ok := starterLease.BeginAuthRefresh()
+	if !ok {
+		t.Fatal("应能开始续签")
+	}
+	defer endRefresh()
+	waitCtx, waitCancel := context.WithTimeout(ctx, 200*time.Millisecond)
+	defer waitCancel()
+	if err := starterLease.WaitForAuthRefresh(waitCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("拿到 Worker 的请求还在进行时续签应等待（标记应已撤销），得到 %v", err)
+	}
+	if err := waiterLease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := starterLease.WaitForAuthRefresh(ctx); err != nil {
+		t.Fatalf("其他请求结束后续签应放行：%v", err)
 	}
 }
 

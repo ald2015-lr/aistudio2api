@@ -159,7 +159,7 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 | --- | --- |
 | `WAA Worker 按需扩容 | Worker=N/M` | 活动 Worker 未达 `MAX_ACTIVE_WORKERS`，新 Worker 成功发布 |
 | `WAA Worker 按需替换 | Worker=N/M` | `pending Worker`（正在启动的替代 Worker）成功启动并替换一个空闲 Worker |
-| `WAA Worker 空闲回收 | Worker=N/M` | 超出热池目标的 Worker 空闲 5 分钟后关闭 |
+| `WAA Worker 空闲回收 | Worker=N/M` | 超出热池目标的 Worker 空闲 5 分钟后关闭；`N` 为关闭之后的数 |
 | `WAA Worker 旧实例停止失败` | 旧实例关闭失败，发布中止并开始关闭 pending Worker |
 | `WAA Worker 重建 | 模型=... | 重放当前请求` | 当前账户 Worker 已失效，业务请求在新实例重放；下一行 `原因:` 为触发重建的错误 |
 | `WAA Worker 后台恢复放弃 | 等待=<DURATION> | ...` | 后台关闭失败的 Worker 时超过排空超时（总时长上限 + 30 秒，总时长上限为 1 小时与 `REQUEST_TIMEOUT` 中较长者；登记关闭时账号上还有 `long-` 自动续写的请求时按续写的绝对总时长上限，即总时长上限的 6 倍，再加到期后体面结束的 30 秒）仍有同账户请求在用，放弃这次关闭、账户恢复接受请求；浏览器已失败的 Worker 由失败 Worker 巡检重新登记，协议 Code 5 的 Worker 在再次失败时重新登记 |
@@ -170,6 +170,8 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`，换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回去等待，写 `换号次数已用完，回到原账号等待 Worker 恢复后重放` 或 `已连续 5 次失败，回到原账号等待 Worker 恢复后重放`。这次失败计入连续失败上限后就到上限的请求不再换号，直接等原账户关闭完成。换号后的选号在排队（其他账户都忙）时原账户关闭完成，写 `换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号`：不再排除原账户，按原来的排队位置重新选号，不固定到原账户（关闭后它没有 Worker，要冷启动并占一个 Worker 槽位），原账户与其他账户哪个先能用就用哪个。回到原账户等待时请求超时或被取消，错误为 `回到原账号等待 <DURATION> 后请求超时（最后原因=WAA Worker 恢复，上次失败=...）: context deadline exceeded`（取消时为 `请求已取消`），对外仍是 504 或取消的官方措辞；经生成服务以首事件前期限结束时，`request.error` 前面另加 `本服务首事件前期限 <DURATION> 到期: `（见[流式等待](#流式等待)）。
 
 按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）；`OMNI_IGNORE_SYSTEM_PROMPT` 发生变化时记录 `视频模型忽略系统提示设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后进入的请求按新设置整理，Omni 请求去掉系统提示时的说明见 [API 请求](#api-请求)）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`策略=<ROUTING_STRATEGY>` 之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；`IP 池` 之前带 `自动续写=<关闭 / 开启（默认总上限 N）>`，为保存并随这次热更新生效的 `LONG_OUTPUT_ENABLED` 与 `LONG_OUTPUT_MAX_TOKENS`（之后开始的请求立即按新设置）；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
+
+空闲回收与按需替换只在 `rebalanceMu` 内选中并预留被关闭的 Worker（`tryReserveVictim`），关闭浏览器在锁外进行：关一个浏览器要几秒，原先这期间所有账户的冷启动、扩容、替换与删除都排队等它，日志里表现为一批 `WAA Worker 启动 | 1/7` 在某个 `WAA Worker 已停止` 之后才集中出现。被关闭的 Worker 关完之前照常占着它的槽位（按需替换时新 Worker 的启动占位也一直保留），容量判断不会多放出槽位；预留期间其他淘汰路径（替换、冷却轮换、死槽位回收）不会再选它；空闲回收关闭期间同分区的按需启动不走按需替换（不会为它再关掉另一个空闲 Worker），等回收关完后按空槽写 `按需扩容`。淘汰对象在关闭期间被删除时按已淘汰处理，不写 `WAA Worker 空闲回收失败`，按需替换的请求也不失败。淘汰对象的 `account.json` 或认证文件被外部移走、目录扫描还没把它移出账户池时（它的 Worker 还活着），空闲回收照旧写 `WAA Worker 空闲回收失败 | 错误=淘汰对象的账户文件已不在…` 并结束本轮；按需替换写 `WAA Worker 按需替换跳过淘汰对象 | 错误=…`（来源为该账户）并换下一个淘汰对象，请求不失败，驻留数不超过峰值；等下一个淘汰对象期间分区空出了槽位（跳过的账户被目录扫描移出、其他 Worker 被删除或回收）时直接发布新 Worker、写 `按需扩容`，跳过的账户文件放回后重新参与选号；一直没有空出槽位、也没有别的淘汰对象（例如只删了 `account.json`、目录还在，目录扫描不会移出它）时最多等约 70 秒，随后关掉没发布的新浏览器，后台扩容写 `WAA Worker 后台扩容失败 | 错误=淘汰对象的账户文件已不在…：等了 1m10s 仍没有空出槽位或其他可淘汰的 Worker`。按需替换的 `WAA Worker 停止`、`WAA Worker 已停止` 两行与新 Worker 的 `就绪`、`按需替换` 之间因此可能夹着其他账户的启动日志。
 
 保存服务配置使 `ULTRA_INCLUDE_PRO` 实际切换时（热更新；同一次保存还改了需要重建生成服务的字段时随重建生效，不写这几行），`service` 依次记录下面几行。数值都在切换之后读取当前状态：`并入` 为账户池当前的开关，`Ultra 号池账户` 为当前属于 Ultra 号池的账户数，两个分区的 Worker 数为驻留与正在启动的 Worker 之和，`/` 后为 `ULTRA_MAX_ACTIVE_WORKERS` 与 `MAX_ACTIVE_WORKERS`。已运行的 Worker 不重启，只改按新分区计数：
 
@@ -1049,7 +1051,7 @@ data: {"type":"ping"}
 
 ## 账户事件
 
-HTTP `401`、协议 Code 16、Worker 启动时跳转登录页或签名 Cookie 失效会使用该 Chrome 导入账户保存的 OAuth/DBSC 材料续签 Cookie、重置 WAA Worker并重放一次请求。续签先等待同账户其他请求结束，12 秒内没有结束时不再等待、继续续签；等待期间请求取消时放弃本次续签，记录 `账户认证续签放弃`。
+HTTP `401`、协议 Code 16、Worker 启动时跳转登录页或签名 Cookie 失效会使用该 Chrome 导入账户保存的 OAuth/DBSC 材料续签 Cookie、重置 WAA Worker并重放一次请求。续签先等待同账户其他请求结束，12 秒内没有结束时不再等待、继续续签（写 `账户认证续签 | 同账户其他请求 12s 内没有结束，不再等待`）；正在等同账户 Worker 启动结束的请求不算（它还没拿到 Worker，续签打断不了它）：冷启动时续签多半就在那次启动里，原先启动它的请求与等它的同账户请求互相等满 12 秒，现在立即续签，12 秒只作兜底。等待期间请求取消时放弃本次续签，记录 `账户认证续签放弃`。
 
 ```text
 INFO  account@example.com  账户认证续签 | 1/2 | 刷新 Cookie

@@ -271,3 +271,100 @@ func TestForwardEventsConfirmsAuthOnFinish(t *testing.T) {
 		t.Fatalf("正常结束应保持就绪，实际 %s", status.State)
 	}
 }
+
+// TestWaitForAuthRefreshSkipsOpeningWaiters 正在等待同账户 Worker 启动结束的租约（BeginOpeningWait）不算要等的请求；
+// 撤销标记或其他普通请求仍在时照旧等待；带着标记释放的租约不会留下多计的等待者
+func TestWaitForAuthRefreshSkipsOpeningWaiters(t *testing.T) {
+	pool := testPoolWithAccount(t, "alice@example.com")
+	pool.SetPerAccountConcurrency(8)
+	ctx := context.Background()
+	acquire := func() *AccountLease {
+		t.Helper()
+		lease, err := pool.AcquireFor(ctx, AccountSelection{AccountID: "alice@example.com"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = lease.Release() })
+		return lease
+	}
+	expectWait := func(refresher *AccountLease, wantReady bool, message string) {
+		t.Helper()
+		shortCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		defer cancel()
+		err := refresher.WaitForAuthRefresh(shortCtx)
+		if wantReady && err != nil {
+			t.Fatalf("%s：应立即返回，实际 %v", message, err)
+		}
+		if !wantReady && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s：应等到期限，实际 %v", message, err)
+		}
+	}
+	refresher := acquire()
+	opening := acquire()
+	streaming := acquire()
+	end, ok := refresher.BeginAuthRefresh()
+	if !ok {
+		t.Fatal("BeginAuthRefresh 被拒绝")
+	}
+	defer end()
+
+	endWait := opening.BeginOpeningWait()
+	expectWait(refresher, false, "另一个请求仍在流式输出")
+	if err := streaming.Release(); err != nil {
+		t.Fatal(err)
+	}
+	expectWait(refresher, true, "只剩等待 Worker 启动的请求")
+	endWait()
+	endWait()
+	expectWait(refresher, false, "等待结束后它就是正常请求")
+
+	// 等待中被唤醒：标记一出现续签即放行
+	done := make(chan error, 1)
+	go func() {
+		waitCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		done <- refresher.WaitForAuthRefresh(waitCtx)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	endWait = opening.BeginOpeningWait()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("标记后应放行，实际 %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("标记后续签仍在等待")
+	}
+
+	// 带着标记释放（撤销函数还没调用）：计数随租约撤销，新来的正常请求照样要等
+	if err := opening.Release(); err != nil {
+		t.Fatal(err)
+	}
+	end()
+	if err := refresher.Release(); err != nil {
+		t.Fatal(err)
+	}
+	next := acquire()
+	other := acquire()
+	endNext, ok := next.BeginAuthRefresh()
+	if !ok {
+		t.Fatal("BeginAuthRefresh 被拒绝")
+	}
+	defer endNext()
+	expectWait(next, false, "释放时应撤销等待标记")
+	endWait()
+	expectWait(next, false, "释放后再撤销标记不应多减")
+
+	// 独占租约与已释放的租约不计入
+	if err := other.Release(); err != nil {
+		t.Fatal(err)
+	}
+	released := other.BeginOpeningWait()
+	released()
+	pool.mu.Lock()
+	waiters := next.Account().openingWaiters
+	pool.mu.Unlock()
+	if waiters != 0 {
+		t.Fatalf("已释放的租约不应计入等待者，实际 %d", waiters)
+	}
+}

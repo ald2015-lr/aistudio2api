@@ -504,6 +504,7 @@ type Account struct {
 	exclusive         bool
 	exclusiveWaiters  int
 	authRefreshers    int
+	openingWaiters    int // 正在等待同账户 Worker 启动结束的普通租约数（见 AccountLease.BeginOpeningWait），受账户池 mu 保护
 	leaseLock         *flock.Flock
 	leasePath         string
 	storageMu         sync.Mutex
@@ -791,6 +792,8 @@ type AccountLease struct {
 	rateContinuation uint64
 	egressAdmitAt    int64
 	longOutput       bool
+	// openingWaits 为本租约计入账户 openingWaiters 的次数（见 BeginOpeningWait），受账户池 mu 保护；释放时一并撤销
+	openingWaits int
 }
 
 // AccountRuntimeLease 保证同一邮箱只有一个 WAA runtime
@@ -2231,8 +2234,9 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 }
 
 // WaitForAuthRefresh 在 BeginAuthRefresh 之后等待同账户的其他正常请求结束，或复用其他租约已经提交的新认证：
-// 续签会重置账户的 WAA runtime，正在流式输出的请求不能被打断。调用方必须给 ctx 设上限，
-// 同账户的请求可能正等待本次续签所在的 Worker 启动结束
+// 续签会重置账户的 WAA runtime，正在流式输出的请求不能被打断。正在等待同账户 Worker 启动结束的租约（BeginOpeningWait）
+// 不用 runtime，不算要等的请求：冷启动时续签多半就在那次启动里，原先两边互相等到上限（app 层 12 秒）。
+// 调用方仍必须给 ctx 设上限作兜底（标记之外的等待，例如租约在 Worker 启动前的其他环节）
 func (l *AccountLease) WaitForAuthRefresh(ctx context.Context) error {
 	if l == nil || l.account == nil || l.pool == nil {
 		return fmt.Errorf("账户租约未初始化")
@@ -2245,7 +2249,8 @@ func (l *AccountLease) WaitForAuthRefresh(ctx context.Context) error {
 		generation := l.authGeneration
 		l.operation.Unlock()
 		l.pool.mu.Lock()
-		ready := l.exclusive || generation != l.account.authGeneration || l.account.active <= l.account.authRefreshers
+		ready := l.exclusive || generation != l.account.authGeneration ||
+			l.account.active <= l.account.authRefreshers+l.account.openingWaiters
 		changed := l.pool.changed
 		l.pool.mu.Unlock()
 		if ready {
@@ -2256,6 +2261,40 @@ func (l *AccountLease) WaitForAuthRefresh(ctx context.Context) error {
 			return ctx.Err()
 		case <-changed:
 		}
+	}
+}
+
+// BeginOpeningWait 把租约标记为正在等待同账户的 Worker 启动结束（app 层 ensureWorker 等 openings 时），期间
+// WaitForAuthRefresh 不等它：它还没拿到 Worker、不用 WAA runtime，续签重置 runtime 打断不了它。返回的函数撤销标记，
+// 可重复调用；租约释放时标记一并撤销（不会留下多计的等待者，让续签误以为其他请求都已结束）。独占租约与已释放的租约不计
+func (l *AccountLease) BeginOpeningWait() func() {
+	if l == nil || l.account == nil || l.pool == nil {
+		return func() {}
+	}
+	l.operation.Lock()
+	defer l.operation.Unlock()
+	l.pool.mu.Lock()
+	defer l.pool.mu.Unlock()
+	if l.released || l.exclusive {
+		return func() {}
+	}
+	l.openingWaits++
+	l.account.openingWaiters++
+	l.pool.notifyLocked()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			l.pool.mu.Lock()
+			defer l.pool.mu.Unlock()
+			if l.openingWaits == 0 {
+				return
+			}
+			l.openingWaits--
+			if l.account.openingWaiters > 0 {
+				l.account.openingWaiters--
+			}
+			l.pool.notifyLocked()
+		})
 	}
 }
 
@@ -2814,6 +2853,10 @@ func (l *AccountLease) releaseLocked() {
 		if l.account.longOutputs > 0 {
 			l.account.longOutputs--
 		}
+	}
+	if l.openingWaits > 0 {
+		l.account.openingWaiters = max(l.account.openingWaiters-l.openingWaits, 0)
+		l.openingWaits = 0
 	}
 	l.pool.notifyLocked()
 }

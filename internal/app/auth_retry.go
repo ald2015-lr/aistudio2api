@@ -46,8 +46,9 @@ func authRenewPlatformSupported() bool {
 	return runtime.GOOS == "windows"
 }
 
-// authRefreshWaitLimit 为续签等待同账户其他正常请求结束的上限。同账户的请求可能正在等待本次续签所在的
-// Worker 启动结束（ensureWorker 的 waitForOpening），不设上限会互相等待；超时后不再等待，继续续签
+// authRefreshWaitLimit 为续签等待同账户其他正常请求结束的上限。在 ensureWorker 里等本次续签所在的 Worker 启动结束的请求
+// 已标记、不再计入（beginOpeningWait），这个上限是兜底：其他等待（例如租约在 Worker 启动之前的环节）不设上限仍会互相等待；
+// 超时后不再等待，继续续签
 const authRefreshWaitLimit = 12 * time.Second
 
 // authRetryTransport 为普通 RPC 执行一次认证续签重试

@@ -9,6 +9,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -242,6 +243,9 @@ type accountWorkerManager struct {
 	pool             *aistudio.AccountPool
 	accounts         map[string]*accountWorker
 	openings         map[string]chan struct{}
+	// reaping 为各分区正在锁外关闭的空闲回收数（见 reapIdleWorkerIn），由 rebalanceMu 保护：大于 0 时同分区的按需启动不选替换对象，
+	// 等回收关完、按空槽扩容
+	reaping map[aistudio.PoolScope]int
 	// openingSet 是 openings 的无锁镜像，供状态接口读取正在启动的账户
 	openingSet sync.Map
 	// warmFailures 记录预热失败的账户与时间，冷却期内不再反复尝试
@@ -637,26 +641,25 @@ func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 }
 
 // reapIdleWorkerIn 在分区的 Worker 超出该分区常驻数时关闭其中一个空闲超时的 Worker：在热门或主用模型上长时间冷却的死槽位优先，
-// 留下还能服务主用模型的 Worker
+// 留下还能服务主用模型的 Worker。只在 rebalanceMu 内选中并预留淘汰对象（reserveReapVictim），关闭浏览器在锁外进行
+// （关一个浏览器要几秒，原先这期间所有账户的冷启动、扩容、替换与移除都在 rebalanceMu 上排队）。锁外关闭期间：
+// 预留让其他淘汰路径（替换、冷却轮换、死槽位回收）不再选它；它的 Worker 关完之前仍按占用计入分区容量（occupiedWorkersIn：
+// Worker 还在、或账户锁被关闭流程占用都计 1 个槽位），不会多放出槽位；分区记一次进行中的回收（reaping），同分区的按需启动
+// 不选替换对象（原先回收持有 rebalanceMu，按需启动等回收关完后按空槽扩容，不会再淘汰另一个空闲 Worker），关完后撤销并唤醒排队的请求。
+// 回收本身只在分区没有 Worker 正在启动时开始（reserveReapVictim），两者在 rebalanceMu 内互斥
 func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolScope, before time.Time) bool {
-	manager.rebalanceMu.Lock()
-	defer manager.rebalanceMu.Unlock()
-	ultra := manager.pool.UltraAccountIDs()
-	if manager.openingIn(partition, ultra) || len(inPartition(manager.WarmAccountIDs(), ultra, partition)) <= manager.warmTargetFor(partition) {
-		return false
-	}
-	victim := manager.pickIdleVictimFor("", "", manager.deadSlotModelsFor(partition), victimAny, partition, before)
+	victim := manager.reserveReapVictim(partition, before)
 	if victim == "" {
 		return false
 	}
-	manager.mu.RLock()
-	account := manager.accounts[victim]
-	manager.mu.RUnlock()
-	_, lastUsed := manager.pool.Activity(victim)
-	if lastUsed.After(before) || account != nil && time.Unix(0, account.readyAt.Load()).After(before) {
-		return false
+	evicted, err := manager.evictReservedVictim(manager.lifecycle, victim)
+	manager.releaseVictim(victim)
+	manager.rebalanceMu.Lock()
+	if manager.reaping[partition]--; manager.reaping[partition] <= 0 {
+		delete(manager.reaping, partition)
 	}
-	evicted, err := manager.evictIdleWorker(manager.lifecycle, victim)
+	manager.rebalanceMu.Unlock()
+	manager.notifyScheduling()
 	if err != nil {
 		manager.requests.log(victim, "WARN", fmt.Sprintf("WAA Worker 空闲回收失败 | 错误=%v", err))
 		return false
@@ -667,6 +670,37 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 		))
 	}
 	return evicted
+}
+
+// reserveReapVictim 在 rebalanceMu 内判断分区是否超出常驻数（没有 Worker 在启动时），选出一个空闲超时的 Worker 并预留
+// （tryReserveVictim），同时为分区记一次进行中的回收（reaping），返回它的账户；没有可回收的或已被其他路径预留时返回空。
+// 调用方关闭后 releaseVictim 并撤销 reaping
+func (manager *accountWorkerManager) reserveReapVictim(partition aistudio.PoolScope, before time.Time) string {
+	manager.rebalanceMu.Lock()
+	defer manager.rebalanceMu.Unlock()
+	ultra := manager.pool.UltraAccountIDs()
+	if manager.openingIn(partition, ultra) || len(inPartition(manager.WarmAccountIDs(), ultra, partition)) <= manager.warmTargetFor(partition) {
+		return ""
+	}
+	victim := manager.pickIdleVictimFor("", "", manager.deadSlotModelsFor(partition), victimAny, partition, before)
+	if victim == "" {
+		return ""
+	}
+	manager.mu.RLock()
+	account := manager.accounts[victim]
+	manager.mu.RUnlock()
+	_, lastUsed := manager.pool.Activity(victim)
+	if lastUsed.After(before) || account != nil && time.Unix(0, account.readyAt.Load()).After(before) {
+		return ""
+	}
+	if !manager.tryReserveVictim(victim) {
+		return ""
+	}
+	if manager.reaping == nil {
+		manager.reaping = make(map[aistudio.PoolScope]int)
+	}
+	manager.reaping[partition]++
+	return victim
 }
 
 // forwardPoolChanges 在账户池租约或状态变化后唤醒排队请求，并让待淘汰的冷却 Worker 在租约释放后被关闭
@@ -760,7 +794,7 @@ func (manager *accountWorkerManager) Reset(accountID string) error {
 	account := manager.accounts[accountID]
 	manager.mu.RUnlock()
 	if account == nil {
-		return fmt.Errorf("WAA worker 账户不存在: %s", accountID)
+		return fmt.Errorf("%w: %s", errWorkerAccountMissing, accountID)
 	}
 	account.startupMu.Lock()
 	defer account.startupMu.Unlock()
@@ -1585,6 +1619,90 @@ func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID
 	return manager.pickIdleVictim(excludeID, modelID, mode, partition)
 }
 
+// errWorkerAccountMissing 为 Worker 管理器里已经没有这个账户（已删除，见 Reset）
+var errWorkerAccountMissing = errors.New("WAA worker 账户不存在")
+
+// evictReservedVictim 在 rebalanceMu 外淘汰已预留的 victim（空闲回收与按需替换）。victim 在淘汰期间被删除时按已淘汰处理、不算错误：
+// 删除（单个、批量删除与账户目录移走）先在账户池里取得独占、在回调里关闭它的 Worker（workers.Reset）、移出账户池，最后才从管理器移除，
+// 于是这里取账户租约得到 aistudio.ErrAccountNotFound、账户池里也已没有它（Worker 已由删除流程关闭），或者取得租约后 Reset 得到
+// errWorkerAccountMissing（管理器已移除）。关闭期间账户锁被占着，仍按 1 个槽位计入占用。原先淘汰持有 rebalanceMu，删除要等淘汰结束，
+// 遇不到这种情况；现在按错误返回会让按需替换关掉已经启动好的新浏览器、请求失败，空闲回收写一条失败日志。
+// 取租约得到 ErrAccountNotFound 而账户还在账户池里时不算已淘汰（errVictimFilesMissing）：账户的 account.json 或认证文件被外部移走、
+// 目录扫描还没把它移出（单个缺失约 20 秒，批量缺失约 1 分钟），它的 Worker 还活着。原先一律按已淘汰处理，空闲回收原地空转、
+// 每轮写一条“空闲回收”，按需替换不关旧浏览器就发布新的，驻留数超过峰值
+func (manager *accountWorkerManager) evictReservedVictim(ctx context.Context, victim string) (bool, error) {
+	evicted, err := manager.evictIdleWorker(ctx, victim)
+	switch {
+	case evicted && errors.Is(err, errWorkerAccountMissing):
+		return true, nil
+	case !evicted && errors.Is(err, aistudio.ErrAccountNotFound):
+		if _, poolErr := manager.pool.Account(victim); errors.Is(poolErr, aistudio.ErrAccountNotFound) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%w: %w", errVictimFilesMissing, err)
+	}
+	return evicted, err
+}
+
+// errVictimFilesMissing 为淘汰对象还在账户池里、但账户文件已不在（见 evictReservedVictim），它的 Worker 还没有关闭
+var errVictimFilesMissing = errors.New("淘汰对象的账户文件已不在，等目录扫描移出账户")
+
+// staleVictimWait 为按需替换跳过账户文件已不在的淘汰对象之后，最多等多久还没有空出槽位、也没有别的淘汰对象就放弃（关掉没发布的新浏览器）：
+// 目录被移走的账户由目录扫描在两轮（约 20 秒）内移出，批量缺失时约 1 分钟，上限比批量缺失再多一轮扫描。只删了 account.json、
+// 目录还在的账户不会被移出，原先按需替换一直等到请求超时，不带期限的后台扩容一直挂住、占着启动占位
+var staleVictimWait = (massMissingScans + 1) * accountScanInterval
+
+// recheckStaleVictims 复查按需替换跳过的淘汰对象（账户文件已不在，见 ensureWorker）：已移出账户池的（移出流程已关闭它的 Worker，
+// 空出的槽位由调用方按容量发布），或账户文件已放回的（取租约会成功，可以照常淘汰），解除预留、不再跳过，返回仍要跳过的。
+// 原先跳过的对象保持预留到替换结束：文件放回后选号仍跳过它，替换一直等到请求超时
+func (manager *accountWorkerManager) recheckStaleVictims(stale []string) []string {
+	kept := stale[:0]
+	for _, accountID := range stale {
+		if account, err := manager.pool.Account(accountID); err == nil && !accountFilesPresent(account) {
+			kept = append(kept, accountID)
+			continue
+		}
+		manager.releaseVictim(accountID)
+	}
+	return kept
+}
+
+// accountFilesPresent 判断账户的 account.json 与认证文件都在（与账户池取租约时的检查相同）；没有持久文件的账户（测试构造）按都在处理
+func accountFilesPresent(account *aistudio.Account) bool {
+	if account == nil || account.ConfigPath == "" {
+		return true
+	}
+	for _, path := range []string{account.ConfigPath, account.StoragePath} {
+		if strings.TrimSpace(path) == "" {
+			return false
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() {
+			return false
+		}
+	}
+	return true
+}
+
+// replacementFitsLocked 判断按需替换已不必再淘汰：按 ensureWorker 扩容的同一口径统计分区占用（排空中的 Worker 按已让出计，
+// 同分区每个启动占位计 1 个槽位，含这次替换自己的），合计不超过峰值时新 Worker 可以直接发布。等淘汰对象期间分区可能已空出槽位：
+// 跳过的淘汰对象被目录扫描移出、其他 Worker 被删除或回收。调用方持有 rebalanceMu
+func (manager *accountWorkerManager) replacementFitsLocked(partition aistudio.PoolScope) bool {
+	ultra := manager.pool.UltraAccountIDs()
+	occupancy := manager.occupiedWorkersIn(partition, ultra)
+	slots := occupancy.effectiveSlots()
+	for openingAccountID := range manager.openings {
+		if partitionOf(openingAccountID, ultra) != partition {
+			continue
+		}
+		// 与扩容判断相同：账户锁被占用的已按 1 个槽位估计，不再重复计入
+		if _, estimated := occupancy.lockBusy[openingAccountID]; !estimated {
+			slots++
+		}
+	}
+	return slots <= manager.maxActiveFor(partition)
+}
+
 func (manager *accountWorkerManager) evictIdleWorker(ctx context.Context, accountID string) (bool, error) {
 	evictionCtx, cancel := context.WithTimeout(ctx, workerEvictionTimeout)
 	defer cancel()
@@ -1640,10 +1758,14 @@ func (manager *accountWorkerManager) ensureWorker(
 			if !waitForOpening {
 				return nil, errAccountWorkerOpening
 			}
+			// 等待期间这个请求不用 WAA runtime：标记后，启动里的认证续签不再等它（见 beginOpeningWait）
+			endWait := beginOpeningWait(ctx, accountID)
 			select {
 			case <-ctx.Done():
+				endWait()
 				return nil, ctx.Err()
 			case <-opening:
+				endWait()
 				continue
 			}
 		}
@@ -1733,8 +1855,10 @@ func (manager *accountWorkerManager) ensureWorker(
 		// 淘汰选号与现场提升判断“能否替换”同一口径（replaceVictimFor，N3）：同分区有 Worker 正在启动时只换冷却中、死槽位、不可调度的，
 		// 以及对该模型不可服务或空闲超过 victimIdleReplaceAfter 的健康空闲 Worker；刚就绪不到 rotationWarmupGrace 的不换（N6）。
 		// 每个分区每分钟的按需替换不超过 replacementsPerMinute（N6），超过时排队等待（不等待的选号按容量已满返回）
+		// 同分区正在锁外关闭空闲回收的 Worker 时不选替换对象：回收关完就空出槽位，按空槽扩容，不必再淘汰另一个空闲 Worker
+		// （原先回收全程持有 rebalanceMu，这里等它结束后走扩容）；等待的请求由回收结束时的调度信号唤醒，不等待的选号按容量已满返回
 		victim := ""
-		if manager.replacementAllowed(ctx, partition) {
+		if manager.reaping[partition] == 0 && manager.replacementAllowed(ctx, partition) {
 			victim = manager.replaceVictimFor(accountID, modelID, partition)
 		}
 		// 与冷却轮换共用淘汰标记：选中后原子标记，已被轮换标记的视为不可用，下一轮重新选择
@@ -1766,7 +1890,15 @@ func (manager *accountWorkerManager) ensureWorker(
 		// 闸门放行后才记一次按需替换（N6）：被闸门拒掉的尝试没有启动浏览器，不占每分钟的替换名额。原先选中淘汰对象就记，
 		// 出口限流期间每个排队请求每次复查都用掉一次，名额很快用完，闸门本来会放行的补覆盖也拿不到可替换的 Worker
 		manager.noteReplacement(ctx, partition)
-		defer func() { manager.releaseVictim(victim) }()
+		// staleVictims 为账户文件已不在、跳过的淘汰对象（见下面的循环），替换结束时一并解除预留；staleSince 为第一次跳过的时间
+		var staleVictims []string
+		var staleSince time.Time
+		defer func() {
+			manager.releaseVictim(victim)
+			for _, stale := range staleVictims {
+				manager.releaseVictim(stale)
+			}
+		}()
 		opening := make(chan struct{})
 		manager.openings[accountID] = opening
 		manager.openingSet.Store(accountID, struct{}{})
@@ -1779,59 +1911,98 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return nil, startErr
 		}
-		for {
+		// abandon 关闭还没发布的新 Worker 后再结束启动占位：关闭浏览器不持有 rebalanceMu，启动占位一直保留到浏览器关完（期间照常计入占用）
+		abandon := func(cause error) (aistudio.ProtectedPreparer, error) {
+			discardErr := discardAccountWorker(pending)
 			manager.rebalanceMu.Lock()
+			manager.finishOpening(accountID, opening)
+			manager.rebalanceMu.Unlock()
+			return nil, errors.Join(cause, discardErr)
+		}
+		// publish 在 rebalanceMu 内发布新 Worker 并结束启动占位（调用方已加锁，返回前解锁），kind 为日志里的“按需替换”或“按需扩容”
+		publish := func(kind string) (aistudio.ProtectedPreparer, error) {
+			activationErr := activateAccountWorker(pending)
+			manager.finishOpening(accountID, opening)
+			warmCount := len(manager.warmAccountIDsIn(partition))
+			manager.rebalanceMu.Unlock()
+			if activationErr != nil {
+				return nil, activationErr
+			}
+			if workerStartSourceFrom(ctx) != workerStartPrewarm {
+				manager.requests.log("service", "INFO", fmt.Sprintf(
+					"%s %s | Worker=%d/%d | 超出常驻=%s",
+					workerLogName(partition), kind, warmCount, manager.maxActiveFor(partition), aboveResidentText(warmCount > manager.warmTargetFor(partition)),
+				))
+			}
+			return pending, nil
+		}
+		for {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				discardErr := discardAccountWorker(pending)
-				manager.finishOpening(accountID, opening)
-				manager.rebalanceMu.Unlock()
-				return nil, errors.Join(ctxErr, discardErr)
+				return abandon(ctxErr)
 			}
 			if victim == "" {
+				// 选下一个淘汰对象之前：先复查跳过的对象（已移出的不再算、文件放回的重新参与选号），再看分区是否已空出槽位。
+				// 原先只等下一个淘汰对象：跳过的对象被目录扫描移出、槽位已空出后，峰值为 1 的分区一直等到请求超时、关掉已启动好的新浏览器，
+				// 不带期限的后台扩容一直挂住、占着启动占位；峰值更大时又淘汰一个健康的空闲 Worker，分区比峰值少一个
+				staleVictims = manager.recheckStaleVictims(staleVictims)
+				manager.rebalanceMu.Lock()
+				if manager.replacementFitsLocked(partition) {
+					return publish("按需扩容")
+				}
 				victim = manager.pickReplaceVictim(accountID, modelID, victimAny, partition)
 				if victim != "" && !manager.tryReserveVictim(victim) {
 					victim = ""
 				}
+				manager.rebalanceMu.Unlock()
 			}
 			if victim == "" {
-				manager.rebalanceMu.Unlock()
+				// 只剩跳过的对象可换时等待有上限（staleVictimWait）：只删了 account.json、目录还在的账户不会被目录扫描移出
+				if len(staleVictims) > 0 && time.Since(staleSince) >= staleVictimWait {
+					return abandon(fmt.Errorf("%w：等了 %s 仍没有空出槽位或其他可淘汰的 Worker", errVictimFilesMissing, staleVictimWait))
+				}
 				if err := waitWarmCandidate(ctx, 100*time.Millisecond); err != nil {
-					manager.rebalanceMu.Lock()
-					discardErr := discardAccountWorker(pending)
-					manager.finishOpening(accountID, opening)
-					manager.rebalanceMu.Unlock()
-					return nil, errors.Join(err, discardErr)
+					return abandon(err)
 				}
 				continue
 			}
-			evicted, evictionErr := manager.evictIdleWorker(ctx, victim)
+			// 锁外淘汰（关一个浏览器要几秒，原先持有 rebalanceMu，期间所有账户的冷启动、扩容、替换与移除都要排队）：
+			// victim 已预留，其他淘汰路径不会再选它；本账户的启动占位一直保留，victim 的 Worker 关完之前也照常计入占用
+			// （occupiedWorkersIn），期间分区不会多放出槽位。发布新 Worker 与结束占位仍在 rebalanceMu 内一起完成
+			evicted, evictionErr := manager.evictReservedVictim(ctx, victim)
+			if errors.Is(evictionErr, errVictimFilesMissing) && ctx.Err() == nil {
+				// 淘汰对象的账户文件被外部移走、还在账户池里（Worker 还活着）：不算淘汰，换下一个对象，新浏览器照常等。它保持预留到这次
+				// 替换结束：它已不可调度、排在选号最前，解除预留的话下一轮又选回它，在它身上原地空转。目录扫描移出它时由移出流程关闭它的 Worker
+				manager.requests.log(victim, "WARN", fmt.Sprintf("WAA Worker 按需替换跳过淘汰对象 | 错误=%v", evictionErr))
+				if len(staleVictims) == 0 {
+					staleSince = time.Now()
+				}
+				staleVictims = append(staleVictims, victim)
+				victim = ""
+				continue
+			}
 			if evictionErr == nil && evicted {
-				activationErr := activateAccountWorker(pending)
-				manager.finishOpening(accountID, opening)
-				warmCount := len(manager.warmAccountIDsIn(partition))
-				manager.rebalanceMu.Unlock()
-				if activationErr != nil {
-					return nil, activationErr
-				}
-				if workerStartSourceFrom(ctx) != workerStartPrewarm {
-					manager.requests.log("service", "INFO", fmt.Sprintf(
-						"%s 按需替换 | Worker=%d/%d | 超出常驻=%s",
-						workerLogName(partition), warmCount, manager.maxActiveFor(partition), aboveResidentText(warmCount > manager.warmTargetFor(partition)),
-					))
-				}
-				return pending, nil
+				manager.rebalanceMu.Lock()
+				return publish("按需替换")
 			}
 			if evictionErr != nil || ctx.Err() != nil {
-				discardErr := discardAccountWorker(pending)
-				manager.finishOpening(accountID, opening)
-				manager.rebalanceMu.Unlock()
-				return nil, errors.Join(evictionErr, ctx.Err(), discardErr)
+				return abandon(errors.Join(evictionErr, ctx.Err()))
 			}
 			manager.releaseVictim(victim)
 			victim = ""
-			manager.rebalanceMu.Unlock()
 		}
 	}
+}
+
+// beginOpeningWait 把 ctx 里同一账户的租约标记为正在等待该账户的 Worker 启动结束（aistudio.AccountLease.BeginOpeningWait）：
+// 冷启动时持有租约的请求 A 启动 Worker、启动里遇到登录失效要续签，续签先等同账户其他请求结束（WaitForAuthRefresh），
+// 而同账户的请求 B 正在这里等 A 的启动结束，两边互相等到 authRefreshWaitLimit（12 秒）才放行。标记后续签不等 B，
+// 12 秒上限保留作兜底。ctx 没有租约或租约属于其他账户时为空操作；返回的函数撤销标记
+func beginOpeningWait(ctx context.Context, accountID string) func() {
+	lease, ok := aistudio.AccountLeaseFromContext(ctx)
+	if !ok || lease.Account().ID != accountID {
+		return func() {}
+	}
+	return lease.BeginOpeningWait()
 }
 
 // admitColdStart 经冷启动闸门（见 egress_guard.go）判断这次冷启动：没有闸门、账户自己重开（replacing，或来源为重开：请求已取得租约、
