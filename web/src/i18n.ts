@@ -19,6 +19,8 @@ const zhCN = {
   'app.eventsReconnecting': '实时连接已断开，正在重连…',
   'app.eventsClosed': '实时连接已断开（可能是管理令牌失效），请刷新页面',
   'app.statusUnreachable': '无法连接服务，显示的是上一次的状态',
+  'app.assetReloadBlocked':
+    '管理页已经更新，部分页面文件载入失败。当前有未保存的输入或还没完成的保存、批量操作（服务配置、账户或 API 试用），没有自动刷新：请等操作完成，保存或记下这些内容后，再手动刷新浏览器',
   'nav.logs': '日志',
   'nav.accounts': '账户',
   'nav.models': '模型目录',
@@ -972,6 +974,8 @@ const en: Record<TranslationKey, string> = {
   'app.eventsReconnecting': 'Live connection lost, reconnecting…',
   'app.eventsClosed': 'Live connection closed (the admin token may have expired). Please reload the page.',
   'app.statusUnreachable': 'Cannot reach the service; showing the last known status',
+  'app.assetReloadBlocked':
+    'The management page has been updated and some page files failed to load. There is unsaved input or a save or bulk operation still in progress (service configuration, accounts or the API playground), so the page was not reloaded automatically: wait for the operation to finish, save or note your input, then reload the browser',
   'nav.logs': 'Logs',
   'nav.accounts': 'Accounts',
   'nav.models': 'Model catalog',

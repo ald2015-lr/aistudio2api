@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '@/api'
+import { trackPendingWrite, useUnsavedGuard } from '@/assetRecovery'
 import {
   emptyBulkState,
   runBulk,
@@ -935,6 +936,11 @@ watch(
 // ---------- 批量操作 ----------
 
 const bulk = reactive<BulkState>(emptyBulkState())
+// 账户编辑、浏览器登录或 Chrome 导入弹窗打开、批量任务进行中时，页面文件载入失败后不自动刷新（见 assetRecovery.ts）；
+// 批量任务在面板卸载后仍会跑完，另外登记为在途写操作（见 startBulk、enableTargets 与删除权限被拒的账户）
+useUnsavedGuard(
+  () => showEditor.value || showBrowserLogin.value || showChromeImport.value || bulk.running,
+)
 const bulkPanelOpen = ref(false)
 const showVerifyDialog = ref(false)
 const verifyScope = ref<'problem' | 'enabled' | 'selection'>('problem')
@@ -988,7 +994,7 @@ async function startBulk(
 ): Promise<void> {
   if (bulk.running || accounts.length === 0) return
   bulkPanelOpen.value = true
-  await runBulk(bulk, action, accounts, concurrency, task)
+  await trackPendingWrite(runBulk(bulk, action, accounts, concurrency, task))
   finishBulk(action)
 }
 
@@ -1027,7 +1033,7 @@ const ENABLE_CHUNK = 500
 async function enableTargets(targets: readonly Account[]): Promise<void> {
   if (bulk.running || targets.length === 0) return
   bulkPanelOpen.value = true
-  await runChunkedBulk(bulk, 'enable', targets, ENABLE_CHUNK, enableChunk)
+  await trackPendingWrite(runChunkedBulk(bulk, 'enable', targets, ENABLE_CHUNK, enableChunk))
   finishBulk('enable')
 }
 
@@ -1137,36 +1143,38 @@ async function deleteListed(kind: ListedKind): Promise<void> {
     totals.skipped = confirmed.length - targets.length
     if (targets.length > 0) {
       bulkPanelOpen.value = true
-      await runChunkedBulk(bulk, 'delete', targets, PERMISSION_DENIED_DELETE_CHUNK, async (chunk) => {
-        // 前面几批删除期间列表可能又刷新过
-        const listed = stillListed(kind, chunk)
-        totals.skipped += chunk.length - listed.length
-        if (listed.length === 0) return { succeeded: 0, failures: [] }
-        const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
-        const failed = result.failed ?? []
-        totals.deleted += result.deleted
-        totals.missing += result.missing
-        totals.remaining += result.remaining
-        // 有本次没有处理的账户时不知道是哪几个，这一批只靠重新读取列表；账户 ID 按不区分大小写对照
-        if (result.remaining === 0) {
-          const failedIDs = new Set(failed.map((failure) => failure.id.toLowerCase()))
-          for (const account of listed) {
-            if (!failedIDs.has(account.id.toLowerCase())) removed.add(account.id)
+      await trackPendingWrite(
+        runChunkedBulk(bulk, 'delete', targets, PERMISSION_DENIED_DELETE_CHUNK, async (chunk) => {
+          // 前面几批删除期间列表可能又刷新过
+          const listed = stillListed(kind, chunk)
+          totals.skipped += chunk.length - listed.length
+          if (listed.length === 0) return { succeeded: 0, failures: [] }
+          const result = await api.bulkDeleteAccounts(listed.map((account) => account.id))
+          const failed = result.failed ?? []
+          totals.deleted += result.deleted
+          totals.missing += result.missing
+          totals.remaining += result.remaining
+          // 有本次没有处理的账户时不知道是哪几个，这一批只靠重新读取列表；账户 ID 按不区分大小写对照
+          if (result.remaining === 0) {
+            const failedIDs = new Set(failed.map((failure) => failure.id.toLowerCase()))
+            for (const account of listed) {
+              if (!failedIDs.has(account.id.toLowerCase())) removed.add(account.id)
+            }
           }
-        }
-        const labels = new Map(listed.map((account) => [account.id.toLowerCase(), account.label]))
-        return {
-          succeeded: result.deleted + result.missing,
-          failures: failed.map((failure) => ({
-            id: failure.id,
-            label: labels.get(failure.id.toLowerCase()) ?? failure.id,
-            message:
-              failure.code === 'account_busy'
-                ? t('accounts.permissionDeniedDeleteBusy')
-                : failure.message,
-          })),
-        }
-      })
+          const labels = new Map(listed.map((account) => [account.id.toLowerCase(), account.label]))
+          return {
+            succeeded: result.deleted + result.missing,
+            failures: failed.map((failure) => ({
+              id: failure.id,
+              label: labels.get(failure.id.toLowerCase()) ?? failure.id,
+              message:
+                failure.code === 'account_busy'
+                  ? t('accounts.permissionDeniedDeleteBusy')
+                  : failure.message,
+            })),
+          }
+        }),
+      )
       failures = bulk.failures
     }
   } finally {

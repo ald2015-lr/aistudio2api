@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { ApiError, api } from '@/api'
+import { trackPendingWrite, useUnsavedGuard } from '@/assetRecovery'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import {
   DEFAULT_PROXY_POOL_PORT_END,
@@ -353,6 +354,8 @@ function snapshot(source: ServiceConfig, keys: readonly EditableKey[] = EDITABLE
 const dirty = computed(
   () => savedConfig.value !== null && snapshot(form) !== snapshot(savedConfig.value),
 )
+// 有未保存或正在保存的修改时，页面文件载入失败后不自动刷新（见 assetRecovery.ts）
+useUnsavedGuard(() => dirty.value || saving.value)
 
 const statusText = computed(() => {
   if (saving.value) return t('settings.stateSaving')
@@ -823,9 +826,10 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
   }
 }
 
-// save 串行执行保存，避免并发请求乱序覆盖
+// save 串行执行保存，避免并发请求乱序覆盖。保存登记为在途写操作：切到用量页时本面板卸载前补发的保存仍在进行，
+// 页面文件载入失败后的自动刷新先等它结束（见 assetRecovery.ts）
 function save(includeBlurFields: boolean): Promise<ServiceConfig | null> {
-  const run = saveChain.then(() => doSave(includeBlurFields))
+  const run = trackPendingWrite(saveChain.then(() => doSave(includeBlurFields)))
   saveChain = run.catch(() => undefined)
   return run
 }
@@ -882,7 +886,8 @@ async function applyNow(): Promise<void> {
   if (applying.value) return
   applying.value = true
   try {
-    await api.restartService()
+    // 重启同样登记为在途写操作，切到其他页后仍在等待时不会被自动刷新打断
+    await trackPendingWrite(api.restartService())
     const fresh = await api.config()
     savedConfig.value = fresh
     emit('saved', fresh)

@@ -10,6 +10,7 @@ import {
   watch,
 } from 'vue'
 import { api, openAdminEvents, type EventConnection, type EventsState } from '@/api'
+import { assetReloadBlocked, recoverFromAssetError } from '@/assetRecovery'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
@@ -35,9 +36,14 @@ import { formatClock } from '@/proxyPool'
 import { readStorage, writeStorage } from '@/storage'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
-// 用量页按需加载：图表库只在打开用量页时下载，不进入主包
+// 用量页按需加载：图表库只在打开用量页时下载，不进入主包。服务升级后旧页面载入旧版的块会失败，
+// 确认服务端已换成新版本时自动刷新一次（见 assetRecovery.ts），否则照旧显示载入失败
 const UsagePanel = defineAsyncComponent({
-  loader: () => import('@/components/UsagePanel.vue'),
+  loader: () =>
+    import('@/components/UsagePanel.vue').catch((error: unknown) => {
+      void recoverFromAssetError()
+      throw error
+    }),
   loadingComponent: {
     render: () =>
       h('p', { class: 'p-8 text-sm text-gray-500', role: 'status' }, t('usage.panelLoading')),
@@ -413,6 +419,11 @@ function showNotice(message: string, tone: 'success' | 'error'): void {
     notice.message = ''
   }, 3200)
 }
+
+// 页面文件载入失败而有未保存的输入、没有自动刷新时，提示手动刷新
+watch(assetReloadBlocked, () => {
+  showNotice(t('app.assetReloadBlocked'), 'error')
+})
 
 let statusTimer: number | undefined
 

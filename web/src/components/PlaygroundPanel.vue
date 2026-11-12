@@ -7,6 +7,7 @@ import {
   runPlayground,
   type PlaygroundChunk,
 } from '@/api'
+import { useUnsavedGuard } from '@/assetRecovery'
 import { copyText } from '@/clipboard'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
@@ -95,6 +96,8 @@ let controller: AbortController | undefined
 let stopRequested = false
 // lastInput 为上一次实际发出的输入快照：重试按它重发，输出类型、协议、号池与模型保持一致，不与之后改动的表单拼在一起
 let lastInput: PlaygroundInput | undefined
+// 有请求在进行或输入框里有没发出的内容时，页面文件载入失败后不自动刷新（试用页切走后保留，见 assetRecovery.ts）
+useUnsavedGuard(() => isRunning.value || form.prompt.trim() !== '' || form.system.trim() !== '')
 
 // ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 号池时模型列表只显示这些模型，还没有读到时显示全部模型。
 // 账户的 models 只含 Playground 目录，只在 Build 通道提供的模型（如 gemini-4-argon）不会出现在这里，过滤时要放过它们

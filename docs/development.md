@@ -714,6 +714,8 @@ Vite 将生产产物写入 `internal/webui/dist`。管理端通过本机 `/api` 
 
 `internal/webui/embed.go` 使用 `//go:embed dist`，因此 Go 构建前必须生成当前前端产物。管理端从 `/api/events` 接收 `status`、`models`、`accounts`、`log`、`cooldowns` 和 `request` 事件。
 
+静态资源的缓存：`/assets/` 下的构建产物文件名带内容哈希，返回 `Cache-Control: public, max-age=31536000, immutable`；入口 `index.html`、其他静态文件与 SPA 回落返回 `no-store`。`/assets/`（含目录本身）下不存在的文件返回 404（带 `no-store`），不回落为 `index.html`：服务升级后，已打开的旧页面再载入旧版的懒加载块会拿到 404，原先拿到 200 的 `index.html` 只报 MIME 类型错误。非 `/assets/` 的前端路由照旧回落为入口。前端 `assetRecovery.ts` 监听 `vite:preloadError`、脚本与样式元素的载入失败，用量页的懒加载函数失败时也调用它：先以 `no-store` 重新读取入口页面，入口脚本与当前页面不同（服务端已换成新构建）才自动刷新一次；30 秒内最多一次，时间记在 `sessionStorage`（读写都包 `try/catch`，读写不了或写入后读回不一致时不刷新）；组件用 `useUnsavedGuard` 登记“有未保存输入”的判定（服务配置有未保存或正在保存的修改、账户编辑与登录弹窗开着、账户批量任务进行中、API 试用有没发出的输入或正在请求），有时不刷新，改为显示一直保留的错误提示请用户手动刷新。这些判定随组件卸载移除，而切到用量页时设置页卸载前补发的保存、账户面板的批量任务在组件卸载后仍在进行，所以写操作另用 `trackPendingWrite` 登记（配置保存、应用配置的重启、账户批量验证/启用/停用/删除），不随组件卸载移除：刷新前先等它们结束，最多 5 秒，届时还没结束同样不刷新。服务离线、入口读不出或没变时不刷新，页面照旧显示载入失败。
+
 用量账本（`internal/requestdb`）的原始记录与小时、本地日汇总都有 `pool` 列（`/ultra` 请求为 `ultra`，其余为空），汇总主键包含 `pool`。旧版 `runtime/requests.db` 每次打开时由 `migrate` 检查并升级，可重复执行：原始记录缺少 `pool` 时 `ALTER TABLE ... ADD COLUMN` 并建立 `requests_pool_time` 索引，汇总表缺少 `pool` 时在一个事务内按新主键重建并复制旧汇总，旧数据归入普通号池。用量接口的 `pool` 维度对外取值为 `normal`、`ultra`，可筛选、分组与堆叠；协议归类先去掉 `/trace` 与 `/ultra` 前缀。
 
 用量页（`UsagePanel.vue` 与 `components/usage/`）按需加载：ECharts 只注册用到的折线图、柱状图与组件，单独构建为 `echarts-*.js`，与用量页代码一起在第一次打开用量页时下载，不进入主包。用量页通过 `/api/usage`、`/api/usage/records`、`/api/usage/records.csv` 与 `/api/requests/{id}/body` 读取账本，与其他管理接口一样依靠管理令牌 Cookie；账本未启用时这些接口返回 404，页面显示账本未启用。

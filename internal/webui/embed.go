@@ -23,7 +23,11 @@ func Files() fs.FS {
 
 // Handler 返回管理端静态文件处理器
 func Handler() http.Handler {
-	files := Files()
+	return newHandler(Files())
+}
+
+// newHandler 返回服务 files 中构建产物的处理器，files 根目录必须有 index.html
+func newHandler(files fs.FS) http.Handler {
 	index, err := fs.ReadFile(files, "index.html")
 	if err != nil {
 		panic(err)
@@ -41,7 +45,14 @@ type spaHandler struct {
 	index  []byte
 }
 
-// ServeHTTP 服务静态资源并为普通页面路径返回 SPA 入口
+// assetCacheControl 是 /assets/ 下构建产物的缓存策略：Vite 输出的文件名带内容哈希，内容变了文件名就变，
+// 浏览器可以长期缓存且不必重新验证
+const assetCacheControl = "public, max-age=31536000, immutable"
+
+// ServeHTTP 服务静态资源并为普通页面路径返回 SPA 入口。/assets/ 下的文件长期缓存，不存在时返回 404：
+// 服务升级后，已打开的旧页面再去载入旧版的懒加载块，拿到 404 才会按载入失败处理（前端随后自动刷新一次），
+// 原先回落为 200 的 index.html，浏览器只报 MIME 类型错误。入口 index.html、其他静态文件与 SPA 回落一律 no-store，
+// 升级后刷新页面总能拿到引用新文件名的入口
 func (handler *spaHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	requestPath := path.Clean(request.URL.Path)
 	if reservedPath(requestPath) {
@@ -57,7 +68,20 @@ func (handler *spaHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 	if name == "." {
 		name = "index.html"
 	}
-	if _, err := fs.Stat(handler.files, name); err == nil {
+	info, err := fs.Stat(handler.files, name)
+	if assetPath(requestPath) {
+		// 目录不列出内容，与不存在的文件一样返回 404
+		if err != nil || info.IsDir() {
+			writer.Header().Set("Cache-Control", "no-store")
+			http.NotFound(writer, request)
+			return
+		}
+		writer.Header().Set("Cache-Control", assetCacheControl)
+		handler.static.ServeHTTP(writer, request)
+		return
+	}
+	writer.Header().Set("Cache-Control", "no-store")
+	if err == nil {
 		handler.static.ServeHTTP(writer, request)
 		return
 	}
@@ -69,6 +93,11 @@ func (handler *spaHandler) ServeHTTP(writer http.ResponseWriter, request *http.R
 	writer.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
 	_, _ = writer.Write(handler.index)
+}
+
+// assetPath 判断清理后的路径是否在构建产物目录 /assets 下
+func assetPath(requestPath string) bool {
+	return requestPath == "/assets" || strings.HasPrefix(requestPath, "/assets/")
 }
 
 // reservedPath 判断路径是否属于服务 API
