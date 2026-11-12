@@ -222,6 +222,8 @@ type catalogSyncer struct {
 	random                                       func() float64
 	// egressPaused 替代出口判定器的 catalogPaused（只给包内测试）
 	egressPaused func(key string) bool
+	// probe 为请求的模型不在任何账户目录里时的限频读目录（见 catalog_probe.go）
+	probe missingModelProbe
 }
 
 // newCatalogSyncer 创建调度器（不带磁盘缓存，newRuntime 用 attach 挂上）
@@ -642,6 +644,7 @@ func (syncer *catalogSyncer) loop(ctx context.Context, done chan struct{}) {
 	var tasks sync.WaitGroup
 	defer func() {
 		tasks.Wait()
+		syncer.waitProbe()
 		if err := syncer.cache.flush(); err != nil {
 			syncer.service.requests.log("service", "WARN", "模型目录缓存写入失败 | 错误="+err.Error())
 		}

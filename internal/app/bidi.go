@@ -286,6 +286,8 @@ func (service *trackedService) bidiCandidates(ctx context.Context, model string,
 	}
 	groups, err := service.pool.ClassifyCandidates(ctx, selection, service.workers.WarmAccountIDs())
 	if err != nil {
+		// 请求的模型不在号池任何账户的目录里：与生成选号相同，限频地在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）
+		service.noteMissingModel(selection, err)
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {

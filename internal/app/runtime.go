@@ -3938,6 +3938,8 @@ func (service *trackedService) acquireLease(
 		active := service.workers.WarmAccountIDs()
 		groups, err := service.pool.ClassifyCandidates(ctx, selection, warm)
 		if err != nil {
+			// 请求的模型不在号池任何账户的目录里：限频地挑高权益的空闲账户在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）
+			service.noteMissingModel(selection, err)
 			return nil, err
 		}
 		groups.WarmReady = excludeAccountIDs(groups.WarmReady, failedWorkers)
