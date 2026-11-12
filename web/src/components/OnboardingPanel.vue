@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, onUnmounted, ref } from 'vue'
 import { api } from '@/api'
+import { trackPendingWrite } from '@/assetRecovery'
 import { confirmAction } from '@/confirm'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type { OnboardingPolicy, OnboardingResult, OnboardingStatus } from '@/types'
@@ -125,7 +126,8 @@ async function save(): Promise<void> {
   }
   saving.value = true
   try {
-    const next = await api.updateOnboarding({ ...draft.value })
+    // 与账户的其他写请求一样登记为在途写操作：面板卸载后请求仍会完成，页面文件载入失败后的自动刷新先等它结束
+    const next = await trackPendingWrite(api.updateOnboarding({ ...draft.value }))
     status.value = next
     draft.value = { ...next.policy }
     error.value = ''
@@ -152,7 +154,7 @@ async function queueDisabled(): Promise<void> {
   if (!confirmed) return
   queueing.value = true
   try {
-    status.value = await api.queueDisabledOnboarding()
+    status.value = await trackPendingWrite(api.queueDisabledOnboarding())
     error.value = ''
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
@@ -161,9 +163,13 @@ async function queueDisabled(): Promise<void> {
   }
 }
 
+// scheduleSave 在设置停止变化 SAVE_DELAY 后保存；saveTimer 只在有挂起的保存时有值（卸载前据此补发，见 onBeforeUnmount）
 function scheduleSave(): void {
   window.clearTimeout(saveTimer)
-  saveTimer = window.setTimeout(() => void save(), SAVE_DELAY)
+  saveTimer = window.setTimeout(() => {
+    saveTimer = undefined
+    void save()
+  }, SAVE_DELAY)
 }
 
 onMounted(() => {
@@ -173,9 +179,17 @@ onMounted(() => {
   }, POLL_INTERVAL)
 })
 
+// 卸载前补发挂起的保存（与设置页相同）：改完设置 SAVE_DELAY 内切到其他页时，原先卸载时直接清掉定时器，这次修改既没发出、
+// 也没登记为在途写操作，静默丢失。save() 在第一个 await 之前就读完草稿并发出请求、登记在途，卸载后请求照常完成，自动刷新也会等它
+onBeforeUnmount(() => {
+  if (saveTimer === undefined) return
+  window.clearTimeout(saveTimer)
+  saveTimer = undefined
+  void save()
+})
+
 onUnmounted(() => {
   window.clearInterval(pollTimer)
-  window.clearTimeout(saveTimer)
   window.clearTimeout(savedTimer)
 })
 </script>

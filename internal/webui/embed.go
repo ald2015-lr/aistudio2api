@@ -46,8 +46,9 @@ type spaHandler struct {
 }
 
 // assetCacheControl 是 /assets/ 下构建产物的缓存策略：Vite 输出的文件名带内容哈希，内容变了文件名就变，
-// 浏览器可以长期缓存且不必重新验证
-const assetCacheControl = "public, max-age=31536000, immutable"
+// 浏览器可以长期缓存且不必重新验证。用 private：这些文件要通过管理端鉴权（管理密码的 Basic 认证或管理令牌 Cookie）才提供，
+// 请求带 Authorization 时 public 明确允许反向代理、CDN 等共享缓存存下响应、再发给没有鉴权的人；private 只让浏览器自己缓存
+const assetCacheControl = "private, max-age=31536000, immutable"
 
 // ServeHTTP 服务静态资源并为普通页面路径返回 SPA 入口。/assets/ 下的文件长期缓存，不存在时返回 404：
 // 服务升级后，已打开的旧页面再去载入旧版的懒加载块，拿到 404 才会按载入失败处理（前端随后自动刷新一次），

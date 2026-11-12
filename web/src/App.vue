@@ -1068,10 +1068,12 @@ onUnmounted(() => {
     </main>
 
     <Transition name="notice">
-      <!-- 窄屏时左右各留 1.25rem，不超出视口；长单词与地址可在任意处换行 -->
+      <!-- 窄屏时左右各留 1.25rem，不超出视口；长单词与地址可在任意处换行。层级高于弹窗遮罩（.modal-overlay 为 50）、
+           低于下拉框与悬浮说明：弹窗里的操作出错（浏览器添加的账户已存在、时区无效等，弹窗保持打开）时，常驻的错误提示
+           不被遮罩盖住，关闭与展开按钮可以点 -->
       <div
         v-if="notice.message"
-        class="fixed right-5 bottom-5 z-50 flex max-w-[calc(100vw-2.5rem)] items-start gap-2 rounded border bg-[#161b22] py-3 pr-2 pl-4 text-sm shadow-xl sm:max-w-md"
+        class="fixed right-5 bottom-5 z-[65] flex max-w-[calc(100vw-2.5rem)] items-start gap-2 rounded border bg-[#161b22] py-3 pr-2 pl-4 text-sm shadow-xl sm:max-w-md"
         :class="
           notice.tone === 'error'
             ? 'border-red-500/50 text-red-300'
@@ -1080,7 +1082,9 @@ onUnmounted(() => {
       >
         <div class="min-w-0 flex-1">
           <!-- 实时播报区域只放在正文上：展开、关闭按钮在区域外，切换展开只改样式、不改区域里的文字，读屏软件不会重读整段提示。
-               按类型换 key：成功提示还没消失时来了错误，重新创建区域，以新的角色播报新内容 -->
+               按类型换 key：成功提示还没消失时来了错误，重新创建区域，以新的角色播报新内容。
+               展开与关闭按钮在 mousedown 时阻止默认行为，点它们不抢走焦点：焦点在失焦即保存的输入框（默认代理、本地 API 密钥、
+               媒体链接地址等）时，点提示框不会先让输入框失焦、把输入到一半的值保存掉；click 与键盘操作照旧 -->
           <p
             :id="noticeBodyID"
             :key="notice.tone"
@@ -1097,6 +1101,7 @@ onUnmounted(() => {
             class="mt-1 text-xs text-gray-400 underline-offset-2 transition hover:text-gray-200 hover:underline"
             :aria-expanded="noticeExpanded"
             :aria-controls="noticeBodyID"
+            @mousedown.prevent
             @click="toggleNotice"
           >
             {{ noticeExpanded ? t('app.noticeCollapse') : t('app.noticeExpand') }}
@@ -1107,6 +1112,7 @@ onUnmounted(() => {
           class="-my-1 shrink-0 rounded p-1 text-gray-500 transition hover:bg-[#21262d] hover:text-gray-200"
           :aria-label="t('app.noticeClose')"
           :title="t('app.noticeClose')"
+          @mousedown.prevent
           @click="closeNotice"
         >
           <UiIcon name="close" :size="14" />

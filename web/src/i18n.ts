@@ -23,7 +23,7 @@ const zhCN = {
   'app.noticeExpand': '展开全文',
   'app.noticeCollapse': '收起',
   'app.assetReloadBlocked':
-    '管理页已经更新，部分页面文件载入失败。当前有未保存的输入或还没完成的保存、批量操作（服务配置、账户或 API 试用），没有自动刷新：请等操作完成，保存或记下这些内容后，再手动刷新浏览器',
+    '管理页已经更新，部分页面文件载入失败。当前有未保存的输入或还没完成的保存与账户操作（服务配置、账户或 API 试用），没有自动刷新：请等操作完成，保存或记下这些内容后，再手动刷新浏览器',
   'nav.logs': '日志',
   'nav.accounts': '账户',
   'nav.models': '模型目录',
@@ -1010,7 +1010,7 @@ const en: Record<TranslationKey, string> = {
   'app.noticeExpand': 'Show full message',
   'app.noticeCollapse': 'Show less',
   'app.assetReloadBlocked':
-    'The management page has been updated and some page files failed to load. There is unsaved input or a save or bulk operation still in progress (service configuration, accounts or the API playground), so the page was not reloaded automatically: wait for the operation to finish, save or note your input, then reload the browser',
+    'The management page has been updated and some page files failed to load. There is unsaved input or a save or account operation still in progress (service configuration, accounts or the API playground), so the page was not reloaded automatically: wait for the operation to finish, save or note your input, then reload the browser',
   'nav.logs': 'Logs',
   'nav.accounts': 'Accounts',
   'nav.models': 'Model catalog',

@@ -4,6 +4,7 @@
 // 不合法时设置页不提交，错误显示在对应输入框旁
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { ApiError, api } from '@/api'
+import { trackPendingWrite } from '@/assetRecovery'
 import { confirmAction } from '@/confirm'
 import { useI18n, type TranslationKey } from '@/i18n'
 import { proxyParts } from '@/proxy'
@@ -296,7 +297,8 @@ async function followDefault(): Promise<void> {
   if (!confirmed) return
   following.value = true
   try {
-    const result = await api.followDefaultProxy()
+    // 改为跟随默认代理会改写账户配置：登记为在途写操作，切到用量页后页面文件载入失败时先等它结束再自动刷新
+    const result = await trackPendingWrite(api.followDefaultProxy())
     emit(
       'notice',
       tf('settings.proxyPoolFollowDone', {

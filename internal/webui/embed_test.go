@@ -42,7 +42,7 @@ func TestAssetsCachedImmutable(t *testing.T) {
 		if recorder.Code != http.StatusOK || recorder.Body.String() != test.body {
 			t.Fatalf("%s status=%d body=%q", test.target, recorder.Code, recorder.Body.String())
 		}
-		if got := recorder.Header().Get("Cache-Control"); got != "public, max-age=31536000, immutable" {
+		if got := recorder.Header().Get("Cache-Control"); got != "private, max-age=31536000, immutable" {
 			t.Fatalf("%s Cache-Control=%q", test.target, got)
 		}
 		if got := recorder.Header().Get("Content-Type"); !strings.Contains(got, test.contentType) {
@@ -50,7 +50,7 @@ func TestAssetsCachedImmutable(t *testing.T) {
 		}
 	}
 	if recorder := serve(handler, http.MethodHead, "/assets/index-AbC123.js"); recorder.Code != http.StatusOK ||
-		recorder.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		recorder.Header().Get("Cache-Control") != "private, max-age=31536000, immutable" {
 		t.Fatalf("HEAD 资源 status=%d Cache-Control=%q", recorder.Code, recorder.Header().Get("Cache-Control"))
 	}
 }
@@ -126,7 +126,7 @@ func TestEmbeddedHandlerServesBuild(t *testing.T) {
 		t.Fatalf("入口里的资源路径不完整: %q", body[start:])
 	}
 	asset := serve(handler, http.MethodGet, body[start:start+end])
-	if asset.Code != http.StatusOK || asset.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+	if asset.Code != http.StatusOK || asset.Header().Get("Cache-Control") != "private, max-age=31536000, immutable" {
 		t.Fatalf("%s status=%d Cache-Control=%q", body[start:start+end], asset.Code, asset.Header().Get("Cache-Control"))
 	}
 }

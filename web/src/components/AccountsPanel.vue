@@ -324,7 +324,7 @@ async function clearPermissionDenied(): Promise<void> {
     return
   permissionDeniedClearing.value = true
   try {
-    const result = await api.clearPermissionDenied({ all: true })
+    const result = await trackPendingWrite(api.clearPermissionDenied({ all: true }))
     permissionDeniedVersion += 1
     permissionDenied.value = []
     showAllPermissionDenied.value = false
@@ -349,7 +349,7 @@ async function clearOrgDisabled(): Promise<void> {
     return
   orgDisabledClearing.value = true
   try {
-    const result = await api.clearOrgDisabled({ all: true })
+    const result = await trackPendingWrite(api.clearOrgDisabled({ all: true }))
     permissionDeniedVersion += 1
     orgDisabled.value = []
     showAllOrgDisabled.value = false
@@ -519,7 +519,7 @@ function closeBrowserLogin(): void {
 async function beginBrowserLogin(): Promise<void> {
   pendingAction.value = 'browser-login'
   try {
-    await api.createAccount({ ...accountEnvironment })
+    await trackPendingWrite(api.createAccount({ ...accountEnvironment }))
     showBrowserLogin.value = false
     emit('refresh')
     emit('notice', t('accounts.loginComplete'), 'success')
@@ -555,10 +555,12 @@ function closeChromeImport(): void {
 async function importChromeAccounts(): Promise<void> {
   pendingAction.value = 'chrome-import'
   try {
-    const result = await api.importChromeAccounts({
-      account_ids: [...selectedChromeProfiles.value],
-      ...accountEnvironment,
-    })
+    const result = await trackPendingWrite(
+      api.importChromeAccounts({
+        account_ids: [...selectedChromeProfiles.value],
+        ...accountEnvironment,
+      }),
+    )
     showChromeImport.value = false
     chromeProfiles.value = []
     selectedChromeProfiles.value = []
@@ -596,7 +598,7 @@ async function saveAccount(): Promise<void> {
   if (editingAccountID.value === '') return
   pendingAction.value = `edit:${editingAccountID.value}`
   try {
-    await api.updateAccount(editingAccountID.value, { ...draft })
+    await trackPendingWrite(api.updateAccount(editingAccountID.value, { ...draft }))
     closeEditor()
     emit('refresh')
     emit('notice', t('accounts.saved'), 'success')
@@ -622,7 +624,7 @@ function setEnabled(account: Account, enabled: boolean): Promise<void> {
 async function toggleAccount(account: Account): Promise<void> {
   pendingAction.value = `toggle:${account.id}`
   try {
-    await setEnabled(account, !account.enabled)
+    await trackPendingWrite(setEnabled(account, !account.enabled))
     emit('refresh')
   } catch (error) {
     actionError(error)
@@ -646,12 +648,12 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
   pendingAction.value = `${action}:${account.id}`
   try {
     if (action === 'login') {
-      await api.loginAccount(account.id)
+      await trackPendingWrite(api.loginAccount(account.id))
       emit('refresh')
       emit('notice', t('accounts.loginComplete'), 'success')
       return
     }
-    const verified = await api.verifyAccount(account.id)
+    const verified = await trackPendingWrite(api.verifyAccount(account.id))
     emit('refresh')
     if (verifiedOrgDisabled(verified)) {
       emit('notice', t('accounts.verifyOrgDisabled'), 'error')
@@ -676,7 +678,7 @@ async function removeAccount(account: Account): Promise<void> {
   if (!(await confirmAction(t('accounts.deleteConfirm'), t('common.delete')))) return
   pendingAction.value = `delete:${account.id}`
   try {
-    await api.deleteAccount(account.id)
+    await trackPendingWrite(api.deleteAccount(account.id))
     emit('refresh')
     emit('notice', t('accounts.deleted'), 'success')
   } catch (error) {
@@ -1005,8 +1007,10 @@ watch(
 // ---------- 批量操作 ----------
 
 const bulk = reactive<BulkState>(emptyBulkState())
-// 账户编辑、浏览器登录或 Chrome 导入弹窗打开、批量任务进行中时，页面文件载入失败后不自动刷新（见 assetRecovery.ts）；
-// 批量任务在面板卸载后仍会跑完，另外登记为在途写操作（见 startBulk、enableTargets 与删除权限被拒的账户）
+// 账户编辑、浏览器登录或 Chrome 导入弹窗打开、批量任务进行中时，页面文件载入失败后不自动刷新（见 assetRecovery.ts）。
+// 目前触发自动刷新的只有切到用量页，这时账户面板已经卸载、这项判定随之移除，实际起作用的是在途写操作的等待：
+// 账户的写请求（添加、重新登录、验证、启停、修改、删除、Chrome 导入、清除列表与批量任务）在面板卸载后仍会完成，
+// 都用 trackPendingWrite 登记，刷新前先等它们结束
 useUnsavedGuard(
   () => showEditor.value || showBrowserLogin.value || showChromeImport.value || bulk.running,
 )
