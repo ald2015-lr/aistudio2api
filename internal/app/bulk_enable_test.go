@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -10,9 +11,9 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
 )
 
-// TestEnableAccountsBulk 批量启用：去重、跳过已启用的、不存在的与正忙的（等待上限内拿不到账户）列为失败；
+// TestEnableAccountsBulk 批量启用：去重、跳过已启用的、不存在的与正忙的（另一个进程持有账户文件锁）列为失败；
 // 启用的账户写回 account.json、清除停用原因；整批只合并一次全部账户的模型目录，没有逐个账户推送；
-// 没有模型目录的账户在后台同步，整批同步完再合并一次
+// 没有模型目录的账户在后台同步，整批同步完再合并一次。本进程里正在使用的账户不取租约也能启用（见 TestBulkEnableDuringDrain）
 func TestEnableAccountsBulk(t *testing.T) {
 	notes := isolateDisableNotes(t)
 	previousWait := bulkEnableAcquireWait
@@ -24,7 +25,14 @@ func TestEnableAccountsBulk(t *testing.T) {
 	}
 	notes.set("a@example.com", "通过管理页或管理接口停用", false)
 	notes.set("b@example.com", "新账户自动处理验证未通过", true)
-	busy, err := admin.pool.AcquireAccount(context.Background(), "c@example.com")
+	// 另一个进程：同一账户目录上的另一个账户池，持有 c 的账户文件锁
+	loaded, failures := aistudio.NewAccountStore(filepath.Dir(accounts[2].Directory)).LoadTolerant()
+	if len(failures) > 0 {
+		t.Fatal(failures)
+	}
+	other := aistudio.NewAccountPool(loaded, 1)
+	t.Cleanup(other.WaitBackground)
+	busy, err := other.AcquireAccount(context.Background(), "c@example.com")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +49,7 @@ func TestEnableAccountsBulk(t *testing.T) {
 		t.Fatal(err)
 	}
 	if elapsed := time.Since(startedAt); elapsed > 5*time.Second {
-		t.Fatalf("正忙的账户应在等待上限后放弃，实际耗时 %s", elapsed)
+		t.Fatalf("正忙的账户应立即报告，实际耗时 %s", elapsed)
 	}
 	if result.Enabled != 2 || result.Skipped != 1 || result.Remaining != 0 || len(result.Failed) != 2 {
 		t.Fatalf("结果 = %+v，期望启用 2、跳过 1、失败 2", result)

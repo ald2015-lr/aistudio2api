@@ -82,6 +82,14 @@ func (admin *runtimeAdmin) DeleteAccounts(ctx context.Context, input api.BulkDel
 	defer cancel()
 	jobs := make([]bulkDeleteJob, 0, min(len(targets), bulkDeleteMaxPerCall))
 	missing := make([]string, 0)
+	// 被取消的启停收尾（账户 → 取消前的阶段）：整批结束后，没删掉的账户（正忙、删除失败）按原阶段重新开始收尾，
+	// 停用的账户继续等请求结束、关闭 Worker，阶段照常显示；已删除的账户不存在，恢复是空操作
+	canceled := make(map[string]aistudio.AccountTransition)
+	defer func() {
+		for accountID, stage := range canceled {
+			admin.resumeTransition(accountID, stage)
+		}
+	}()
 	for _, accountID := range targets {
 		if len(jobs) >= bulkDeleteMaxPerCall {
 			if _, err := admin.pool.Account(accountID); errors.Is(err, aistudio.ErrAccountNotFound) {
@@ -90,6 +98,10 @@ func (admin *runtimeAdmin) DeleteAccounts(ctx context.Context, input api.BulkDel
 				result.Remaining++
 			}
 			continue
+		}
+		// 先取消启停的后台收尾：停用收尾也登记着独占等待，删除要等它。只在取消时持有账户操作锁，等独占时不持有
+		if stage := admin.cancelTransition(accountID); stage != "" {
+			canceled[accountID] = stage
 		}
 		reservation, err := admin.pool.ReserveAccount(accountID)
 		switch {

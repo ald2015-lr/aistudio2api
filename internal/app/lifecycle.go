@@ -464,7 +464,7 @@ func (manager *runtimeManager) ChromeImportProfiles(ctx context.Context) ([]api.
 }
 
 // ImportChromeAccounts 在当前生成服务批量导入 Chrome 账号
-func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
+func (manager *runtimeManager) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) (api.ChromeImportResult, error) {
 	return manager.generation().admin.ImportChromeAccounts(ctx, input)
 }
 

@@ -24,6 +24,7 @@ func prepareWAABackend(ctx context.Context, cfg config.Config, requests *request
 		return "", nil, err
 	}
 	removeStaleCamoufoxProfiles(requests)
+	// REQUEST_TIMEOUT 只作无头验证的时限；可见登录（添加账户、重新登录）固定 30 分钟，见 aistudio.NewNativeLoginDriver
 	login, err := aistudio.NewNativeLoginDriver(camoufoxPath, cfg.RequestTimeout)
 	if err != nil {
 		return "", nil, err
@@ -50,7 +51,7 @@ func newWAAWorker(ctx context.Context, accountID string, options camoufoxnative.
 	return aistudio.NewNativeWorker(ctx, accountID, options)
 }
 
-// lazyLoginDriver 在第一次登录或校验账户时定位 Camoufox 并创建登录驱动
+// lazyLoginDriver 在第一次登录或校验账户时定位 Camoufox 并创建登录驱动；timeout 为无头验证的时限（可见登录固定 30 分钟）
 type lazyLoginDriver struct {
 	timeout time.Duration
 	mu      sync.Mutex

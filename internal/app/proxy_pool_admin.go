@@ -230,6 +230,9 @@ func (admin *runtimeAdmin) followDefaultProxy(ctx context.Context, accountID str
 		}
 		return false, false, accountOperationError(err)
 	}
+	// 账户操作锁：与不取租约的启停（setAccountEnabled）串行，读出配置改代理再写回不会盖掉刚切换的启用状态
+	unlockAccount := admin.transitions.lock(accountID)
+	defer unlockAccount()
 	accountConfig := lease.Account().Config
 	if strings.TrimSpace(accountConfig.Proxy) == "" || config.CanonicalProxy(accountConfig.Proxy) != global {
 		// 列出之后已被其他操作改掉

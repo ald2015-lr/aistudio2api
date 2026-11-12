@@ -339,6 +339,7 @@ func defaultSetupLoginDriver(ctx context.Context, cfg config.Config) (aistudio.I
 	if err != nil {
 		return nil, err
 	}
+	// REQUEST_TIMEOUT 只作无头验证的时限；setup 的可见登录固定 30 分钟（见 aistudio.NewNativeLoginDriver）
 	return aistudio.NewNativeLoginDriver(camoufoxPath, cfg.RequestTimeout)
 }
 

@@ -13,7 +13,7 @@ type BulkEnableInput struct {
 	AllDisabled bool     `json:"all_disabled"`
 }
 
-// BulkEnableFailure 为一个没有启用的账户：Code 为 account_busy（账户正在验证、登录或处理请求）、
+// BulkEnableFailure 为一个没有启用的账户：Code 为 account_busy（另一个进程正持有账户文件锁）、
 // account_not_found 等错误码，没有对应错误码时为空
 type BulkEnableFailure struct {
 	ID      string `json:"id"`

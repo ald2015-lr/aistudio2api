@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { api } from '@/api'
+import { ApiError, api } from '@/api'
 import { trackPendingWrite, useUnsavedGuard } from '@/assetRecovery'
 import {
   emptyBulkState,
@@ -371,10 +371,21 @@ const editingAccountID = ref('')
 const pendingAction = ref('')
 const chromeProfiles = ref<ChromeImportProfile[]>([])
 const selectedChromeProfiles = ref<string[]>([])
+// chromeBulkSelectable 为“全选”会选中的 Chrome 账号：新账号与需要重新登录的已有账户。状态正常的已有账户要单独勾选：
+// 就地重新导入会关掉它正在服务的 Worker、在 Google 侧新建一个会话，只为加新账号点全选时不应把它们一起重新导入
+const chromeBulkSelectable = computed(() =>
+  chromeProfiles.value
+    .filter((profile) => !profile.existing || profile.state === 'auth_required')
+    .map((profile) => profile.id),
+)
 const allChromeProfilesSelected = computed(
   () =>
-    chromeProfiles.value.length > 0 &&
-    selectedChromeProfiles.value.length === chromeProfiles.value.length,
+    chromeBulkSelectable.value.length > 0 &&
+    chromeBulkSelectable.value.every((id) => selectedChromeProfiles.value.includes(id)),
+)
+// chromeHealthyExisting 为列表里有状态正常的已有账户（全选不选它们，按钮旁给出说明）
+const chromeHealthyExisting = computed(() =>
+  chromeProfiles.value.some((profile) => profile.existing && profile.state !== 'auth_required'),
 )
 const accountEnvironment = reactive({
   proxy: '',
@@ -423,15 +434,53 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : t('common.error')
 }
 
-// actionError 将账户写操作错误发送到全局通知
-function actionError(error: unknown): void {
-  emit('notice', messageOf(error), 'error')
+// accountErrorKeys 为账户写操作中按错误码显示本地化文案的错误：录入的时区无效（400 invalid_timezone）。
+// 添加的账户已经存在（409 account_exists）另按账户状态选文案，见 accountExistsNotice
+const accountErrorKeys: Record<string, TranslationKey> = {
+  invalid_timezone: 'accounts.invalidTimezone',
 }
 
+// accountEmailPattern 从服务端错误消息里取出账户邮箱（账户 ID 就是邮箱）
+const accountEmailPattern = /[^\s:：，,（）()]+@[^\s:：，,（）()]+/
+
+// accountExistsNotice 返回添加的账户已经存在（409 account_exists，没有重复添加）的提示：从服务端消息里取出邮箱，
+// 按它在账户列表里的状态说明怎么处理。“重新登录”只对需要登录的启用账户显示，原先一律提示对它使用“重新登录”，多数状态下照做不了；
+// 列表里没有它时是同邮箱的账户目录已在 auth 目录下、还没被目录扫描载入（Chrome 导入多个账号时也能看出是哪一个）。取不出邮箱时用通用说明
+function accountExistsNotice(message: string): string {
+  const email = accountEmailPattern.exec(message)?.[0].toLowerCase()
+  if (email === undefined) return t('accounts.accountExists')
+  const account = props.accounts.find((item) => item.id.toLowerCase() === email)
+  if (account === undefined) return tf('accounts.accountDirectoryExists', { email })
+  if (!account.enabled) return tf('accounts.accountExistsDisabled', { email })
+  if (account.state === 'auth_required') return tf('accounts.accountExistsRelogin', { email })
+  return tf('accounts.accountExistsReady', { email })
+}
+
+// actionError 将账户写操作错误发送到全局通知
+function actionError(error: unknown): void {
+  if (error instanceof ApiError && error.code === 'account_exists') {
+    emit('notice', accountExistsNotice(error.message), 'error')
+    return
+  }
+  const key = error instanceof ApiError ? accountErrorKeys[error.code] : undefined
+  emit('notice', key === undefined ? messageOf(error) : t(key), 'error')
+}
+
+// transitionText 返回账户启停之后后台收尾阶段的说明，没有收尾时为空。draining 而没有进行中的请求时在等账户上的其他操作
+// （登录、验证、目录同步、Worker 启动等，不计入请求数）结束，还没开始关闭 Worker；开始关闭后阶段为 closing
+function transitionText(account: Account): string {
+  if (account.transition === 'syncing') return t('accounts.transitionSyncing')
+  if (account.transition === 'closing') return t('accounts.transitionClosing')
+  if (account.transition !== 'draining') return ''
+  const count = account.active_requests ?? 0
+  return count > 0 ? tf('accounts.transitionDraining', { count }) : t('accounts.transitionWaiting')
+}
+
+// toggleAllChromeProfiles 全选新账号与需要重新登录的已有账户（保留已单独勾选的），再点一次取消全部勾选
 function toggleAllChromeProfiles(): void {
   selectedChromeProfiles.value = allChromeProfilesSelected.value
     ? []
-    : chromeProfiles.value.map((profile) => profile.id)
+    : [...new Set([...selectedChromeProfiles.value, ...chromeBulkSelectable.value])]
 }
 
 function beginEdit(account: Account): void {
@@ -514,7 +563,27 @@ async function importChromeAccounts(): Promise<void> {
     chromeProfiles.value = []
     selectedChromeProfiles.value = []
     emit('refresh')
-    emit('notice', tf('accounts.importComplete', { count: result.accounts.length }), 'success')
+    // 就地重新导入逐个处理：失败的已有账户列出原因，成功的照常计入
+    const failed = result.failed ?? []
+    if (failed.length === 0) {
+      emit('notice', tf('accounts.importComplete', { count: result.accounts.length }), 'success')
+    } else {
+      const details = failed
+        .map(
+          (failure) =>
+            `${failure.email}: ${failure.code === 'account_busy' ? t('accounts.bulkEnableBusy') : failure.message}`,
+        )
+        .join('; ')
+      emit(
+        'notice',
+        tf('accounts.chromeImportPartial', {
+          count: result.accounts.length,
+          failed: failed.length,
+          details,
+        }),
+        'error',
+      )
+    }
   } catch (error) {
     actionError(error)
   } finally {
@@ -1037,7 +1106,8 @@ async function enableTargets(targets: readonly Account[]): Promise<void> {
   finishBulk('enable')
 }
 
-// enableChunk 一次请求启用一批账户，把服务端的失败项换成面板的失败明细
+// enableChunk 一次请求启用一批账户，把服务端的失败项换成面板的失败明细。管理员批量启用不等账户上的请求与操作，
+// account_busy 只在另一个进程持有账户文件锁时出现（共用账户目录的另一个实例），等多久都不会好，提示先停掉它
 async function enableChunk(chunk: readonly Account[]): Promise<BulkChunkResult> {
   const result = await api.enableAccounts({ account_ids: chunk.map((account) => account.id) })
   const labels = new Map(chunk.map((account) => [account.id, account.label]))
@@ -1046,7 +1116,7 @@ async function enableChunk(chunk: readonly Account[]): Promise<BulkChunkResult> 
     failures: (result.failed ?? []).map((failure) => ({
       id: failure.id,
       label: labels.get(failure.id) ?? failure.id,
-      message: failure.code === 'account_busy' ? t('accounts.bulkEnableBusy') : failure.message,
+      message: failure.code === 'account_busy' ? t('accounts.bulkEnableLocked') : failure.message,
     })),
   }
 }
@@ -1915,6 +1985,13 @@ function closeBulkPanel(): void {
                     <span class="dot" :class="stateDotClass[account.state]"></span>
                     {{ t(stateKeys[account.state]) }}
                   </span>
+                  <span
+                    v-if="transitionText(account) !== ''"
+                    v-tooltip="t('accounts.transitionHelp')"
+                    class="mt-0.5 block text-[11px] text-yellow-400"
+                    tabindex="0"
+                    >{{ transitionText(account) }}</span
+                  >
                 </td>
                 <td>
                   <span
@@ -2292,9 +2369,13 @@ function closeBulkPanel(): void {
           <div v-if="chromeProfiles.length === 0" class="py-8 text-center text-sm text-gray-500">
             {{ t('accounts.chromeEmpty') }}
           </div>
-          <div v-else class="mb-2 flex justify-end">
+          <div v-else class="mb-2 flex items-center justify-end gap-2">
+            <span v-if="chromeHealthyExisting" class="min-w-0 flex-1 text-xs text-gray-500">{{
+              t('accounts.chromeSelectAllHint')
+            }}</span>
             <button
-              class="text-xs text-blue-400 transition hover:text-blue-300"
+              v-if="chromeBulkSelectable.length > 0"
+              class="shrink-0 text-xs text-blue-400 transition hover:text-blue-300"
               type="button"
               @click="toggleAllChromeProfiles"
             >
@@ -2315,6 +2396,16 @@ function closeBulkPanel(): void {
               />
               <span class="min-w-0 flex-1">
                 <strong class="block truncate text-sm text-white">{{ profile.email }}</strong>
+                <span
+                  v-if="profile.existing"
+                  v-tooltip="t('accounts.chromeExistingHelp')"
+                  class="block truncate text-xs text-yellow-400"
+                  tabindex="0"
+                  >{{ t('accounts.chromeExisting')
+                  }}<template v-if="profile.state === 'auth_required'">
+                    · {{ t('state.auth_required') }}</template
+                  ></span
+                >
                 <span class="block truncate text-xs text-gray-400">{{ profile.display_name }}</span>
                 <span class="block truncate font-mono text-xs text-gray-500">{{
                   profile.profile

@@ -17,7 +17,7 @@ type AdminService interface {
 	Accounts(context.Context) ([]AdminAccount, error)
 	CreateAccount(context.Context, AccountCreateInput) (AdminAccount, error)
 	ChromeImportProfiles(context.Context) ([]ChromeImportProfile, error)
-	ImportChromeAccounts(context.Context, ChromeImportInput) ([]AdminAccount, error)
+	ImportChromeAccounts(context.Context, ChromeImportInput) (ChromeImportResult, error)
 	UpdateAccount(context.Context, string, AccountInput) (AdminAccount, error)
 	DeleteAccount(context.Context, string) error
 	LoginAccount(context.Context, string) (AdminAccount, error)
@@ -427,6 +427,11 @@ type AdminAccount struct {
 	// OrgDisabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户的 state 仍为 disabled、
 	// message 接上这个原因；验证接口的返回在验证遇到组织停用时同样为 true，前端据此提示组织停用而不是登录失效
 	OrgDisabled bool `json:"org_disabled,omitempty"`
+	// Transition 为管理页启停账户之后的后台收尾阶段：draining（已停用，等进行中的请求与账户上的其他操作结束）、closing
+	// （已停用，正在关闭 Worker）或 syncing（已启用，合并模型目录、没有目录时同步一次），没有收尾时省略；
+	// ActiveRequests 为收尾期间账户上进行中的请求数（登录、验证等独占操作不计入）
+	Transition     string `json:"transition,omitempty"`
+	ActiveRequests int    `json:"active_requests,omitempty"`
 }
 
 // AccountInput 表示已有账户配置
@@ -445,13 +450,16 @@ type AccountCreateInput struct {
 	Timezone string `json:"timezone"`
 }
 
-// ChromeImportProfile 表示可从本机 Chrome 导入的账号
+// ChromeImportProfile 表示可从本机 Chrome 导入的账号。Existing 表示邮箱已是号池里的账户：导入时就地重新导入，
+// 只覆盖 Cookie 与续签材料，保留账户配置、指纹、资源绑定与运行态；State 为该账户当前的状态（如 auth_required）
 type ChromeImportProfile struct {
 	ID          string `json:"id"`
 	Profile     string `json:"profile"`
 	DisplayName string `json:"display_name"`
 	Email       string `json:"email"`
 	Locale      string `json:"locale"`
+	Existing    bool   `json:"existing,omitempty"`
+	State       string `json:"state,omitempty"`
 }
 
 // ChromeImportInput 表示批量导入的 Chrome 账号与账户环境
@@ -460,6 +468,22 @@ type ChromeImportInput struct {
 	Proxy      string   `json:"proxy"`
 	Locale     string   `json:"locale"`
 	Timezone   string   `json:"timezone"`
+}
+
+// ChromeImportResult 为 Chrome 导入的结果：Accounts 为新增与就地重新导入成功的账户；Failed 为就地重新导入失败的已有账户
+// （逐个处理，一个失败不打断后面的，也不让已经新增或重新导入的账户从结果里消失），没有时为空数组
+type ChromeImportResult struct {
+	Accounts []AdminAccount        `json:"accounts"`
+	Failed   []ChromeImportFailure `json:"failed"`
+}
+
+// ChromeImportFailure 为一个没有重新导入的已有账户：ID 为 Chrome 账号 ID，Email 为账户邮箱，Code 为 account_busy、
+// invalid_account 等错误码（没有对应错误码时为空）
+type ChromeImportFailure struct {
+	ID      string `json:"id"`
+	Email   string `json:"email"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message"`
 }
 
 // RuntimeConfig 表示全局运行配置
@@ -746,12 +770,12 @@ func (s *server) handleImportChromeAccounts(w http.ResponseWriter, r *http.Reque
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	accounts, err := s.config.Admin.ImportChromeAccounts(r.Context(), input)
+	result, err := s.config.Admin.ImportChromeAccounts(r.Context(), input)
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string][]AdminAccount{"accounts": accounts})
+	writeJSON(w, http.StatusCreated, result)
 }
 
 func (s *server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {

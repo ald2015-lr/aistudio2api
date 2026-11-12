@@ -41,6 +41,10 @@ type runtimeAdmin struct {
 	catalogSlots     chan struct{}
 	// operationWait 大于 0 时为管理端账户操作等待独占租约的上限（见 accountOperationWait），只给包内测试调低
 	operationWait time.Duration
+	// transitions 为管理页启停账户的后台收尾与按账户串行的操作锁（见 account_transition.go）；modelSyncPending 为已经排上、
+	// 还没做的合并刷新模型目录（见 syncModelCacheSoon）
+	transitions      accountTransitions
+	modelSyncPending atomic.Bool
 }
 
 // requestRegistry 保存活动请求与事件订阅
@@ -262,12 +266,16 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
+	timezone, err := accountTimezoneInput(input.Timezone)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
 	accountConfig := aistudio.DefaultAccountConfig("")
 	accountConfig.Proxy = accountProxy
 	if locale := strings.TrimSpace(input.Locale); locale != "" {
 		accountConfig.Locale = locale
 	}
-	if timezone := strings.TrimSpace(input.Timezone); timezone != "" {
+	if timezone != "" {
 		accountConfig.Timezone = timezone
 	}
 	directory, err := os.MkdirTemp("", "aistudio2api-account-login-*")
@@ -291,6 +299,14 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
 		))
 		return api.AdminAccount{}, err
+	}
+	// 浏览器里登录的是已有账户：邮箱要到登录完成后才知道，拿到后立即返回 409（不签名、不建临时目录），按账户状态提示怎么处理
+	// （见 errAccountExists）。不就地更新：这次登录用的是新生成的指纹，覆盖已有账户等于换掉它的浏览器身份
+	if email := strings.ToLower(strings.TrimSpace(result.Email)); email != "" {
+		if _, exists := admin.pool.StatusOf(email); exists {
+			admin.requests.log("auth", "WARN", "账户添加 | 账户已在号池中，没有重复添加 | 账户="+email)
+			return api.AdminAccount{}, errAccountExists(email, true)
+		}
 	}
 	if result.DriveError != "" {
 		admin.requests.log("auth", "WARN", "账户添加 | Drive 授权失败 | 错误="+result.DriveError)
@@ -319,61 +335,82 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	return created, nil
 }
 
+// ChromeImportProfiles 列出本机 Chrome 里可以导入的 Google 账号：邮箱已是号池里的账户时标 existing 与它的状态（导入时就地重新导入，
+// 覆盖 Cookie 与续签材料，保留指纹、资源绑定与运行态，见 account_reimport.go），同一邮箱只列一次。管理页的全选只选新账号与
+// 需要重新登录的已有账户：就地重新导入会关闭账户正在服务的 Worker，状态正常的已有账户要单独勾选
 func (admin *runtimeAdmin) ChromeImportProfiles(context.Context) ([]api.ChromeImportProfile, error) {
-	root, err := chromeauth.DefaultChromeRoot()
+	root, err := chromeImportRoot()
 	if err != nil {
 		return nil, err
 	}
-	accounts, err := chromeauth.Discover(root)
+	accounts, err := chromeDiscover(root)
 	if err != nil {
 		return nil, err
 	}
-	existing := make(map[string]struct{})
-	for _, status := range admin.pool.Status() {
-		existing[strings.ToLower(strings.TrimSpace(status.ID))] = struct{}{}
-	}
+	seen := make(map[string]struct{}, len(accounts))
 	profiles := make([]api.ChromeImportProfile, 0, len(accounts))
 	for _, account := range accounts {
 		email := strings.ToLower(strings.TrimSpace(account.Email))
 		if !account.Importable || email == "" {
 			continue
 		}
-		if _, exists := existing[email]; exists {
+		if _, duplicate := seen[email]; duplicate {
 			continue
 		}
-		existing[email] = struct{}{}
-		profiles = append(profiles, api.ChromeImportProfile{
+		seen[email] = struct{}{}
+		profile := api.ChromeImportProfile{
 			ID: account.ID, Profile: account.Profile, DisplayName: account.DisplayName, Email: email, Locale: account.Locale,
-		})
+		}
+		if status, exists := admin.pool.StatusOf(email); exists {
+			profile.Existing, profile.State = true, string(status.State)
+		}
+		profiles = append(profiles, profile)
 	}
 	return profiles, nil
 }
 
-func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) ([]api.AdminAccount, error) {
+// ImportChromeAccounts 从本机 Chrome 导入选中的账号：新邮箱新增账户；邮箱已是号池里账户的就地重新导入（见 reimportChromeAccount），
+// 逐个处理，失败的记入结果的 Failed、接着处理下一个：一个账户正忙或签发失败不让整批只返回错误，已经新增与重新导入的账户照常列在结果里
+// （原先任何一个失败都直接返回错误，管理页只看到错误，重试时刚新增的账户又被当成已有账户再导入一遍）。
+// 新账号的导入（同一次 Chrome 导入里签发）失败仍按整批失败返回，与原先相同
+func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.ChromeImportInput) (api.ChromeImportResult, error) {
 	if len(input.AccountIDs) == 0 {
-		return nil, invalidAccount(fmt.Errorf("未选择 Chrome 账号"))
+		return api.ChromeImportResult{}, invalidAccount(fmt.Errorf("未选择 Chrome 账号"))
 	}
 	// 代理先规范化：原先要等 Chrome 导入（含 OAuth 网络请求）做完才校验，代理写错时白白等一轮导入
 	accountProxy, err := normalizeAccountProxy(input.Proxy)
 	if err != nil {
-		return nil, err
+		return api.ChromeImportResult{}, err
+	}
+	timezone, err := accountTimezoneInput(input.Timezone)
+	if err != nil {
+		return api.ChromeImportResult{}, err
 	}
 	root, err := chromeImportRoot()
 	if err != nil {
-		return nil, err
+		return api.ChromeImportResult{}, err
+	}
+	// 邮箱已是号池里账户的 Chrome 账号就地重新导入（见 reimportChromeAccount）：只替换认证状态，代理、语言、时区与指纹都不变
+	fresh, existing, err := admin.splitChromeImport(root, input.AccountIDs)
+	if err != nil {
+		return api.ChromeImportResult{}, err
 	}
 	// 逐个导入时每个账号导入完就归还出口、只记下端口号或会话号：新建成功的账户按记下的值登记到名下（见 addAccount 的 onCreated），
 	// 已存在的账户不受影响
-	results, poolClaims, err := admin.importChrome(ctx, root, accountProxy, input.AccountIDs)
-	if err != nil {
-		return nil, err
+	var results []chromeauth.ImportResult
+	var poolClaims []*proxyPoolClaim
+	if len(fresh) > 0 {
+		results, poolClaims, err = admin.importChrome(ctx, root, accountProxy, fresh)
+		if err != nil {
+			return api.ChromeImportResult{}, err
+		}
 	}
 	configs := make([]aistudio.AccountConfig, len(results))
 	seen := make(map[string]struct{}, len(results))
 	for index, result := range results {
 		email := strings.ToLower(strings.TrimSpace(result.Email))
 		if _, exists := seen[email]; exists {
-			return nil, invalidAccount(fmt.Errorf("Chrome 账号重复: %s", email))
+			return api.ChromeImportResult{}, invalidAccount(fmt.Errorf("Chrome 账号重复: %s", email))
 		}
 		seen[email] = struct{}{}
 		accountConfig := aistudio.DefaultAccountConfig(email)
@@ -383,27 +420,51 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 		} else if locale := strings.TrimSpace(result.Locale); locale != "" {
 			accountConfig.Locale = locale
 		}
-		if timezone := strings.TrimSpace(input.Timezone); timezone != "" {
+		if timezone != "" {
 			accountConfig.Timezone = timezone
 		}
 		if err := accountConfig.Validate(); err != nil {
-			return nil, invalidAccount(err)
+			return api.ChromeImportResult{}, invalidAccount(err)
 		}
 		if _, err := aistudio.NewSigner().Sign(result.State); err != nil {
-			return nil, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
+			return api.ChromeImportResult{}, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
 		}
 		configs[index] = accountConfig
 	}
-	accounts := make([]api.AdminAccount, 0, len(results))
+	imported := api.ChromeImportResult{
+		Accounts: make([]api.AdminAccount, 0, len(results)+len(existing)), Failed: []api.ChromeImportFailure{},
+	}
 	for index, result := range results {
 		account, err := admin.addAccount(ctx, configs[index], result.State, "", poolClaims[index].adopt)
 		if err != nil {
-			return nil, err
+			return api.ChromeImportResult{}, err
 		}
-		accounts = append(accounts, account)
+		imported.Accounts = append(imported.Accounts, account)
 		admin.requests.log("auth", "INFO", "Chrome 账户已导入 | 账户="+account.Label)
 	}
-	return accounts, nil
+	for _, target := range existing {
+		if ctx.Err() != nil {
+			return imported, ctx.Err()
+		}
+		account, err := admin.reimportChromeAccount(ctx, root, target)
+		if err != nil {
+			imported.Failed = append(imported.Failed, chromeImportFailure(target, err))
+			admin.requests.log(target.accountID, "WARN", "Chrome 就地重新导入失败 | 错误="+strings.TrimSpace(err.Error()))
+			continue
+		}
+		imported.Accounts = append(imported.Accounts, account)
+	}
+	return imported, nil
+}
+
+// chromeImportFailure 把一个已有账户就地重新导入的错误转换为导入结果中的失败项
+func chromeImportFailure(target chromeReimport, err error) api.ChromeImportFailure {
+	failure := api.ChromeImportFailure{ID: target.chromeID, Email: target.accountID, Message: strings.TrimSpace(err.Error())}
+	var operation *adminOperationError
+	if errors.As(err, &operation) {
+		failure.Code = operation.code
+	}
+	return failure
 }
 
 // addAccount 保存并挂载新账户；onCreated 在账户新建成功（store.Create）之后、Worker 与账户池挂载之前以账户 ID 调用，
@@ -416,6 +477,11 @@ func (admin *runtimeAdmin) addAccount(
 	onCreated func(accountID string),
 ) (created api.AdminAccount, resultErr error) {
 	account, publishLease, err := admin.store.Create(accountConfig, state)
+	if errors.Is(err, aistudio.ErrAccountExists) {
+		// 多半是账户目录已在 auth 目录下、还没被目录扫描载入；刚好在这之前载入了的按已在号池中提示
+		_, loaded := admin.pool.StatusOf(accountConfig.Label)
+		return api.AdminAccount{}, errAccountExists(accountConfig.Label, loaded)
+	}
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -493,14 +559,34 @@ func (admin *runtimeAdmin) updateAccount(
 	accountConfig.Proxy = accountProxy
 	accountConfig.Locale = strings.TrimSpace(input.Locale)
 	accountConfig.Timezone = strings.TrimSpace(input.Timezone)
+	current, known := admin.pool.StatusOf(accountID)
+	// 时区只在录入、修改时校验（见 accountTimezoneInput）：已有账户原样保存的时区不校验，启停、改代理不会因为早先存下的值被拒
+	if !known || accountConfig.Timezone != current.Timezone {
+		if _, err := accountTimezoneInput(accountConfig.Timezone); err != nil {
+			return api.AdminAccount{}, err
+		}
+	}
 	if err := accountConfig.Validate(); err != nil {
 		return api.AdminAccount{}, invalidAccount(err)
 	}
+	// 管理员只切换启用状态：立即生效并返回，等请求结束、关闭 Worker、同步目录转入后台（见 account_transition.go）。
+	// 新账户自动处理的启用仍在租约内复核停用记录，走下面的原路径
+	if automatic == nil && known && enableOnlyChange(current, accountConfig) {
+		return admin.setAccountEnabled(ctx, accountID, input.Enabled)
+	}
+	// 改代理、语言、时区等：先取消启停的后台收尾，再取独占租约。取不到租约或保存失败时按取消前的阶段重新开始收尾（停用的账户
+	// 继续等请求结束、关闭 Worker，阶段照常显示）；保存成功时 Worker 与固定出口已在租约内换掉，只恢复启用收尾（没有目录时同步一次）
+	stage := admin.cancelTransition(accountID)
+	resume := stage
+	defer func() { admin.resumeTransition(accountID, resume) }()
 	lease, err := admin.acquireAccountForOperation(ctx, accountID)
 	if err != nil {
 		return api.AdminAccount{}, err
 	}
 	account := lease.Account()
+	// 账户操作锁：与不取租约的启停（setAccountEnabled）串行，停用记录的复核与写入之间没有空档，也不会盖掉刚切换的启用状态
+	unlockAccount := admin.transitions.lock(account.ID)
+	defer unlockAccount()
 	wasEnabled := account.Config.Enabled
 	if automatic != nil && input.Enabled && !wasEnabled &&
 		accountDisableNotes.blocksAutoEnable(account.ID, automatic.explicitAt) {
@@ -524,6 +610,9 @@ func (admin *runtimeAdmin) updateAccount(
 	}
 	workerUpdate.Commit()
 	headerUpdate.Commit()
+	if stage == aistudio.AccountDraining {
+		resume = ""
+	}
 	// 账户代理可能变了：IP 池重算它的外部占用与默认出口（改代理时旧 Worker 已关闭，租约随之归还）
 	admin.ipPool().refresh(admin.pool, account.ID)
 	switch {
@@ -545,6 +634,7 @@ func (admin *runtimeAdmin) updateAccount(
 		// 管理员启用时清除包括手动停用在内的记录；新账户自动处理走到这里时上面已确认没有挡住启用的手动停用记录
 		accountDisableNotes.clear(account.ID)
 	}
+	unlockAccount()
 	if err := lease.Release(); err != nil {
 		return api.AdminAccount{}, err
 	}
@@ -553,6 +643,9 @@ func (admin *runtimeAdmin) updateAccount(
 		// 停用账户不参与启动时的模型目录同步，启用后没有目录就不能预热、接不到请求：在后台补一次同步
 		admin.startCatalogBackfill([]string{account.ID})
 	}
+	// 在返回的账户视图之前恢复被取消的启用收尾，账户行照常显示阶段
+	admin.resumeTransition(account.ID, resume)
+	resume = ""
 	admin.requests.log("auth", "INFO", "账户配置已更新 | 账户="+accountConfig.Label)
 	return admin.account(account.ID)
 }
@@ -561,6 +654,13 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 	if _, err := admin.account(accountID); err != nil {
 		return err
 	}
+	// 先取消启停的后台收尾（停用收尾登记着独占等待，账户池会按正在使用拒绝删除）；按账户串行，取消后不会再开始新的收尾。
+	// 账户还有进行中的请求、删除失败时，按取消前的阶段重新开始收尾（停用的账户等请求结束、关闭 Worker），阶段照常显示。
+	// 删除不等租约（账户池正在使用时直接拒绝），整个过程持有账户操作锁
+	unlockAccount := admin.transitions.lock(accountID)
+	defer unlockAccount()
+	stage := admin.transitions.stage(accountID)
+	admin.transitions.cancel(accountID)
 	defer admin.syncModelCache()
 	removed, err := admin.removeAccount(func(deleteDirectory func(*aistudio.Account) error) (*aistudio.Account, error) {
 		var removed *aistudio.Account
@@ -572,6 +672,7 @@ func (admin *runtimeAdmin) DeleteAccount(_ context.Context, accountID string) er
 		return removed, err
 	})
 	if removed == nil {
+		admin.resumeTransitionLocked(accountID, stage)
 		return accountOperationError(err)
 	}
 	if err != nil {
@@ -675,11 +776,14 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	if _, err := aistudio.NewSigner().Sign(result.StorageState); err != nil {
 		return api.AdminAccount{}, errors.Join(fmt.Errorf("认证状态无法用于 AI Studio: %w", err), lease.Release())
 	}
-	if err := camoufoxnative.PersistAccountFingerprint(directory, account.Directory); err != nil {
+	// 写回账户原有指纹的副本与新登录状态；新状态没有 Chrome OAuth 续签材料时沿用原有的（见 replaceAccountState）：
+	// Chrome 导入的账户重新登录后，之后遇到 401 仍能原地续签
+	carried, err := replaceAccountState(lease, result.StorageState, directory)
+	if err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
-	if err := lease.SaveStorageState(result.StorageState); err != nil {
-		return api.AdminAccount{}, errors.Join(err, lease.Release())
+	if carried {
+		admin.requests.log(account.Config.Label, "INFO", "账户登录 | 沿用原有的 Chrome OAuth 续签材料")
 	}
 	// 不清空模型目录：同一邮箱即同一账户，权益与目录的变化由随后的刷新纠正（SetCatalog 发现权益变化时清除模型资格）。
 	// 原先先清空目录，随后的同步遇到 429 时目录一直为空，账号登录成功却不是任何模型的候选
@@ -1081,6 +1185,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		BenefitTierKnown: status.BenefitTierKnown, Pool: status.Pool,
 		ProxyPoolSlot: status.ProxySlot, ProxyPoolActive: status.ProxySlotActive,
 		OrgDisabled: status.OrgDisabled,
+		Transition:  string(status.Transition), ActiveRequests: status.ActiveRequests,
 	}
 }
 

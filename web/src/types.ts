@@ -43,7 +43,15 @@ export interface Account {
   // org_disabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户仍为 disabled、
   // message 接上原因；验证接口的返回在验证遇到组织停用时同样为 true
   org_disabled?: boolean
+  // transition 为管理页启停之后的后台收尾阶段：draining（已停用，等进行中的请求与账户上的其他操作结束）、closing（已停用，
+  // 正在关闭 Worker）或 syncing（已启用，合并模型目录、没有目录时同步一次），没有收尾时没有这个字段；
+  // active_requests 为收尾期间进行中的请求数（登录、验证等独占操作不计入，draining 而它为 0 时在等这些操作结束）
+  transition?: AccountTransition
+  active_requests?: number
 }
+
+// AccountTransition 为账户启停之后的后台收尾阶段
+export type AccountTransition = 'draining' | 'closing' | 'syncing'
 
 // AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
 export type AccountPool = 'ultra' | 'normal'
@@ -68,10 +76,29 @@ export interface ChromeImportProfile {
   display_name: string
   email: string
   locale: string
+  // existing 表示邮箱已是号池里的账户：导入时就地重新导入（只覆盖 Cookie 与续签材料，保留设置、指纹、资源绑定与运行态）；
+  // state 为该账户当前的状态
+  existing?: boolean
+  state?: AccountState
 }
 
 export interface ChromeImportInput extends AccountLoginInput {
   account_ids: string[]
+}
+
+// ChromeImportFailure 为一个没有就地重新导入的已有账户：id 为 Chrome 账号 ID，email 为账户邮箱，code 为 account_busy 等错误码
+export interface ChromeImportFailure {
+  id: string
+  email: string
+  code?: string
+  message: string
+}
+
+// ChromeImportResult 为 Chrome 导入的结果：accounts 为新增与就地重新导入成功的账户，failed 为重新导入失败的已有账户
+// （逐个处理，一个失败不打断后面的；旧版服务没有这个字段）
+export interface ChromeImportResult {
+  accounts: Account[]
+  failed?: ChromeImportFailure[] | null
 }
 
 export interface AccountCounters {

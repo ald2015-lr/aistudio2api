@@ -172,6 +172,8 @@ func newRuntime(
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
 	))
 	closeRuntime := func() error {
+		// 管理页启停账户的后台收尾（见 account_transition.go）：先取消并等它们退出，之后不会再为账户关闭 Worker
+		admin.transitions.close()
 		// 停用原因与新账户处理记录都是合并几秒后才写文件，关闭时立即写出，退出前的变化不会丢失
 		admin.onboard.flush()
 		accountDisableNotes.flush()
@@ -711,6 +713,25 @@ func (manager *accountWorkerManager) finishOpening(accountID string, opening cha
 	manager.openingSet.Delete(accountID)
 	close(opening)
 	manager.notifyScheduling()
+}
+
+// waitOpening 等账户正在进行的 Worker 启动结束（启动占位 openings 撤销），没有在启动时立即返回；ctx 结束时返回它的错误。
+// 预热这类不持有账户租约的启动在启动期间一直持有该账户的 startupMu（最长约 INIT_TIMEOUT），Reset 在 startupMu 上等它、不能取消；
+// 停用收尾（finishDisable）先在这里可取消地等，再次启停、删除时立即放弃
+func (manager *accountWorkerManager) waitOpening(ctx context.Context, accountID string) error {
+	for {
+		manager.rebalanceMu.Lock()
+		opening := manager.openings[accountID]
+		manager.rebalanceMu.Unlock()
+		if opening == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-opening:
+		}
+	}
 }
 
 // Add 注册新账户的 WAA worker 配置

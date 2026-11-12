@@ -9,6 +9,7 @@ import type {
   BulkEnableResult,
   ChromeImportInput,
   ChromeImportProfile,
+  ChromeImportResult,
   Model,
   OnboardingPolicy,
   OnboardingStatus,
@@ -184,8 +185,17 @@ async function playgroundResponseError(response: Response): Promise<ApiError> {
   })
 }
 
-// requestJSON 执行管理端 JSON 请求并保留服务端错误语义
-async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
+// adminResponseError 把管理端的非 2xx 响应转为 ApiError。withCode 为真时带上错误外壳里的错误码（管理端为 {error:{code,message}}），
+// 只给按错误码显示本地化文案的账户写操作用（添加账户、修改账户、Chrome 导入：account_exists、invalid_timezone）；
+// 其他管理请求的错误照旧只带消息与状态码
+async function adminResponseError(response: Response, withCode: boolean): Promise<ApiError> {
+  if (!withCode) return new ApiError(await responseErrorMessage(response), response.status)
+  const { message, code } = await responseErrorBody(response)
+  return new ApiError(message, response.status, { code })
+}
+
+// requestJSON 执行管理端 JSON 请求并保留服务端错误语义；withCode 见 adminResponseError
+async function requestJSON<T>(path: string, init?: RequestInit, withCode = false): Promise<T> {
   const headers = new Headers(init?.headers)
   if (init?.body !== undefined) {
     headers.set('Content-Type', 'application/json')
@@ -193,14 +203,14 @@ async function requestJSON<T>(path: string, init?: RequestInit): Promise<T> {
 
   const response = await fetch(path, { ...init, headers })
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await adminResponseError(response, withCode)
   }
 
   return (await response.json()) as T
 }
 
-// requestCommand 执行无需响应体的管理写操作
-async function requestCommand(path: string, init: RequestInit): Promise<void> {
+// requestCommand 执行无需响应体的管理写操作；withCode 见 adminResponseError
+async function requestCommand(path: string, init: RequestInit, withCode = false): Promise<void> {
   const headers = new Headers(init.headers)
   if (init.body !== undefined) {
     headers.set('Content-Type', 'application/json')
@@ -208,7 +218,7 @@ async function requestCommand(path: string, init: RequestInit): Promise<void> {
 
   const response = await fetch(path, { ...init, headers })
   if (!response.ok) {
-    throw new ApiError(await responseErrorMessage(response), response.status)
+    throw await adminResponseError(response, withCode)
   }
 }
 
@@ -259,23 +269,37 @@ export const api = {
     }),
   requests: async () => (await requestJSON<RequestsResponse>('/api/requests')).requests,
   config: () => requestJSON<ServiceConfig>('/api/config'),
+  // 添加账户、Chrome 导入与修改账户的错误带错误码：重复添加（409 account_exists）与时区无效（400 invalid_timezone）按错误码
+  // 显示中英文文案（见 AccountsPanel 的 actionError）
   createAccount: (input: AccountLoginInput) =>
-    requestJSON<AccountResponse>('/api/accounts', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
+    requestJSON<AccountResponse>(
+      '/api/accounts',
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      },
+      true,
+    ),
   chromeImportProfiles: async () =>
     (await requestJSON<ChromeProfilesResponse>('/api/accounts/import/chrome')).profiles,
   importChromeAccounts: (input: ChromeImportInput) =>
-    requestJSON<AccountsResponse>('/api/accounts/import/chrome', {
-      method: 'POST',
-      body: JSON.stringify(input),
-    }),
+    requestJSON<ChromeImportResult>(
+      '/api/accounts/import/chrome',
+      {
+        method: 'POST',
+        body: JSON.stringify(input),
+      },
+      true,
+    ),
   updateAccount: (id: string, draft: AccountDraft) =>
-    requestCommand(`/api/accounts/${encodeURIComponent(id)}`, {
-      method: 'PUT',
-      body: JSON.stringify(draft),
-    }),
+    requestCommand(
+      `/api/accounts/${encodeURIComponent(id)}`,
+      {
+        method: 'PUT',
+        body: JSON.stringify(draft),
+      },
+      true,
+    ),
   // enableAccounts 一次请求启用一批账户（服务端每次最多 1000 个）
   enableAccounts: (input: BulkEnableInput) =>
     requestJSON<BulkEnableResult>('/api/accounts/bulk-enable', {

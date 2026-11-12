@@ -442,7 +442,9 @@ func TestAccountOperationWaitBounded(t *testing.T) {
 		t.Fatalf("默认等待上限 = %s，期望 REQUEST_TIMEOUT + 30s = %s", got, want)
 	}
 	admin.operationWait = 200 * time.Millisecond
+	// 改语言区域：要重建 Worker 配置、取独占租约（只改启用状态的保存立即生效，不等租约，见 account_transition.go）
 	input := manualDisableInput(accountID, true)
+	input.Locale = "ja-JP"
 	release := holdLease(t, admin.pool, accountID)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

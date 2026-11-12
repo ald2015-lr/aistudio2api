@@ -565,6 +565,8 @@ type Account struct {
 	// schedulingState 读取，底层状态 State 照常写入、不被覆盖；受账户池 mu 保护
 	orgDisabled       bool
 	orgDisabledReason string
+	// transition 为管理页启停账户之后的后台收尾阶段（见 SetTransition），受账户池 mu 保护
+	transition AccountTransition
 }
 
 // AccountStatus 表示管理界面使用的脱敏账户状态
@@ -592,6 +594,11 @@ type AccountStatus struct {
 	// OrgDisabled 表示账户带着组织停用的标记（见 org_disabled.go），不区分是否启用：停用账户的 State 仍为 disabled，
 	// 管理页靠它看出停用账户所属组织停用了 AI Studio
 	OrgDisabled bool `json:"org_disabled,omitempty"`
+	// Transition 为管理页启停账户之后的后台收尾阶段（draining、closing、syncing，见 SetTransition），没有收尾时为空；
+	// ActiveRequests 为账户上进行中的普通租约数，只在有收尾阶段时填写（停用后等它们结束）。独占操作（登录、验证、目录同步、
+	// 收尾等着的 Worker 启动等）不计入：draining 而 ActiveRequests 为 0 表示还在等这些操作结束；没有要等的、正在关闭 Worker 时为 closing
+	Transition     AccountTransition `json:"transition,omitempty"`
+	ActiveRequests int               `json:"active_requests,omitempty"`
 }
 
 // AccountSelection 描述账户调度所需的能力或粘性条件
@@ -921,6 +928,11 @@ func (s *AccountStore) Create(accountConfig AccountConfig, state StorageState) (
 		return nil, nil, err
 	}
 	accountConfig.Label = id
+	// 同一邮箱的账户已经存在：在写临时目录之前报 ErrAccountExists（原先到改名时才失败，报的是“file exists”），
+	// 管理端据此提示对该账户使用重新登录
+	if accountDirectoryExists(filepath.Join(root, id)) {
+		return nil, nil, fmt.Errorf("%w: %s", ErrAccountExists, id)
+	}
 	temporary, err := os.MkdirTemp(root, ".account-*.tmp")
 	if err != nil {
 		return nil, nil, fmt.Errorf("创建临时账户目录: %w", err)
@@ -3603,6 +3615,14 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 		Cooldowns:        cloneCooldowns(account.runtime.Cooldowns),
 		Message:          account.stateMessageLocked(),
 		OrgDisabled:      account.orgDisabled,
+	}
+	if account.transition != "" {
+		status.Transition, status.ActiveRequests = account.transition, account.active
+		// 停用收尾还没取得独占租约、账户上也没有请求与独占操作（登录、验证、目录同步等）时，下一步就是关闭 Worker：按 closing 显示。
+		// 停用一个空闲账户时返回的账户视图即是如此；有独占操作时（包括收尾自己取得租约后等不持有租约的 Worker 启动结束）仍为 draining
+		if status.Transition == AccountDraining && account.active == 0 && !account.exclusive {
+			status.Transition = AccountClosing
+		}
 	}
 	if !account.LastUsed.IsZero() {
 		status.LastUsed = timePointer(account.LastUsed)

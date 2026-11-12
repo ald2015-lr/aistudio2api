@@ -138,7 +138,7 @@ func (recorder *relayLogRecorder) text() string {
 
 // TestNativeLoginRelayOptions 带认证的代理在登录参数里换成本机中转地址（http 上游给 http://127.0.0.1:N，socks5 上游给
 // socks5://127.0.0.1:N）；不带认证时原样返回、不起监听；中转解析不了的值原样交给 Camoufox，由它按原规则报错；
-// 使用者为“登录:新账户”“验证:账户 ID”
+// 使用者为“登录:新账户”“验证:账户 ID”；可见登录的时限固定 30 分钟，无头验证用驱动的时限（REQUEST_TIMEOUT）
 func TestNativeLoginRelayOptions(t *testing.T) {
 	recorder := &relayLogRecorder{}
 	proxyrelay.SetLogger(recorder.log)
@@ -146,7 +146,7 @@ func TestNativeLoginRelayOptions(t *testing.T) {
 	driver := &NativeLoginDriver{camoufox: "/opt/camoufox/camoufox", timeout: time.Minute}
 
 	httpUpstream := "http://" + relayTestUser + ":" + relayTestPassword + "@127.0.0.1:9"
-	options, relay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "new", Proxy: httpUpstream, Locale: "en-US"}, "登录")
+	options, relay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "new", Proxy: httpUpstream, Locale: "en-US"}, "登录", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,19 +154,25 @@ func TestNativeLoginRelayOptions(t *testing.T) {
 	if !relay.Relayed() || !regexp.MustCompile(`^http://127\.0\.0\.1:[0-9]+$`).MatchString(options.Proxy) {
 		t.Fatalf("http 上游应换成 http://127.0.0.1:N，得到 %q", options.Proxy)
 	}
-	if options.ExecutablePath != driver.camoufox || options.Locale != "en-US" || options.Timeout != time.Minute {
+	if options.ExecutablePath != driver.camoufox || options.Locale != "en-US" {
 		t.Fatalf("其余登录参数应原样透传: %+v", options)
+	}
+	if options.Timeout != 30*time.Minute {
+		t.Fatalf("可见登录的时限应固定 30 分钟（不跟随 REQUEST_TIMEOUT），得到 %s", options.Timeout)
 	}
 	if !strings.Contains(recorder.text(), "使用者=登录:新账户") {
 		t.Fatalf("新账户登录的使用者应为“登录:新账户”，日志: %s", recorder.text())
 	}
 
 	socksUpstream := "socks5://" + relayTestUser + ":" + relayTestPassword + "@127.0.0.1:9"
-	options, socksRelay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "a@example.com", Proxy: socksUpstream}, "验证")
+	options, socksRelay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "a@example.com", Proxy: socksUpstream}, "验证", false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer socksRelay.Release()
+	if options.Timeout != time.Minute {
+		t.Fatalf("无头验证占着账户的独占租约，时限应保持驱动的时限 1 分钟，得到 %s", options.Timeout)
+	}
 	if !socksRelay.Relayed() || !regexp.MustCompile(`^socks5://127\.0\.0\.1:[0-9]+$`).MatchString(options.Proxy) {
 		t.Fatalf("socks5 上游应换成 socks5://127.0.0.1:N，得到 %q", options.Proxy)
 	}
@@ -175,7 +181,7 @@ func TestNativeLoginRelayOptions(t *testing.T) {
 	}
 
 	for _, plain := range []string{"", "http://127.0.0.1:7890", "HTTP://Proxy.example.com:8080/", "socks5://[::1]:1080"} {
-		options, plainRelay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "setup", Proxy: plain}, "登录")
+		options, plainRelay, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "setup", Proxy: plain}, "登录", true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +192,7 @@ func TestNativeLoginRelayOptions(t *testing.T) {
 	}
 
 	// 中转不支持的写法（例如带账号密码的 socks4）不起中转、原值交给 Camoufox：它会按原规则以固定文案拒绝
-	options, invalid, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "a@example.com", Proxy: "socks4://u:p@h:1080"}, "登录")
+	options, invalid, err := driver.relayOptions(IsolatedLoginRequest{AccountID: "a@example.com", Proxy: "socks4://u:p@h:1080"}, "登录", true)
 	if err != nil || invalid.Relayed() || options.Proxy != "socks4://u:p@h:1080" {
 		t.Fatalf("中转解析不了的值应原样交给 Camoufox，得到 %q（%v）", options.Proxy, err)
 	}

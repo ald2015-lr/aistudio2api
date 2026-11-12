@@ -1307,18 +1307,31 @@ func TestProxyPoolAdoptOnlyNewAccounts(t *testing.T) {
 		return results, nil
 	}
 	chromeImportRoot = func() (string, error) { return "root", nil }
-	t.Cleanup(func() { chromeImport, chromeImportRoot = previousImport, previousRoot })
-	if _, err := admin.ImportChromeAccounts(context.Background(), api.ChromeImportInput{AccountIDs: []string{"Default/a@example.com"}}); err == nil {
-		t.Fatal("导入已存在的账号应失败")
+	previousDiscover := chromeDiscover
+	chromeDiscover = func(string) ([]chromeauth.Account, error) {
+		return []chromeauth.Account{
+			{ID: "Default/a@example.com", Email: "a@example.com", Importable: true},
+			{ID: "Default/z@example.com", Email: "z@example.com", Importable: true},
+		}, nil
+	}
+	t.Cleanup(func() {
+		chromeImport, chromeImportRoot, chromeDiscover = previousImport, previousRoot, previousDiscover
+	})
+	// 已存在的账号就地重新导入：用账户自己的会话号签发 Cookie，不 adopt、不改会话号
+	if reimported, err := admin.ImportChromeAccounts(context.Background(), api.ChromeImportInput{AccountIDs: []string{"Default/a@example.com"}}); err != nil || len(reimported.Accounts) != 1 || len(reimported.Failed) != 0 {
+		t.Fatalf("已存在的账号应就地重新导入：%+v（%v）", reimported, err)
+	}
+	if !strings.Contains(imports[len(imports)-1].Proxy, "sessid-"+sessionBefore+":") {
+		t.Fatal("就地重新导入应使用账户自己的会话号")
 	}
 	if after, adopted := session("a@example.com"); after != sessionBefore || adopted {
 		t.Fatalf("重复添加不应改掉已有账户的会话号：%s → %s（adopted=%v）", sessionBefore, after, adopted)
 	}
 	if status := ipPool.status(); len(status.Assignments) != 0 {
-		t.Fatalf("导入失败后租约应全部归还：%+v", status.Assignments)
+		t.Fatalf("重新导入后租约应全部归还：%+v", status.Assignments)
 	}
 	created, err := admin.ImportChromeAccounts(context.Background(), api.ChromeImportInput{AccountIDs: []string{"Default/z@example.com"}})
-	if err != nil || len(created) != 1 {
+	if err != nil || len(created.Accounts) != 1 {
 		t.Fatalf("导入新账号：%+v（%v）", created, err)
 	}
 	zSession, adopted := session("z@example.com")

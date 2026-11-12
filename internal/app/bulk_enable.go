@@ -31,7 +31,8 @@ const (
 var (
 	// bulkEnableMaxPerCall 为单次请求最多启用的账户数，其余计入 remaining，管理页分批提交
 	bulkEnableMaxPerCall = 1000
-	// bulkEnableAcquireWait 为等待账户空闲的最长时间；账户正在验证、登录或处理请求时不等下去，报告 account_busy，稍后重试
+	// bulkEnableAcquireWait 为自动启用（认证文件更新后）等待账户空闲的最长时间；账户正在验证、登录或处理请求时不等下去，
+	// 报告 account_busy，稍后重试。管理员批量启用不取租约，不等（见 enableAccountConfig）
 	bulkEnableAcquireWait = 3 * time.Second
 )
 
@@ -60,12 +61,20 @@ func accountBusyError(err error) bool {
 
 // enableAccountConfig 只把账户改为启用并写回 account.json：代理、语言、时区不变，不重建固定出口与 Worker 配置
 // （它们只取决于这些字段），不登记模型变化、不合并模型目录、不推送账户状态，由调用方在一批结束后统一处理；
-// 清除账户的停用原因。账户最多等 bulkEnableAcquireWait 空闲，等不到返回 account_busy。返回是否由本次启用。
+// 清除账户的停用原因。返回是否由本次启用。
 //
-// automatic 为假时是管理员的明确操作（批量启用），手动停用的账户同样启用并清除记录；为真时是按默认启用的自动启用
-// （认证文件更新后），在账户租约内再看一次停用记录，手动停用的不启用、返回 errAccountManuallyDisabled：
-// 原先只在租约外判断，判断后、启用前被手动停用的账户仍被启用，手动停用记录也被清除
+// automatic 为假时是管理员的明确操作（批量启用），与在账户页逐个启用（setAccountEnabled）同一路径：在账户操作锁内先取消
+// 停用收尾，再不取租约写入（aistudio.AccountPool.SetEnabled），手动停用的账户同样启用并清除记录。停用之后还有请求在跑的账户
+// （停用收尾正在等请求结束）因此能立即启用：原先要等独占租约，等满 bulkEnableAcquireWait 报 account_busy，与逐个启用不一致；
+// 一批上万个账户也不再逐个等租约。只有另一个进程持有账户文件锁时返回 account_busy。
+//
+// automatic 为真时是按默认启用的自动启用（认证文件更新后），最多等 bulkEnableAcquireWait 空闲（等不到返回 account_busy），
+// 在账户租约内再看一次停用记录，手动停用的不启用、返回 errAccountManuallyDisabled：原先只在租约外判断，
+// 判断后、启用前被手动停用的账户仍被启用，手动停用记录也被清除
 func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID string, automatic bool) (bool, error) {
+	if !automatic {
+		return admin.enableAccountNow(accountID)
+	}
 	acquireCtx, cancel := context.WithTimeout(ctx, bulkEnableAcquireWait)
 	defer cancel()
 	lease, err := admin.pool.AcquireAccount(acquireCtx, accountID)
@@ -75,6 +84,10 @@ func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID st
 		}
 		return false, accountOperationError(err)
 	}
+	// 账户操作锁：与不取租约的启停（setAccountEnabled）串行，读出配置再写回不会盖掉刚切换的启用状态，
+	// 自动启用复核停用记录与手动停用之间也没有空档
+	unlockAccount := admin.transitions.lock(accountID)
+	defer unlockAccount()
 	accountConfig := lease.Account().Config
 	if accountConfig.Enabled {
 		return false, lease.Release()
@@ -88,6 +101,28 @@ func (admin *runtimeAdmin) enableAccountConfig(ctx context.Context, accountID st
 	}
 	accountDisableNotes.clear(accountID)
 	return true, lease.Release()
+}
+
+// enableAccountNow 为管理员批量启用一个账户（见 enableAccountConfig）：在账户操作锁内取消停用收尾、不取租约写入启用状态、
+// 清除停用记录。账户已经启用时不取消它的收尾（例如逐个启用后正在同步目录），返回 false。写入失败（另一个进程持有账户文件锁、
+// 写 account.json 失败）时账户仍是停用，被取消的停用收尾按原阶段重新开始（与逐个启用相同，见 setAccountEnabled）
+func (admin *runtimeAdmin) enableAccountNow(accountID string) (bool, error) {
+	unlockAccount := admin.transitions.lock(accountID)
+	defer unlockAccount()
+	if status, ok := admin.pool.StatusOf(accountID); ok && status.Enabled {
+		return false, nil
+	}
+	cancelled := admin.transitions.stage(accountID)
+	admin.transitions.cancel(accountID)
+	_, changed, err := admin.pool.SetEnabled(accountID, true)
+	if err != nil {
+		admin.resumeTransitionLocked(accountID, cancelled)
+		return false, accountOperationError(err)
+	}
+	if changed {
+		accountDisableNotes.clear(accountID)
+	}
+	return changed, nil
 }
 
 // EnableAccounts 批量启用账户：去重后只处理停用的账户，单次最多 bulkEnableMaxPerCall 个（其余计入 remaining），

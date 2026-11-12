@@ -92,6 +92,31 @@ const zhCN = {
   'accounts.saved': '账户已保存',
   'accounts.deleted': '账户已删除',
   'accounts.importComplete': '已导入 {count} 个账户',
+  'accounts.accountExists':
+    '该账户已存在，没有重复添加：在账户列表里状态为“需要登录”时对它使用“重新登录”，停用的先启用，其他状态不需要再添加；列表里没有它时是账户目录已在 auth 目录下，等目录扫描自动载入',
+  'accounts.accountExistsReady': '{email} 已在号池中，没有重复添加，不需要再添加',
+  'accounts.accountExistsRelogin':
+    '{email} 已在号池中、需要登录，没有重复添加：请在账户列表里对它使用“重新登录”',
+  'accounts.accountExistsDisabled':
+    '{email} 已在号池中、已停用，没有重复添加：在账户列表里启用它即可，启用后需要登录时再对它使用“重新登录”',
+  'accounts.accountDirectoryExists':
+    '{email} 的账户目录已在 auth 目录下，没有重复添加：目录扫描会自动载入它，载入后需要登录时再对它使用“重新登录”',
+  'accounts.invalidTimezone':
+    '时区无效：请填写 IANA 时区名（如 Asia/Shanghai），不能含空白或不可见字符',
+  'accounts.transitionDraining': '已停用，等 {count} 个请求结束后关闭 Worker',
+  'accounts.transitionWaiting':
+    '已停用，等账户上的其他操作（登录、验证、Worker 启动等）结束后关闭 Worker',
+  'accounts.transitionClosing': '已停用，正在关闭 Worker',
+  'accounts.transitionSyncing': '已启用，正在同步模型目录',
+  'accounts.transitionHelp':
+    '启用或停用已经生效：停用的账户不再接新请求，进行中的请求照常结束；等请求结束、关闭 Worker、同步模型目录在后台进行',
+  'accounts.chromeExisting': '已导入 · 就地重新导入',
+  'accounts.chromeExistingHelp':
+    '导入时只覆盖这个账户的 Cookie 与续签材料，保留账户设置、浏览器指纹、资源绑定与运行态；上面的代理、语言区域、时区只用于新账户',
+  'accounts.chromeSelectAllHint':
+    '全选只选新账号与需要重新登录的账户；状态正常的已导入账户请单独勾选（重新导入会关闭它正在服务的 Worker）',
+  'accounts.chromeImportPartial':
+    '已导入 {count} 个账户，{failed} 个已有账户没有重新导入：{details}',
   'accounts.editTitle': '编辑账户',
   'accounts.deleteConfirm': '确认删除此账户？',
   'logs.level': '日志等级',
@@ -430,6 +455,8 @@ const zhCN = {
   'accounts.bulkBusy': '批量操作进行中，请稍候',
   'accounts.bulkFinished': '{action}完成：成功 {succeeded}，失败 {failed}',
   'accounts.bulkEnableBusy': '账户正忙（正在验证、登录或处理请求），稍后重试',
+  'accounts.bulkEnableLocked':
+    '另一个进程正在使用这个账户的文件（共用账户目录的另一个实例），请先停掉它再重试',
   'accounts.state': '状态',
   'accounts.account': '账户',
   'accounts.region': '区域 / 时区',
@@ -1052,6 +1079,33 @@ const en: Record<TranslationKey, string> = {
   'accounts.saved': 'Account saved',
   'accounts.deleted': 'Account deleted',
   'accounts.importComplete': 'Imported {count} accounts',
+  'accounts.accountExists':
+    'This account already exists and was not added again: if the account list shows it as "Login required", use "Log in again" on it; enable it first if it is disabled; in any other state nothing more is needed. If it is not in the list, its folder is already in the auth directory and the directory scan loads it automatically',
+  'accounts.accountExistsReady':
+    '{email} is already in the pool and was not added again; nothing more is needed',
+  'accounts.accountExistsRelogin':
+    '{email} is already in the pool and needs login, so it was not added again: use "Log in again" on it in the account list',
+  'accounts.accountExistsDisabled':
+    '{email} is already in the pool and disabled, so it was not added again: enable it in the account list, then use "Log in again" on it if it needs login',
+  'accounts.accountDirectoryExists':
+    'The folder for {email} is already in the auth directory, so it was not added again: the directory scan loads it automatically; use "Log in again" on it once loaded if it needs login',
+  'accounts.invalidTimezone':
+    'Invalid time zone: enter an IANA time zone name such as Asia/Shanghai, without spaces or invisible characters',
+  'accounts.transitionDraining':
+    'Disabled; the Worker closes after {count} in-flight requests finish',
+  'accounts.transitionWaiting':
+    'Disabled; the Worker closes after other operations on this account (login, verification, Worker startup, etc.) finish',
+  'accounts.transitionClosing': 'Disabled; closing the Worker',
+  'accounts.transitionSyncing': 'Enabled; syncing the model catalog',
+  'accounts.transitionHelp':
+    'The change is already in effect: a disabled account takes no new requests and in-flight requests finish normally. Waiting for them, closing the Worker and syncing the model catalog happen in the background',
+  'accounts.chromeExisting': 'Already imported · re-import in place',
+  'accounts.chromeExistingHelp':
+    'Importing replaces only the cookies and renewal material of this account. Its settings, browser fingerprint, resource bindings and runtime state are kept; the proxy, locale and time zone above apply to new accounts only',
+  'accounts.chromeSelectAllHint':
+    'Select all picks new accounts and accounts that need to log in again. Check healthy imported accounts individually (re-importing closes the Worker it is serving)',
+  'accounts.chromeImportPartial':
+    'Imported {count} accounts; {failed} existing accounts were not re-imported: {details}',
   'accounts.editTitle': 'Edit account',
   'accounts.deleteConfirm': 'Delete this account?',
   'logs.level': 'Log level',
@@ -1404,6 +1458,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.bulkFinished': '{action} finished: {succeeded} succeeded, {failed} failed',
   'accounts.bulkEnableBusy':
     'Account is busy (verifying, logging in, or serving a request); try again later',
+  'accounts.bulkEnableLocked':
+    'Another process is using the files of this account (another instance sharing the account directory); stop it and try again',
   'accounts.state': 'State',
   'accounts.account': 'Account',
   'accounts.region': 'Locale / Time zone',
