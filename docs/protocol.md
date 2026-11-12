@@ -166,6 +166,8 @@ Google 邮箱的小写形式同时作为账户目录、管理页面标识和日�
 
 `runtime-state.json` 根字段为 `cooldowns`、`resources`、`model_access`、`benefit_tier`、`catalog_fingerprint`。cooldown value 为 `{until,reason?}`；model access value 为 `{state,checked_at,reason?}`；resource value 为 `{kind?,name?,mime?,size?,purpose?,created_at,video?:{model,seconds,size}}`。
 
+资源绑定按保留期清理（只清本地绑定，不删 Drive 上的文件；`aistudio.ReclaimExpiredResourceBindings`，生成服务运行期间启动 2 分钟后第一轮、之后每 10 分钟一轮，每轮最多写回 200 个账户，达到上限时 1 分钟后接着清）：`bidi-session`（Live 续接凭证，每次上游发放新凭证换成新绑定）自 `created_at` 起 24 小时，官方续接凭证只在会话结束后的短时间内可用（文档写的是 2 小时），24 小时与上游 v0.3.5 相同；`video-operation` 与 `video-file`（Veo 任务与结果文件）自 `created_at` 起 72 小时，官方 Veo 文档写明生成的视频在服务器上只保存 2 天，多留 1 天覆盖任务从登记到完成的几分钟、结果文件晚于完成才被轮询登记与时钟偏差，官方仍可下载期间绑定一定还在；`drive-file`（`/v1/files` 与 Gemini Files 上传的文件）与未标类型的绑定不按时间清理，由客户端删除。账户正持有独占租约（登录、重新导入、删除、关闭 Worker）或在做认证续签写回时跳过、下一轮再清；正有普通请求的账户照常清理（能清的绑定都已过了官方有效期，上游已取不到，不会再被续接、轮询或下载；原先有租约就跳过，持续有请求的高负载账户一直清不掉），写回前按磁盘上的最新状态在账户池锁内再判断一次；每个账户只在有到期绑定时重写一次 `runtime-state.json`（原先这些绑定永久保留，而每次写冷却都要整个重写这个文件）。清理之后用这些 ID 续接或查询按资源不存在处理（视频为 404），与上游过期后的结果相同；Drive 里的生成视频文件保留在账户的 Drive 中。
+
 每次运行状态事务先取得 `auth/.leases/<账户>.runtime.lock`，每 25ms 尝试一次，等待上限为 2 秒；携带调用方 context（Go 取消上下文）的事务在调用方取消或 deadline 更早到达时立即结束。取得锁后重新读取当前磁盘值，只合并目标字段，以临时文件原子替换 `runtime-state.json`，再同步内存状态与资源归属。锁等待失败、读取失败、写回失败和 unlock 失败均返回原始错误链。
 
 调度器按实时模型方法、capability、AccessModes 和账户权益选择候选，优先使用已经成功调用目标 scope（模型资格与冷却的状态记录范围）的预热账户，再按目标模型最近一次真实首事件耗时排序。Code 7 保留已有账户和模型成功记录。常驻 Worker 优先覆盖可调用模型更多的账户。预热数量低于上限时提升待机账户，预热账户均忙时等待并发槽位。同账号 WAA proof 串行生成，已准备的 MakerSuite HTTP 请求并发执行；首个活动请求获取 `.leases/<邮箱>.lock`，最后一个释放。Drive file、Veo operation 与产物 file 始终使用创建账户。
@@ -2376,7 +2378,7 @@ OpenAI video object：
 }
 ```
 
-`model`、`seconds`、`size` 与 UTC `created_at` 随创建账户持久保存，后续轮询从资源绑定恢复；生成服务或进程重新启动后，OpenAI POST 与 GET 仍返回相同字段。OpenAI 请求显式提供 `size` 时原样保存该公开值，省略时按默认 16:9、720p 保存 `1280x720`。Gemini 请求保存归一化输出尺寸：720p 为 `1280x720` 或 `720x1280`，1080p 为 `1920x1080` 或 `1080x1920`，4k 为 `3840x2160` 或 `2160x3840`。公开对象的 `created_at` 是绑定创建时间的 Unix 秒。
+`model`、`seconds`、`size` 与 UTC `created_at` 随创建账户持久保存（自 `created_at` 起保留 72 小时，见“资源绑定按保留期清理”），后续轮询从资源绑定恢复；生成服务或进程重新启动后，OpenAI POST 与 GET 仍返回相同字段。OpenAI 请求显式提供 `size` 时原样保存该公开值，省略时按默认 16:9、720p 保存 `1280x720`。Gemini 请求保存归一化输出尺寸：720p 为 `1280x720` 或 `720x1280`，1080p 为 `1920x1080` 或 `1080x1920`，4k 为 `3840x2160` 或 `2160x3840`。公开对象的 `created_at` 是绑定创建时间的 Unix 秒。
 
 Gemini `:predictLongRunning` 请求：
 

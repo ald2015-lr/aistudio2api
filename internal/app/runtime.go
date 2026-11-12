@@ -3049,6 +3049,8 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	catalogReady, catalogSynced, catalogDone := service.catalogSync.start(dataContext)
 	// 登录复核与目录调度器同时开始：启动期间目录同步遇到的上游 401 同样先记疑似登录失效、复核后才标记（见 auth_recheck.go）
 	go service.authRecheck.run(dataContext)
+	// 过了保留期的本地资源绑定（Live 续接凭证、视频任务与结果文件）定期清理，见 resource_retention.go
+	go service.reclaimResourceBindings(dataContext)
 	service.lifecycleMu.Lock()
 	if service.dataContext == dataContext {
 		service.modelRefreshDone = catalogDone

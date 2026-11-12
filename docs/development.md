@@ -259,7 +259,7 @@ POST /api/control/start
 | `runtime-state.json` | 权益等级、模型资格、冷却与资源账户绑定 | 权益同步、首次模型结果或资源变化后原子写回 |
 | `camoufox-cache/` | 该账户 Camoufox 的 HTTP 磁盘缓存，上限 256 MB；`.lock` 为使用者持有的锁，`.created` 为创建时间 | WAA runtime 运行期间独占写入；超过 3 天在下次启动时清空，页面状态类启动失败后清空（12 小时内新建或清空过的不清），随账户目录删除 |
 
-`runtime-state.json` 的 `model_access` value 为 `{state,checked_at,reason?}`，成功状态为 `verified`；`cooldowns` value 为 `{until,reason?}`；`resources` value 保存 kind、name、mime、size、purpose、created_at 与可选 video 元数据。Drive file、Veo operation、视频产物和 Bidi 恢复 token 均保持创建账户粘性。Veo operation 额外保存公开 video object 的 model、seconds、size 与 UTC 创建时间，生成服务或进程重启后的轮询继续投影相同字段。
+`runtime-state.json` 的 `model_access` value 为 `{state,checked_at,reason?}`，成功状态为 `verified`；`cooldowns` value 为 `{until,reason?}`；`resources` value 保存 kind、name、mime、size、purpose、created_at 与可选 video 元数据。Drive file、Veo operation、视频产物和 Bidi 恢复 token 均保持创建账户粘性。Bidi 恢复 token（24 小时）、Veo operation 与视频产物（72 小时）的绑定过了保留期由 `app/resource_retention.go` 的定期任务调 `AccountPool.ReclaimExpiredResourceBindings` 清理（只清本地绑定、不删 Drive 文件，账户持有独占租约或在做认证续签写回时跳过、正有普通请求时照常清理，每轮最多 200 个账户、按账户 ID 轮转起点，依据见 protocol.md）；Drive file 不按时间清理。Veo operation 额外保存公开 video object 的 model、seconds、size 与 UTC 创建时间，生成服务或进程重启后的轮询继续投影相同字段。
 
 活动请求锁保护跨进程账户租约，短事务锁保护 `runtime-state.json` 合并写回。短事务锁位于 `auth/.leases/<账户>.runtime.lock`，以 25ms 间隔等待，最多 2 秒；取得锁后重读磁盘状态，只修改目标字段，原子替换文件，再同步内存与资源索引。接收 context 的资源事务会在取消或 deadline 到达时提前返回。
 
