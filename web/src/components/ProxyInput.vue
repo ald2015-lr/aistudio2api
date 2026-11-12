@@ -6,6 +6,7 @@ import { useI18n, type TranslationKey } from '@/i18n'
 import { maskProxy, proxyHasAuth, proxyParts } from '@/proxy'
 import { slotLabel } from '@/proxyPool'
 import type { ProxyTestProbe, ProxyTestResult } from '@/types'
+import HelpText from './HelpText.vue'
 
 const model = defineModel<string>({ required: true })
 const props = withDefaults(
@@ -22,8 +23,17 @@ const props = withDefaults(
     // accountCleared 为这个账户原来有自己的代理（对话框里清空了）：服务端改测清空后 IP 池会给它的出口
     accountId?: string
     accountCleared?: boolean
+    // collapsibleHelp 为 true 时长说明折叠成两行、可展开（设置页）；账户对话框照常完整显示
+    collapsibleHelp?: boolean
   }>(),
-  { label: '', testable: true, placeholder: '', accountId: '', accountCleared: false },
+  {
+    label: '',
+    testable: true,
+    placeholder: '',
+    accountId: '',
+    accountCleared: false,
+    collapsibleHelp: false,
+  },
 )
 // testing 在测试开始与结束时通知调用处（passed 为两条路径都拿到出口 IP）：设置页据此在测试期间不自动应用
 const emit = defineEmits<{ commit: []; testing: [running: boolean, passed: boolean] }>()
@@ -191,7 +201,8 @@ watch(model, (value) => {
         {{ testing ? t('proxy.testing') : t('proxy.test') }}
       </button>
     </div>
-    <span class="mt-1 block text-xs text-gray-500">{{ help }}</span>
+    <HelpText v-if="collapsibleHelp" class="mt-1 block text-xs text-gray-500" :text="help" />
+    <span v-else class="mt-1 block text-xs text-gray-500">{{ help }}</span>
     <span v-if="testable" class="mt-1 block text-xs text-gray-500">{{ t('proxy.testHint') }}</span>
     <div
       v-if="result !== null || testError !== ''"

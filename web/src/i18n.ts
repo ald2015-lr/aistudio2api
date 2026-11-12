@@ -19,6 +19,9 @@ const zhCN = {
   'app.eventsReconnecting': '实时连接已断开，正在重连…',
   'app.eventsClosed': '实时连接已断开（可能是管理令牌失效），请刷新页面',
   'app.statusUnreachable': '无法连接服务，显示的是上一次的状态',
+  'app.noticeClose': '关闭提示',
+  'app.noticeExpand': '展开全文',
+  'app.noticeCollapse': '收起',
   'app.assetReloadBlocked':
     '管理页已经更新，部分页面文件载入失败。当前有未保存的输入或还没完成的保存、批量操作（服务配置、账户或 API 试用），没有自动刷新：请等操作完成，保存或记下这些内容后，再手动刷新浏览器',
   'nav.logs': '日志',
@@ -610,6 +613,8 @@ const zhCN = {
   'accounts.tierFilterUnknown': '权益：未读取',
   'accounts.tierUnknown': '未读取',
   'accounts.tierUnknownHelp': '尚未从官网读取权益，暂按 Free 计入普通号池',
+  'settings.helpExpand': '展开说明',
+  'settings.helpCollapse': '收起说明',
   'settings.liveHint':
     'Worker 数、并发、单账号每分钟请求上限、账户选择策略、超时、临时对话、IP 池保存后立即生效；账户目录、默认代理、WAA 后端、上游通道需要重启生成服务。',
   'logs.categoryAll': '全部',
@@ -974,6 +979,9 @@ const en: Record<TranslationKey, string> = {
   'app.eventsReconnecting': 'Live connection lost, reconnecting…',
   'app.eventsClosed': 'Live connection closed (the admin token may have expired). Please reload the page.',
   'app.statusUnreachable': 'Cannot reach the service; showing the last known status',
+  'app.noticeClose': 'Dismiss notification',
+  'app.noticeExpand': 'Show full message',
+  'app.noticeCollapse': 'Show less',
   'app.assetReloadBlocked':
     'The management page has been updated and some page files failed to load. There is unsaved input or a save or bulk operation still in progress (service configuration, accounts or the API playground), so the page was not reloaded automatically: wait for the operation to finish, save or note your input, then reload the browser',
   'nav.logs': 'Logs',
@@ -1585,6 +1593,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.tierFilterUnknown': 'Tier: not read yet',
   'accounts.tierUnknown': 'Not read',
   'accounts.tierUnknownHelp': 'The tier has not been read from AI Studio yet; the account counts as Free in the normal pool for now',
+  'settings.helpExpand': 'Show more',
+  'settings.helpCollapse': 'Show less',
   'settings.liveHint':
     'Worker counts, concurrency, requests per minute per account, routing strategy, timeouts, temporary chat and the IP pool apply immediately; the account directory, default proxy, WAA backend and upstream channels need a generation service restart.',
   'logs.categoryAll': 'All',

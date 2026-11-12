@@ -24,6 +24,7 @@ import type {
   ProxyTestProbe,
   ProxyTestResult,
 } from '@/types'
+import HelpText from './HelpText.vue'
 import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
@@ -322,7 +323,7 @@ onBeforeUnmount(clearPending)
     <span class="mb-1 block text-sm font-medium text-gray-300">{{
       t('settings.proxyPoolTitle')
     }}</span>
-    <p class="mb-4 text-xs leading-5 text-gray-500">{{ t('settings.proxyPoolHelp') }}</p>
+    <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.proxyPoolHelp')" />
 
     <label class="block">
       <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -343,6 +344,7 @@ onBeforeUnmount(clearPending)
         v-model="url"
         :input-class="INPUT_CLASS"
         :help="urlHelp"
+        collapsible-help
         :allow-empty-test="false"
         :testable="false"
         :label="t('settings.proxyPoolURL')"
@@ -384,7 +386,7 @@ onBeforeUnmount(clearPending)
           />
         </label>
       </div>
-      <span class="mt-2 block text-xs text-gray-500">{{ t('settings.proxyPoolPortsHelp') }}</span>
+      <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.proxyPoolPortsHelp')" />
       <template v-if="capacityShown && capacity !== null">
         <span class="mt-2 block text-xs text-gray-400">
           {{
@@ -413,10 +415,15 @@ onBeforeUnmount(clearPending)
     </div>
     <p v-if="portsError !== ''" class="mt-2 text-xs text-red-400" role="alert">{{ portsError }}</p>
 
-    <p v-if="model.mode !== 'off' && hasDefaultProxy" class="mt-3 text-xs leading-5 text-gray-500">
-      {{ t('settings.proxyPoolDefaultProxyHint') }}
-    </p>
-    <p class="mt-3 text-xs leading-5 text-gray-500">{{ t('settings.proxyPoolLiveHint') }}</p>
+    <HelpText
+      v-if="model.mode !== 'off' && hasDefaultProxy"
+      class="mt-3 text-xs leading-5 text-gray-500"
+      :text="t('settings.proxyPoolDefaultProxyHint')"
+    />
+    <HelpText
+      class="mt-3 text-xs leading-5 text-gray-500"
+      :text="t('settings.proxyPoolLiveHint')"
+    />
 
     <div v-if="model.mode !== 'off'" class="mt-4 border-t border-[#30363d] pt-4">
       <div class="flex flex-wrap items-center gap-2">
@@ -445,7 +452,10 @@ onBeforeUnmount(clearPending)
           {{ t('settings.proxyPoolCheck') }}
         </button>
       </div>
-      <span class="mt-2 block text-xs text-gray-500">{{ t('settings.proxyPoolSampleHint') }}</span>
+      <HelpText
+        class="mt-2 block text-xs text-gray-500"
+        :text="t('settings.proxyPoolSampleHint')"
+      />
 
       <div
         v-if="sample !== null || sampleError !== ''"

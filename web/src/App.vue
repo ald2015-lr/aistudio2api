@@ -7,6 +7,7 @@ import {
   onUnmounted,
   reactive,
   ref,
+  useId,
   watch,
 } from 'vue'
 import { api, openAdminEvents, type EventConnection, type EventsState } from '@/api'
@@ -94,6 +95,11 @@ const loading = reactive({
 const errors = reactive({ accounts: '', models: '', requests: '', cooldowns: '', config: '' })
 let eventConnection: EventConnection | undefined
 let noticeTimer: number | undefined
+// noticeBody 为提示正文；noticeExpanded 为已展开全文，noticeClipped 为正文超过三行（折叠时被截断）
+const noticeBody = ref<HTMLElement | null>(null)
+const noticeBodyID = useId()
+const noticeExpanded = ref(false)
+const noticeClipped = ref(false)
 
 const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'logs', label: 'nav.logs', icon: 'dashboard' },
@@ -410,17 +416,51 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : t('common.error')
 }
 
-// showNotice 显示一次短暂操作结果
+// showNotice 显示一次操作结果：成功提示约 3.2 秒后自动关闭；错误提示一直保留，直到手动关闭或被下一条提示替换。
+// 新提示总是先折叠显示
 function showNotice(message: string, tone: 'success' | 'error'): void {
   notice.message = message
   notice.tone = tone
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
-  noticeTimer = window.setTimeout(() => {
-    notice.message = ''
-  }, 3200)
+  noticeExpanded.value = false
+  clearNoticeTimer()
+  if (tone === 'success') noticeTimer = window.setTimeout(closeNotice, 3200)
 }
 
-// 页面文件载入失败而有未保存的输入、没有自动刷新时，提示手动刷新
+// closeNotice 关闭当前提示
+function closeNotice(): void {
+  clearNoticeTimer()
+  notice.message = ''
+  noticeExpanded.value = false
+}
+
+function clearNoticeTimer(): void {
+  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
+  noticeTimer = undefined
+}
+
+// toggleNotice 展开或收起提示全文；展开后不再自动关闭，读完由用户关闭
+function toggleNotice(): void {
+  noticeExpanded.value = !noticeExpanded.value
+  if (noticeExpanded.value) clearNoticeTimer()
+}
+
+// measureNotice 在折叠状态下判断正文是否超过三行（line-clamp 截断后 scrollHeight 大于 clientHeight）；展开时保留上次结果
+function measureNotice(): void {
+  const element = noticeBody.value
+  if (element === null || noticeExpanded.value) return
+  noticeClipped.value = element.scrollHeight - element.clientHeight > 1
+}
+
+watch(() => notice.message, measureNotice, { flush: 'post' })
+// 提示框宽度随窗口变化（窄屏占满一行），宽度变化后重新判断是否超过三行
+watch(noticeBody, (element, _previous, onCleanup) => {
+  if (element === null || typeof ResizeObserver === 'undefined') return
+  const observer = new ResizeObserver(measureNotice)
+  observer.observe(element)
+  onCleanup(() => observer.disconnect())
+})
+
+// 页面文件载入失败而有未保存的输入、没有自动刷新时，提示手动刷新（错误提示一直保留）
 watch(assetReloadBlocked, () => {
   showNotice(t('app.assetReloadBlocked'), 'error')
 })
@@ -661,7 +701,7 @@ onUnmounted(() => {
   eventConnection?.close()
   if (statusTimer !== undefined) window.clearInterval(statusTimer)
   if (logFlushTimer !== undefined) window.clearTimeout(logFlushTimer)
-  if (noticeTimer !== undefined) window.clearTimeout(noticeTimer)
+  clearNoticeTimer()
 })
 </script>
 
@@ -1028,16 +1068,49 @@ onUnmounted(() => {
     </main>
 
     <Transition name="notice">
+      <!-- 窄屏时左右各留 1.25rem，不超出视口；长单词与地址可在任意处换行 -->
       <div
         v-if="notice.message"
-        class="fixed right-5 bottom-5 z-50 max-w-md rounded border bg-[#161b22] px-4 py-3 text-sm shadow-xl"
+        class="fixed right-5 bottom-5 z-50 flex max-w-[calc(100vw-2.5rem)] items-start gap-2 rounded border bg-[#161b22] py-3 pr-2 pl-4 text-sm shadow-xl sm:max-w-md"
         :class="
           notice.tone === 'error'
             ? 'border-red-500/50 text-red-300'
             : 'border-green-500/50 text-green-300'
         "
       >
-        {{ notice.message }}
+        <div class="min-w-0 flex-1">
+          <!-- 实时播报区域只放在正文上：展开、关闭按钮在区域外，切换展开只改样式、不改区域里的文字，读屏软件不会重读整段提示。
+               按类型换 key：成功提示还没消失时来了错误，重新创建区域，以新的角色播报新内容 -->
+          <p
+            :id="noticeBodyID"
+            :key="notice.tone"
+            ref="noticeBody"
+            :role="notice.tone === 'error' ? 'alert' : 'status'"
+            class="break-words"
+            :class="noticeExpanded ? 'max-h-[40vh] overflow-y-auto' : 'line-clamp-3'"
+          >
+            {{ notice.message }}
+          </p>
+          <button
+            v-if="noticeClipped || noticeExpanded"
+            type="button"
+            class="mt-1 text-xs text-gray-400 underline-offset-2 transition hover:text-gray-200 hover:underline"
+            :aria-expanded="noticeExpanded"
+            :aria-controls="noticeBodyID"
+            @click="toggleNotice"
+          >
+            {{ noticeExpanded ? t('app.noticeCollapse') : t('app.noticeExpand') }}
+          </button>
+        </div>
+        <button
+          type="button"
+          class="-my-1 shrink-0 rounded p-1 text-gray-500 transition hover:bg-[#21262d] hover:text-gray-200"
+          :aria-label="t('app.noticeClose')"
+          :title="t('app.noticeClose')"
+          @click="closeNotice"
+        >
+          <UiIcon name="close" :size="14" />
+        </button>
       </div>
     </Transition>
     <UiConfirm />

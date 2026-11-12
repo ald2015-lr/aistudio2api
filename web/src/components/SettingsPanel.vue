@@ -21,6 +21,8 @@ import type {
   UpstreamChannel,
 } from '@/types'
 import ProxyInput from './ProxyInput.vue'
+import HelpField from './HelpField.vue'
+import HelpText from './HelpText.vue'
 import ProxyPoolSettings from './ProxyPoolSettings.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
@@ -1096,32 +1098,35 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <label class="block">
-          <span class="mb-1 block text-sm font-medium text-gray-300">{{
-            t('settings.apiKey')
-          }}</span>
-          <div class="flex gap-2">
-            <input
-              v-model="form.proxy_api_key"
-              :type="revealKey ? 'text' : 'password'"
-              :placeholder="DEFAULT_API_KEY"
-              class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-              autocomplete="new-password"
-              @change="commitBlurField"
+        <HelpField>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-300">{{
+              t('settings.apiKey')
+            }}</span>
+            <div class="flex gap-2">
+              <input
+                v-model="form.proxy_api_key"
+                :type="revealKey ? 'text' : 'password'"
+                :placeholder="DEFAULT_API_KEY"
+                class="min-w-0 flex-1 rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                autocomplete="new-password"
+                @change="commitBlurField"
+              />
+              <button
+                class="rounded border border-[#30363d] bg-[#21262d] px-3 text-xs text-gray-300 transition hover:bg-[#30363d]"
+                type="button"
+                @click="revealKey = !revealKey"
+              >
+                {{ revealKey ? t('settings.hide') : t('settings.reveal') }}
+              </button>
+            </div>
+            <span class="mt-1 block text-xs text-gray-500">{{ t('settings.apiKeyHot') }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="tf('settings.apiKeyDefault', { key: DEFAULT_API_KEY })"
             />
-            <button
-              class="rounded border border-[#30363d] bg-[#21262d] px-3 text-xs text-gray-300 transition hover:bg-[#30363d]"
-              type="button"
-              @click="revealKey = !revealKey"
-            >
-              {{ revealKey ? t('settings.hide') : t('settings.reveal') }}
-            </button>
-          </div>
-          <span class="mt-1 block text-xs text-gray-500">{{ t('settings.apiKeyHot') }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{
-            tf('settings.apiKeyDefault', { key: DEFAULT_API_KEY })
-          }}</span>
-        </label>
+          </label>
+        </HelpField>
       </div>
 
       <!-- 代理输入里有掩码按钮与“测试代理”按钮，标题不用 label 包裹，避免点说明文字或测试结果时触发掩码按钮 -->
@@ -1131,6 +1136,7 @@ onBeforeUnmount(() => {
           v-model="form.proxy"
           input-class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
           :help="t('settings.proxyHelp')"
+          collapsible-help
           :allow-empty-test="false"
           :label="t('settings.proxy')"
           @commit="commitBlurField"
@@ -1164,47 +1170,62 @@ onBeforeUnmount(() => {
             autocomplete="off"
           />
         </label>
+        <HelpField>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.requestTimeout')
+            }}</span>
+            <input
+              v-model.trim="form.request_timeout"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              required
+              autocomplete="off"
+            />
+            <HelpText
+              class="mt-2 block text-xs text-gray-500"
+              :text="t('settings.requestTimeoutHelp')"
+            />
+          </label>
+        </HelpField>
+      </div>
+
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <label class="block">
-          <span class="mb-1 block text-sm font-medium text-gray-400">{{
-            t('settings.requestTimeout')
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.firstEventTimeout')
           }}</span>
           <input
-            v-model.trim="form.request_timeout"
+            v-model.trim="form.first_event_timeout"
             class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            placeholder="0s"
             required
             autocomplete="off"
           />
-          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.requestTimeoutHelp') }}</span>
+          <HelpText
+            class="mt-2 block text-xs text-gray-500"
+            :text="t('settings.firstEventTimeoutHelp')"
+          />
         </label>
-      </div>
+      </HelpField>
 
-      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.firstEventTimeout') }}</span>
-        <input
-          v-model.trim="form.first_event_timeout"
-          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-          placeholder="0s"
-          required
-          autocomplete="off"
-        />
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.firstEventTimeoutHelp') }}</span>
-      </label>
-
-      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <input
-          v-model="form.stream_data_heartbeat"
-          class="mt-0.5 h-4 w-4 accent-blue-500"
-          type="checkbox"
-        />
-        <span>
-          <span class="block text-sm font-medium text-gray-300">{{
-            t('settings.streamDataHeartbeat')
-          }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{
-            t('settings.streamDataHeartbeatHelp')
-          }}</span>
-        </span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.stream_data_heartbeat"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.streamDataHeartbeat')
+            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.streamDataHeartbeatHelp')"
+            />
+          </span>
+        </label>
+      </HelpField>
 
       <div class="grid grid-cols-1 gap-4 md:grid-cols-4">
         <label class="block">
@@ -1257,20 +1278,30 @@ onBeforeUnmount(() => {
           />
         </label>
       </div>
-      <p class="-mt-4 text-xs leading-5 text-gray-500">{{ t('settings.workerPartitionHelp') }}</p>
+      <HelpText
+        class="-mt-4 text-xs leading-5 text-gray-500"
+        :text="t('settings.workerPartitionHelp')"
+      />
 
-      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.accountRpmLimit') }}</span>
-        <input
-          v-model.number="form.account_rpm_limit"
-          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-          type="number"
-          min="0"
-          max="1000"
-          required
-        />
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.accountRpmLimitHelp') }}</span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.accountRpmLimit')
+          }}</span>
+          <input
+            v-model.number="form.account_rpm_limit"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            type="number"
+            min="0"
+            max="1000"
+            required
+          />
+          <HelpText
+            class="mt-2 block text-xs text-gray-500"
+            :text="t('settings.accountRpmLimitHelp')"
+          />
+        </label>
+      </HelpField>
 
       <fieldset class="block rounded-lg border border-fuchsia-500/30 bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.ultraTitle') }}</legend>
@@ -1278,29 +1309,43 @@ onBeforeUnmount(() => {
           <span class="tag tag-ultra">{{ t('pool.ultra') }}</span>
           <span class="text-sm font-medium text-gray-300">{{ t('settings.ultraTitle') }}</span>
         </div>
-        <p class="mb-4 text-xs leading-5 text-gray-500">{{ t('settings.ultraHelp') }}</p>
-        <label class="flex items-start gap-3">
-          <input v-model="form.ultra_exclusive" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
-          <span>
-            <span class="block text-sm font-medium text-gray-300">{{ t('settings.ultraExclusive') }}</span>
-            <span class="mt-1 block text-xs text-gray-500">{{ t('settings.ultraExclusiveHelp') }}</span>
-          </span>
-        </label>
-        <label class="mt-3 flex items-start gap-3">
-          <input
-            v-model="form.ultra_include_pro"
-            class="mt-0.5 h-4 w-4 accent-blue-500"
-            type="checkbox"
-          />
-          <span>
-            <span class="block text-sm font-medium text-gray-300">{{
-              t('settings.ultraIncludePro')
-            }}</span>
-            <span class="mt-1 block text-xs text-gray-500">{{
-              t('settings.ultraIncludeProHelp')
-            }}</span>
-          </span>
-        </label>
+        <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.ultraHelp')" />
+        <HelpField>
+          <label class="flex items-start gap-3">
+            <input
+              v-model="form.ultra_exclusive"
+              class="mt-0.5 h-4 w-4 accent-blue-500"
+              type="checkbox"
+            />
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.ultraExclusive')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.ultraExclusiveHelp')"
+              />
+            </span>
+          </label>
+        </HelpField>
+        <HelpField class="mt-3">
+          <label class="flex items-start gap-3">
+            <input
+              v-model="form.ultra_include_pro"
+              class="mt-0.5 h-4 w-4 accent-blue-500"
+              type="checkbox"
+            />
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.ultraIncludePro')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.ultraIncludeProHelp')"
+              />
+            </span>
+          </label>
+        </HelpField>
         <!-- 并入开关开启而独占关闭时，普通路径仍会用到 Pro，用户想要的“Pro 不服务普通路径”没有达成，这里明确提示 -->
         <p
           v-if="form.ultra_include_pro && !form.ultra_exclusive"
@@ -1335,70 +1380,84 @@ onBeforeUnmount(() => {
             />
           </label>
         </div>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.ultraWorkersHelp') }}</span>
+        <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.ultraWorkersHelp')" />
       </fieldset>
 
-      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <span class="mb-2 block text-sm font-medium text-gray-300">{{
-          t('settings.routingStrategy')
-        }}</span>
-        <UiSelect
-          v-model="form.routing_strategy"
-          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-        >
-          <option value="round-robin">{{ t('settings.routingRoundRobin') }}</option>
-          <option value="fill-first">{{ t('settings.routingFillFirst') }}</option>
-        </UiSelect>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.routingHelp') }}</span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.routingStrategy')
+          }}</span>
+          <UiSelect
+            v-model="form.routing_strategy"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          >
+            <option value="round-robin">{{ t('settings.routingRoundRobin') }}</option>
+            <option value="fill-first">{{ t('settings.routingFillFirst') }}</option>
+          </UiSelect>
+          <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.routingHelp')" />
+        </label>
+      </HelpField>
 
-      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <span class="mb-2 block text-sm font-medium text-gray-300">{{
-          t('settings.waaBackend')
-        }}</span>
-        <UiSelect
-          v-model="form.waa_backend"
-          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-        >
-          <option value="camoufox">{{ t('settings.waaBackendCamoufox') }}</option>
-          <option value="go">{{ t('settings.waaBackendGo') }}</option>
-        </UiSelect>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.waaBackendHelp') }}</span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.waaBackend')
+          }}</span>
+          <UiSelect
+            v-model="form.waa_backend"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+          >
+            <option value="camoufox">{{ t('settings.waaBackendCamoufox') }}</option>
+            <option value="go">{{ t('settings.waaBackendGo') }}</option>
+          </UiSelect>
+          <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.waaBackendHelp')" />
+        </label>
+      </HelpField>
 
       <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.mediaTitle') }}</legend>
         <span class="mb-1 block text-sm font-medium text-gray-300">{{
           t('settings.mediaTitle')
         }}</span>
-        <p class="mb-4 text-xs leading-5 text-gray-500">{{ t('settings.mediaHelp') }}</p>
-        <label class="block">
-          <span class="mb-1 block text-sm font-medium text-gray-400">{{
-            t('settings.mediaOutput')
-          }}</span>
-          <UiSelect
-            v-model="form.media_output"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-          >
-            <option value="inline">{{ t('settings.mediaOutputInline') }}</option>
-            <option value="url">{{ t('settings.mediaOutputURL') }}</option>
-          </UiSelect>
-          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaOutputHelp') }}</span>
-        </label>
-        <label v-if="form.media_output === 'url'" class="mt-4 block">
-          <span class="mb-1 block text-sm font-medium text-gray-400">{{
-            t('settings.mediaBaseURL')
-          }}</span>
-          <input
-            v-model.trim="form.media_base_url"
-            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-            placeholder="https://ai.example.com"
-            autocomplete="off"
-            spellcheck="false"
-            @change="commitBlurField"
-          />
-          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaBaseURLHelp') }}</span>
-        </label>
+        <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.mediaHelp')" />
+        <HelpField>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.mediaOutput')
+            }}</span>
+            <UiSelect
+              v-model="form.media_output"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            >
+              <option value="inline">{{ t('settings.mediaOutputInline') }}</option>
+              <option value="url">{{ t('settings.mediaOutputURL') }}</option>
+            </UiSelect>
+            <HelpText
+              class="mt-2 block text-xs text-gray-500"
+              :text="t('settings.mediaOutputHelp')"
+            />
+          </label>
+        </HelpField>
+        <HelpField v-if="form.media_output === 'url'" class="mt-4">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.mediaBaseURL')
+            }}</span>
+            <input
+              v-model.trim="form.media_base_url"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              placeholder="https://ai.example.com"
+              autocomplete="off"
+              spellcheck="false"
+              @change="commitBlurField"
+            />
+            <HelpText
+              class="mt-2 block text-xs text-gray-500"
+              :text="t('settings.mediaBaseURLHelp')"
+            />
+          </label>
+        </HelpField>
         <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
           <label class="block">
             <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -1427,40 +1486,46 @@ onBeforeUnmount(() => {
             />
           </label>
         </div>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.mediaCleanupHelp') }}</span>
+        <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.mediaCleanupHelp')" />
       </fieldset>
 
-      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <input
-          v-model="form.omni_ignore_system_prompt"
-          class="mt-0.5 h-4 w-4 accent-blue-500"
-          type="checkbox"
-        />
-        <span>
-          <span class="block text-sm font-medium text-gray-300">{{
-            t('settings.omniIgnoreSystemPrompt')
-          }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{
-            t('settings.omniIgnoreSystemPromptHelp')
-          }}</span>
-        </span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.omni_ignore_system_prompt"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.omniIgnoreSystemPrompt')
+            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.omniIgnoreSystemPromptHelp')"
+            />
+          </span>
+        </label>
+      </HelpField>
 
-      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <input
-          v-model="form.omni_image_binding"
-          class="mt-0.5 h-4 w-4 accent-blue-500"
-          type="checkbox"
-        />
-        <span>
-          <span class="block text-sm font-medium text-gray-300">{{
-            t('settings.omniImageBinding')
-          }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{
-            t('settings.omniImageBindingHelp')
-          }}</span>
-        </span>
-      </label>
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.omni_image_binding"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.omniImageBinding')
+            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.omniImageBindingHelp')"
+            />
+          </span>
+        </label>
+      </HelpField>
 
       <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.upstreamChannels') }}</legend>
@@ -1485,9 +1550,10 @@ onBeforeUnmount(() => {
             {{ t(channelLabelKey(channel)) }}
           </label>
         </div>
-        <span class="mt-2 block text-xs text-gray-500">{{
-          t('settings.upstreamChannelsHelp')
-        }}</span>
+        <HelpText
+          class="mt-2 block text-xs text-gray-500"
+          :text="t('settings.upstreamChannelsHelp')"
+        />
         <span
           v-if="buildChannelText"
           class="mt-1 block text-xs"
@@ -1510,9 +1576,10 @@ onBeforeUnmount(() => {
             @input="onStreamModelsInput"
           />
         </label>
-        <span class="mt-2 block text-xs text-gray-500">{{
-          t('settings.streamPlaygroundModelsHelp')
-        }}</span>
+        <HelpText
+          class="mt-2 block text-xs text-gray-500"
+          :text="t('settings.streamPlaygroundModelsHelp')"
+        />
         <div v-if="subscriptionModels.length > 0" class="mt-3 flex flex-wrap items-center gap-2">
           <span class="text-xs text-gray-500">{{ t('settings.streamPlaygroundModelsHint') }}</span>
           <button
@@ -1558,7 +1625,7 @@ onBeforeUnmount(() => {
             />
           </label>
         </div>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.primaryHelp') }}</span>
+        <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.primaryHelp')" />
         <div class="mt-4 border-t border-[#30363d] pt-4">
           <div class="grid grid-cols-1 gap-4 md:grid-cols-3">
             <label class="block md:col-span-2">
@@ -1588,7 +1655,10 @@ onBeforeUnmount(() => {
               />
             </label>
           </div>
-          <span class="mt-2 block text-xs text-gray-500">{{ t('settings.ultraPrimaryHelp') }}</span>
+          <HelpText
+            class="mt-2 block text-xs text-gray-500"
+            :text="t('settings.ultraPrimaryHelp')"
+          />
         </div>
       </div>
 
@@ -1625,7 +1695,10 @@ onBeforeUnmount(() => {
             </UiSelect>
           </label>
         </div>
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.modelFallbackHelp') }}</span>
+        <HelpText
+          class="mt-2 block text-xs text-gray-500"
+          :text="t('settings.modelFallbackHelp')"
+        />
       </div>
 
       <label class="flex items-center gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
@@ -1633,91 +1706,144 @@ onBeforeUnmount(() => {
         <span class="text-sm font-medium text-gray-300">{{ t('settings.temporaryChat') }}</span>
       </label>
 
-      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <input v-model="form.ignore_client_seed" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
-        <span>
-          <span class="block text-sm font-medium text-gray-300">{{ t('settings.ignoreClientSeed') }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{ t('settings.ignoreClientSeedHelp') }}</span>
-        </span>
-      </label>
-
-      <label class="flex items-start gap-3 rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <input v-model="form.repeat_prompt_nonce" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
-        <span>
-          <span class="block text-sm font-medium text-gray-300">{{ t('settings.repeatPromptNonce') }}</span>
-          <span class="mt-1 block text-xs text-gray-500">{{ t('settings.repeatPromptNonceHelp') }}</span>
-        </span>
-      </label>
-
-      <label class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.minOutputTokens') }}</span>
-        <input
-          v-model.number="form.min_output_tokens"
-          class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-          type="number"
-          min="0"
-          step="1000"
-          required
-        />
-        <span class="mt-2 block text-xs text-gray-500">{{ t('settings.minOutputTokensHelp') }}</span>
-      </label>
-
-      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
         <label class="flex items-start gap-3">
           <input
-            v-model="form.long_output_enabled"
+            v-model="form.ignore_client_seed"
             class="mt-0.5 h-4 w-4 accent-blue-500"
             type="checkbox"
           />
           <span>
             <span class="block text-sm font-medium text-gray-300">{{
-              t('settings.longOutputEnabled')
+              t('settings.ignoreClientSeed')
             }}</span>
-            <span class="mt-1 block text-xs text-gray-500">{{
-              t('settings.longOutputEnabledHelp')
-            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.ignoreClientSeedHelp')"
+            />
           </span>
         </label>
-        <label class="mt-4 block">
+      </HelpField>
+
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.repeat_prompt_nonce"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.repeatPromptNonce')
+            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.repeatPromptNonceHelp')"
+            />
+          </span>
+        </label>
+      </HelpField>
+
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
           <span class="mb-2 block text-sm font-medium text-gray-300">{{
-            t('settings.longOutputMaxTokens')
+            t('settings.minOutputTokens')
           }}</span>
           <input
-            v-model.number="form.long_output_max_tokens"
+            v-model.number="form.min_output_tokens"
             class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
             type="number"
             min="0"
-            max="1048576"
-            step="1"
+            step="1000"
             required
           />
-          <span class="mt-2 block text-xs text-gray-500">{{
-            t('settings.longOutputMaxTokensHelp')
-          }}</span>
+          <HelpText
+            class="mt-2 block text-xs text-gray-500"
+            :text="t('settings.minOutputTokensHelp')"
+          />
         </label>
+      </HelpField>
+
+      <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <HelpField>
+          <label class="flex items-start gap-3">
+            <input
+              v-model="form.long_output_enabled"
+              class="mt-0.5 h-4 w-4 accent-blue-500"
+              type="checkbox"
+            />
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.longOutputEnabled')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.longOutputEnabledHelp')"
+              />
+            </span>
+          </label>
+        </HelpField>
+        <HelpField class="mt-4">
+          <label class="block">
+            <span class="mb-2 block text-sm font-medium text-gray-300">{{
+              t('settings.longOutputMaxTokens')
+            }}</span>
+            <input
+              v-model.number="form.long_output_max_tokens"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="number"
+              min="0"
+              max="1048576"
+              step="1"
+              required
+            />
+            <HelpText
+              class="mt-2 block text-xs text-gray-500"
+              :text="t('settings.longOutputMaxTokensHelp')"
+            />
+          </label>
+        </HelpField>
       </div>
 
       <div class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-        <label class="flex items-start gap-3">
-          <input v-model="form.downgrade_guard.enabled" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
-          <span>
-            <span class="block text-sm font-medium text-gray-300">{{ t('settings.downgradeGuard') }}</span>
-            <span class="mt-1 block text-xs text-gray-500">{{ t('settings.downgradeGuardHelp') }}</span>
-          </span>
-        </label>
-        <div v-if="form.downgrade_guard.enabled" class="mt-4 space-y-4 border-t border-[#30363d] pt-4">
-          <label class="block">
-            <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeModels') }}</span>
+        <HelpField>
+          <label class="flex items-start gap-3">
             <input
-              :value="guardModelsText"
-              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-              type="text"
-              spellcheck="false"
-              autocomplete="off"
-              @input="onGuardModelsInput"
+              v-model="form.downgrade_guard.enabled"
+              class="mt-0.5 h-4 w-4 accent-blue-500"
+              type="checkbox"
             />
-            <span class="mt-2 block text-xs text-gray-500">{{ t('settings.downgradeModelsHelp') }}</span>
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.downgradeGuard')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.downgradeGuardHelp')"
+              />
+            </span>
           </label>
+        </HelpField>
+        <div v-if="form.downgrade_guard.enabled" class="mt-4 space-y-4 border-t border-[#30363d] pt-4">
+          <HelpField>
+            <label class="block">
+              <span class="mb-2 block text-sm font-medium text-gray-300">{{
+                t('settings.downgradeModels')
+              }}</span>
+              <input
+                :value="guardModelsText"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="text"
+                spellcheck="false"
+                autocomplete="off"
+                @input="onGuardModelsInput"
+              />
+              <HelpText
+                class="mt-2 block text-xs text-gray-500"
+                :text="t('settings.downgradeModelsHelp')"
+              />
+            </label>
+          </HelpField>
           <div class="grid gap-4 sm:grid-cols-3">
             <label class="block">
               <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeSpeed') }}</span>
@@ -1753,7 +1879,7 @@ onBeforeUnmount(() => {
               />
             </label>
           </div>
-          <span class="block text-xs text-gray-500">{{ t('settings.downgradeSpeedHelp') }}</span>
+          <HelpText class="block text-xs text-gray-500" :text="t('settings.downgradeSpeedHelp')" />
           <div class="grid gap-4 sm:grid-cols-3">
             <label class="block">
               <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeFuzzyLow') }}</span>
@@ -1789,51 +1915,81 @@ onBeforeUnmount(() => {
               />
             </label>
           </div>
-          <span class="block text-xs text-gray-500">{{ t('settings.downgradeFuzzyHelp') }}</span>
-          <label class="block">
-            <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeMaxHold') }}</span>
-            <input
-              v-model.number="form.downgrade_guard.max_hold_ms"
-              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-              type="number"
-              min="0"
-              step="500"
-              required
-            />
-            <span class="mt-2 block text-xs text-gray-500">{{ t('settings.downgradeMaxHoldHelp') }}</span>
-          </label>
-          <label class="flex items-start gap-3">
-            <input v-model="form.downgrade_guard.fast_mode" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
-            <span>
-              <span class="block text-sm font-medium text-gray-300">{{ t('settings.downgradeFastMode') }}</span>
-              <span class="mt-1 block text-xs text-gray-500">{{ t('settings.downgradeFastModeHelp') }}</span>
-            </span>
-          </label>
-          <label class="block">
-            <span class="mb-2 block text-sm font-medium text-gray-300">{{
-              t('settings.downgradeRejectStatus')
-            }}</span>
-            <UiSelect
-              v-model="form.downgrade_guard.reject_status"
-              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-            >
-              <option :value="400">{{ t('settings.downgradeReject400') }}</option>
-              <option :value="503">{{ t('settings.downgradeReject503') }}</option>
-            </UiSelect>
-            <span class="mt-2 block text-xs text-gray-500">{{ t('settings.downgradeRejectStatusHelp') }}</span>
-          </label>
-          <label class="block">
-            <span class="mb-2 block text-sm font-medium text-gray-300">{{ t('settings.downgradeMemory') }}</span>
-            <input
-              v-model.number="form.downgrade_guard.memory_minutes"
-              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
-              type="number"
-              min="0"
-              step="5"
-              required
-            />
-            <span class="mt-2 block text-xs text-gray-500">{{ t('settings.downgradeMemoryHelp') }}</span>
-          </label>
+          <HelpText class="block text-xs text-gray-500" :text="t('settings.downgradeFuzzyHelp')" />
+          <HelpField>
+            <label class="block">
+              <span class="mb-2 block text-sm font-medium text-gray-300">{{
+                t('settings.downgradeMaxHold')
+              }}</span>
+              <input
+                v-model.number="form.downgrade_guard.max_hold_ms"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="number"
+                min="0"
+                step="500"
+                required
+              />
+              <HelpText
+                class="mt-2 block text-xs text-gray-500"
+                :text="t('settings.downgradeMaxHoldHelp')"
+              />
+            </label>
+          </HelpField>
+          <HelpField>
+            <label class="flex items-start gap-3">
+              <input
+                v-model="form.downgrade_guard.fast_mode"
+                class="mt-0.5 h-4 w-4 accent-blue-500"
+                type="checkbox"
+              />
+              <span>
+                <span class="block text-sm font-medium text-gray-300">{{
+                  t('settings.downgradeFastMode')
+                }}</span>
+                <HelpText
+                  class="mt-1 block text-xs text-gray-500"
+                  :text="t('settings.downgradeFastModeHelp')"
+                />
+              </span>
+            </label>
+          </HelpField>
+          <HelpField>
+            <label class="block">
+              <span class="mb-2 block text-sm font-medium text-gray-300">{{
+                t('settings.downgradeRejectStatus')
+              }}</span>
+              <UiSelect
+                v-model="form.downgrade_guard.reject_status"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              >
+                <option :value="400">{{ t('settings.downgradeReject400') }}</option>
+                <option :value="503">{{ t('settings.downgradeReject503') }}</option>
+              </UiSelect>
+              <HelpText
+                class="mt-2 block text-xs text-gray-500"
+                :text="t('settings.downgradeRejectStatusHelp')"
+              />
+            </label>
+          </HelpField>
+          <HelpField>
+            <label class="block">
+              <span class="mb-2 block text-sm font-medium text-gray-300">{{
+                t('settings.downgradeMemory')
+              }}</span>
+              <input
+                v-model.number="form.downgrade_guard.memory_minutes"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="number"
+                min="0"
+                step="5"
+                required
+              />
+              <HelpText
+                class="mt-2 block text-xs text-gray-500"
+                :text="t('settings.downgradeMemoryHelp')"
+              />
+            </label>
+          </HelpField>
         </div>
       </div>
 
