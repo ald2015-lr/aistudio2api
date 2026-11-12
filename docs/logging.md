@@ -28,6 +28,8 @@
 
 请求错误保存在 `request.error` 并直接展示在请求行下方。运行事件的错误详情保留在 `message` 中。
 
+网络错误（连接被拒、超时、TLS 失败等）的文本里，请求地址只保留到路径，查询串写成 `?<redacted>`，如 `Post "https://…/channel/bind?<redacted>": read: connection reset by peer`：WebChannel 的 `SID`、`gsessionid`、`RID` 与 Drive 断点续传的 `upload_id` 不进运行日志、冷却原因与 `tools/trace_pack.sh` 诊断包（见 [protocol.md](protocol.md)）。
+
 ## 启动过程
 
 管理进程先载入账户并启动控制面。完成后管理页面可以查看账户、配置和日志，此时生成服务保持 `STOPPED`。

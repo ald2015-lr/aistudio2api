@@ -271,7 +271,9 @@ func (s StorageState) CookieValue(name string, targetURL string, now time.Time) 
 	return selected, selectedPath >= 0
 }
 
-// MergeSetCookieHeaders 将响应轮换的 Cookie 合并到 storage state
+// MergeSetCookieHeaders 将响应轮换的 Cookie 合并到 storage state。替换已有 Cookie 时写回原下标：RFC 6265 5.3
+// 要求替换时保留旧 Cookie 的创建时间，浏览器的 Cookie 请求头顺序因此不变（CookieHeader 同路径长度按下标排序）；
+// 新 Cookie 追加到末尾，过期或 Max-Age<0 时删除
 func (s *StorageState) MergeSetCookieHeaders(headers []string, sourceURL string, now time.Time) error {
 	source, err := url.Parse(sourceURL)
 	if err != nil || source.Scheme == "" || source.Hostname() == "" {
@@ -299,10 +301,10 @@ func (s *StorageState) MergeSetCookieHeaders(headers []string, sourceURL string,
 				break
 			}
 		}
-		if index >= 0 {
-			s.Cookies = append(s.Cookies[:index], s.Cookies[index+1:]...)
-		}
 		if incoming.MaxAge < 0 || !incoming.Expires.IsZero() && !incoming.Expires.After(now) {
+			if index >= 0 {
+				s.Cookies = append(s.Cookies[:index], s.Cookies[index+1:]...)
+			}
 			continue
 		}
 		expires := float64(-1)
@@ -311,7 +313,7 @@ func (s *StorageState) MergeSetCookieHeaders(headers []string, sourceURL string,
 		} else if !incoming.Expires.IsZero() {
 			expires = float64(incoming.Expires.UnixNano()) / 1e9
 		}
-		s.Cookies = append(s.Cookies, StateCookie{
+		cookie := StateCookie{
 			Name:     incoming.Name,
 			Value:    incoming.Value,
 			Domain:   domain,
@@ -320,7 +322,12 @@ func (s *StorageState) MergeSetCookieHeaders(headers []string, sourceURL string,
 			HTTPOnly: incoming.HttpOnly,
 			Secure:   incoming.Secure,
 			SameSite: sameSiteText(incoming.SameSite),
-		})
+		}
+		if index >= 0 {
+			s.Cookies[index] = cookie
+		} else {
+			s.Cookies = append(s.Cookies, cookie)
+		}
 	}
 	return nil
 }

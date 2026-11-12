@@ -993,7 +993,7 @@ func uploadDriveMultipart(ctx context.Context, client *http.Client, token string
 	httpRequest.ContentLength = int64(prefix.Len()) + request.Size + int64(len(footer))
 	httpRequest.Header.Set("Authorization", "Bearer "+token)
 	httpRequest.Header.Set("Content-Type", "multipart/related; boundary="+writer.Boundary())
-	response, err := client.Do(httpRequest)
+	response, err := sendHTTP(client, httpRequest)
 	if err != nil {
 		return FileRef{}, fmt.Errorf("上传 Drive 文件: %w", err)
 	}
@@ -1012,7 +1012,7 @@ func uploadDriveResumable(ctx context.Context, client *http.Client, token string
 	initRequest.Header.Set("Authorization", "Bearer "+token)
 	initRequest.Header.Set("Content-Type", "application/json; charset=UTF-8")
 	initRequest.Header.Set("X-Upload-Content-Type", request.MIME)
-	initResponse, err := client.Do(initRequest)
+	initResponse, err := sendHTTP(client, initRequest)
 	if err != nil {
 		return FileRef{}, fmt.Errorf("创建 Drive 上传会话: %w", err)
 	}
@@ -1110,7 +1110,7 @@ func sendDriveUploadChunk(
 		totalValue = fmt.Sprintf("%d", total)
 	}
 	request.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%s", offset, end, totalValue))
-	response, err := client.Do(request)
+	response, err := sendHTTP(client, request)
 	if err != nil {
 		return nil, fmt.Errorf("上传 Drive 文件块: %w", err)
 	}
@@ -1168,7 +1168,7 @@ func (t *MakerSuiteHTTPTransport) DownloadDrive(ctx context.Context, accountID s
 	if err != nil {
 		return MediaStream{}, release(err)
 	}
-	response, err := client.Do(httpRequest)
+	response, err := sendHTTP(client, httpRequest)
 	if err != nil {
 		return MediaStream{}, release(fmt.Errorf("下载 Drive 文件: %w", err))
 	}
@@ -1218,7 +1218,7 @@ func (t *MakerSuiteHTTPTransport) DeleteDrive(ctx context.Context, accountID str
 	if err != nil {
 		return release(err)
 	}
-	response, err := client.Do(request)
+	response, err := sendHTTP(client, request)
 	if err != nil {
 		return release(fmt.Errorf("删除 Drive 文件: %w", err))
 	}

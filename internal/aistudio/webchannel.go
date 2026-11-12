@@ -1200,14 +1200,9 @@ func webChannelHeaders(protocolHeaders http.Header) http.Header {
 }
 
 // do 发送 WebChannel 请求。握手 URL 的 $httpHeaders 携带 Authorization（SAPISIDHASH），其他请求的查询串携带会话 ID；
-// 网络错误（*url.Error）的文本包含完整 URL，会进入日志与冷却原因（runtime-state.json），这里去掉查询串
+// 网络错误（*url.Error）的文本包含完整 URL，会进入日志与冷却原因（runtime-state.json），这里去掉查询串（错误链的每一层，见 sendHTTP）
 func (s *BidiSession) do(request *http.Request) (*http.Response, error) {
-	response, err := s.client.Do(request)
-	var urlError *url.Error
-	if errors.As(err, &urlError) {
-		urlError.URL = redactURLQuery(urlError.URL)
-	}
-	return response, err
+	return sendHTTP(s.client, request)
 }
 
 // redactURLQuery 去掉 URL 的查询串与片段

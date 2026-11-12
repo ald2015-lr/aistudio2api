@@ -143,7 +143,7 @@ Chrome 导入状态在 `storage-state.json` 的 `aistudio2api` 扩展中保存�
 }
 ```
 
-Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secure`、`sameSite` 与可选 `partitionKey` 原样持久化；`sameSite` 接受空值、`Lax`、`Strict` 或 `None`。origin 必须包含 scheme 与 host。请求 Cookie 过滤过期项与不匹配的 Secure/domain/path 条目，同名项按 path 长度降序发送；普通 HTTP 响应的 `Set-Cookie` 按 name、domain、path 替换或删除未分区项，同名分区项独立保留。浏览器恢复时，`partitionKey` 映射到 BiDi `storageKey.sourceOrigin`，空值使用默认分区。
+Cookie 的 `name`、`value`、`domain`、`path`、`expires`、`httpOnly`、`secure`、`sameSite` 与可选 `partitionKey` 原样持久化；`sameSite` 接受空值、`Lax`、`Strict` 或 `None`。origin 必须包含 scheme 与 host。请求 Cookie 过滤过期项与不匹配的 Secure/domain/path 条目，同名项按 path 长度降序发送；普通 HTTP 响应的 `Set-Cookie` 按 name、domain、path 替换或删除未分区项，同名分区项独立保留；替换（如 `__Secure-1PSIDTS`、`SIDCC` 轮换）写回原来的位置，新 Cookie 追加到末尾，过期或 `Max-Age<=0` 时删除。RFC 6265 5.3 要求替换时保留旧 Cookie 的创建时间，浏览器的 Cookie 请求头顺序因此不随轮换变化；同路径长度的 Cookie 按保存顺序发送，原先先删后追加，轮换过的 Cookie 每次都挪到同级 Cookie 的最后。浏览器恢复时，`partitionKey` 映射到 BiDi `storageKey.sourceOrigin`，空值使用默认分区。
 
 localStorage 由站点脚本之前运行的 preload 按 origin 恢复，只写入页面里还没有的键（`getItem` 为 `null` 时才 `setItem`）：每次启动的 Camoufox profile 都是新建的，第一次载入时保存的键全部写入；preload 在每次导航（含页面自己刷新）时都会运行，页面自己写入或原地升级过的值保留，不再被保存的旧值覆盖。这与 Playwright storageState（建上下文时每个 origin 只写一次）不同：之后每次导航仍会补上为 `null` 的键，页面删掉的键（`removeItem` 或 `clear` 之后刷新）会被重新写入；没有在 `sessionStorage` 等处记标记让它只生效一次，因为页面脚本能看到多出来的存储项。WAA Worker 启动完成、发布之前，服务用只读的 `script.evaluate` 读出当前 `https://aistudio.google.com` 页面的全部 localStorage，替换 `storage-state.json` 里这个 origin 的 `localStorage`（浏览器里的值以保存的值为起点、经页面升级，是权威版本），其他 origin 原样保留。写回与 Cookie 写回一样按认证代际判断，启动期间保存过新登录或续签时不写；认证文件被外部换成另一个登录（登录签名 Cookie 与内存不同）、扫描还没载入时 Cookie 与 localStorage 都不写，记下账户交给账户目录扫描载入；浏览器没有导出任何项、与磁盘相同时不写文件；键名与值合计超过 512 KB 时不写。多个进程共用账户目录时，403 无权限账户按认证文件内容判断是否重新上传，这个 origin 的 localStorage 与轮换 Cookie 一样不计入比较。写回只在启动成功后发生：如果保存的旧格式本身就让页面起不来，这些账号拿不到新格式，需要重新登录（登录用全新的浏览器，导出页面新建的 localStorage）。读取或写回失败只记一条 `WAA Worker 启动后写回 localStorage 失败` 警告，不影响启动；日志只写原因与大小，不写 localStorage 的值。纯 Go 后端没有浏览器页面，不写回。
 
@@ -1155,6 +1155,8 @@ backchannel 使用 `RID=rpc`、当前 SID、gsessionid 与 AID。每个网络帧
 ```
 
 JSON 根值包含 repeated `[serverAID,payload]` envelope。payload 解码成功并按顺序发布后，将 AID 提交为 `max(currentAID,serverAID)`。首次 backchannel 建立后的临时读取失败保留 SID、gsessionid 与已提交 AID 并重新连接；首次建立失败、协议终态、显式 close 或不可恢复错误进入关闭链。会话状态为 `new -> handshaking -> ready -> reconnecting -> ready`，关闭路径依次进入 `closing -> closed`。
+
+网络错误里的地址去掉查询串：Go 通道请求失败时 `*url.Error` 的文本带完整 URL，WebChannel 的 `SID`、`gsessionid`、`RID`，握手 `$httpHeaders` 里的授权头，以及 Drive 断点续传地址的 `upload_id` 会随它进入运行日志、冷却原因（`runtime-state.json`）与 `tools/trace_pack.sh` 诊断包。`aistudio.sendHTTP` 把错误链里每一层 `*url.Error` 的地址换成 `<去掉查询串的地址>?<redacted>`（浏览器形状传输经 fhttp 返回的 `*url.Error` 又被 `net/http.Client` 包一层，两层都带完整 URL；原先 WebChannel 只改最外层，里层照样带出会话参数），发出的请求不变。覆盖 WebChannel 的握手、前向 POST、backchannel 与 terminate、MakerSuite 普通 RPC、首页公共头发现与 Drive 上传、下载、删除；WAA 运行时文件（`runtime_go.go`）与浏览器传输本身不改。
 
 客户端帧：
 

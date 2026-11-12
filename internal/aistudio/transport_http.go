@@ -127,7 +127,7 @@ func DiscoverPublicHeaders(ctx context.Context, client *http.Client) (http.Heade
 	}
 	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	request.Header.Set("User-Agent", publicDiscoveryUserAgent)
-	response, err := client.Do(request)
+	response, err := sendHTTP(client, request)
 	if err != nil {
 		return nil, fmt.Errorf("读取 AI Studio 首页: %w", err)
 	}
@@ -204,7 +204,7 @@ func (t *MakerSuiteHTTPTransport) Do(ctx context.Context, rpc RPCRequest) (*RPCR
 	if err != nil {
 		return nil, releaseOnError(err)
 	}
-	response, err := client.Do(request)
+	response, err := sendHTTP(client, request)
 	if err != nil {
 		return nil, releaseOnError(fmt.Errorf("执行 MakerSuite %s 请求: %w", rpc.Method, err))
 	}
