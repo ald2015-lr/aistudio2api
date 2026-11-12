@@ -456,9 +456,10 @@ Interaction（`CreateInteractionStream`）交给 `DoProtected` 的 binding 由 `
 | `error` | 来源 | 耗时特征 |
 | --- | --- | --- |
 | `本服务首事件前期限 …` | 本服务首事件前期限：首字之前就到时；`（停在 换号退避）: ` 之后是上一次尝试的错误原文（可能带协议错误码 4），不是 Google 侧期限，这时 `status` 为上一次错误对外的状态（码 4 为 504；上游 503 为 503、429 为 429，其他 5xx 与断流为 500） | 约 `REQUEST_TIMEOUT`，`first_event_ms` 为 0 |
+| `本服务扣住期间空闲期限 …` | 强制调用工具时生成服务扣住上游事件，上游连续 `REQUEST_TIMEOUT` 没有网络字节 | 不小于 `REQUEST_TIMEOUT`，`first_event_ms` 为 0 |
 | `本服务首事件后空闲期限 …` | 开始输出后上游卡住 | 任意；请求时间线的最后一次 `事件流停顿` 之后没有 `事件流恢复` |
 | `本服务总时长上限 …` | 总时长上限 | 约 1 小时（或 `REQUEST_TIMEOUT`） |
-| `… 返回 HTTP 504、协议错误码 4: Deadline expired …` | Google 侧的期限（`aistudio.RPCError`） | `duration_ms` 是 Google 期限的估计 |
+| `… 返回 HTTP 504、协议错误码 4: Deadline expired …` | Google 侧的期限（`aistudio.RPCError`，没有本服务前缀）。旧版本在换号退避中到期时也只留这段原文，`diag_regen.sh` 把状态 504、没有首事件、耗时不小于 `REQUEST_TIMEOUT` 减 2 秒（账本耗时从进入 HTTP 中间件算起，本服务期限到期的一定不小于 `REQUEST_TIMEOUT`）的这类归为“本服务首事件前期限在换号退避中到期（上一次为码 4，旧版本文本）” | `duration_ms` 是 Google 期限的估计 |
 | `AI Studio stream closed before finish` | 上游在结束帧之前断流（浏览器中继、网络） | 任意 |
 | 只有 `context deadline exceeded` 本身（没有前缀） | 旧版本的整段 `REQUEST_TIMEOUT`，或其他数据请求。带 `AI Studio … 协议位置`（浏览器连续 60 秒没有回应）或 `BiDi … 等待回复超时` 的是上游或浏览器链路超时，看同账号同一时刻的告警，不是本服务期限 | 约 `REQUEST_TIMEOUT`；链路超时任意 |
 | 状态 499、`context canceled` | 客户端、中转或 CDN 断开，管理端取消，停止服务 | 经 Cloudflare 的非流式约 100 秒 |

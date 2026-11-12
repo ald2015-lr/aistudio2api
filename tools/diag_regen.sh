@@ -5,12 +5,21 @@
 # 不改任何配置、冷却、账号或 Worker，也不发生成请求；临时文件放在 mktemp -d 建的目录里，退出时删除（建不了时直接退出）。
 # python3 没有 sqlite3 模块时不读用量账本，只分析运行日志。
 #
-# 截断来源按用量账本与请求日志的 error 分辨（客户端看到的都是 504 "Deadline expired before operation could complete."）：
+# 截断来源按用量账本与请求日志的 error 分辨（客户端看到的都是 504 "Deadline expired before operation could complete."；在换号退避或
+# 限流换号前等待中到期的例外，照旧按上一次的错误返回：上一次为上游 503、429 时为 503、429，为其他 5xx（如 500 INTERNAL）
+# 与断流时为 500）：
 #   本服务首事件前期限 … 到期          首字之前就到时（排队、冷启动、隐藏思考时的长思考：Build 通道上游不返回思考，
-#                                        Playground 通道上游返回但本服务丢弃）
+#                                        Playground 通道上游返回但本服务丢弃）。在某次尝试中到期带“（停在 <位置>）”，扣住过上游事件时
+#                                        前面另有“（扣住上游事件的 <时长> 不计入）”；在换号退避（或限流换号前等待）中到期为
+#                                        “…到期（停在 换号退避）: <上一次错误>”，上一次错误可能是协议错误码 4、5xx 的上游原文，
+#                                        按本服务期限算，不是 Google 侧期限
 #   本服务首事件后空闲期限 … 到期      开始输出后上游连续 REQUEST_TIMEOUT 没有事件也没有网络字节
+#   本服务扣住期间空闲期限 … 到期      强制调用工具时生成服务扣住上游事件等调用，上游连续 REQUEST_TIMEOUT 没有网络字节
 #   本服务总时长上限 … 到期            整条请求超过 max(1 小时, REQUEST_TIMEOUT)
-#   … 协议错误码 4: Deadline expired … Google 侧自己的期限
+#   … 协议错误码 4: Deadline expired … Google 侧自己的期限。旧版本在换号退避中到期、上一次为码 4 时只留这段原文（没有本服务前缀）：
+#                                        状态 504、没有首事件（first_event_ms 为 0 或缺失）且耗时不小于 REQUEST_TIMEOUT 减 2 秒
+#                                        （与“在 REQUEST_TIMEOUT 附近”的下界相同）的按“本服务首事件前期限在换号退避中到期
+#                                        （上一次为码 4，旧版本文本）”算
 #   AI Studio stream closed before finish  上游在结束帧之前断流
 #   只有 context deadline exceeded 本身   旧版本的整段 REQUEST_TIMEOUT（或计数、视频、转写请求）；带 "AI Studio … 协议位置"
 #                                        或 "BiDi … 等待回复超时" 的是上游或浏览器链路超时，归到上游断流，不是本服务期限
@@ -333,12 +342,26 @@ def fields(message):
 
 
 # ---------- 本服务自己的期限截断（app/generate_context.go serviceDeadlineError.Error） ----------
-# 首事件前：本服务首事件前期限 <期限> 到期[（停在 <位置>）]: <原错误或 context deadline exceeded>
+# 首事件前：本服务首事件前期限 <期限> 到期[（扣住上游事件的 <时长> 不计入）][（停在 <位置>）]: <原错误或 context deadline exceeded>
+#           在两次尝试之间的等待中到期为“…到期（停在 换号退避）: <上一次错误>”（或“停在 限流换号前等待”；上一次错误为原文，
+#           可能是协议错误码 4、5xx、429、断流等，见 app/generate_context.go betweenAttemptsDeadlineError）
 # 首事件后：本服务首事件后空闲期限 <期限> 到期（已输出 推理=N 正文=M）: context deadline exceeded
+# 扣住期间：本服务扣住期间空闲期限 <期限> 到期（生成服务扣住上游事件等待工具调用，上游没有动静）: context deadline exceeded
 # 总上限：  本服务总时长上限 <期限> 到期（已输出 推理=N 正文=M）: context deadline exceeded
-CUT_RE = re.compile(r"本服务(首事件前期限|首事件后空闲期限|总时长上限) (\S+) 到期")
-CUT_KIND = {"首事件前期限": "timeout_start", "首事件后空闲期限": "timeout_idle", "总时长上限": "timeout_total"}
-SERVICE_CUT_KINDS = ("timeout_start", "timeout_idle", "timeout_total")
+#           （扣住上游事件期间到期为“本服务总时长上限 <期限> 到期（生成服务扣住上游事件等待工具调用）: …”，同样按总时长上限算）
+CUT_RE = re.compile(r"本服务(首事件前期限|首事件后空闲期限|扣住期间空闲期限|总时长上限) (\S+) 到期")
+CUT_KIND = {"首事件前期限": "timeout_start", "首事件后空闲期限": "timeout_idle", "扣住期间空闲期限": "timeout_held",
+            "总时长上限": "timeout_total"}
+SERVICE_CUT_KINDS = ("timeout_start", "timeout_idle", "timeout_held", "timeout_total")
+# 首事件前期限之后的说明：扣住过上游事件时先有“（扣住上游事件的 <时长> 不计入）”，再有“（停在 <位置>）”（serviceDeadlineError.head），
+# 两段都可能没有；位置本身可能带括号（“首事件与期限同时到达（已丢弃，未向客户端输出）”），以紧跟的“）: ”为界
+START_DETAIL_RE = re.compile(r"(?:（扣住上游事件的 (\S+?) 不计入）)?(?:（停在 (.*?)）)?: ")
+# 两次尝试之间的等待（停在这些位置时冒号后是上一次尝试的错误原文，不是这次到期的原因）
+BETWEEN_ATTEMPTS = ("换号退避", "限流换号前等待")
+# 旧版本换号退避中到期的判定：error 为协议错误码 4 原文、状态 504、没有首事件、耗时不小于 REQUEST_TIMEOUT 减这么多秒（与 near_timeout
+# 的下界相同）。账本耗时从进入 HTTP 中间件算起，首事件前期限从稍后建立请求上下文时算起（扣住上游事件的时长还会顺延），本服务期限到期的
+# 耗时一定不小于 REQUEST_TIMEOUT；比它短还以码 4 结束的只能是 Google 侧期限（固定账号、换号次数或连续失败到了上限，没有号可换）
+LEGACY_BACKOFF_SLACK = 2
 
 
 def service_cut(error):
@@ -346,12 +369,12 @@ def service_cut(error):
     if not match:
         return None
     rest = error[match.end():]
-    where = re.match(r"（停在 (.*?)）: ", rest)
+    detail = START_DETAIL_RE.match(rest) if match.group(1) == "首事件前期限" else None
     output = re.match(r"（已输出 推理=(\d+) 正文=(\d+)）", rest)
     inner = rest.split(": ", 1)[1] if ": " in rest else ""
     return {
         "kind": CUT_KIND[match.group(1)], "limit": go_duration(match.group(2)), "limit_text": match.group(2),
-        "where": where.group(1) if where else "", "inner": inner,
+        "where": (detail.group(2) or "") if detail else "", "held_for": (detail.group(1) or "") if detail else "", "inner": inner,
         "reasoning": int(output.group(1)) if output else None, "content": int(output.group(2)) if output else None,
     }
 
@@ -390,6 +413,8 @@ def end_class(row):
             return "本服务首事件前期限到期·" + detail, "timeout_start"
         if cut["kind"] == "timeout_idle":
             return "本服务首事件后空闲期限到期（开始输出后上游连续无事件、无字节）", "timeout_idle"
+        if cut["kind"] == "timeout_held":
+            return "本服务扣住期间空闲期限到期（强制调用工具时扣住上游事件，上游连续无字节）", "timeout_held"
         return "本服务总时长上限到期", "timeout_total"
     # 旧版本：app/queue_progress.go queueEnded "排队 X 后请求超时（最后原因=…）: context deadline exceeded"
     if "排队" in error and "后请求超时" in error:
@@ -400,6 +425,13 @@ def end_class(row):
     # api/middleware.go：context.Canceled 或客户端断开 → 499、state=cancelled（app/request_logging.go requestOutcome）
     if state == "cancelled" or status == 499:
         return "已取消 499（客户端/中转/代理断开；或服务重启、管理端取消）", "cancel"
+    # 旧版本：首事件前期限在换号退避中到期、上一次尝试为协议错误码 4 时 error 只留上游原文（没有本服务前缀；新版本为
+    # “本服务首事件前期限 … 到期（停在 换号退避）: <上一次错误>”），看起来像 Google 侧期限。状态 504、没有首事件、耗时已到
+    # REQUEST_TIMEOUT（见 LEGACY_BACKOFF_SLACK）仍以码 4 结束的，按本服务首事件前期限算：码 4 是在尝试中返回的，返回后还能换号，
+    # 到了首事件前期限才结束多半是退避中到期
+    if ("协议错误码 4:" in error and status == 504 and not row["first"]
+            and row["duration"] >= TIMEOUT - LEGACY_BACKOFF_SLACK):
+        return "本服务首事件前期限在换号退避中到期（上一次为码 4，旧版本文本）", "timeout_backoff_legacy"
     # 上游 RPC 的 DEADLINE_EXCEEDED（aistudio/client.go RPCError："AI Studio <方法> 返回 HTTP 504、协议错误码 4: Deadline expired…"）
     if "协议错误码 4:" in error or "deadline expired" in low or "deadline_exceeded" in low:
         return "Google 侧期限（协议错误码 4：Deadline expired before operation could complete.）", "upstream_deadline"
@@ -760,7 +792,7 @@ def pick_model():
     explicit = model_key(ENV.get("MODEL"))
     if explicit:
         return explicit, "MODEL 指定"
-    cut_kinds = SERVICE_CUT_KINDS + ("upstream_deadline", "stream_closed", "proto_break", "timeout_legacy")
+    cut_kinds = SERVICE_CUT_KINDS + ("timeout_backoff_legacy", "upstream_deadline", "stream_closed", "proto_break", "timeout_legacy")
     cuts = collections.Counter(row["served"] or row["model"] for row in window_all
                                if row["model"] and (row["kind"] in cut_kinds or (not row["success"] and row["first"])))
     if cuts:
@@ -910,8 +942,9 @@ section("0. 相关配置与反向代理")
 print(f"  REQUEST_TIMEOUT={secs(TIMEOUT)}{timeout_note}    总时长上限={secs(TOTAL_CAP)}    FIRST_EVENT_TIMEOUT={FIRST_EVENT_TIMEOUT}")
 print("    · 拆分期限后的版本（app/generate_context.go）：REQUEST_TIMEOUT 是首个上游事件之前的总期限（排队、冷启动、WAA proof、附件上传、"
       "等首字与首事件前换号都计入）；开始输出后改为空闲上限（上游连续这么久既没有事件也没有网络字节才结束）；整条生成请求最长 "
-      f"max(1 小时, REQUEST_TIMEOUT)={secs(TOTAL_CAP)}。三种到期对外都是 504 \"Deadline expired before operation could complete.\"，"
-      "error 以“本服务…”开头")
+      f"max(1 小时, REQUEST_TIMEOUT)={secs(TOTAL_CAP)}；强制调用工具时生成服务扣住上游事件的期间改按空闲判断。这几种到期对外都是 504 "
+      "\"Deadline expired before operation could complete.\"，error 以“本服务…”开头（在换号退避或限流换号前等待中到期时冒号后是上一次尝试的"
+      "错误原文，对外照旧按它返回：上一次为上游 503、429 时是 503、429，为其他 5xx（如 500 INTERNAL）与断流时是 500）")
 print("    · 旧版本：REQUEST_TIMEOUT 覆盖整条请求（含全部流式输出），到时 error 为没有前缀的 context deadline exceeded")
 if NEW_VERSION:
     print("    · 账本或日志里出现过“本服务…期限”文本：运行的是拆分期限后的版本，下面按 error 文本判断截断来源，"
@@ -960,6 +993,8 @@ else:
 section(f"1. {MODEL} 最近 {MINUTES} 分钟的请求：耗时、首事件与结束原因")
 start_rows = [row for row in window_rows if row["kind"] == "timeout_start"]
 idle_rows = [row for row in window_rows if row["kind"] == "timeout_idle"]
+held_rows = [row for row in window_rows if row["kind"] == "timeout_held"]
+backoff_legacy_rows = [row for row in window_rows if row["kind"] == "timeout_backoff_legacy"]
 total_rows = [row for row in window_rows if row["kind"] == "timeout_total"]
 legacy_rows = [row for row in window_rows if row["kind"] == "timeout_legacy"]
 code4_rows = [row for row in window_rows if row["kind"] == "upstream_deadline"]
@@ -998,7 +1033,7 @@ else:
     # 本服务自己的期限截断（新版本）
     print()
     print(f"  ▶ 本服务自己的期限截断（error 以“本服务…”开头）：首事件前 {len(start_rows)}、首事件后空闲 {len(idle_rows)}、"
-          f"总时长上限 {len(total_rows)}")
+          f"扣住期间空闲 {len(held_rows)}、总时长上限 {len(total_rows)}")
     if start_rows:
         print(f"    首事件前期限：{top(collections.Counter(row['class'].split('·', 1)[1] for row in start_rows), 6)}；"
               f"总耗时 {dist([row['duration'] for row in start_rows])}；期限 {top(collections.Counter(row['cut']['limit_text'] for row in start_rows), 3)}")
@@ -1006,6 +1041,18 @@ else:
         if waited_first:
             print(f"      其中停在等待上游首事件：{len(waited_first)}（上游已建立响应、一直没有转发给客户端的事件：隐藏思考时的长思考"
                   "（Build 通道上游不返回思考，Playground 通道上游返回但本服务丢弃）、Build 单次调用整段生成，或上游卡住）")
+        between = [row for row in start_rows if row["cut"]["where"] in BETWEEN_ATTEMPTS]
+        if between:
+            print(f"      其中停在换号退避或限流换号前等待：{len(between)}（上一次尝试失败后、换号之前到期，error 冒号后是上一次的错误原文，"
+                  f"不是这次到期的原因；上一次：{top(collections.Counter(attempt_class(row['cut']['inner']) for row in between), 4)}）")
+        held_before = [row for row in start_rows if row["cut"]["held_for"]]
+        if held_before:
+            print(f"      其中扣住过上游事件（“扣住上游事件的 … 不计入”，扣住的时间已从首事件前期限里扣除）：{len(held_before)}")
+    if held_rows:
+        print(f"    扣住期间空闲期限（强制调用工具时生成服务扣住上游事件等调用，上游连续 REQUEST_TIMEOUT 没有网络字节）："
+              f"总耗时 {dist([row['duration'] for row in held_rows])}；期限 {top(collections.Counter(row['cut']['limit_text'] for row in held_rows), 3)}；样例：")
+        for row in sorted(held_rows, key=lambda r: r["end"], reverse=True)[:max(1, SAMPLES)]:
+            print(f"      {local(row['start'])} {short_id(row['id'])} 账号 {mask(row['account'])} 总 {secs(row['duration'])}  {brief(row)}")
     if idle_rows:
         reasoning = [row["cut"]["reasoning"] for row in idle_rows if row["cut"]["reasoning"] is not None]
         content = [row["cut"]["content"] for row in idle_rows if row["cut"]["content"] is not None]
@@ -1016,6 +1063,11 @@ else:
             print(f"      结束前有\"事件流停顿\"而没有恢复的 {share(len(stalled), len(idle_rows))}：上游开始输出后卡住，不是还在正常输出")
     if total_rows:
         print(f"    总时长上限：总耗时 {dist([row['duration'] for row in total_rows])}（上限 {top(collections.Counter(row['cut']['limit_text'] for row in total_rows), 2)}）")
+    if backoff_legacy_rows:
+        print(f"  ▶ 旧版本文本的换号退避中到期（error 只有协议错误码 4 原文、状态 504、没有首事件、耗时 ≥ "
+              f"{secs(TIMEOUT - LEGACY_BACKOFF_SLACK)}）：{len(backoff_legacy_rows)}，总耗时 {dist([row['duration'] for row in backoff_legacy_rows])}；"
+              "旧版本在换号退避中到期时只留上一次的上游原文，按本服务首事件前期限算，不计入 Google 侧期限"
+              "（新版本为“本服务首事件前期限 … 到期（停在 换号退避）: …”）")
     if code4_rows:
         print(f"  ▶ Google 侧期限（协议错误码 4）：{len(code4_rows)}，总耗时 {dist([row['duration'] for row in code4_rows])}，"
               f"其中已收到首事件 {sum(1 for row in code4_rows if row['first'])}（duration_ms 是 Google 期限的估计）")
@@ -1108,6 +1160,20 @@ else:
         VERDICTS.append(f"{len(start_rows)} 个在首字之前被本服务首事件前期限截断（{where}）：排队或冷启动长时看 diag_busy.sh；"
                         "停在等待上游首事件的，多为隐藏思考（Anthropic thinking.type=disabled、Gemini includeThoughts=false：Build 通道上游"
                         "不返回，Playground 通道上游返回但本服务丢弃）时的长思考或单次调用整段生成，要按最长的生成调大 REQUEST_TIMEOUT")
+    if held_rows:
+        VERDICTS.append(f"{len(held_rows)} 个在强制调用工具、生成服务扣住上游事件期间被本服务扣住期间空闲期限截断"
+                        "（上游连续 REQUEST_TIMEOUT 没有网络字节）：上游卡住；看请求时间线里的“工具约束要求必须调用：…”与之后的网络字节")
+    between_rows = [row for row in start_rows if row["cut"]["where"] in BETWEEN_ATTEMPTS] + backoff_legacy_rows
+    if between_rows:
+        previous = collections.Counter("Google 侧期限（协议错误码 4）" if row["kind"] == "timeout_backoff_legacy"
+                                       else attempt_class(row["cut"]["inner"]) for row in between_rows)
+        # 只有旧版本文本时才说明其中几个是旧版本的码 4 原文，没有这类时不写“其中旧版本文本 0 个”
+        legacy_note = (f"（其中旧版本文本 {len(backoff_legacy_rows)} 个：error 只有协议错误码 4 原文、状态 504、没有首事件、"
+                       "耗时到了 REQUEST_TIMEOUT）" if backoff_legacy_rows else "")
+        VERDICTS.append(f"{len(between_rows)} 个在换号退避（或限流换号前等待）中被本服务首事件前期限截断{legacy_note}，"
+                        "不是 Google 侧期限：首事件前失败的尝试把期限"
+                        f"耗完了，上一次失败为 {top(previous, 3)}。上一次多为码 4 时根本原因仍是 Google 侧期限（缩短思考或输出），"
+                        "调大 REQUEST_TIMEOUT 只能多换一次号；新版本的 error 为“本服务首事件前期限 … 到期（停在 换号退避）: <上一次错误>”")
     if total_rows:
         VERDICTS.append(f"{len(total_rows)} 个达到本服务总时长上限 {secs(TOTAL_CAP)}：上游以极低速率一直输出；确实需要更长时调大 REQUEST_TIMEOUT")
     if code4_rows:
@@ -1126,7 +1192,8 @@ print(f"  有输入指纹的请求：{share(len([r for r in window_rows if r['fp
       f"（日志 {sum(1 for r in window_rows if '日志' in r['fp_kinds'])}、正文 {sum(1 for r in window_rows if '正文' in r['fp_kinds'])}）")
 print("  指纹 = 协议 + 号池 + 模型 + 消息数 + 文字字数 + 附件数/字节 + 文件数 + 生成参数（不含 seed），来自 request.started/finished 日志"
       "（api/middleware.go）；开启 REQUEST_BODY_LOG 时另用请求正文摘要，任一种相同即算相同输入；账本本身没有输入指纹列")
-CUT_FOR_RETRY = SERVICE_CUT_KINDS + ("upstream_deadline", "stream_closed", "proto_break", "timeout_legacy", "5xx", "timeout_other")
+CUT_FOR_RETRY = SERVICE_CUT_KINDS + ("timeout_backoff_legacy", "upstream_deadline", "stream_closed", "proto_break", "timeout_legacy", "5xx",
+                                     "timeout_other")
 groups = collections.defaultdict(list)
 for row in fp_rows:
     for fp, _ in row["fps"]:
@@ -1241,7 +1308,7 @@ if retried:
     spent = [sum((a.get("duration_ms") or 0) for a in row["attempts"]) / 1000 for row in retried]
     print(f"    失败尝试累计耗时：{dist(spent)}（这段时间计入首事件前期限 REQUEST_TIMEOUT）")
     print(f"    最终结果：{top(collections.Counter(row['class'] for row in retried), 4)}")
-    start_retried = [row for row in retried if row["kind"] in ("timeout_start", "timeout_legacy", "queue_timeout")]
+    start_retried = [row for row in retried if row["kind"] in ("timeout_start", "timeout_backoff_legacy", "timeout_legacy", "queue_timeout")]
     if start_retried:
         print(f"    ⚠ 其中 {len(start_retried)} 个最后因首事件前期限结束：换号耗掉的时间让首字之前就到时")
 multi_first = [row for row in window_rows if row["first_events"] > 1]
@@ -1265,7 +1332,7 @@ else:
     in_window = [entry for entry in cut_logs if entry["t"] >= SINCE]
     mine = [entry for entry in in_window if (entry["request"] or {}).get("id") in model_ids or MODEL in ("all", "*")]
     stages = collections.Counter(fields(entry["msg"]).get("阶段", "?") for entry in mine)
-    print(f"  \"本服务期限截断 | 阶段=…\"：全部 {len(in_window)} 条，其中 {MODEL} {len(mine)} 条：{top(stages, 3) if mine else '-'}")
+    print(f"  \"本服务期限截断 | 阶段=…\"：全部 {len(in_window)} 条，其中 {MODEL} {len(mine)} 条：{top(stages, 5) if mine else '-'}")
     before = [fields(entry["msg"]) for entry in mine if fields(entry["msg"]).get("阶段") == "首事件前"]
     if before:
         print(f"    首事件前：停在 {top(collections.Counter(item.get('停在', '?') for item in before), 5)}")
@@ -1308,16 +1375,19 @@ else:
     texts = collections.Counter()
     for row in window_rows:
         error = row["error"]
-        for key in ("本服务首事件前期限", "本服务首事件后空闲期限", "本服务总时长上限", "协议错误码 4", "stream closed before finish",
+        for key in ("本服务首事件前期限", "本服务首事件后空闲期限", "本服务扣住期间空闲期限", "本服务总时长上限", "停在 换号退避",
+                    "协议错误码 4", "stream closed before finish",
                     "stream closed before first event", "context deadline exceeded", "Deadline expired", "后请求超时", "后请求已取消",
                     "协议位置", "context canceled"):
             if key.lower() in error.lower():
                 texts[key] += 1
     print(f"  账本 error 文案命中：{top(texts, 12) if texts else '无'}")
-    print("    · 本服务首事件前期限 / 首事件后空闲期限 / 总时长上限 = 本服务自己的期限（新版本，三者都带 context deadline exceeded 结尾）；"
+    print("    · 本服务首事件前期限 / 首事件后空闲期限 / 扣住期间空闲期限 / 总时长上限 = 本服务自己的期限（新版本；首事件前期限在换号退避中"
+          "到期时为“…（停在 换号退避）: <上一次错误>”，带协议错误码 4 也按本服务期限算，其余以 context deadline exceeded 结尾）；"
           "error 只有 context deadline exceeded 本身 = 旧版本整段 REQUEST_TIMEOUT 或其他数据请求，带 AI Studio … 协议位置 或 "
-          "BiDi … 等待回复超时 的 = 上游或浏览器链路超时；协议错误码 4 / Deadline expired = "
-          "Google 侧期限；stream closed before finish = 上游断流；客户端看到的 504 文案都相同（api/official_errors.go）")
+          "BiDi … 等待回复超时 的 = 上游或浏览器链路超时；没有本服务前缀的协议错误码 4 / Deadline expired = Google 侧期限"
+          "（状态 504、没有首事件且耗时到了 REQUEST_TIMEOUT 的除外：旧版本在换号退避中到期的文本）；stream closed before finish = 上游断流；"
+          "客户端看到的 504 文案都相同（api/official_errors.go；停在换号退避、限流换号前等待的照旧按上一次的错误返回）")
     finished_cancel = [row for row in window_rows if row["kind"] == "cancel"]
     print(f"  \"请求已取消\"（request.finished WARN，app/request_logging.go requestOutcome）：{len(finished_cancel)}")
     if quota_after_output:
@@ -1413,7 +1483,8 @@ if window_rows:
     service_cuts = sum(1 for row in bad if row["kind"] in SERVICE_CUT_KINDS)
     VERDICTS.insert(0, f"{MODEL}：最近 {MINUTES} 分钟 {len(window_rows)} 个请求，失败/取消 {share(len(bad), len(window_rows))}，"
                        f"其中已输出内容后 {sum(1 for row in bad if row['first'])}，本服务期限截断 {service_cuts}"
-                       f"（首事件前 {len(start_rows)}、首事件后空闲 {len(idle_rows)}、总时长上限 {len(total_rows)}）")
+                       f"（首事件前 {len(start_rows)}、首事件后空闲 {len(idle_rows)}、扣住期间空闲 {len(held_rows)}、总时长上限 {len(total_rows)}）"
+                       + (f"，另有旧版本文本的换号退避中到期 {len(backoff_legacy_rows)}" if backoff_legacy_rows else ""))
     upstream_cut = [row for row in window_rows if row["kind"] in ("proto_break", "stream_closed")]
     if upstream_cut:
         VERDICTS.append(f"{len(upstream_cut)} 个被上游/浏览器链路中途断开（{top(collections.Counter(r['class'] for r in upstream_cut), 3)}），"
