@@ -16,7 +16,9 @@ import (
 // 线上 Build 代理调用开始返回 HTTP 400 “PROXY_GENERATION_DISABLED: streamGenerateContent is not supported”（需要订阅权益的模型
 // 走单次代理调用，为 “… generateContent is not supported”），流式与非流式都关了。原先按请求本身的 400 直接返回客户端，不换通道；
 // Playground 输入超限改走 Build 的请求与只能经 Build 调用的模型同样只拿到这个看不懂的 400。现在（识别见 aistudio/build_pause.go）：
-//   - 当次请求：生成请求在 Build 上遇到它，不返回客户端，立即改走 Playground（同账号的 Playground 可用时在同账号重试，否则按现有规则换号），
+//   - 当次请求：生成请求在 Build 上遇到它，不返回客户端，立即改走 Playground（同账号的 Playground 可用时在同账号重试，否则按现有规则选号；
+//     账号仍留在候选里、不占换号次数，它的 Playground 只是冷却时由选号按全部冷却或额度不足返回 429；本请求刚在它的 Playground 上
+//     遇到冷却很快结束的额度 429 时不在同账号上等它恢复，见 runtime.go 的 buildDisabled 与 recentPlaygroundQuota），
 //     不计入连续失败上限、不退避、不冷却任何额度；错误在首事件之前，流式请求同样无缝重试
 //   - 按账号暂停：该账号不再经 Build 接生成请求（账户池标记，选号跳过它的 Build），buildPauseInterval（加少量抖动）后到期，
 //     到期后它在 Build 上的下一次真实请求就是试探：成功即解除，再遇到就再暂停一段（不重复写日志）
@@ -415,7 +417,10 @@ func buildInputLimitUnavailable(modelID string, capErr error, cause error) error
 
 // buildUnavailableAtEnd 返回换号结束、最后的错误仍是 Build 的 PROXY_GENERATION_DISABLED 时给客户端的错误：
 // 只能走 Build 的请求（输入超过 Playground 上限，capErr 为改走 Build 时 Playground 的上限错误）为输入超限（400），
-// Playground 目录没有的模型为只能经 Build 调用（503），其余为 Playground 接不了（503）
+// Playground 目录没有的模型为只能经 Build 调用（503），其余为 Playground 接不了（503）。能经 Playground 接的账户只是冷却或额度用完时
+// 不走到这里：被拒的账号留在候选里，之后的选号按全部冷却或额度不足结束（429）；本请求刚在它的 Playground 上遇到冷却很快结束的额度 429 时
+// 留在排除名单里、不占换号次数，选号同样按额度不足结束（见 recentPlaygroundQuota）；本请求第一次用到、只在 Build 上被拒的账号不占每请求
+// 换号硬上限，之前试过的账号在 Build 上被拒时到硬上限、本请求有过额度失败的同样按额度不足结束（见 runtime.go 的 buildDisabled 与硬上限的处理）
 func (service *trackedService) buildUnavailableAtEnd(modelID string, buildOnly bool, capErr error, cause error) error {
 	if buildOnly && capErr != nil {
 		return buildInputLimitUnavailable(modelID, capErr, cause)
@@ -425,6 +430,22 @@ func (service *trackedService) buildUnavailableAtEnd(modelID string, buildOnly b
 		reason = aistudio.BuildUnavailableModel
 	}
 	return &aistudio.BuildGenerationUnavailableError{Reason: reason, Model: modelID, Cause: cause}
+}
+
+// recentPlaygroundQuota 为本请求在某个账号的 Playground 上遇到的额度 429（generateForModel 按账号记下最后一次）：until 为写入的冷却
+// 恢复时间，err 为那次尝试的错误。同账号随后改走 Build 又遇到 PROXY_GENERATION_DISABLED 时（runtime.go 的 buildDisabled）据此判断：
+// 冷却很快结束（short）时选号会原地等它恢复、再在同账号的 Playground 上试一次，而限流类失败后同账号马上再试多半还是失败
+// （见 quota_switch.go），只启用 Playground 时也不会这样再试，所以不把账号放回候选（指定账户的请求按这次 429 结束）；
+// 每日限额等长冷却照常放回，由选号给出准确的最早恢复时间
+type recentPlaygroundQuota struct {
+	until time.Time
+	err   error
+}
+
+// short 判断这次额度 429 的冷却还没结束、剩余不超过 cooldownQueueLimit（选号会原地排队等它恢复的长度）
+func (quota recentPlaygroundQuota) short(now time.Time) bool {
+	remaining := quota.until.Sub(now)
+	return remaining > 0 && remaining <= cooldownQueueLimit
 }
 
 // joinBuildCause 合并内部原因，跳过空值

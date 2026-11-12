@@ -60,6 +60,8 @@ const (
 	// BuildUnavailableInputLimit 为输入超过 Playground 的上限、只能改走 Build 的请求
 	BuildUnavailableInputLimit
 	// BuildUnavailableNoPlayground 为 Playground 接不了的请求：UPSTREAM_CHANNELS 没有启用 Playground，或换到 Playground 后仍没有可用账号
+	// （这次请求能用的账户的 Playground 都接不了该模型，或最后在 Build 上被拒的账户的 Playground 接不了、其余能接的都已因冷却以外的原因试过；
+	// 只是冷却或额度用完时按全部冷却或额度不足返回 429）
 	BuildUnavailableNoPlayground
 )
 

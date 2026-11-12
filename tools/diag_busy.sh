@@ -422,6 +422,14 @@ def row_class(row):
         return "发出前已冷却 429"
     if status == 429 or "HTTP 429" in error:
         return "上游 429·" + quota_class(error)
+    # 官网停用了 Build 通道的生成、请求又只能经 Build 处理（aistudio/build_pause.go BuildGenerationUnavailableError，对外 503）：
+    # 不是号池不可用，单独成类。错误原文以“官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED）”开头，Playground 接不了（没有启用
+    # Playground，或这次请求能用的账户的 Playground 都接不了该模型）写“Playground 通道接不了模型”，只能经 Build 调用的模型写“只能经 Build
+    # 通道调用”；Playground 只是冷却或额度用完时按全部冷却、额度不足的 429 结束，不在这里
+    if status == 503 and "官网停用了 Build 通道的生成" in error and "Playground 通道接不了模型" in error:
+        return "503 Build 被官网停用、Playground 接不了"
+    if status == 503 and "官网停用了 Build 通道的生成" in error and "只能经 Build 通道调用" in error:
+        return "503 Build 被官网停用、模型只能经 Build"
     if status == 504 or "deadline exceeded" in error.lower() or "超时" in error:
         return "超时 504" + ("（排队中）" if "排队" in error else "")
     if status == 400:

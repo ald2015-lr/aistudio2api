@@ -20,7 +20,8 @@ package app
 //   - 出口正常时第 2 次起的限流类换号前等待 300–800ms（quotaJitterDelay）：错开并发请求的重试，不是降速（降速靠出口令牌桶），
 //     排队预算已过时不等待，等待截到预算剩余；不改 generateRetryBackoff；
 //   - 发出前已冷却（ErrAccountCoolingDown，请求没有发到上游、不消耗出口额度）不计入额度上限、不退避，只计入每请求硬上限；
-//   - 每请求硬上限 generateSwitchCeiling：最多在这么多个不同账号上取得租约发起尝试，不受 attempted 的删除与 maxAttempts 的补偿影响。
+//   - 每请求硬上限 generateSwitchCeiling：最多在这么多个不同账号上取得租约发起尝试，不受 attempted 的删除与 maxAttempts 的补偿影响；
+//     本请求第一次用到、只在 Build 上被官网停用的账号不计入（只是换通道，见 runtime.go 的 buildDisabled）。
 // 结束时按 PrimaryQuotaError（Kind 为 QuotaFailSwitchLimit 或 QuotaFailEgress）返回：对外 429 + Retry-After（见 primaryQuotaRetryAt）。
 // 指定账号的请求只能用这个账号，不计数，按原错误结束
 

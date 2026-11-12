@@ -4863,6 +4863,9 @@ func (service *trackedService) generateForModel(
 	// preferPlaygroundAfterBuild：本请求已在 Build 上遇到 PROXY_GENERATION_DISABLED，之后的尝试每个账号先 Playground（只调整顺序，
 	// Playground 接不了的模型仍可用其他账号的 Build），不在其他账号的 Build 上再白试一次
 	preferPlaygroundAfterBuild := false
+	// playgroundQuota 为本请求在各账号的 Playground 上遇到的额度 429（同一账号取最后一次，见 recentPlaygroundQuota）：之后同账号改走 Build
+	// 又遇到 PROXY_GENERATION_DISABLED 时，冷却很快结束的账号不放回候选，与只启用 Playground 时一样不在同账号上等它恢复再试
+	var playgroundQuota map[string]recentPlaygroundQuota
 	// noCandidate 为最近一次选号失败时、不固定账户的选号没有候选（aistudio.NoCandidateFailure）的核对结果（见 aistudio.NoCandidateReport）：
 	// 请求以这个错误结束时按它写原因摘要并决定对外状态（循环后的 NoServingAccountError）；指定账户、绑定文件的选号不核对，照原来的错误返回。
 	// 只在这次没有候选会成为请求的最终错误时核对（之前没有失败的尝试，err 为空）：换号用尽、输入超限后的再试等情况下请求按之前的错误结束，
@@ -4966,6 +4969,9 @@ func (service *trackedService) generateForModel(
 	// warmOnlyNext：上一次尝试是额度失败，下一次选号只用已启动的 Worker（withoutColdStart），取得租约后清除；
 	// 标记只加在那次选号的 context 上，不进整个请求共用的 acquireCtx
 	warmOnlyNext := false
+	// sameAccountQuotaNext：上一次尝试是额度失败、在同账号另一通道再试（quotaSameAccount：不算换号，没有做限流类换号前的等待），
+	// 取得租约后清除；这次尝试在 Build 上被官网停用、又要换走时据此按那次额度失败换号（见下文 buildDisabled 的 quotaCarried）
+	sameAccountQuotaNext := false
 	// 排队进度同样整个请求共用一份，带上请求 ID：主路由（没有排查记录）的排队原因与回收记录也能写进请求时间线（见 queue_progress.go）
 	progress := newLeaseWaitProgress(request.ID)
 	baseCtx := withLeaseWaitBudget(requestCtx, budget)
@@ -5351,10 +5357,18 @@ func (service *trackedService) generateForModel(
 				attempted[selectionAccountID] = struct{}{}
 				continue
 			}
-			if policy.counted && quota.lastErr != nil && errors.Is(err, quota.lastErr) && requestCtx.Err() == nil {
+			if policy.counted && quota.lastErr != nil && requestCtx.Err() == nil &&
+				(errors.Is(err, quota.lastErr) || !buildOnly && aistudio.BuildGenerationDisabledFailure(err)) {
 				// 额度失败后的换号只剩号池一侧暂时不可调度的账号（需要重新登录、已停用、runtime 被其他进程占用等，
 				// AccountsNotReadyError），上面也回不到没等到关闭的原账号：按没有其他可换的账号返回额度不足（429，带 Retry-After），
-				// 不以上一次不带 Retry-After 的上游额度错误结束。上一次失败不是额度失败时 err 不是它，照原来的错误结束
+				// 不以上一次不带 Retry-After 的上游额度错误结束。上一次失败不是额度失败时 err 不是它，照原来的错误结束。
+				// 本请求有过计入换号上限的额度失败、最后一次是在 Build 上被官网停用、err 仍是这次拒绝（PROXY_GENERATION_DISABLED，见上文
+				// buildDisabled 的 default 分支：紧接在同账号换通道的额度失败之后的拒绝已换回那次的额度错误，走前一种；这里是被拒账号的
+				// Playground 接不了该模型，或中间隔着其他尝试）时同样按额度不足结束：Build 被拒只是换通道，不是能交给客户端的失败，
+				// 不把本请求遇到的额度 429 盖成“Playground 接不了”的 503。
+				// 这与选号没有候选时（上面的 primaryQuotaSelectionReason，只看本请求有没有过额度失败）的规则一致，不追溯被拒前最后一次
+				// 真正的失败：中间换到的账号返回过 5xx 等非额度失败时，只启用 Playground 的同一请求在这里按那次错误结束，这里仍按额度不足。
+				// 只能经 Build 处理的请求（buildOnly，输入超过 Playground 上限）不在此列，照原来的错误结束（输入超限或 Build 不可用）
 				meta.accounts = len(tried)
 				err = service.finishQuotaFailure(request.ID, "service", &quota, meta, primaryQuotaReasonNoOther, nil, nil)
 				break
@@ -5367,7 +5381,10 @@ func (service *trackedService) generateForModel(
 			break
 		}
 		lease = nextLease
-		warmOnlyNext = false
+		// warmOnlyAttempt：这次选号因上一次额度失败只用已启动的 Worker；sameAccountQuotaAttempt：上一次尝试是同账号换通道的额度失败。
+		// 两个标记都在这里清除，这次尝试在 Build 上被官网停用、只是换通道时据此恢复（见下文 buildDisabled）
+		warmOnlyAttempt, sameAccountQuotaAttempt := warmOnlyNext, sameAccountQuotaNext
+		warmOnlyNext, sameAccountQuotaNext = false, false
 		err = nil
 		source = nil
 		// 之前选号没有候选的核对结果只属于那次选号：这次尝试以满足 NoCandidateFailure 的错误结束时（例如发送前的租约校验）照原来的错误返回，
@@ -5378,6 +5395,9 @@ func (service *trackedService) generateForModel(
 		}
 		request.AccountID = lease.Account().ID
 		workerGeneration := service.workers.WorkerGeneration(request.AccountID)
+		// triedBefore：本请求之前已在这个账号上尝试过（已记进 tried）。这次只在它的 Build 上被官网停用时据此决定是否把它移出 tried
+		// （不占每请求换号硬上限，见下文 buildDisabled 的 default 分支）
+		_, triedBefore := tried[request.AccountID]
 		attempted[request.AccountID] = struct{}{}
 		tried[request.AccountID] = struct{}{}
 		// 租约所在的出口与分区通道（现场提升时已跟到新 Worker 的出口，见 acquireLease）：这次尝试的结果按它交给出口判定器（见 egress_guard.go）
@@ -5765,10 +5785,14 @@ func (service *trackedService) generateForModel(
 			driveMissing && (unbound || fileBound) && requestCtx.Err() == nil
 		// buildDisabled：Build 代理返回 PROXY_GENERATION_DISABLED（官网停用了经 Build 代理的生成，见 build_pause.go）。与请求本身、
 		// 账号额度都无关：不冷却、不计连续失败上限、不退避；记进 Build 暂停（该账号不再走 Build，短时间内 3 个账号即全局暂停），
-		// 本请求立即改走 Playground：同账号的 Playground 可用时在同账号重试，否则按原规则换号。错误在首事件之前，流式请求同样无缝重试。
+		// 本请求立即改走 Playground：同账号的 Playground 可用时在同账号重试，否则按原规则选号（账号仍留在候选里，见下文 default 分支）。
+		// 错误在首事件之前，流式请求同样无缝重试。
 		// 只能经 Build 处理的请求（输入超过 Playground 上限）换其他账号的 Build 再试，全局暂停后按 Build 不可用的清楚错误结束
 		buildDisabled := generated && lease.Channel() == aistudio.ChannelBuild && requestCtx.Err() == nil &&
 			aistudio.BuildGenerationDisabledFailure(attemptErr)
+		// quotaCarried：这次 Build 被拒后要换走，上一次尝试是同账号换通道的额度失败（见下文 default 分支）：按那次额度失败换号，
+		// 错误回到那次的额度错误，换号前补上那次没有做的限流类换号前等待
+		quotaCarried := false
 		if buildDisabled {
 			buildDisabledErr = attemptErr
 			globalPaused := pauses.disabled(request.AccountID, accountLabel, probeAttempt)
@@ -5787,16 +5811,82 @@ func (service *trackedService) generateForModel(
 					"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），输入超过 Playground 上限，换账号的 Build 再试")
 			default:
 				preferPlaygroundAfterBuild = true
-				same := "否"
-				if service.pool.AccountChannelAvailable(request.AccountID, channelFallback(retrySelection)) {
-					// 该账号的 Build 已暂停，换通道的判断只剩 Playground：可用时在同账号重试，不占换号次数
+				// 该账号的 Build 已同步暂停（pauses.disabled 同步写入账户池的暂停标记，暂停期间选号不再取它的 Build；全局暂停中的试探
+				// 每个间隔只放行一次），换通道的判断只剩 Playground：
+				//   - 它的 Playground 现在可用：放回候选、不占换号次数，下一次在同账号的 Playground 重试；
+				//   - 本请求刚在它的 Playground 上遇到额度 429、冷却很快结束（recentPlaygroundQuota.short，多半是同账号换通道到这里）：
+				//     与只启用 Playground 时一样不在同账号上等它恢复再试（限流类失败后同账号马上再试多半还是失败，见 quota_switch.go）。
+				//     不固定账号的请求把它留在排除名单里换其他账号，同样不占换号次数；没有其他账号时选号按额度不足立即返回 429（没有候选时
+				//     经 primaryQuotaSelectionReason，只剩需要重新登录、已停用等暂时不可调度的账号时经选号失败处的兜底；Retry-After 取 5 秒
+				//     与本请求遇到的额度冷却中较早者，见 primaryQuotaRetryAt；交给 MODEL_FALLBACKS）；
+				//     指定账户的请求只能用这个账户，按那次额度 429 结束；
+				//   - 其余（冷却中、接不了该模型）：放回候选、不占换号次数。冷却中（额度用完、本请求遇到的每日限额等长冷却）时由选号
+				//     按它的冷却给出全部冷却（429 带最早恢复时间，或额度失败后的额度不足，交给 MODEL_FALLBACKS），冷却短于排队上限时
+				//     等它恢复（Ultra 主用模型不等）；接不了该模型时选号不会再取它。
+				// Build 被拒只是换通道，不改变上一次额度失败之后的处理，与只启用 Playground 时那次额度失败之后相同：
+				//   - 这次选号因额度失败只用已启动的 Worker（warmOnlyAttempt，取得租约时已清除）：恢复这个约束，下一次选号同样不在请求路径上
+				//     现场冷启动备用账号（没有热候选时按额度不足返回 429 并发起后台扩容）；
+				//   - 上一次尝试是同账号换通道的额度失败（sameAccountQuotaAttempt，那次不算换号），这次又要换走（排除它换其他账号，或放回候选
+				//     按原规则选号）：按那次额度失败换号（quotaCarried）。本次尝试的错误回到那次的额度错误（quota.lastErr），请求在换号前结束时
+				//     （释放租约出错、换号前等待中首事件前期限到期等）按它结束，不换成“Playground 接不了”的 503；补上那次没有做的
+				//     第 2 次起的限流类换号前等待
+				// 原先只在可用时放回：冷却中的账号留在排除名单里，不计入全部冷却，换号次数又被占掉一次，号池里支持该模型的账号少时
+				// （换号次数按全部可调度账号计）以“Playground 接不了”的 503 结束，盖住了额度 429。
+				// 本请求第一次用到的账号只在它的 Build 上被拒时（!triedBefore）同样不占每请求换号硬上限（generateSwitchCeiling）：移出 tried，
+				// 之后选号再取它（同账号的 Playground 重试、冷却恢复后）时照常记入。只启用 Playground 时它要么不是候选（Playground 接不了
+				// 该模型），要么在它的 Playground 上才算一次；原先记进 tried，几次不终止请求的额度失败加上两三个账号的 Build 被拒就能凑满
+				// 硬上限，号池里还有能经 Playground 接的账号时也不再换号，以“Playground 接不了”的 503 结束。之前已在本请求里试过的账号
+				// （同账号换通道到这里、Worker 重建后的重放等）留在 tried 里，在这里到硬上限时按额度不足结束（见下文硬上限的处理）。
+				// 不会循环：被拒的账号随即暂停 Build（暂停 30 分钟起），选号不再取它的 Build，短时间内 3 个账号被拒即全局暂停，
+				// 试探被拒后下次试探同样在 30 分钟以后，一个请求里 Build 被拒的次数不超过支持该模型的账号数（加至多一次试探）
+				recent, quotaHere := playgroundQuota[request.AccountID]
+				now := time.Now()
+				if warmOnlyAttempt {
+					warmOnlyNext = true
+				}
+				if !triedBefore {
+					delete(tried, request.AccountID)
+				}
+				switch {
+				case service.pool.AccountChannelAvailable(request.AccountID, channelFallback(retrySelection)):
 					delete(attempted, request.AccountID)
 					maxAttempts++
-					same = "是"
+					trace.Note("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试")
+					service.requests.logRequestProgress(request.ID, accountLabel, "INFO",
+						"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 | 同账号=是")
+				case quotaHere && recent.short(now) && (unbound || fileBound):
+					maxAttempts++
+					quotaCarried = sameAccountQuotaAttempt
+					note := fmt.Sprintf("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 | 同账号=否 | "+
+						"本请求刚在该账号的 Playground 上遇到额度 429，冷却剩余 %s，与只启用 Playground 时一样不在同账号上等它恢复，"+
+						"换其他账号（不占换号次数，没有时按额度不足返回 429）", recent.until.Sub(now).Round(time.Millisecond))
+					trace.Note(note)
+					service.requests.logRequestProgress(request.ID, accountLabel, "INFO", note)
+				case quotaHere && recent.short(now):
+					// 指定账户：与只启用 Playground 时相同，以那次额度 429 结束（额度失败计入换号上限的 Ultra 主用模型按额度不足结束）
+					retryable = false
+					err = recent.err
+					note := fmt.Sprintf("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），指定账户的 Playground 本请求刚遇到额度 429，"+
+						"冷却剩余 %s，与只启用 Playground 时一样不等它恢复，按那次额度 429 结束", recent.until.Sub(now).Round(time.Millisecond))
+					trace.Note(note)
+					service.requests.logRequestProgress(request.ID, accountLabel, "WARN", note)
+					if policy.counted {
+						meta.accounts = len(tried)
+						err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonNoOther, nil, recent.err)
+					}
+				default:
+					delete(attempted, request.AccountID)
+					maxAttempts++
+					quotaCarried = sameAccountQuotaAttempt
+					trace.Note("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试")
+					service.requests.logRequestProgress(request.ID, accountLabel, "INFO",
+						"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 | 同账号=否 | "+
+							"该账号的 Playground 现在不可用（冷却中或接不了该模型），账号仍留在候选里、不占换号次数")
 				}
-				trace.Note("Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试")
-				service.requests.logRequestProgress(request.ID, accountLabel, "INFO",
-					"Build 通道的生成被官网停用（PROXY_GENERATION_DISABLED），改走 Playground 重试 | 同账号="+same)
+				if quotaCarried {
+					// 尝试记录、日志与 buildDisabledErr 已按 Build 的拒绝写过；之后的换号与结束按那次额度失败处理
+					err = quota.lastErr
+				}
 			}
 		} else if probeAttempt {
 			// 试探请求以其他原因失败（额度、超时等）：说明不了 Build 是否恢复，稍后再放行下一次试探；这次请求照常换号
@@ -5911,6 +6001,13 @@ func (service *trackedService) generateForModel(
 				}
 				quotaFailure, quotaKind = true, cooldown.Kind
 			}
+			if stateErr == nil && lease.Channel() == aistudio.ChannelPlayground {
+				// 记下本请求在这个账号的 Playground 上遇到的额度 429：同账号换到 Build 又被官网停用时据此决定是否放回候选（见上文 buildDisabled）
+				if playgroundQuota == nil {
+					playgroundQuota = make(map[string]recentPlaygroundQuota, 1)
+				}
+				playgroundQuota[request.AccountID] = recentPlaygroundQuota{until: cooldown.Until, err: err}
+			}
 			if stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
@@ -5947,6 +6044,7 @@ func (service *trackedService) generateForModel(
 		if quotaFailure && policy.warmAfter(quota.last) || policy.ultra && coolingDown && quota.hits() > 0 {
 			warmOnlyNext = true
 		}
+		sameAccountQuotaNext = quotaFailure && quotaSameAccount
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度。与单模型 403 一样只按本次尝试本身的错误判断：
 		// 删除临时 Drive 副本时 DriveDelete 返回的 403 与模型权限无关，不计入（原先按并入清理错误后的 err，几次清理 403 就可能暂停正常账号）；
 		// 带图 Interaction 请求的 403 与账户无关，不计入
@@ -6167,8 +6265,9 @@ func (service *trackedService) generateForModel(
 			}
 			break
 		}
-		// 每请求换号硬上限：已在 generateSwitchCeiling 个不同账号上尝试过，不再换号（同账号重建后重放不算换号）。还有没等到关闭就换走的
-		// 原账号时先回到那里等关闭结束后重放；否则这次是额度失败时按额度不足结束（429，带 Retry-After），其余按这次的错误结束
+		// 每请求换号硬上限：已在 generateSwitchCeiling 个不同账号上尝试过，不再换号（同账号重建后重放不算换号，只在 Build 上被官网停用的
+		// 新账号不计入，见上文 buildDisabled）。还有没等到关闭就换走的原账号时先回到那里等关闭结束后重放；否则这次是额度失败（或额度失败后
+		// 在 Build 上被官网停用）时按额度不足结束（429，带 Retry-After），其余按这次的错误结束
 		if !recoverWorker && (unbound || fileBound) && len(tried) >= generateSwitchCeiling {
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 				"已尝试 %d 个账号，不再换号 | 原因=%s", len(tried), progressReason(err)))
@@ -6182,9 +6281,18 @@ func (service *trackedService) generateForModel(
 				keepImageDeniedEnd(fmt.Sprintf("已尝试 %d 个账号，到每请求换号上限：%s", len(tried), progressReason(err)))
 				break
 			}
-			if !ended && quotaFailure && requestCtx.Err() == nil {
+			// 这次在 Build 上被官网停用（只是换通道，见上文 buildDisabled）、本请求此前有过计入换号上限的额度失败：同样按额度不足结束，
+			// 原因取那次额度失败（quota.lastErr），与选号失败处的兜底一致；不以 Build 的拒绝结束（循环后换成“Playground 接不了”的 503），
+			// quotaCarried 时也不以裸的上游额度错误结束（不带 Retry-After，限流类不交给 MODEL_FALLBACKS）。只在 Build 上被拒的新账号
+			// 不占硬上限，到这里的是本请求之前已试过的账号（Worker 重建后的重放、回到没等到关闭的原账号等）。只走 Build 的 buildOnly 除外
+			buildQuotaEnd := buildDisabled && !buildOnly && policy.counted && quota.lastErr != nil
+			if !ended && (quotaFailure || buildQuotaEnd) && requestCtx.Err() == nil {
 				meta.accounts = len(tried)
-				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonCeiling, nil, err)
+				cause := err
+				if !quotaFailure {
+					cause = nil
+				}
+				err = service.finishQuotaFailure(request.ID, accountLabel, &quota, meta, primaryQuotaReasonCeiling, nil, cause)
 			}
 			if !ended && driveMissing && len(drive.last.Available) > 0 {
 				// 换满上限的都是没有 Drive 授权的账号，号池里却有记着 Drive 可用的账号（本请求试过或现在用不了）：按号池繁忙返回 429，
@@ -6215,8 +6323,9 @@ func (service *trackedService) generateForModel(
 			}
 		}
 		// 出口正常时第 2 次起的限流类换号前短暂等待（错开并发请求的重试，见 quota_switch.go）：出口限速生效时令牌桶已错开，
-		// 排队预算已过时不等待；走到这里已确定要换号（换号上限、换号次数、硬上限都已检查过）
-		if !recoverWorker && !quotaSameAccount && quotaFailure && quota.last == primaryQuotaRate && quota.rate >= 2 &&
+		// 排队预算已过时不等待；走到这里已确定要换号（换号上限、换号次数、硬上限都已检查过）。同账号换通道不算换号、不等待；
+		// 换到的 Build 被官网停用又要换走时（quotaCarried）补上，与只启用 Playground 时那次额度失败后换号相同
+		if !recoverWorker && (quotaFailure && !quotaSameAccount || quotaCarried) && quota.last == primaryQuotaRate && quota.rate >= 2 &&
 			policy.jitter && !quota.egress.Throttled && !budget.expired() {
 			if waitErr := waitQuotaJitter(requestCtx, service.quotaJitterDelay(), budget); waitErr != nil {
 				// 首事件前期限在这段等待中到期：与换号退避相同，文本标明停在限流换号前等待，对外仍按上一次的 429 返回
