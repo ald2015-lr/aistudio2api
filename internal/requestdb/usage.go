@@ -435,6 +435,9 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 	now := time.Now()
 	from, to := query.From.UnixMilli(), query.To.UnixMilli()
 	starts := bucketStarts(query.From, query.To, query.Bucket, location)
+	if query.PairsOf != nil {
+		return store.usagePairs(ctx, query, plan(from, to, starts), now)
+	}
 	totals := &aggregate{}
 	buckets := make([]*aggregate, len(starts))
 	for index := range buckets {
@@ -459,11 +462,9 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		for _, dimension := range usageDimensions {
 			add(groups[dimension], value.dimension(dimension), value)
 		}
-		pair := [2]string{value.account, value.model}
-		if pairs[pair] == nil {
-			pairs[pair] = &aggregate{}
+		if !query.SkipPairs {
+			addPair(pairs, value)
 		}
-		pairs[pair].add(value)
 		key := value.dimension(query.Stack)
 		if stack[key] == nil {
 			stack[key] = make([][2]int64, len(starts))
@@ -491,7 +492,7 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		From: query.From.UTC(), To: query.To.UTC(), BucketSeconds: int64(query.Bucket / time.Second), GeneratedAt: now.UTC(),
 		Totals: totals.stats(), Previous: previous.stats(), StackBy: query.Stack,
 		Recent:  api.UsageRecent{Minutes: int(recentWindow / time.Minute), Requests: recent.requests, Tokens: recent.totalTokens},
-		Buckets: make([]api.UsageBucket, len(starts)), Groups: map[string][]api.UsageGroup{}, Pairs: []api.UsagePair{},
+		Buckets: make([]api.UsageBucket, len(starts)), Groups: map[string][]api.UsageGroup{}, Pairs: rankPairs(pairs),
 	}
 	for index, start := range starts {
 		report.Buckets[index] = api.UsageBucket{At: time.UnixMilli(start).UTC(), UsageStats: buckets[index].stats()}
@@ -499,12 +500,6 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 	for _, dimension := range usageDimensions {
 		report.Groups[dimension] = rankGroups(groups[dimension])
 	}
-	for pair, total := range pairs {
-		report.Pairs = append(report.Pairs, api.UsagePair{Account: pair[0], Model: pair[1], UsageStats: total.stats()})
-	}
-	slices.SortFunc(report.Pairs, func(a, b api.UsagePair) int {
-		return cmp.Or(cmp.Compare(b.Requests, a.Requests), strings.Compare(a.Account, b.Account), strings.Compare(a.Model, b.Model))
-	})
 	report.Series = stackSeries(report.Groups[query.Stack], stack, len(starts))
 	var latest sql.NullInt64
 	if err := store.db.QueryRowContext(ctx, `SELECT MAX(time) FROM requests`).Scan(&latest); err != nil {
@@ -527,6 +522,64 @@ func (store *Store) Usage(ctx context.Context, query api.UsageQuery) (api.UsageR
 		report.Options[dimension] = slices.Sorted(maps.Keys(groups[dimension]))
 	}
 	return report, nil
+}
+
+// addPair 把条目累加到它的账户与模型组合
+func addPair(pairs map[[2]string]*aggregate, value *entry) {
+	pair := [2]string{value.account, value.model}
+	if pairs[pair] == nil {
+		pairs[pair] = &aggregate{}
+	}
+	pairs[pair].add(value)
+}
+
+// rankPairs 按请求数降序、账户与模型升序排列组合明细；没有组合时为空数组
+func rankPairs(pairs map[[2]string]*aggregate) []api.UsagePair {
+	ranked := make([]api.UsagePair, 0, len(pairs))
+	for pair, total := range pairs {
+		ranked = append(ranked, api.UsagePair{Account: pair[0], Model: pair[1], UsageStats: total.stats()})
+	}
+	slices.SortFunc(ranked, func(a, b api.UsagePair) int {
+		return cmp.Or(cmp.Compare(b.Requests, a.Requests), strings.Compare(a.Account, b.Account), strings.Compare(a.Model, b.Model))
+	})
+	return ranked
+}
+
+// usagePairs 只汇总排行中一行的组合明细（api.UsageQuery.PairsOf）：读取与主报告相同的时间段与筛选，SQL 另按这一行的取值收窄，
+// 结果与同一查询的主报告里这一行的组合逐项相同；趋势、分项、上一周期、当前吞吐与筛选候选都不计算，报告里这些字段为空
+func (store *Store) usagePairs(ctx context.Context, query api.UsageQuery, segments []segment, now time.Time) (api.UsageReport, error) {
+	report := api.UsageReport{
+		From: query.From.UTC(), To: query.To.UTC(), BucketSeconds: int64(query.Bucket / time.Second), GeneratedAt: now.UTC(),
+		StackBy: query.Stack, Buckets: []api.UsageBucket{}, Series: []api.UsageSeries{}, Groups: map[string][]api.UsageGroup{},
+		Pairs: []api.UsagePair{}, Options: map[string][]string{},
+	}
+	filters, ok := narrowFilters(query.Filters, query.PairsOf.Dimension, query.PairsOf.Key)
+	if !ok {
+		return report, nil
+	}
+	pairs := map[[2]string]*aggregate{}
+	visit := func(value *entry) { addPair(pairs, value) }
+	for _, part := range segments {
+		if err := store.scan(ctx, part, filters, visit); err != nil {
+			return api.UsageReport{}, err
+		}
+	}
+	report.Pairs = rankPairs(pairs)
+	return report, nil
+}
+
+// narrowFilters 在筛选上再限定一个维度只取 key（key 可以为空，即未分配；筛选值经查询参数读入时空值被忽略，这里直接写入）。
+// 这个维度原本有筛选而不含 key 时，这一行不在主报告的范围内，返回 false
+func narrowFilters(filters api.UsageFilters, dimension, key string) (api.UsageFilters, bool) {
+	if values := filters[dimension]; len(values) > 0 && !slices.Contains(values, key) {
+		return nil, false
+	}
+	narrowed := maps.Clone(filters)
+	if narrowed == nil {
+		narrowed = api.UsageFilters{}
+	}
+	narrowed[dimension] = []string{key}
+	return narrowed, true
 }
 
 // rankGroups 按请求数降序、取值升序排列维度分项

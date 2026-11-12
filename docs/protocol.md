@@ -1324,7 +1324,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |
 | `GET /api/events` | 200 SSE | `{"type":"<TYPE>","data":<DTO>}` |
-| `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state`、`pool`（`normal` 或 `ultra`）筛选；`stack` 与分项 `groups` 同样包含 `pool` |
+| `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state`、`pool`（`normal` 或 `ultra`）筛选；`stack` 与分项 `groups` 同样包含 `pool`。账户×模型组合明细 `pairs`：不带参数或 `pairs=1` 时与原先相同返回全部组合；`pairs=0` 不聚合组合，`pairs` 为空数组，其余字段不变（管理页的主报告这样请求）；`pairs_account=<账户>` 或 `pairs_model=<模型>`（二选一，取值原样使用、可以为空即未分配的那一行）只返回这一行的组合，时间范围与各维度筛选与主报告相同，组合的统计与主报告里这一行的组合逐项相同，其余字段（`totals`、`buckets`、`groups`、`series`、`options` 等）为空或零值；该维度原有筛选不含这个取值时 `pairs` 为空。`pairs` 取 `0`、`1` 以外的值、两个行参数同时出现或与 `pairs=0` 同时出现时 400 |
 | `GET /api/usage/records`、`records.csv` | 200 | `{"items":[UsageRecord,...],"next_cursor"?}` 或带 BOM 的 UTF-8 CSV；另接受 `status`、`q`（请求 ID、错误或回复指纹）、`cursor`、`limit`（1 到 200）；记录与 CSV 带 `pool`（`normal` 或 `ultra`） |
 | `GET /api/requests/{id}/body` | 200 / 404 | `RequestBody`；只在 `REQUEST_BODY_LOG=true` 时保存 |
 

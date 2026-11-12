@@ -718,6 +718,8 @@ Vite 将生产产物写入 `internal/webui/dist`。管理端通过本机 `/api` 
 
 用量页（`UsagePanel.vue` 与 `components/usage/`）按需加载：ECharts 只注册用到的折线图、柱状图与组件，单独构建为 `echarts-*.js`，与用量页代码一起在第一次打开用量页时下载，不进入主包。用量页通过 `/api/usage`、`/api/usage/records`、`/api/usage/records.csv` 与 `/api/requests/{id}/body` 读取账本，与其他管理接口一样依靠管理令牌 Cookie；账本未启用时这些接口返回 404，页面显示账本未启用。
 
+分项排行（`usage/RankingTable.vue`）按 `paging.ts` 分页（默认每页 50 行，每页条数记在本机），切换维度或排序时回到第一页。主报告带 `pairs=0`，服务端（`api.UsageQuery.SkipPairs`）在 `requestdb` 里跳过账户×模型组合的聚合；展开账户或模型行时，`UsagePanel.vue` 的 `loadPairs` 沿用主报告的查询参数（时间已解析为绝对时间、时区与筛选相同），去掉 `pairs=0`、加上 `pairs_account` 或 `pairs_model` 读取这一行的组合（`api.UsageQuery.PairsOf`：服务端在原筛选上再按这一行的取值收窄 SQL，只汇总组合，结果与主报告里这一行的组合逐项相同；空取值即未分配的那一行同样可读）。报告更新后只重读仍展开且在当前页的行，重新读取期间保留上一次的明细；收起、翻页离开或切换维度时中止并丢弃。明细有读取中、读取失败（可重试）与没有组合三种状态；一行的组合先显示 50 个，按需每次再显示 50 个。
+
 API 试用通过 `eventsource-parser` 读取 SSE，以各协议完成事件结束请求；流内错误与提前断流显示为失败。响应头、正文和心跳的刷新错误沿 HTTP 写入路径返回，事件转发在取消时释放账户租约。试用页同一时刻执行一个请求，停止后可继续提交。
 
 ## 5. 协议实现

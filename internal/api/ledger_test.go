@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -150,6 +151,42 @@ func TestUsageQueryValidation(t *testing.T) {
 	}
 	if strings.Join(query.Filters["model"], ",") != "a,b,c" || strings.Join(query.Filters["state"], ",") != "failed" {
 		t.Fatalf("筛选值不对: %+v", query.Filters)
+	}
+}
+
+// TestUsagePairsParams 不带组合参数时与原先相同（带全部组合）；pairs=0 不聚合组合；pairs_account、pairs_model 只读一行的组合，
+// 取值可以为空（未分配）且原样使用；取值无效或互相冲突时返回 400，不到达账本
+func TestUsagePairsParams(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		query string
+		skip  bool
+		of    *UsagePairsOf
+	}{
+		{name: "不带参数", query: ""},
+		{name: "pairs=1", query: "&pairs=1"},
+		{name: "pairs=0", query: "&pairs=0", skip: true},
+		{name: "按账户", query: "&pairs_account=a%40example.test&account=a%40example.test,b", of: &UsagePairsOf{Dimension: "account", Key: "a@example.test"}},
+		{name: "未分配的账户", query: "&pairs_account=", of: &UsagePairsOf{Dimension: "account", Key: ""}},
+		{name: "按模型原样取值", query: "&pairs_model=%20x%2Cy", of: &UsagePairsOf{Dimension: "model", Key: " x,y"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ledger := &fakeLedger{}
+			recorder := adminGet(ledgerTestHandler(ledger), "/api/usage?"+usageRange()+test.query)
+			if recorder.Code != http.StatusOK || len(ledger.usage) != 1 {
+				t.Fatalf("status = %d: %s", recorder.Code, recorder.Body.String())
+			}
+			query := ledger.usage[0]
+			if query.SkipPairs != test.skip || !reflect.DeepEqual(query.PairsOf, test.of) {
+				t.Fatalf("SkipPairs=%v PairsOf=%+v，期望 %v %+v", query.SkipPairs, query.PairsOf, test.skip, test.of)
+			}
+		})
+	}
+	for _, bad := range []string{"&pairs=2", "&pairs=false", "&pairs_account=a&pairs_model=b", "&pairs=0&pairs_model=b", "&pairs=0&pairs_account="} {
+		ledger := &fakeLedger{}
+		if recorder := adminGet(ledgerTestHandler(ledger), "/api/usage?"+usageRange()+bad); recorder.Code != http.StatusBadRequest || len(ledger.usage) != 0 {
+			t.Fatalf("%s status = %d，期望 400 且不到达账本: %s", bad, recorder.Code, recorder.Body.String())
+		}
 	}
 }
 

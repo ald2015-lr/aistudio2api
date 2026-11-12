@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -57,6 +58,18 @@ type UsageQuery struct {
 	Location *time.Location
 	Filters  UsageFilters
 	Stack    string
+	// SkipPairs 为真时不聚合账户与模型组合明细，报告的 pairs 为空数组（查询参数 pairs=0）。账户上万时组合可达数十万条，
+	// 管理页的主报告不带组合，展开排行行时再按 PairsOf 读取这一行的组合
+	SkipPairs bool
+	// PairsOf 不为空时只读取排行中一行的组合明细（查询参数 pairs_account 或 pairs_model）：时间范围与各维度筛选与主报告相同，
+	// 报告只含这一行的组合，其余字段为空
+	PairsOf *UsagePairsOf
+}
+
+// UsagePairsOf 是要读取组合明细的排行行：Dimension 为 account 或 model，Key 为这一行的取值（空字符串为未分配）
+type UsagePairsOf struct {
+	Dimension string
+	Key       string
 }
 
 // UsageLatency 汇总一组请求的平均值与分位耗时
@@ -308,6 +321,32 @@ func parseUsageFilters(values map[string][]string) UsageFilters {
 	return filters
 }
 
+// parseUsagePairs 读取组合明细参数：pairs 省略或为 1 时与原先相同带全部组合，为 0 时不聚合组合；
+// pairs_account 或 pairs_model 出现时（取值可以为空，即未分配的那一行）只读这一行的组合，取值原样使用，不按逗号拆分、不去空白
+func parseUsagePairs(values url.Values, query *UsageQuery) error {
+	switch values.Get("pairs") {
+	case "", "1":
+	case "0":
+		query.SkipPairs = true
+	default:
+		return fmt.Errorf("pairs 必须是 0 或 1")
+	}
+	for _, dimension := range []string{"account", "model"} {
+		name := "pairs_" + dimension
+		if !values.Has(name) {
+			continue
+		}
+		if query.PairsOf != nil {
+			return fmt.Errorf("pairs_account 与 pairs_model 只能选一个")
+		}
+		if query.SkipPairs {
+			return fmt.Errorf("pairs=0 不能与 %s 同时使用", name)
+		}
+		query.PairsOf = &UsagePairsOf{Dimension: dimension, Key: values.Get(name)}
+	}
+	return nil
+}
+
 // ledgerErrorStatus 返回账本查询失败的状态码：客户端取消与超时按原语义，其余是本地数据库错误
 func ledgerErrorStatus(err error) int {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -349,6 +388,10 @@ func (s *server) handleUsage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		query.Stack = value
+	}
+	if err := parseUsagePairs(values, &query); err != nil {
+		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
 	}
 	report, err := s.config.Ledger.Usage(r.Context(), query)
 	if err != nil {

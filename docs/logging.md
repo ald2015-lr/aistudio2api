@@ -1192,7 +1192,7 @@ WARN  service  续接状态写入排队已满，丢弃 <COUNT> 次改动（状�
 
 超过 4 MiB 的节点通常带大图片、视频等内联附件，或在淘汰最早的节点时被并入了很长的上文。这是常规情形，按 INFO 记，每条续接链只记一行：节点与它当时的后代一起从库里删除（重启后都接不上，`一并从状态库删除以它为续接起点的节点` 为后代个数，没有后代时不写这一段），之后以它们为续接起点保存的节点不再写库、不再记日志。编码前先按文本与内联数据的字节数粗估，粗估已超限的不编码（记 `内容至少 <BYTES> 字节`），不在持锁时为注定丢弃的节点编码几 MiB。编码失败不该发生，按 WARN 记。排队的续接状态合计超过 64 MiB 时丢弃新的改动（落盘后释放排队字节）。账本打开失败时续接状态只在内存里保存，与原先相同。
 
-管理页的用量看板通过 `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv` 与 `GET /api/requests/{id}/body` 查询，与其他控制面接口一样需要管理令牌。
+管理页的用量看板通过 `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv` 与 `GET /api/requests/{id}/body` 查询，与其他控制面接口一样需要管理令牌。主报告带 `pairs=0`，不含账户×模型组合；展开排行行时以 `pairs_account` 或 `pairs_model` 另读这一行的组合（参数见 [protocol.md](protocol.md)），不带这些参数的脚本与旧版页面照旧拿到全部组合。
 
 `REQUEST_BODY_LOG=true` 时，账本同时保存通过 API key 校验的 POST 请求与响应的原始正文（token 计数请求与 `max_tokens` 为 `0` 的预热请求除外），各截断到 64 KiB 并记录原始字节数，只保留最近 1000 条；流式响应保存 SSE 原文。正文包含提示词与模型输出，以明文保存在本机。用量页的请求详情中按请求 ID 查看正文。
 

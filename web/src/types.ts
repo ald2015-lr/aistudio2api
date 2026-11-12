@@ -900,6 +900,7 @@ export interface UsageReport {
   stack_by: UsageDimension
   series: UsageSeries[]
   groups: Record<UsageDimension | 'status', UsageGroup[]>
+  // pairs 为账户与模型组合明细：用量页的主报告带 pairs=0 不读组合（为空），展开排行行时按 pairs_account 或 pairs_model 另行读取
   pairs: UsagePair[]
   options: Record<UsageDimension, string[]>
 }

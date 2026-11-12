@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { api, ApiError } from '@/api'
 import { useI18n } from '@/i18n'
-import type { UsageDimension, UsageReport, UsageStats } from '@/types'
+import type { UsageDimension, UsagePair, UsageReport, UsageStats } from '@/types'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 import FilterMenu from './usage/FilterMenu.vue'
@@ -49,6 +49,8 @@ watch(autoRefresh, (value) => writePreference('aistudio2api_usage_refresh', valu
 const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone
 let controller: AbortController | undefined
 let clockTimer: number | undefined
+// reportQuery 为当前报告的查询参数（时间已解析为绝对时间）：展开排行行读取组合明细时沿用，范围与主报告相同
+let reportQuery = ''
 
 // filterDimensions 为下拉多选的筛选维度；号池只有两个取值，单独用分段按钮筛选
 const filterDimensions = dimensions.filter((item) => item !== 'pool')
@@ -93,6 +95,8 @@ async function load(): Promise<void> {
   // 服务端按该时区对齐日分桶；浏览器取不到时区时不传，按 UTC 对齐
   if (timezone) query.set('tz', timezone)
   query.set('stack', state.stack)
+  // 主报告不带账户×模型组合（账户上万时可达数十万条），展开排行行时再按行读取（loadPairs）
+  query.set('pairs', '0')
   controller?.abort()
   const current = new AbortController()
   controller = current
@@ -100,6 +104,7 @@ async function load(): Promise<void> {
   attemptedAt.value = Date.now()
   try {
     const value = await api.usage(query, current.signal)
+    reportQuery = query.toString()
     report.value = value
     status.value = 'ready'
     error.value = ''
@@ -110,6 +115,22 @@ async function load(): Promise<void> {
     if (report.value === null) status.value = 'error'
   } finally {
     if (controller === current) loading.value = false
+  }
+}
+
+// loadPairs 读取当前报告中一行（账户或模型）的组合明细：沿用主报告的时间、时区与筛选，只把 pairs=0 换成这一行
+async function loadPairs(
+  dimension: 'account' | 'model',
+  key: string,
+  signal: AbortSignal,
+): Promise<UsagePair[]> {
+  const query = new URLSearchParams(reportQuery)
+  query.delete('pairs')
+  query.set(`pairs_${dimension}`, key)
+  try {
+    return (await api.usage(query, signal)).pairs
+  } catch (reason) {
+    throw new Error(usageError(reason), { cause: reason })
   }
 }
 
@@ -581,6 +602,7 @@ const statusOptions = computed(() =>
             <RankingTable
               :report="report"
               :now="now"
+              :load-pairs="loadPairs"
               @filter="addFilter"
               @status="state.status = $event"
             />
