@@ -984,7 +984,7 @@ INFO  service  额度用完改用其他模型的设置已更新并立即生效 |
 
 本服务期限截断（`本服务期限截断 | …`，WARN）的两种格式：
 
-- 首事件前：`本服务期限截断 | 阶段=首事件前 | 期限=<DURATION> | 已用时=<DURATION> | 停在=<位置> | 原因=<原因>`，写在 `service` 名下。`停在` 为期限在某次尝试中到期时那次尝试停在哪一步：`WAA proof`、`等待上游响应头`、`等待上游首事件`、`文件复制或附件上传`、`首事件与期限同时到达（已丢弃，未向客户端输出）`；不在尝试中（排队、回到原账号等待时，或换号退避中）到期为 `-`。`原因` 为加前缀之前的错误。期限在换号退避中到期时按上一次尝试的错误区分：上一次的错误满足 `context.DeadlineExceeded`（首事件超时、`BiDi … 等待回复超时`、`协议位置 …: context deadline exceeded` 这类读取超时等）时照样加前缀、写这一行，`停在` 为 `-`，`原因` 为那次的错误；上一次是上游返回的 RPC 错误（如上游 5xx、协议错误码，不满足 `context.DeadlineExceeded`）时保留那次的上游错误与状态码，不加前缀，也不写这一行。文件资源刷新（引用的文件在请求开始时刷新）时到期的不写这一行，`request.error` 为 `本服务首事件前期限 <DURATION> 到期（停在 文件资源刷新）: …`。
+- 首事件前：`本服务期限截断 | 阶段=首事件前 | 期限=<DURATION> | 已用时=<DURATION> | 停在=<位置> | 原因=<原因>`，写在 `service` 名下。`停在` 为期限在某次尝试中到期时那次尝试停在哪一步：`WAA proof`、`等待上游响应头`、`等待上游首事件`、`文件复制或附件上传`、`首事件与期限同时到达（已丢弃，未向客户端输出）`；在两次尝试之间的等待中到期为那段等待：`换号退避`（非额度类失败换号前的退避，200ms 起翻倍、最长 2 秒）、`限流换号前等待`（第 2 次起的限流类换号前错开并发重试的 0.3–0.8 秒）；其他不在尝试中（排队、回到原账号等待时）到期为 `-`。`原因` 为加前缀之前的错误。在换号退避或限流换号前等待中到期时 `原因` 为上一次尝试的错误，不管它是什么（上游 RPC 错误如协议错误码 4、5xx，429，`AI Studio stream closed before first event` 这类断流，首事件超时、`BiDi … 等待回复超时` 等超时类错误）都加前缀、写这一行，`request.error` 为 `本服务首事件前期限 <DURATION> 到期（停在 换号退避）: <上一次错误>`：只改文本，错误链接着上一次的错误（含 `context.Canceled` 时只到 `context.DeadlineExceeded`），客户端收到的与没有前缀时相同，HTTP 状态与用量账本的 `status` 随之：协议错误码 4 与超时类为 504 官方原句，上游 503（协议错误码 14）为 503、429 为 429，其他 5xx（如协议错误码 13 的 500 INTERNAL）与断流为 500，状态 `failed`。原先上一次是上游 RPC 错误（不满足 `context.DeadlineExceeded`）时只留那次的上游错误、不加前缀也不写这一行，码 4 时 `request.error` 与用量账本看起来像 Google 侧期限；上一次为超时类错误时有前缀但没有 `（停在 …）`，为 `本服务首事件前期限 <DURATION> 到期: <上一次错误>`。文件资源刷新（引用的文件在请求开始时刷新）时到期的不写这一行，`request.error` 为 `本服务首事件前期限 <DURATION> 到期（停在 文件资源刷新）: …`。
 - 扣住期间（强制调用工具时生成服务扣住上游事件，见 [protocol.md](protocol.md) 的工具选择）：格式与首事件前相同，`阶段=扣住期间空闲`（上游连续 `REQUEST_TIMEOUT` 没有网络字节，也没有新的发送）或 `阶段=扣住期间总时长上限`，`期限` 为空闲期限或总时长上限，`停在=扣住上游事件`。扣住期间不受首事件前期限的固定时长约束；扣住的尝试以错误结束、换号再试后，首事件前期限顺延扣住的累计时长，之后到期的 `request.error` 带 `（扣住上游事件的 <DURATION> 不计入）`。
 - 首事件后：`本服务期限截断 | 阶段=首事件后空闲 | 期限=<DURATION> | 已用时=<DURATION> | 最近事件=<KIND> | 推理=<N> | 正文=<N> | 网络字节=<N> | 最近网络=<DURATION>`，写在账户名下；总时长上限到期时 `阶段=总时长上限`、`期限` 为总时长上限（`long-` 自动续写每开始一轮重新计算，整段到总时长上限的 6 倍时 `期限` 为这个绝对上限；第二轮起到期时只结束这一轮，写 `续写第 <N> 轮被本服务结束（…）`，不写这一行，见[自动续写](#自动续写long--前缀)）；还没有收到网络字节时末尾只有 `网络字节=0`。`已用时` 从请求开始算，`推理`、`正文` 为首事件后收到的推理与正文事件数（模型名带 `-nothinking` 时推理事件在协议层丢弃，同样计数；Anthropic `thinking.type=disabled`、Gemini `includeThoughts=false` 时推理事件在本服务调用上游的一层就丢弃（Build 通道上游不返回），不计入 `推理`，Playground 通道的思考字节仍计入 `网络字节` 与 `最近网络`）。
 
@@ -993,19 +993,21 @@ INFO  service  额度用完改用其他模型的设置已更新并立即生效 |
 ```text
 本服务首事件前期限 5m0s 到期（停在 等待上游首事件）: context deadline exceeded
 本服务首事件前期限 5m0s 到期: 排队 4m59.9s 后请求超时（最后原因=账号全部忙碌）: context deadline exceeded
+本服务首事件前期限 5m0s 到期（停在 换号退避）: AI Studio GenerateContent 返回 HTTP 504、协议错误码 4: Deadline expired before operation could complete.
 本服务首事件后空闲期限 5m0s 到期（已输出 推理=812 正文=40）: context deadline exceeded
 本服务总时长上限 1h0m0s 到期（已输出 推理=812 正文=4033）: context deadline exceeded
 本服务扣住期间空闲期限 5m0s 到期（生成服务扣住上游事件等待工具调用，上游没有动静）: context deadline exceeded
 本服务首事件前期限 5m0s 到期（扣住上游事件的 3m12.5s 不计入）（停在 等待上游首事件）: context deadline exceeded
 ```
 
-三种错误都只解包为 `context.DeadlineExceeded`：HTTP 状态记 504、状态为 `failed`，客户端收到的仍是 504 官方原句 `Deadline expired before operation could complete.`，不含“本服务”字样。上游自己的期限是 `AI Studio <方法> 返回 HTTP 504、协议错误码 4: …`，上游断流是 `AI Studio stream closed before finish`，两者都不带这个前缀。排查记录（`/trace/`）的 `notes` 另记 `本服务首事件前期限到期: <错误>` 或 `本服务期限截断: <错误>`。
+这些错误都只解包为 `context.DeadlineExceeded`：HTTP 状态记 504、状态为 `failed`，客户端收到的仍是 504 官方原句 `Deadline expired before operation could complete.`，不含“本服务”字样。停在 `换号退避`、`限流换号前等待` 的例外：解包为上一次尝试的错误，客户端收到的与没有前缀时相同（上一次为协议错误码 4 时同样是这句 504 官方原句，为上游 503、429 时为 503、429，为其他 5xx（如 500 INTERNAL）与断流时为 500），本服务前缀与上一次的错误原文只在请求日志与账本里。上游自己的期限是以 `AI Studio <方法> 返回 HTTP 504、协议错误码 4: …` 开头、不带这个前缀的错误，上游断流是 `AI Studio stream closed before finish`。排查记录（`/trace/`）的 `notes` 另记 `本服务首事件前期限到期: <错误>` 或 `本服务期限截断: <错误>`。
 
 截断或丢弃首事件之后，服务读完这次尝试的事件流、确认上游 goroutine 退出后再释放租约；5 秒内没有结束时另写一条 WARN：首事件前为 `首事件到达时请求已结束，上游事件流未及时结束`，首事件后为 `本服务期限截断后上游事件流未及时结束`。
 
 ```text
 WARN  service  本服务期限截断 | 阶段=首事件前 | 期限=5m0s | 已用时=5m0.001s | 停在=等待上游首事件 | 原因=context deadline exceeded
 WARN  service  本服务期限截断 | 阶段=首事件前 | 期限=5m0s | 已用时=5m0s | 停在=- | 原因=排队 4m59.9s 后请求超时（最后原因=账号全部忙碌）: context deadline exceeded
+WARN  service  本服务期限截断 | 阶段=首事件前 | 期限=5m0s | 已用时=5m0s | 停在=换号退避 | 原因=AI Studio GenerateContent 返回 HTTP 504、协议错误码 4: Deadline expired before operation could complete.
 WARN  account@example.com  本服务期限截断 | 阶段=首事件后空闲 | 期限=5m0s | 已用时=9m12.408s | 最近事件=reasoning | 推理=812 | 正文=40 | 网络字节=1832210 | 最近网络=5m0.002s
 WARN  account@example.com  本服务期限截断 | 阶段=总时长上限 | 期限=1h0m0s | 已用时=1h0m0s | 最近事件=text | 推理=812 | 正文=4033 | 网络字节=9921034 | 最近网络=180ms
 WARN  account@example.com  上游首事件到达时请求已结束，不转发 | 原因=context deadline exceeded

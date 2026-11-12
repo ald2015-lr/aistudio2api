@@ -85,7 +85,8 @@ func (stage serviceDeadlineStage) label() string {
 
 // serviceDeadlineError 为本服务自己的期限到期（不是上游的“协议错误码 4”，也不是上游断流 “stream closed before finish”）：
 // 只解包为 context.DeadlineExceeded（或包装的、本身满足 DeadlineExceeded 的等待错误），对外仍是 504 官方文案、状态记 failed，
-// 首事件前照常按超时处理、不换号。错误链里绝不能有 context.Canceled：statusFromError、访问日志与 finalRequestState 都先判断取消
+// 首事件前照常按超时处理、不换号。首事件前期限在两次尝试之间的等待中到期时例外（见 prior）：解包为上一次尝试的错误，对外照旧按它返回。
+// 错误链里绝不能有 context.Canceled：statusFromError、访问日志与 finalRequestState 都先判断取消
 type serviceDeadlineError struct {
 	stage   serviceDeadlineStage
 	limit   time.Duration
@@ -97,6 +98,12 @@ type serviceDeadlineError struct {
 	// inner 为首事件前到期时原来的错误（带等待原因的 ctx 错误，如“排队 … 后请求超时（最后原因=…）”）；只在它满足
 	// DeadlineExceeded 且不含 context.Canceled 时保留
 	inner error
+	// prior 为首事件前期限在两次尝试之间的等待（换号退避、限流换号前等待）中到期时上一次尝试的错误（见 betweenAttemptsDeadlineError）：
+	// 原文写在前缀之后；不含 context.Canceled 时同时是错误链的下一环，对外的状态码与文案、Retry-After、MODEL_FALLBACKS 的判断都与
+	// 原来一样按它（协议错误码 4 与超时类仍是 504 官方原句，上游 503、429 照旧是 503、429，其他 5xx（如 500 INTERNAL）与断流
+	// 照旧是 500，见 api 包的 upstreamPublicError）。含 context.Canceled 时（上一次的尝试被取消）错误链只到 context.DeadlineExceeded，
+	// 与原来 startDeadlineError 的处理一致，请求状态不会记成 cancelled
+	prior error
 	// held 为期限在生成服务扣住上游事件期间到期（还没有交出首事件，见 holdUpstream）：stage 为空闲或总时长上限
 	held bool
 	// heldFor 为首事件前期限到期时此前扣住上游事件的累计时长（不计入首事件前期限，见 endHold）
@@ -104,6 +111,9 @@ type serviceDeadlineError struct {
 }
 
 func (e *serviceDeadlineError) Error() string {
+	if e.prior != nil {
+		return e.head() + ": " + e.prior.Error()
+	}
 	return e.head() + ": " + e.Unwrap().Error()
 }
 
@@ -134,6 +144,9 @@ func (e *serviceDeadlineError) head() string {
 func (e *serviceDeadlineError) Unwrap() error {
 	if e.inner != nil {
 		return e.inner
+	}
+	if e.prior != nil && !errors.Is(e.prior, context.Canceled) {
+		return e.prior
 	}
 	return context.DeadlineExceeded
 }
@@ -613,7 +626,8 @@ func (c *generateContext) idleTimeout() time.Duration {
 
 // startDeadlineError 在首事件前期限到期时把请求的最终错误 err 标注为本服务的首事件前期限（where 为停在哪一步）：
 // err 满足 context.Canceled 时（首事件超时或期限取消的尝试）不保留原错误，错误链里不能有 Canceled；满足 DeadlineExceeded 时
-// 保留原错误（带等待原因）；其他错误（上游先返回的真实错误）、已经标注过的、不是首事件前期限到期时返回 false，保留原样
+// 保留原错误（带等待原因）；其他错误（上游先返回的真实错误）、已经标注过的、不是首事件前期限到期时返回 false，保留原样。
+// 期限在两次尝试之间的等待中到期时 err 是上一次尝试的错误，改用 betweenAttemptsDeadlineError
 func (c *generateContext) startDeadlineError(err error, where string) (*serviceDeadlineError, bool) {
 	if err == nil {
 		return nil, false
@@ -636,6 +650,29 @@ func (c *generateContext) startDeadlineError(err error, where string) (*serviceD
 		return &cut, true
 	}
 	return nil, false
+}
+
+// betweenAttemptsDeadlineError 在两次尝试之间的等待（换号退避、限流换号前等待）因首事件前期限到期而结束时，把请求的最终错误标注为
+// 本服务的首事件前期限：where 为停在哪一步，err 为上一次尝试的错误（上游 RPC 错误如协议错误码 4、5xx，429，网络错误，超时类错误等），
+// 原文写在前缀之后（“本服务首事件前期限 <期限> 到期（停在 换号退避）: <上一次错误>”），请求日志与账本据此分清是本服务的期限。
+// 只改文本，客户端看到的不变：错误链接着上一次的错误（含 context.Canceled 时只到 context.DeadlineExceeded，见 prior），对外按它原来的
+// 状态码与文案返回，码 4 与超时类仍是 504 官方原句。原先只有超时类的上一次错误加了前缀，上游 RPC 错误只留原文：码 4 时请求日志与
+// 账本看起来像 Google 侧期限。不是首事件前期限到期（客户端断开、生成服务停止）、已经标注过或为 nil 时返回 false，保留原样
+func (c *generateContext) betweenAttemptsDeadlineError(err error, where string) (*serviceDeadlineError, bool) {
+	if err == nil {
+		return nil, false
+	}
+	cause := c.deadlineCause()
+	if !cause.beforeFirstEvent() {
+		return nil, false
+	}
+	var marked *serviceDeadlineError
+	if errors.As(err, &marked) {
+		return nil, false
+	}
+	cut := *cause
+	cut.where, cut.inner, cut.prior = where, nil, err
+	return &cut, true
 }
 
 // generateContextFrom 返回 ctx 所属的生成请求上下文（经 WithValue 等包装也能取到）；不是生成请求时为 nil

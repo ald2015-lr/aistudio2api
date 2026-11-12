@@ -4777,8 +4777,10 @@ func (service *trackedService) generateForModel(
 	scope := aistudio.PoolScopeFromContext(requestCtx)
 	// phase 为生成请求的上下文（见 generate_context.go）；测试直接传普通 context 时为 nil，各方法按原来的整段期限处理
 	phase := generateContextFrom(requestCtx)
-	// startCutWhere 为首事件前期限在某次尝试中到期时那次尝试停在哪一步（写进最终错误，见 startDeadlineError）
-	startCutWhere := ""
+	// startCutWhere 为首事件前期限在某次尝试中到期时那次尝试停在哪一步（写进最终错误，见 startDeadlineError）；
+	// startCutBetween 为期限在两次尝试之间的等待（换号退避、限流换号前等待）中到期，startCutWhere 为那段等待，
+	// 这时 err 是上一次尝试的错误（见 betweenAttemptsDeadlineError）
+	startCutWhere, startCutBetween := "", false
 	maxAttempts := 1
 	requestedAccountID := strings.TrimSpace(request.AccountID)
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
@@ -6205,6 +6207,9 @@ func (service *trackedService) generateForModel(
 			// 主用模型的排队截止时间已过时同样不退避：下一次尝试只接受立即可用的账号，退避只会推迟 429
 			if !modelForbidden && resetDeferred == nil && !budget.expired() {
 				if waitErr := waitRetryBackoff(requestCtx, hardFailures); waitErr != nil {
+					// 首事件前期限在换号退避中到期：最终错误的文本标明是本服务的期限、停在换号退避，对外仍按上一次的错误返回（不是首事件前
+					// 期限到期，如客户端断开时不标注，见 betweenAttemptsDeadlineError）
+					startCutWhere, startCutBetween = "换号退避", true
 					break
 				}
 			}
@@ -6214,6 +6219,8 @@ func (service *trackedService) generateForModel(
 		if !recoverWorker && !quotaSameAccount && quotaFailure && quota.last == primaryQuotaRate && quota.rate >= 2 &&
 			policy.jitter && !quota.egress.Throttled && !budget.expired() {
 			if waitErr := waitQuotaJitter(requestCtx, service.quotaJitterDelay(), budget); waitErr != nil {
+				// 首事件前期限在这段等待中到期：与换号退避相同，文本标明停在限流换号前等待，对外仍按上一次的 429 返回
+				startCutWhere, startCutBetween = "限流换号前等待", true
 				break
 			}
 		}
@@ -6290,8 +6297,13 @@ func (service *trackedService) generateForModel(
 		err = service.buildUnavailableAtEnd(modelID, buildOnly, playgroundCapErr, err)
 		service.requests.logRequestProgress(request.ID, "service", "WARN", "官网停用了 Build 通道的生成，没有其他通道能接这个请求 | 原因="+progressReason(err))
 	}
-	// 首事件前期限到期：错误标明是本服务自己的期限（与上游的“协议错误码 4”、上游断流区分开），仍满足 context.DeadlineExceeded（对外 504）
-	if cut, ok := phase.startDeadlineError(err, startCutWhere); ok {
+	// 首事件前期限到期：错误标明是本服务自己的期限（与上游的“协议错误码 4”、上游断流区分开），仍满足 context.DeadlineExceeded（对外 504）。
+	// 在两次尝试之间的等待中到期时 err 是上一次尝试的错误（上游 RPC 错误、429、网络错误等），同样标注；错误链接着它，对外照旧按它返回
+	markStartCut := phase.startDeadlineError
+	if startCutBetween {
+		markStartCut = phase.betweenAttemptsDeadlineError
+	}
+	if cut, ok := markStartCut(err, startCutWhere); ok {
 		reason := progressReason(err)
 		err = cut
 		where := cut.where
