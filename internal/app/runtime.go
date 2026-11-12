@@ -39,6 +39,7 @@ func newRuntime(
 	for _, failure := range loadFailures {
 		requests.log("service", "WARN", "跳过无法载入的账户目录 | 错误="+strings.TrimSpace(failure.Error()))
 	}
+	logDeviceBoundSessions(requests, accounts, "启动时")
 	if err := launchCtx.Err(); err != nil {
 		return nil, nil, nil, err
 	}

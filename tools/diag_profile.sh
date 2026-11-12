@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # AIStudio2API 一键对比“启动失败的账号”与“启动成功的账号”保存的浏览器状态：老账号起不来、新账号能跑时用来找原因。
 # 对比项：storage-state.json 里 aistudio.google.com 的 localStorage（只列键名与值长度，不输出值）、Cookie 数与文件时间，
+# 带 __Secure-1PSIDRTS 的设备绑定会话（只看 Cookie 名：这类认证文件复制出来约 2 小时后失效）的数量与其中带 Chrome 续签材料
+# （只看认证扩展 aistudio2api 里有没有 oauth 键，Windows 上可原地续签）的数量，
 # 以及账户目录下 camoufox-cache（HTTP 磁盘缓存）的有无、大小与时间。
 # 只读：只读运行日志与账户目录，不访问网络、不改任何文件。输出同时写到 $OUT（默认 logs/diag_profile.txt），账号已打码
 #
@@ -72,9 +74,6 @@ for path in (log + ".1", log):
 ok = set(ready)
 bad = set(failed) - ok
 print(f"最近 {minutes} 分钟：启动成功过的账号 {len(ok)} 个；只失败、没成功过的账号 {len(bad)} 个")
-if not ok and not bad:
-    print("这段时间没有启动结果，换更长的 LOG_MINUTES 再试")
-    raise SystemExit
 
 directories = []
 for root in [part for part in auth.split(",") if part]:
@@ -99,6 +98,44 @@ for directory in directories:
     by_label.setdefault(label or os.path.basename(directory), directory)
     by_label.setdefault(os.path.basename(directory), directory)
 print(f"账户目录 {len(directories)} 个（{auth}）")
+# 设备绑定会话（DBSC）：认证文件带 __Secure-1PSIDRTS 的账户，复制出来的认证文件约 2 小时后失效。先按字节找 Cookie 名，
+# 只有找到时才解析，看认证扩展 aistudio2api 里有没有 oauth 键（本服务 Chrome 导入保存的续签材料，Windows 上遇到 401 可原地续签）；
+# 只看键名，不输出任何值
+DEVICE_BOUND = b'"__Secure-1PSIDRTS"'
+
+
+def renewal_material(state):
+    extension = state.get("aistudio2api") if isinstance(state, dict) else None
+    return isinstance(extension, dict) and "oauth" in extension
+
+
+def device_bound(directory):
+    """返回 (是否设备绑定会话, 是否带 Chrome 续签材料)"""
+    try:
+        with open(os.path.join(directory, "storage-state.json"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return False, False
+    if DEVICE_BOUND not in data:
+        return False, False
+    try:
+        return True, renewal_material(json.loads(data))
+    except Exception:
+        return True, False
+
+
+bound_all = renewable_all = 0
+for directory in directories:
+    bound, renewable = device_bound(directory)
+    bound_all += bound
+    renewable_all += renewable
+print(f"带 __Secure-1PSIDRTS（设备绑定会话，复制出来约 2 小时后失效）的账户目录：{bound_all}/{len(directories)}，"
+      f"其中带 Chrome 续签材料（Windows 上可原地续签）的 {renewable_all} 个")
+# 没有启动结果时只跳过下面两组对比：批量导入的设备绑定副本约 2 小时后一起变成“需要登录”、不再被调度，正是没有 Worker 启动日志的时候，
+# 上面的全部账户目录统计照样输出
+if not ok and not bad:
+    print("这段时间没有启动结果，跳过两组对比；换更长的 LOG_MINUTES 再试")
+    raise SystemExit
 
 
 def tree_size(path, limit=20000):
@@ -124,13 +161,15 @@ def profile(label):
     directory = by_label.get(label)
     if not directory:
         return None
-    result = {"keys": {}, "cookies": 0, "age_days": None, "origins": 0, "cache": None}
+    result = {"keys": {}, "cookies": 0, "age_days": None, "origins": 0, "cache": None, "device_bound": False, "renewable": False}
     state_path = os.path.join(directory, "storage-state.json")
     try:
         result["age_days"] = (now - os.stat(state_path).st_mtime) / 86400
         with open(state_path, encoding="utf-8") as f:
             state = json.load(f)
         result["cookies"] = len(state.get("cookies") or [])
+        result["device_bound"] = any(str((cookie or {}).get("name", "")) == "__Secure-1PSIDRTS" for cookie in state.get("cookies") or [])
+        result["renewable"] = result["device_bound"] and renewal_material(state)
         origins = state.get("origins") or []
         result["origins"] = len(origins)
         for origin in origins:
@@ -158,6 +197,8 @@ def summarize(name, labels):
     with_ls = [p for p in profiles if p["keys"]]
     print(f"有 aistudio.google.com localStorage 的：{len(with_ls)}/{len(profiles)}，键数中位 {statistics.median([len(p['keys']) for p in profiles]):.0f}")
     print(f"Cookie 数中位 {statistics.median([p['cookies'] for p in profiles]):.0f}；origins 数中位 {statistics.median([p['origins'] for p in profiles]):.0f}")
+    print(f"带 __Secure-1PSIDRTS（设备绑定会话）的：{sum(1 for p in profiles if p['device_bound'])}/{len(profiles)}，"
+          f"其中带 Chrome 续签材料的 {sum(1 for p in profiles if p['renewable'])} 个")
     caches = [p["cache"] for p in profiles if p["cache"]]
     if caches:
         sizes = sorted(c[0] for c in caches)

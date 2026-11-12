@@ -133,6 +133,8 @@ func (watcher *accountWatcher) scan(ctx context.Context) {
 	// 账户默认启用：account.json 为停用、没有手动停用记录的账户先改为启用（并行写回 account.json），再加入账户池，
 	// 与启动时的规则一致；一次放进几千个目录时也不逐个推送账户状态
 	enableUnmarkedAccounts(loaded, watcher.admin.requests, "导入时")
+	// 设备绑定会话的统计在加入账户池之前（读认证状态不加锁），一批只写一行
+	logDeviceBoundSessions(watcher.admin.requests, loaded, "导入时")
 	for index, account := range loaded {
 		if ctx.Err() != nil {
 			return
@@ -421,6 +423,8 @@ func (watcher *accountWatcher) startLoginRefresh(ctx context.Context, known map[
 	go func() {
 		defer watcher.refreshing.Store(false)
 		limiter := make(chan struct{}, loginRefreshConcurrency)
+		// 这一批载入的新认证文件里的设备绑定会话，批量覆盖已有账户的 storage-state.json 时集中失效最常见：整批结束后写一行
+		devices := &deviceBoundTally{}
 		var group sync.WaitGroup
 		for _, summary := range batch {
 			if ctx.Err() != nil {
@@ -431,7 +435,7 @@ func (watcher *accountWatcher) startLoginRefresh(ctx context.Context, known map[
 			go func(summary aistudio.AccountLoginSummary) {
 				defer group.Done()
 				defer func() { <-limiter }()
-				if !watcher.admin.applyLoginUpdate(ctx, summary) {
+				if !watcher.admin.applyLoginUpdateCounting(ctx, summary, devices) {
 					// 账户正在处理请求，下一轮再试
 					watcher.loginMu.Lock()
 					watcher.loginPending[summary.ID] = struct{}{}
@@ -440,11 +444,24 @@ func (watcher *accountWatcher) startLoginRefresh(ctx context.Context, known map[
 			}(summary)
 		}
 		group.Wait()
+		devices.log(watcher.admin.requests, "认证文件更新时")
 	}()
 }
 
 // applyLoginUpdate 载入外部更新的登录状态；返回 false 表示账户正在处理请求，需要下一轮再试
 func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudio.AccountLoginSummary) bool {
+	return admin.applyLoginUpdateCounting(ctx, summary, nil)
+}
+
+// applyLoginUpdateCounting 与 applyLoginUpdate 相同，载入了新的认证文件时把它计入 devices（设备绑定会话统计，可为 nil）
+func (admin *runtimeAdmin) applyLoginUpdateCounting(
+	ctx context.Context, summary aistudio.AccountLoginSummary, devices *deviceBoundTally,
+) bool {
+	counted := func() {
+		if state, ok := admin.pool.StorageStateOf(summary.ID); ok && devices != nil {
+			devices.add(summary.ID, state)
+		}
+	}
 	if summary.Enabled && summary.State == aistudio.AccountAuthRequired {
 		// 需要登录的账户：完整重新载入，恢复调度并重新同步模型目录。需要登录的账户仍有未结束的租约时也按此处理
 		// （不再显示为忙碌），等不到账户空闲就下一轮再试
@@ -458,6 +475,7 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 		if !reloaded {
 			return false
 		}
+		counted()
 		admin.requests.log("auth", "INFO", "检测到新的认证文件，已重新载入并恢复调度 | 账户="+summary.ID)
 		return true
 	}
@@ -471,6 +489,7 @@ func (admin *runtimeAdmin) applyLoginUpdate(ctx context.Context, summary aistudi
 	if !refreshed {
 		return false
 	}
+	counted()
 	switch {
 	case summary.Enabled:
 		admin.requests.log("auth", "INFO", "检测到认证文件更新，已载入新的登录 Cookie | 账户="+summary.ID)
