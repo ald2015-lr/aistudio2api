@@ -578,7 +578,7 @@ func deniedWatcherAdmin(t *testing.T, listed []string, accountIDs ...string) (*r
 		); err != nil {
 			t.Fatal(err)
 		}
-		admin.service.recordPermissionDenied(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", time.Now())
+		admin.service.recordPermissionDenied(accountID, testRuntimeModel, aistudio.ChannelPlayground, "The caller does not have permission", time.Now(), nil)
 	}
 	return admin, registry
 }

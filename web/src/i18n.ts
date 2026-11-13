@@ -417,7 +417,7 @@ const zhCN = {
   'accounts.filterAll': '全部',
   'accounts.filterProblem': '出问题',
   'accounts.problemHelp':
-    '403 无权限（如需要验证账号）、组织已停用、需要登录、不可用的账户，每个账户写明原因',
+    '403 无权限（如需要验证账号）、组织已停用、需要登录、不可用的账户，每个账户写明原因；403 的每个模型带最近一次的时间与次数，只涉及一个模型的归为“403 单个模型无权限”；不是账户级、超过 {hours} 小时没有再出现、账户也不在 403 冷却里的 403 记录视为陈旧，不计入（上方 403 列表里灰显，可逐行清除）',
   'accounts.problemCount': '{count} 个出问题的账户',
   'accounts.problemCopyWithReason': '复制邮箱与原因',
   'accounts.problemCopied': '已复制 {count} 个账户',
@@ -427,7 +427,11 @@ const zhCN = {
   'accounts.problemKind': '问题类型',
   'accounts.problemKindAll': '全部问题',
   'accounts.problemKindVerify': '403 需要验证账号',
-  'accounts.problemKindForbidden': '403 无权限（其他）',
+  'accounts.problemKindForbidden': '403 无权限（多个模型）',
+  'accounts.problemKindModelForbidden': '403 单个模型无权限',
+  'accounts.problemVerifyPaused':
+    '需要验证账号，整户暂停调度（403 记录已清除；到官网验证后点“验证”，或在上方 403 区块点“解除暂停”）',
+  'accounts.problemStaleMore': '；另有 {count} 个陈旧记录不计',
   'accounts.sortDefault': '默认排序',
   'accounts.sortState': '按状态',
   'accounts.sortLabel': '按邮箱',
@@ -482,7 +486,7 @@ const zhCN = {
   'accounts.permissionDeniedHint': '（多半未同意 Google 政策，重新获取认证文件后上传即可）',
   'accounts.permissionDeniedCount': '{count} 个',
   'accounts.permissionDeniedHelp':
-    '生成请求返回 HTTP 403 PERMISSION_DENIED（The caller does not have permission）的账户。认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录）后自动清除，并立即解除它的 403 冷却；之后在某个模型上成功也会清除该模型的记录。号池级 403 不计入。',
+    '生成请求返回 HTTP 403 PERMISSION_DENIED（The caller does not have permission）的账户，每个模型记下最近一次的时间、次数与请求来源。以下情况清除记录：认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录，同时解除它的 403 冷却）；该模型在该通道上成功一次（只清这个模型这个通道）；需要验证账号的账户在任一模型上成功；管理页“验证”通过；启动时对账（账户已不在号池，或登录签名变了）；号池级 403 撤销；每行的“清除”与“清除记录”（清除时解除需要验证账号的整户暂停，不解除单模型 403 冷却）。超过 {hours} 小时没有再出现、账户也不在 403 冷却里的记录灰显为陈旧，多半是很早以前或别人（new-api 渠道测试、下游用户、模型别名、共用账户目录的另一个实例）调用留下的。号池级 403 不计入。',
   'accounts.permissionDeniedEmail': '邮箱',
   'accounts.permissionDeniedModels': '模型 · 通道',
   'accounts.permissionDeniedLast': '最近一次',
@@ -493,11 +497,19 @@ const zhCN = {
   'accounts.permissionDeniedClearConfirm':
     '清除全部 403 无权限账户记录？不解除单模型 403 冷却与多模型 403 自动暂停；例外是“需要验证账号”的整户暂停会一并解除（仍未验证时下一次请求会重新暂停）。账户再次返回 403 时会重新列出。',
   'accounts.permissionDeniedCleared': '已清除 {count} 个账户的记录',
+  'accounts.permissionDeniedLiftedMore': '；解除 {count} 个账户需要验证账号的整户暂停',
   'accounts.permissionDeniedDelete': '一键删除',
   'accounts.permissionDeniedDeleteHelp':
     '从号池删除列表中的全部账户（包括折叠未显示的）并删除它们的认证目录，与账户列表里的“删除”相同，不能恢复。',
   'accounts.permissionDeniedDeleteConfirm':
     '删除列表中的全部 {count} 个账户及其认证文件（账户目录会被移除）？删除后不能恢复，要重新上传认证文件才能再用；正在处理请求的账户会等它空闲后删除。',
+  'accounts.permissionDeniedDeleteConfirmFresh':
+    '删除列表中 403 记录不陈旧的 {count} 个账户及其认证文件（账户目录会被移除）？另有 {stale} 个账户的 403 记录全部陈旧（灰显，多半没有问题），不删除，可以按行清除。删除后不能恢复，要重新上传认证文件才能再用；正在处理请求的账户会等它空闲后删除。',
+  'accounts.permissionDeniedDeleteStaleHelp':
+    '403 记录全部陈旧的账户（灰显，多半没有问题）不删除。',
+  'accounts.permissionDeniedDeleteStaleKept': '；{count} 个 403 记录全部陈旧的账户没有删除',
+  'accounts.permissionDeniedDeleteAllStale':
+    '列表里 {count} 个账户的 403 记录全部陈旧（多半没有问题），一键删除不删除它们；可以按行清除记录，确实要删除时到账户列表里逐个删除',
   'accounts.permissionDeniedDeleteResult':
     '已删除 {deleted} 个，不存在 {missing} 个，失败 {failed} 个',
   'accounts.permissionDeniedDeleteFailures': '；失败：{list}',
@@ -507,6 +519,30 @@ const zhCN = {
   'accounts.permissionDeniedDeleteSkipped':
     '；{count} 个在确认后已不在列表里（例如重新上传了认证文件），没有删除',
   'accounts.permissionDeniedShowAll': '展开全部 {count} 个',
+  'accounts.permissionDeniedSeen': '最近 {time} · {count} 次',
+  'accounts.permissionDeniedLastRequest': '最近一次请求：{detail}',
+  'accounts.permissionDeniedRequestModel': '请求名 {model}',
+  'accounts.permissionDeniedRequestMessages': '{count} 条消息',
+  'accounts.permissionDeniedRequestImages': '图片 {count}',
+  'accounts.permissionDeniedRequestFiles': '文件 {count}',
+  'accounts.permissionDeniedStale': '陈旧（{days} 天前）',
+  'accounts.permissionDeniedStaleShort': '陈旧',
+  'accounts.permissionDeniedStaleCount': '其中 {count} 个陈旧',
+  'accounts.permissionDeniedStaleHelp':
+    '超过 {hours} 小时没有再出现、账户也不在 403 冷却里，多半是很早以前或别人调用留下的，可以清除；不计入“出问题”',
+  'accounts.permissionDeniedClearRow': '清除',
+  'accounts.permissionDeniedClearRowHelp':
+    '只清除这个账户的 403 记录：不解除单模型 403 冷却，需要验证账号的整户暂停一并解除',
+  'accounts.permissionDeniedRowCleared': '已清除 {label} 的 403 记录',
+  'accounts.permissionDeniedRowMissing': '{label} 的 403 记录已经不在（可能刚被清除）',
+  'accounts.verifyPausedOrphans': '{count} 个账户需要验证账号、整户暂停调度，403 记录已清除：',
+  'accounts.verifyPausedMore': ' 等 {count} 个',
+  'accounts.verifyPausedHelp':
+    '这些账户需要验证账号的整户暂停还在，403 记录却已经清除（旧版本点过“清除记录”留下的），403 列表里没有它们的行。到 https://aistudio.google.com/verify-account 验证后在账户列表点“验证”即可解除；也可以点“解除暂停”：只解除这些账户需要验证账号的整户暂停，不解除单模型 403 冷却，仍未验证的账户下一次请求会重新暂停。',
+  'accounts.verifyPausedLift': '解除暂停',
+  'accounts.verifyPausedLiftConfirm':
+    '解除这 {count} 个账户需要验证账号的整户暂停？不解除单模型 403 冷却；仍未验证的账户下一次请求会重新暂停（那次请求换号重试）。',
+  'accounts.verifyPausedLifted': '已解除 {count} 个账户需要验证账号的整户暂停',
   'accounts.orgDisabledTitle': '组织已停用 AI Studio 的账户',
   'accounts.orgDisabledHint':
     '（账号所属组织关闭了 AI Studio，重新登录也没用；已停止调度，换号或等组织重新开放）',
@@ -1431,7 +1467,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.filterAll': 'All',
   'accounts.filterProblem': 'Problems',
   'accounts.problemHelp':
-    'Accounts with 403 permission denied (such as account verification required), AI Studio disabled by the organization, sign-in required, or unavailable, each with its reason',
+    'Accounts with 403 permission denied (such as account verification required), AI Studio disabled by the organization, sign-in required, or unavailable, each with its reason. Each 403 model shows the time and count of its latest 403, and an account with a 403 on only one model is grouped as "403 permission denied (single model)". A 403 record that is not account-level, has not been seen for more than {hours} hours and whose account is not in a 403 cooldown counts as stale and is left out (it stays greyed out in the 403 list above and can be cleared per row)',
   'accounts.problemCount': '{count} problem accounts',
   'accounts.problemCopyWithReason': 'Copy emails and reasons',
   'accounts.problemCopied': 'Copied {count} accounts',
@@ -1441,7 +1477,11 @@ const en: Record<TranslationKey, string> = {
   'accounts.problemKind': 'Problem type',
   'accounts.problemKindAll': 'All problems',
   'accounts.problemKindVerify': '403 verification required',
-  'accounts.problemKindForbidden': '403 permission denied (other)',
+  'accounts.problemKindForbidden': '403 permission denied (multiple models)',
+  'accounts.problemKindModelForbidden': '403 permission denied (single model)',
+  'accounts.problemVerifyPaused':
+    'Account verification required, whole account paused (403 record already cleared; verify on the official site and click "Verify", or click "Lift pause" in the 403 section above)',
+  'accounts.problemStaleMore': '; {count} more stale records not counted',
   'accounts.sortDefault': 'Default order',
   'accounts.sortState': 'By state',
   'accounts.sortLabel': 'By email',
@@ -1499,7 +1539,7 @@ const en: Record<TranslationKey, string> = {
     "(usually the account has not accepted Google's terms; fetch a new auth file and upload it)",
   'accounts.permissionDeniedCount': '{count}',
   'accounts.permissionDeniedHelp':
-    'Accounts whose generation requests returned HTTP 403 PERMISSION_DENIED (The caller does not have permission). An entry is cleared automatically when the auth file is updated (a new storage-state.json is uploaded, a browser login, or the directory is imported again), and its 403 cooldowns are lifted at once; a later success on a model also clears that model. Pool-wide 403s are not counted.',
+    'Accounts whose generation requests returned HTTP 403 PERMISSION_DENIED (The caller does not have permission); each model keeps the time and count of its latest 403 and where that request came from. A record is cleared when the auth file is updated (a new storage-state.json is uploaded, a browser login, or the directory is imported again; its 403 cooldowns are lifted too); when the model succeeds once on that channel (only that model and channel); when an account that needs verification succeeds on any model; when "Verify" passes on this page; by the startup reconciliation (the account left the pool or its login signature changed); when a pool-wide 403 is revoked; and by the "Clear" button of each row or "Clear records" (clearing lifts the whole-account pause for account verification required, not per-model 403 cooldowns). Records not seen for more than {hours} hours while the account is not in a 403 cooldown are greyed out as stale: most likely left over from long ago or from someone else (new-api channel tests, downstream users, a model alias, another instance sharing the account directory). Pool-wide 403s are not counted.',
   'accounts.permissionDeniedEmail': 'Email',
   'accounts.permissionDeniedModels': 'Model · channel',
   'accounts.permissionDeniedLast': 'Last seen',
@@ -1510,11 +1550,21 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedClearConfirm':
     'Clear all 403 permission denied records? Per-model 403 cooldowns and multi-model 403 auto-pauses stay; the one exception is the whole-account pause for "account verification required", which is lifted too (an account that is still unverified is paused again on its next request). An account that returns 403 again is listed again.',
   'accounts.permissionDeniedCleared': 'Cleared records of {count} accounts',
+  'accounts.permissionDeniedLiftedMore':
+    '; lifted the whole-account pause for account verification on {count} accounts',
   'accounts.permissionDeniedDelete': 'Delete all',
   'accounts.permissionDeniedDeleteHelp':
     'Removes every listed account (including collapsed ones) from the pool and deletes its auth directory, the same as "Delete" in the account list. This cannot be undone.',
   'accounts.permissionDeniedDeleteConfirm':
     'Delete all {count} listed accounts and their auth files (the account directories are removed)? This cannot be undone; an account can be used again only after its auth file is uploaded again. Accounts serving a request are deleted once they become idle.',
+  'accounts.permissionDeniedDeleteConfirmFresh':
+    'Delete the {count} listed accounts whose 403 records are not stale, and their auth files (the account directories are removed)? The other {stale} accounts have only stale 403 records (greyed out, most likely fine) and are not deleted; they can be cleared per row. This cannot be undone; an account can be used again only after its auth file is uploaded again. Accounts serving a request are deleted once they become idle.',
+  'accounts.permissionDeniedDeleteStaleHelp':
+    ' Accounts whose 403 records are all stale (greyed out, most likely fine) are not deleted.',
+  'accounts.permissionDeniedDeleteStaleKept':
+    '; {count} accounts with only stale 403 records were not deleted',
+  'accounts.permissionDeniedDeleteAllStale':
+    'All {count} listed accounts have only stale 403 records (most likely fine), so "Delete all" leaves them alone; clear their records per row, or delete them one by one in the account list if you really mean to',
   'accounts.permissionDeniedDeleteResult':
     'Deleted {deleted}, {missing} no longer existed, {failed} failed',
   'accounts.permissionDeniedDeleteFailures': '; failed: {list}',
@@ -1526,6 +1576,33 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedDeleteSkipped':
     '; {count} were no longer listed after confirming (for example, the auth file was uploaded again) and were not deleted',
   'accounts.permissionDeniedShowAll': 'Show all {count}',
+  'accounts.permissionDeniedSeen': 'last {time} · {count}×',
+  'accounts.permissionDeniedLastRequest': 'Last request: {detail}',
+  'accounts.permissionDeniedRequestModel': 'requested as {model}',
+  'accounts.permissionDeniedRequestMessages': '{count} messages',
+  'accounts.permissionDeniedRequestImages': 'images {count}',
+  'accounts.permissionDeniedRequestFiles': 'files {count}',
+  'accounts.permissionDeniedStale': 'Stale ({days} days ago)',
+  'accounts.permissionDeniedStaleShort': 'stale',
+  'accounts.permissionDeniedStaleCount': '{count} stale',
+  'accounts.permissionDeniedStaleHelp':
+    'Not seen again for more than {hours} hours and the account is not in a 403 cooldown: most likely left over from long ago or from calls made by someone else, and safe to clear. Not counted under "Problems".',
+  'accounts.permissionDeniedClearRow': 'Clear',
+  'accounts.permissionDeniedClearRowHelp':
+    'Clears only the 403 record of this account: per-model 403 cooldowns stay, the whole-account pause for account verification required is lifted',
+  'accounts.permissionDeniedRowCleared': 'Cleared the 403 record of {label}',
+  'accounts.permissionDeniedRowMissing':
+    'The 403 record of {label} no longer exists (it may have just been cleared)',
+  'accounts.verifyPausedOrphans':
+    '{count} accounts are paused as a whole for account verification, their 403 records already cleared:',
+  'accounts.verifyPausedMore': ' and {count} more',
+  'accounts.verifyPausedHelp':
+    'These accounts are still paused as a whole for account verification although their 403 records were already cleared (left over from clicking "Clear records" on an older version), so the 403 list has no row for them. Verify at https://aistudio.google.com/verify-account and click "Verify" in the account list to lift the pause; or click "Lift pause": it lifts only the whole-account pause for account verification of these accounts, per-model 403 cooldowns stay, and an account that is still unverified is paused again on its next request.',
+  'accounts.verifyPausedLift': 'Lift pause',
+  'accounts.verifyPausedLiftConfirm':
+    'Lift the whole-account pause for account verification on these {count} accounts? Per-model 403 cooldowns stay; an account that is still unverified is paused again on its next request (that request switches to another account).',
+  'accounts.verifyPausedLifted':
+    'Lifted the whole-account pause for account verification on {count} accounts',
   'accounts.orgDisabledTitle': 'Accounts with AI Studio disabled by their organization',
   'accounts.orgDisabledHint':
     '(the organization that manages the account has turned AI Studio off; signing in again does not help. Scheduling has stopped: replace the account or wait for the organization to re-enable it)',

@@ -641,6 +641,12 @@ Drive 授权状态记录的运行日志（`service`）：装配运行时恢复�
 {"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"工具调用完成","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064}}}
 ```
 
+客户端请求的模型名与最终的 `model` 不同时，`request.finished` 另带 `requested_model`，与同一请求 `request.started` 的 `model` 含义相同：协议层已解析名称后缀（`-high`、`-online` 等）与 `long-` 前缀，号池目录里的别名还没换成正式 ID。例如请求一个只作为 Omni 别名存在的名字时，`request.started` 的 `model` 与 `request.finished` 的 `requested_model` 都是这个名字，`request.finished` 的 `model` 为 Omni 的正式 ID；额度用完改用其他模型时 `model` 为目标模型、`fallback_from` 为改用前的模型、`requested_model` 为客户端请求的名字。两者相同时不带这个字段（旧版本也没有），其他字段与用量账本不变：
+
+```json
+{"time":"2026-11-13T02:00:00Z","level":"ERROR","msg":"请求失败","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"failed","model":"gemini-omni-1.1-flash","method":"POST","path":"/v1/chat/completions","status":503,"duration_ms":1830,"requested_model":"veo-alias-example","error":"…"}}
+```
+
 采样参数保存在 `request.parameters`。`first_event_ms`、`queue_ms`、`proof_ms` 和 `upstream_bytes` 作为 JSON 诊断字段保留：`queue_ms` 是请求进入服务到取得最终执行账户的时间，`proof_ms` 是等待并生成 WAA proof 的累计时间。页面支持按级别、账户以及模型、请求 ID、状态码搜索。
 
 客户端取消记录为 `499`；认证、额度和上游失败分别使用对应 HTTP 状态与 `request.error`。

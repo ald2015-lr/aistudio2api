@@ -65,8 +65,11 @@ export interface AccountProblemLists {
   orgDisabled: OrgDisabledAccount[]
 }
 
+// PermissionDeniedClearResponse 为清除接口的结果：cleared 为清除了记录的账户数；lifted 为一并解除需要验证账号整户暂停的账户数
+// （只有 403 无权限账户的清除接口返回，旧版服务没有）
 interface PermissionDeniedClearResponse {
   cleared: number
+  lifted?: number
 }
 
 export interface EventConnection {

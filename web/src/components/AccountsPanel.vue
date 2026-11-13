@@ -25,6 +25,7 @@ import type {
   Cooldown,
   OrgDisabledAccount,
   PermissionDeniedAccount,
+  PermissionDeniedModel,
   ProxyPoolAssignment,
   ProxyPoolStatus,
   UltraWorkerCounters,
@@ -166,6 +167,8 @@ const PERMISSION_DENIED_COLLAPSED = 20
 const permissionDenied = ref<PermissionDeniedAccount[]>([])
 const showAllPermissionDenied = ref(false)
 const permissionDeniedClearing = ref(false)
+// permissionDeniedRowClearing 为正在按行清除记录的账户 ID（同一时间只清一行）
+const permissionDeniedRowClearing = ref('')
 let permissionDeniedLoadedAt = 0
 let permissionDeniedLoading = false
 let permissionDeniedTimer: number | undefined
@@ -256,6 +259,150 @@ onBeforeUnmount(() => {
   if (permissionDeniedTimer !== undefined) window.clearTimeout(permissionDeniedTimer)
 })
 
+// 陈旧的 403 记录：不是账户级（需要验证账号）的模型条目，最近一次 403 早于 PERMISSION_DENIED_STALE_HOURS 小时、且账户此刻不在
+// 403 冷却或暂停里。阈值取 72 小时：单模型 403 冷却最长一档到太平洋时间次日零点（不超过 24 小时、至少 6 小时，见 forbidden_guard.go 的
+// forbiddenModelCooldownUntil），多模型连续 403 的自动暂停为 30 分钟（forbiddenPause），都不超过 24 小时，再留两天余量；需要验证账号的
+// 整户暂停（30 天）是账户级的，账户级条目从不算陈旧。一个账户的 403 模型条目都陈旧时不计入“出问题”，上方 403 列表里仍列出并灰显
+const PERMISSION_DENIED_STALE_HOURS = 72
+const PERMISSION_DENIED_STALE_MS = PERMISSION_DENIED_STALE_HOURS * 60 * 60 * 1000
+// 服务端 forbiddenCooldown 认得的 403 冷却原因：单模型 403 冷却的前缀，多模型连续 403 自动暂停（含需要验证账号的整户暂停）的后缀
+const FORBIDDEN_MODEL_REASON_PREFIX = '无权限（模型）: '
+const FORBIDDEN_PAUSE_REASON_SUFFIX = '次返回 403 无权限，自动暂停'
+// 账户级的 403（需要验证账号）：与服务端 accountLevelPermissionDenied 相同
+const ACCOUNT_LEVEL_DENIED = /verify-account|must be verified/i
+const DAY_MS = 24 * 60 * 60 * 1000
+// 403 区块里列出的需要验证账号暂停（403 记录已清除）的账户数，其余写“等 N 个”
+const VERIFY_PAUSED_SHOWN = 5
+
+// minuteClock 为按分钟取整的当前时间：陈旧判断不需要秒级精度，“出问题”的统计不随每秒的倒计时重新计算
+const minuteClock = computed(() => Math.floor(clock.value / 60000) * 60000)
+
+// forbiddenCooldownState 为此刻仍在 403 冷却或暂停里的账户，以及其中需要验证账号整户暂停的账户（账户 ID → 暂停原因与邮箱）。
+// 冷却列表把整户暂停按账户目录里的每个模型展开、原因相同，这里按账户合并
+const forbiddenCooldownState = computed(() => {
+  const now = minuteClock.value
+  const cooling = new Set<string>()
+  const verifyPaused = new Map<string, { reason: string; label: string }>()
+  for (const { cooldown, until } of parsedCooldowns.value) {
+    if (until <= now) continue
+    const reason = (cooldown.reason ?? '').trim()
+    const pause = reason.endsWith(FORBIDDEN_PAUSE_REASON_SUFFIX)
+    if (pause || reason.startsWith(FORBIDDEN_MODEL_REASON_PREFIX)) cooling.add(cooldown.account_id)
+    if (pause && ACCOUNT_LEVEL_DENIED.test(reason)) {
+      verifyPaused.set(cooldown.account_id, {
+        reason,
+        label: cooldown.account_label || cooldown.account_id,
+      })
+    }
+  }
+  return { cooling, verifyPaused }
+})
+
+// verifyPausedOrphans 为需要验证账号的整户暂停还在、403 列表里却没有这个账户的（旧版本点过“清除记录”留下的）：没有可以按行
+// “清除”的一行，403 区块单独列出并可“解除暂停”（按账户调用清除接口，服务端对登记表里没有的账户同样解除这类暂停）；按邮箱排列
+const verifyPausedOrphans = computed(() => {
+  const listed = new Set(permissionDenied.value.map((account) => account.id))
+  const orphans: { id: string; label: string }[] = []
+  for (const [id, pause] of forbiddenCooldownState.value.verifyPaused) {
+    if (!listed.has(id)) orphans.push({ id, label: pause.label })
+  }
+  return orphans.sort((a, b) => a.label.localeCompare(b.label))
+})
+
+// PermissionDeniedView 为一个 403 账户的分类：verify 为有账户级条目（需要验证账号）；fresh 与 stale 为不是账户级的条目里
+// 不陈旧与陈旧的；staleDays 为陈旧条目里最近一次 403 距今的天数
+interface PermissionDeniedView {
+  verify: boolean
+  fresh: PermissionDeniedModel[]
+  stale: PermissionDeniedModel[]
+  staleDays: number
+}
+
+const permissionDeniedViews = computed(() => {
+  const now = minuteClock.value
+  const { cooling } = forbiddenCooldownState.value
+  const views = new Map<string, PermissionDeniedView>()
+  for (const account of permissionDenied.value) {
+    const view: PermissionDeniedView = { verify: false, fresh: [], stale: [], staleDays: 0 }
+    let staleLatest = 0
+    for (const model of account.models) {
+      if (ACCOUNT_LEVEL_DENIED.test(model.message ?? '')) {
+        view.verify = true
+        continue
+      }
+      const last = Date.parse(model.last_at)
+      if (
+        !cooling.has(account.id) &&
+        Number.isFinite(last) &&
+        now - last > PERMISSION_DENIED_STALE_MS
+      ) {
+        view.stale.push(model)
+        staleLatest = Math.max(staleLatest, last)
+      } else {
+        view.fresh.push(model)
+      }
+    }
+    if (staleLatest > 0) view.staleDays = Math.floor((now - staleLatest) / DAY_MS)
+    views.set(account.id, view)
+  }
+  return views
+})
+
+// permissionDeniedStaleView 返回账户的分类；账户的 403 记录全部陈旧（没有账户级条目、不陈旧的条目为 0）时才返回，其余为 undefined
+function permissionDeniedStaleView(
+  account: PermissionDeniedAccount,
+): PermissionDeniedView | undefined {
+  const view = permissionDeniedViews.value.get(account.id)
+  return view !== undefined && !view.verify && view.fresh.length === 0 && view.stale.length > 0
+    ? view
+    : undefined
+}
+
+const permissionDeniedStaleCount = computed(
+  () => permissionDenied.value.filter((account) => permissionDeniedStaleView(account)).length,
+)
+
+// formatShortTime 把时间写成本机时区的“MM-DD HH:MM”（与表格“最近一次”同一时区）
+function formatShortTime(value: string): string {
+  const time = Date.parse(value)
+  if (!Number.isFinite(time)) return '—'
+  const date = new Date(time)
+  const pad = (number: number) => String(number).padStart(2, '0')
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+// modelSeen 为模型的“最近 MM-DD HH:MM · N 次”
+function modelSeen(model: PermissionDeniedModel): string {
+  return tf('accounts.permissionDeniedSeen', {
+    time: formatShortTime(model.last_at),
+    count: model.count,
+  })
+}
+
+// lastRequestText 为模型最近一次 403 的请求来源：“最近一次请求：path · 请求名 · N 条消息 · 图片 N · 文件 N · ID …”；
+// 旧记录没有来源时为空
+function lastRequestText(model: PermissionDeniedModel): string {
+  const last = model.last_request
+  if (last === undefined) return ''
+  const parts = [
+    last.path || '—',
+    tf('accounts.permissionDeniedRequestModel', { model: last.requested_model || model.model }),
+    tf('accounts.permissionDeniedRequestMessages', { count: last.messages ?? 0 }),
+    tf('accounts.permissionDeniedRequestImages', { count: last.images ?? 0 }),
+    tf('accounts.permissionDeniedRequestFiles', { count: last.files ?? 0 }),
+  ]
+  if (last.id) parts.push(`ID ${last.id}`)
+  return tf('accounts.permissionDeniedLastRequest', { detail: parts.join(' · ') })
+}
+
+// latestRequestText 为模型一栏下的小字：账户里最近一次带请求来源的 403（模型按最近一次从新到旧排列），有多个模型时前面写模型名
+function latestRequestText(account: PermissionDeniedAccount): string {
+  const model = account.models.find((item) => item.last_request !== undefined)
+  if (model === undefined) return ''
+  const text = lastRequestText(model)
+  return account.models.length > 1 ? `${model.model}：${text}` : text
+}
+
 // permissionDeniedModels 把账户的 403 模型格式化为"模型（通道）"，按最近一次从新到旧
 function permissionDeniedModels(account: PermissionDeniedAccount): string {
   return account.models
@@ -266,10 +413,18 @@ function permissionDeniedModels(account: PermissionDeniedAccount): string {
     .join(', ')
 }
 
-// permissionDeniedDetail 为模型一栏的悬停提示：每个模型的次数与上游原文
+// permissionDeniedDetail 为模型一栏的悬停提示：每个模型的最近时间、次数、是否陈旧、上游原文与最近一次请求
 function permissionDeniedDetail(account: PermissionDeniedAccount): string {
+  const view = permissionDeniedViews.value.get(account.id)
   return account.models
-    .map((model) => `${model.model} ×${model.count}${model.message ? `: ${model.message}` : ''}`)
+    .map((model) => {
+      const stale = view?.stale.includes(model)
+        ? ` · ${t('accounts.permissionDeniedStaleShort')}`
+        : ''
+      const head = `${model.model} · ${modelSeen(model)}${stale}${model.message ? `: ${model.message}` : ''}`
+      const request = lastRequestText(model)
+      return request === '' ? head : `${head}\n  ${request}`
+    })
     .join('\n')
 }
 
@@ -328,9 +483,82 @@ async function clearPermissionDenied(): Promise<void> {
     permissionDeniedVersion += 1
     permissionDenied.value = []
     showAllPermissionDenied.value = false
-    emit('notice', tf('accounts.permissionDeniedCleared', { count: result.cleared }), 'success')
+    emit(
+      'notice',
+      tf('accounts.permissionDeniedCleared', { count: result.cleared }) + liftedNotice(result),
+      'success',
+    )
     // 需要验证账号的整户暂停随之解除：刷新账户状态
     emit('refresh')
+  } catch (error) {
+    actionError(error)
+  } finally {
+    permissionDeniedClearing.value = false
+  }
+}
+
+// clearPermissionDeniedAccount 清除一个账户的 403 记录（每行的“清除”，与“清除记录”相同：不解除单模型 403 冷却，
+// 需要验证账号的整户暂停一并解除），成功后刷新列表与账户状态
+async function clearPermissionDeniedAccount(account: PermissionDeniedAccount): Promise<void> {
+  if (permissionDeniedRowClearing.value !== '' || permissionDeniedClearing.value) return
+  permissionDeniedRowClearing.value = account.id
+  try {
+    const result = await trackPendingWrite(api.clearPermissionDenied({ account_ids: [account.id] }))
+    permissionDeniedVersion += 1
+    permissionDenied.value = permissionDenied.value.filter((item) => item.id !== account.id)
+    if (permissionDenied.value.length <= PERMISSION_DENIED_COLLAPSED) {
+      showAllPermissionDenied.value = false
+    }
+    emit(
+      'notice',
+      tf(
+        result.cleared > 0
+          ? 'accounts.permissionDeniedRowCleared'
+          : 'accounts.permissionDeniedRowMissing',
+        { label: account.label },
+      ) + liftedNotice(result),
+      'success',
+    )
+    emit('refresh')
+    void loadPermissionDenied()
+  } catch (error) {
+    actionError(error)
+  } finally {
+    permissionDeniedRowClearing.value = ''
+  }
+}
+
+// liftedNotice 为清除结果里解除需要验证账号整户暂停的说明（旧版服务不返回 lifted，按 0 计）
+function liftedNotice(result: { lifted?: number }): string {
+  const lifted = result.lifted ?? 0
+  return lifted > 0 ? tf('accounts.permissionDeniedLiftedMore', { count: lifted }) : ''
+}
+
+// liftVerifyPausedOrphans 解除 verifyPausedOrphans 的整户暂停（按账户调用清除接口：这些账户不在登记表里，只解除暂停）；
+// 单模型 403 冷却不变，仍未验证的账户下一次请求会重新暂停
+async function liftVerifyPausedOrphans(): Promise<void> {
+  const orphans = verifyPausedOrphans.value
+  if (
+    orphans.length === 0 ||
+    permissionDeniedRowClearing.value !== '' ||
+    permissionDeniedClearing.value
+  )
+    return
+  if (
+    !(await confirmAction(
+      tf('accounts.verifyPausedLiftConfirm', { count: orphans.length }),
+      t('accounts.verifyPausedLift'),
+    ))
+  )
+    return
+  permissionDeniedClearing.value = true
+  try {
+    const result = await trackPendingWrite(
+      api.clearPermissionDenied({ account_ids: orphans.map((account) => account.id) }),
+    )
+    emit('notice', tf('accounts.verifyPausedLifted', { count: result.lifted ?? 0 }), 'success')
+    emit('refresh')
+    void loadPermissionDenied()
   } catch (error) {
     actionError(error)
   } finally {
@@ -694,11 +922,14 @@ async function removeAccount(account: Account): Promise<void> {
 
 // problem 为“出问题”：403 无权限、组织已停用、需要登录、不可用的账户，按原因列出
 type StateFilter = 'all' | 'problem' | AccountState
-// ProblemKind 为出问题账户的类型：需要验证账号的 403、其他 403、需要登录、组织已停用、不可用；以后有新的问题类型在这里加
-type ProblemKind = 'verify' | 'forbidden' | 'auth_required' | 'org_disabled' | 'unavailable'
+// ProblemKind 为出问题账户的类型：需要验证账号的 403（含 403 记录已清除、整户暂停还在的账户）、多个模型的 403、只有一个模型的 403、
+// 需要登录、组织已停用、不可用；陈旧的 403 记录不计入（见 PERMISSION_DENIED_STALE_HOURS）。以后有新的问题类型在这里加
+type ProblemKind =
+  'verify' | 'forbidden' | 'model_forbidden' | 'auth_required' | 'org_disabled' | 'unavailable'
 const problemKindOptions: { value: ProblemKind; label: TranslationKey }[] = [
   { value: 'verify', label: 'accounts.problemKindVerify' },
   { value: 'forbidden', label: 'accounts.problemKindForbidden' },
+  { value: 'model_forbidden', label: 'accounts.problemKindModelForbidden' },
   { value: 'auth_required', label: 'state.auth_required' },
   { value: 'org_disabled', label: 'accounts.problemOrgDisabled' },
   { value: 'unavailable', label: 'state.unavailable' },
@@ -945,24 +1176,45 @@ const problemInfo = computed(() => {
       ? `${t('accounts.problemVerifyRequired')}：${text}`
       : text
   }
+  // 403 记录：每个模型带“最近 MM-DD HH:MM · N 次”；有账户级条目的为 verify，否则按不陈旧的条目数分为单个模型与多个模型，
+  // 全部陈旧的账户不计入（上方 403 列表里灰显）
   for (const account of permissionDenied.value) {
+    const view = permissionDeniedViews.value.get(account.id)
+    if (view === undefined || (!view.verify && view.fresh.length === 0)) continue
+    const counted = view.verify ? account.models : view.fresh
     const messages = [
       ...new Set(
-        account.models
+        counted
           .map((model) => model.message ?? '')
           .filter((m) => m !== '')
           .map(brief),
       ),
     ]
-    const models = account.models.map((model) => model.model).join(', ')
-    const verify = account.models.some((model) =>
-      /verify-account|must be verified/i.test(model.message ?? ''),
+    const models = counted.map((model) => `${model.model} ${modelSeen(model)}`).join(', ')
+    const kind: ProblemKind = view.verify
+      ? 'verify'
+      : view.fresh.length === 1
+        ? 'model_forbidden'
+        : 'forbidden'
+    const label = t(
+      kind === 'model_forbidden'
+        ? 'accounts.problemKindModelForbidden'
+        : 'accounts.problemPermissionDenied',
     )
+    const stale =
+      !view.verify && view.stale.length > 0
+        ? tf('accounts.problemStaleMore', { count: view.stale.length })
+        : ''
     add(
       account.id,
-      `${t('accounts.problemPermissionDenied')}（${models}）${messages.length > 0 ? `：${messages.join(' / ')}` : ''}`,
-      verify ? 'verify' : 'forbidden',
+      `${label}（${models}${stale}）${messages.length > 0 ? `：${messages.join(' / ')}` : ''}`,
+      kind,
     )
+  }
+  // 需要验证账号的整户暂停还在、登记表里却没有账户级记录（旧版本点过“清除记录”）：同样列为需要验证账号，原因写暂停原因
+  for (const [id, pause] of forbiddenCooldownState.value.verifyPaused) {
+    if (kinds.get(id)?.has('verify')) continue
+    add(id, `${t('accounts.problemVerifyPaused')}：${pause.reason}`, 'verify')
   }
   for (const account of orgDisabled.value) {
     add(
@@ -992,6 +1244,7 @@ const problemKindCounts = computed(() => {
   const counts: Record<ProblemKind, number> = {
     verify: 0,
     forbidden: 0,
+    model_forbidden: 0,
     auth_required: 0,
     org_disabled: 0,
     unavailable: 0,
@@ -1283,24 +1536,36 @@ async function deleteOrgDisabled(): Promise<void> {
 // 批量进度面板；正在处理请求的账户由服务端等它空闲后删除，等不到的列为失败。完成后刷新列表与账户列表。
 // 确认框打开期间列表可能已经变化：重新上传了认证文件的账户会被服务端移出列表，这时再删除就会连同新的认证文件一起删掉。
 // 所以确认后先重新读取一次列表，每批提交前再与当前列表对照，只删除确认时列出、提交时仍在列表里的账户；
-// 确认后才列出的账户没有经过确认，也不删除
+// 确认后才列出的账户没有经过确认，也不删除。403 列表里 403 记录全部陈旧的账户（见 permissionDeniedStaleView，多半没有问题，
+// 是很早以前或别人调用留下的）不删除：确认框与结果提示写明跳过的个数，要删除它们到账户列表里逐个删除
 async function deleteListed(kind: ListedKind): Promise<void> {
   const deleting = kind === 'permissionDenied' ? permissionDeniedDeleting : orgDisabledDeleting
-  const confirmed = listedAccounts(kind).map(({ id, label }) => ({ id, label }))
-  if (
-    busy.value ||
-    permissionDeniedDeleting.value ||
-    orgDisabledDeleting.value ||
-    confirmed.length === 0
-  )
+  const listed = listedAccounts(kind)
+  const confirmed = (
+    kind === 'permissionDenied'
+      ? permissionDenied.value.filter((account) => !permissionDeniedStaleView(account))
+      : listed
+  ).map(({ id, label }) => ({ id, label }))
+  const staleSkipped = listed.length - confirmed.length
+  if (busy.value || permissionDeniedDeleting.value || orgDisabledDeleting.value) return
+  if (confirmed.length === 0) {
+    if (staleSkipped > 0) {
+      emit(
+        'notice',
+        tf('accounts.permissionDeniedDeleteAllStale', { count: staleSkipped }),
+        'success',
+      )
+    }
     return
-  if (
-    !(await confirmAction(
-      tf('accounts.permissionDeniedDeleteConfirm', { count: confirmed.length }),
-      t('accounts.permissionDeniedDelete'),
-    ))
-  )
-    return
+  }
+  const confirmText =
+    staleSkipped > 0
+      ? tf('accounts.permissionDeniedDeleteConfirmFresh', {
+          count: confirmed.length,
+          stale: staleSkipped,
+        })
+      : tf('accounts.permissionDeniedDeleteConfirm', { count: confirmed.length })
+  if (!(await confirmAction(confirmText, t('accounts.permissionDeniedDelete')))) return
   if (busy.value || permissionDeniedDeleting.value || orgDisabledDeleting.value) return
   deleting.value = true
   // skipped 为确认后已移出列表、没有删除的账户数
@@ -1387,6 +1652,9 @@ async function deleteListed(kind: ListedKind): Promise<void> {
   }
   if (totals.skipped > 0) {
     message += tf('accounts.permissionDeniedDeleteSkipped', { count: totals.skipped })
+  }
+  if (staleSkipped > 0) {
+    message += tf('accounts.permissionDeniedDeleteStaleKept', { count: staleSkipped })
   }
   emit('notice', message, failures.length === 0 && totals.remaining === 0 ? 'success' : 'error')
 }
@@ -1544,32 +1812,50 @@ function closeBulkPanel(): void {
 
       <!-- 403 无权限账户：多半未同意 Google 政策，重新获取认证文件上传后自动清除 -->
       <div
-        v-if="permissionDenied.length > 0"
+        v-if="permissionDenied.length > 0 || verifyPausedOrphans.length > 0"
         class="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm"
       >
         <div class="flex flex-wrap items-center justify-between gap-2">
           <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
             <span
-              v-tooltip="t('accounts.permissionDeniedHelp')"
+              v-tooltip="
+                tf('accounts.permissionDeniedHelp', { hours: PERMISSION_DENIED_STALE_HOURS })
+              "
               class="font-bold text-red-300"
               tabindex="0"
             >
               {{ t('accounts.permissionDeniedTitle') }}
             </span>
             <span class="text-gray-300">{{ t('accounts.permissionDeniedHint') }}</span>
-            <span class="font-mono text-red-300">
+            <span v-if="permissionDenied.length > 0" class="font-mono text-red-300">
               {{ tf('accounts.permissionDeniedCount', { count: permissionDenied.length }) }}
+            </span>
+            <span
+              v-if="permissionDeniedStaleCount > 0"
+              v-tooltip="
+                tf('accounts.permissionDeniedStaleHelp', { hours: PERMISSION_DENIED_STALE_HOURS })
+              "
+              class="text-gray-400"
+              tabindex="0"
+            >
+              {{ tf('accounts.permissionDeniedStaleCount', { count: permissionDeniedStaleCount }) }}
             </span>
           </div>
           <div class="flex flex-wrap gap-2">
             <button
+              v-if="permissionDenied.length > 0"
               class="btn btn-sm"
               type="button"
               @click="copyEmails(permissionDenied.map((account) => account.label))"
             >
               {{ t('accounts.copyAllEmails') }}
             </button>
-            <button class="btn btn-sm" type="button" @click="downloadPermissionDenied">
+            <button
+              v-if="permissionDenied.length > 0"
+              class="btn btn-sm"
+              type="button"
+              @click="downloadPermissionDenied"
+            >
               {{ t('accounts.permissionDeniedDownload') }}
             </button>
             <button
@@ -1582,14 +1868,18 @@ function closeBulkPanel(): void {
               {{ t('accounts.permissionDeniedClear') }}
             </button>
             <button
-              v-tooltip="t('accounts.permissionDeniedDeleteHelp')"
+              v-if="permissionDenied.length > 0"
+              v-tooltip="
+                t('accounts.permissionDeniedDeleteHelp') +
+                t('accounts.permissionDeniedDeleteStaleHelp')
+              "
               class="btn btn-sm btn-danger"
               type="button"
               :disabled="
                 busy ||
                 permissionDeniedDeleting ||
                 permissionDeniedClearing ||
-                permissionDenied.length === 0
+                permissionDenied.length === permissionDeniedStaleCount
               "
               :aria-busy="permissionDeniedDeleting"
               @click="deletePermissionDenied"
@@ -1606,7 +1896,48 @@ function closeBulkPanel(): void {
             </button>
           </div>
         </div>
-        <div class="mt-2 overflow-x-auto">
+        <!-- 需要验证账号的整户暂停还在、403 列表里没有这个账户（旧版本点过“清除记录”）：没有可以按行清除的一行，单独列出 -->
+        <div
+          v-if="verifyPausedOrphans.length > 0"
+          class="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded border border-amber-500/30 bg-amber-500/5 px-2 py-1 text-xs"
+        >
+          <span
+            v-tooltip="t('accounts.verifyPausedHelp')"
+            class="font-bold text-amber-200"
+            tabindex="0"
+          >
+            {{ tf('accounts.verifyPausedOrphans', { count: verifyPausedOrphans.length }) }}
+          </span>
+          <span class="min-w-0 break-all font-mono text-gray-300">
+            {{
+              verifyPausedOrphans
+                .slice(0, VERIFY_PAUSED_SHOWN)
+                .map((account) => account.label)
+                .join(', ')
+            }}{{
+              verifyPausedOrphans.length > VERIFY_PAUSED_SHOWN
+                ? tf('accounts.verifyPausedMore', {
+                    count: verifyPausedOrphans.length - VERIFY_PAUSED_SHOWN,
+                  })
+                : ''
+            }}
+          </span>
+          <span class="flex-1"></span>
+          <button
+            class="btn btn-sm"
+            type="button"
+            :disabled="
+              permissionDeniedClearing ||
+              permissionDeniedDeleting ||
+              permissionDeniedRowClearing !== ''
+            "
+            :aria-busy="permissionDeniedClearing"
+            @click="liftVerifyPausedOrphans"
+          >
+            {{ t('accounts.verifyPausedLift') }}
+          </button>
+        </div>
+        <div v-if="permissionDenied.length > 0" class="mt-2 overflow-x-auto">
           <table class="w-full text-xs">
             <thead>
               <tr class="text-left text-gray-500">
@@ -1616,6 +1947,7 @@ function closeBulkPanel(): void {
                 <th class="py-1 text-right font-normal">
                   {{ t('accounts.permissionDeniedTimes') }}
                 </th>
+                <th class="py-1 pl-3 text-right font-normal">{{ t('accounts.actions') }}</th>
               </tr>
             </thead>
             <tbody>
@@ -1623,17 +1955,57 @@ function closeBulkPanel(): void {
                 v-for="account in visiblePermissionDenied"
                 :key="account.id"
                 class="border-t border-[#30363d]"
+                :class="{ 'opacity-60': permissionDeniedStaleView(account) }"
               >
                 <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
                 <td class="max-w-md py-1 pr-3">
                   <div class="cell-truncate text-gray-300" :title="permissionDeniedDetail(account)">
                     {{ permissionDeniedModels(account) }}
                   </div>
+                  <div
+                    v-if="latestRequestText(account) !== ''"
+                    class="cell-truncate text-[11px] text-gray-500"
+                    :title="latestRequestText(account)"
+                  >
+                    {{ latestRequestText(account) }}
+                  </div>
                 </td>
                 <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
                   {{ formatDateTime(account.last_at) }}
+                  <span
+                    v-if="permissionDeniedStaleView(account)"
+                    v-tooltip="
+                      tf('accounts.permissionDeniedStaleHelp', {
+                        hours: PERMISSION_DENIED_STALE_HOURS,
+                      })
+                    "
+                    class="ml-1 rounded bg-gray-500/20 px-1 font-sans text-gray-400"
+                    tabindex="0"
+                  >
+                    {{
+                      tf('accounts.permissionDeniedStale', {
+                        days: permissionDeniedStaleView(account)?.staleDays ?? 0,
+                      })
+                    }}
+                  </span>
                 </td>
                 <td class="py-1 text-right font-mono text-red-300">{{ account.count }}</td>
+                <td class="py-1 pl-3 text-right">
+                  <button
+                    class="btn btn-sm"
+                    type="button"
+                    :title="t('accounts.permissionDeniedClearRowHelp')"
+                    :disabled="
+                      permissionDeniedRowClearing !== '' ||
+                      permissionDeniedClearing ||
+                      permissionDeniedDeleting
+                    "
+                    :aria-busy="permissionDeniedRowClearing === account.id"
+                    @click="clearPermissionDeniedAccount(account)"
+                  >
+                    {{ t('accounts.permissionDeniedClearRow') }}
+                  </button>
+                </td>
               </tr>
             </tbody>
           </table>
@@ -1966,7 +2338,7 @@ function closeBulkPanel(): void {
             <span class="seg-count">{{ stateCounts[state] }}</span>
           </button>
           <button
-            v-tooltip="t('accounts.problemHelp')"
+            v-tooltip="tf('accounts.problemHelp', { hours: PERMISSION_DENIED_STALE_HOURS })"
             class="seg-item"
             :class="{ active: stateFilter === 'problem' }"
             type="button"
@@ -2021,7 +2393,9 @@ function closeBulkPanel(): void {
         <strong class="text-red-300">{{
           tf('accounts.problemCount', { count: filtered.length })
         }}</strong>
-        <span class="text-gray-400">{{ t('accounts.problemHelp') }}</span>
+        <span class="text-gray-400">{{
+          tf('accounts.problemHelp', { hours: PERMISSION_DENIED_STALE_HOURS })
+        }}</span>
         <span class="flex-1"></span>
         <button
           class="btn btn-sm"

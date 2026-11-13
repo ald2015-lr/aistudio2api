@@ -6097,7 +6097,7 @@ func (service *trackedService) generateForModel(
 		}
 		if modelDenied {
 			// 登记为 403 无权限账户，管理页单独列出（多半是没有同意 Google 的政策，重新获取认证文件上传后清除，见 permission_denied.go）
-			service.recordPermissionDenied(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now())
+			service.recordPermissionDenied(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now(), permissionDeniedRequestOf(requestCtx, entry, modelID))
 			cooldownScope := lease.CooldownScope(modelID)
 			until, level := service.forbidden.recordModel(request.AccountID, cooldownScope, time.Now())
 			reason := forbiddenModelReasonPrefix + err.Error()

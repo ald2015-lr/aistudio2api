@@ -112,3 +112,32 @@ func TestAccessLogAttemptsSnapshotIsCopy(t *testing.T) {
 		t.Fatalf("快照被后续修改影响: %+v", snapshot.attempts)
 	}
 }
+
+// TestAccessLogRequestedModel 请求结果日志的 RequestedModel 为写 request.started 时的模型名（目录别名换成正式 ID 之前）：之后改记的模型
+// 不改变它；AccessLogRequestInfo 返回请求日志记下的接口路径（带 /ultra 前缀）与这个名字，没有请求日志的上下文都为空
+func TestAccessLogRequestedModel(t *testing.T) {
+	admin := &capturingAdmin{}
+	var path, model string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		SetAccessLogTarget(ctx, "models/veo-alias", "")
+		StartAccessLog(ctx)
+		SetAccessLogTarget(ctx, "gemini-omni-1.1-flash", "a@example.com")
+		path, model = AccessLogRequestInfo(ctx)
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := requestLoggingMiddleware(admin, inner)
+	request := httptest.NewRequest(http.MethodPost, "/v1beta/interactions", nil)
+	request = request.WithContext(aistudio.ContextWithPoolScope(request.Context(), aistudio.PoolScopeUltra))
+	handler.ServeHTTP(httptest.NewRecorder(), request)
+	entries := admin.finished()
+	if len(entries) != 1 || entries[0].Model != "gemini-omni-1.1-flash" || entries[0].RequestedModel != "veo-alias" {
+		t.Fatalf("请求结果日志 = %+v，期望模型为正式 ID、请求名为别名", entries)
+	}
+	if path != "/ultra/v1beta/interactions" || path != entries[0].Path || model != "veo-alias" {
+		t.Fatalf("AccessLogRequestInfo = %q %q，期望 %q veo-alias", path, model, entries[0].Path)
+	}
+	if path, model := AccessLogRequestInfo(httptest.NewRequest(http.MethodPost, "/", nil).Context()); path != "" || model != "" {
+		t.Fatalf("没有请求日志时应为空：%q %q", path, model)
+	}
+}

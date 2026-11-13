@@ -585,7 +585,19 @@ export interface Cooldown {
   reason?: string
 }
 
-// PermissionDeniedModel 为账户在一个模型上的 403 无权限记录；channels 为返回过 403、之后还没有成功过的通道
+// PermissionDeniedRequest 为一个模型最近一次 403 的请求来源（不含 API 密钥、IP、User-Agent 与提示词）：id 为请求 ID，path 为接口路径，
+// requested_model 为客户端请求的模型名（与登记的模型相同时省略）；messages、images、files 为消息条数、内联图片数与文件引用数（为 0 时省略）
+export interface PermissionDeniedRequest {
+  id?: string
+  path?: string
+  requested_model?: string
+  messages?: number
+  images?: number
+  files?: number
+}
+
+// PermissionDeniedModel 为账户在一个模型上的 403 无权限记录；channels 为返回过 403、之后还没有成功过的通道；
+// last_request 为最近一次 403 的请求来源（旧版本服务与旧记录没有）
 export interface PermissionDeniedModel {
   model: string
   channels: UpstreamChannel[]
@@ -593,6 +605,7 @@ export interface PermissionDeniedModel {
   first_at: string
   last_at: string
   message?: string
+  last_request?: PermissionDeniedRequest
 }
 
 // PermissionDeniedAccount 为返回过 403 无权限的账户（多半未同意 Google 政策），重新获取认证文件上传后清除

@@ -58,6 +58,9 @@ type accessLogMetadata struct {
 	requestID       string
 	// fallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时为空
 	fallbackFrom string
+	// startedModel 为写 request.started 时的模型名（客户端请求的名字：协议层已解析名称后缀与 long- 前缀，号池目录里的别名还没换成
+	// 正式 ID）；request.finished 在它与最终模型不同时另记 requested_model，403 无权限账户登记记作最近一次请求的请求名
+	startedModel string
 	// startedAt 为请求进入服务的时间；queueWait 为进入服务到取得最终执行账户的时间
 	startedAt time.Time
 	queueWait time.Duration
@@ -98,6 +101,7 @@ type accessDisconnect struct {
 type accessLogSnapshot struct {
 	generation      bool
 	model           string
+	startedModel    string
 	account         string
 	channel         string
 	finishReason    string
@@ -269,6 +273,7 @@ func (metadata *accessLogMetadata) start(force bool) {
 		return
 	}
 	metadata.started = true
+	metadata.startedModel = metadata.model
 	admin := metadata.admin
 	entry := AccessLog{
 		Method: metadata.method, Path: metadata.path, Pool: metadata.pool, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
@@ -551,7 +556,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 	metadata.mu.Lock()
 	snapshot := accessLogSnapshot{
 		generation: metadata.generation,
-		model:      metadata.model, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
+		model:      metadata.model, startedModel: metadata.startedModel, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
 		requestErr: metadata.err, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
 		failureStatus: metadata.failureStatus,
 		firstEvent:    metadata.firstEvent,
@@ -664,6 +669,17 @@ func SetAccessLogUpstreamBytes(ctx context.Context, bytes int64) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
 		metadata.setUpstreamBytes(bytes)
 	}
+}
+
+// AccessLogRequestInfo 返回请求日志记下的接口路径（带 /ultra、/trace 前缀，与 request.finished 的 path 相同）与 request.started 写下的
+// 模型名（见 accessLogMetadata.startedModel）。不经公开 API 进入的调用（没有请求日志）都为空；还没写 request.started 时模型名为空
+func AccessLogRequestInfo(ctx context.Context) (string, string) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		defer metadata.mu.Unlock()
+		return metadata.path, metadata.startedModel
+	}
+	return "", ""
 }
 
 // StartAccessLog 立即写入已经完成解析的请求开始记录
@@ -823,7 +839,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				Temperature: snapshot.temperature, TopP: snapshot.topP, TopK: snapshot.topK,
 				Thinking: snapshot.thinking, MaxOutputTokens: snapshot.maxOutputTokens, Seed: snapshot.seed,
 				RequestID: snapshot.requestID, Pool: pool,
-				Method: r.Method, Path: path, Model: snapshot.model, Account: snapshot.account, Channel: snapshot.channel,
+				Method: r.Method, Path: path, Model: snapshot.model, RequestedModel: snapshot.startedModel, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,

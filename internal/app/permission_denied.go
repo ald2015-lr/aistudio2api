@@ -21,11 +21,12 @@ import (
 )
 
 // 403 无权限账户登记：生成请求返回 HTTP 403 PERMISSION_DENIED（The caller does not have permission，协议错误码 7）的账户
-// 按模型记下通道、首次与最近一次的时间、次数与上游原文，管理页账户列表上方单独列出。这类账户多半是没有同意 Google 的政策，
+// 按模型记下通道、首次与最近一次的时间、次数、上游原文与最近一次的请求来源（见 permissionDeniedRequest），管理页账户列表上方单独列出。这类账户多半是没有同意 Google 的政策，
 // 冷却到期后仍然 403，只有重新获取认证文件上传才能恢复；冷却列表按模型汇总、到期即消失，看不出是哪些账户。
 // 认证文件更新（外部更新、浏览器登录、重新导入，以及服务停止期间替换了认证文件，见 reconcilePermissionDenied）时清除该账户的登记，
 // 并清除它的 403 冷却与暂停，让它立即重新参与调度；之后在某个模型的某个通道上成功时清除该模型这个通道的登记。
-// 号池级 403（见 forbiddenSystemicAccounts）不是账户的问题，不登记，判定成立前登记的也撤销（见 dropSystemic）。
+// 号池级 403（见 forbiddenSystemicAccounts）不是账户的问题，不登记，判定成立前登记的也撤销（见 dropSystemic）。登记不会过期；管理页可以
+// 按账户或全部清除（见 ClearPermissionDenied，冷却只解除需要验证账号的整户暂停）。
 // 保存在账户目录下的 .permission-denied.json，不写入各账户的 account.json 与 runtime-state.json
 const (
 	permissionDeniedFileName  = ".permission-denied.json"
@@ -41,6 +42,45 @@ type permissionDeniedModel struct {
 	LastAt   time.Time `json:"last_at"`
 	Count    int       `json:"count"`
 	Message  string    `json:"message,omitempty"`
+	// LastRequest 为最近一次 403 的请求来源（见 permissionDeniedRequest）；旧版本保存的文件里没有，照常读入。每次登记都换成这一次的，
+	// 这一次拿不到时清空，不留下更早那次的来源
+	LastRequest *permissionDeniedRequest `json:"last_request,omitempty"`
+}
+
+// permissionDeniedRequest 为一个模型最近一次 403 的请求来源：管理员没有调用过这个模型却看到它的 403 时，据此看出是谁、从哪个接口、
+// 以什么形态调用的（new-api 渠道测试、下游带图请求、目录别名、直连 interactions 等，见 tools/diag_403.sh）。不记 API 密钥、IP、
+// User-Agent 与提示词。ID 为请求 ID（与请求日志、用量账本相同）；Path 为请求日志记下的接口路径（带 /ultra、/trace 前缀）；
+// RequestedModel 为 request.started 记下的模型名（客户端请求的名字：协议层已解析名称后缀，号池目录里的别名还没换成正式 ID），
+// 与登记的模型相同时省略；Messages、Images、Files 按生成服务收到的请求（协议转换之后、换号与上传 Drive 之前）计：消息条数、
+// 内联图片数（image/* 的内联数据）与文件引用数（Drive、文件接口的引用），为 0 时省略。不经公开 API 的调用没有 Path 与 RequestedModel
+type permissionDeniedRequest struct {
+	ID             string `json:"id,omitempty"`
+	Path           string `json:"path,omitempty"`
+	RequestedModel string `json:"requested_model,omitempty"`
+	Messages       int    `json:"messages,omitempty"`
+	Images         int    `json:"images,omitempty"`
+	Files          int    `json:"files,omitempty"`
+}
+
+// permissionDeniedRequestOf 按生成请求与请求日志取得这次 403 的请求来源（见 permissionDeniedRequest）；modelID 为登记的模型
+func permissionDeniedRequestOf(ctx context.Context, request aistudio.GenerateRequest, modelID string) *permissionDeniedRequest {
+	last := &permissionDeniedRequest{ID: strings.TrimSpace(request.ID), Messages: len(request.Contents)}
+	path, requested := api.AccessLogRequestInfo(ctx)
+	last.Path = path
+	if requested = strings.TrimPrefix(strings.TrimSpace(requested), "models/"); requested != modelID {
+		last.RequestedModel = requested
+	}
+	for _, content := range request.Contents {
+		for _, part := range content.Parts {
+			if part.InlineData != nil && strings.HasPrefix(strings.ToLower(part.InlineData.MIME), "image/") {
+				last.Images++
+			}
+			if part.File != nil {
+				last.Files++
+			}
+		}
+	}
+	return last
 }
 
 type permissionDeniedAccount struct {
@@ -155,9 +195,17 @@ func (registry *permissionDeniedRegistry) load() error {
 }
 
 // record 登记一次 403 无权限：账户在该模型该通道上返回了 403。identity 为账户当前登录签名 Cookie 的指纹（见 permissionDeniedAccount.Identity），
-// 为空时保留之前记下的
+// 为空时保留之前记下的。不带请求来源（见 recordRequest）
 func (registry *permissionDeniedRegistry) record(
 	accountID string, modelID string, channel aistudio.Channel, message string, identity string, now time.Time,
+) {
+	registry.recordRequest(accountID, modelID, channel, message, identity, now, nil)
+}
+
+// recordRequest 与 record 相同，另记下这次 403 的请求来源（last 为空时清空之前记下的）
+func (registry *permissionDeniedRegistry) recordRequest(
+	accountID string, modelID string, channel aistudio.Channel, message string, identity string, now time.Time,
+	last *permissionDeniedRequest,
 ) {
 	if registry == nil || accountID == "" || modelID == "" {
 		return
@@ -189,6 +237,7 @@ func (registry *permissionDeniedRegistry) record(
 	model.LastAt = now
 	model.Count++
 	model.Message = message
+	model.LastRequest = last
 	registry.scheduleSaveLocked()
 }
 
@@ -607,8 +656,11 @@ func (service *trackedService) permissionDeniedSucceeded(accountID string, model
 	}
 }
 
-// recordPermissionDenied 登记账户在该模型该通道上的一次 403 无权限，同时记下账户当前登录签名 Cookie 的指纹
-func (service *trackedService) recordPermissionDenied(accountID string, modelID string, channel aistudio.Channel, message string, now time.Time) {
+// recordPermissionDenied 登记账户在该模型该通道上的一次 403 无权限，同时记下账户当前登录签名 Cookie 的指纹与这次的请求来源
+// （last，见 permissionDeniedRequestOf；为空时不记）
+func (service *trackedService) recordPermissionDenied(
+	accountID string, modelID string, channel aistudio.Channel, message string, now time.Time, last *permissionDeniedRequest,
+) {
 	if service == nil || service.permissionDenied == nil {
 		return
 	}
@@ -616,7 +668,7 @@ func (service *trackedService) recordPermissionDenied(accountID string, modelID 
 	if service.pool != nil {
 		identity, _ = service.pool.LoginIdentity(accountID)
 	}
-	service.permissionDenied.record(accountID, modelID, channel, message, identity, now)
+	service.permissionDenied.recordRequest(accountID, modelID, channel, message, identity, now, last)
 }
 
 // dropSystemicPermissionDenied 号池级 403 判定成立后撤销号池里该模型的登记：起点为号池里该模型最近一次成功的时间
@@ -715,10 +767,17 @@ func (admin *runtimeAdmin) PermissionDenied(context.Context) ([]api.AdminPermiss
 		}
 		models := make([]api.AdminPermissionDeniedModel, 0, len(entry.models))
 		for _, model := range entry.models {
-			models = append(models, api.AdminPermissionDeniedModel{
+			item := api.AdminPermissionDeniedModel{
 				Model: model.modelID, Channels: model.model.Channels, Count: model.model.Count,
 				FirstAt: model.model.FirstAt, LastAt: model.model.LastAt, Message: model.model.Message,
-			})
+			}
+			if last := model.model.LastRequest; last != nil {
+				item.LastRequest = &api.AdminPermissionDeniedRequest{
+					ID: last.ID, Path: last.Path, RequestedModel: last.RequestedModel,
+					Messages: last.Messages, Images: last.Images, Files: last.Files,
+				}
+			}
+			models = append(models, item)
 		}
 		result = append(result, api.AdminPermissionDenied{
 			ID: entry.accountID, Label: label, Models: models, Count: entry.count,

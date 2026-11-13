@@ -691,7 +691,7 @@ Worker 与登录驱动经 `aistudio.acquireProxyRelay` 申请：中转解析不�
 | 生成服务 | `POST /api/control/start`、`POST /api/control/stop` |
 | 配置 | `GET /api/config`、`PUT /api/config` |
 | 冷却与请求 | `GET /api/cooldowns`、`GET /api/requests`、`POST /api/requests/{id}/cancel` |
-| 403 无权限账户与组织停用账户 | `GET /api/accounts/permission-denied`（另带 `org_disabled`）、`POST /api/accounts/permission-denied/clear`、`POST /api/accounts/org-disabled/clear` |
+| 403 无权限账户与组织停用账户 | `GET /api/accounts/permission-denied`（另带 `org_disabled`；模型条目可带 `last_request`：最近一次 403 的请求 ID、接口、请求名与消息、内联图片、文件引用数）、`POST /api/accounts/permission-denied/clear`（返回 `cleared` 与 `lifted`；清除时只解除需要验证账号的整户暂停，指定的账户不在登记表里时同样解除，`all` 对号池里全部账户生效）、`POST /api/accounts/org-disabled/clear` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 
 `/api` 接受 loopback 请求，并在请求带 `Origin` 时执行 same-origin 校验。`/v1` 与 `/v1beta` 使用公开 API key 与 CORS。`authMiddleware` 经 `requestAPIKeyMatches` 逐个比较 `?key=`、`X-Goog-API-Key`、`X-API-Key`、`Api-Key` 与 `Authorization: Bearer`（`bearerToken`），每个来源都按常量时间比较，任一相同即放行并标记访问日志已通过校验；不再只取优先级最高的一个来源。

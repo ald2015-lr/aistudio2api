@@ -274,6 +274,9 @@ type RequestLog struct {
 	ServedModel string `json:"served_model,omitempty"`
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时不出现
 	FallbackFrom string `json:"fallback_from,omitempty"`
+	// RequestedModel 只在 request.finished 里、客户端请求的模型名与最终的 Model 不同时出现（请求了目录别名、经 MODEL_FALLBACKS 改用等），
+	// 与同一请求 request.started 的 model 含义相同
+	RequestedModel string `json:"requested_model,omitempty"`
 	// Downgrade 为降级判定的依据（只有被拦截的模型才有）
 	Downgrade       *aistudio.DowngradeDecision `json:"downgrade,omitempty"`
 	Error           string                      `json:"error,omitempty"`
@@ -370,6 +373,8 @@ type AccessLog struct {
 	Error        string
 	Canceled     bool
 	Generation   bool
+	// RequestedModel 为写 request.started 时的模型名（客户端请求的名字，号池目录里的别名还没换成正式 ID）；只在请求结果日志里填写
+	RequestedModel string
 	// Attempts 为最终结果之前未成功的上游尝试
 	Attempts []RequestAttempt
 	// Authorized 表示请求通过了公开 API key 校验
@@ -615,6 +620,20 @@ type AdminPermissionDeniedModel struct {
 	FirstAt  time.Time `json:"first_at"`
 	LastAt   time.Time `json:"last_at"`
 	Message  string    `json:"message,omitempty"`
+	// LastRequest 为最近一次 403 的请求来源；旧版本登记的条目没有
+	LastRequest *AdminPermissionDeniedRequest `json:"last_request,omitempty"`
+}
+
+// AdminPermissionDeniedRequest 为一个模型最近一次 403 的请求来源，用来看出是谁、从哪个接口、以什么形态调用的（不含 API 密钥、IP、
+// User-Agent 与提示词）：ID 为请求 ID（与请求日志、用量账本相同），Path 为接口路径；RequestedModel 为客户端请求的模型名，与登记的模型
+// 相同时省略；Messages、Images、Files 为消息条数、内联图片数与文件引用（Drive、文件接口）数，为 0 时省略
+type AdminPermissionDeniedRequest struct {
+	ID             string `json:"id,omitempty"`
+	Path           string `json:"path,omitempty"`
+	RequestedModel string `json:"requested_model,omitempty"`
+	Messages       int    `json:"messages,omitempty"`
+	Images         int    `json:"images,omitempty"`
+	Files          int    `json:"files,omitempty"`
 }
 
 // PermissionDeniedClearInput 表示要清除记录的账户；All 为真时清除全部（组织停用账户的清除接口共用）

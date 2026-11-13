@@ -28,6 +28,10 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
 		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect, FallbackFrom: entry.FallbackFrom,
 	}
+	// 客户端请求的模型名与最终模型不同时（请求了目录别名、经 MODEL_FALLBACKS 改用等）另记 requested_model；只有请求结果日志带
+	if requested := entry.RequestedModel; requested != "" && requested != entry.Model {
+		data.RequestedModel = requested
+	}
 	if entry.Generation {
 		data.Parameters = map[string]string{
 			"temperature": entry.Temperature, "top_p": entry.TopP, "top_k": entry.TopK,

@@ -52,6 +52,11 @@ func TestPermissionDeniedRoutes(t *testing.T) {
 		Models: []AdminPermissionDeniedModel{{
 			Model: "pro", Channels: []string{"build", "playground"}, Count: 3, FirstAt: at, LastAt: at.Add(time.Minute),
 			Message: "The caller does not have permission",
+			LastRequest: &AdminPermissionDeniedRequest{
+				ID: "chatcmpl_1", Path: "/v1/chat/completions", RequestedModel: "pro-alias", Messages: 1, Images: 2,
+			},
+		}, {
+			Model: "flash", Channels: []string{"playground"}, Count: 1, FirstAt: at, LastAt: at,
 		}},
 	}}}
 	handler := NewHandler(modelListService{}, Config{APIKey: "sk-test", AdminToken: testAdminToken, Admin: admin})
@@ -78,8 +83,17 @@ func TestPermissionDeniedRoutes(t *testing.T) {
 		}
 	}
 	models, _ := account["models"].([]any)
-	if len(models) != 1 {
+	if len(models) != 2 {
 		t.Fatalf("模型条目 = %v", account["models"])
+	}
+	// 最近一次请求：为 0 的计数与空字段省略；旧版本登记的条目（没有来源）不输出 last_request
+	last, _ := models[0].(map[string]any)["last_request"].(map[string]any)
+	if last["id"] != "chatcmpl_1" || last["path"] != "/v1/chat/completions" || last["requested_model"] != "pro-alias" ||
+		last["messages"] != float64(1) || last["images"] != float64(2) || len(last) != 5 {
+		t.Fatalf("last_request = %v", last)
+	}
+	if _, ok := models[1].(map[string]any)["last_request"]; ok {
+		t.Fatalf("没有来源的条目不应输出 last_request：%v", models[1])
 	}
 	model, _ := models[0].(map[string]any)
 	for _, field := range []string{"model", "channels", "count", "first_at", "last_at", "message"} {
