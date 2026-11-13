@@ -920,19 +920,15 @@ async function removeAccount(account: Account): Promise<void> {
 
 // ---------- 筛选、排序、分页与选择 ----------
 
-// problem 为“出问题”：403 无权限、组织已停用、需要登录、不可用的账户，按原因列出
+// problem 为“出问题”：只汇总 403 无权限的账户，按原因列出。需要登录、组织已停用、不可用各有单独的状态筛选，不计入
 type StateFilter = 'all' | 'problem' | AccountState
-// ProblemKind 为出问题账户的类型：需要验证账号的 403（含 403 记录已清除、整户暂停还在的账户）、多个模型的 403、只有一个模型的 403、
-// 需要登录、组织已停用、不可用；陈旧的 403 记录不计入（见 PERMISSION_DENIED_STALE_HOURS）。以后有新的问题类型在这里加
-type ProblemKind =
-  'verify' | 'forbidden' | 'model_forbidden' | 'auth_required' | 'org_disabled' | 'unavailable'
+// ProblemKind 为出问题账户的 403 类型：需要验证账号（含 403 记录已清除、整户暂停还在的账户）、多个模型、只有一个模型；
+// 陈旧的 403 记录不计入（见 PERMISSION_DENIED_STALE_HOURS）。以后有新的 403 类型在这里加
+type ProblemKind = 'verify' | 'forbidden' | 'model_forbidden'
 const problemKindOptions: { value: ProblemKind; label: TranslationKey }[] = [
   { value: 'verify', label: 'accounts.problemKindVerify' },
   { value: 'forbidden', label: 'accounts.problemKindForbidden' },
   { value: 'model_forbidden', label: 'accounts.problemKindModelForbidden' },
-  { value: 'auth_required', label: 'state.auth_required' },
-  { value: 'org_disabled', label: 'accounts.problemOrgDisabled' },
-  { value: 'unavailable', label: 'state.unavailable' },
 ]
 type WorkerFilter = 'all' | WorkerState
 // AccountTier 为筛选与显示用的权益：unknown 表示权益尚未从官网读取
@@ -1155,12 +1151,26 @@ const ultraReady = computed(
     props.accounts.filter((account) => inUltraPool(account) && account.state === 'ready').length,
 )
 
-// problemReasons 为出问题的账户及原因（账户 ID → 原因，多个原因用“；”连接）：403 无权限（模型与上游原文）、组织已停用、
-// 需要登录与不可用（状态说明）。403 与组织停用的列表与页面上方的两张表同源，约 15 秒刷新一次
-// problemKinds 为每个出问题账户的问题类型（同一账户可以有多种），供“问题类型”下拉按类型分开查看
+// problemReasons 为出问题的账户及原因（账户 ID → 原因，多个原因用“；”连接）：只有 403 无权限（模型与上游原文），
+// 以及 403 记录已清除、需要验证账号的整户暂停还在的账户（暂停原因）。需要登录、组织已停用、不可用已有单独的状态筛选，
+// 这些账户即使有 403 记录或整户暂停也不在这里重复计（见 problemExcluded）。403 列表与页面上方的表同源，约 15 秒刷新一次
+// problemKinds 为每个出问题账户的 403 类型（同一账户可以有多种），供“问题类型”下拉按类型分开查看
 const problemInfo = computed(() => {
   const reasons = new Map<string, string[]>()
   const kinds = new Map<string, Set<ProblemKind>>()
+  // problemExcluded 为不计入的账户：状态为需要登录、组织已停用、不可用的账户，另并入组织停用表（账户列表还没刷新到时）。
+  // 它们的 403 记录在重新登录或更新认证文件后一并清除，上方 403 列表照常列出、可按行清除
+  const problemExcluded = new Set<string>(
+    props.accounts
+      .filter(
+        (account) =>
+          account.state === 'auth_required' ||
+          account.state === 'org_disabled' ||
+          account.state === 'unavailable',
+      )
+      .map((account) => account.id),
+  )
+  for (const account of orgDisabled.value) problemExcluded.add(account.id)
   const add = (id: string, reason: string, kind: ProblemKind): void => {
     const list = reasons.get(id)
     if (list === undefined) reasons.set(id, [reason])
@@ -1179,6 +1189,7 @@ const problemInfo = computed(() => {
   // 403 记录：每个模型带“最近 MM-DD HH:MM · N 次”；有账户级条目的为 verify，否则按不陈旧的条目数分为单个模型与多个模型，
   // 全部陈旧的账户不计入（上方 403 列表里灰显）
   for (const account of permissionDenied.value) {
+    if (problemExcluded.has(account.id)) continue
     const view = permissionDeniedViews.value.get(account.id)
     if (view === undefined || (!view.verify && view.fresh.length === 0)) continue
     const counted = view.verify ? account.models : view.fresh
@@ -1213,26 +1224,8 @@ const problemInfo = computed(() => {
   }
   // 需要验证账号的整户暂停还在、登记表里却没有账户级记录（旧版本点过“清除记录”）：同样列为需要验证账号，原因写暂停原因
   for (const [id, pause] of forbiddenCooldownState.value.verifyPaused) {
-    if (kinds.get(id)?.has('verify')) continue
+    if (problemExcluded.has(id) || kinds.get(id)?.has('verify')) continue
     add(id, `${t('accounts.problemVerifyPaused')}：${pause.reason}`, 'verify')
-  }
-  for (const account of orgDisabled.value) {
-    add(
-      account.id,
-      `${t('accounts.problemOrgDisabled')}${account.message ? `：${account.message}` : ''}`,
-      'org_disabled',
-    )
-  }
-  for (const account of props.accounts) {
-    if (
-      account.state !== 'auth_required' &&
-      account.state !== 'unavailable' &&
-      account.state !== 'org_disabled'
-    )
-      continue
-    if (account.state === 'org_disabled' && reasons.has(account.id)) continue
-    const label = t(stateKeys[account.state])
-    add(account.id, account.message ? `${label}：${account.message}` : label, account.state)
   }
   const joined = new Map<string, string>()
   for (const [id, list] of reasons) joined.set(id, list.join('；'))
@@ -1241,14 +1234,7 @@ const problemInfo = computed(() => {
 const problemReasons = computed(() => problemInfo.value.reasons)
 // problemKindCounts 为各问题类型的账户数（下拉里显示）
 const problemKindCounts = computed(() => {
-  const counts: Record<ProblemKind, number> = {
-    verify: 0,
-    forbidden: 0,
-    model_forbidden: 0,
-    auth_required: 0,
-    org_disabled: 0,
-    unavailable: 0,
-  }
+  const counts: Record<ProblemKind, number> = { verify: 0, forbidden: 0, model_forbidden: 0 }
   for (const set of problemInfo.value.kinds.values()) for (const kind of set) counts[kind] += 1
   return counts
 })
