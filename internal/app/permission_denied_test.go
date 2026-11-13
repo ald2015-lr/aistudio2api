@@ -1154,3 +1154,31 @@ func TestPermissionDeniedAccountLevelClearedOnAnySuccess(t *testing.T) {
 		t.Fatalf("剩余登记 = %+v，期望只剩 p@example.com 的 model-b", entries)
 	}
 }
+
+// TestVerifyRequiredPausesAccount 上游要求先验证账号（verify-account）时整个账户暂停调度（不只冷却这个模型），
+// 请求换到其他账户完成；清除 403 状态（管理页验证通过、认证文件更新）时解除暂停
+func TestVerifyRequiredPausesAccount(t *testing.T) {
+	upstream := &forbiddenUpstream{
+		denied:  map[string]bool{forbiddenBad: true},
+		message: "Your account must be verified before it can continue using the Gemini API. Verify your account at https://aistudio.google.com/verify-account.",
+	}
+	service, pool := primaryBusyService(t, upstream, forbiddenBad, forbiddenGood)
+	withPermissionDenied(t, service)
+	preverifyRuntimeModelAccess(t, pool, forbiddenGood)
+	if text, err, _ := runAccountRequest(t, service, "req-verify-pause", ""); err != nil || text != "hello" {
+		t.Fatalf("应换到其他账户完成：text=%q err=%v", text, err)
+	}
+	if !pool.AccountCoolingDown(forbiddenBad, "") || !hasLogContaining(service.requests, "账号暂停调度 | 原因="+verifyRequiredPauseReason) {
+		t.Fatalf("需要验证账号时整个账户应暂停调度，日志 = %v", serviceLogMessages(service.requests))
+	}
+	if pool.AccountCoolingDown(forbiddenGood, "") {
+		t.Fatal("正常账户不应暂停")
+	}
+	if !forbiddenCooldown("", aistudio.CooldownState{Reason: verifyRequiredPauseReason}) {
+		t.Fatal("整户暂停应能按 403 冷却清除")
+	}
+	service.clearPermissionDeniedState(forbiddenBad, "账户验证")
+	if pool.AccountCoolingDown(forbiddenBad, "") {
+		t.Fatal("清除 403 状态后应解除暂停")
+	}
+}

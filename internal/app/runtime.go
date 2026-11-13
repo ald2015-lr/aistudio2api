@@ -6082,7 +6082,10 @@ func (service *trackedService) generateForModel(
 		}
 		// 号池级 403：号池内多个账号对该模型连续 403、这段时间又没有任何成功，多半是 proof、请求形态等号池一侧的问题，不是账号没有
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
-		if modelDenied && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
+		// verifyRequired：上游要求先验证账号（Your account must be verified … verify-account）。账户级的问题，与模型和号池一侧都无关：
+		// 不参与号池级 403 判定（大批账号同时要求验证时不能当成号池一侧的问题而不冷却），整个账户暂停调度直到验证通过（见下文）
+		verifyRequired := modelDenied && accountLevelPermissionDenied(attemptErr.Error())
+		if modelDenied && !verifyRequired && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
 			modelDenied = false
 			// 判定成立之前号池里的 403 已经登记为无权限账户：撤销号池里该模型自最近一次成功以来登记的全部条目（不只是判定记着的
 			// 几个账号），免得修复后列表里留下一批正常账户
@@ -6114,6 +6117,23 @@ func (service *trackedService) generateForModel(
 					maxAttempts++
 				}
 				service.retireCooledWorker(request.AccountID, modelID, aistudio.QuotaCooldown{Until: until, Kind: "无权限", Reason: reason})
+			}
+			if verifyRequired {
+				// 需要验证账号：整个账户暂停调度（全部模型与通道），直到在管理页验证通过、认证文件更新或清除 403 记录（这几处按
+				// forbiddenCooldown 清除 403 冷却与暂停）；verifyRequiredPause 只是兜底的上限，到期后再 403 会重新暂停
+				pauseUntil := time.Now().Add(verifyRequiredPause)
+				pauseReason := verifyRequiredPauseReason
+				if stateErr := service.pool.MarkCooldownIfGeneration(
+					request.AccountID, "", lease.ModelAccessGeneration(), lease.CheckedAt(), pauseUntil, pauseReason,
+				); stateErr == nil {
+					cooled, modelForbidden = true, true
+					// 同账号的其他通道同样被暂停：不在同账号上再试
+					attempted[request.AccountID] = struct{}{}
+					service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+						"账号暂停调度 | 原因=%s | 恢复=验证通过、认证文件更新或清除 403 记录（最迟 %s）",
+						pauseReason, pauseUntil.Format(time.RFC3339),
+					))
+				}
 			}
 		}
 		// 输入 token 超过上限（提示词过长）与账号无关：不冷却、不按一般失败换号，对外按 400 返回（上游有时按 429 返回这个错误，

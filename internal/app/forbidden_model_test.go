@@ -22,6 +22,8 @@ type forbiddenUpstream struct {
 	quota  map[string]bool
 	delay  time.Duration
 	calls  []string
+	// message 不为空时代替 403 的上游原文
+	message string
 }
 
 func (upstream *forbiddenUpstream) Models(context.Context) ([]aistudio.Model, error) { return nil, nil }
@@ -46,7 +48,11 @@ func (upstream *forbiddenUpstream) Generate(ctx context.Context, request aistudi
 	upstream.mu.Lock()
 	upstream.calls = append(upstream.calls, request.AccountID)
 	denied, quota, delay := upstream.denied[request.AccountID], upstream.quota[request.AccountID], upstream.delay
+	message := upstream.message
 	upstream.mu.Unlock()
+	if message == "" {
+		message = "The caller does not have permission"
+	}
 	if delay > 0 {
 		select {
 		case <-time.After(delay):
@@ -57,7 +63,7 @@ func (upstream *forbiddenUpstream) Generate(ctx context.Context, request aistudi
 	if denied {
 		return nil, &aistudio.RPCError{
 			Method: "GenerateContent", StatusCode: http.StatusForbidden, Code: 7,
-			Message: "The caller does not have permission",
+			Message: message,
 		}
 	}
 	if quota {

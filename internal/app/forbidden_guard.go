@@ -34,6 +34,11 @@ const (
 	// 认证文件更新后按它们找出 403 无权限的冷却并清除（见 forbiddenCooldown）
 	forbiddenModelReasonPrefix = "无权限（模型）: "
 	forbiddenPauseReasonSuffix = "次返回 403 无权限，自动暂停"
+	// verifyRequiredPause 为需要验证账号（403 Your account must be verified … verify-account）时整个账户暂停调度的上限：
+	// 实际在管理页验证通过、认证文件更新或清除 403 记录时立即解除（原因以 forbiddenPauseReasonSuffix 结尾，按 forbiddenCooldown 清除）
+	verifyRequiredPause = 30 * 24 * time.Hour
+	// verifyRequiredPauseReason 为需要验证账号时整个账户暂停的冷却原因
+	verifyRequiredPauseReason = "需要验证账号（verify-account），在官网验证后到管理页点验证；已 1 " + forbiddenPauseReasonSuffix
 )
 
 type forbiddenEvent struct {
