@@ -856,6 +856,14 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 	status, _ := admin.pool.StatusOf(accountID)
 	failed, reason := onboardVerifyFailure(verification, status)
 	authenticated := !failed
+	if authenticated && !verification.OrgDisabled {
+		// 手动验证通过（登录有效）：清除 403 无权限记录与冷却（与认证文件更新相同）。需要验证账号（verify-account）的账户在官网完成
+		// 验证后点“验证”即从 403 列表移出、重新参与调度；仍然 403 时下一次请求会重新登记
+		admin.service.clearPermissionDeniedState(accountID, "账户验证")
+		if refreshed, refreshErr := admin.account(accountID); refreshErr == nil {
+			account = refreshed
+		}
+	}
 	account.Authenticated = &authenticated
 	account.VerifyReason = reason
 	if verification.OrgDisabled {

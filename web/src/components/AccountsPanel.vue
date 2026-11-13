@@ -692,6 +692,15 @@ async function removeAccount(account: Account): Promise<void> {
 
 // problem 为“出问题”：403 无权限、组织已停用、需要登录、不可用的账户，按原因列出
 type StateFilter = 'all' | 'problem' | AccountState
+// ProblemKind 为出问题账户的类型：需要验证账号的 403、其他 403、需要登录、组织已停用、不可用；以后有新的问题类型在这里加
+type ProblemKind = 'verify' | 'forbidden' | 'auth_required' | 'org_disabled' | 'unavailable'
+const problemKindOptions: { value: ProblemKind; label: TranslationKey }[] = [
+  { value: 'verify', label: 'accounts.problemKindVerify' },
+  { value: 'forbidden', label: 'accounts.problemKindForbidden' },
+  { value: 'auth_required', label: 'state.auth_required' },
+  { value: 'org_disabled', label: 'accounts.problemOrgDisabled' },
+  { value: 'unavailable', label: 'state.unavailable' },
+]
 type WorkerFilter = 'all' | WorkerState
 // AccountTier 为筛选与显示用的权益：unknown 表示权益尚未从官网读取
 type AccountTier = 'Ultra' | 'Pro' | 'Plus' | 'Free' | 'unknown'
@@ -868,6 +877,7 @@ function proxySearchText(account: Account): string {
 
 const query = ref('')
 const stateFilter = ref<StateFilter>('all')
+const problemKind = ref<'all' | ProblemKind>('all')
 const workerFilter = ref<WorkerFilter>('all')
 const tierFilter = ref<TierFilter>('all')
 const sortKey = ref<SortKey>('default')
@@ -914,12 +924,17 @@ const ultraReady = computed(
 
 // problemReasons 为出问题的账户及原因（账户 ID → 原因，多个原因用“；”连接）：403 无权限（模型与上游原文）、组织已停用、
 // 需要登录与不可用（状态说明）。403 与组织停用的列表与页面上方的两张表同源，约 15 秒刷新一次
-const problemReasons = computed(() => {
+// problemKinds 为每个出问题账户的问题类型（同一账户可以有多种），供“问题类型”下拉按类型分开查看
+const problemInfo = computed(() => {
   const reasons = new Map<string, string[]>()
-  const add = (id: string, reason: string): void => {
+  const kinds = new Map<string, Set<ProblemKind>>()
+  const add = (id: string, reason: string, kind: ProblemKind): void => {
     const list = reasons.get(id)
     if (list === undefined) reasons.set(id, [reason])
     else if (!list.includes(reason)) list.push(reason)
+    const set = kinds.get(id)
+    if (set === undefined) kinds.set(id, new Set([kind]))
+    else set.add(kind)
   }
   // 403 原文去掉“AI Studio GenerateContent 返回 HTTP 403、协议错误码 7: ”这类前缀，需要验证账号时在前面写明
   const brief = (message: string): string => {
@@ -938,15 +953,20 @@ const problemReasons = computed(() => {
       ),
     ]
     const models = account.models.map((model) => model.model).join(', ')
+    const verify = account.models.some((model) =>
+      /verify-account|must be verified/i.test(model.message ?? ''),
+    )
     add(
       account.id,
       `${t('accounts.problemPermissionDenied')}（${models}）${messages.length > 0 ? `：${messages.join(' / ')}` : ''}`,
+      verify ? 'verify' : 'forbidden',
     )
   }
   for (const account of orgDisabled.value) {
     add(
       account.id,
       `${t('accounts.problemOrgDisabled')}${account.message ? `：${account.message}` : ''}`,
+      'org_disabled',
     )
   }
   for (const account of props.accounts) {
@@ -958,18 +978,33 @@ const problemReasons = computed(() => {
       continue
     if (account.state === 'org_disabled' && reasons.has(account.id)) continue
     const label = t(stateKeys[account.state])
-    add(account.id, account.message ? `${label}：${account.message}` : label)
+    add(account.id, account.message ? `${label}：${account.message}` : label, account.state)
   }
   const joined = new Map<string, string>()
   for (const [id, list] of reasons) joined.set(id, list.join('；'))
-  return joined
+  return { reasons: joined, kinds }
+})
+const problemReasons = computed(() => problemInfo.value.reasons)
+// problemKindCounts 为各问题类型的账户数（下拉里显示）
+const problemKindCounts = computed(() => {
+  const counts: Record<ProblemKind, number> = {
+    verify: 0,
+    forbidden: 0,
+    auth_required: 0,
+    org_disabled: 0,
+    unavailable: 0,
+  }
+  for (const set of problemInfo.value.kinds.values()) for (const kind of set) counts[kind] += 1
+  return counts
 })
 
 const filtered = computed(() => {
   const term = query.value.trim().toLowerCase()
   const list = props.accounts.filter((account) => {
     if (stateFilter.value === 'problem') {
-      if (!problemReasons.value.has(account.id)) return false
+      const kinds = problemInfo.value.kinds.get(account.id)
+      if (kinds === undefined) return false
+      if (problemKind.value !== 'all' && !kinds.has(problemKind.value)) return false
     } else if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
@@ -1011,7 +1046,7 @@ const { page, pageSize, pageItems } = usePaging(
   50,
 )
 
-watch([query, stateFilter, workerFilter, tierFilter, sortKey], () => {
+watch([query, stateFilter, problemKind, workerFilter, tierFilter, sortKey], () => {
   page.value = 1
 })
 
@@ -1969,6 +2004,18 @@ function closeBulkPanel(): void {
         v-if="stateFilter === 'problem'"
         class="flex flex-wrap items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs"
       >
+        <select
+          v-model="problemKind"
+          class="input py-1 text-xs"
+          :aria-label="t('accounts.problemKind')"
+        >
+          <option value="all">
+            {{ t('accounts.problemKindAll') }} ({{ problemReasons.size }})
+          </option>
+          <option v-for="option in problemKindOptions" :key="option.value" :value="option.value">
+            {{ t(option.label) }} ({{ problemKindCounts[option.value] }})
+          </option>
+        </select>
         <strong class="text-red-300">{{
           tf('accounts.problemCount', { count: filtered.length })
         }}</strong>

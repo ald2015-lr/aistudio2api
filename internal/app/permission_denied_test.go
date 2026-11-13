@@ -1128,3 +1128,29 @@ func TestStorageStateDigestIgnoresWrittenBack(t *testing.T) {
 		t.Fatalf("磁盘与内存只差 AI Studio 的 localStorage 时 deniedAuthUpdated = (%t, %t)，期望 (false, true)", refresh, settled)
 	}
 }
+
+// TestPermissionDeniedAccountLevelClearedOnAnySuccess 需要验证账号的 403 是账户级的：任一模型成功即清除全部登记；
+// 普通 403 只清除成功的那个模型这个通道
+func TestPermissionDeniedAccountLevelClearedOnAnySuccess(t *testing.T) {
+	registry := newPermissionDeniedRegistry(t.TempDir(), nil)
+	at := time.Date(2026, 11, 13, 1, 0, 0, 0, time.UTC)
+	verify := "AI Studio GenerateContent 返回 HTTP 403、协议错误码 7: Your account must be verified before it can continue using the Gemini API. Verify your account at https://aistudio.google.com/verify-account."
+	registry.record("v@example.com", "model-a", aistudio.ChannelPlayground, verify, "", at)
+	registry.record("v@example.com", "model-b", aistudio.ChannelBuild, verify, "", at)
+	registry.record("p@example.com", "model-a", aistudio.ChannelPlayground, "The caller does not have permission", "", at)
+	registry.record("p@example.com", "model-b", aistudio.ChannelPlayground, "The caller does not have permission", "", at)
+
+	if !registry.succeeded("v@example.com", "model-c", aistudio.ChannelPlayground) {
+		t.Fatal("需要验证账号的 403：任一模型成功应清除全部登记")
+	}
+	if registry.succeeded("p@example.com", "model-c", aistudio.ChannelPlayground) {
+		t.Fatal("普通 403：其他模型成功不应清除")
+	}
+	if registry.succeeded("p@example.com", "model-a", aistudio.ChannelPlayground) {
+		t.Fatal("普通 403 按通道清除，不返回账户级")
+	}
+	entries := registry.list()
+	if len(entries) != 1 || entries[0].accountID != "p@example.com" || len(entries[0].models) != 1 {
+		t.Fatalf("剩余登记 = %+v，期望只剩 p@example.com 的 model-b", entries)
+	}
+}

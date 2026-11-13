@@ -192,24 +192,31 @@ func (registry *permissionDeniedRegistry) record(
 	registry.scheduleSaveLocked()
 }
 
-// succeeded 账户在该模型该通道上请求成功：清除这个通道的登记，模型的通道都清除后清除该模型。在每个成功的请求上调用，
-// 没有登记时只在读锁下查一次表，不与其他成功的请求争用
-func (registry *permissionDeniedRegistry) succeeded(accountID string, modelID string, channel aistudio.Channel) {
+// succeeded 账户在该模型该通道上请求成功：清除这个通道的登记，模型的通道都清除后清除该模型。账户的登记里有账户级的 403
+// （需要验证账号，见 accountLevelPermissionDenied）时，任一模型成功都说明账户已经恢复，清除它的全部登记并返回 true（调用方清除
+// 它其余模型的 403 冷却）。在每个成功的请求上调用，没有登记时只在读锁下查一次表，不与其他成功的请求争用
+func (registry *permissionDeniedRegistry) succeeded(accountID string, modelID string, channel aistudio.Channel) bool {
 	if registry == nil {
-		return
+		return false
 	}
 	registry.mu.RLock()
 	_, listed := registry.channelIndexLocked(accountID, modelID, channel)
+	accountLevel := registry.accountLevelLocked(accountID)
 	registry.mu.RUnlock()
-	if !listed {
-		return
+	if !listed && !accountLevel {
+		return false
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
+	if registry.accountLevelLocked(accountID) {
+		delete(registry.accounts, accountID)
+		registry.scheduleSaveLocked()
+		return true
+	}
 	// 释放读锁后可能已被其他请求清除，重新查找
 	index, listed := registry.channelIndexLocked(accountID, modelID, channel)
 	if !listed {
-		return
+		return false
 	}
 	account := registry.accounts[accountID]
 	model := account.Models[modelID]
@@ -221,6 +228,28 @@ func (registry *permissionDeniedRegistry) succeeded(accountID string, modelID st
 		delete(registry.accounts, accountID)
 	}
 	registry.scheduleSaveLocked()
+	return false
+}
+
+// accountLevelPermissionDenied 判断 403 原文是否说明是账户级的问题（需要验证账号：Your account must be verified …
+// verify-account）：与具体模型无关，账户验证通过后任一模型都能成功
+func accountLevelPermissionDenied(message string) bool {
+	lower := strings.ToLower(message)
+	return strings.Contains(lower, "verify-account") || strings.Contains(lower, "must be verified")
+}
+
+// accountLevelLocked 判断账户的登记里有没有账户级的 403；调用方持有 mu（读锁即可）
+func (registry *permissionDeniedRegistry) accountLevelLocked(accountID string) bool {
+	account := registry.accounts[accountID]
+	if account == nil {
+		return false
+	}
+	for _, model := range account.Models {
+		if model != nil && accountLevelPermissionDenied(model.Message) {
+			return true
+		}
+	}
+	return false
 }
 
 // channelIndexLocked 返回账户在该模型上登记的通道下标；调用方持有 mu（读锁即可）
@@ -518,6 +547,14 @@ func (service *trackedService) forgetPermissionDenied(accountID string, source s
 	}
 	// 新的认证文件同样可能是组织重新开放了 AI Studio 之后（或换了号）重新获取的：一并清除组织停用状态（见 org_disabled.go）
 	service.forgetOrgDisabled(accountID, source)
+	service.clearPermissionDeniedState(accountID, source)
+}
+
+// clearPermissionDeniedState 清除账户的 403 无权限登记、冷却与暂停（不动组织停用）：认证文件更新与手动验证通过时调用
+func (service *trackedService) clearPermissionDeniedState(accountID string, source string) {
+	if service == nil {
+		return
+	}
 	models := service.permissionDenied.clearAccount(accountID)
 	service.forbidden.forgetAccount(accountID)
 	cooldowns := 0
@@ -532,8 +569,33 @@ func (service *trackedService) forgetPermissionDenied(accountID string, source s
 		return
 	}
 	if service.requests != nil {
+		head := "认证文件已更新"
+		if source == "账户验证" {
+			head = "账户验证通过"
+		}
 		service.requests.log(accountID, "INFO", fmt.Sprintf(
-			"认证文件已更新，清除 403 无权限记录与冷却 | 来源=%s | 记录模型=%d | 冷却=%d", source, models, cooldowns,
+			"%s，清除 403 无权限记录与冷却 | 来源=%s | 记录模型=%d | 冷却=%d", head, source, models, cooldowns,
+		))
+	}
+	if cooldowns > 0 {
+		service.publishModelAccess()
+	}
+}
+
+// permissionDeniedSucceeded 账户在该模型该通道上请求成功：清除对应的 403 登记；账户级的 403（需要验证账号）在任一模型成功时
+// 清除全部登记，并清除它其余模型的 403 冷却与暂停，账户已在官网完成验证后立即重新参与这些模型的调度
+func (service *trackedService) permissionDeniedSucceeded(accountID string, modelID string, channel aistudio.Channel) {
+	if service == nil || !service.permissionDenied.succeeded(accountID, modelID, channel) {
+		return
+	}
+	service.forbidden.forgetAccount(accountID)
+	cooldowns := 0
+	if service.pool != nil {
+		cooldowns, _ = service.pool.ClearCooldownsMatching(accountID, forbiddenCooldown)
+	}
+	if service.requests != nil {
+		service.requests.log(accountID, "INFO", fmt.Sprintf(
+			"账户已通过验证（请求成功），清除需要验证账号的 403 记录与冷却 | 模型=%s | 冷却=%d", modelID, cooldowns,
 		))
 	}
 	if cooldowns > 0 {

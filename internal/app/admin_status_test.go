@@ -132,6 +132,24 @@ func TestVerifyAccountReportsAuthenticated(t *testing.T) {
 			t.Fatalf("日志 = %v", serviceLogMessages(admin.requests))
 		}
 	})
+	t.Run("有效时清除 403 无权限记录", func(t *testing.T) {
+		// 需要验证账号（verify-account）的账户在官网完成验证后点“验证”：从 403 列表移出
+		admin, _, accounts := enableTestAdmin(t, "verify-403@example.com")
+		admin.login = &verifyTestLogin{verification: aistudio.LoginVerification{Authenticated: true}}
+		admin.service.service = newProbeTestService(nil)
+		admin.service.permissionDenied = newPermissionDeniedRegistry(t.TempDir(), admin.requests)
+		admin.service.permissionDenied.record(accounts[0].ID, testRuntimeModel, aistudio.ChannelPlayground,
+			"Your account must be verified before it can continue using the Gemini API.", "", time.Now())
+		if _, err := admin.VerifyAccount(context.Background(), accounts[0].ID); err != nil {
+			t.Fatal(err)
+		}
+		if len(admin.service.permissionDenied.list()) != 0 {
+			t.Fatal("验证通过应清除 403 无权限记录")
+		}
+		if !hasLogContaining(admin.requests, "账户验证通过，清除 403 无权限记录与冷却 | 来源=账户验证") {
+			t.Fatalf("日志 = %v", serviceLogMessages(admin.requests))
+		}
+	})
 	t.Run("接口认证失败", func(t *testing.T) {
 		admin, _, accounts := enableTestAdmin(t, "verify-api@example.com")
 		admin.login = &verifyTestLogin{verification: aistudio.LoginVerification{Authenticated: true}}

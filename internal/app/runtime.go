@@ -5721,7 +5721,7 @@ func (service *trackedService) generateForModel(
 			// 真正成功过的账户：清掉登录复核的退避（见 auth_recheck.go）与坏号记录，记为近期成功（预热与替补优先，见 bad_accounts.go）
 			service.authRecheck.noteSuccess(request.AccountID)
 			service.workers.badAccountMemory().observe(request.AccountID, accountLabel, egressSuccess)
-			service.permissionDenied.succeeded(request.AccountID, modelID, lease.Channel())
+			service.permissionDeniedSucceeded(request.AccountID, modelID, lease.Channel())
 			if lease.Channel() == aistudio.ChannelBuild {
 				// Build 生成暂停中的试探成功，或暂停过的账号在 Build 上成功：解除暂停（见 build_pause.go）；没有暂停记录时不加锁
 				pauses.succeeded(request.AccountID, accountLabel, probeAttempt)
