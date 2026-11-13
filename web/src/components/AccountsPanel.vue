@@ -690,7 +690,8 @@ async function removeAccount(account: Account): Promise<void> {
 
 // ---------- 筛选、排序、分页与选择 ----------
 
-type StateFilter = 'all' | AccountState
+// problem 为“出问题”：403 无权限、组织已停用、需要登录、不可用的账户，按原因列出
+type StateFilter = 'all' | 'problem' | AccountState
 type WorkerFilter = 'all' | WorkerState
 // AccountTier 为筛选与显示用的权益：unknown 表示权益尚未从官网读取
 type AccountTier = 'Ultra' | 'Pro' | 'Plus' | 'Free' | 'unknown'
@@ -911,17 +912,76 @@ const ultraReady = computed(
     props.accounts.filter((account) => inUltraPool(account) && account.state === 'ready').length,
 )
 
+// problemReasons 为出问题的账户及原因（账户 ID → 原因，多个原因用“；”连接）：403 无权限（模型与上游原文）、组织已停用、
+// 需要登录与不可用（状态说明）。403 与组织停用的列表与页面上方的两张表同源，约 15 秒刷新一次
+const problemReasons = computed(() => {
+  const reasons = new Map<string, string[]>()
+  const add = (id: string, reason: string): void => {
+    const list = reasons.get(id)
+    if (list === undefined) reasons.set(id, [reason])
+    else if (!list.includes(reason)) list.push(reason)
+  }
+  // 403 原文去掉“AI Studio GenerateContent 返回 HTTP 403、协议错误码 7: ”这类前缀，需要验证账号时在前面写明
+  const brief = (message: string): string => {
+    const text = message.replace(/^.*?协议错误码 \d+:\s*/, '')
+    return /verify-account|must be verified/i.test(text)
+      ? `${t('accounts.problemVerifyRequired')}：${text}`
+      : text
+  }
+  for (const account of permissionDenied.value) {
+    const messages = [
+      ...new Set(
+        account.models
+          .map((model) => model.message ?? '')
+          .filter((m) => m !== '')
+          .map(brief),
+      ),
+    ]
+    const models = account.models.map((model) => model.model).join(', ')
+    add(
+      account.id,
+      `${t('accounts.problemPermissionDenied')}（${models}）${messages.length > 0 ? `：${messages.join(' / ')}` : ''}`,
+    )
+  }
+  for (const account of orgDisabled.value) {
+    add(
+      account.id,
+      `${t('accounts.problemOrgDisabled')}${account.message ? `：${account.message}` : ''}`,
+    )
+  }
+  for (const account of props.accounts) {
+    if (
+      account.state !== 'auth_required' &&
+      account.state !== 'unavailable' &&
+      account.state !== 'org_disabled'
+    )
+      continue
+    if (account.state === 'org_disabled' && reasons.has(account.id)) continue
+    const label = t(stateKeys[account.state])
+    add(account.id, account.message ? `${label}：${account.message}` : label)
+  }
+  const joined = new Map<string, string>()
+  for (const [id, list] of reasons) joined.set(id, list.join('；'))
+  return joined
+})
+
 const filtered = computed(() => {
   const term = query.value.trim().toLowerCase()
   const list = props.accounts.filter((account) => {
-    if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
+    if (stateFilter.value === 'problem') {
+      if (!problemReasons.value.has(account.id)) return false
+    } else if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
     if (term === '') return true
     // 代理按掩码后的显示值匹配，搜不到账号密码；IP 池的端口号或会话号也能搜
-    return [account.label, proxySearchText(account), account.message, account.benefit_tier].some(
-      (value) => value.toLowerCase().includes(term),
-    )
+    return [
+      account.label,
+      proxySearchText(account),
+      account.message,
+      account.benefit_tier,
+      problemReasons.value.get(account.id) ?? '',
+    ].some((value) => value.toLowerCase().includes(term))
   })
   if (sortKey.value === 'state') {
     list.sort(
@@ -1336,6 +1396,21 @@ async function bulkSelected(action: 'enable' | 'disable' | 'delete'): Promise<vo
     return
   }
   await enableTargets(targets.filter((account) => !account.enabled))
+}
+
+// copyProblems 复制当前筛选出的出问题账户：withReason 时每行“邮箱<Tab>原因”，否则每行一个邮箱
+async function copyProblems(withReason: boolean): Promise<void> {
+  const list = filtered.value.filter((account) => problemReasons.value.has(account.id))
+  if (list.length === 0) return
+  const lines = list.map((account) =>
+    withReason ? `${account.label}\t${problemReasons.value.get(account.id) ?? ''}` : account.label,
+  )
+  const copied = await copyText(lines.join('\n'))
+  emit(
+    'notice',
+    copied ? tf('accounts.problemCopied', { count: list.length }) : t('common.error'),
+    copied ? 'success' : 'error',
+  )
 }
 
 // copyEmails 复制账户邮箱（每行一个），便于在本地批量重新登录
@@ -1853,6 +1928,17 @@ function closeBulkPanel(): void {
             {{ t(stateKeys[state]) }}
             <span class="seg-count">{{ stateCounts[state] }}</span>
           </button>
+          <button
+            v-tooltip="t('accounts.problemHelp')"
+            class="seg-item"
+            :class="{ active: stateFilter === 'problem' }"
+            type="button"
+            @click="stateFilter = 'problem'"
+          >
+            <span class="dot bg-red-500"></span>
+            {{ t('accounts.filterProblem') }}
+            <span class="seg-count">{{ problemReasons.size }}</span>
+          </button>
         </div>
         <input
           v-model="query"
@@ -1876,6 +1962,34 @@ function closeBulkPanel(): void {
             {{ t(option.label) }}
           </option>
         </select>
+      </div>
+
+      <!-- 出问题的账户：一键复制邮箱与原因 -->
+      <div
+        v-if="stateFilter === 'problem'"
+        class="flex flex-wrap items-center gap-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-xs"
+      >
+        <strong class="text-red-300">{{
+          tf('accounts.problemCount', { count: filtered.length })
+        }}</strong>
+        <span class="text-gray-400">{{ t('accounts.problemHelp') }}</span>
+        <span class="flex-1"></span>
+        <button
+          class="btn btn-sm"
+          type="button"
+          :disabled="filtered.length === 0"
+          @click="copyProblems(true)"
+        >
+          {{ t('accounts.problemCopyWithReason') }}
+        </button>
+        <button
+          class="btn btn-sm"
+          type="button"
+          :disabled="filtered.length === 0"
+          @click="copyProblems(false)"
+        >
+          {{ t('accounts.copyEmails') }}
+        </button>
       </div>
 
       <!-- 选择工具条 -->
@@ -2011,7 +2125,14 @@ function closeBulkPanel(): void {
                     {{ account.label }}
                   </div>
                   <div
-                    v-if="account.message"
+                    v-if="stateFilter === 'problem' && problemReasons.has(account.id)"
+                    v-tooltip="problemReasons.get(account.id)"
+                    class="cell-truncate text-[11px] text-red-400"
+                  >
+                    {{ problemReasons.get(account.id) }}
+                  </div>
+                  <div
+                    v-else-if="account.message"
                     v-tooltip="account.message"
                     class="cell-truncate text-[11px] text-red-400"
                   >
