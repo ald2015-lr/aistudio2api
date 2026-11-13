@@ -22,9 +22,9 @@ func (admin *permissionDeniedAdmin) PermissionDenied(context.Context) ([]AdminPe
 	return admin.accounts, nil
 }
 
-func (admin *permissionDeniedAdmin) ClearPermissionDenied(_ context.Context, input PermissionDeniedClearInput) (int, error) {
+func (admin *permissionDeniedAdmin) ClearPermissionDenied(_ context.Context, input PermissionDeniedClearInput) (PermissionDeniedClearResult, error) {
 	admin.cleared = append(admin.cleared, input)
-	return len(input.AccountIDs), nil
+	return PermissionDeniedClearResult{Cleared: len(input.AccountIDs), Lifted: 1}, nil
 }
 
 func (admin *permissionDeniedAdmin) RecordAccessStart(AccessLog) {}
@@ -44,7 +44,7 @@ func postPermissionDeniedClear(handler http.Handler, body string) *httptest.Resp
 }
 
 // TestPermissionDeniedRoutes 403 无权限账户列表与清除接口：需要管理令牌；列表按 {"accounts":[...]} 返回邮箱、各模型的通道、次数、
-// 首次与最近时间、上游原文；清除接口把 account_ids / all 交给管理服务并返回清除数，请求体无效时返回 400
+// 首次与最近时间、上游原文；清除接口把 account_ids / all 交给管理服务并返回清除的登记数与解除的需要验证账号暂停数，请求体无效时返回 400
 func TestPermissionDeniedRoutes(t *testing.T) {
 	at := time.Date(2026, 10, 16, 8, 0, 0, 0, time.UTC)
 	admin := &permissionDeniedAdmin{accounts: []AdminPermissionDenied{{
@@ -92,7 +92,7 @@ func TestPermissionDeniedRoutes(t *testing.T) {
 	}
 
 	recorder = postPermissionDeniedClear(handler, `{"account_ids":["a@example.com","b@example.com"]}`)
-	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != `{"cleared":2}` {
+	if recorder.Code != http.StatusOK || strings.TrimSpace(recorder.Body.String()) != `{"cleared":2,"lifted":1}` {
 		t.Fatalf("清除 status = %d body = %s", recorder.Code, recorder.Body.String())
 	}
 	if len(admin.cleared) != 1 || !slices.Equal(admin.cleared[0].AccountIDs, []string{"a@example.com", "b@example.com"}) || admin.cleared[0].All {

@@ -1323,7 +1323,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `GET /api/accounts/permission-denied` | 200 | `{"accounts":[AdminPermissionDenied,...],"org_disabled":[AdminOrgDisabled,...]}`，`accounts` 按最近一次 403 从新到旧；`org_disabled` 为组织停用 AI Studio 的账户（见下文“组织停用 AI Studio 的账户”） |
 | `POST /api/egress/{id}/withdraw`、`resume` | 200 | `AdminStatus`（动作后的最新状态）；`{id}` 为 `AdminEgress.id`。`withdraw` 撤销该出口的判定，30 分钟内不再判定（交回逐级冷却），`resume` 取消撤销、回到 `normal`；只改内存，不落盘、不是配置项。没有这个出口或管理端不支持时 404 |
 | `POST /api/accounts/org-disabled/clear` | 200 | 请求体同下一行；清除组织停用状态、立即恢复调度，返回 `{"cleared":<清除的账户数>}` |
-| `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400；账户 ID 只去掉首尾空白，匹配不区分大小写）；返回 `{"cleared":<清除的账户数>}`，只清除记录、不解除冷却 |
+| `POST /api/accounts/permission-denied/clear` | 200 | 请求体 `{"account_ids":[...]}` 或 `{"all":true}`（两者都没有时 400；账户 ID 只去掉首尾空白，匹配不区分大小写）；返回 `{"cleared":<清除了登记的账户数>,"lifted":<解除需要验证账号整户暂停的账户数>}`；冷却只解除需要验证账号的整户暂停（指定的账户，登记表里没有它们时同样解除；`all` 时为号池里的全部账户），单模型 403 冷却与多模型 403 自动暂停不变 |
 | `GET /api/requests` | 200 | `{"requests":[AdminRequest,...]}` |
 | `POST /api/requests/{id}/cancel` | 204 | 空 body |
 | `DELETE /api/logs` | 204 | 空 body |

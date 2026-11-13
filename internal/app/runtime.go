@@ -6119,8 +6119,9 @@ func (service *trackedService) generateForModel(
 				service.retireCooledWorker(request.AccountID, modelID, aistudio.QuotaCooldown{Until: until, Kind: "无权限", Reason: reason})
 			}
 			if verifyRequired {
-				// 需要验证账号：整个账户暂停调度（全部模型与通道），直到在管理页验证通过、认证文件更新或清除 403 记录（这几处按
-				// forbiddenCooldown 清除 403 冷却与暂停）；verifyRequiredPause 只是兜底的上限，到期后再 403 会重新暂停
+				// 需要验证账号：整个账户暂停调度（全部模型与通道），直到在管理页验证通过、认证文件更新（这两处按 forbiddenCooldown
+				// 与其他 403 冷却一起清除）或管理页清除 403 记录（只解除这一种暂停，按 verifyRequiredPauseCooldown，见 liftVerifyRequiredPauses）；
+				// verifyRequiredPause 只是兜底的上限，到期后再 403 会重新暂停
 				pauseUntil := time.Now().Add(verifyRequiredPause)
 				pauseReason := verifyRequiredPauseReason
 				if stateErr := service.pool.MarkCooldownIfGeneration(

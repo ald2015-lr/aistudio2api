@@ -29,7 +29,7 @@ type AdminService interface {
 	UpdateRuntimeConfig(context.Context, RuntimeConfig) (RuntimeConfig, error)
 	Cooldowns(context.Context) ([]AdminCooldown, error)
 	PermissionDenied(context.Context) ([]AdminPermissionDenied, error)
-	ClearPermissionDenied(context.Context, PermissionDeniedClearInput) (int, error)
+	ClearPermissionDenied(context.Context, PermissionDeniedClearInput) (PermissionDeniedClearResult, error)
 	Requests(context.Context) ([]AdminRequest, error)
 	CancelRequest(context.Context, string) error
 	Events(context.Context) (<-chan AdminEvent, error)
@@ -623,6 +623,13 @@ type PermissionDeniedClearInput struct {
 	All        bool     `json:"all"`
 }
 
+// PermissionDeniedClearResult 为清除 403 无权限账户记录的结果：Cleared 为清除了登记的账户数，Lifted 为一并解除需要验证账号整户暂停的
+// 账户数（可以多于 Cleared：登记已经清除、暂停还在的账户也会解除，见 app 的 liftVerifyRequiredPauses）
+type PermissionDeniedClearResult struct {
+	Cleared int `json:"cleared"`
+	Lifted  int `json:"lifted"`
+}
+
 // AdminOrgDisabled 表示一个所属组织停用了 AI Studio 的账户（Google Workspace 账号的组织或 Google 关闭了这项服务）：载入 AI Studio
 // 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或 RPC 返回 HTTP 403 “AI Studio app is disabled”。重新登录也没用，
 // 账户不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复。Source 为第一次进入的来源（启动、模型目录、验证、登录、请求、
@@ -926,12 +933,12 @@ func (s *server) handleClearPermissionDenied(w http.ResponseWriter, r *http.Requ
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	cleared, err := s.config.Admin.ClearPermissionDenied(r.Context(), input)
+	result, err := s.config.Admin.ClearPermissionDenied(r.Context(), input)
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]int{"cleared": cleared})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) handleRequests(w http.ResponseWriter, r *http.Request) {

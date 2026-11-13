@@ -552,7 +552,9 @@ func (manager *runtimeManager) PermissionDenied(ctx context.Context) ([]api.Admi
 }
 
 // ClearPermissionDenied 清除当前生成服务的 403 无权限账户记录
-func (manager *runtimeManager) ClearPermissionDenied(ctx context.Context, input api.PermissionDeniedClearInput) (int, error) {
+func (manager *runtimeManager) ClearPermissionDenied(
+	ctx context.Context, input api.PermissionDeniedClearInput,
+) (api.PermissionDeniedClearResult, error) {
 	return manager.generation().admin.ClearPermissionDenied(ctx, input)
 }
 

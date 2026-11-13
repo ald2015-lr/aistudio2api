@@ -35,7 +35,8 @@ const (
 	forbiddenModelReasonPrefix = "无权限（模型）: "
 	forbiddenPauseReasonSuffix = "次返回 403 无权限，自动暂停"
 	// verifyRequiredPause 为需要验证账号（403 Your account must be verified … verify-account）时整个账户暂停调度的上限：
-	// 实际在管理页验证通过、认证文件更新或清除 403 记录时立即解除（原因以 forbiddenPauseReasonSuffix 结尾，按 forbiddenCooldown 清除）
+	// 实际在管理页验证通过、认证文件更新时与其他 403 冷却一起立即解除（原因以 forbiddenPauseReasonSuffix 结尾，按 forbiddenCooldown 清除），
+	// 管理页清除 403 记录时只解除这一种暂停（按 verifyRequiredPauseCooldown，见 liftVerifyRequiredPauses）
 	verifyRequiredPause = 30 * 24 * time.Hour
 	// verifyRequiredPauseReason 为需要验证账号时整个账户暂停的冷却原因
 	verifyRequiredPauseReason = "需要验证账号（verify-account），在官网验证后到管理页点验证；已 1 " + forbiddenPauseReasonSuffix
@@ -261,6 +262,12 @@ func (tracker *forbiddenTracker) forgetAccount(accountID string) {
 func forbiddenCooldown(_ string, cooldown aistudio.CooldownState) bool {
 	return strings.HasPrefix(cooldown.Reason, forbiddenModelReasonPrefix) ||
 		strings.HasSuffix(cooldown.Reason, forbiddenPauseReasonSuffix)
+}
+
+// verifyRequiredPauseCooldown 判断冷却是否为需要验证账号时的整户暂停（原因等于 verifyRequiredPauseReason）：管理页清除 403 记录时
+// 只解除它，单模型 403 冷却与多模型连续 403 的自动暂停不动
+func verifyRequiredPauseCooldown(_ string, cooldown aistudio.CooldownState) bool {
+	return cooldown.Reason == verifyRequiredPauseReason
 }
 
 // isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）。“AI Studio app is disabled”（账号所属组织停用了 AI Studio，

@@ -378,24 +378,27 @@ func (registry *permissionDeniedRegistry) clearAccount(accountID string) int {
 	return len(account.Models)
 }
 
-// clear 清除指定账户（all 为真时为全部账户）的登记，返回清除的账户数。账户 ID 不区分大小写：从磁盘导入的账户以目录名为 ID，
-// 不一定是小写，按原样精确匹配不到时再与登记表里的 ID 逐个按 strings.EqualFold 比较
-func (registry *permissionDeniedRegistry) clear(accountIDs []string, all bool) int {
+// clear 清除指定账户（all 为真时为全部账户）的登记，返回清除的账户 ID（登记表里的写法，即账户池的账户 ID）。账户 ID 不区分大小写：
+// 从磁盘导入的账户以目录名为 ID，不一定是小写，按原样精确匹配不到时再与登记表里的 ID 逐个按 strings.EqualFold 比较
+func (registry *permissionDeniedRegistry) clear(accountIDs []string, all bool) []string {
 	if registry == nil {
-		return 0
+		return nil
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	cleared := 0
+	var cleared []string
 	if all {
-		cleared = len(registry.accounts)
+		cleared = make([]string, 0, len(registry.accounts))
+		for accountID := range registry.accounts {
+			cleared = append(cleared, accountID)
+		}
 		clear(registry.accounts)
 	} else {
 		unmatched := make([]string, 0)
 		for _, accountID := range accountIDs {
 			if _, exists := registry.accounts[accountID]; exists {
 				delete(registry.accounts, accountID)
-				cleared++
+				cleared = append(cleared, accountID)
 			} else {
 				unmatched = append(unmatched, accountID)
 			}
@@ -404,14 +407,15 @@ func (registry *permissionDeniedRegistry) clear(accountIDs []string, all bool) i
 			for accountID := range registry.accounts {
 				if slices.ContainsFunc(unmatched, func(requested string) bool { return strings.EqualFold(requested, accountID) }) {
 					delete(registry.accounts, accountID)
-					cleared++
+					cleared = append(cleared, accountID)
 				}
 			}
 		}
 	}
-	if cleared > 0 {
+	if len(cleared) > 0 {
 		registry.scheduleSaveLocked()
 	}
+	sort.Strings(cleared)
 	return cleared
 }
 
@@ -724,9 +728,13 @@ func (admin *runtimeAdmin) PermissionDenied(context.Context) ([]api.AdminPermiss
 	return result, nil
 }
 
-// ClearPermissionDenied 按管理页的操作清除 403 无权限账户的登记（不改变冷却），返回清除的账户数。账户 ID 只去掉首尾空白，
-// 不转小写（与其他管理接口一致；从磁盘导入的账户 ID 是目录名，可能带大写），匹配时不区分大小写（见 permissionDeniedRegistry.clear）
-func (admin *runtimeAdmin) ClearPermissionDenied(_ context.Context, input api.PermissionDeniedClearInput) (int, error) {
+// ClearPermissionDenied 按管理页的操作清除 403 无权限账户的登记，返回清除了登记的账户数与解除需要验证账号整户暂停的账户数。
+// 冷却只解除一种：指定的账户（all 时为号池里的全部账户）需要验证账号的整户暂停（见 liftVerifyRequiredPauses），登记表里没有它们时
+// 同样解除；单模型 403 冷却与多模型连续 403 的自动暂停不变。账户 ID 只去掉首尾空白，不转小写（与其他管理接口一致；从磁盘导入的
+// 账户 ID 是目录名，可能带大写），匹配时不区分大小写（见 permissionDeniedRegistry.clear 与 matchPoolAccountIDs）
+func (admin *runtimeAdmin) ClearPermissionDenied(
+	ctx context.Context, input api.PermissionDeniedClearInput,
+) (api.PermissionDeniedClearResult, error) {
 	accountIDs := make([]string, 0, len(input.AccountIDs))
 	for _, accountID := range input.AccountIDs {
 		if accountID = strings.TrimSpace(accountID); accountID != "" {
@@ -734,17 +742,82 @@ func (admin *runtimeAdmin) ClearPermissionDenied(_ context.Context, input api.Pe
 		}
 	}
 	if !input.All && len(accountIDs) == 0 {
-		return 0, &adminOperationError{status: http.StatusBadRequest, code: "invalid_request", message: "需要 account_ids 或 all"}
+		return api.PermissionDeniedClearResult{}, &adminOperationError{status: http.StatusBadRequest, code: "invalid_request", message: "需要 account_ids 或 all"}
 	}
 	var registry *permissionDeniedRegistry
 	if admin.service != nil {
 		registry = admin.service.permissionDenied
 	}
 	cleared := registry.clear(accountIDs, input.All)
-	if cleared > 0 {
-		admin.requests.log("auth", "INFO", fmt.Sprintf("已清除 403 无权限账户记录 | 账户=%d", cleared))
+	if len(cleared) > 0 {
+		admin.requests.log("auth", "INFO", fmt.Sprintf("已清除 403 无权限账户记录 | 账户=%d", len(cleared)))
 	}
-	return cleared, nil
+	// 按账户清除时解除指定的账户：登记表里清到的（登记表的写法），以及登记表里没有、暂停还在的（管理页“解除暂停”传入的账户）
+	lifted := admin.service.liftVerifyRequiredPauses(append(cleared, accountIDs...), input.All, time.Now())
+	if lifted > 0 && admin.pool != nil {
+		// 冷却列表只在请求结束后推送：立即推送一次，管理页的冷却概况与“出问题”马上不再显示这些暂停
+		if cooldowns, err := admin.Cooldowns(ctx); err == nil {
+			admin.requests.publish(api.AdminEvent{Type: "cooldowns", Data: cooldowns})
+		}
+	}
+	return api.PermissionDeniedClearResult{Cleared: len(cleared), Lifted: lifted}, nil
+}
+
+// liftVerifyRequiredPauses 管理页清除 403 记录时解除需要验证账号的整户暂停（原因等于 verifyRequiredPauseReason、此刻仍生效的冷却，
+// 见 verifyRequiredPauseCooldown），返回解除的账户数。原先只清列表：账户从 403 列表与“出问题”里消失，暂停却留着（最长 verifyRequiredPause），
+// 管理员看不出它为什么不参与调度。accountIDs 为要解除的账户（按号池的账户 ID 不区分大小写匹配，号池里没有的跳过）；all 时对号池里的
+// 全部账户清，覆盖登记已经清空、暂停还在的账户（旧版本点过“清除记录”留下的）。只清这一种：单模型 403 冷却与多模型连续 403 的
+// 自动暂停保持不变（与管理页确认框的说明一致）。now 之前已经到期的暂停（运行态里到期的冷却不会自动删除）不算解除：不计数、不写日志。
+// 账户仍未验证时下一次请求会重新暂停
+func (service *trackedService) liftVerifyRequiredPauses(accountIDs []string, all bool, now time.Time) int {
+	if service == nil || service.pool == nil {
+		return 0
+	}
+	if all {
+		accountIDs = service.pool.AccountIDs()
+	} else {
+		accountIDs = matchPoolAccountIDs(service.pool.AccountIDs(), accountIDs)
+	}
+	active := func(scope string, cooldown aistudio.CooldownState) bool {
+		return verifyRequiredPauseCooldown(scope, cooldown) && cooldown.Active(now)
+	}
+	lifted := 0
+	for _, accountID := range accountIDs {
+		// 取号池账户列表之后被删除的账户返回 ErrAccountNotFound，跳过
+		cleared, err := service.pool.ClearCooldownsMatching(accountID, active)
+		if err != nil && !errors.Is(err, aistudio.ErrAccountNotFound) && service.requests != nil {
+			service.requests.log(accountID, "WARN", "解除需要验证账号的整户暂停失败 | 错误="+strings.TrimSpace(err.Error()))
+		}
+		if err != nil || cleared == 0 {
+			continue
+		}
+		lifted++
+		if service.requests != nil {
+			service.requests.log(accountID, "INFO",
+				"已清除 403 记录，解除需要验证账号的整户暂停，账户重新参与调度 | 来源=管理页清除 403 记录 | 单模型 403 冷却不变（仍未验证时下一次请求会重新暂停）")
+		}
+	}
+	if lifted > 0 {
+		service.publishModelAccess()
+	}
+	return lifted
+}
+
+// matchPoolAccountIDs 把要解除的账户 ID 换成号池里的写法（去重、按号池顺序）：原样相同的直接取，其余按 strings.EqualFold 比较
+// （从磁盘导入的账户以目录名为 ID，不一定是小写）；号池里没有的丢掉
+func matchPoolAccountIDs(poolIDs []string, requested []string) []string {
+	if len(requested) == 0 {
+		return nil
+	}
+	matched := make([]string, 0, len(requested))
+	for _, poolID := range poolIDs {
+		if slices.ContainsFunc(requested, func(accountID string) bool {
+			return accountID == poolID || strings.EqualFold(accountID, poolID)
+		}) {
+			matched = append(matched, poolID)
+		}
+	}
+	return matched
 }
 
 // permissionDeniedIdentity 返回账户登记时记下的登录签名指纹，以及账户是否列为 403 无权限账户；没有登记表时为否

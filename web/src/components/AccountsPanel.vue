@@ -313,7 +313,7 @@ function downloadEmails(accounts: readonly { label: string }[], prefix: string):
   window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
-// clearPermissionDenied 清除全部 403 无权限账户记录（只清除列表，不解除冷却）
+// clearPermissionDenied 清除全部 403 无权限账户记录（不解除单模型 403 冷却与多模型 403 自动暂停，只解除需要验证账号的整户暂停）
 async function clearPermissionDenied(): Promise<void> {
   if (
     !(await confirmAction(
@@ -329,6 +329,8 @@ async function clearPermissionDenied(): Promise<void> {
     permissionDenied.value = []
     showAllPermissionDenied.value = false
     emit('notice', tf('accounts.permissionDeniedCleared', { count: result.cleared }), 'success')
+    // 需要验证账号的整户暂停随之解除：刷新账户状态
+    emit('refresh')
   } catch (error) {
     actionError(error)
   } finally {

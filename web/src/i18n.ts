@@ -491,7 +491,7 @@ const zhCN = {
   'accounts.permissionDeniedDownload': '下载列表',
   'accounts.permissionDeniedClear': '清除记录',
   'accounts.permissionDeniedClearConfirm':
-    '清除全部 403 无权限账户记录？只清除这个列表，不解除冷却；账户再次返回 403 时会重新列出。',
+    '清除全部 403 无权限账户记录？不解除单模型 403 冷却与多模型 403 自动暂停；例外是“需要验证账号”的整户暂停会一并解除（仍未验证时下一次请求会重新暂停）。账户再次返回 403 时会重新列出。',
   'accounts.permissionDeniedCleared': '已清除 {count} 个账户的记录',
   'accounts.permissionDeniedDelete': '一键删除',
   'accounts.permissionDeniedDeleteHelp':
@@ -1508,7 +1508,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedDownload': 'Download list',
   'accounts.permissionDeniedClear': 'Clear records',
   'accounts.permissionDeniedClearConfirm':
-    'Clear all 403 permission denied records? Only this list is cleared, cooldowns stay; an account that returns 403 again is listed again.',
+    'Clear all 403 permission denied records? Per-model 403 cooldowns and multi-model 403 auto-pauses stay; the one exception is the whole-account pause for "account verification required", which is lifted too (an account that is still unverified is paused again on its next request). An account that returns 403 again is listed again.',
   'accounts.permissionDeniedCleared': 'Cleared records of {count} accounts',
   'accounts.permissionDeniedDelete': 'Delete all',
   'accounts.permissionDeniedDeleteHelp':

@@ -324,8 +324,8 @@ func TestPermissionDeniedPersistence(t *testing.T) {
 		t.Fatalf("重新打开后的登录签名 = %q，期望 identity-a", identity)
 	}
 	// 清除后同样持久化
-	if cleared := second.clear([]string{"a@example.com", "missing@example.com"}, false); cleared != 1 {
-		t.Fatalf("清除数 = %d，期望 1", cleared)
+	if cleared := second.clear([]string{"a@example.com", "missing@example.com"}, false); len(cleared) != 1 || cleared[0] != "a@example.com" {
+		t.Fatalf("清除的账户 = %v，期望 [a@example.com]", cleared)
 	}
 	second.flush()
 	if entries := newPermissionDeniedRegistry(directory, nil).list(); len(entries) != 1 || entries[0].accountID != "b@example.com" {
@@ -352,7 +352,8 @@ func TestPermissionDeniedPersistence(t *testing.T) {
 	}
 }
 
-// TestClearPermissionDeniedAdmin 管理接口按账户或全部清除登记（只清除列表，不改变冷却）；两者都没有给时返回 400
+// TestClearPermissionDeniedAdmin 管理接口按账户或全部清除登记（冷却只解除需要验证账号的整户暂停，见 verify_pause_clear_test.go）；
+// 两者都没有给时返回 400
 func TestClearPermissionDeniedAdmin(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -367,16 +368,16 @@ func TestClearPermissionDeniedAdmin(t *testing.T) {
 	if _, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{}); !errors.As(err, &operation) || operation.status != http.StatusBadRequest {
 		t.Fatalf("没有账户也没有 all 时应返回 400，err=%v", err)
 	}
-	cleared, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{" A@example.com "}})
-	if err != nil || cleared != 1 {
-		t.Fatalf("按账户清除：cleared=%d err=%v", cleared, err)
+	result, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{" A@example.com "}})
+	if err != nil || result.Cleared != 1 || result.Lifted != 0 {
+		t.Fatalf("按账户清除：result=%+v err=%v", result, err)
 	}
 	if _, ok := permissionDeniedEntryOf(registry, "a@example.com"); ok {
 		t.Fatal("指定的账户应被清除")
 	}
-	cleared, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{All: true})
-	if err != nil || cleared != 2 || len(registry.list()) != 0 {
-		t.Fatalf("全部清除：cleared=%d err=%v 剩余=%+v", cleared, err, registry.list())
+	result, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{All: true})
+	if err != nil || result.Cleared != 2 || len(registry.list()) != 0 {
+		t.Fatalf("全部清除：result=%+v err=%v 剩余=%+v", result, err, registry.list())
 	}
 }
 
@@ -388,17 +389,17 @@ func TestClearPermissionDeniedMixedCaseIDs(t *testing.T) {
 	requests := newRequestRegistry(ctx)
 	registry := newPermissionDeniedRegistry("", requests)
 	now := time.Now()
-	for _, accountID := range []string{"John.Doe@Gmail.com", "Jane.Roe@Gmail.com", "other@example.com"} {
+	for _, accountID := range []string{"John.Doe@Example.com", "Jane.Roe@Example.com", "other@example.com"} {
 		registry.record(accountID, "pro", aistudio.ChannelPlayground, "denied", "", now)
 	}
 	admin := &runtimeAdmin{service: &trackedService{permissionDenied: registry, requests: requests}, requests: requests}
-	cleared, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{" John.Doe@Gmail.com "}})
-	if err != nil || cleared != 1 {
-		t.Fatalf("按列表返回的 ID 清除：cleared=%d err=%v，期望 1", cleared, err)
+	result, err := admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{" John.Doe@Example.com "}})
+	if err != nil || result.Cleared != 1 {
+		t.Fatalf("按列表返回的 ID 清除：result=%+v err=%v，期望清除 1", result, err)
 	}
-	cleared, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{"jane.roe@gmail.com"}})
-	if err != nil || cleared != 1 {
-		t.Fatalf("大小写不同的 ID 清除：cleared=%d err=%v，期望 1", cleared, err)
+	result, err = admin.ClearPermissionDenied(ctx, api.PermissionDeniedClearInput{AccountIDs: []string{"jane.roe@example.com"}})
+	if err != nil || result.Cleared != 1 {
+		t.Fatalf("大小写不同的 ID 清除：result=%+v err=%v，期望清除 1", result, err)
 	}
 	if entries := registry.list(); len(entries) != 1 || entries[0].accountID != "other@example.com" {
 		t.Fatalf("清除后剩余 = %+v，期望只剩 other@example.com", entries)
