@@ -197,7 +197,7 @@ export interface PrewarmState {
 // WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户；
 // dead 为 warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位；
 // draining 为其中排空中的 Worker（不再接新请求，正在服务的请求结束后关闭，替补已先启动），retiring 为待淘汰登记数；
-// unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、没有模型目录），等待释放；旧版服务端不返回
+// unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、没有模型目录、需要验证账号的整户暂停中），等待释放；旧版服务端不返回
 export interface WorkerCounters {
   warm: number
   starting: number

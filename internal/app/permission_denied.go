@@ -26,7 +26,8 @@ import (
 // 认证文件更新（外部更新、浏览器登录、重新导入，以及服务停止期间替换了认证文件，见 reconcilePermissionDenied）时清除该账户的登记，
 // 并清除它的 403 冷却与暂停，让它立即重新参与调度；之后在某个模型的某个通道上成功时清除该模型这个通道的登记。
 // 号池级 403（见 forbiddenSystemicAccounts）不是账户的问题，不登记，判定成立前登记的也撤销（见 dropSystemic）。登记不会过期；管理页可以
-// 按账户或全部清除（见 ClearPermissionDenied，冷却只解除需要验证账号的整户暂停）。
+// 按账户或全部清除（见 ClearPermissionDenied，冷却只解除需要验证账号的整户暂停）。启动时为有账户级 403（需要验证账号）登记、
+// 却没有整户暂停的账户按最近一次 403 的时间补写暂停（见 backfillVerifyRequiredPauses）。
 // 保存在账户目录下的 .permission-denied.json，不写入各账户的 account.json 与 runtime-state.json
 const (
 	permissionDeniedFileName  = ".permission-denied.json"
@@ -411,6 +412,30 @@ func (registry *permissionDeniedRegistry) identities() map[string]string {
 	return identities
 }
 
+// accountLevelLastAt 返回登记里有账户级 403（需要验证账号，见 accountLevelPermissionDenied）的账户，以及其中账户级条目最近一次 403 的时间
+func (registry *permissionDeniedRegistry) accountLevelLastAt() map[string]time.Time {
+	if registry == nil {
+		return nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	result := make(map[string]time.Time)
+	for accountID, account := range registry.accounts {
+		if account == nil {
+			continue
+		}
+		for _, model := range account.Models {
+			if model == nil || !accountLevelPermissionDenied(model.Message) {
+				continue
+			}
+			if last, seen := result[accountID]; !seen || model.LastAt.After(last) {
+				result[accountID] = model.LastAt
+			}
+		}
+	}
+	return result
+}
+
 // clearAccount 清除账户的全部登记，返回清除的模型数
 func (registry *permissionDeniedRegistry) clearAccount(accountID string) int {
 	if registry == nil {
@@ -708,6 +733,76 @@ func (service *trackedService) reconcilePermissionDenied() {
 	if missing > 0 && service.requests != nil {
 		service.requests.log("service", "INFO", fmt.Sprintf("清除已不在账户池中的账户的 403 无权限记录 | 账户=%d", missing))
 	}
+}
+
+// backfillVerifyRequiredPauses 在启动时（reconcilePermissionDenied 之后、首次预热之前）为登记表里有账户级 403（需要验证账号）、
+// 此刻却没有整户暂停的账户补写暂停，返回补写的账户数。这些账户是第一次遇到就暂停之前登记的、当时写暂停被目录代际或检查时间跳过的，
+// 原先仍是预热与选号的候选：冷启动一个 Worker（10–30 秒），第一次生成就 403，再暂停、释放，还白占一次换号尝试。解除方式与生成路径
+// 写入的暂停相同（管理页验证通过、认证文件更新、任一模型成功、清除 403 记录、到期）。规则：
+//   - 暂停仍生效的跳过（只查内存，不读写文件）；
+//   - 暂停期限从账户级条目最近一次 403 的时间（last_at）起算 verifyRequiredPause，已到期的不补（超过 30 天，与暂停到期后的规则相同），
+//     超过 now+verifyRequiredPause 的（时钟回拨）截到 now+verifyRequiredPause；
+//   - 检查时间用 last_at（晚于 now 时截到 now）：403 之后全局作用域有更晚的记录（任一模型成功、其他整户冷却、启用或同步目录清除冷却）时返回
+//     CooldownSkippedStale，不补写。检查时间不截断的话，时钟回拨时全局作用域的检查时间被写到未来：清除 403 记录解除暂停后，
+//     之后按租约时间写入的整户暂停、每日限额等全局冷却在 last_at 之前都会被当作陈旧跳过。同一进程里成功还会经 permissionDeniedSucceeded 清除登记；认证文件已在停机期间更新的账户
+//     先经 reconcilePermissionDenied 清除，所以必须排在它之后。
+func (service *trackedService) backfillVerifyRequiredPauses(now time.Time) int {
+	if service == nil || service.pool == nil || service.permissionDenied == nil {
+		return 0
+	}
+	lastAt := service.permissionDenied.accountLevelLastAt()
+	if len(lastAt) == 0 {
+		return 0
+	}
+	accountIDs := make([]string, 0, len(lastAt))
+	for accountID := range lastAt {
+		accountIDs = append(accountIDs, accountID)
+	}
+	slices.Sort(accountIDs)
+	written, paused, expired, stale, failed := 0, 0, 0, 0, 0
+	limit := now.Add(verifyRequiredPause)
+	for _, accountID := range accountIDs {
+		if service.pool.VerifyRequiredPaused(accountID) {
+			paused++
+			continue
+		}
+		last := lastAt[accountID]
+		until := last.Add(verifyRequiredPause)
+		if last.IsZero() || !until.After(now) {
+			expired++
+			continue
+		}
+		if until.After(limit) {
+			until = limit
+		}
+		checkedAt := last
+		if checkedAt.After(now) {
+			checkedAt = now
+		}
+		write, err := service.pool.TryMarkCooldownIfGeneration(
+			accountID, "", service.pool.ModelAccessGeneration(accountID), checkedAt, until, verifyRequiredPauseReason,
+		)
+		switch {
+		case errors.Is(err, aistudio.ErrAccountNotFound):
+		case err != nil:
+			failed++
+			if service.requests != nil {
+				service.requests.log(accountID, "WARN", "启动时补写需要验证账号的整户暂停失败 | 错误="+strings.TrimSpace(err.Error()))
+			}
+		case write == aistudio.CooldownWritten:
+			written++
+		default:
+			stale++
+		}
+	}
+	if written+expired+stale+failed > 0 && service.requests != nil {
+		// 持久行：启动时控制台队列可能还没有消费者
+		service.requests.logDurable("service", "INFO", fmt.Sprintf(
+			"启动时补写需要验证账号的整户暂停 | 补写=%d | 已暂停=%d | 最近一次 403 超过 %d 天=%d | 之后有更新的记录=%d | 失败=%d",
+			written, paused, int(verifyRequiredPause/(24*time.Hour)), expired, stale, failed,
+		))
+	}
+	return written
 }
 
 // rotatingCookies 为 Google 用 Set-Cookie 定期轮换的会话 Cookie：同一登录会话里一直在变，每个进程都会把它们回写到认证文件

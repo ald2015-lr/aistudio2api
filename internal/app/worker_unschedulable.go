@@ -12,12 +12,14 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
 
-// 不可调度的驻留 Worker：账号需要登录、已停用、不可用，或目录加载过却没有可初始化的模型时，它的 Worker 不是任何模型的候选，
-// 却一直占着驻留槽位（既不算死槽位也不算冷却中，淘汰与按需替换都换不掉）。线上第二份诊断：150 个驻留里 138–140 个不是任何模型的
-// 候选，生成 401 把账号标成需要登录却不关它的 Worker。这里登记释放（与冷却淘汰共用登记表与淘汰循环，见 worker_retire.go）：
-//   - 生成、流内、续签重放、启动阶段确认需要登录后立即登记（releaseUnschedulable）；
+// 不可调度的驻留 Worker：账号需要登录、已停用、不可用、所属组织停用了 AI Studio、需要验证账号的整户暂停生效中，或目录加载过
+// 却没有可初始化的模型时，它的 Worker 不是任何模型的候选，却一直占着驻留槽位（需要登录等既不算死槽位也不算冷却中，淘汰与按需替换
+// 都换不掉；需要验证账号的整户暂停是 30 天的全局冷却，按冷却淘汰要等分区内有可接替账户，号池大半冷却时一直等不到）。线上第二份诊断：
+// 150 个驻留里 138–140 个不是任何模型的候选，生成 401 把账号标成需要登录却不关它的 Worker。这里登记释放（与冷却淘汰共用登记表与
+// 淘汰循环，见 worker_retire.go）：
+//   - 生成、流内、续签重放、启动阶段确认需要登录后，生成请求写入需要验证账号的整户暂停后，立即登记（releaseUnschedulable）；
 //   - keepWarm 每 5 秒对驻留 Worker 补登记其他路径造成的不可调度（registerUnschedulableWorkers）：aistudio 内部的 CountTokens、
-//     上传、视频的 401，管理页停用，认证文件变化，目录被同步成空等；
+//     上传、视频的 401，管理页停用，认证文件变化，目录被同步成空，重启后读回或其他进程写入的需要验证账号暂停等；
 //   - 淘汰循环对它空闲即关，忙碌等请求结束；不排空、不要求可接替账户、不走排空超时，关闭后只补齐预热，不按冷却模型挑替补。
 // 淘汰选号（pickIdleVictimFor）把它排在死槽位之前，按需替换、现场回收、空闲回收都先关它。
 // “账号需要登录”日志由 noteAuthRequired 统一写（持久行，同账号 1 分钟最多一条），是第 5 项（需要登录误判）的诊断依据
@@ -31,12 +33,15 @@ const (
 	unschedulableOther        = aistudio.UnschedulableNotReady
 	// unschedulableOrgDisabled 为账号所属组织停用了 AI Studio（见 org_disabled.go）
 	unschedulableOrgDisabled = aistudio.UnschedulableOrgDisabled
+	// unschedulableVerifyRequired 为需要验证账号的整户暂停生效中（由账户池按全局冷却的原因派生，见 forbidden_guard.go 的
+	// verifyRequiredPauseReason）：暂停解除（验证通过、认证文件更新、任一模型成功、清除 403 记录、到期）后自动恢复可调度
+	unschedulableVerifyRequired = aistudio.UnschedulableVerifyRequired
 )
 
 // unschedulableReasonOrder 为补登记日志里各原因的顺序
 var unschedulableReasonOrder = []string{
-	unschedulableAuthRequired, unschedulableOrgDisabled, unschedulableDisabled, unschedulableUnavailable, unschedulableNoCatalog,
-	unschedulableOther,
+	unschedulableAuthRequired, unschedulableOrgDisabled, unschedulableVerifyRequired, unschedulableDisabled, unschedulableUnavailable,
+	unschedulableNoCatalog, unschedulableOther,
 }
 
 const (
@@ -134,7 +139,7 @@ func (notes *authRequiredNotes) allow(accountID string, now time.Time) bool {
 }
 
 // releaseUnschedulable 登记释放账号的驻留 Worker（reason 为调用方确认的不可调度原因）：空闲即关，忙碌等它的请求释放租约后关闭。
-// 生成路径确认需要登录后立即调用；manager 为 nil 或账号没有驻留 Worker 时不做任何事。
+// 生成路径确认需要登录、写入需要验证账号的整户暂停后立即调用；manager 为 nil 或账号没有驻留 Worker 时不做任何事。
 // 登记以账户池当前的原因为准：登录在这之前已被替换（认证代际变化）时需要登录的标记不会写入，账号仍可调度，不登记
 func (manager *accountWorkerManager) releaseUnschedulable(accountID string, reason string) {
 	if manager == nil || manager.pool == nil {
@@ -182,7 +187,8 @@ func withAuthNoteExtra(cause error, extra string) error {
 }
 
 // registerUnschedulableWorkers 为 keepWarm 每个周期的补登记：驻留 Worker 中已不可调度、还没有登记释放的账号
-// （aistudio 内部的 401、管理页停用、认证文件变化、启动阶段登录失效、目录被同步成空等），返回新增登记数。
+// （aistudio 内部的 401、管理页停用、认证文件变化、启动阶段登录失效、目录被同步成空、重启后读回或其他进程写入的需要验证账号暂停等），
+// 返回新增登记数。
 // 驻留 Worker 不超过峰值数（线上 150），账户池只加锁一次
 func (service *trackedService) registerUnschedulableWorkers() int {
 	workers := service.workers

@@ -23,8 +23,10 @@ import (
 // 正在服务请求的 Worker 永远不会被关闭。只有分区内有可接替的账户时才淘汰：小规模部署全部账号都冷却时保留 Worker，
 // 冷却到期后能立即服务。登记了却一直忙碌的 Worker（饱和时其他模型的请求一直在用它）先排空再淘汰，替补在排空开始时就启动，
 // 见 worker_drain.go；keepWarm 每个周期把驻留 Worker 中的死槽位补登记（registerDeadWorkers），重启后与其他进程写入的冷却同样会被淘汰。
-// 不可调度的驻留 Worker（账号需要登录、已停用、没有模型目录等，见 worker_unschedulable.go）共用这张登记表与淘汰循环，按释放处理：
-// 空闲即关，忙碌等请求结束，不排空、不要求可接替账户、不走排空超时，关闭后只补齐预热
+// 不可调度的驻留 Worker（账号需要登录、已停用、没有模型目录、需要验证账号的整户暂停生效中等，见 worker_unschedulable.go）共用这张
+// 登记表与淘汰循环，按释放处理：空闲即关，忙碌等请求结束，不排空、不要求可接替账户、不走排空超时，关闭后只补齐预热。
+// 需要验证账号的整户暂停虽是全局冷却，但最长 30 天、只能靠用户操作解除，“冷却到期后能立即服务”对它不成立，因此不按冷却淘汰保留；
+// 死槽位的补登记、冷却清扫与冷却轮换都跳过不可调度的账号（dropUnschedulable），只走释放
 
 const (
 	// retireDebounce 为淘汰循环两轮之间的最短间隔：租约释放很频繁，忙碌中的登记不必每次都重试
@@ -599,12 +601,19 @@ func (service *trackedService) registerDeadWorkers() int {
 	return added
 }
 
-// registerDeadWorkersIn 在一个分区的驻留 Worker 中补登记死槽位（models 为该分区判断死槽位用的模型），返回新增的登记数与死槽位数
+// registerDeadWorkersIn 在一个分区的驻留 Worker 中补登记死槽位（models 为该分区判断死槽位用的模型），返回新增的登记数与死槽位数。
+// 死槽位数照旧计入不可调度的账号（与状态页的死槽位口径一致），但不为它们写冷却登记：它们由 registerUnschedulableWorkers 登记释放，
+// 免得同一个 Worker 先写一条“补登记淘汰”再写一条“补登记释放”
 func (service *trackedService) registerDeadWorkersIn(warm []string, models []string) (int, int) {
 	workers := service.workers
 	dead := service.pool.LongCoolingSet(warm, models, rotationMinRemaining, false)
 	if len(dead) == 0 {
 		return 0, 0
+	}
+	deadCount := len(dead)
+	dropUnschedulable(service.pool, dead)
+	if len(dead) == 0 {
+		return 0, deadCount
 	}
 	accountIDs := make([]string, 0, len(dead))
 	for accountID := range dead {
@@ -632,7 +641,22 @@ func (service *trackedService) registerDeadWorkersIn(warm []string, models []str
 			}
 		}
 	}
-	return added, len(dead)
+	return added, deadCount
+}
+
+// dropUnschedulable 从死槽位集合中去掉不可调度的账号（再对账户池加锁一次，只在有死槽位时）：它们按释放处理（见 worker_unschedulable.go），
+// 不走冷却淘汰、冷却清扫与冷却轮换（要求可接替账户、启替补）
+func dropUnschedulable(pool *aistudio.AccountPool, dead map[string]struct{}) {
+	if len(dead) == 0 {
+		return
+	}
+	accountIDs := make([]string, 0, len(dead))
+	for accountID := range dead {
+		accountIDs = append(accountIDs, accountID)
+	}
+	for accountID := range pool.UnschedulableSet(accountIDs) {
+		delete(dead, accountID)
+	}
 }
 
 // victimMode 为淘汰选号的范围
@@ -839,7 +863,7 @@ func (manager *accountWorkerManager) deadWarmCounts(warm []string, ultra map[str
 	return normal, ultraDead
 }
 
-// unschedulableWarmCounts 统计各分区驻留 Worker 中不可调度的账号数（需要登录、已停用、不可用、没有模型目录，等待释放），供状态页显示；
+// unschedulableWarmCounts 统计各分区驻留 Worker 中不可调度的账号数（需要登录、已停用、不可用、没有模型目录、需要验证账号的整户暂停，等待释放），供状态页显示；
 // 口径与补登记释放（registerUnschedulableWorkers）一致，与死槽位分开计：死槽位的口径不变，同一账号既长时间冷却又不可调度时两边都计
 func (manager *accountWorkerManager) unschedulableWarmCounts(warm []string, ultra map[string]struct{}) (normal int, ultraCount int) {
 	for accountID := range manager.pool.UnschedulableSet(warm) {

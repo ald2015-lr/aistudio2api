@@ -208,7 +208,7 @@ type AdminWorkerPartition struct {
 	Dead     int `json:"dead"`
 	Draining int `json:"draining"`
 	Retiring int `json:"retiring"`
-	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、没有可初始化模型），等待释放
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放
 	Unschedulable int `json:"unschedulable"`
 	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
 	Target    int `json:"target"`
@@ -242,7 +242,7 @@ type AdminWorkerCounts struct {
 	Prewarm     AdminPrewarmState `json:"prewarm"`
 	WarmIDs     []string          `json:"warm_ids,omitempty"`
 	StartingIDs []string          `json:"starting_ids,omitempty"`
-	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、没有可初始化模型），等待释放
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放
 	Unschedulable int `json:"unschedulable"`
 }
 

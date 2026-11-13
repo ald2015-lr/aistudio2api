@@ -590,7 +590,7 @@ const zhCN = {
     '冷却占位的 Worker 不再接新请求，正在服务的请求结束后关闭（开始输出的长流会让排空保持到流结束）；有空槽时替补已先启动，否则旧 Worker 关闭后补上',
   'app.workersUnschedulable': '不可调度 {count}',
   'app.workersUnschedulableDetail':
-    '驻留 Worker 的账号需要登录、已停用或没有模型目录，已不能服务任何模型：空闲后立即释放，槽位由预热补上',
+    '驻留 Worker 的账号需要登录、已停用、没有模型目录或需要验证账号（整户暂停中），已不能服务任何模型：空闲后立即释放，槽位由预热补上',
   'app.primarySupplyModel': '主用 {model}：',
   'app.primarySupply': '热 {warm} · 冷却 {cooling} · 备用 {standby}',
   'app.primarySupplyDetail':
@@ -1650,7 +1650,7 @@ const en: Record<TranslationKey, string> = {
     'These dead-slot workers take no new requests and close once their in-flight requests finish (a long stream that has started output keeps the drain going until it ends); their replacements have already been started when a slot was free, otherwise they start once the old worker closes',
   'app.workersUnschedulable': '{count} unschedulable',
   'app.workersUnschedulableDetail':
-    'Resident workers whose accounts need login, are disabled or have no model catalog; released when idle and refilled by prewarm',
+    'Resident workers whose accounts need login, are disabled, have no model catalog or are paused until account verification; released when idle and refilled by prewarm',
   'app.primarySupplyModel': 'Primary {model}:',
   'app.primarySupply': '{warm} warm · {cooling} cooling · {standby} standby',
   'app.primarySupplyDetail':

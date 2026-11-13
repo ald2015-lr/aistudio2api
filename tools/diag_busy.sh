@@ -796,10 +796,10 @@ if status:
     if ultra_workers.get("max"):
         print(f"  Ultra 分区 Worker：就绪 {ultra_workers.get('warm')} / 预热目标 {ultra_workers.get('target')} / 峰值 {ultra_workers.get('max')}，"
               f"启动中 {ultra_workers.get('starting')}，死槽位 {ultra_workers.get('dead') or 0}，排空中 {ultra_workers.get('draining') or 0}")
-    # 不可调度（app/worker_unschedulable.go）：驻留 Worker 的账号需要登录、已停用、不可用或没有模型目录，不是任何模型的候选，等待释放
+    # 不可调度（app/worker_unschedulable.go）：驻留 Worker 的账号需要登录、已停用、不可用、没有模型目录或需要验证账号（整户暂停中），不是任何模型的候选，等待释放
     if "unschedulable" in workers:
         print(f"  驻留 Worker 不可调度={(workers.get('unschedulable') or 0) + (ultra_workers.get('unschedulable') or 0)}"
-              f"（普通 {workers.get('unschedulable') or 0}，Ultra {ultra_workers.get('unschedulable') or 0}；需要登录、已停用或没有模型目录，空闲即释放）")
+              f"（普通 {workers.get('unschedulable') or 0}，Ultra {ultra_workers.get('unschedulable') or 0}；需要登录、已停用、没有模型目录或需要验证账号，空闲即释放）")
     else:
         print("  驻留 Worker 不可调度=-（这个版本的状态接口没有 unschedulable 字段）")
     for supply in supplies:

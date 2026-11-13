@@ -38,8 +38,10 @@ const (
 	// 实际在管理页验证通过、认证文件更新时与其他 403 冷却一起立即解除（原因以 forbiddenPauseReasonSuffix 结尾，按 forbiddenCooldown 清除），
 	// 管理页清除 403 记录时只解除这一种暂停（按 verifyRequiredPauseCooldown，见 liftVerifyRequiredPauses）
 	verifyRequiredPause = 30 * 24 * time.Hour
-	// verifyRequiredPauseReason 为需要验证账号时整个账户暂停的冷却原因
-	verifyRequiredPauseReason = "需要验证账号（verify-account），在官网验证后到管理页点验证；已 1 " + forbiddenPauseReasonSuffix
+	// verifyRequiredPauseReason 为需要验证账号时整个账户暂停的冷却原因。定义在账户池（aistudio.VerifyRequiredPauseReason）：
+	// 账户池按它把暂停中的账户派生为不可调度（需要验证账号），驻留 Worker 按释放处理（见 worker_unschedulable.go）。
+	// 文字必须与已持久化的暂停逐字相同，并以 forbiddenPauseReasonSuffix 结尾（见 TestVerifyRequiredPauseReasonStable）
+	verifyRequiredPauseReason = aistudio.VerifyRequiredPauseReason
 )
 
 type forbiddenEvent struct {

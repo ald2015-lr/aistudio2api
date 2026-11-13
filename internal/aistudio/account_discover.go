@@ -400,12 +400,40 @@ const (
 	UnschedulableUnavailable  = "不可用"
 	UnschedulableNotReady     = "不可调度"
 	UnschedulableNoCatalog    = "没有模型目录"
+	// UnschedulableVerifyRequired 为需要验证账号的整户暂停生效中（见 verifyRequiredPausedLocked）：暂停最长 30 天、只能靠管理页验证通过、
+	// 认证文件更新、任一模型成功或清除 403 记录解除，驻留 Worker 留着等冷却到期没有意义，按不可调度释放
+	UnschedulableVerifyRequired = "需要验证账号"
 )
 
+// VerifyRequiredPauseReason 为需要验证账号（403 Your account must be verified … verify-account）时整个账户暂停调度写入的
+// 全局冷却原因（调度层写入，见 app 的 forbidden_guard.go）。已持久化在各账户运行态里的暂停只能按这串逐字识别：不能改动文字，
+// 调度层还按它的后缀“次返回 403 无权限，自动暂停”在认证文件更新、验证通过时清除它
+const VerifyRequiredPauseReason = "需要验证账号（verify-account），在官网验证后到管理页点验证；已 1 次返回 403 无权限，自动暂停"
+
+// verifyRequiredPausedLocked 判断账户的需要验证账号整户暂停此刻是否生效：全局冷却仍生效且原因逐字等于 VerifyRequiredPauseReason。
+// 暂停由冷却派生，不另设标记：解除暂停的各条路径清掉冷却（或冷却到期）后账户自动恢复可调度。调用方持有 p.mu
+func verifyRequiredPausedLocked(account *Account, now time.Time) bool {
+	cooldown, exists := account.runtime.Cooldowns[globalCooldownKey]
+	return exists && cooldown.Reason == VerifyRequiredPauseReason && cooldown.Active(now)
+}
+
+// VerifyRequiredPaused 判断账户的需要验证账号整户暂停此刻是否生效（见 verifyRequiredPausedLocked）；账户不存在时为假
+func (p *AccountPool) VerifyRequiredPaused(accountID string) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	account := p.byID[strings.TrimSpace(accountID)]
+	return account != nil && verifyRequiredPausedLocked(account, time.Now())
+}
+
 // unschedulableReasonLocked 返回账户不能服务任何模型的原因，空为可调度；调用方持有 p.mu。
-// 停用、需要登录、不可用与其他非就绪状态的账户拿不到不固定账户的租约；目录加载过（initializedAt 非零）却没有可初始化的模型时
-// 同样不是任何模型的候选（目录被同步成空、权益变化后没有可用模型）。只看“目录加载过”：测试里手工标热、从没设过目录的账户不算
-func unschedulableReasonLocked(account *Account) string {
+// 停用、需要登录、不可用与其他非就绪状态的账户拿不到不固定账户的租约；需要验证账号的整户暂停生效中（全局冷却）同样拿不到，
+// 而且不会在短时间内到期；目录加载过（initializedAt 非零）却没有可初始化的模型时同样不是任何模型的候选（目录被同步成空、
+// 权益变化后没有可用模型）。只看“目录加载过”：测试里手工标热、从没设过目录的账户不算。
+// 停用、组织停用、需要登录、不可用、未就绪优先于需要验证账号：这些原因各有判断口径（noteAuthRequired、目录同步按需要登录判断）
+func unschedulableReasonLocked(account *Account, now time.Time) string {
 	switch {
 	case !account.Config.Enabled:
 		return UnschedulableDisabled
@@ -417,6 +445,8 @@ func unschedulableReasonLocked(account *Account) string {
 		return UnschedulableUnavailable
 	case account.State != AccountReady:
 		return UnschedulableNotReady
+	case verifyRequiredPausedLocked(account, now):
+		return UnschedulableVerifyRequired
 	case !account.initializedAt.IsZero() && len(accountBootstrapModelsLocked(account)) == 0:
 		return UnschedulableNoCatalog
 	}
@@ -432,12 +462,13 @@ func (p *AccountPool) UnschedulableSet(accountIDs []string) map[string]string {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	for _, accountID := range accountIDs {
 		account := p.byID[accountID]
 		if account == nil {
 			continue
 		}
-		if reason := unschedulableReasonLocked(account); reason != "" {
+		if reason := unschedulableReasonLocked(account, now); reason != "" {
 			result[accountID] = reason
 		}
 	}
@@ -478,7 +509,7 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 			Cooling: longCooldownActive(account, globalCooldownKey, now, ShortCooldownMax) ||
 				cooling && until.Sub(now) >= ShortCooldownMax,
 			Dead:          p.longCoolingLocked(account, modelID, now, minRemaining),
-			Unschedulable: unschedulableReasonLocked(account),
+			Unschedulable: unschedulableReasonLocked(account, now),
 			Unservable: modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
 				!accountSupportsSelection(account, AccountSelection{ModelID: modelID}),
 		}

@@ -52,7 +52,7 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	// 驻留 Worker 中的死槽位每个周期补登记淘汰（忙碌的由淘汰循环排空），全局长时间冷却的空闲 Worker 每个周期清扫，
 	// 不等 30 秒一轮的按模型轮换
 	service.registerDeadWorkers()
-	// 已不可调度（需要登录、已停用、没有模型目录）的驻留 Worker 同样每个周期补登记释放（见 worker_unschedulable.go）
+	// 已不可调度（需要登录、已停用、没有模型目录、需要验证账号的整户暂停生效中）的驻留 Worker 同样每个周期补登记释放（见 worker_unschedulable.go）
 	service.registerUnschedulableWorkers()
 	service.sweepDeadWorkers(dataContext)
 	if time.Since(lastRotation) >= rotationInterval {
@@ -259,11 +259,14 @@ func (manager *accountWorkerManager) rankColdCandidates(partition aistudio.PoolS
 // sweepDeadWorkers 淘汰预热池中全局长时间冷却（每日限额冻结整个账号）的空闲 Worker。这样的 Worker 对任何模型都是死槽位，
 // 不受 hotModelsIn 按模型的 5% 阈值限制：本进程写入的冷却在 applyQuotaCooldown 时就已登记淘汰（见 worker_retire.go），
 // 这里兜底处理其他进程写入的冷却与登记后仍在重试的 Worker。每个 keepWarm 周期两个分区合计最多关闭 WARM_STARTUP_CONCURRENCY 个，
-// 关闭并发进行；接替的 Worker 由预热经冷启动名额补齐，不会超过启动并发。只在分区内有可接替的账户时淘汰
+// 关闭并发进行；接替的 Worker 由预热经冷启动名额补齐，不会超过启动并发。只在分区内有可接替的账户时淘汰。
+// 不可调度的账号（需要验证账号的整户暂停也是全局冷却）不在这里清扫，只走释放（见 worker_unschedulable.go）：不要求可接替账户、
+// 不启替补，日志口径一致
 func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 	workers := service.workers
 	allWarm := workers.WarmAccountIDs()
 	dead := service.pool.LongCoolingSet(allWarm, nil, rotationMinRemaining, true)
+	dropUnschedulable(service.pool, dead)
 	if len(dead) == 0 || ctx.Err() != nil {
 		return 0
 	}
@@ -439,7 +442,10 @@ func (service *trackedService) hotModelsIn(warm []string) ([]string, map[string]
 }
 
 // rotatePartition 在分区内淘汰最多 limit 个在热门模型上长时间冷却的空闲 Worker，返回淘汰数与被淘汰账号淘汰前的排空状态
-// （每个被淘汰的 Worker 一项，不在排空时为 nil，供随后启动替补）
+// （每个被淘汰的 Worker 一项，不在排空时为 nil，供随后启动替补）。
+// 不可调度的账号（需要验证账号的整户暂停等）不在这里轮换，只走释放（见 worker_unschedulable.go），与 sweepDeadWorkers 一致：
+// 同一个 keepWarm 周期里 registerUnschedulableWorkers 只登记、异步唤醒淘汰循环，轮换先抢到时会按“冷却轮换”关闭并按热门模型
+// 多冷启动一个替补
 func (service *trackedService) rotatePartition(
 	ctx context.Context, partition aistudio.PoolScope, warm []string, openingIDs []string, hot []string, limit int,
 ) (int, []*drainState) {
@@ -456,6 +462,7 @@ func (service *trackedService) rotatePartition(
 		return 0, nil
 	}
 	victims := service.pool.LongCoolingSet(warm, hot, rotationMinRemaining, true)
+	dropUnschedulable(service.pool, victims)
 	rotated := 0
 	var drains []*drainState
 	now := time.Now()

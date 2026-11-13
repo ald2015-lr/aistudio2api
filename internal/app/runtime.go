@@ -140,6 +140,9 @@ func newRuntime(
 	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
 	service.reconcilePermissionDenied()
 	service.reconcileOrgDisabled()
+	// 登记里有需要验证账号的 403、却没有整户暂停的账户补写暂停（见 backfillVerifyRequiredPauses）：要在对照之后（认证文件已更新的
+	// 账户先清除登记）、首次预热之前，免得预热为它们冷启动 Worker 只为再吃一次 403
+	service.backfillVerifyRequiredPauses(time.Now())
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -6134,6 +6137,9 @@ func (service *trackedService) generateForModel(
 						"账号暂停调度 | 原因=%s | 恢复=验证通过、认证文件更新或清除 403 记录（最迟 %s）",
 						pauseReason, pauseUntil.Format(time.RFC3339),
 					))
+					// 暂停期间账号不是任何模型的候选：立即登记释放它的驻留 Worker（本请求还持有租约，请求结束后关闭），
+					// 不按冷却淘汰等分区内有可接替账户、不排空、不启替补，关闭后只补齐预热（见 worker_unschedulable.go）
+					service.workers.releaseUnschedulable(request.AccountID, unschedulableVerifyRequired)
 				}
 			}
 		}
