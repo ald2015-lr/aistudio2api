@@ -11,7 +11,17 @@
 #   3. 用量账本最近 DAYS 天（默认 92，最多 92）这个模型的请求：按接口、按天（总数/成功）；每个模型最多统计最近的 10000 条，超过时写明
 #   4. 每个登记账户最近一次 403 对应的请求与经过：登记带 last_request 时按请求 ID 找（本实例账本里没有这个 ID 时写明），没有时按时间
 #      在账本里单独查一个窄窗口（请求结束时间在最近一次 403 前 2 分钟到后 60 分钟、且这个账户在其中返回过 403），再到运行日志的
-#      request.started 里看请求形态；需要验证账号的账户的登记照样查（第 7 段要用），默认只给个数与时间范围
+#      request.started 里看请求形态；需要验证账号的账户的登记照样查（第 7 段要用），默认只给个数与时间范围。
+#      登记与运行日志都看不到请求形态（f06ddf9 之前的版本不记 last_request、运行日志已轮转）、账本里却对上了请求时，用账本补判：
+#      记录带正文（has_body）时读 GET /api/requests/{id}/body（客户端发来的原始请求体，截断到 64 KiB，只保留最近 1000 条；按请求 ID
+#      只读一次，最多 300 个不同的请求，超出时写明跳过了多少；读正文超时或连接中断一次后不再读，同样写明个数），按接口解析出消息条数、
+#      文字字数、图片与其他内联数据、文件引用、max tokens 参数与请求名，与 request.started 同口径判断（只有系统提示时按 1 条用户消息、
+#      发给 Omni 视频模型时不计被去掉的系统提示；请求名是目录别名或 MODEL_FALLBACKS 的源模型时照常判为别名、改用；不输出正文文字）；
+#      运行日志结束行的 fallback_from、账本记录的上游尝试（额度用完改用时源模型与目标模型的尝试各带模型，中间有一条改用备注）说明登记的
+#      模型是改用的目标时，有没有正文都先判为额度用完改用（登记的模型是改用的源模型时照常按形态判断）；
+#      没有正文时按账本的输入 tokens 判断：输入含本服务加的零宽字符随机后缀（REPEAT_PROMPT_NONCE，默认开启，十几到近百个 token），
+#      渠道测试的上限按同一次运行里已确认是渠道测试的请求校准（没有样本时只认不超过 8 的），下游的门槛为校准值（没有样本时为后缀可能的
+#      最大贡献 96）加 100；逐条输出时多一行“账本补判”：正文有/无/被截断/读取失败与原因、上游尝试里改用过的模型、账本的输入/回复 tokens
 #   5. 目录里这个模型的别名（别名本身不是目录 ID 时，请求这个别名会落到这个模型上、登记在它名下）
 #   6. 运行日志里这个模型的 403 冷却与需要验证账号的暂停行（需要验证账号的账户的暂停、解除与 403 冷却行默认只给行数、账户数与时间范围）
 #   7. 结论：每个登记账户一行（带最近一次 403 的本机时间与请求 ID，对应管理页 403 列表的行），按 README“没有调用过的模型出现在 403 列表里”
@@ -21,9 +31,15 @@
 #      30 天，管理页整个账户不列在 403 列表里、另有汇总块；这个账户在其他模型上的普通 403 也算在内）同样判断请求来源，默认汇总成一小段：
 #      账户数、最近一次 403 的时间范围、按请求来源分类的账户数、涉及的请求 ID 数与账户数最多的前 5 个请求（一个请求依次换号、每个都 403）。
 #      账户级 403 的那条登记不套用旧记录、升级前带图误登记与下游带图三条（它们针对的是 The caller does not have permission 被误登记的
-#      情形，结论是“账户本身多半正常”），按请求形态归入渠道测试、下游等；同一账户在其他模型上的普通 403 照常套用
+#      情形，结论是“账户本身多半正常”），按请求形态归入渠道测试、下游等；同一账户在其他模型上的普通 403 照常套用。
+#      汇总另给按接口的账户数，账户数最多的请求带上接口；大部分账户无法判断请求形态时写明主要原因与下一步。
+#      账本补判出来的来源照常归类；仍判断不了时写“无法判断请求形态”，附上接口、这个请求依次试了几个账户、最终结果与看不到形态的原因
+#      （登记早于记录请求形态的版本、运行日志已轮转或覆盖这段时间却没有开始行、账本里没有正文、tokens 判断不了）。账本里也没有、只有请求 ID 时按 ID 前缀
+#      补一句接口类型：resp_ 为 Gemini 原生 generateContent 或 OpenAI Responses，chatcmpl_ 为 /v1/chat/completions，msg_ 为
+#      Anthropic /v1/messages，int_ 为 Interactions
 # 只读：只对本机管理接口发 GET 请求，只读 .env、运行日志（logs/aistudio2api.log 与 .1）、登记文件（管理接口连不上时）与进程信息，
-# 不改任何配置、记录、冷却或账户；邮箱已打码，不输出管理令牌、API 密钥与提示词（运行日志与账本本来也不记提示词）。
+# 不改任何配置、记录、冷却或账户；邮箱已打码，不输出管理令牌、API 密钥与提示词（账本里的请求正文只取消息条数、字数、媒体数与参数值，
+# 不输出任何文字内容）。
 #
 # 用法（放在程序目录的 tools/ 下运行，或用 APP 指定程序目录）：
 #   bash tools/diag_403.sh                        查 gemini-omni-1.1-flash（默认）
@@ -121,6 +137,7 @@ export APP MODEL DAYS VERIFY FIX_COUNT PROC_START SHARED APP_AUTH
 # 只读：只对本机管理接口发 GET、只读日志与登记文件；邮箱打码，不输出令牌与提示词。兼容 Python 3.7（不用 3.8 以后的语法）
 import collections
 import datetime
+import http.client
 import json
 import os
 import re
@@ -155,6 +172,38 @@ INTERACTIONS = ("/v1/interactions", "/v1beta/interactions")
 # new-api 渠道测试的请求形态：一条短消息（默认 "hi"），max_tokens 为 16 或 3000、或不带（按 QuantumNous/new-api 的渠道测试）
 TEST_PATHS = ("/v1/chat/completions", "/v1/messages", "/v1/responses", ":generateContent", ":streamGenerateContent")
 TEST_TOKENS = re.compile(r"^(16|3000|默认)(\D|$)")
+# 账本补判（登记与运行日志都没有请求形态时，见 ledger_info 与 ledger_judge）：
+# 请求正文（GET /api/requests/{id}/body）是客户端发来的原始 POST 请求体（API key 校验之后、协议转换之前，不含请求头），截断到前 64 KiB
+# （internal/api/ledger.go 的 requestBodyLimit），只保留最近 1000 条（internal/requestdb 的 bodyRetention），REQUEST_BODY_LOG=false 时不存。
+# 按请求 ID 只读一次，最多读 BODY_FETCH_LIMIT 个不同的请求（上千个账户多半是少数几个请求依次换号），超出的写明跳过了多少
+BODY_LIMIT = 64 << 10
+BODY_FETCH_LIMIT = 300
+SUCCESS_STATES = ("completed", "tool_calls", "limited")
+# 没有正文时按账本的 input_tokens 判断。它是最终那次上游尝试的输入用量（上游 usageMetadata 的 promptTokenCount 加 toolUsePromptTokenCount，
+# Interactions 为用量数组的输入数；上游没给用量时为本地估算；见 internal/app/request_logging.go 的 requestLogData 与 requestRow），
+# 被拒绝的尝试不计入，请求最终失败时为 0；上游终止生成（blocked：finishReason 不是 stop，HTTP 200）时上游已处理了提示词，用量照样是上游给的。
+# 它比客户端发来的多出本服务加的内容：
+#   随机后缀（REPEAT_PROMPT_NONCE，默认开启）：客户端没有指定 seed（IGNORE_CLIENT_SEED 默认忽略客户端的 seed）、温度不为 0、模型名不带 image、
+#     tts、audio、veo 等的请求，发往上游之前在最后一条用户消息末尾加 32 个零宽字符（U+200B/U+200C，internal/app/duplicates.go 的
+#     maybeAddPromptNonce）。运行日志的字数不含它（SetAccessLogGenerationInput 在加后缀之前），上游的输入 tokens 含它：按分词方式约十几个到
+#     近百个 token（每个零宽字符按 UTF-8 3 字节回退时 96 个），所以一条 “hi” 的渠道测试在账本里也远不止几个 token；
+#   系统提示：本服务不加（发给 Omni 视频模型时反而去掉客户端的系统提示，见 internal/api/omni_system.go；按工具设置追加的要求只在请求带工具时
+#     才有，Omni 请求的工具在选号前已去掉）。
+# 所以渠道测试的上限从账本自己校准（见 token_calibration）：同一次运行里请求形态已确认是渠道测试（运行日志的开始行或账本正文：1 条不超过 8 字的
+# 消息、没有媒体与文件、max_tokens 为 16/3000/不带、渠道测试会用的接口）、最终成功的请求，按模型取输入 tokens 的最大值。超过 8 加随机后缀最大
+# 贡献（NONCE_TOKENS_MAX）的样本不算：一条短消息加后缀到不了，多半另有工具声明等内容。阈值：
+#   渠道测试（只认最终成功的）：不超过校准值加 8（与渠道测试判定里“1 条不超过 8 字的消息”同一量级，中文 1 字约 1 token，英文更少）；没有校准样本时
+#     只认不超过 8 的（没有加随机后缀，与一条 “hi” 相当），随机后缀开启时介于之间的写出数字并注明含后缀，不下结论；
+#   下游主动调用：不少于校准值（没有样本时为随机后缀可能的最大贡献，REPEAT_PROMPT_NONCE 关闭时为 0）加 100（约 75 个英文单词或上百个汉字，
+#     带一张图就有几百 token，远不止一条短消息）；上游终止生成的请求用量是真的，同样按这条判下游；
+#   之间：一句短问题、带默认系统提示的客户端都可能落在这里，不下结论，写出数字。
+# .env 只反映现在的设置，那时的 REPEAT_PROMPT_NONCE 可能不同；校准样本是那时的实际输入 tokens，不受影响
+LEDGER_TEST_TOKENS = 8
+LEDGER_DOWNSTREAM_TOKENS = 100
+NONCE_TOKENS_MAX = 96
+# 请求 ID 的前缀（internal/api 里 newID 的调用处）：账本里没有这个请求、只知道请求 ID 时据此补一句接口类型，不改分类
+ID_PREFIXES = (("resp_", "Gemini 原生 generateContent 或 OpenAI Responses"), ("chatcmpl_", "OpenAI /v1/chat/completions"),
+               ("msg_", "Anthropic /v1/messages"), ("int_", "Interactions（直连本服务，new-api 不转发）"))
 # 每个模型（以及每个登记条目的窄窗口查询）最多读的账本页数，每页 200 条
 LEDGER_PAGES = 50
 LEDGER_PAGE_SIZE = 200
@@ -252,6 +301,16 @@ if FALLBACKS is None:
 FALLBACK_SCOPE = (env_value("MODEL_FALLBACK_SCOPE") or "ultra").strip().lower()
 if FALLBACK_SCOPE not in ("ultra", "all", "off"):
     FALLBACK_SCOPE = "ultra"
+def env_off(name):
+    # 默认开启的开关（按 Go 的 strconv.ParseBool 解析）：.env 里写成 false 的写法时为关闭；没有写、写空或写法无效时服务按默认值开启
+    return env_value(name).strip() in ("0", "f", "F", "FALSE", "false", "False")
+
+
+# REQUEST_BODY_LOG：关闭时账本不存请求正文；REPEAT_PROMPT_NONCE：开启时上游的输入 tokens 含本服务加的随机后缀（见 LEDGER_TEST_TOKENS 的说明）；
+# OMNI_IGNORE_SYSTEM_PROMPT：开启时发给 Omni 视频模型的请求去掉客户端的系统提示，运行日志的字数不含它（见 shape_counts）
+REQUEST_BODY_OFF = env_off("REQUEST_BODY_LOG")
+NONCE_ON = not env_off("REPEAT_PROMPT_NONCE")
+OMNI_SYSTEM_DROP = not env_off("OMNI_IGNORE_SYSTEM_PROMPT")
 
 
 def fallback_applies(path):
@@ -273,8 +332,9 @@ OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 API_STATE = {"value": "ok", "reason": ""}
 
 
-def get(path, timeout=30):
-    """返回 (数据, HTTP 状态, 错误说明)；连不上或令牌被拒绝时之后不再访问。状态 0 为没有响应"""
+def get(path, timeout=30, sticky=True):
+    """返回 (数据, HTTP 状态, 错误说明)；连不上或令牌被拒绝时之后不再访问。状态 0 为没有响应。sticky 为假时（读请求正文）超时、连接中断与
+    响应不是 JSON 只返回说明，不把管理接口当成连不上：一次读正文超时不影响之后的请求"""
     if API_STATE["value"] in ("down", "denied"):
         return None, 0, API_STATE["reason"]
     request = urllib.request.Request("http://%s:%s%s" % (host, port, path), headers={"X-Admin-Token": TOKEN})
@@ -294,7 +354,10 @@ def get(path, timeout=30):
                 error.code, "找不到 .admin-token" if not TOKEN else "管理令牌不对，确认 .admin-token 属于这个服务")
             detail = API_STATE["reason"]
         return None, error.code, mask(detail)[:200]
-    except (urllib.error.URLError, OSError, ValueError) as error:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as error:
+        if not sticky:
+            cause = error.reason if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException) else error
+            return None, 0, "%s（%s）" % ("响应不是 JSON" if isinstance(error, ValueError) else "超时或连接中断", type(cause).__name__)
         API_STATE["value"], API_STATE["reason"] = "down", "管理接口 http://%s:%s 连不上（服务没有运行，或 LISTEN_ADDR 不是这个地址）：%s" % (
             host, port, type(error).__name__)
         return None, 0, API_STATE["reason"]
@@ -500,6 +563,17 @@ def interaction_model(model_id):
     return model_id.lower().startswith("gemini-omni")
 
 
+def omni_video(model_id):
+    # 能输出视频的 Omni 模型（与 aistudio.OmniVideoModel 相同：目录里有 interactions_api 能力、带视频选项）：OMNI_IGNORE_SYSTEM_PROMPT 开启时
+    # 发给它的请求去掉客户端的系统提示。目录里没有这个模型时按名字
+    for item in CATALOG:
+        if item.get("id") == model_id:
+            options = item.get("capability_options") or {}
+            return bool((item.get("capabilities") or {}).get("interactions_api")) and any(
+                options.get(key) for key in ("video_output_resolutions", "video_duration_range", "video_tasks"))
+    return model_id.lower().startswith("gemini-omni")
+
+
 # ---------- 3. 用量账本 ----------
 models_of_interest = sorted({e["model"] for e in entries}) if ALL else [MODEL]
 print("\n== 3. 用量账本最近 %d 天的请求（账本只记模型、接口、账户与结果，不记密钥、IP、User-Agent 与提示词）" % DAYS)
@@ -681,7 +755,630 @@ def log_absence(entry):
         if entry["record"]:
             return "本实例运行日志（从 %s 开始）里没有这个请求的开始行" % show(log_since)
         return "本实例运行日志（从 %s 开始）里没有这个请求：多半不是经过本实例的" % show(log_since)
+    if entry["last"] is not None and log_since <= entry["last"]:
+        # 日志开始得比这次 403 早、却不到一小时：请求可能在日志开始之前就已开始，不说“晚于”，也不下“已轮转”的结论
+        return "运行日志从 %s 开始，只比这次 403 早 %d 分钟，不能确定请求开始时日志是否已在（只保留当前和上一份，各约 50MB）" % (
+            show(log_since), (entry["last"] - log_since).total_seconds() // 60)
     return "运行日志从 %s 开始，晚于这次 403：已轮转（只保留当前和上一份，各约 50MB）" % show(log_since)
+
+
+def request_began(entry):
+    # 请求开始的时间：账本的时间是请求结束的时间，减去耗时；没有记录时按最近一次 403
+    record = entry["record"] or {}
+    finished = parse_time(record.get("time"))
+    if finished is None:
+        return entry["last"]
+    try:
+        elapsed = max(0, int(record.get("duration_ms") or 0))
+    except (TypeError, ValueError):
+        elapsed = 0
+    return finished - datetime.timedelta(milliseconds=elapsed)
+
+
+def log_gap(entry):
+    # 运行日志看不到形态的原因：(分类, 说明)。按请求开始的时间区分“已轮转”与“覆盖这段时间却没有开始行”；账本补判的条目第 4、7 段都用它
+    if entry.get("start"):
+        return "loggap", "运行日志的开始行里没有消息条数"
+    if entry.get("finish"):
+        return "loggap", "运行日志里只有这个请求的结束行，开始行不在"
+    if not log_files or log_since is None:
+        return "nolog", "没有运行日志（logs/aistudio2api.log 与 .1 都不在）"
+    began = request_began(entry)
+    if began is not None and log_since <= began:
+        return "loggap", "运行日志（从 %s 开始）覆盖这个请求开始的时间（%s），却没有它的开始行" % (show(log_since), show(began))
+    return "rotated", "运行日志已轮转（从 %s 开始，晚于这个请求开始的 %s；只保留当前和上一份，各约 50MB）" % (show(log_since), show(began))
+
+
+# ---------- 账本补判请求形态 ----------
+# 登记没有请求形态（f06ddf9 之前的版本不记 last_request）、运行日志里也没有这个请求的开始行，账本里却对上了记录时，用账本补判：
+# 先看记录里的请求正文（has_body），按接口解析出与运行日志 request.started 同口径的形态，交给第 7 段同一套判断；没有正文时按最终成功时的
+# 输入 tokens；仍判断不了时写明已知的与看不到形态的原因。正文只取计数、字数与参数值，解析后不保留、不输出任何文字
+BODY_CACHE = {}  # 请求 ID → 正文解析出的形态与说明（见 body_info），不存正文
+BODY_SKIPPED = set()  # 超过 BODY_FETCH_LIMIT 没有读正文的请求 ID
+# 读正文超时或连接中断一次后不再读（几百个请求各等 30 秒太久），之后的请求 ID 记入 BODY_ABORTED；BODY_ABORT 为那一次的说明与请求 ID
+BODY_ABORTED = set()
+BODY_ABORT = {"reason": "", "id": ""}
+BODY_PROTOCOLS = ("openai-chat", "openai-responses", "anthropic", "gemini", "interactions")
+INLINE_HINT = re.compile(r';base64,|"(?:inlineData|inline_data|input_audio)"\s*:|"type"\s*:\s*"base64"|"file_data"\s*:\s*"')
+# Anthropic messages 里的 system 角色消息转成 <system-reminder> 用户消息（internal/api/anthropic.go），包装的字数计入运行日志的 input_text_chars
+SYSTEM_REMINDER_CHARS = len("<system-reminder>\n") + len("\n</system-reminder>")
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def text_chars(value):
+    # 与运行日志的 input_text_chars 同口径：按字符（Unicode 码点）计
+    return len(value) if isinstance(value, str) else 0
+
+
+def token_param(value):
+    # max tokens 参数与运行日志的 max_output_tokens 同一写法：没有写（或写成 null）为“默认”
+    if value is None:
+        return "默认"
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value)[:20]
+
+
+OPENAI_TEXT_TYPES = ("text", "input_text", "output_text")
+
+
+def block_texts(content, kinds):
+    # 字符串，或内容块数组里类型为 kinds 的文字段
+    if isinstance(content, str):
+        return [content]
+    return [as_dict(block).get("text") for block in as_list(content)
+            if as_dict(block).get("type") in kinds and isinstance(as_dict(block).get("text"), str)]
+
+
+def openai_content(content, shape):
+    """OpenAI Chat 与 Responses 的 content（字符串或内容块数组）：返回文字字数；图片、其他内联数据（音频、视频、内联文件与文件地址）
+    与文件引用（file_id）计入 shape"""
+    if isinstance(content, str):
+        return len(content)
+    chars = 0
+    for block in as_list(content):
+        block = as_dict(block)
+        kind = block.get("type")
+        if kind in OPENAI_TEXT_TYPES:
+            chars += text_chars(block.get("text"))
+        elif kind in ("image_url", "input_image"):
+            shape["images"] += 1
+        elif kind in ("video_url", "input_video", "input_audio"):
+            shape["inline"] += 1
+        elif kind in ("file", "input_file"):
+            item = as_dict(block.get("file"))
+            shape["inline" if item.get("file_data") or block.get("file_data") or block.get("file_url") else "files"] += 1
+    return chars
+
+
+def gemini_content(content, shape):
+    # Gemini 原生的一轮（parts 里的 text、inlineData/inline_data、fileData/file_data）：返回文字字数
+    chars = 0
+    for part in as_list(as_dict(content).get("parts")):
+        part = as_dict(part)
+        chars += text_chars(part.get("text"))
+        blob = as_dict(part.get("inlineData") or part.get("inline_data"))
+        if blob:
+            mime = str(blob.get("mimeType") or blob.get("mime_type") or "").lower()
+            shape["images" if mime.startswith("image/") else "inline"] += 1
+        if part.get("fileData") or part.get("file_data"):
+            shape["files"] += 1
+    return chars
+
+
+def anthropic_content(content, shape):
+    # Anthropic 的 content（字符串或内容块数组）：返回文字字数；工具结果里的图片与文档会作为真正的媒体发送，同样计入（其中的文字不计）
+    if isinstance(content, str):
+        return len(content)
+    chars = 0
+    for block in as_list(content):
+        block = as_dict(block)
+        kind = block.get("type")
+        if kind == "text":
+            chars += text_chars(block.get("text"))
+        elif kind == "image":
+            shape["images"] += 1
+        elif kind == "document":
+            shape["files" if as_dict(block.get("source")).get("type") == "file" else "inline"] += 1
+        elif kind == "tool_result":
+            anthropic_content([b for b in as_list(block.get("content")) if as_dict(b).get("type") != "text"], shape)
+    return chars
+
+
+def interaction_block(block, shape):
+    # Interactions 的内容块：text 返回字数；image、audio、video、document 带 data 为内联、带 uri 为文件引用
+    block = as_dict(block)
+    kind = block.get("type")
+    if kind == "text":
+        return text_chars(block.get("text"))
+    if kind in ("image", "audio", "video", "document"):
+        shape["files" if block.get("uri") and not block.get("data") else "images" if kind == "image" else "inline"] += 1
+    return 0
+
+
+def body_shape(protocol, body):
+    """按接口解析请求体，只取形态：对话消息条数与字数（不含系统提示）、系统提示的字数（多条按换行拼接，与服务端相同）、Anthropic messages 里
+    system 角色消息转成的轮次、最后一条用户消息的字数、图片、其他内联数据、文件引用、max tokens 参数（名与值）、是否续接上一轮与请求体里的
+    模型名；与运行日志 request.started 同口径的消息条数与字数见 shape_counts。认不出时返回 None"""
+    if not isinstance(body, dict):
+        return None
+    shape = {"protocol": protocol, "messages": 0, "chars": 0, "last_user": None, "images": 0, "inline": 0, "files": 0,
+             "system": 0, "system_text": False, "system_turns": 0, "system_turn_chars": 0,
+             "tokens_name": "", "tokens": "默认", "continuation": False, "model": ""}
+    if isinstance(body.get("model"), str):
+        shape["model"] = body["model"].strip()[:80]
+    system = []  # 系统提示的各段文字（服务端去掉空段、按换行拼接成一段），只用来计数，函数返回前丢弃
+
+    def add_system(text):
+        if isinstance(text, str) and text:
+            system.append(text)
+
+    if protocol == "openai-chat":
+        if not isinstance(body.get("messages"), list):
+            return None
+        for message in body["messages"]:
+            message = as_dict(message)
+            if message.get("role") in ("system", "developer"):
+                add_system("".join(block_texts(message.get("content"), OPENAI_TEXT_TYPES)))
+                continue
+            chars = openai_content(message.get("content"), shape)
+            shape["chars"] += chars
+            shape["messages"] += 1
+            if message.get("role") == "user":
+                shape["last_user"] = chars
+        # max_completion_tokens 写了就以它为准（与 chatRequest.generationConfig 相同）
+        name = "max_completion_tokens" if body.get("max_completion_tokens") is not None else "max_tokens"
+        shape["tokens_name"], shape["tokens"] = name, token_param(body.get(name))
+    elif protocol == "openai-responses":
+        items = body.get("input")
+        shape["continuation"] = bool(body.get("previous_response_id"))
+        add_system(body.get("instructions"))
+        if isinstance(items, str):
+            shape["messages"], shape["last_user"] = 1, len(items)
+            shape["chars"] += len(items)
+        elif isinstance(items, list):
+            for item in items:
+                item = as_dict(item)
+                kind = item.get("type") or "message"
+                if kind == "message":
+                    if item.get("role") in ("system", "developer"):
+                        add_system("".join(block_texts(item.get("content"), OPENAI_TEXT_TYPES)))
+                        continue
+                    chars = openai_content(item.get("content"), shape)
+                    shape["chars"] += chars
+                    shape["messages"] += 1
+                    if item.get("role") == "user":
+                        shape["last_user"] = chars
+                elif kind in ("agent_message", "function_call", "function_call_output"):
+                    shape["messages"] += 1
+        elif not shape["continuation"]:
+            return None
+        shape["tokens_name"], shape["tokens"] = "max_output_tokens", token_param(body.get("max_output_tokens"))
+    elif protocol == "anthropic":
+        if not isinstance(body.get("messages"), list):
+            return None
+        # 顶层 system 与 system 角色消息的文字块按换行拼接（internal/api/anthropic.go 的 anthropicSystemText）
+        add_system("\n".join(t for t in block_texts(body.get("system"), ("text",)) if t))
+        for message in body["messages"]:
+            message = as_dict(message)
+            if message.get("role") == "system":
+                # 转成一条 <system-reminder> 用户消息（文字为空时不发），Omni 视频模型去掉系统提示时整轮去掉
+                text = "\n".join(t for t in block_texts(message.get("content"), ("text",)) if t)
+                if text.strip():
+                    shape["system_turns"] += 1
+                    shape["system_turn_chars"] += len(text) + SYSTEM_REMINDER_CHARS
+                continue
+            chars = anthropic_content(message.get("content"), shape)
+            shape["chars"] += chars
+            shape["messages"] += 1
+            if message.get("role") == "user":
+                shape["last_user"] = chars
+        shape["tokens_name"], shape["tokens"] = "max_tokens", token_param(body.get("max_tokens"))
+    elif protocol == "gemini":
+        request = body
+        if not isinstance(request.get("contents"), list):
+            # 批量写法 {"requests": [...]} 只支持一条，countTokens 的 generateContentRequest 包装
+            if as_list(request.get("requests")):
+                request = as_dict(request["requests"][0])
+            elif isinstance(request.get("generateContentRequest"), dict):
+                request = request["generateContentRequest"]
+        instruction = request.get("systemInstruction") or request.get("system_instruction")
+        contents = request.get("contents")
+        if not isinstance(contents, list):
+            if isinstance(request.get("content"), dict):
+                contents = [request["content"]]
+            elif isinstance(instruction, dict):
+                # 只有 systemInstruction、没有 contents（new-api 把只有 system 的 OpenAI 对话转过来时就是这样）：服务端照常接受
+                contents = []
+            else:
+                return None
+        # 系统提示只取文字（各 part 直接拼接；带媒体时服务端返回 400）
+        add_system("".join(t for t in (as_dict(part).get("text") for part in as_list(as_dict(instruction).get("parts"))) if isinstance(t, str)))
+        for content in contents:
+            if not as_list(as_dict(content).get("parts")):
+                continue  # 没有 parts 的轮次服务端跳过
+            chars = gemini_content(content, shape)
+            shape["chars"] += chars
+            shape["messages"] += 1
+            if as_dict(content).get("role") in (None, "", "user"):
+                shape["last_user"] = chars
+        value = as_dict(request.get("generationConfig")).get("maxOutputTokens")
+        if value is None:
+            snake = as_dict(request.get("generation_config"))
+            value = snake.get("max_output_tokens", snake.get("maxOutputTokens"))
+        shape["tokens_name"], shape["tokens"] = "maxOutputTokens", token_param(value)
+    elif protocol == "interactions":
+        raw = body.get("input")
+        shape["continuation"] = bool(body.get("previous_interaction_id"))
+        add_system(body.get("system_instruction"))
+        if isinstance(raw, str):
+            if raw.strip():
+                shape["messages"], shape["last_user"] = 1, len(raw)
+                shape["chars"] += len(raw)
+        elif isinstance(raw, (list, dict)):
+            # 同一角色相邻的步骤并成一轮（与 appendInteractionParts 相同）
+            turns = []
+            for item in raw if isinstance(raw, list) else [raw]:
+                item = as_dict(item)
+                kind, chars = item.get("type"), 0
+                if kind == "thought":
+                    continue
+                if kind in ("user_input", "model_output"):
+                    role = "model" if kind == "model_output" else "user"
+                    for block in as_list(item.get("content")):
+                        chars += interaction_block(block, shape)
+                elif kind in ("function_call", "function_result"):
+                    role = "model" if kind == "function_call" else "tool"
+                else:
+                    role, chars = "user", interaction_block(item, shape)
+                shape["chars"] += chars
+                if turns and turns[-1][0] == role:
+                    turns[-1][1] += chars
+                else:
+                    turns.append([role, chars])
+            shape["messages"] = len(turns)
+            users = [chars for role, chars in turns if role == "user"]
+            shape["last_user"] = users[-1] if users else None
+        elif not shape["continuation"] and not system:
+            # 没有输入时只有系统指令的请求按用户消息生成（internal/api/interactions.go），两者都没有才是 400
+            return None
+        shape["tokens_name"], shape["tokens"] = "max_output_tokens", token_param(as_dict(body.get("generation_config")).get("max_output_tokens"))
+    else:
+        return None
+    joined = "\n".join(system)
+    shape["system"], shape["system_text"] = len(joined), bool(joined.strip())
+    return shape
+
+
+def shape_counts(shape, omni_drop):
+    """与运行日志 request.started 同口径的 (消息条数, 文字字数, 最后一条用户消息的字数, 去掉的系统提示字数)。运行日志在协议转换、整理系统提示
+    之后才记（internal/api/middleware.go 的 setGenerationInput）：系统提示不算消息、字数算在内；Anthropic 的 system 角色消息按用户消息算。
+    omni_drop（发给能输出视频的 Omni 模型且 OMNI_IGNORE_SYSTEM_PROMPT 开启）时与 aistudio.DropClientSystemPrompt 相同：有对话消息时去掉
+    系统提示与 system 角色消息转成的轮次；只有 system 角色消息时只去掉系统提示；只有系统提示时不去掉。之后只有系统提示、没有对话消息的请求
+    按一条用户消息发送（internal/app/runtime.go 的 startGenerate），消息 1 条、字数为系统提示的字数"""
+    messages, chars, last_user = shape["messages"], shape["chars"], shape["last_user"]
+    turns, turn_chars, system = shape["system_turns"], shape["system_turn_chars"], shape["system"]
+    if omni_drop and messages:
+        return messages, chars, last_user, system + turn_chars
+    if omni_drop and turns:
+        return turns, turn_chars, last_user, system
+    if not messages and not turns and shape["system_text"] and not shape["continuation"]:
+        return 1, system, system, 0
+    return messages + turns, chars + system + turn_chars, last_user, 0
+
+
+def body_protocol(record):
+    # 账本记录的 protocol（internal/app/request_logging.go 的 requestProtocol）；旧记录或认不出时按路径
+    protocol = (record.get("protocol") or "").strip()
+    if protocol in BODY_PROTOCOLS:
+        return protocol
+    path = base_path(record.get("path") or "")
+    if path == "/v1/chat/completions":
+        return "openai-chat"
+    if path == "/v1/responses":
+        return "openai-responses"
+    if path.startswith("/v1/messages"):
+        return "anthropic"
+    if path in INTERACTIONS:
+        return "interactions"
+    if path.endswith((":generateContent", ":streamGenerateContent")):
+        return "gemini"
+    return protocol or "-"
+
+
+def body_info(record):
+    """读这个请求的正文（只读 GET /api/requests/{id}/body）并解析出形态，按请求 ID 只读、只解析一次：BODY_CACHE 只存解析结果与说明，
+    不存正文。超过 BODY_FETCH_LIMIT 个不同的请求时不再读（记入 BODY_SKIPPED）；读正文超时或连接中断一次后之后的都不再读（记入
+    BODY_ABORTED），这次失败也不把管理接口当成连不上（get 的 sticky 为假）。返回 shape（body_shape 的结果，读不到或解析不了时为 None）、
+    truncated（正文被截断、解析不了时的同口径形态）、gap（正文用不上的原因：分类与说明）、short（结论里的简短说明）、note（第 4 段
+    “账本补判”一行的正文部分，有 shape 时由 ledger_info 按条目写）与 size（请求体字节数）、cut（是否被截断）"""
+    request_id = record.get("id") or ""
+    if request_id in BODY_CACHE:
+        return BODY_CACHE[request_id]
+    info = {"shape": None, "truncated": None, "gap": None, "short": "", "note": "", "size": 0, "cut": False, "protocol": body_protocol(record)}
+    if BODY_ABORT["reason"]:
+        BODY_ABORTED.add(request_id)
+        text = "前面读正文%s，之后的不再读" % BODY_ABORT["reason"]
+        info["gap"], info["short"], info["note"] = ("bodyfail", "正文没有读（%s）" % text), "正文没有读", "正文没有读（%s）" % text
+        return info
+    if len(BODY_CACHE) >= BODY_FETCH_LIMIT:
+        BODY_SKIPPED.add(request_id)
+        text = "需要读正文的请求超过 %d 个，这一条没有读" % BODY_FETCH_LIMIT
+        info["gap"], info["short"], info["note"] = ("bodyfail", text), "正文没有读", "正文没有读（需要读正文的请求超过 %d 个）" % BODY_FETCH_LIMIT
+        return info
+    data, status, detail = get("/api/requests/%s/body" % urllib.parse.quote(request_id, safe=""), sticky=False)
+    if not isinstance(data, dict):
+        if status == 404 and "正文不存在" in detail:
+            # 正文不存在时服务返回 request_body_not_found（说明为“请求正文不存在”）：只保留最近 1000 条，读取时已被挤出
+            info["gap"] = ("nobody", "账本里这条请求的正文读取时已不在（只保留最近 1000 条）")
+            info["note"] = "正文无（读取时已不在：只保留最近 1000 条）"
+        elif status == 0 and API_STATE["value"] == "ok":
+            # 超时、连接中断或响应不是 JSON（服务多半在运行，只是这一个请求慢或出错）：不当成管理接口连不上；超时与连接中断后不再读之后的正文
+            text = "读正文%s" % detail
+            if not detail.startswith("响应不是 JSON"):
+                BODY_ABORT["reason"], BODY_ABORT["id"] = detail, request_id
+            info["gap"], info["note"] = ("bodyfail", text), text
+        else:
+            # 没有这个接口的旧版本服务同样是 404，说明不同
+            text = "读不到正文（HTTP 404：旧版本服务没有正文接口）" if status == 404 else "正文读取失败（%s）" % (
+                "HTTP %d%s" % (status, "：" + detail if detail else "") if status else detail or "没有响应")
+            info["gap"], info["note"] = ("bodyfail", text), text
+        info["short"] = "正文读不到"
+        BODY_CACHE[request_id] = info
+        return info
+    raw = data.get("request") if isinstance(data.get("request"), str) else ""
+    size = data.get("request_size") if isinstance(data.get("request_size"), int) else len(raw.encode("utf-8"))
+    cut = size > BODY_LIMIT or size > len(raw.encode("utf-8"))
+    info["size"], info["cut"] = size, cut
+    try:
+        body = json.loads(raw) if raw.strip() else None
+    except ValueError:
+        body = None
+    shape = body_shape(info["protocol"], body) if body is not None else None
+    if shape is None and cut:
+        # 截断本身说明请求体超过 64 KiB，不是渠道测试的一条短消息；前 64 KiB 里能看到的内联数据照样算上
+        inline = bool(INLINE_HINT.search(raw))
+        info["truncated"] = {"_ledger": True, "_truncated": True, "_size": size, "input_media": 1 if inline else 0, "input_files": 0}
+        info["note"] = "正文被截断（请求体 %d 字节，账本只存前 64 KiB，解析不了；前 64 KiB 里%s内联数据）" % (size, "有" if inline else "没有")
+    elif shape is None:
+        text = "正文为空" if not raw.strip() else "正文不是 JSON（请求体 %d 字节）" % size if body is None else "认不出这个接口（%s）的请求体" % info["protocol"]
+        info["gap"], info["short"], info["note"] = ("bodyfail", text), "正文解析不了", "正文有但解析不了：" + text
+    info["shape"] = shape
+    BODY_CACHE[request_id] = info
+    return info
+
+
+# 账本里额度用完改用的备注（app/model_fallback.go 的 modelFallbackSwitchNote：“模型 <源> 额度用完（<原因>），按 MODEL_FALLBACKS 改用 <目标>”，
+# 后面可能还有“ | 历史里的 N 个思考签名…”）
+SWITCH_NOTE = re.compile(r"模型 (\S+) 额度用完.*?按 MODEL_FALLBACKS 改用 ([^\s|，（]+)")
+
+
+def text_value(value):
+    return value.strip() if isinstance(value, str) else ""
+
+
+def ledger_switch(record):
+    """账本记录里看得到的额度用完改用（MODEL_FALLBACKS，e2e0a20 起；见 app/model_fallback.go 的 switchModelFallback、endModelFallback）：
+    第一次改用时先给已记下的源模型尝试补记源模型（TagAccessLogAttempts），再追加一条账户与模型都为空的改用备注，之后目标模型的尝试在
+    记下时就写目标模型；目标都失败时记录的模型恢复为源模型（RestoreAccessLogSource）。返回 (源模型, 目标模型集合（小写，按目录换成正式
+    ID）, 依次试过的模型)：源模型取备注里写的，备注认不出时取第一条备注之前的尝试所记的模型（源模型的候选全部冷却、一次也没有发出时
+    备注之前没有尝试）；目标取备注里写的与第一条备注之后的尝试所记的模型。没有改用过的记录（没有目标）返回 ("", set(), [])"""
+    source, tagged, targets, order, seen = "", "", set(), [], False
+
+    def add(name):
+        if name and (not order or order[-1].lower() != name.lower()):
+            order.append(name)
+
+    for attempt in as_list(record.get("attempts")):
+        if not isinstance(attempt, dict):
+            continue
+        model = fallback_name(text_value(attempt.get("model")))
+        if model:
+            if seen:
+                targets.add(canonical(model))
+            else:
+                tagged = tagged or model
+            add(model)
+            continue
+        if text_value(attempt.get("account")):
+            continue
+        # 账户与模型都为空：改用备注（尝试只在改用时才带模型，改用之前没有模型的尝试在第一次改用时都补记了源模型）
+        seen = True
+        match = SWITCH_NOTE.search(text_value(attempt.get("error")))
+        if match:
+            source = source or fallback_name(match.group(1))
+            targets.add(canonical(match.group(2)))
+            if not order:
+                add(fallback_name(match.group(1)))
+            add(fallback_name(match.group(2)))
+    if not targets:
+        return "", set(), []
+    return source or tagged, targets, order
+
+
+# ledger_requested 的改用证据：来源 → 第 7 段结论末尾写的依据
+SWITCH_BASIS = {"finish": "运行日志的结束行", "attempts": "账本记录的上游尝试", "record": "账本记录的模型（改用的目标都失败时恢复为源模型）"}
+
+
+def ledger_requested(entry, shape):
+    """账本里看得到的客户端请求名：请求体里的 model，Gemini 原生为路径里的模型名（/v1beta/models/<请求名>:generateContent）。只在能确定时
+    返回 (请求名, 来源)，交给 judge 判别名与改用（与 request.started 的模型名同口径：目录别名落到这个模型，或按 MODEL_FALLBACKS 改用到这个
+    模型）；带思考、视频等后缀的其他写法不返回，免得把后缀判成“模型重定向或改用（未确认）”。
+    请求体与路径都确定不了时，再看现成的额度用完改用证据，它们直接说明发生过改用（judge 不再按现在的 MODEL_FALLBACK_SCOPE 判断路径）：
+      finish：运行日志结束行的 fallback_from（请求以改用后的目标结束），与登记的模型不同时就是客户端请求的源模型；
+      attempts：账本记录的上游尝试（见 ledger_switch）说明登记的模型是改用的目标，源模型与它不同时；
+      record：登记的模型是改用的目标、备注与尝试都看不出源模型时，记录的模型（目标都失败时恢复为源模型）与它不同、且按 MODEL_FALLBACKS
+              改用到它时。
+    默认的 MODEL_FALLBACKS 是双向的（argon=carbon、carbon=argon）：登记的模型是改用的源模型时（这个账户在源模型上 403，之后额度用完改用
+    到别的模型），客户端请求的就是登记的模型，这里不返回，按形态照常判断"""
+    record = entry["record"] or {}
+    names = [(shape["model"], "body")] if shape and shape.get("model") else []
+    match = re.search(r"/models/([^/:]+):", record.get("path") or "")
+    if match:
+        names.append((urllib.parse.unquote(match.group(1)), "path"))
+    target = entry["model"].lower()
+    for raw, where in names:
+        name = fallback_name(raw)
+        if not name or name.lower() == target:
+            continue
+        if canonical(name) == target or fallback_applies(record.get("path") or "") and fallback_pair(name, entry["model"]):
+            return name, where
+    name = fallback_name(text_value((entry.get("finish") or {}).get("fallback_from")))
+    if name and name.lower() != target and canonical(name) != target:
+        return name, "finish"
+    source, targets, _ = ledger_switch(record)
+    if target in targets or canonical(target) in targets:
+        if source and source.lower() != target and canonical(source) != target:
+            return source, "attempts"
+        name = fallback_name(text_value(record.get("model")))
+        if not source and name and name.lower() != target and fallback_pair(name, entry["model"]):
+            return name, "record"
+    return "", ""
+
+
+def needs_ledger(entry):
+    """是否要用账本补判：账本里对上了记录，登记与运行日志都没有消息条数，且第 7 段不会先按其他规则下结论（早于 93c16fa 的普通 403 判为
+    旧记录、直连 interactions、请求名与登记的模型不同）。已有请求形态的条目不读正文，结论不变"""
+    last, start, record = entry["last_request"] or {}, entry.get("start") or {}, entry["record"]
+    if not record or last.get("messages") or start.get("input_messages") or last.get("requested_model"):
+        return False
+    if base_path(last.get("path") or record.get("path") or "") in INTERACTIONS:
+        return False
+    return entry["verify"] or not (entry["last"] and entry["last"] < FIX_AT)
+
+
+def final_text(record):
+    # 账本记录的最终结果：成功（completed、tool_calls、limited）、上游终止生成（blocked：finishReason 不是 stop，HTTP 200）、取消、失败
+    state = record.get("state")
+    return "成功" if state in SUCCESS_STATES else "上游终止生成" if state == "blocked" else "取消" if state == "cancelled" else "失败"
+
+
+def record_tokens(record):
+    # 账本的输入、回复 tokens（不是整数时按 0）
+    values = []
+    for key in ("input_tokens", "reply_tokens"):
+        try:
+            values.append(max(0, int(record.get(key) or 0)))
+        except (TypeError, ValueError):
+            values.append(0)
+    return values[0], values[1]
+
+
+def ledger_info(entry):
+    """账本补判用到的信息（见 body_info）：记录没有正文（has_body 为假）时不读正文接口。有正文形态时按这个条目换成与 request.started 同口径的
+    start（发给 Omni 视频模型且 OMNI_IGNORE_SYSTEM_PROMPT 开启时不计被去掉的系统提示，只有系统提示时按 1 条用户消息，见 shape_counts）；
+    请求名能确定是目录别名或 MODEL_FALLBACKS 的源模型时带上（见 ledger_requested）。note 为第 4 段“账本补判”一行：正文部分、账本的输入、
+    回复 tokens 与最终结果"""
+    record = entry["record"]
+    if record.get("has_body"):
+        body = body_info(record)
+    else:
+        reason = ".env 里 REQUEST_BODY_LOG=false，不记正文" if REQUEST_BODY_OFF else "正文只保留最近 1000 条，或当时 REQUEST_BODY_LOG 关闭"
+        body = {"shape": None, "truncated": None, "gap": ("nobody", "账本里没有这条请求的正文（%s）" % reason), "short": "账本里没有请求正文",
+                "note": "正文无（%s）" % reason}
+    info = {"start": None, "gap": body["gap"], "short": body["short"], "note": body["note"]}
+    shape = body.get("shape")
+    info["requested"] = ledger_requested(entry, shape)
+    if shape:
+        dropping = OMNI_SYSTEM_DROP and omni_video(entry["model"])
+        messages, chars, last_user, dropped = shape_counts(shape, dropping)
+        info["start"] = {"_ledger": True, "_shape": shape, "_continuation": shape["continuation"],
+                         "input_messages": messages, "input_text_chars": chars,
+                         "input_media": shape["images"] + shape["inline"], "input_files": shape["files"],
+                         "parameters": {"max_output_tokens": shape["tokens"]}}
+        system = shape["system"] + shape["system_turn_chars"]
+        notes = []
+        if dropped:
+            notes.append("客户端的系统提示 %d 字发给 Omni 视频模型时服务端去掉，不计入，与运行日志同口径" % dropped)
+        elif messages and not shape["messages"] and not shape["system_turns"]:
+            notes.append("只有系统提示，服务端把它作为 1 条用户消息发送")
+        elif system:
+            notes.append("含系统提示 %d 字" % system)
+        if last_user is not None:
+            notes.append("最后一条用户消息 %d 字" % last_user)
+        info["note"] = "正文有（%s，请求体 %d 字节%s）：%d 条消息、文字 %d 字%s、图片 %d、其他内联数据 %d、文件 %d、%s %s%s%s" % (
+            shape["protocol"], body["size"], "，被截断但前 64 KiB 解析得了" if body["cut"] else "", messages, chars,
+            "（%s）" % "；".join(notes) if notes else "",
+            shape["images"], shape["inline"], shape["files"], shape["tokens_name"] or "max tokens", shape["tokens"],
+            "、续接上一轮" if shape["continuation"] else "", "、请求体里的模型名 %s" % shape["model"] if shape["model"] else "")
+    elif body.get("truncated"):
+        info["start"] = dict(body["truncated"])
+    requested, where = info["requested"]
+    if requested and info["start"]:
+        info["start"]["model"] = requested
+        if where in SWITCH_BASIS:
+            info["start"]["_switched"] = True
+    if requested and where == "path":
+        info["note"] += "；路径里的请求名 %s" % requested
+    source, _, order = ledger_switch(record)
+    if order:
+        # 改用备注认不出、改用前又没有源模型的尝试时看不出源模型，写成“? → 目标”
+        info["note"] += "；上游尝试的模型：%s%s（MODEL_FALLBACKS 额度用完改用）" % ("" if source else "? → ", " → ".join(order))
+    tokens, reply = record_tokens(record)
+    info["note"] += " · 按账本：输入 %d / 回复 %d tokens（最终%s，HTTP %s %s）" % (
+        tokens, reply, final_text(record), record.get("status") or "-", record.get("state") or "-")
+    return info
+
+
+def id_kind(request_id):
+    # 请求 ID 前缀对应的接口类型（见 ID_PREFIXES）；认不出时为空
+    for prefix, label in ID_PREFIXES:
+        if (request_id or "").startswith(prefix):
+            return prefix, label
+    return "", ""
+
+
+def id_only(entry):
+    # 账本里没有记录、登记里也没有接口与请求形态，只知道请求 ID：按 ID 前缀补一句接口类型
+    last = entry["last_request"] or {}
+    return entry["record"] is None and bool(entry.get("request_id")) and not last.get("path") and not last.get("messages") and bool(
+        id_kind(entry["request_id"])[1])
+
+
+def test_shaped(start, path):
+    # 请求形态与渠道测试相符（与 judge 的渠道测试判定同一套：1 条不超过 8 字的消息、没有媒体与文件、max_tokens 为 16/3000/不带、渠道测试会用的接口）
+    if not start or start.get("_truncated") or start.get("_continuation"):
+        return False
+    chars = start.get("input_text_chars")
+    tokens = str((start.get("parameters") or {}).get("max_output_tokens") or "")
+    return (start.get("input_messages") == 1 and not start.get("input_media") and not start.get("input_files") and isinstance(chars, int)
+            and chars <= 8 and bool(TEST_TOKENS.match(tokens or "默认")) and path.endswith(TEST_PATHS))
+
+
+def token_calibration():
+    """渠道测试的输入 tokens 校准样本（见 LEDGER_TEST_TOKENS 的说明）：请求形态已确认是渠道测试（运行日志的开始行，或账本正文得出的同口径形态）、
+    最终成功、账本有输入 tokens 的请求，按最终的模型（小写）取输入 tokens，每个请求只算一次；超过 8 加随机后缀最大贡献的不算"""
+    samples = collections.defaultdict(dict)
+    for entry in entries:
+        record = entry["record"]
+        if not record or record.get("state") not in SUCCESS_STATES:
+            continue
+        tokens = record_tokens(record)[0]
+        start = (entry.get("ledger") or {}).get("start") or entry.get("start") or {}
+        path = base_path((entry["last_request"] or {}).get("path") or record.get("path") or "")
+        if 0 < tokens <= LEDGER_TEST_TOKENS + NONCE_TOKENS_MAX and test_shaped(start, path):
+            samples[(record.get("model") or entry["model"]).lower()][record.get("id")] = tokens
+    return {model: sorted(values.values()) for model, values in samples.items()}
+
+
+def token_limits(record, entry):
+    """(校准样本, 渠道测试上限, 下游门槛)：有同一模型的校准样本时上限为样本最大值加 LEDGER_TEST_TOKENS、门槛为最大值加 LEDGER_DOWNSTREAM_TOKENS；
+    没有样本时上限为 LEDGER_TEST_TOKENS，门槛为随机后缀可能的最大贡献（REPEAT_PROMPT_NONCE 关闭时为 0）加 LEDGER_DOWNSTREAM_TOKENS"""
+    samples = CALIBRATION.get((record.get("model") or entry["model"]).lower()) or []
+    if samples:
+        return samples, samples[-1] + LEDGER_TEST_TOKENS, samples[-1] + LEDGER_DOWNSTREAM_TOKENS
+    return samples, LEDGER_TEST_TOKENS, (NONCE_TOKENS_MAX if NONCE_ON else 0) + LEDGER_DOWNSTREAM_TOKENS
+
+
+def samples_text(samples):
+    return "%d 个请求，输入 %s tokens" % (len(samples), "%d" % samples[0] if samples[0] == samples[-1] else "%d～%d" % (samples[0], samples[-1]))
 
 
 print("\n== 4. 每个登记账户最近一次 403 对应的请求与经过（运行日志：%s）" % ("、".join(log_files) or "没有"))
@@ -693,6 +1390,8 @@ for entry in entries:
     entry["start"], entry["finish"], entry["request_id"] = start, finishes.get(request_id) or {}, request_id
     # 登记带请求 ID、运行日志覆盖这次 403 却没有这个请求：账本读不到时据此判断请求不是经过本实例的
     entry["log_missing"] = bool(last.get("id")) and not start and not entry["finish"] and log_covers(entry)
+    # 登记与运行日志都没有请求形态、账本里对上了记录时用账本补判（需要验证账号的账户同样要，第 7 段用）
+    entry["ledger"] = ledger_info(entry) if needs_ledger(entry) else None
     # 需要验证账号的账户的登记照样对照（第 7 段要判断请求来源），默认不逐条输出，循环后只给个数与时间范围
     if not detailed(entry):
         continue
@@ -733,13 +1432,31 @@ for entry in entries:
         shape.append("运行日志：只有这个请求的结束行（HTTP %s %s），开始行不在日志里，看不到消息数与 max_output_tokens" % (
             entry["finish"].get("status", "-"), entry["finish"].get("state", "-")))
     elif request_id:
-        shape.append(log_absence(entry))
+        # 账本补判的条目与第 7 段同一口径（按账本算出的请求开始时间，见 log_gap）；其余照旧按这次 403 的时间
+        shape.append(log_gap(entry)[1] if entry["ledger"] else log_absence(entry))
     if entry["finish"].get("fallback_from"):
         shape.append("运行日志：request.finished 带 fallback_from=%s（额度用完改用）" % entry["finish"]["fallback_from"])
+    if entry["ledger"]:
+        shape.append("账本补判：" + entry["ledger"]["note"])
+    if id_only(entry):
+        shape.append("请求 ID 前缀 %s：%s（只按 ID 推断接口类型）" % id_kind(request_id))
     for item in shape:
         print("    " + item)
 if VERIFY_ENTRIES and not VERIFY_LIST:
     print("需要验证账号的账户的登记不逐条列出：%s；请求来源见第 7 段的汇总（VERIFY=list 逐条列出）" % verify_brief(VERIFY_ENTRIES))
+if BODY_SKIPPED:
+    print("⚠ 需要读请求正文的请求有 %d 个，超过上限 %d 个：其中 %d 个没有读正文，按账本的 tokens 与其他信息判断" % (
+        len(BODY_CACHE) + len(BODY_SKIPPED) + len(BODY_ABORTED), BODY_FETCH_LIMIT, len(BODY_SKIPPED)))
+if BODY_ABORTED:
+    print("⚠ 读请求 %s 的正文%s（管理接口没有当成连不上）：之后 %d 个请求的正文不再读，按账本的 tokens 与其他信息判断" % (
+        BODY_ABORT["id"], BODY_ABORT["reason"], len(BODY_ABORTED)))
+# 账本补判按输入 tokens 判断时的渠道测试校准（见 token_calibration），有用账本补判的条目时写明
+CALIBRATION = token_calibration()
+if any(entry["ledger"] for entry in entries):
+    print("账本补判按输入 tokens 判断时：随机后缀（REPEAT_PROMPT_NONCE）%s；渠道测试的校准样本（形态已确认是渠道测试、最终成功）%s" % (
+        "开启，输入 tokens 含后缀" if NONCE_ON else "关闭", "：" + "；".join("%s %s" % (model, samples_text(values)) for model, values in sorted(
+            CALIBRATION.items())) if CALIBRATION else "没有：渠道测试只认输入不超过 %d 的，不少于 %d 才判为下游" % (
+            LEDGER_TEST_TOKENS, (NONCE_TOKENS_MAX if NONCE_ON else 0) + LEDGER_DOWNSTREAM_TOKENS)))
 
 # ---------- 5. 目录别名 ----------
 print("\n== 5. 目录里的别名（别名本身不是目录 ID 时，请求这个别名会落到这个模型、登记在它名下）")
@@ -821,10 +1538,32 @@ ADVICE = {
                        "不要这些号就删除；请求来源见结论",
     "账本没有": "看第 1 段有没有多个实例共用账户目录、账户目录是不是从别处复制或恢复来的；确认后点这一行的“清除”",
     "无法对照": "按最近一次 403 的时间（或账本里这个请求的时间）到 new-api 查",
+    # 账本里有这个请求，登记、运行日志与账本都看不出形态（见 ledger_judge）
+    "无法判断形态": "按这个请求的时间与接口到 new-api 的使用日志里查这个模型（看是哪个令牌、哪个用户）；看第 3 段这个模型按接口、按天的"
+              "请求数与成功数，判断现在还有没有这类请求",
 }
+
+# 看不到请求形态的原因（ledger_judge 记在 entry["gaps"]），第 7 段需要验证账号的汇总按它说明主要原因
+GAP_LABELS = collections.OrderedDict((
+    ("reg", "这些登记早于记录请求形态的版本 f06ddf9"), ("rotated", "运行日志已轮转"), ("loggap", "运行日志覆盖这段时间却没有开始行"),
+    ("nolog", "没有运行日志"), ("nobody", "账本里也没有正文"), ("bodyfail", "正文读不到或解析不了"), ("noshape", "正文里没有对话消息"),
+    ("failed", "请求最终没有成功、账本里没有 tokens"),
+    ("tokens", "账本的输入 tokens 判断不了（为 0、介于渠道测试与下游之间，或请求没有成功）")))
+
+
+def ledger_shape_text(start):
+    # 按账本正文得出的形态（见 ledger_info）
+    if start.get("_truncated"):
+        return "按账本里的请求正文：请求体 %d 字节，超过 64 KiB 被截断%s" % (
+            start["_size"], "，前 64 KiB 里有内联数据" if start.get("input_media") else "")
+    shape = start["_shape"]
+    return "按账本里的请求正文：%d 条消息、图片 %d、其他内联数据 %d、文件 %d%s" % (
+        start["input_messages"], shape["images"], shape["inline"], shape["files"], "、续接上一轮" if shape["continuation"] else "")
 
 
 def shape_text(last, start):
+    if start.get("_ledger"):
+        return ledger_shape_text(start)
     if last:
         text = "%d 条消息、图片 %d、文件 %d" % (last.get("messages") or 0, last.get("images") or 0, last.get("files") or 0)
         if start:
@@ -840,12 +1579,14 @@ def shared_note():
     return "；第 1 段发现 %d 个实例共用账户目录" % SHARED if SHARED >= 2 else ""
 
 
-def request_source(entry):
+def judge(entry, start):
     """请求来源的结论与分类。账户级 403（需要验证账号）的那条登记同样判断来源，但跳过三条“多半与账户权限无关”的判定（早于 93c16fa 的
     旧记录、升级前带图 Omni 的误登记、下游带图调用 Omni）：上游原文已明确是账户需要验证，这些判定针对的是“The caller does not have
     permission”被误登记的情形，套用会得出“账户本身多半正常”的错误结论；它们按请求形态照常归入渠道测试、下游等。需要验证账号的账户在
-    其他模型上的普通 403 照常套用"""
-    last, start, record = entry["last_request"] or {}, entry.get("start") or {}, entry["record"]
+    其他模型上的普通 403 照常套用。start 为运行日志的 request.started，或账本补判按正文得出的同口径形态（带 _ledger，见 ledger_info）；
+    账本里有这个请求、却看不出形态时返回 (None, None)，由 ledger_judge 补判"""
+    last, record = entry["last_request"] or {}, entry["record"]
+    from_ledger = bool(start.get("_ledger"))
     account_level = entry["verify"]
     if not account_level and entry["last"] and entry["last"] < FIX_AT:
         return "多半是旧记录（最近一次 403 早于 93c16fa 修复带图 Omni 403 误登记的时间 %s）" % show(FIX_AT), "旧记录"
@@ -860,7 +1601,8 @@ def request_source(entry):
             shared_note(), "；登记的请求形态：%s %s" % (last.get("path") or "-", shape) if shape else ""), "账本没有"
     path = base_path(last.get("path") or (record or {}).get("path") or "")
     raw_path = last.get("path") or (record or {}).get("path") or ""
-    media = (last.get("images") or 0) if last else (start.get("input_media") or 0)
+    # 按账本正文补判时登记里没有图片数（或登记的 last_request 里没有消息数），看正文得出的媒体数
+    media = (last.get("images") or 0) if last and not from_ledger else (start.get("input_media") or 0)
     code7 = "协议错误码 7" in entry["message"]
     if not account_level and interaction_model(entry["model"]) and media > 0 and (not last or FIX_COUNT == "0"):
         text = "多半是升级到含 93c16fa 的版本之前带图请求的误登记（%s）：新版本不再把带图、协议错误码 7 的 Omni 403 登记为账户无权限，账户本身多半正常" % (
@@ -879,7 +1621,9 @@ def request_source(entry):
     requested = last.get("requested_model") or (start.get("model") if start.get("model") not in (None, "", entry["model"]) else "")
     if requested and requested.lower() != entry["model"].lower():
         finish = entry.get("finish") or {}
-        if (finish.get("fallback_from") or "").lower() == requested.lower() or fallback_applies(raw_path) and fallback_pair(requested, entry["model"]):
+        # 账本补判看到了改用的证据（运行日志结束行的 fallback_from、账本记录的上游尝试，见 ledger_requested）时不再按现在的生效范围判断
+        if start.get("_switched") or (finish.get("fallback_from") or "").lower() == requested.lower() or \
+                fallback_applies(raw_path) and fallback_pair(requested, entry["model"]):
             return "额度用完改用（MODEL_FALLBACKS：客户端请求 %s，改用 %s 后 403）" % (requested, entry["model"]), "改用"
         if canonical(requested) == entry["model"].lower():
             return "别名（客户端请求的是目录别名 %s，落到了 %s）" % (requested, entry["model"]), "别名"
@@ -887,7 +1631,7 @@ def request_source(entry):
             requested, entry["model"], "目录里它现在不是这个模型的别名" if CATALOG_OK else "读不到模型目录，无法核对别名"), "未确认"
     messages = last.get("messages") or start.get("input_messages")
     if messages:
-        images = (last.get("images") or 0) if last else (start.get("input_media") or 0)
+        images = (last.get("images") or 0) if last and not from_ledger else (start.get("input_media") or 0)
         # 登记的图片只数 image/* 内联数据，内联的视频、音频只算在运行日志的媒体里：判断下游取两者较大的；渠道测试从不带媒体与文件，
         # 运行日志里媒体或文件不为 0 的在这里归为下游，不会进入下面的渠道测试判定
         inline = max(images, start.get("input_media") or 0)
@@ -895,7 +1639,8 @@ def request_source(entry):
         if not account_level and images and interaction_model(entry["model"]) and not code7:
             return "下游带图调用 Omni（%s）：新版本只在 403 的错误体不带协议错误码 7 时（出口或 GFE 的 HTML 错误页）才登记带图请求，" \
                    "多半与账户权限无关" % shape_text(last, start), "下游带图"
-        if inline or files or messages > 1:
+        # 续接上一轮（previous_response_id、previous_interaction_id）的请求带着历史，与多条消息一样是下游（只有账本正文看得出）
+        if inline or files or messages > 1 or start.get("_continuation"):
             return "下游主动调用（%s）" % shape_text(last, start), "下游"
         tokens = str((start.get("parameters") or {}).get("max_output_tokens") or "")
         chars = start.get("input_text_chars")
@@ -913,7 +1658,110 @@ def request_source(entry):
     if record is None:
         extra = "，早于账本保留期" if entry["age"] > 90 else ""
         return "账本里没有对应请求（可能是共用账户目录的其他实例或复制来的目录%s%s）" % (extra, shared_note()), "账本没有"
-    return "无法判断请求形态（账本里有这个请求，运行日志里没有它的开始行）", "无法对照"
+    return None, None
+
+
+def tried_accounts(record):
+    # 账本里这个请求试过的不同账户数（不区分大小写）：请求最终失败时 account 是最后一次尝试的账户，它也在 attempts 里；同一账户换通道再试、
+    # 额度用完改用的备注（账户为空）都不另算
+    return len({(attempt.get("account") or "").lower() for attempt in record.get("attempts") or [] if attempt.get("account")} |
+               ({record["account"].lower()} if record.get("account") else set()))
+
+
+def record_brief(record):
+    # 账本里已知的：接口、依次试了几个不同的账户与最终结果
+    return "接口 %s %s，这个请求依次试了 %d 个不同的账户，最终%s（HTTP %s %s）" % (
+        record.get("protocol") or "-", record.get("path") or "-", tried_accounts(record), final_text(record), record.get("status") or "-",
+        record.get("state") or "-")
+
+
+def ledger_judge(entry):
+    """账本里有这个请求、登记与运行日志都看不出形态时补判（判断规则与 judge 是同一套）：
+      a. 有正文：按正文得出的同口径形态交给 judge（请求名能确定是目录别名或 MODEL_FALLBACKS 的源模型时一并交给它）；正文被截断时截断本身
+         说明请求体超过 64 KiB，不是渠道测试的一条短消息。没有正文、Gemini 原生路径里的请求名是别名或源模型时同样先判别名、改用；
+         运行日志结束行的 fallback_from、账本记录的上游尝试说明登记的模型是额度用完改用的目标时，有没有正文都先判为改用（与有开始行时
+         judge 先判改用相同）
+      b. 仍看不出：按账本的输入 tokens（阈值见 LEDGER_TEST_TOKENS 的说明与 token_limits）。渠道测试只认最终成功的；上游终止生成（blocked）的
+         用量是上游给的，够得上下游门槛时同样判下游；取消、失败的请求有 tokens 也不按它判断
+      c. 仍判断不了：写“无法判断请求形态”，附上接口、依次试了几个账户、最终结果，与看不到形态的原因（分类记在 entry["gaps"]）"""
+    info = entry.get("ledger") or ledger_info(entry)
+    record, last = entry["record"], entry["last_request"] or {}
+    pseudo, gaps, short = info["start"], [], info["short"] or "没有请求正文"
+    requested, where = info.get("requested") or ("", "")
+    if pseudo:
+        text, kind = judge(entry, pseudo)
+        if kind is None and pseudo.get("_truncated"):
+            text, kind = "下游主动调用（%s：远不止渠道测试的一条短消息）" % ledger_shape_text(pseudo), "下游"
+        elif kind is None and pseudo.get("_continuation"):
+            text, kind = "下游主动调用（%s）" % ledger_shape_text(pseudo), "下游"
+        if kind is not None:
+            # 结论里用到了正文形态（ledger_shape_text）时已写明“按账本里的请求正文”，其余（渠道测试、别名等）在末尾注明
+            basis = SWITCH_BASIS[where] if kind == "改用" and where in SWITCH_BASIS else \
+                "账本记录的请求路径" if where == "path" and kind in ("别名", "改用") else "账本里的请求正文"
+            return text if "按账本里的请求正文" in text else text + "，依据" + basis, kind
+        gaps.append(("noshape", "正文里没有对话消息"))
+        short = "正文里没有对话消息"
+    elif requested:
+        # 没有可用的正文，Gemini 原生路径里的请求名是目录别名或 MODEL_FALLBACKS 的源模型，或运行日志的结束行、账本记录的上游尝试说明
+        # 发生过额度用完改用（见 ledger_requested）
+        text, kind = judge(entry, {"_ledger": True, "model": requested, "_switched": where in SWITCH_BASIS})
+        if kind is not None:
+            return text + "，依据" + SWITCH_BASIS.get(where, "账本记录的请求路径"), kind
+    if not pseudo and info["gap"]:
+        gaps.append(info["gap"])
+    path = base_path(last.get("path") or record.get("path") or "")
+    tokens, reply = record_tokens(record)
+    state = record.get("state")
+    success = state in SUCCESS_STATES
+    samples, test_limit, down_limit = token_limits(record, entry)
+    if tokens > 0 and (success or state == "blocked"):
+        if success and tokens <= test_limit and path.endswith(TEST_PATHS):
+            basis = "与一条“hi”相当" if tokens <= LEDGER_TEST_TOKENS else "不超过本次账本里已确认的渠道测试（%s%s）加 %d" % (
+                samples_text(samples), "，含本服务加的随机后缀" if NONCE_ON else "", LEDGER_TEST_TOKENS)
+            return "多半是 new-api 渠道测试（按账本：输入 %d tokens、回复 %d tokens，%s；%s，看不到 max_tokens 与消息条数）" % (
+                tokens, reply, basis, short), "渠道测试"
+        if tokens >= down_limit:
+            limit = "按本次已确认的渠道测试校准" if samples else "已算上本服务加的随机后缀" if NONCE_ON else ""
+            return "下游主动调用（按账本：输入 %d tokens，%s远不止一条短消息%s）" % (
+                tokens, "不少于 %d（%s），" % (down_limit, limit) if limit else "",
+                "；请求最终被上游终止生成（HTTP %s blocked），输入 tokens 是上游给的" % (record.get("status") or "-") if not success else ""), "下游"
+        if not success:
+            gaps.append(("tokens", "请求最终被上游终止生成（HTTP %s blocked），按账本输入 %d tokens、回复 %d tokens，不到下游主动调用的 %d；"
+                                   "渠道测试只按最终成功的请求判断" % (record.get("status") or "-", tokens, reply, down_limit)))
+        elif tokens <= test_limit:
+            gaps.append(("tokens", "按账本输入只有 %d tokens、回复 %d tokens，但接口 %s 不是渠道测试会用的接口" % (tokens, reply, path or "-")))
+        elif samples:
+            gaps.append(("tokens", "按账本输入 %d tokens、回复 %d tokens，介于渠道测试（按本次账本里已确认的渠道测试校准：%s，不超过 %d）"
+                                   "与下游主动调用（不少于 %d）之间" % (tokens, reply, samples_text(samples), test_limit, down_limit)))
+        elif NONCE_ON:
+            gaps.append(("tokens", "按账本输入 %d tokens、回复 %d tokens：输入含本服务加的 32 个零宽字符随机后缀（REPEAT_PROMPT_NONCE，约十几到"
+                                   "近百个 token），一条“hi”的渠道测试也会到这个数；本次账本里没有可校准的渠道测试（形态已确认、最终成功），"
+                                   "不按 tokens 判断（不少于 %d 才判为下游）" % (tokens, reply, down_limit)))
+        else:
+            gaps.append(("tokens", "按账本输入 %d tokens、回复 %d tokens，介于渠道测试（不超过 %d）与下游主动调用（不少于 %d）之间" % (
+                tokens, reply, test_limit, down_limit)))
+    elif tokens > 0:
+        gaps.append(("tokens", "请求最终没有成功（HTTP %s %s），按账本输入 %d tokens、回复 %d tokens，不按 tokens 判断" % (
+            record.get("status") or "-", state or "-", tokens, reply)))
+    elif success:
+        gaps.append(("tokens", "账本里这个请求的输入 tokens 为 0"))
+    else:
+        gaps.append(("failed", "请求最终没有成功，账本里没有输入 tokens"))
+    gaps = [("reg", "登记没有请求形态（f06ddf9 之前的版本不记 last_request）" if not last else "登记的 last_request 里没有消息条数"),
+            log_gap(entry)] + gaps
+    entry["gaps"] = [code for code, _ in gaps]
+    return "无法判断请求形态（按账本：%s；看不到形态：%s）" % (record_brief(record), "；".join(text for _, text in gaps)), "无法判断形态"
+
+
+def request_source(entry):
+    # 先按登记与运行日志判断（judge），账本里有这个请求却看不出形态时用账本补判（ledger_judge）；账本里也没有、只知道请求 ID 时按 ID 前缀
+    # 补一句接口类型（只作补充说明，不改分类）
+    text, kind = judge(entry, entry.get("start") or {})
+    if kind is None:
+        text, kind = ledger_judge(entry)
+    if id_only(entry):
+        text += "；请求 ID 前缀 %s：%s（只按 ID 推断接口类型）" % id_kind(entry["request_id"])
+    return text, kind
 
 
 def conclude(entry):
@@ -934,13 +1782,25 @@ def conclude(entry):
     return "%s；请求来源：%s" % (head, text), "需要验证（暂停已到期）" if pause_expired(entry) else "需要验证"
 
 
+def path_label(item):
+    # 汇总用的接口：登记或账本记录的路径，按 base_path 去掉 /trace、/ultra 前缀，Gemini 原生路径里的模型名换成 *（别名与正式名不分开计）；
+    # 都没有时按请求 ID 前缀写接口类型
+    path = base_path((item["last_request"] or {}).get("path") or (item["record"] or {}).get("path") or "")
+    if path:
+        return re.sub(r"/models/[^/:]+:", "/models/*:", path)
+    prefix = id_kind(item.get("request_id"))[0]
+    return "接口不明（请求 ID 前缀 %s）" % prefix if prefix else "接口不明"
+
+
 def verify_summary():
-    # 需要验证账号的账户汇总成一小段（每个账户取一条登记，见 per_account）：账户数与时间范围、按请求来源分类的账户数、涉及的请求 ID，
-    # 以及账户数最多的前 5 个请求（一个请求依次换号、每个账户都 403，管理页里就多出这么多需要验证账号的账户）
+    # 需要验证账号的账户汇总成一小段（每个账户取一条登记，见 per_account）：账户数与时间范围、按请求来源分类的账户数、按接口的账户数、
+    # 涉及的请求 ID，以及账户数最多的前 5 个请求（一个请求依次换号、每个账户都 403，管理页里就多出这么多需要验证账号的账户）；
+    # 大部分账户无法判断请求形态时写明主要原因与下一步
     accounts = per_account(VERIFY_ENTRIES)
     print("需要验证账号的账户（账户级，第一次遇到即整户暂停调度 30 天，管理页不在 403 列表里）：%s" % verify_brief(VERIFY_ENTRIES))
     kinds = collections.Counter(item["source_kind"] for item in accounts)
     print("  按请求来源（账户数）：" + "、".join("%s %d" % item for item in kinds.most_common()))
+    print("  按接口（账户数）：" + "、".join("%s %d" % item for item in collections.Counter(path_label(item) for item in accounts).most_common()))
     groups, no_id = collections.OrderedDict(), []
     for item in accounts:
         if item["request_id"]:
@@ -968,16 +1828,24 @@ def verify_summary():
         record = next((item["record"] for item in items if item["record"]), None)
         ledger_note = ""
         if record:
-            # 按不同的账户计（不区分大小写）：请求最终失败时 account 是最后一次尝试的账户，它也在 attempts 里；同一账户换通道再试、
-            # 额度用完改用的备注（账户为空）都不另算
-            tried = len({(attempt.get("account") or "").lower() for attempt in record.get("attempts") or [] if attempt.get("account")} |
-                        ({record["account"].lower()} if record.get("account") else set()))
+            # 按不同的账户计（见 tried_accounts）
             ledger_note = "；账本：这个请求依次试了 %d 个账户，最终%s" % (
-                tried, "成功" if record.get("state") in ("completed", "tool_calls", "limited") else
-                "失败（HTTP %s %s）" % (record.get("status") or "-", record.get("state") or "-"))
-        print("    请求 %s（%s）：连续换了 %d 个账户，每个都 403%s%s" % (
-            request_id, items[0]["source_kind"], len(items),
+                tried_accounts(record), "成功" if record.get("state") in SUCCESS_STATES else
+                "%s（HTTP %s %s）" % (final_text(record), record.get("status") or "-", record.get("state") or "-"))
+        print("    请求 %s（%s · %s）：连续换了 %d 个账户，每个都 403%s%s" % (
+            request_id, items[0]["source_kind"], path_label(items[0]), len(items),
             "，%s 至 %s" % (show(min(times)), show(max(times))) if times else "", ledger_note))
+    unknown = [item for item in accounts if item["source_kind"] == "无法判断形态"]
+    if len(unknown) * 2 > len(accounts):
+        # 大部分账户看不出请求形态：按 ledger_judge 记下的原因计数，写明主要原因与下一步
+        gaps = collections.Counter(code for item in unknown for code in set(item.get("gaps") or []))
+        print("  大部分账户（%d/%d 个）无法判断请求形态，主要原因：%s；下一步看第 3 段这个模型按接口、按天的请求数与成功数，判断现在还有没有"
+              "这类请求，并按时间与接口到 new-api 的使用日志里查这个模型" % (len(unknown), len(accounts), "、".join(
+                  "%s（%d 个）" % (label, gaps[code]) for code, label in GAP_LABELS.items() if gaps[code]) or "见逐条结论"))
+    if BODY_SKIPPED:
+        print("  ⚠ 需要读请求正文的请求超过 %d 个，%d 个没有读正文（见第 4 段末尾）" % (BODY_FETCH_LIMIT, len(BODY_SKIPPED)))
+    if BODY_ABORTED:
+        print("  ⚠ 读请求正文%s，之后 %d 个请求的正文没有读（见第 4 段末尾）" % (BODY_ABORT["reason"], len(BODY_ABORTED)))
     expired = sum(1 for item in accounts if pause_expired(item))
     print("  → " + ADVICE["需要验证"] + ("；暂停已到期的 %d 个已重新参与调度，仍未验证的下一次请求会再返回 403 并重新暂停" % expired if expired else "") +
           ("" if VERIFY_LIST else "（VERIFY=list 逐个列出这些账户与各自的请求来源）"))
