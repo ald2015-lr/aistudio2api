@@ -15,6 +15,8 @@ var testStudioSecret = "AQ.TESTKEY" + strings.Repeat("s", 24)
 type studioKeyAdmin struct {
 	AdminService
 	fetched [][]string
+	all     []bool
+	stopped int
 }
 
 func (admin *studioKeyAdmin) StudioKeys(context.Context) (StudioKeyStatus, error) {
@@ -25,11 +27,21 @@ func (admin *studioKeyAdmin) StudioKeys(context.Context) (StudioKeyStatus, error
 
 func (admin *studioKeyAdmin) FetchStudioKeys(_ context.Context, input StudioKeyFetchInput) (StudioKeyStatus, error) {
 	admin.fetched = append(admin.fetched, input.AccountIDs)
+	admin.all = append(admin.all, input.All && input.MissingOnly)
 	return admin.StudioKeys(context.Background())
 }
 
 func (admin *studioKeyAdmin) RevealStudioKey(_ context.Context, id string) (StudioKeySecret, error) {
 	return StudioKeySecret{AccountID: id, Key: testStudioSecret}, nil
+}
+
+func (admin *studioKeyAdmin) StopStudioKeys(context.Context) (StudioKeyStatus, error) {
+	admin.stopped++
+	return admin.StudioKeys(context.Background())
+}
+
+func (admin *studioKeyAdmin) ExportStudioKeys(context.Context) (StudioKeyExport, error) {
+	return StudioKeyExport{Keys: []StudioKeySecret{{AccountID: "a@example.com", Key: testStudioSecret}}}, nil
 }
 
 func (admin *studioKeyAdmin) RecordAccessStart(AccessLog) {}
@@ -57,6 +69,8 @@ func TestStudioKeyRoutes(t *testing.T) {
 		{http.MethodGet, "/api/studio-keys"},
 		{http.MethodPost, "/api/studio-keys/fetch"},
 		{http.MethodPost, "/api/studio-keys/a@example.com/reveal"},
+		{http.MethodPost, "/api/studio-keys/stop"},
+		{http.MethodPost, "/api/studio-keys/export"},
 	} {
 		if recorder := studioKeyRequest(handler, item.method, item.target, `{"account_ids":["a@example.com"]}`, false); recorder.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s 没有令牌 status = %d", item.method, item.target, recorder.Code)
@@ -80,6 +94,17 @@ func TestStudioKeyRoutes(t *testing.T) {
 	}
 	if empty := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/fetch", `{"account_ids":[]}`, true); empty.Code != http.StatusBadRequest {
 		t.Fatalf("空列表 status=%d", empty.Code)
+	}
+	// 全部获取：不带账户也接受，交给管理服务展开
+	if all := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/fetch", `{"all":true,"missing_only":true}`, true); all.Code != http.StatusOK || len(admin.all) != 2 || !admin.all[1] {
+		t.Fatalf("全部获取 status=%d all=%v", all.Code, admin.all)
+	}
+	if stop := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/stop", "", true); stop.Code != http.StatusOK || admin.stopped != 1 {
+		t.Fatalf("停止 status=%d stopped=%d", stop.Code, admin.stopped)
+	}
+	export := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/export", "", true)
+	if export.Code != http.StatusOK || export.Header().Get("Cache-Control") != "no-store" || !strings.Contains(export.Body.String(), testStudioSecret) {
+		t.Fatalf("导出 status=%d cache=%q", export.Code, export.Header().Get("Cache-Control"))
 	}
 }
 

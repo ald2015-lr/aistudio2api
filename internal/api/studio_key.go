@@ -41,9 +41,17 @@ type StudioKeyStatus struct {
 	Records []StudioKeyRecord `json:"records"`
 }
 
-// StudioKeyFetchInput 为要获取 Key 的账户
+// StudioKeyFetchInput 为要获取 Key 的账户；All 为全部账户（按账户列表顺序逐个排队，跳过规则照旧），
+// MissingOnly 时跳过已经保存着 Key 的账户（中途停止或失败后再点一次只补没拿到的）
 type StudioKeyFetchInput struct {
-	AccountIDs []string `json:"account_ids"`
+	AccountIDs  []string `json:"account_ids"`
+	All         bool     `json:"all,omitempty"`
+	MissingOnly bool     `json:"missing_only,omitempty"`
+}
+
+// StudioKeyExport 为全部保存着的完整 Key（只由 export 接口返回，给“复制全部 Key”用）
+type StudioKeyExport struct {
+	Keys []StudioKeySecret `json:"keys"`
 }
 
 // StudioKeySecret 为完整 Key（只由 reveal 接口返回）
@@ -59,6 +67,9 @@ type StudioKeyService interface {
 	StudioKeys(context.Context) (StudioKeyStatus, error)
 	FetchStudioKeys(context.Context, StudioKeyFetchInput) (StudioKeyStatus, error)
 	RevealStudioKey(context.Context, string) (StudioKeySecret, error)
+	// StopStudioKeys 清空排队中的账户（正在处理的那个照常做完）
+	StopStudioKeys(context.Context) (StudioKeyStatus, error)
+	ExportStudioKeys(context.Context) (StudioKeyExport, error)
 }
 
 func (s *server) studioKeyService(w http.ResponseWriter) (StudioKeyService, bool) {
@@ -93,7 +104,7 @@ func (s *server) handleFetchStudioKeys(w http.ResponseWriter, r *http.Request) {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if len(input.AccountIDs) == 0 {
+	if len(input.AccountIDs) == 0 && !input.All {
 		writeAdminError(w, http.StatusBadRequest, "invalid_request", "account_ids is required")
 		return
 	}
@@ -119,4 +130,36 @@ func (s *server) handleRevealStudioKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, secret)
+}
+
+func (s *server) handleStopStudioKeys(w http.ResponseWriter, r *http.Request) {
+	service, ok := s.studioKeyService(w)
+	if !ok {
+		return
+	}
+	status, err := service.StopStudioKeys(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *server) handleExportStudioKeys(w http.ResponseWriter, r *http.Request) {
+	service, ok := s.studioKeyService(w)
+	if !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	export, err := service.ExportStudioKeys(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	if export.Keys == nil {
+		export.Keys = []StudioKeySecret{}
+	}
+	writeJSON(w, http.StatusOK, export)
 }

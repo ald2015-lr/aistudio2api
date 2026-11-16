@@ -27,6 +27,7 @@ import type {
   ServiceStatus,
   UsageRecordPage,
   UsageReport,
+  StudioKeyExport,
   StudioKeySecret,
   StudioKeyStatus,
 } from '@/types'
@@ -332,6 +333,16 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ account_ids: ids }),
     }),
+  // fetchAllStudioKeys 全部账户排队（只补还没有 Key 的），服务端逐个处理、按间隔等待
+  fetchAllStudioKeys: () =>
+    requestJSON<StudioKeyStatus>('/api/studio-keys/fetch', {
+      method: 'POST',
+      body: JSON.stringify({ all: true, missing_only: true }),
+    }),
+  stopStudioKeys: () => requestJSON<StudioKeyStatus>('/api/studio-keys/stop', { method: 'POST' }),
+  // exportStudioKeys 只给“复制全部 Key”用（服务端 Cache-Control: no-store），结果不保存在页面状态里
+  exportStudioKeys: () =>
+    requestJSON<StudioKeyExport>('/api/studio-keys/export', { method: 'POST', cache: 'no-store' }),
   revealStudioKey: (id: string) =>
     requestJSON<StudioKeySecret>(`/api/studio-keys/${encodeURIComponent(id)}/reveal`, {
       method: 'POST',

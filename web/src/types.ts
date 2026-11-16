@@ -1029,6 +1029,11 @@ export interface StudioKeyStatus {
 }
 
 // StudioKeySecret 为完整 Key（只由复制按钮读取）
+// StudioKeyExport 为全部保存着的完整 Key（“复制全部 Key”）
+export interface StudioKeyExport {
+  keys: StudioKeySecret[]
+}
+
 export interface StudioKeySecret {
   account_id: string
   key: string

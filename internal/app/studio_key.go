@@ -211,6 +211,13 @@ func (job *studioKeyJob) waiting(at time.Time) {
 	job.nextAt = at
 }
 
+// clear 清空排队中的账户（正在处理的不受影响）；间隔等待中时处理协程醒来后发现队列空就结束
+func (job *studioKeyJob) clear() {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	job.queue = nil
+}
+
 func (job *studioKeyJob) pending() bool {
 	job.mu.Lock()
 	defer job.mu.Unlock()
@@ -284,11 +291,27 @@ func (manager *runtimeManager) FetchStudioKeys(ctx context.Context, input api.St
 	if err != nil {
 		return api.StudioKeyStatus{}, err
 	}
+	ids := input.AccountIDs
+	if input.All {
+		ids = admin.pool.AccountIDs()
+	}
 	var accepted []string
-	for _, id := range input.AccountIDs {
-		if _, ok := admin.pool.StatusOf(id); ok {
-			accepted = append(accepted, id)
+	for _, id := range ids {
+		if _, ok := admin.pool.StatusOf(id); !ok {
+			continue
 		}
+		if input.MissingOnly {
+			if account, err := admin.pool.Account(id); err == nil && account != nil {
+				if record, ok, err := manager.studioKeys.load(id, account.Directory); err == nil && ok && record.Key != "" {
+					continue
+				}
+			}
+		}
+		accepted = append(accepted, id)
+	}
+	if len(accepted) == 0 && input.All {
+		// 全部账户都已经有 Key（或没有账户）：不算错误，返回现状
+		return manager.StudioKeys(ctx)
 	}
 	if len(accepted) == 0 {
 		return api.StudioKeyStatus{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, strings.Join(input.AccountIDs, ",")))
@@ -325,6 +348,41 @@ func (manager *runtimeManager) RevealStudioKey(_ context.Context, accountID stri
 	}, nil
 }
 
+// StopStudioKeys 清空排队中的账户；正在处理的那个照常做完（中途打断浏览器可能留下建了一半的 Key）
+func (manager *runtimeManager) StopStudioKeys(ctx context.Context) (api.StudioKeyStatus, error) {
+	if _, err := manager.studioKeyAdmin(); err != nil {
+		return api.StudioKeyStatus{}, err
+	}
+	manager.studioKeys.clear()
+	return manager.StudioKeys(ctx)
+}
+
+// ExportStudioKeys 返回全部保存着的完整 Key（按账户列表顺序，只给“复制全部 Key”用）
+func (manager *runtimeManager) ExportStudioKeys(ctx context.Context) (api.StudioKeyExport, error) {
+	admin, err := manager.studioKeyAdmin()
+	if err != nil {
+		return api.StudioKeyExport{}, err
+	}
+	export := api.StudioKeyExport{Keys: []api.StudioKeySecret{}}
+	for _, id := range admin.pool.AccountIDs() {
+		if ctx.Err() != nil {
+			return api.StudioKeyExport{}, ctx.Err()
+		}
+		account, err := admin.pool.Account(id)
+		if err != nil || account == nil {
+			continue
+		}
+		record, ok, err := manager.studioKeys.load(id, account.Directory)
+		if err != nil || !ok || record.Key == "" {
+			continue
+		}
+		export.Keys = append(export.Keys, api.StudioKeySecret{
+			AccountID: id, Key: record.Key, ProjectName: record.ProjectName, ProjectNumber: record.ProjectNumber,
+		})
+	}
+	return export, nil
+}
+
 // runStudioKeys 逐个处理队列；打开过浏览器的账户之后等 STUDIO_KEY_DELAY
 func (manager *runtimeManager) runStudioKeys(ctx context.Context) {
 	for {
@@ -348,12 +406,20 @@ func (manager *runtimeManager) runStudioKeys(ctx context.Context) {
 		if delay <= 0 {
 			continue
 		}
-		manager.studioKeys.waiting(time.Now().Add(delay))
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
+		deadline := time.Now().Add(delay)
+		manager.studioKeys.waiting(deadline)
+		// 每秒看一次队列：点了“停止”清空队列后不必等满间隔
+		for ctx.Err() == nil && manager.studioKeys.pending() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			timer := time.NewTimer(min(remaining, time.Second))
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
 			timer.Stop()
-		case <-timer.C:
 		}
 	}
 }

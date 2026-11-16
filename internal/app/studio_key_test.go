@@ -88,6 +88,25 @@ func TestStudioKeyJobQueue(t *testing.T) {
 	}
 }
 
+// TestStudioKeyJobClear 停止清空排队中的账户，正在处理的那个不受影响
+func TestStudioKeyJobClear(t *testing.T) {
+	var job studioKeyJob
+	job.enqueue([]string{"a@example.com", "b@example.com", "c@example.com"})
+	if id, _ := job.next(); id != "a@example.com" {
+		t.Fatalf("first = %q", id)
+	}
+	job.clear()
+	if job.pending() {
+		t.Fatal("停止后仍有排队")
+	}
+	if _, current, queue, _ := job.snapshot(); current != "a@example.com" || len(queue) != 0 {
+		t.Fatalf("current=%q queue=%v", current, queue)
+	}
+	if _, ok := job.next(); ok {
+		t.Fatal("停止后不应再取出账户")
+	}
+}
+
 // TestStudioKeySkipReason 未登录、停用、组织停用、收尾中的账户跳过
 func TestStudioKeySkipReason(t *testing.T) {
 	cases := map[string]aistudio.AccountStatus{

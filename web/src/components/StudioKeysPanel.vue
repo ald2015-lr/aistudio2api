@@ -17,6 +17,7 @@ const status = ref<StudioKeyStatus | null>(null)
 const error = ref('')
 const expanded = ref(false)
 const copying = ref('')
+const busy = ref(false)
 let pollTimer: number | undefined
 
 const statusKeys: Record<string, TranslationKey> = {
@@ -88,6 +89,66 @@ async function fetchKeys(ids: string[]): Promise<void> {
   schedule()
 }
 
+// fetchAll 全部账户排队，只补还没有 Key 的；服务端逐个处理，号与号之间按间隔等待
+async function fetchAll(): Promise<void> {
+  if (
+    !window.confirm(tf('studioKey.fetchAllConfirm', { delay: status.value?.delay_seconds ?? 30 }))
+  )
+    return
+  busy.value = true
+  try {
+    status.value = await api.fetchAllStudioKeys()
+    expanded.value = true
+    emit(
+      'notice',
+      status.value.running ? t('studioKey.queuedAll') : t('studioKey.allDone'),
+      'success',
+    )
+  } catch (cause) {
+    emit('notice', cause instanceof Error ? cause.message : String(cause), 'error')
+  } finally {
+    busy.value = false
+  }
+  schedule()
+}
+
+async function stopAll(): Promise<void> {
+  busy.value = true
+  try {
+    status.value = await api.stopStudioKeys()
+    emit('notice', t('studioKey.stopped'), 'success')
+  } catch (cause) {
+    emit('notice', cause instanceof Error ? cause.message : String(cause), 'error')
+  } finally {
+    busy.value = false
+  }
+  schedule()
+}
+
+// copyAll 读取全部完整 Key，一行一个复制到剪贴板，不保存在页面状态里
+async function copyAll(): Promise<void> {
+  busy.value = true
+  try {
+    const exported = await api.exportStudioKeys()
+    if (exported.keys.length === 0) {
+      emit('notice', t('studioKey.noKeys'), 'error')
+      return
+    }
+    const copied = await copyText(exported.keys.map((item) => item.key).join('\n'))
+    emit(
+      'notice',
+      copied
+        ? tf('studioKey.copiedAll', { count: exported.keys.length })
+        : t('studioKey.copyFailed'),
+      copied ? 'success' : 'error',
+    )
+  } catch (cause) {
+    emit('notice', cause instanceof Error ? cause.message : String(cause), 'error')
+  } finally {
+    busy.value = false
+  }
+}
+
 // copyKey 读取完整 Key 并复制，不保存在页面状态里
 async function copyKey(record: StudioKeyRecord): Promise<void> {
   copying.value = record.account_id
@@ -124,7 +185,22 @@ onBeforeUnmount(() => {
         {{ tf('studioKey.summary', { count: withKey, total: records.length }) }}
       </span>
       <span v-if="error" class="text-xs text-red-400">{{ error }}</span>
-      <button class="btn btn-sm btn-ghost ml-auto" type="button" @click="expanded = !expanded">
+      <button class="btn btn-sm ml-auto" type="button" :disabled="busy" @click="fetchAll">
+        {{ t('studioKey.fetchAll') }}
+      </button>
+      <button
+        v-if="status?.running && (status.queue.length ?? 0) > 0"
+        class="btn btn-sm"
+        type="button"
+        :disabled="busy"
+        @click="stopAll"
+      >
+        {{ t('studioKey.stop') }}
+      </button>
+      <button class="btn btn-sm" type="button" :disabled="busy || withKey === 0" @click="copyAll">
+        {{ tf('studioKey.copyAll', { count: withKey }) }}
+      </button>
+      <button class="btn btn-sm btn-ghost" type="button" @click="expanded = !expanded">
         {{ expanded ? t('studioKey.collapse') : t('studioKey.expand') }}
       </button>
     </div>
