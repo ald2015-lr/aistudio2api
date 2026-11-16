@@ -111,16 +111,18 @@ func coolModel(t *testing.T, pool *aistudio.AccountPool, accountID string, model
 	}
 }
 
-// TestEgressLimitedShortCooldownNoStrike 判定成立期间裸 429 只冷却本通道（测试改小为 200ms）、不建档位，日志写“出口限流不升档 | 出口=直连”；
-// 冷却到期后再失败仍是短冷却，不升到第 2 档
+// TestEgressLimitedShortCooldownNoStrike 判定成立期间裸 429 只冷却本通道（测试改小为 2s）、不建档位，日志写“出口限流不升档 | 出口=直连”；
+// 冷却到期后再失败仍是短冷却，不升到第 2 档。短冷却取 2s：-race 下慢的 CI 机器上一次请求从写入冷却到读回可能超过 200ms，
+// 读回时冷却已到期会被当成没有冷却
 func TestEgressLimitedShortCooldownNoStrike(t *testing.T) {
 	upstream := &bareRateUpstream{limited: map[string]bool{"a@example.com": true}, midStream: map[string]bool{}}
 	service, pool := firstEventTestService(t, upstream, 0, "a@example.com")
 	service.rateLimitLadder = testRateLadder
 	service.rateLimits = newRateLimitGuard()
 	service.egress = newEgressGuard(pool, service.requests)
-	service.egress.shortCooldown = 200 * time.Millisecond
-	forceEgressLimited(service, 7*time.Second)
+	const shortCooldown = 2 * time.Second
+	service.egress.shortCooldown = shortCooldown
+	forceEgressLimited(service, 30*time.Second)
 	for round := 1; round <= 2; round++ {
 		startedAt := time.Now()
 		text, err, _ := runModelRequest(t, service, fmt.Sprintf("req-egress-short-%d", round), "a@example.com", testRuntimeModel)
@@ -129,8 +131,8 @@ func TestEgressLimitedShortCooldownNoStrike(t *testing.T) {
 			t.Fatalf("第 %d 次：text=%q err=%v，期望固定账号的请求按原错误结束", round, text, err)
 		}
 		until, reason, ok := modelCooldownUntil(t, pool, "a@example.com", testRuntimeModel)
-		if !ok || until.Sub(startedAt) > time.Second || !strings.HasPrefix(reason, "限流: 出口限流短冷却，") || strings.Contains(reason, "连续限流第") {
-			t.Fatalf("第 %d 次冷却 = %s 后、原因 %q，期望约 200ms 的出口限流短冷却、没有档位", round, until.Sub(startedAt), reason)
+		if !ok || until.Sub(startedAt) > shortCooldown+time.Second || !strings.HasPrefix(reason, "限流: 出口限流短冷却，") || strings.Contains(reason, "连续限流第") {
+			t.Fatalf("第 %d 次冷却 = %s 后、原因 %q，期望约 2s 的出口限流短冷却、没有档位", round, until.Sub(startedAt), reason)
 		}
 		if got := countSourceLogs(service.requests, "", "账号冷却 | 类型=限流", "出口限流不升档 | 出口=直连"); got != round {
 			t.Fatalf("“出口限流不升档”日志 %d 条，期望 %d 条", got, round)
