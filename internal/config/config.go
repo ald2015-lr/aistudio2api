@@ -33,7 +33,10 @@ const (
 	// defaultAccountRPMLimit 为单账号每分钟生成请求上限的默认值：上游每账号每分钟 12 次（所有模型、两个通道共用），留出余量；
 	// maxAccountRPMLimit 为允许配置的最大值
 	defaultAccountRPMLimit = 10
-	maxAccountRPMLimit     = 1000
+	// defaultStudioKeyDelaySeconds 与 maxStudioKeyDelaySeconds 为批量获取 AI Studio API Key 时相邻两个账户之间间隔的默认值与上限（秒）
+	defaultStudioKeyDelaySeconds = 30
+	maxStudioKeyDelaySeconds     = 3600
+	maxAccountRPMLimit           = 1000
 )
 
 // defaultUltraPrimaryModels 为 Ultra 主用模型的默认列表：Build 独有、需要订阅的模型只有 Ultra 号池能服务，
@@ -62,6 +65,7 @@ var configKeys = [...]string{
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ACCOUNT_RPM_LIMIT",
+	"STUDIO_KEY_DELAY",
 	"ROUTING_STRATEGY",
 	"UPSTREAM_CHANNELS",
 	"STREAM_PLAYGROUND_MODELS",
@@ -125,9 +129,12 @@ type Config struct {
 	PerAccountConcurrency  int           `json:"per_account_concurrency"`
 	// AccountRPMLimit 为单账号最近 60 秒最多发出的生成请求数（ACCOUNT_RPM_LIMIT，默认 10，0 到 1000）：满了就算忙碌，
 	// 请求换到其他账号，热 Worker 都满时启动新的 Worker；只统计本进程，429 冷却仍兜底；0 表示关闭；保存后立即生效
-	AccountRPMLimit  int      `json:"account_rpm_limit"`
-	RoutingStrategy  string   `json:"routing_strategy"`
-	UpstreamChannels []string `json:"upstream_channels"`
+	AccountRPMLimit int `json:"account_rpm_limit"`
+	// StudioKeyDelaySeconds 为批量获取 AI Studio API Key 时相邻两个账户之间的间隔（STUDIO_KEY_DELAY，秒，默认 30，0 到 3600）；
+	// 获取任务每次等待前重新读取，保存后立即生效
+	StudioKeyDelaySeconds int      `json:"studio_key_delay"`
+	RoutingStrategy       string   `json:"routing_strategy"`
+	UpstreamChannels      []string `json:"upstream_channels"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
 	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
 	StreamPlaygroundModels []string `json:"stream_playground_models"`
@@ -244,6 +251,7 @@ func Default() Config {
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		AccountRPMLimit:        defaultAccountRPMLimit,
+		StudioKeyDelaySeconds:  defaultStudioKeyDelaySeconds,
 		RoutingStrategy:        "round-robin",
 		UpstreamChannels:       append([]string(nil), upstreamChannels...),
 		PrimaryQueueWait:       defaultPrimaryQueueWait,
@@ -354,6 +362,7 @@ func Load(path string) (Config, error) {
 	integer("PER_ACCOUNT_CONCURRENCY", false, parsePositiveInt, &cfg.PerAccountConcurrency)
 	// 空值沿用默认值，关闭必须写 0
 	integer("ACCOUNT_RPM_LIMIT", true, parseNonNegativeInt, &cfg.AccountRPMLimit)
+	integer("STUDIO_KEY_DELAY", true, parseNonNegativeInt, &cfg.StudioKeyDelaySeconds)
 	text("ROUTING_STRATEGY", &cfg.RoutingStrategy)
 	_ = loader.field("UPSTREAM_CHANNELS", false, func(value string) error {
 		cfg.UpstreamChannels = ParseUpstreamChannels(value)
@@ -483,6 +492,7 @@ func (c Config) save(path string, kept map[string]string) error {
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ACCOUNT_RPM_LIMIT":        strconv.Itoa(c.AccountRPMLimit),
+		"STUDIO_KEY_DELAY":         strconv.Itoa(c.StudioKeyDelaySeconds),
 		"ROUTING_STRATEGY":         c.RoutingStrategy,
 		"UPSTREAM_CHANNELS":        strings.Join(c.UpstreamChannels, ","),
 		"STREAM_PLAYGROUND_MODELS": strings.Join(c.StreamPlaygroundModels, ","),
@@ -606,6 +616,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmStartupConcurrency int               `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int               `json:"per_account_concurrency"`
 		AccountRPMLimit        int               `json:"account_rpm_limit"`
+		StudioKeyDelaySeconds  int               `json:"studio_key_delay"`
 		RoutingStrategy        string            `json:"routing_strategy"`
 		UpstreamChannels       []string          `json:"upstream_channels"`
 		StreamPlaygroundModels []string          `json:"stream_playground_models"`
@@ -646,6 +657,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		AccountRPMLimit:        c.AccountRPMLimit,
+		StudioKeyDelaySeconds:  c.StudioKeyDelaySeconds,
 		RoutingStrategy:        c.RoutingStrategy,
 		UpstreamChannels:       c.UpstreamChannels,
 		StreamPlaygroundModels: c.StreamPlaygroundModels,
@@ -690,6 +702,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmStartupConcurrency int                `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int                `json:"per_account_concurrency"`
 		AccountRPMLimit        *int               `json:"account_rpm_limit"`
+		StudioKeyDelaySeconds  *int               `json:"studio_key_delay"`
 		RoutingStrategy        string             `json:"routing_strategy"`
 		UpstreamChannels       []string           `json:"upstream_channels"`
 		StreamPlaygroundModels []string           `json:"stream_playground_models"`
@@ -782,6 +795,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		AccountRPMLimit:        intOrDefault(value.AccountRPMLimit, defaultAccountRPMLimit),
+		StudioKeyDelaySeconds:  intOrDefault(value.StudioKeyDelaySeconds, defaultStudioKeyDelaySeconds),
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: NormalizeModelList(value.StreamPlaygroundModels),

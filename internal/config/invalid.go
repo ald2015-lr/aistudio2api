@@ -154,6 +154,8 @@ func (c *Config) resetKey(key string) {
 		c.PerAccountConcurrency = defaults.PerAccountConcurrency
 	case "ACCOUNT_RPM_LIMIT":
 		c.AccountRPMLimit = defaults.AccountRPMLimit
+	case "STUDIO_KEY_DELAY":
+		c.StudioKeyDelaySeconds = defaults.StudioKeyDelaySeconds
 	case "MIN_OUTPUT_TOKENS":
 		c.MinOutputTokens = defaults.MinOutputTokens
 	case "LONG_OUTPUT_MAX_TOKENS":
@@ -297,6 +299,12 @@ var configChecks = []configCheck{
 	{keys: []string{"PER_ACCOUNT_CONCURRENCY"}, check: func(c Config) error {
 		if c.PerAccountConcurrency <= 0 {
 			return fmt.Errorf("PER_ACCOUNT_CONCURRENCY 必须是正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"STUDIO_KEY_DELAY"}, check: func(c Config) error {
+		if c.StudioKeyDelaySeconds < 0 || c.StudioKeyDelaySeconds > maxStudioKeyDelaySeconds {
+			return fmt.Errorf("STUDIO_KEY_DELAY 必须是 0 到 %d 的整数（秒）", maxStudioKeyDelaySeconds)
 		}
 		return nil
 	}},

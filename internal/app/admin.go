@@ -1362,6 +1362,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.AccountRPMLimit != nil {
 		accountRPMLimit = *value.AccountRPMLimit
 	}
+	// 获取 AI Studio API Key 的间隔：旧版页面保存时不带该字段，沿用现值（0 表示不等待）
+	studioKeyDelay := saved.StudioKeyDelaySeconds
+	if value.StudioKeyDelay != nil {
+		studioKeyDelay = *value.StudioKeyDelay
+	}
 	// 流式优先 Playground 的模型：旧版页面保存时不带该字段，沿用现值；空数组表示清空
 	streamPlaygroundModels := saved.StreamPlaygroundModels
 	if value.StreamPlaygroundModels != nil {
@@ -1428,6 +1433,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		AccountRPMLimit:        accountRPMLimit,
+		StudioKeyDelaySeconds:  studioKeyDelay,
 		RoutingStrategy:        value.RoutingStrategy,
 		UpstreamChannels:       value.UpstreamChannels,
 		StreamPlaygroundModels: streamPlaygroundModels,
@@ -2145,6 +2151,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		WarmStartupConcurrency: cfg.WarmStartupConcurrency,
 		PerAccountConcurrency:  cfg.PerAccountConcurrency,
 		AccountRPMLimit:        &cfg.AccountRPMLimit,
+		StudioKeyDelay:         &cfg.StudioKeyDelaySeconds,
 		RoutingStrategy:        cfg.RoutingStrategy,
 		UpstreamChannels:       cfg.UpstreamChannels,
 		TemporaryChat:          cfg.TemporaryChat,

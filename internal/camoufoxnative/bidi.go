@@ -23,6 +23,9 @@ type bidiClient struct {
 	// navigatedAt 为 Worker 发出导航 AI Studio 命令的时刻（UnixNano，0 为还没导航）；
 	// 页面快照据此写 since，与页面的 age 对照判断导航之后文档是否被替换过（见 page_snapshot.go）
 	navigatedAt atomic.Int64
+	// responseHook 为获取 API Key 时只读监听页面响应的回调（见 studio_key.go），收到 network.responseCompleted 时在后台读取协程里调用；
+	// 平时为空，不影响其他流程
+	responseHook atomic.Pointer[func(params map[string]any)]
 	// mu 保护下面的等待表与后台读取协程写入的观测字段
 	mu                       sync.Mutex
 	nextID                   int
@@ -219,6 +222,11 @@ func (client *bidiClient) observe(message map[string]any) {
 		return
 	}
 	params, _ := message["params"].(map[string]any)
+	if method == "network.responseCompleted" {
+		if hook := client.responseHook.Load(); hook != nil {
+			(*hook)(params)
+		}
+	}
 	request, _ := params["request"].(map[string]any)
 	rawURL, _ := request["url"].(string)
 	requestMethod, _ := request["method"].(string)

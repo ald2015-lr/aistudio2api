@@ -518,6 +518,8 @@ type RuntimeConfig struct {
 	// AccountRPMLimit 为单账户每分钟生成请求上限（ACCOUNT_RPM_LIMIT，0 表示关闭），读取时总是返回；保存时没有该字段（旧版页面）
 	// 则沿用现值。用指针是因为 0 表示关闭，不能用零值判断是否缺省
 	AccountRPMLimit *int `json:"account_rpm_limit,omitempty"`
+	// StudioKeyDelay 为批量获取 AI Studio API Key 时相邻两个账户之间的间隔（STUDIO_KEY_DELAY，秒）；保存时没有该字段（旧版页面）则沿用现值
+	StudioKeyDelay *int `json:"studio_key_delay,omitempty"`
 	// DowngradeGuard 为降级判定设置；保存时没有该字段（旧版页面）则沿用现值
 	DowngradeGuard *DowngradeGuardConfig `json:"downgrade_guard,omitempty"`
 	// UltraExclusive、UltraIncludePro、UltraWarmWorkerLimit、UltraMaxActiveWorkers 为 Ultra 号池设置（ULTRA_EXCLUSIVE、
@@ -705,6 +707,9 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/bulk-delete", s.handleBulkDeleteAccounts)
 	mux.HandleFunc("POST /api/accounts/{id}/login", s.handleLoginAccount)
 	mux.HandleFunc("POST /api/accounts/{id}/verify", s.handleVerifyAccount)
+	mux.HandleFunc("GET /api/studio-keys", s.handleStudioKeys)
+	mux.HandleFunc("POST /api/studio-keys/fetch", s.handleFetchStudioKeys)
+	mux.HandleFunc("POST /api/studio-keys/{id}/reveal", s.handleRevealStudioKey)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
 	mux.HandleFunc("POST /api/control/restart", s.handleRestartService)

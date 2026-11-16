@@ -16,7 +16,7 @@
 /aistudio2api.tmp
 
 # 前端产物
-/web/node_modules/
+/web/node_modules
 /internal/webui/dist/
 
 # Go 工作区

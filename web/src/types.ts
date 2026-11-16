@@ -719,6 +719,8 @@ export interface ServiceConfig {
   per_account_concurrency: number
   // account_rpm_limit 为单账号最近 60 秒最多发出的生成请求数，0 表示关闭。服务端总是返回该字段，因此这里不是可选字段
   account_rpm_limit: number
+  // studio_key_delay 为批量获取 AI Studio API Key 时相邻两个账户之间的间隔（秒），服务端总是返回该字段
+  studio_key_delay: number
   routing_strategy: 'round-robin' | 'fill-first'
   upstream_channels: UpstreamChannel[]
   // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段
@@ -995,4 +997,41 @@ export interface RequestBody {
   request_size: number
   response: string
   response_size: number
+}
+
+// StudioKeyRecord 为一个账户的 AI Studio API Key 记录（列表只有末四位，没有完整 Key）
+export interface StudioKeyRecord {
+  account_id: string
+  label?: string
+  // status：ok 读到 Key；none 页面上没有 Key 也不能创建；failed 失败；skipped 账户未登录、停用等被跳过
+  status: 'ok' | 'none' | 'failed' | 'skipped' | string
+  reason?: string
+  has_key: boolean
+  last4?: string
+  project_name?: string
+  project_number?: string
+  project_display?: string
+  created?: boolean
+  key_count?: number
+  fetched_at?: string
+  created_at?: string
+  attempt_at?: string
+}
+
+// StudioKeyStatus 为获取任务状态与全部记录
+export interface StudioKeyStatus {
+  delay_seconds: number
+  running: boolean
+  current?: string
+  queue: string[]
+  next_at?: string
+  records: StudioKeyRecord[]
+}
+
+// StudioKeySecret 为完整 Key（只由复制按钮读取）
+export interface StudioKeySecret {
+  account_id: string
+  key: string
+  project_name?: string
+  project_number?: string
 }

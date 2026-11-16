@@ -794,6 +794,7 @@ cp .env.example .env
 | `WARM_STARTUP_CONCURRENCY` | `2` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，请求现场的冷启动另保留 1 个名额并优先；`WAA_BACKEND=go` 不受此限 |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数；受每分钟次数上限（`ACCOUNT_RPM_LIMIT`）约束，不宜调高 |
 | `ACCOUNT_RPM_LIMIT` | `10` | 单账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型与两个通道共用），满了就换号、热 Worker 都满时扩容；只统计本服务，429 冷却仍兜底；`0` 关闭；保存后立即生效 |
+| `STUDIO_KEY_DELAY` | `30` | 批量获取 AI Studio API Key 时相邻两个账户之间等待的秒数（`0` 到 `3600`，`0` 不等待）；每次等待前重新读取，保存后立即生效 |
 | `ROUTING_STRATEGY` | `round-robin` | `round-robin` 轮询；`fill-first` 账号粘性优先 |
 | `UPSTREAM_CHANNELS` | `playground,build` | 生成请求使用的上游通道，可只保留其一；保存后立即生效，不需要重启。官网停用 Build 通道的生成时不必改它，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成) |
 | `STREAM_PLAYGROUND_MODELS` | 空 | 流式请求优先走 Playground 的模型，逗号分隔。需要订阅权益的模型在 Build 通道只能一次性返回整段回复；列表中的模型的流式请求先用 Playground 逐块输出，Playground 账号都在忙时立即改用 Build，不排队等待 Playground。留空时 Playground 与 Build 照常轮询；非流式请求不受影响。管理页“服务配置”会列出目录中需要订阅权益、可经 Playground 调用的模型，保存后立即生效 |
@@ -938,6 +939,18 @@ PROXY_POOL_URL=http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.
 - **`ulimit -n`**：带账号密码的代理经本机中转交给浏览器，浏览器多时连接数很多。Linux 下进程的打开文件数上限建议不低于 65536（启动前 `ulimit -n 65536`，或在 systemd 里设 `LimitNOFILE=65536`）；上限偏低时日志与设置页会提示。
 - **`setup` 与“改为跟随默认代理”**：`aistudio2api setup` 没传 `--proxy` 时不再把 `PROXY` 写进账户的 `account.json`（账户跟随默认）；IP 池开启时 setup 登录也从池里取端口（与主进程按端口锁互斥；端口全被占用时与其他浏览器共用一个端口，不退回默认代理），一次 setup 只用一个出口（批量导入 Chrome 的多个账号共用它，要一号一 IP 请在管理页导入）。以前用 setup 建的账户固定了 `PROXY`，不会使用 IP 池：设置页 IP 池分组会提示数量，点“改为跟随默认代理”一次清空这些账户的账户代理（运行中的 Worker 不重启，关闭后才改用 IP 池；正在被其他操作使用的账户会跳过，稍后再点一次）。程序不会自动改：有人是故意固定的。
 - **账号密码**：`PROXY_POOL_URL` 与 `PROXY` 一样明文保存在 `.env`（权限 0600），只在 `/api/config` 返回给管理页编辑，页面按掩码显示；日志、状态接口、账户列表、`runtime/proxy-pool.json` 与端口锁的文件名里只有 `协议://主机`、端口号与会话号，没有用户名和密码。
+
+### 获取 AI Studio API Key
+
+管理页“账户”页的 **AI Studio API Key** 卡片记录每个账户在 AI Studio API Keys 页面（`aistudio.google.com/apikey`）上的 Key、项目名（`projects/<编号>`）与项目编号。本服务不用这些 Key 转发任何请求，只提供复制按钮。
+
+- **触发**：账户行的“获取 Key”，或选中账户后点工具条上的“获取 Key”。只在你点击时运行，启动时与后台都不会自动运行。
+- **过程**：与“验证”相同，先等账户上进行中的请求结束、取得独占（期间该账户不接新请求），再用账户已保存的登录态启动一个无头隔离浏览器打开 API Keys 页面，只读监听页面自己发出的请求的响应，从中读出 Key 与项目。页面上已有 Key 时只读取、不创建；没有 Key 时点击页面自己的“Create API key”与对话框里的确认按钮创建一个（请求由页面自己发出），再从之后的响应里读取。服务本身不直接向 Google 发任何新请求。
+- **顺序与间隔**：账户逐个处理，打开过浏览器的账户之后等 `STUDIO_KEY_DELAY` 秒（默认 30，设置页可改，保存后立即生效）。停用、需要登录、组织停用、不可用、因需要验证账号而整户暂停、正在启停收尾的账户直接跳过，记为“已跳过”。
+- **结果**：成功、没有 Key（页面上没有 Key，也找不到创建按钮）、失败（写明原因，如登录已失效、创建对话框需要先选择或创建 Google Cloud 项目、超时）。失败时保留上一次读到的 Key。页面停在首次使用页时按启动时的规则自动完成后重试。
+- **保存与安全**：记录保存在账户目录下的 `studio-key.json`（权限 0600，重启后仍在，删除账户时一并删除）。Key 不写运行日志、错误与列表接口：列表只显示末四位，点“复制”时才经 `POST /api/studio-keys/{id}/reveal`（需要管理令牌，响应不缓存）读取完整 Key 并写入剪贴板。
+- **接口**：`GET /api/studio-keys`（队列与记录，不含完整 Key）、`POST /api/studio-keys/fetch`（`{"account_ids":[…]}` 加入队列）、`POST /api/studio-keys/{id}/reveal`。
+- **说明**：API Keys 页面的接口没有公开文档，解析按“响应正文里形如 `AIza…`（39 位）或 `AQ.…` 的完整字符串，取同一条记录里最近的 `projects/<数字>`”进行；官网改版后可能读不到，届时状态会显示失败原因。
 
 ### 认证文件管理
 

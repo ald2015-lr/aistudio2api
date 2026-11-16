@@ -35,6 +35,7 @@ import type {
 import { maskProxy, proxyHasAuth } from '@/proxy'
 import { proxyPoolActive, slotLabel } from '@/proxyPool'
 import OnboardingPanel from './OnboardingPanel.vue'
+import StudioKeysPanel from './StudioKeysPanel.vue'
 import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiPager from './UiPager.vue'
@@ -57,6 +58,11 @@ const emit = defineEmits<{
 }>()
 
 const { t, tf } = useI18n()
+// studioKeys 为 AI Studio API Key 卡片：账户行的“获取 Key”与选中账户的批量按钮把账户交给它排队（服务端逐个处理、按间隔等待）
+const studioKeys = ref<InstanceType<typeof StudioKeysPanel> | null>(null)
+function fetchStudioKeys(ids: string[]): void {
+  void studioKeys.value?.fetchKeys(ids)
+}
 const defaultAccountLocale = navigator.language || 'en-US'
 const defaultAccountTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'
 
@@ -1988,6 +1994,7 @@ function closeBulkPanel(): void {
 
       <p class="-mt-2 text-xs text-gray-500">{{ t('accounts.autoImportHint') }}</p>
       <OnboardingPanel :disabled-count="stateCounts.disabled" />
+      <StudioKeysPanel ref="studioKeys" @notice="(message, tone) => emit('notice', message, tone)" />
 
       <!-- 403 无权限账户：只列普通 403（多半未同意 Google 政策，重新获取认证文件上传后自动清除）；需要验证账号的账户见下面的汇总块 -->
       <div
@@ -2622,6 +2629,14 @@ function closeBulkPanel(): void {
           {{ t('common.verify') }}
         </button>
         <button
+          class="btn btn-sm"
+          type="button"
+          :disabled="busy"
+          @click="fetchStudioKeys(selectedAccounts.map((account) => account.id))"
+        >
+          {{ t('studioKey.fetchSelected') }}
+        </button>
+        <button
           class="btn btn-sm btn-danger"
           type="button"
           :disabled="busy"
@@ -2835,6 +2850,14 @@ function closeBulkPanel(): void {
                       @click="runAccountAction(account, 'verify')"
                     >
                       {{ t('common.verify') }}
+                    </button>
+                    <button
+                      class="btn btn-sm"
+                      type="button"
+                      :disabled="busy || !account.enabled"
+                      @click="fetchStudioKeys([account.id])"
+                    >
+                      {{ t('studioKey.fetch') }}
                     </button>
                     <button
                       class="btn btn-sm btn-danger"

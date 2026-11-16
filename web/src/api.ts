@@ -27,6 +27,8 @@ import type {
   ServiceStatus,
   UsageRecordPage,
   UsageReport,
+  StudioKeySecret,
+  StudioKeyStatus,
 } from '@/types'
 
 interface AccountsResponse {
@@ -323,6 +325,18 @@ export const api = {
   // 服务端返回 {"account": …}，取出里面的账户（原先把外壳当成账户，authenticated 永远读不到）
   verifyAccount: async (id: string) =>
     (await requestJSON<AccountResponse>(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' })).account,
+  // AI Studio API Key：列表只有末四位；revealStudioKey 只给复制按钮用（服务端 Cache-Control: no-store）
+  studioKeys: () => requestJSON<StudioKeyStatus>('/api/studio-keys', { cache: 'no-store' }),
+  fetchStudioKeys: (ids: string[]) =>
+    requestJSON<StudioKeyStatus>('/api/studio-keys/fetch', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
+    }),
+  revealStudioKey: (id: string) =>
+    requestJSON<StudioKeySecret>(`/api/studio-keys/${encodeURIComponent(id)}/reveal`, {
+      method: 'POST',
+      cache: 'no-store',
+    }),
   startService: () => requestJSON<ServiceStatus>('/api/control/start', { method: 'POST' }),
   stopService: () => requestJSON<ServiceStatus>('/api/control/stop', { method: 'POST' }),
   restartService: () => requestJSON<ServiceStatus>('/api/control/restart', { method: 'POST' }),

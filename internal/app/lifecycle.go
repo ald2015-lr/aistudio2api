@@ -107,6 +107,8 @@ type runtimeManager struct {
 	media atomic.Pointer[config.MediaSettings]
 	// mediaCleaner 定期清理媒体目录，由 runCommand 启动；测试直接构造的管理器为 nil（Kick 对 nil 安全）
 	mediaCleaner *mediastore.Cleaner
+	// studioKeys 为管理页手动触发的获取 AI Studio API Key 队列（见 studio_key.go）
+	studioKeys studioKeyJob
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。
@@ -674,6 +676,11 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
 		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
 		ModelFallbacks: active.ModelFallbacks, ModelFallbackScope: active.ModelFallbackScope,
+		StudioKeyDelaySeconds: active.StudioKeyDelaySeconds,
+	}
+	// 获取 API Key 的间隔：提交时省略（旧版页面）按生效值比较
+	if value.StudioKeyDelay != nil {
+		saved.StudioKeyDelaySeconds = *value.StudioKeyDelay
 	}
 	// 额度用完改用其他模型：提交时省略（旧版页面）按生效值比较，规则按规范写法比较
 	if value.ModelFallbacks != nil {
@@ -766,6 +773,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
+		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 

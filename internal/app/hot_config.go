@@ -209,6 +209,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
+		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
 }
 

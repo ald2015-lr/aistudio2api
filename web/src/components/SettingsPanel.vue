@@ -63,6 +63,7 @@ type EditableKey =
   | 'warm_startup_concurrency'
   | 'per_account_concurrency'
   | 'account_rpm_limit'
+  | 'studio_key_delay'
   | 'routing_strategy'
   | 'upstream_channels'
   | 'stream_playground_models'
@@ -106,6 +107,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'warm_startup_concurrency',
   'per_account_concurrency',
   'account_rpm_limit',
+  'studio_key_delay',
   'routing_strategy',
   'upstream_channels',
   'stream_playground_models',
@@ -243,6 +245,7 @@ const form = reactive<ServiceConfig>({
   warm_startup_concurrency: 2,
   per_account_concurrency: 2,
   account_rpm_limit: 10,
+  studio_key_delay: 30,
   routing_strategy: 'round-robin',
   upstream_channels: ['playground', 'build'],
   stream_playground_models: [],
@@ -564,6 +567,11 @@ function validate(value: ServiceConfig): string {
   const rpm = value.account_rpm_limit
   if (typeof rpm !== 'number' || !Number.isInteger(rpm) || rpm < 0 || rpm > 1000) {
     return t('settings.invalidAccountRpmLimit')
+  }
+  // 获取 API Key 的间隔可以为 0（不等待），最大 3600 秒
+  const studioDelay = value.studio_key_delay
+  if (typeof studioDelay !== 'number' || !Number.isInteger(studioDelay) || studioDelay < 0 || studioDelay > 3600) {
+    return tf('settings.invalidNumber', { field: label('settings.studioKeyDelay') })
   }
   const floor = value.min_output_tokens
   if (typeof floor !== 'number' || !Number.isInteger(floor) || floor < 0) {
@@ -1299,6 +1307,26 @@ onBeforeUnmount(() => {
           <HelpText
             class="mt-2 block text-xs text-gray-500"
             :text="t('settings.accountRpmLimitHelp')"
+          />
+        </label>
+      </HelpField>
+
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="block">
+          <span class="mb-2 block text-sm font-medium text-gray-300">{{
+            t('settings.studioKeyDelay')
+          }}</span>
+          <input
+            v-model.number="form.studio_key_delay"
+            class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+            type="number"
+            min="0"
+            max="3600"
+            required
+          />
+          <HelpText
+            class="mt-2 block text-xs text-gray-500"
+            :text="t('settings.studioKeyDelayHelp')"
           />
         </label>
       </HelpField>
