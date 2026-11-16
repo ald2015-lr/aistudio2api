@@ -494,7 +494,7 @@ const zhCN = {
   'studioKey.expand': '展开',
   'studioKey.collapse': '收起',
   'studioKey.help':
-    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key；页面上没有 Key 时点页面自己的“Create API key”创建一个（账户还没有 Google Cloud 项目时先经页面新建一个项目，每次最多建一个项目、一个 Key）。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用、组织停用的账户跳过，需要验证账号（403）而暂停的账户照常获取、获取后仍暂停。列表只显示末四位，点“复制”才读取完整 Key。',
+    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key；页面上没有 Key 时点页面自己的“Create API key”创建一个（账户还没有 Google Cloud 项目时先经页面新建一个项目，每次最多建一个项目、一个 Key）。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用、组织停用的账户跳过，需要验证账号（403）而暂停的账户照常获取、获取后仍暂停。列表只显示末四位，点“复制”才读取完整 Key。缺项目编号的 Key 可以点“补项目信息”（只读打开页面，从不创建 Key 或项目）；失败、跳过的记录可以删除（只是从列表里去掉，从不删除已保存的 Key）。',
   'studioKey.empty': '还没有记录。在账户行点“获取 Key”，或选中账户后批量获取。',
   'studioKey.account': '账户',
   'studioKey.key': 'Key',
@@ -541,6 +541,33 @@ const zhCN = {
   'studioKey.status.none': '没有 Key',
   'studioKey.status.failed': '失败',
   'studioKey.status.skipped': '已跳过',
+  'studioKey.fillMark': '（补项目信息）',
+  'studioKey.projectIdTitle': '项目 ID：{id}',
+  'studioKey.delete': '删除',
+  'studioKey.clear': '清除',
+  'studioKey.clearTab': '清除这一栏的记录（{count}）',
+  'studioKey.clearFailure': '清除失败信息',
+  'studioKey.deleteRecordConfirm':
+    '删除 {label} 的这条“{tab}”记录？记录只是从列表里消失，不会删除任何已保存的 Key，也不会动 AI Studio 上的任何东西；之后再获取会重新生成记录。',
+  'studioKey.clearTabConfirm':
+    '清除“{tab}”这一栏的全部 {count} 条记录（包括其他页的）？这些记录只是从列表里消失：已保存的 Key 从不删除，也不会动 AI Studio 上的任何东西；正在处理的账户不动。之后再获取会重新生成记录。',
+  'studioKey.clearFailureConfirm':
+    '清除 {label} 最近一次没成功的信息？保存着的 Key 与项目信息原样保留，只是不再显示失败原因（这条仍在“成功”里）。',
+  'studioKey.cleared': '已清除：{parts}（保存着的 Key 都没动）',
+  'studioKey.clearedDeleted': '删掉 {count} 条记录',
+  'studioKey.clearedReset': '清掉 {count} 条失败信息',
+  'studioKey.clearedJoin': '，',
+  'studioKey.clearedNothing': '没有需要清除的记录',
+  'studioKey.clearedBusy': '正在处理的 {busy} 个账户没有动',
+  'studioKey.clearedUnknown': '{count} 个账户已不在账户列表里',
+  'studioKey.clearedErrors': '{count} 个账户的记录读写失败（文件损坏或没有读写权限），没有动',
+  'studioKey.clearedSentence': '；',
+  'studioKey.fillProjects': '补项目信息（{count}）',
+  'studioKey.fillProjectsAction': '补项目信息',
+  'studioKey.fillProjectsConfirm':
+    '给 {count} 个缺项目编号的 Key 补项目名与项目编号？只读打开 AI Studio 的 API Keys 页面，找到已保存的那条 Key 读它的项目（必要时点开这条 Key 的详情读完再关掉），从不点创建、从不新建 Key 或项目；页面上找不到这条 Key 时记为失败，Key 照样保留。逐个处理、号与号之间隔 {delay} 秒，可以随时点“停止”。',
+  'studioKey.fillQueued': '已开始补项目信息：{count} 个账户逐个处理，进度看上方队列',
+  'studioKey.fillNone': '没有缺项目编号的 Key',
   'settings.studioKeyDelay': '获取 API Key 的间隔（秒）',
   'settings.studioKeyDelayHelp':
     '批量获取 AI Studio API Key 时，相邻两个账户之间等待的秒数（STUDIO_KEY_DELAY，默认 30，0 到 3600）。保存后立即生效。',
@@ -1623,7 +1650,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.expand': 'Expand',
   'studioKey.collapse': 'Collapse',
   'studioKey.help':
-    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests; when the page has no key, it clicks the page\'s own "Create API key" to create one (if the account has no Google Cloud project yet, it first creates one through the page; at most one project and one key per run). Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Signed-out, disabled and organization-disabled accounts are skipped; accounts paused for account verification (403) are processed as usual and stay paused afterwards. Only the last 4 characters are listed; the full key is read only when you click Copy.',
+    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests; when the page has no key, it clicks the page\'s own "Create API key" to create one (if the account has no Google Cloud project yet, it first creates one through the page; at most one project and one key per run). Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Signed-out, disabled and organization-disabled accounts are skipped; accounts paused for account verification (403) are processed as usual and stay paused afterwards. Only the last 4 characters are listed; the full key is read only when you click Copy. Keys without a project number can be completed with "Fill project info" (read-only: never creates a key or project); failed and skipped records can be deleted (they only disappear from the list; saved keys are never deleted).',
   'studioKey.empty': 'No records yet. Click "Get key" on an account row, or select accounts and get keys in bulk.',
   'studioKey.account': 'Account',
   'studioKey.key': 'Key',
@@ -1670,6 +1697,34 @@ const en: Record<TranslationKey, string> = {
   'studioKey.status.none': 'No key',
   'studioKey.status.failed': 'Failed',
   'studioKey.status.skipped': 'Skipped',
+  'studioKey.fillMark': ' (filling project info)',
+  'studioKey.projectIdTitle': 'Project ID: {id}',
+  'studioKey.delete': 'Delete',
+  'studioKey.clear': 'Clear',
+  'studioKey.clearTab': 'Clear records in this tab ({count})',
+  'studioKey.clearFailure': 'Clear failure info',
+  'studioKey.deleteRecordConfirm':
+    'Delete the "{tab}" record of {label}? The record only disappears from the list: no saved key is ever deleted and nothing on AI Studio is touched. Fetching again creates a new record.',
+  'studioKey.clearTabConfirm':
+    'Clear all {count} records in the "{tab}" tab (including other pages)? They only disappear from the list: saved keys are never deleted, nothing on AI Studio is touched, and the account in progress is left alone. Fetching again creates new records.',
+  'studioKey.clearFailureConfirm':
+    'Clear the failure info of {label}\'s latest attempt? The saved key and project info stay as they are; only the failure reason is no longer shown (the record stays under "OK").',
+  'studioKey.cleared': 'Cleared: {parts} (no saved key was touched)',
+  'studioKey.clearedDeleted': '{count} record(s) deleted',
+  'studioKey.clearedReset': 'failure info cleared on {count} record(s)',
+  'studioKey.clearedJoin': ', ',
+  'studioKey.clearedNothing': 'Nothing to clear',
+  'studioKey.clearedBusy': '{busy} account(s) in progress were left alone',
+  'studioKey.clearedUnknown': '{count} account(s) are no longer in the account list',
+  'studioKey.clearedErrors':
+    'Records of {count} account(s) could not be read or written (damaged file or no permission) and were left alone',
+  'studioKey.clearedSentence': '; ',
+  'studioKey.fillProjects': 'Fill project info ({count})',
+  'studioKey.fillProjectsAction': 'Fill project info',
+  'studioKey.fillProjectsConfirm':
+    'Fill in the project name and number for {count} key(s) without a project number? The AI Studio API Keys page is opened read-only, the saved key is found and its project is read (opening that key\'s details and closing them again if needed); nothing is ever created, neither keys nor projects. If the saved key is not on the page, the record is marked failed and the key is kept. Accounts are processed one by one, {delay} seconds apart; you can click "Stop" at any time.',
+  'studioKey.fillQueued': 'Started filling project info: {count} account(s), one by one; see the queue above',
+  'studioKey.fillNone': 'No key is missing a project number',
   'settings.studioKeyDelay': 'API key fetch interval (seconds)',
   'settings.studioKeyDelayHelp':
     'Seconds to wait between two accounts when getting AI Studio API keys in bulk (STUDIO_KEY_DELAY, default 30, 0 to 3600). Takes effect as soon as it is saved.',

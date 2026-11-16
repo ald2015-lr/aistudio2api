@@ -1011,6 +1011,8 @@ export interface StudioKeyRecord {
   project_name?: string
   project_number?: string
   project_display?: string
+  // project_id：项目 ID（如 gen-lang-client-0123456789）
+  project_id?: string
   created?: boolean
   // project_created：Key 所在的项目是获取时经页面新建的（账户原先没有 Google Cloud 项目）
   project_created?: boolean
@@ -1025,6 +1027,8 @@ export interface StudioKeyStatus {
   delay_seconds: number
   running: boolean
   current?: string
+  // current_fill：正在处理的账户是补项目信息（只读，不创建 Key 与项目）
+  current_fill?: boolean
   queue: string[]
   next_at?: string
   records: StudioKeyRecord[]
@@ -1041,4 +1045,22 @@ export interface StudioKeySecret {
   key: string
   project_name?: string
   project_number?: string
+  project_display?: string
+  project_id?: string
+}
+
+// StudioKeyClearCounts 为清除记录的计数：deleted 删掉的没有 Key 的记录；reset 清掉失败信息的保存着 Key 的记录（Key 不动）；
+// busy 正在处理、没有动的账户；unknown 不认识的账户；unchanged 不用清的；errors 读不出来、没有动的
+export interface StudioKeyClearCounts {
+  deleted: number
+  reset: number
+  busy: number
+  unknown: number
+  unchanged: number
+  errors: number
+}
+
+// StudioKeyClearResult 为清除之后的状态与计数
+export interface StudioKeyClearResult extends StudioKeyStatus {
+  cleared: StudioKeyClearCounts
 }

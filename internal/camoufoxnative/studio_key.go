@@ -24,6 +24,11 @@ import (
 //     一个 Key，从不删除任何东西，不点站外链接。
 //   - 页面上有验证账号的提示（需要验证账号的账户）不影响：只要 API Keys 页面可用就照常读取或创建；页面被跳到验证账号页时
 //     重新打开一次，仍被跳走才失败。
+//   - 只读（StudioKeyOptions.ReadOnly，补项目信息）：从不点“Create API key”、不新建项目、不点对话框，只在页面自己的响应里找
+//     账户已保存的 Key（完整相等）；找不到时失败（StudioKeyReasonSavedMissing），不创建。
+//   - 选定的 Key 在响应里没有项目编号时，依次与这次所有响应里的项目对照、读 Key 列表里这一行（只读）、打开这条 Key 自己的
+//     “API key details”对话框读出项目名与项目编号后用它自己的关闭按钮关掉（每次运行最多点开一次，见 studio_key_project.go）；
+//     都没有时照样返回 Key，步骤里记一笔，不算失败。
 //
 // Key 是机密：不写日志，错误文案里任何像 Key 的片段都打码（RedactStudioKeys），页面文字读出来之前就把 Key 换成 <key>。
 
@@ -34,12 +39,8 @@ const StudioKeyPath = "/apikey"
 // 免得没有项目的账户在建好项目之后、建 Key 之前超时（新建项目再创建 Key 最长约 4 分钟）
 const StudioKeyMinTimeout = 5 * time.Minute
 
-const (
-	// studioKeyProjectNameWait 为读到 Key 但还没找到项目名时多等的时间
-	studioKeyProjectNameWait = 5 * time.Second
-	// studioKeyMaxBody 为单个响应正文收集的上限（字节）
-	studioKeyMaxBody = 8 << 20
-)
+// studioKeyMaxBody 为单个响应正文收集的上限（字节）
+const studioKeyMaxBody = 8 << 20
 
 // 失败原因（StudioKeyError.Reason），写进管理页与运行日志，不含 Key；创建流程各步卡住时的原因见 studio_key_flow.go
 const (
@@ -52,7 +53,17 @@ const (
 	StudioKeyReasonUnreadable   = "页面上已有 Key，但没能从页面响应里读到完整 Key（页面接口可能已改版），没有创建新 Key"
 	StudioKeyReasonTimeout      = "获取 API Key 超时"
 	StudioKeyReasonFlowTimeout  = "获取 API Key 超时（创建流程没有走完）"
+	StudioKeyReasonSavedMissing = "页面上没有找到已保存的 Key（可能已在官网删除），没有创建新 Key"
 )
+
+// StudioKeyOptions 为一次获取的方式
+type StudioKeyOptions struct {
+	// ReadOnly 为只读（补项目信息）：从不点“Create API key”、不新建项目、不点创建流程里的任何控件，只在页面的 Key 里找 SavedKey
+	// （完整相等）并读它的项目；找不到时以 StudioKeyReasonSavedMissing 失败，不创建
+	ReadOnly bool
+	// SavedKey 为账户已保存的 Key（机密，不写日志）：这次没有创建、页面上有多条 Key 时优先选它；ReadOnly 时必须是完整的 Key
+	SavedKey string
+}
 
 // StudioKeyResult 为一次获取的结果。Key 是机密，调用方只能把它写进 0600 的文件，不能写日志
 type StudioKeyResult struct {
@@ -60,13 +71,15 @@ type StudioKeyResult struct {
 	ProjectName    string
 	ProjectNumber  string
 	ProjectDisplay string
+	// ProjectID 为项目 ID（如 gen-lang-client-0123456789，尽力而为，可为空）
+	ProjectID string
 	// Created 表示这次通过页面的创建流程新建了 Key
 	Created bool
 	// ProjectCreated 表示这次先经页面新建了一个 Google Cloud 项目
 	ProjectCreated bool
 	// KeyCount 为在页面响应里看到的 Key 个数
 	KeyCount int
-	// Steps 为创建流程做过的步骤（页面文字已打码、截短，不含 Key），没有创建时为空
+	// Steps 为创建流程做过的步骤与补项目信息的记录（页面文字已打码、截短，不含 Key），都没有时为空
 	Steps []string
 }
 
@@ -89,11 +102,15 @@ func (err *StudioKeyError) Unwrap() error {
 	return err.Cause
 }
 
-// FetchStudioKey 用已有登录态打开 API Keys 页面读取（必要时创建）API Key；整次的时限为 options.Timeout，不短于 StudioKeyMinTimeout
-func FetchStudioKey(ctx context.Context, options LoginOptions, storageStateJSON []byte) (result StudioKeyResult, err error) {
+// FetchStudioKey 用已有登录态打开 API Keys 页面读取（必要时创建；keyOptions.ReadOnly 时只读）API Key；整次的时限为 options.Timeout，
+// 不短于 StudioKeyMinTimeout
+func FetchStudioKey(ctx context.Context, options LoginOptions, storageStateJSON []byte, keyOptions StudioKeyOptions) (result StudioKeyResult, err error) {
 	options, err = validateLoginOptions(options)
 	if err != nil {
 		return StudioKeyResult{}, err
+	}
+	if keyOptions.ReadOnly && !IsStudioKey(keyOptions.SavedKey) {
+		return StudioKeyResult{}, errors.New("只读获取需要账户已保存的完整 Key")
 	}
 	options.Timeout = studioKeyTimeout(options.Timeout)
 	var state storageState
@@ -115,7 +132,7 @@ func FetchStudioKey(ctx context.Context, options LoginOptions, storageStateJSON 
 		_ = session.Close()
 	}()
 	session.onboardingCompleted = options.OnboardingCompleted
-	return session.fetchStudioKey(fetchCtx)
+	return session.fetchStudioKey(fetchCtx, keyOptions)
 }
 
 // studioKeyTimeout 返回整次获取的时限：timeout 与 StudioKeyMinTimeout 中较大者
@@ -163,7 +180,7 @@ func studioKeyResponseHost(rawURL string) bool {
 		strings.HasSuffix(host, ".clients6.google.com")
 }
 
-func (session *loginSession) fetchStudioKey(ctx context.Context) (StudioKeyResult, error) {
+func (session *loginSession) fetchStudioKey(ctx context.Context, options StudioKeyOptions) (StudioKeyResult, error) {
 	client := session.client
 	listener := &studioKeyListener{}
 	hook := listener.observe
@@ -199,7 +216,6 @@ func (session *loginSession) fetchStudioKey(ctx context.Context) (StudioKeyResul
 	}
 	var (
 		onboarding    onboardingBudget
-		keys          []StudioKeyCandidate
 		navigatedAt   = time.Now()
 		keysAt        time.Time
 		existing      = map[string]bool{}
@@ -208,6 +224,7 @@ func (session *loginSession) fetchStudioKey(ctx context.Context) (StudioKeyResul
 		offSiteSince  time.Time
 		dismissedAt   time.Time
 	)
+	run := &studioKeyRun{session: session, collector: collector, listener: listener, flow: flow, options: options}
 	fail := func(reason string, cause error) (StudioKeyResult, error) {
 		return StudioKeyResult{}, &StudioKeyError{Reason: reason, Detail: flow.detail(), Cause: cause}
 	}
@@ -215,19 +232,13 @@ func (session *loginSession) fetchStudioKey(ctx context.Context) (StudioKeyResul
 		if err := ctx.Err(); err != nil {
 			return fail(flow.timeoutReason(time.Now()), err)
 		}
-		for _, requestID := range listener.take() {
-			body, ok := client.studioKeyResponseBody(ctx, collector, requestID)
-			if ok {
-				keys = mergeStudioKeys(keys, ExtractStudioKeys(body))
-				flow.noteProjects(ExtractStudioProjects(body))
-			}
-		}
-		if len(keys) > 0 && keysAt.IsZero() {
+		run.drain(ctx)
+		if len(run.keys) > 0 && keysAt.IsZero() {
 			keysAt = time.Now()
 		}
-		if chosen, ok := chooseStudioKey(keys, existing, flow.running()); ok {
-			if chosen.ProjectName != "" || time.Since(keysAt) >= studioKeyProjectNameWait {
-				return flow.result(chosen, len(keys)), nil
+		if chosen, ok := chooseStudioKey(run.keys, existing, flow.running(), options); ok {
+			if chosen.ProjectName != "" || time.Since(keysAt) >= studioKeyTiming.projectName {
+				return run.finish(ctx, chosen), nil
 			}
 		}
 		pageURL, err := client.evaluateString(ctx, session.contextID, "location.href")
@@ -284,12 +295,26 @@ func (session *loginSession) fetchStudioKey(ctx context.Context) (StudioKeyResul
 				_ = waitContext(ctx, studioKeyTiming.poll)
 				continue
 			}
+			if options.ReadOnly {
+				// 只读：页面的 Key 里没有已保存的那条（或一条都没读到）。多等 studioKeyTiming.projectName 让后到的响应进来，仍没有就失败；
+				// 不点任何东西
+				if time.Since(navigatedAt) < studioKeyTiming.settle+studioKeyTiming.projectName {
+					_ = waitContext(ctx, studioKeyTiming.poll)
+					continue
+				}
+				if len(run.keys) == 0 {
+					if shown, _ := client.evaluateBool(ctx, session.contextID, studioKeyShownExpression); shown {
+						return fail(StudioKeyReasonUnreadable, nil)
+					}
+				}
+				return fail(StudioKeyReasonSavedMissing, nil)
+			}
 			// 页面加载完成后仍没有 Key：记下已看到的 Key（应为空），点击页面自己的创建按钮
-			for _, candidate := range keys {
+			for _, candidate := range run.keys {
 				existing[candidate.Key] = true
 			}
-			if len(keys) > 0 {
-				// 读到了 Key 只是缺项目名，前面会在 studioKeyProjectNameWait 后返回，这里不创建
+			if len(run.keys) > 0 {
+				// 读到了 Key 只是缺项目名，前面会在 studioKeyTiming.projectName 后返回，这里不创建
 				_ = waitContext(ctx, 300*time.Millisecond)
 				continue
 			}
@@ -441,28 +466,40 @@ func studioKeyPageHost(pageURL string) string {
 	return strings.ToLower(parsed.Hostname())
 }
 
-// result 整理返回值：没有从 Key 的记录里读到项目、这次新建了一个项目时，用新项目补上；显示名缺时用响应里同一项目的显示名补上
+// result 整理返回值：没有从 Key 的记录里读到项目、这次新建了一个项目时，用新项目补上；显示名、项目 ID 缺时用响应里同一项目的补上
 func (flow *studioKeyFlow) result(chosen StudioKeyCandidate, count int) StudioKeyResult {
 	result := StudioKeyResult{
 		Key: chosen.Key, ProjectName: chosen.ProjectName, ProjectNumber: chosen.ProjectNumber, ProjectDisplay: chosen.ProjectDisplay,
-		Created: flow.running(), ProjectCreated: flow.projectCreated(), KeyCount: count,
+		ProjectID: chosen.ProjectID, Created: flow.running(), ProjectCreated: flow.projectCreated(), KeyCount: count,
 	}
 	if result.Created {
 		result.Steps = append([]string(nil), flow.steps...)
 	}
 	if result.ProjectName == "" && result.ProjectCreated && len(flow.newProjects) == 1 {
-		project := flow.newProjects[0]
-		result.ProjectName, result.ProjectNumber = project.Name, project.Number
-		if result.ProjectDisplay == "" {
-			result.ProjectDisplay = project.Display
-		}
+		applyStudioProject(&result, flow.newProjects[0])
 	}
-	if result.ProjectDisplay == "" && result.ProjectNumber != "" {
+	if result.ProjectNumber != "" {
 		if project, ok := flow.project(result.ProjectNumber); ok {
-			result.ProjectDisplay = project.Display
+			applyStudioProject(&result, project)
 		}
 	}
 	return result
+}
+
+// applyStudioProject 用项目补上结果里缺的项目字段：编号只在结果还没有编号时补（已有编号的不换），显示名与项目 ID 缺时补
+func applyStudioProject(result *StudioKeyResult, project StudioProject) {
+	if result.ProjectNumber == "" && project.Number != "" {
+		result.ProjectName, result.ProjectNumber = "projects/"+project.Number, project.Number
+	}
+	if result.ProjectNumber != "" && project.Number != "" && project.Number != result.ProjectNumber {
+		return
+	}
+	if result.ProjectDisplay == "" {
+		result.ProjectDisplay = project.Display
+	}
+	if result.ProjectID == "" {
+		result.ProjectID = project.ID
+	}
 }
 
 // timeoutReason 返回总时限到了时的原因（按卡在哪一步）
@@ -487,8 +524,19 @@ func ErrStudioKeyNone(err error) bool {
 	return errors.As(err, &keyErr) && keyErr.Reason == StudioKeyReasonNoCreate
 }
 
-// chooseStudioKey 选出要记录的 Key：创建之后只认创建前没有的新 Key（有多条时取第一条）；没有创建时取第一条
-func chooseStudioKey(keys []StudioKeyCandidate, existing map[string]bool, created bool) (StudioKeyCandidate, bool) {
+// chooseStudioKey 选出要记录的 Key：只读时只认已保存的那条（完整相等）；创建之后只认创建前没有的新 Key（有多条时取第一条）；
+// 没有创建时已保存的那条在页面上就选它，否则取第一条
+func chooseStudioKey(keys []StudioKeyCandidate, existing map[string]bool, created bool, options StudioKeyOptions) (StudioKeyCandidate, bool) {
+	if options.ReadOnly || !created && options.SavedKey != "" {
+		for _, candidate := range keys {
+			if candidate.Key == options.SavedKey {
+				return candidate, true
+			}
+		}
+		if options.ReadOnly {
+			return StudioKeyCandidate{}, false
+		}
+	}
 	for _, candidate := range keys {
 		if created && existing[candidate.Key] {
 			continue

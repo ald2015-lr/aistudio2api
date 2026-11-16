@@ -5,12 +5,14 @@ import { copyText } from '@/clipboard'
 import { confirmAction } from '@/confirm'
 import { useI18n, type TranslationKey } from '@/i18n'
 import { readStorage, writeStorage } from '@/storage'
-import type { StudioKeyRecord, StudioKeyStatus } from '@/types'
+import type { StudioKeyClearCounts, StudioKeyRecord, StudioKeyStatus } from '@/types'
 import UiPager from './UiPager.vue'
 
 // AI Studio API Key：显示获取队列与每个账户的记录（Key 只显示末四位），复制按钮按需读取完整 Key、不在页面里保存。
 // 获取由账户行的“获取 Key”按钮或选中账户后的批量按钮触发（见 AccountsPanel），这里只轮询状态。
-// 记录按成功、失败、跳过分标签列出，各自按最近一次尝试从新到旧排序、每页 10 条：账户多时失败原因不再整列铺开
+// 记录按成功、失败、跳过分标签列出，各自按最近一次尝试从新到旧排序、每页 10 条：账户多时失败原因不再整列铺开。
+// 失败、跳过的记录可以逐条删除或整栏清除，成功标签里保留着上次 Key 的失败信息可以清掉（服务端从不删除已保存的 Key）；
+// 缺项目编号的 Key 可以“补项目信息”（服务端只读打开页面，不创建 Key 与项目）
 const { t, tf, locale } = useI18n()
 const emit = defineEmits<{ notice: [message: string, kind: 'success' | 'error'] }>()
 
@@ -18,6 +20,8 @@ const POLL_RUNNING = 3000
 const POLL_IDLE = 20000
 const PAGE_SIZE = 10
 const TAB_STORAGE_KEY = 'aistudio2api_studio_keys_tab'
+// CLEAR_LIMIT 为一次清除请求最多的账户数（与服务端一致），更多时分批
+const CLEAR_LIMIT = 5000
 
 // KeyTab：ok 已有 Key（最近一次失败但保留着上次的 Key 也算）；failed 没有 Key 且失败或页面上没有 Key；skipped 没有 Key 且被跳过
 type KeyTab = 'ok' | 'failed' | 'skipped'
@@ -94,6 +98,8 @@ const grouped = computed<Record<KeyTab, StudioKeyRecord[]>>(() => {
   return groups
 })
 const withKey = computed(() => grouped.value.ok.length)
+// missingProject 为保存着 Key 却没有项目编号的记录（“补项目信息”的对象）
+const missingProject = computed(() => grouped.value.ok.filter((record) => !record.project_number))
 
 // 标签：记住每个浏览器上次选的标签；第一次读到记录时，上次选的标签没有记录就按成功、失败、跳过的顺序停在第一个有记录的标签
 const tab = ref<KeyTab>('ok')
@@ -152,7 +158,9 @@ const queueText = computed(() => {
   if (value === null) return ''
   if (!value.running) return t('studioKey.idle')
   return tf('studioKey.running', {
-    current: value.current || '-',
+    current: value.current
+      ? value.current + (value.current_fill ? t('studioKey.fillMark') : '')
+      : '-',
     queued: value.queue.length,
     delay: value.delay_seconds,
   })
@@ -177,6 +185,22 @@ function formatTime(value?: string): string {
     second: '2-digit',
     hourCycle: 'h23',
   })
+}
+
+// projectText 为项目列的主文字：显示名优先，没有时为 projects/<编号> 或项目 ID；projectSecondary 为显示名后面灰色的 projects/<编号>
+function projectText(record: StudioKeyRecord): string {
+  return record.project_display || record.project_name || record.project_id || '-'
+}
+
+function projectSecondary(record: StudioKeyRecord): string {
+  return record.project_display ? (record.project_name ?? '') : ''
+}
+
+// projectTitle 为项目列的悬停全文：显示名、projects/<编号> 与项目 ID
+function projectTitle(record: StudioKeyRecord): string {
+  const parts = [record.project_display, record.project_name].filter(Boolean) as string[]
+  if (record.project_id) parts.push(tf('studioKey.projectIdTitle', { id: record.project_id }))
+  return parts.length > 0 ? parts.join(' · ') : '-'
 }
 
 // timeLines 为成功标签时间列的各行（读取、创建、最近一次没成功的尝试），每行另作悬停全文
@@ -273,6 +297,111 @@ async function copyFailedEmails(): Promise<void> {
       : t('studioKey.copyFailed'),
     copied ? 'success' : 'error',
   )
+}
+
+// clearRecords 清除这些账户的记录（服务端：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息，从不删除 Key；正在处理的不动），
+// 确认后才提交；超过 CLEAR_LIMIT 个时分批。清除后用返回的最新状态刷新列表（页码由 watch(pageCount) 收回到最后一页）
+async function clearRecords(ids: string[], message: string): Promise<void> {
+  if (ids.length === 0 || busy.value) return
+  if (!(await confirmAction(message, t('studioKey.clear')))) return
+  busy.value = true
+  const total: StudioKeyClearCounts = {
+    deleted: 0,
+    reset: 0,
+    busy: 0,
+    unknown: 0,
+    unchanged: 0,
+    errors: 0,
+  }
+  try {
+    for (let start = 0; start < ids.length; start += CLEAR_LIMIT) {
+      const result = await api.clearStudioKeys(ids.slice(start, start + CLEAR_LIMIT))
+      status.value = result
+      total.deleted += result.cleared.deleted
+      total.reset += result.cleared.reset
+      total.busy += result.cleared.busy
+      total.unknown += result.cleared.unknown
+      total.errors += result.cleared.errors
+    }
+    // 有账户的记录读写失败（没有动）时用错误样式，提示里写明个数
+    emit('notice', clearedText(total), total.errors > 0 ? 'error' : 'success')
+  } catch (cause) {
+    emit('notice', cause instanceof Error ? cause.message : String(cause), 'error')
+  } finally {
+    busy.value = false
+  }
+  schedule()
+}
+
+// processing 判断这条记录的账户正在处理（服务端清除时也不动它，按钮先禁用）
+function processing(record: StudioKeyRecord): boolean {
+  return status.value?.running === true && status.value.current === record.account_id
+}
+
+// clearedText 为清除之后的提示：只写不为零的计数；正在处理没动的、已不在账户列表里的、记录读写失败没动的账户各另写一句
+// （有读写失败时不写“没有需要清除的记录”）
+function clearedText(counts: StudioKeyClearCounts): string {
+  const parts: string[] = []
+  if (counts.deleted > 0) parts.push(tf('studioKey.clearedDeleted', { count: counts.deleted }))
+  if (counts.reset > 0) parts.push(tf('studioKey.clearedReset', { count: counts.reset }))
+  const sentences: string[] = []
+  if (parts.length > 0) {
+    sentences.push(tf('studioKey.cleared', { parts: parts.join(t('studioKey.clearedJoin')) }))
+  } else if (counts.errors === 0) {
+    sentences.push(t('studioKey.clearedNothing'))
+  }
+  if (counts.busy > 0) sentences.push(tf('studioKey.clearedBusy', { busy: counts.busy }))
+  if (counts.unknown > 0) sentences.push(tf('studioKey.clearedUnknown', { count: counts.unknown }))
+  if (counts.errors > 0) sentences.push(tf('studioKey.clearedErrors', { count: counts.errors }))
+  return sentences.join(t('studioKey.clearedSentence'))
+}
+
+// deleteRecord 删除失败或跳过标签里的一条记录
+function deleteRecord(record: StudioKeyRecord): void {
+  void clearRecords(
+    [record.account_id],
+    tf('studioKey.deleteRecordConfirm', { label: labelOf(record), tab: t(tabKeys[tab.value]) }),
+  )
+}
+
+// clearTab 清除当前标签（失败或跳过）里的全部记录（包括其他页的）
+function clearTab(): void {
+  const ids = tabRecords.value.map((record) => record.account_id)
+  void clearRecords(
+    ids,
+    tf('studioKey.clearTabConfirm', { tab: t(tabKeys[tab.value]), count: ids.length }),
+  )
+}
+
+// clearFailure 清掉成功标签里保留着上次 Key 的记录最近一次失败的信息（Key 与项目不动）
+function clearFailure(record: StudioKeyRecord): void {
+  void clearRecords(
+    [record.account_id],
+    tf('studioKey.clearFailureConfirm', { label: labelOf(record) }),
+  )
+}
+
+// fillProjects 给保存着 Key 却没有项目编号的账户补项目信息（服务端只读打开页面，不创建），确认后才提交
+async function fillProjects(): Promise<void> {
+  const count = missingProject.value.length
+  if (count === 0 || busy.value) return
+  const message = tf('studioKey.fillProjectsConfirm', { count, delay: delaySeconds.value })
+  if (!(await confirmAction(message, t('studioKey.fillProjectsAction')))) return
+  busy.value = true
+  try {
+    status.value = await api.fillStudioKeyProjects()
+    expanded.value = true
+    emit(
+      'notice',
+      status.value.running ? tf('studioKey.fillQueued', { count }) : t('studioKey.fillNone'),
+      'success',
+    )
+  } catch (cause) {
+    emit('notice', cause instanceof Error ? cause.message : String(cause), 'error')
+  } finally {
+    busy.value = false
+  }
+  schedule()
 }
 
 async function stopAll(): Promise<void> {
@@ -398,14 +527,38 @@ onBeforeUnmount(() => {
               <span class="seg-count">{{ grouped[item].length }}</span>
             </button>
           </div>
-          <template v-if="tab === 'failed' && grouped.failed.length > 0">
-            <button class="btn btn-sm ml-auto" type="button" :disabled="busy" @click="retryFailed">
-              {{ tf('studioKey.retryFailed', { count: grouped.failed.length }) }}
+          <!-- 标签上的批量按钮靠右，窄卡片换行时仍靠右对齐 -->
+          <div
+            v-if="tab === 'ok' ? missingProject.length > 0 : tabRecords.length > 0"
+            class="ml-auto flex flex-wrap items-center justify-end gap-2"
+          >
+            <template v-if="tab === 'failed'">
+              <button class="btn btn-sm" type="button" :disabled="busy" @click="retryFailed">
+                {{ tf('studioKey.retryFailed', { count: grouped.failed.length }) }}
+              </button>
+              <button class="btn btn-sm" type="button" @click="copyFailedEmails">
+                {{ t('studioKey.copyFailedEmails') }}
+              </button>
+            </template>
+            <button
+              v-if="tab === 'ok'"
+              class="btn btn-sm"
+              type="button"
+              :disabled="busy"
+              @click="fillProjects"
+            >
+              {{ tf('studioKey.fillProjects', { count: missingProject.length }) }}
             </button>
-            <button class="btn btn-sm" type="button" @click="copyFailedEmails">
-              {{ t('studioKey.copyFailedEmails') }}
+            <button
+              v-else
+              class="btn btn-sm btn-danger"
+              type="button"
+              :disabled="busy"
+              @click="clearTab"
+            >
+              {{ tf('studioKey.clearTab', { count: tabRecords.length }) }}
             </button>
-          </template>
+          </div>
         </div>
         <p v-if="tabRecords.length === 0" class="text-sm text-gray-500">{{ t(emptyKeys[tab]) }}</p>
         <template v-else>
@@ -436,7 +589,8 @@ onBeforeUnmount(() => {
                       {{ t('studioKey.state') }}
                     </th>
                     <th class="py-1 pr-3">{{ t('studioKey.reason') }}</th>
-                    <th class="w-40 py-1">{{ t('studioKey.attemptAt') }}</th>
+                    <th class="w-40 py-1 pr-3">{{ t('studioKey.attemptAt') }}</th>
+                    <th class="w-16 py-1"></th>
                   </template>
                 </tr>
               </thead>
@@ -444,12 +598,7 @@ onBeforeUnmount(() => {
                 <tr
                   v-for="record in pageRecords"
                   :key="record.account_id"
-                  class="border-t border-gray-800 align-top text-gray-300 @max-xl:grid @max-xl:gap-x-2 @max-xl:gap-y-0.5 @max-xl:py-1.5"
-                  :class="
-                    tab === 'ok'
-                      ? '@max-xl:grid-cols-[minmax(0,1fr)_auto_auto]'
-                      : '@max-xl:grid-cols-[minmax(0,1fr)_auto]'
-                  "
+                  class="border-t border-gray-800 align-top text-gray-300 @max-xl:grid @max-xl:grid-cols-[minmax(0,1fr)_auto_auto] @max-xl:gap-x-2 @max-xl:gap-y-0.5 @max-xl:py-1.5"
                 >
                   <td class="py-1 pr-3 @max-xl:p-0">
                     <div
@@ -471,18 +620,11 @@ onBeforeUnmount(() => {
                       …{{ record.last4 }}
                     </td>
                     <td class="hidden py-1 pr-3 @4xl:table-cell">
-                      <div
-                        class="cell-truncate"
-                        :title="
-                          record.project_display
-                            ? `${record.project_name || '-'}（${record.project_display}）`
-                            : record.project_name || '-'
-                        "
-                      >
-                        {{ record.project_name || '-' }}
-                        <span v-if="record.project_display" class="text-gray-500"
-                          >（{{ record.project_display }}）</span
-                        >
+                      <div class="cell-truncate" :title="projectTitle(record)">
+                        {{ projectText(record) }}
+                        <span v-if="projectSecondary(record)" class="text-gray-500">{{
+                          projectSecondary(record)
+                        }}</span>
                         <span v-if="record.project_created" class="text-gray-500">{{
                           t('studioKey.projectCreated')
                         }}</span>
@@ -526,6 +668,14 @@ onBeforeUnmount(() => {
                         >
                           {{ record.reason }}
                         </div>
+                        <button
+                          class="btn btn-sm mt-1"
+                          type="button"
+                          :disabled="busy || processing(record)"
+                          @click="clearFailure(record)"
+                        >
+                          {{ t('studioKey.clearFailure') }}
+                        </button>
                       </template>
                     </td>
                     <td class="hidden py-1 pr-3 text-gray-500 @3xl:table-cell">
@@ -550,12 +700,15 @@ onBeforeUnmount(() => {
                     </td>
                   </template>
                   <template v-else>
-                    <td v-if="tab === 'failed'" class="whitespace-nowrap py-1 pr-3 @max-xl:p-0">
+                    <td
+                      v-if="tab === 'failed'"
+                      class="whitespace-nowrap py-1 pr-3 @max-xl:col-start-2 @max-xl:row-start-1 @max-xl:p-0"
+                    >
                       <span :class="statusClass[record.status] ?? 'text-gray-400'">
                         {{ statusLabel(record.status) }}
                       </span>
                     </td>
-                    <td class="py-1 pr-3 @max-xl:col-span-2 @max-xl:p-0">
+                    <td class="py-1 pr-3 @max-xl:col-span-3 @max-xl:p-0">
                       <div
                         class="cursor-pointer text-gray-400"
                         :class="clipClass(`reason:${record.account_id}`)"
@@ -571,16 +724,26 @@ onBeforeUnmount(() => {
                       </div>
                     </td>
                     <td
-                      class="whitespace-nowrap py-1 font-mono text-gray-500 @max-xl:p-0 @max-xl:text-[11px]"
+                      class="whitespace-nowrap py-1 pr-3 font-mono text-gray-500 @max-xl:p-0 @max-xl:text-[11px]"
                       :class="
                         tab === 'failed'
-                          ? '@max-xl:col-span-2'
+                          ? '@max-xl:col-span-3'
                           : '@max-xl:col-start-2 @max-xl:row-start-1'
                       "
                     >
                       <div class="cell-truncate" :title="formatTime(latestTime(record))">
                         {{ formatTime(latestTime(record)) }}
                       </div>
+                    </td>
+                    <td class="py-1 @max-xl:col-start-3 @max-xl:row-start-1 @max-xl:p-0">
+                      <button
+                        class="btn btn-sm btn-danger"
+                        type="button"
+                        :disabled="busy || processing(record)"
+                        @click="deleteRecord(record)"
+                      >
+                        {{ t('studioKey.delete') }}
+                      </button>
                     </td>
                   </template>
                 </tr>

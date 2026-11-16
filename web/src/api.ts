@@ -27,6 +27,7 @@ import type {
   ServiceStatus,
   UsageRecordPage,
   UsageReport,
+  StudioKeyClearResult,
   StudioKeyExport,
   StudioKeySecret,
   StudioKeyStatus,
@@ -338,6 +339,18 @@ export const api = {
     requestJSON<StudioKeyStatus>('/api/studio-keys/fetch', {
       method: 'POST',
       body: JSON.stringify({ all: true, missing_only: true }),
+    }),
+  // fillStudioKeyProjects 给保存着 Key 却没有项目编号的账户补项目信息（服务端只读打开页面，不创建 Key 与项目），逐个处理、按间隔等待
+  fillStudioKeyProjects: () =>
+    requestJSON<StudioKeyStatus>('/api/studio-keys/fetch', {
+      method: 'POST',
+      body: JSON.stringify({ all: true, missing_project: true }),
+    }),
+  // clearStudioKeys 清除记录：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息（从不删除 Key），一次最多 5000 个账户
+  clearStudioKeys: (ids: string[]) =>
+    requestJSON<StudioKeyClearResult>('/api/studio-keys/clear', {
+      method: 'POST',
+      body: JSON.stringify({ account_ids: ids }),
     }),
   stopStudioKeys: () => requestJSON<StudioKeyStatus>('/api/studio-keys/stop', { method: 'POST' }),
   // exportStudioKeys 只给“复制全部 Key”用（服务端 Cache-Control: no-store），结果不保存在页面状态里

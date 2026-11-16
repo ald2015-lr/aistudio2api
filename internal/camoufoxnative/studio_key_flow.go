@@ -52,6 +52,9 @@ var studioKeyTiming = struct {
 	retry time.Duration
 	// listSettle 为断定下拉列表里没有已有项目之前，列表要连续保持不变（且不在转圈）的时间；Projects 页上点新建之前等它的三倍
 	listSettle time.Duration
+	// projectName 为读到 Key 但还没找到项目名时多等的时间（之后再按 studio_key_project.go 补项目信息）；只读时页面的 Key 里
+	// 没有已保存的那条，也在 settle 之后再等这么久才判失败
+	projectName time.Duration
 }{
 	poll:        500 * time.Millisecond,
 	settle:      15 * time.Second,
@@ -61,6 +64,7 @@ var studioKeyTiming = struct {
 	noDialog:    10 * time.Second,
 	retry:       2 * time.Second,
 	listSettle:  3 * time.Second,
+	projectName: 5 * time.Second,
 }
 
 // 创建流程里各步卡住时的失败原因（不含 Key）；失败时后面接“ | 步骤=…”与“ | 对话框=…”（打码、截短，见 studioKeyFlow.detail）

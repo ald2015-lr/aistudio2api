@@ -3,8 +3,10 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -16,6 +18,8 @@ type studioKeyAdmin struct {
 	AdminService
 	fetched [][]string
 	all     []bool
+	inputs  []StudioKeyFetchInput
+	cleared [][]string
 	stopped int
 }
 
@@ -28,7 +32,14 @@ func (admin *studioKeyAdmin) StudioKeys(context.Context) (StudioKeyStatus, error
 func (admin *studioKeyAdmin) FetchStudioKeys(_ context.Context, input StudioKeyFetchInput) (StudioKeyStatus, error) {
 	admin.fetched = append(admin.fetched, input.AccountIDs)
 	admin.all = append(admin.all, input.All && input.MissingOnly)
+	admin.inputs = append(admin.inputs, input)
 	return admin.StudioKeys(context.Background())
+}
+
+func (admin *studioKeyAdmin) ClearStudioKeys(_ context.Context, input StudioKeyClearInput) (StudioKeyClearResult, error) {
+	admin.cleared = append(admin.cleared, input.AccountIDs)
+	status, _ := admin.StudioKeys(context.Background())
+	return StudioKeyClearResult{StudioKeyStatus: status, Cleared: StudioKeyClearCounts{Deleted: len(input.AccountIDs)}}, nil
 }
 
 func (admin *studioKeyAdmin) RevealStudioKey(_ context.Context, id string) (StudioKeySecret, error) {
@@ -71,6 +82,7 @@ func TestStudioKeyRoutes(t *testing.T) {
 		{http.MethodPost, "/api/studio-keys/a@example.com/reveal"},
 		{http.MethodPost, "/api/studio-keys/stop"},
 		{http.MethodPost, "/api/studio-keys/export"},
+		{http.MethodPost, "/api/studio-keys/clear"},
 	} {
 		if recorder := studioKeyRequest(handler, item.method, item.target, `{"account_ids":["a@example.com"]}`, false); recorder.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s 没有令牌 status = %d", item.method, item.target, recorder.Code)
@@ -113,5 +125,82 @@ func TestStudioKeyRoutesUnsupported(t *testing.T) {
 	handler := NewHandler(modelListService{}, Config{APIKey: "sk-test", AdminToken: testAdminToken, Admin: &permissionDeniedAdmin{}})
 	if recorder := studioKeyRequest(handler, http.MethodGet, "/api/studio-keys", "", true); recorder.Code != http.StatusNotImplemented {
 		t.Fatalf("status = %d", recorder.Code)
+	}
+}
+
+// TestStudioKeyClearRoute 清除记录：账户去掉空白与重复后交给管理服务；空列表、超过上限（原始列表超过上限的两倍）时 400；返回最新状态（列表不含完整 Key）与计数，不缓存
+func TestStudioKeyClearRoute(t *testing.T) {
+	admin := &studioKeyAdmin{}
+	handler := NewHandler(modelListService{}, Config{APIKey: "sk-test", AdminToken: testAdminToken, Admin: admin})
+	for _, body := range []string{`{"account_ids":[]}`, `{"account_ids":[" ",""]}`, `{}`, `not json`} {
+		if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", body, true); recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d", body, recorder.Code)
+		}
+	}
+	ids := make([]string, StudioKeyClearLimit+1)
+	for index := range ids {
+		ids[index] = fmt.Sprintf("u%d@example.com", index)
+	}
+	tooMany, _ := json.Marshal(map[string]any{"account_ids": ids})
+	if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", string(tooMany), true); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("超过上限 status = %d", recorder.Code)
+	}
+	// 原始列表超过上限的两倍时不去重、直接 400（去重用 map，不随请求体平方增长）
+	huge := make([]string, 2*StudioKeyClearLimit+1)
+	for index := range huge {
+		huge[index] = "same@example.com"
+	}
+	hugeBody, _ := json.Marshal(map[string]any{"account_ids": huge})
+	if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", string(hugeBody), true); recorder.Code != http.StatusBadRequest {
+		t.Fatalf("原始列表过长 status = %d", recorder.Code)
+	}
+	if len(admin.cleared) != 0 {
+		t.Fatalf("不合法的请求不应交给管理服务: %v", admin.cleared)
+	}
+	// 上限之内的重复（原始个数不超过两倍）去重后照常处理
+	repeated := append(slices.Clone(ids[:StudioKeyClearLimit]), ids[:StudioKeyClearLimit]...)
+	repeatedBody, _ := json.Marshal(map[string]any{"account_ids": repeated})
+	if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", string(repeatedBody), true); recorder.Code != http.StatusOK ||
+		len(admin.cleared) != 1 || len(admin.cleared[0]) != StudioKeyClearLimit {
+		t.Fatalf("重复的账户去重后应照常处理: status=%d", recorder.Code)
+	}
+	admin.cleared = nil
+	recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", `{"account_ids":[" a@example.com ","b@example.com","a@example.com"]}`, true)
+	if recorder.Code != http.StatusOK || recorder.Header().Get("Cache-Control") != "no-store" || len(admin.cleared) != 1 ||
+		!slices.Equal(admin.cleared[0], []string{"a@example.com", "b@example.com"}) {
+		t.Fatalf("status=%d cleared=%v", recorder.Code, admin.cleared)
+	}
+	var result struct {
+		Records []StudioKeyRecord    `json:"records"`
+		Queue   []string             `json:"queue"`
+		Cleared StudioKeyClearCounts `json:"cleared"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil || result.Cleared.Deleted != 2 || len(result.Records) != 1 || result.Queue == nil ||
+		strings.Contains(recorder.Body.String(), testStudioSecret) {
+		t.Fatalf("body err=%v %s", err, recorder.Body.String())
+	}
+}
+
+// TestStudioKeyFetchFillRoute 补项目信息：fill_project 与 missing_project 原样交给管理服务；与 missing_only 同用时 400
+func TestStudioKeyFetchFillRoute(t *testing.T) {
+	admin := &studioKeyAdmin{}
+	handler := NewHandler(modelListService{}, Config{APIKey: "sk-test", AdminToken: testAdminToken, Admin: admin})
+	if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/fetch", `{"account_ids":["a@example.com"],"fill_project":true}`, true); recorder.Code != http.StatusOK {
+		t.Fatalf("fill_project status = %d", recorder.Code)
+	}
+	if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/fetch", `{"all":true,"missing_project":true}`, true); recorder.Code != http.StatusOK {
+		t.Fatalf("missing_project status = %d", recorder.Code)
+	}
+	if len(admin.inputs) != 2 || !admin.inputs[0].FillProject || admin.inputs[0].All || !admin.inputs[1].All || !admin.inputs[1].MissingProject {
+		t.Fatalf("inputs = %+v", admin.inputs)
+	}
+	for _, body := range []string{`{"all":true,"missing_only":true,"missing_project":true}`, `{"account_ids":["a@example.com"],"missing_only":true,"fill_project":true}`,
+		`{"fill_project":true}`} {
+		if recorder := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/fetch", body, true); recorder.Code != http.StatusBadRequest {
+			t.Fatalf("%s status = %d", body, recorder.Code)
+		}
+	}
+	if len(admin.inputs) != 2 {
+		t.Fatalf("不合法的请求不应交给管理服务: %+v", admin.inputs)
 	}
 }
