@@ -3,8 +3,10 @@ import { computed } from 'vue'
 import { useI18n } from '@/i18n'
 import { PAGE_SIZES } from '@/paging'
 
+// fixedSize 为调用方固定每页条数（如 AI Studio API Key 卡片每页 10 条）：不显示每页条数选择，改为显示“第 x / y 页”
 const props = defineProps<{
   total: number
+  fixedSize?: boolean
 }>()
 
 const page = defineModel<number>('page', { required: true })
@@ -74,7 +76,10 @@ function changeSize(event: Event): void {
       >
         ›
       </button>
-      <select class="input ml-1 h-[1.625rem] text-xs" :value="pageSize" @change="changeSize">
+      <span v-if="fixedSize" class="ml-1 whitespace-nowrap">
+        {{ tf('pager.pageOf', { page: current, count: pageCount }) }}
+      </span>
+      <select v-else class="input ml-1 h-[1.625rem] text-xs" :value="pageSize" @change="changeSize">
         <option v-for="size in PAGE_SIZES" :key="size" :value="size">
           {{ tf('pager.perPage', { count: size }) }}
         </option>

@@ -1527,6 +1527,18 @@ function clearSelection(): void {
   selected.value = new Set()
 }
 
+// fetchSelectedStudioKeys 只把选中的账户加入获取 Key 的队列（未选中的不处理），确认框写明个数与号与号之间的间隔
+async function fetchSelectedStudioKeys(): Promise<void> {
+  const ids = selectedAccounts.value.map((account) => account.id)
+  if (ids.length === 0) return
+  const message = tf('studioKey.fetchSelectedConfirm', {
+    count: ids.length,
+    delay: studioKeys.value?.delaySeconds ?? 30,
+  })
+  if (!(await confirmAction(message, t('studioKey.fetch')))) return
+  fetchStudioKeys(ids)
+}
+
 // 账户被删除后从选择集中移除
 watch(
   () => props.accounts,
@@ -2628,13 +2640,8 @@ function closeBulkPanel(): void {
         <button class="btn btn-sm" type="button" :disabled="busy" @click="openVerifyDialog">
           {{ t('common.verify') }}
         </button>
-        <button
-          class="btn btn-sm"
-          type="button"
-          :disabled="busy"
-          @click="fetchStudioKeys(selectedAccounts.map((account) => account.id))"
-        >
-          {{ t('studioKey.fetchSelected') }}
+        <button class="btn btn-sm" type="button" :disabled="busy" @click="fetchSelectedStudioKeys">
+          {{ tf('studioKey.fetchSelected', { count: selected.size }) }}
         </button>
         <button
           class="btn btn-sm btn-danger"
