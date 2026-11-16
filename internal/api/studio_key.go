@@ -16,13 +16,15 @@ type StudioKeyRecord struct {
 	// Status 为最近一次获取的结论：ok（读到 Key）、none（页面上没有 Key 也不能创建）、failed、skipped（账户未登录、停用等）
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
-	// HasKey 表示保存着 Key（最近一次失败时仍保留上一次读到的 Key）；Last4 为它的末四位
+	// HasKey 表示保存着 Key（最近一次失败时仍保留上一次读到的 Key）；Last4 为它的末四位；
+	// ProjectCreated 表示 Key 所在的项目是获取时经页面新建的（账户原先没有 Google Cloud 项目）
 	HasKey         bool       `json:"has_key"`
 	Last4          string     `json:"last4,omitempty"`
 	ProjectName    string     `json:"project_name,omitempty"`
 	ProjectNumber  string     `json:"project_number,omitempty"`
 	ProjectDisplay string     `json:"project_display,omitempty"`
 	Created        bool       `json:"created,omitempty"`
+	ProjectCreated bool       `json:"project_created,omitempty"`
 	KeyCount       int        `json:"key_count,omitempty"`
 	FetchedAt      *time.Time `json:"fetched_at,omitempty"`
 	CreatedAt      *time.Time `json:"created_at,omitempty"`

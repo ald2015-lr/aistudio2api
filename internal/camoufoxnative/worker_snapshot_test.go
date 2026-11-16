@@ -45,9 +45,11 @@ type fakeBiDiPage struct {
 	methods   []string
 }
 
-// fakeBiDiHooks 为假 Camoufox 的可选钩子：command 在收到每条命令时调用（在假浏览器的协程里），返回的事件在回复之前先发出
+// fakeBiDiHooks 为假 Camoufox 的可选钩子：command 在收到每条命令时调用（在假浏览器的协程里），返回的事件在回复之前先发出；
+// result 不为空时为 script.evaluate 以外的命令给出回复内容（返回 nil 时用默认回复）
 type fakeBiDiHooks struct {
 	command func(method string, params map[string]any) []map[string]any
+	result  func(method string, params map[string]any) map[string]any
 }
 
 func newFakeBiDiPage(t *testing.T, evaluate func(expression string) fakeEvaluate) *fakeBiDiPage {
@@ -105,6 +107,11 @@ func newFakeBiDiPageWithHooks(t *testing.T, evaluate func(expression string) fak
 				}
 			}
 			result := map[string]any{}
+			if hooks.result != nil && message.Method != "script.evaluate" {
+				if custom := hooks.result(message.Method, message.Params); custom != nil {
+					result = custom
+				}
+			}
 			switch message.Method {
 			case "browsingContext.getTree":
 				result = map[string]any{"contexts": []any{map[string]any{"context": "ctx-1"}}}

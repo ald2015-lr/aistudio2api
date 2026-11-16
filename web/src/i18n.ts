@@ -494,7 +494,7 @@ const zhCN = {
   'studioKey.expand': '展开',
   'studioKey.collapse': '收起',
   'studioKey.help':
-    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key；页面上没有 Key 时点页面自己的“Create API key”创建一个。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用的账户跳过。列表只显示末四位，点“复制”才读取完整 Key。',
+    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key；页面上没有 Key 时点页面自己的“Create API key”创建一个（账户还没有 Google Cloud 项目时先经页面新建一个项目，每次最多建一个项目、一个 Key）。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用、组织停用的账户跳过，需要验证账号（403）而暂停的账户照常获取、获取后仍暂停。列表只显示末四位，点“复制”才读取完整 Key。',
   'studioKey.empty': '还没有记录。在账户行点“获取 Key”，或选中账户后批量获取。',
   'studioKey.account': '账户',
   'studioKey.key': 'Key',
@@ -503,6 +503,7 @@ const zhCN = {
   'studioKey.state': '状态',
   'studioKey.time': '时间',
   'studioKey.created': '（本次新建）',
+  'studioKey.projectCreated': '（新建的项目）',
   'studioKey.fetchedAt': '读取',
   'studioKey.createdAt': '创建',
   'studioKey.attemptAt': '最近尝试',
@@ -512,7 +513,7 @@ const zhCN = {
   'studioKey.queued': '已加入获取队列：{count} 个账户',
   'studioKey.fetchAll': '全部获取',
   'studioKey.fetchAllConfirm':
-    '把所有还没有 Key 的账户加入获取队列？会一个一个慢慢处理，号与号之间隔 {delay} 秒；没有 Key 的号会自动创建一个。中途可以点“停止”，之后再点“全部获取”只补没拿到的。',
+    '把所有还没有 Key 的账户加入获取队列？会一个一个慢慢处理，号与号之间隔 {delay} 秒；没有 Key 的号会自动创建一个（没有项目时先新建一个项目）。中途可以点“停止”，之后再点“全部获取”只补没拿到的。',
   'studioKey.queuedAll': '已开始：所有还没有 Key 的账户逐个获取，进度看上方队列',
   'studioKey.allDone': '所有账户都已经有 Key，没有要获取的',
   'studioKey.stop': '停止',
@@ -1606,7 +1607,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.expand': 'Expand',
   'studioKey.collapse': 'Collapse',
   'studioKey.help':
-    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests; when the page has no key, it clicks the page\'s own "Create API key" to create one. Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Accounts that are signed out or disabled are skipped. Only the last 4 characters are listed; the full key is read only when you click Copy.',
+    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests; when the page has no key, it clicks the page\'s own "Create API key" to create one (if the account has no Google Cloud project yet, it first creates one through the page; at most one project and one key per run). Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Signed-out, disabled and organization-disabled accounts are skipped; accounts paused for account verification (403) are processed as usual and stay paused afterwards. Only the last 4 characters are listed; the full key is read only when you click Copy.',
   'studioKey.empty': 'No records yet. Click "Get key" on an account row, or select accounts and get keys in bulk.',
   'studioKey.account': 'Account',
   'studioKey.key': 'Key',
@@ -1615,6 +1616,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.state': 'Status',
   'studioKey.time': 'Time',
   'studioKey.created': '(created this time)',
+  'studioKey.projectCreated': '(project created)',
   'studioKey.fetchedAt': 'Read',
   'studioKey.createdAt': 'Created',
   'studioKey.attemptAt': 'Last attempt',
@@ -1624,7 +1626,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.queued': 'Queued {count} account(s)',
   'studioKey.fetchAll': 'Get all',
   'studioKey.fetchAllConfirm':
-    'Queue every account that has no key yet? They are processed one by one, {delay} seconds apart; an account without a key gets one created. You can click "Stop" at any time; clicking "Get all" again only fills in the missing ones.',
+    'Queue every account that has no key yet? They are processed one by one, {delay} seconds apart; an account without a key gets one created (and a project first if it has none). You can click "Stop" at any time; clicking "Get all" again only fills in the missing ones.',
   'studioKey.queuedAll': 'Started: every account without a key is fetched one by one; see the queue above',
   'studioKey.allDone': 'Every account already has a key; nothing to fetch',
   'studioKey.stop': 'Stop',

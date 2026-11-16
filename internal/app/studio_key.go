@@ -22,8 +22,11 @@ import (
 // 获取 AI Studio API Key：管理页按账户（单个或批量选中）手动触发，绝不在启动时或后台自动运行。
 // 每个账户用已保存的登录态启动一次无头隔离浏览器（与“验证”相同：先取得账户的独占租约，正在处理的请求结束后才开始，
 // 期间这个账户不接新请求），打开 API Keys 页面，从页面自己的响应里读取 Key，页面上没有 Key 时经页面自己的创建按钮创建一个
-// （见 camoufoxnative.FetchStudioKey）。账户逐个处理，打开过浏览器的账户之后等 STUDIO_KEY_DELAY 秒（每次等待前重新读取配置，
-// 保存后立即生效）；未登录、停用、组织停用、正在启停收尾的账户直接跳过、不等待。
+// （没有 Google Cloud 项目时先经页面新建一个项目，见 camoufoxnative.FetchStudioKey）。账户逐个处理，打开过浏览器的账户之后等
+// STUDIO_KEY_DELAY 秒（每次等待前重新读取配置，保存后立即生效）；未登录、停用、组织停用、不可用、正在启停收尾的账户直接跳过、不等待。
+//
+// 需要验证账号（403 verify-account）而整户暂停的账户照常获取：这种账户的 API Key 页面通常仍可用。获取只取得管理操作的独占租约
+// （AcquireAccount 不看调度状态，暂停中也能取得），不清 403 记录与冷却、不改账户状态：结束后账户仍暂停调度，直到验证通过等原有路径解除。
 //
 // Key 保存在账户目录的 studioKeyFileName（0600，账户删除时随目录删除，重启后仍在）。Key 是机密：不写运行日志、错误与列表接口，
 // 列表只给末四位，完整 Key 只经 reveal 接口返回（管理页的复制按钮）。
@@ -49,6 +52,8 @@ type studioKeyFile struct {
 	KeyCount       int        `json:"key_count,omitempty"`
 	FetchedAt      *time.Time `json:"fetched_at,omitempty"`
 	CreatedAt      *time.Time `json:"created_at,omitempty"`
+	// ProjectCreated 表示这个 Key 所在的项目是获取时经页面新建的
+	ProjectCreated bool       `json:"project_created,omitempty"`
 	Status         string     `json:"status"`
 	Reason         string     `json:"reason,omitempty"`
 	AttemptAt      *time.Time `json:"attempt_at,omitempty"`
@@ -86,7 +91,7 @@ func studioKeyView(accountID string, label string, record studioKeyFile) api.Stu
 	view := api.StudioKeyRecord{
 		AccountID: accountID, Label: label, Status: record.Status, Reason: camoufoxnative.RedactStudioKeys(record.Reason),
 		HasKey: record.Key != "", ProjectName: record.ProjectName, ProjectNumber: record.ProjectNumber,
-		ProjectDisplay: record.ProjectDisplay, Created: record.Created, KeyCount: record.KeyCount,
+		ProjectDisplay: record.ProjectDisplay, Created: record.Created, ProjectCreated: record.ProjectCreated, KeyCount: record.KeyCount,
 		FetchedAt: record.FetchedAt, CreatedAt: record.CreatedAt, AttemptAt: record.AttemptAt,
 	}
 	if record.Key != "" {
@@ -424,8 +429,9 @@ func (manager *runtimeManager) runStudioKeys(ctx context.Context) {
 	}
 }
 
-// studioKeySkipReason 返回不处理这个账户的原因（未登录、停用、组织停用、不可用、需要验证账号而整户暂停、正在启停收尾）；可以处理时为空
-func studioKeySkipReason(status aistudio.AccountStatus, verifyPaused bool) string {
+// studioKeySkipReason 返回不处理这个账户的原因（未登录、停用、组织停用、不可用、正在启停收尾）；可以处理时为空。
+// 需要验证账号而整户暂停的账户不跳过（暂停只是一条全局冷却，账户状态显示为冷却，这里不看冷却）
+func studioKeySkipReason(status aistudio.AccountStatus) string {
 	switch {
 	case !status.Enabled || status.State == aistudio.AccountDisabled:
 		return "账户已停用"
@@ -435,8 +441,6 @@ func studioKeySkipReason(status aistudio.AccountStatus, verifyPaused bool) strin
 		return "账户所属组织停用了 AI Studio"
 	case status.State == aistudio.AccountUnavailable:
 		return "账户不可用"
-	case verifyPaused:
-		return "账户需要验证账号，整户暂停中"
 	case status.Transition != "":
 		return "账户正在启停收尾（暂停中）"
 	}
@@ -470,7 +474,7 @@ func (manager *runtimeManager) fetchStudioKey(ctx context.Context, accountID str
 			admin.requests.log(label, "WARN", "获取 API Key | 保存记录失败 | 错误="+camoufoxnative.RedactStudioKeys(err.Error()))
 		}
 	}
-	if reason := studioKeySkipReason(status, admin.pool.VerifyRequiredPaused(accountID)); reason != "" {
+	if reason := studioKeySkipReason(status); reason != "" {
 		previous.Status, previous.Reason = studioKeySkipped, reason
 		save(previous)
 		admin.requests.log(label, "INFO", "获取 API Key | 跳过 | 原因="+reason)
@@ -499,7 +503,7 @@ func (manager *runtimeManager) fetchStudioKey(ctx context.Context, accountID str
 	}
 	record := studioKeyFile{
 		Key: result.Key, ProjectName: result.ProjectName, ProjectNumber: result.ProjectNumber,
-		ProjectDisplay: result.ProjectDisplay, Created: result.Created, KeyCount: result.KeyCount,
+		ProjectDisplay: result.ProjectDisplay, Created: result.Created, ProjectCreated: result.ProjectCreated, KeyCount: result.KeyCount,
 		FetchedAt: &now, Status: studioKeyOK,
 	}
 	switch {
@@ -507,18 +511,35 @@ func (manager *runtimeManager) fetchStudioKey(ctx context.Context, accountID str
 		record.CreatedAt = &now
 	case previous.Key == result.Key:
 		// 同一个 Key：保留当初创建的时间与标记
-		record.CreatedAt, record.Created = previous.CreatedAt, previous.Created
+		record.CreatedAt, record.Created, record.ProjectCreated = previous.CreatedAt, previous.Created, previous.ProjectCreated
 	}
 	save(record)
 	action := "读取"
-	if result.Created {
+	switch {
+	case result.ProjectCreated:
+		action = "新建项目并新建 Key"
+	case result.Created:
 		action = "新建"
 	}
-	admin.requests.log(label, "INFO", fmt.Sprintf(
+	message := fmt.Sprintf(
 		"获取 API Key 完成 | %s | 末四位=%s | 项目=%s | 项目编号=%s | 耗时=%s",
 		action, camoufoxnative.StudioKeyLast4(result.Key), orDash(result.ProjectName), orDash(result.ProjectNumber), elapsed,
-	))
+	)
+	if len(result.Steps) > 0 {
+		message += " | 步骤=" + studioKeyStepsText(result.Steps)
+	}
+	admin.requests.log(label, "INFO", message)
 	return true
+}
+
+// studioKeyStepsText 为写进运行日志的创建步骤（打码、单行、截短）
+func studioKeyStepsText(steps []string) string {
+	text := camoufoxnative.RedactStudioKeys(strings.Join(steps, "→"))
+	text = strings.Join(strings.Fields(text), " ")
+	if runes := []rune(text); len(runes) > 300 {
+		text = string(runes[:299]) + "…"
+	}
+	return text
 }
 
 // fetchStudioKeyWithLease 在账户独占租约内获取 Key（与 verifyLogin 一样：等进行中的请求结束，期间账户不接新请求），
@@ -539,7 +560,7 @@ func (admin *runtimeAdmin) fetchStudioKeyWithLease(
 	return driver.FetchStudioKey(ctx, request, account.StorageState)
 }
 
-// studioKeyFailureReason 返回写进记录与日志的失败原因（打码、单行、截短）
+// studioKeyFailureReason 返回写进记录与日志的失败原因（打码、单行、截短；创建流程的失败带步骤与对话框摘要，上限放宽到 600 字）
 func studioKeyFailureReason(err error) string {
 	var keyErr *camoufoxnative.StudioKeyError
 	text := err.Error()
@@ -548,8 +569,8 @@ func studioKeyFailureReason(err error) string {
 	}
 	text = camoufoxnative.StripPageSnapshots(camoufoxnative.RedactStudioKeys(text))
 	text = strings.Join(strings.Fields(text), " ")
-	if runes := []rune(text); len(runes) > 300 {
-		text = string(runes[:299]) + "…"
+	if runes := []rune(text); len(runes) > 600 {
+		text = string(runes[:599]) + "…"
 	}
 	return text
 }

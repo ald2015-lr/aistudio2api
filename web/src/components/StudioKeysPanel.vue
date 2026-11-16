@@ -235,6 +235,9 @@ onBeforeUnmount(() => {
                 <span v-if="record.project_display" class="text-gray-500"
                   >（{{ record.project_display }}）</span
                 >
+                <span v-if="record.project_created" class="text-gray-500">{{
+                  t('studioKey.projectCreated')
+                }}</span>
               </td>
               <td class="py-1 pr-3 font-mono">{{ record.project_number || '-' }}</td>
               <td class="py-1 pr-3">

@@ -107,3 +107,67 @@ func redactCandidates(keys []StudioKeyCandidate) []StudioKeyCandidate {
 	}
 	return out
 }
+
+// TestExtractStudioProjectsOperation 建项目接口的长操作结果（Cloud Resource Manager 形态，合成数据）：编号、项目 ID 与显示名，
+// 状态之类的大写枚举不当显示名
+func TestExtractStudioProjectsOperation(t *testing.T) {
+	body := `{"name":"operations/cp.7340000000000000000","done":true,"response":{"@type":"type.googleapis.com/google.cloudresourcemanager.v3.Project",` +
+		`"name":"projects/123456789012","parent":"organizations/0","projectId":"gen-lang-client-0123456789","state":"ACTIVE",` +
+		`"displayName":"Gemini Project","createTime":"2026-11-16T08:00:00.000Z"}}`
+	projects := ExtractStudioProjects([]byte(body))
+	if len(projects) != 1 {
+		t.Fatalf("projects = %+v", projects)
+	}
+	want := StudioProject{Name: "projects/123456789012", Number: "123456789012", ID: "gen-lang-client-0123456789", Display: "Gemini Project"}
+	if projects[0] != want {
+		t.Fatalf("project = %+v，期望 %+v", projects[0], want)
+	}
+}
+
+// TestExtractStudioProjectsNestedArrays 页面自己的项目列表（protobuf-JSON 嵌套数组、带 XSSI 前缀，合成数据）：每条记录取编号、
+// 同一层的 gen-lang-client-<数字> 与显示名；大写的状态枚举不当显示名
+func TestExtractStudioProjectsNestedArrays(t *testing.T) {
+	body := ")]}'\n" + `[[["projects/123456789012","gen-lang-client-0123456789","ACTIVE","Gemini Project",null,[1763280000,0]],` +
+		`["projects/210987654321","gen-lang-client-0987654321","Default Gemini Project"]]]`
+	projects := ExtractStudioProjects([]byte(body))
+	if len(projects) != 2 || projects[0].Number != "123456789012" || projects[0].ID != "gen-lang-client-0123456789" ||
+		projects[0].Display != "Gemini Project" || projects[1].Display != "Default Gemini Project" {
+		t.Fatalf("projects = %+v", projects)
+	}
+}
+
+// TestExtractStudioProjectsBatchExecute batchexecute 分块、项目在再包一层的 JSON 字符串里；Key 的资源名（projects/<数字>/…/keys/…）
+// 也算出它所在的项目，与另一处的显示名合并
+func TestExtractStudioProjectsBatchExecute(t *testing.T) {
+	inner, _ := json.Marshal([]any{[]any{"projects/123456789012/locations/global/keys/abc", nil, []any{"projects/123456789012", "Gemini Project"}}})
+	outer, _ := json.Marshal([]any{[]any{"wrb.fr", "CreateProject", string(inner), nil, nil, "generic"}})
+	body := ")]}'\n\n" + "123\n" + string(outer) + "\n25\n[[\"e\",4,null,null,1]]\n"
+	projects := ExtractStudioProjects([]byte(body))
+	if len(projects) != 1 || projects[0].Name != "projects/123456789012" || projects[0].Display != "Gemini Project" {
+		t.Fatalf("projects = %+v", projects)
+	}
+}
+
+// TestExtractStudioProjectsIgnoresNoise 没有项目、编号太短（页面脚本里偶然出现的短串）、前面紧接着字母的（subprojects/…）都不算；
+// 不是 JSON 时按文本扫描
+func TestExtractStudioProjectsIgnoresNoise(t *testing.T) {
+	for _, body := range []string{`{"a":"b"}`, `["projects/12","x"]`, `var a="subprojects/1234567890";`} {
+		if projects := ExtractStudioProjects([]byte(body)); len(projects) != 0 {
+			t.Fatalf("%s: projects = %+v", body, projects)
+		}
+	}
+	projects := ExtractStudioProjects([]byte(`<html>see projects/123456789012 and projects/123456789012/x</html>`))
+	if len(projects) != 1 || projects[0].Number != "123456789012" {
+		t.Fatalf("projects = %+v", projects)
+	}
+}
+
+// TestMergeStudioProjects 同一编号只留一条，后来的结果补上 ID 与显示名
+func TestMergeStudioProjects(t *testing.T) {
+	merged := mergeStudioProjects([]StudioProject{{Name: "projects/123456789012", Number: "123456789012"}},
+		[]StudioProject{{Name: "projects/123456789012", Number: "123456789012", ID: "gen-lang-client-0123456789", Display: "Gemini Project"},
+			{Name: "projects/210987654321", Number: "210987654321"}})
+	if len(merged) != 2 || merged[0].ID != "gen-lang-client-0123456789" || merged[0].Display != "Gemini Project" {
+		t.Fatalf("merged = %+v", merged)
+	}
+}

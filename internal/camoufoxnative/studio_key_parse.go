@@ -285,3 +285,148 @@ func mergeStudioKeys(existing []StudioKeyCandidate, more []StudioKeyCandidate) [
 	}
 	return existing
 }
+
+// 新建项目时，页面自己的响应（建项目的接口、项目列表）里会出现新项目的 projects/<数字>。项目接口同样没有公开文档，
+// 按与 Key 相同的思路解析：JSON（含 XSSI 前缀、batchexecute 分块、字符串里再包一层 JSON）里整段是 projects/<数字>
+// （或其下级资源 projects/<数字>/…）的字符串即一个项目，同一层容器里的 gen-lang-client-<数字>（或对象的 projectId）是项目 ID，
+// 对象的 displayName（或同一层像显示名的文字）是显示名；正文不是 JSON 时按文本扫描。项目编号至少 6 位
+// （实际为 12 位左右），免得把页面脚本里偶然出现的短串当成项目。
+var (
+	studioProjectResource  = regexp.MustCompile(`^projects/([0-9]{6,})(?:/|$)`)
+	studioProjectTextScan  = regexp.MustCompile(`projects/([0-9]{6,})`)
+	studioProjectIDPattern = regexp.MustCompile(`^gen-lang-client-[0-9]{6,}$`)
+	studioUpperToken       = regexp.MustCompile(`^[A-Z0-9_]+$`)
+)
+
+// ExtractStudioProjects 从一段响应正文里找出 Google Cloud 项目（按出现顺序、按编号去重）
+func ExtractStudioProjects(body []byte) []StudioProject {
+	if !studioProjectTextScan.Match(body) {
+		return nil
+	}
+	text := string(bytes.TrimSpace(body))
+	var collector studioProjectCollector
+	parsedAny := false
+	for _, chunk := range studioJSONChunks(text) {
+		var value any
+		decoder := json.NewDecoder(strings.NewReader(chunk))
+		decoder.UseNumber()
+		if err := decoder.Decode(&value); err != nil {
+			continue
+		}
+		parsedAny = true
+		collector.walk(value, nil, 0)
+	}
+	if parsedAny && len(collector.found) > 0 {
+		return collector.found
+	}
+	var found []StudioProject
+	for _, match := range studioProjectTextScan.FindAllStringSubmatchIndex(text, -1) {
+		// 前面紧接着字母数字的不算（如 subprojects/…），后面紧接着数字的已被正则吞掉
+		if match[0] > 0 && isKeyByte(text[match[0]-1]) {
+			continue
+		}
+		number := text[match[2]:match[3]]
+		found = mergeStudioProjects(found, []StudioProject{{Name: "projects/" + number, Number: number}})
+	}
+	return found
+}
+
+type studioProjectCollector struct {
+	found []StudioProject
+}
+
+// walk 递归遍历 JSON 值；parent 为当前值所在的容器
+func (collector *studioProjectCollector) walk(value any, parent any, depth int) {
+	if depth > 64 {
+		return
+	}
+	switch item := value.(type) {
+	case []any:
+		for _, child := range item {
+			collector.walk(child, item, depth+1)
+		}
+	case map[string]any:
+		names := make([]string, 0, len(item))
+		for name := range item {
+			names = append(names, name)
+		}
+		sortStrings(names)
+		for _, name := range names {
+			collector.walk(item[name], item, depth+1)
+		}
+	case string:
+		trimmed := strings.TrimSpace(item)
+		if match := studioProjectResource.FindStringSubmatch(trimmed); match != nil {
+			collector.add(match[1], parent)
+			return
+		}
+		if len(trimmed) > 1 && (trimmed[0] == '[' || trimmed[0] == '{') && studioProjectTextScan.MatchString(trimmed) {
+			var nested any
+			decoder := json.NewDecoder(strings.NewReader(trimmed))
+			decoder.UseNumber()
+			if decoder.Decode(&nested) == nil {
+				collector.walk(nested, nil, depth+1)
+			}
+		}
+	}
+}
+
+func (collector *studioProjectCollector) add(number string, container any) {
+	project := StudioProject{Name: "projects/" + number, Number: number}
+	if object, ok := container.(map[string]any); ok {
+		if value, ok := object["projectId"].(string); ok && studioProjectIDPattern.MatchString(strings.TrimSpace(value)) {
+			project.ID = strings.TrimSpace(value)
+		}
+		for _, name := range []string{"displayName", "display_name", "projectDisplayName"} {
+			if value, ok := object[name].(string); ok && looksLikeDisplayName(strings.TrimSpace(value)) {
+				project.Display = strings.TrimSpace(value)
+				break
+			}
+		}
+	}
+	if container != nil {
+		values := shallowStrings(container, 1)
+		for _, value := range values {
+			if project.ID == "" && studioProjectIDPattern.MatchString(value) {
+				project.ID = value
+			}
+		}
+		if project.Display == "" {
+			for _, value := range values {
+				if value == project.ID || studioProjectIDPattern.MatchString(value) || studioProjectScan.MatchString(value) ||
+					studioKeyScanPattern.MatchString(value) || studioUpperToken.MatchString(value) || !looksLikeDisplayName(value) {
+					continue
+				}
+				project.Display = value
+				break
+			}
+		}
+	}
+	collector.found = mergeStudioProjects(collector.found, []StudioProject{project})
+}
+
+// mergeStudioProjects 合并项目列表：同一编号只留一条，后来的结果补上缺少的 ID 与显示名
+func mergeStudioProjects(existing []StudioProject, more []StudioProject) []StudioProject {
+	for _, project := range more {
+		if project.Number == "" {
+			continue
+		}
+		merged := false
+		for index := range existing {
+			if existing[index].Number != project.Number {
+				continue
+			}
+			merged = true
+			if existing[index].ID == "" {
+				existing[index].ID = project.ID
+			}
+			if existing[index].Display == "" {
+				existing[index].Display = project.Display
+			}
+		}
+		if !merged {
+			existing = append(existing, project)
+		}
+	}
+	return existing
+}

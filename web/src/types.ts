@@ -1012,6 +1012,8 @@ export interface StudioKeyRecord {
   project_number?: string
   project_display?: string
   created?: boolean
+  // project_created：Key 所在的项目是获取时经页面新建的（账户原先没有 Google Cloud 项目）
+  project_created?: boolean
   key_count?: number
   fetched_at?: string
   created_at?: string

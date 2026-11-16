@@ -202,6 +202,13 @@ func (session *loginSession) clickWhenPresent(ctx context.Context, contextID str
 
 // click 以真实指针事件点击表达式返回的元素中心
 func (session *loginSession) click(ctx context.Context, contextID string, expression string) error {
+	_, err := session.pointerClick(ctx, contextID, expression)
+	return err
+}
+
+// pointerClick 同 click，另返回是否已经发出指针动作：元素不存在、读取位置失败时为 false（确定没有点）；
+// 发出 input.performActions 之后出错时为 true（点击可能已经生效，调用方按已点处理，免得重复点击创建类按钮）
+func (session *loginSession) pointerClick(ctx context.Context, contextID string, expression string) (bool, error) {
 	encoded, err := session.client.evaluateString(ctx, contextID, fmt.Sprintf(`(() => {
   const element = %s;
   if (!element) return '';
@@ -210,14 +217,14 @@ func (session *loginSession) click(ctx context.Context, contextID string, expres
   return JSON.stringify([box.left + box.width / 2, box.top + box.height / 2]);
 })()`, expression))
 	if err != nil {
-		return err
+		return false, err
 	}
 	if encoded == "" {
-		return errElementMissing
+		return false, errElementMissing
 	}
 	var point [2]float64
 	if err := json.Unmarshal([]byte(encoded), &point); err != nil {
-		return fmt.Errorf("解析元素位置: %w", err)
+		return false, fmt.Errorf("解析元素位置: %w", err)
 	}
 	x, y := int(math.Round(point[0])), int(math.Round(point[1]))
 	_, err = session.client.command(ctx, "input.performActions", map[string]any{
@@ -233,5 +240,5 @@ func (session *loginSession) click(ctx context.Context, contextID string, expres
 			},
 		}},
 	})
-	return err
+	return true, err
 }
