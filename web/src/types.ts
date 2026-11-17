@@ -1003,8 +1003,9 @@ export interface RequestBody {
 export interface StudioKeyRecord {
   account_id: string
   label?: string
-  // status：ok 读到 Key；none 页面上没有 Key 也不能创建；failed 失败；skipped 账户未登录、停用等被跳过
-  status: 'ok' | 'none' | 'failed' | 'skipped' | string
+  // status：ok 读到 Key；none 页面上没有 Key 也不能创建；failed 失败；skipped 账户未登录、停用等被跳过；
+  // invalid 保存着的 Key 与其他账户相同、已作废（has_key 为假，没有末四位与项目，reason 写明原因）
+  status: 'ok' | 'none' | 'failed' | 'skipped' | 'invalid' | string
   reason?: string
   has_key: boolean
   last4?: string
@@ -1049,10 +1050,12 @@ export interface StudioKeySecret {
   project_id?: string
 }
 
-// StudioKeyClearCounts 为清除记录的计数：deleted 删掉的没有 Key 的记录；reset 清掉失败信息的保存着 Key 的记录（Key 不动）；
-// busy 正在处理、没有动的账户；unknown 不认识的账户；unchanged 不用清的；errors 读不出来、没有动的
+// StudioKeyClearCounts 为清除记录的计数：deleted 删掉的没有 Key 的记录；invalid 删掉的作废 Key 的记录（与其他账户相同，不是账户的 Key）；
+// reset 清掉失败信息的保存着 Key 的记录（Key 不动）；busy 正在处理、没有动的账户；unknown 不认识的账户；unchanged 不用清的；
+// errors 读不出来、没有动的
 export interface StudioKeyClearCounts {
   deleted: number
+  invalid: number
   reset: number
   busy: number
   unknown: number

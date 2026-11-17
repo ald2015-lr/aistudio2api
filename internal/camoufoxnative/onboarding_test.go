@@ -23,10 +23,25 @@ import (
 // display:none 为 display:none，display:contents 的元素自己 checkVisibility 为假，style 里的 visibility 往下继承）、
 // getComputedStyle（只有 display 与 visibility）、位置
 // （rect，没有时为零尺寸）、事件与一个只支持标签、类、属性（=、*=）、:disabled 与后代组合的选择器引擎；勾选框 click 时切换状态
-// 并派发 click、input、change。被点击的元素记在 clicks（data-name）
+// 并派发 click、input、change。被点击的元素记在 clicks（data-name）。文字是文本节点（nodeType 3、data）；textContent 与 innerText
+// 默认在子节点之间补一个空格，gluedText 为真时照真实浏览器：textContent 直接相连，innerText 只在块级元素（常见块级标签、style 里
+// display 为 block/flex/grid、flex 容器的子元素）前后换行，相邻的行内元素直接相连（Angular 去掉了模板里只含空白的文本节点时就是这样）
 const fakeOnboardingDOMLib = `
 let clicks = [];
 let currentHTML = null;
+let gluedText = false;
+const blockTags = new Set(['address', 'article', 'aside', 'blockquote', 'body', 'dd', 'div', 'dl', 'dt', 'fieldset', 'figure', 'footer', 'form',
+  'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'header', 'hr', 'html', 'li', 'main', 'nav', 'ol', 'p', 'pre', 'section', 'table', 'tbody', 'thead',
+  'tfoot', 'tr', 'td', 'th', 'ul', 'mat-dialog-container', 'mat-form-field']);
+class TextNode {
+  constructor(data) {
+    this.data = String(data);
+    this.parentElement = null;
+  }
+  get nodeType() { return 3; }
+  get textContent() { return this.data; }
+  get innerText() { return this.data; }
+}
 const parseCompound = text => {
   const parts = {tag: null, classes: [], attrs: [], pseudos: []};
   let index = 0;
@@ -81,12 +96,14 @@ class Element {
     this.childNodes = [];
     this.listeners = {};
     this.checked = localName === 'input' && this.attributes.has('checked');
-    for (const child of children || []) {
-      if (typeof child !== 'string') child.parentElement = this;
+    for (const raw of children || []) {
+      const child = typeof raw === 'string' ? new TextNode(raw) : raw;
+      child.parentElement = this;
       this.childNodes.push(child);
     }
   }
-  get children() { return this.childNodes.filter(node => typeof node !== 'string'); }
+  get nodeType() { return 1; }
+  get children() { return this.childNodes.filter(node => node.nodeType === 1); }
   getAttribute(name) { return this.attributes.has(name) ? this.attributes.get(name) : null; }
   hasAttribute(name) { return this.attributes.has(name); }
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
@@ -109,8 +126,24 @@ class Element {
     for (let node = this; node; node = node.parentElement) if (node.display === 'none') return false;
     return true;
   }
-  get textContent() { return this.childNodes.map(node => typeof node === 'string' ? node : node.textContent).join(' '); }
-  get innerText() { return this.checkVisibility() ? this.childNodes.map(node => typeof node === 'string' ? node : node.innerText).join(' ') : ''; }
+  get textContent() { return this.childNodes.map(node => node.textContent).join(gluedText ? '' : ' '); }
+  get blockLevel() {
+    if (blockTags.has(this.localName) || /display:\s*(block|flex|grid)/.test(this.getAttribute('style') || '')) return true;
+    return Boolean(this.parentElement && /display:\s*(flex|grid)/.test(this.parentElement.getAttribute('style') || ''));
+  }
+  get innerText() {
+    if (!this.checkVisibility()) return '';
+    if (!gluedText) return this.childNodes.map(node => node.innerText).join(' ');
+    let text = '';
+    let previousBlock = false;
+    this.childNodes.forEach((node, index) => {
+      const block = node.nodeType === 1 && node.blockLevel;
+      if (index > 0 && (block || previousBlock)) text += '\n';
+      text += node.innerText;
+      previousBlock = block;
+    });
+    return text;
+  }
   matches(selector) { return selector.split(',').some(item => matchComplex(this, item)); }
   closest(selector) {
     for (let node = this; node; node = node.parentElement) if (node.matches(selector)) return node;
@@ -159,12 +192,14 @@ const h = (tag, attributes, ...children) => new Element(tag, attributes, childre
 globalThis.getComputedStyle = element => ({display: element.display, visibility: element.visibility});
 // append 在页面已挂载后追加子元素（模拟 Angular 稍后才渲染出来），prepend 插到最前面
 const append = (parent, ...children) => {
-  for (const child of children) {
+  for (const raw of children) {
+    const child = typeof raw === 'string' ? new TextNode(raw) : raw;
     child.parentElement = parent;
     parent.childNodes.push(child);
   }
 };
-const prepend = (parent, child) => {
+const prepend = (parent, raw) => {
+  const child = typeof raw === 'string' ? new TextNode(raw) : raw;
   child.parentElement = parent;
   parent.childNodes.unshift(child);
 };

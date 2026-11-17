@@ -494,7 +494,7 @@ const zhCN = {
   'studioKey.expand': '展开',
   'studioKey.collapse': '收起',
   'studioKey.help':
-    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key；页面上没有 Key 时点页面自己的“Create API key”创建一个（账户还没有 Google Cloud 项目时先经页面新建一个项目，每次最多建一个项目、一个 Key）。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用、组织停用的账户跳过，需要验证账号（403）而暂停的账户照常获取、获取后仍暂停。列表只显示末四位，点“复制”才读取完整 Key。缺项目编号的 Key 可以点“补项目信息”（只读打开页面，从不创建 Key 或项目）；失败、跳过的记录可以删除（只是从列表里去掉，从不删除已保存的 Key）。',
+    '用账户已保存的登录态在后台打开 AI Studio 的 API Keys 页面，从页面自己的请求结果里读取 Key，并且只认与页面 Key 列表里某一行对得上的 Key（页面自己的公共 Key 一律不认；列表只给打码的 Key 时打开这一行的详情读完整 Key）；页面上没有 Key 时点页面自己的“Create API key”创建一个（账户还没有 Google Cloud 项目时先经页面新建一个项目，每次最多建一个项目、一个 Key）。账户逐个处理，每个之后等 {delay} 秒（设置页 STUDIO_KEY_DELAY），处理期间该账户不接新请求；未登录、停用、组织停用的账户跳过，需要验证账号（403）而暂停的账户照常获取、获取后仍暂停。列表只显示末四位，点“复制”才读取完整 Key。与其他账户相同的 Key、浏览器认出的页面公共 Key，以及旧版本保存、没有核对过的 Key 都作废，列在“失败”里，不能复制、不导出，点“全部获取”会重新获取。缺项目编号的 Key 可以点“补项目信息”（只读打开页面，从不创建 Key 或项目）；失败、跳过的记录可以删除（只是从列表里去掉，不删除账户的 Key；作废的 Key 不当作账户的，随记录删掉）。',
   'studioKey.empty': '还没有记录。在账户行点“获取 Key”，或选中账户后批量获取。',
   'studioKey.account': '账户',
   'studioKey.key': 'Key',
@@ -513,7 +513,7 @@ const zhCN = {
   'studioKey.queued': '已加入获取队列：{count} 个账户',
   'studioKey.fetchAll': '全部获取',
   'studioKey.fetchAllConfirm':
-    '把所有还没有 Key 的账户加入获取队列？会一个一个慢慢处理，号与号之间隔 {delay} 秒；没有 Key 的号会自动创建一个（没有项目时先新建一个项目）。中途可以点“停止”，之后再点“全部获取”只补没拿到的。',
+    '把所有还没有 Key 的账户（含 Key 已作废的）加入获取队列？会一个一个慢慢处理，号与号之间隔 {delay} 秒；没有 Key 的号会自动创建一个（没有项目时先新建一个项目）。中途可以点“停止”，之后再点“全部获取”只补没拿到的。',
   'studioKey.queuedAll': '已开始：所有还没有 Key 的账户逐个获取，进度看上方队列',
   'studioKey.allDone': '所有账户都已经有 Key，没有要获取的',
   'studioKey.stop': '停止',
@@ -541,6 +541,10 @@ const zhCN = {
   'studioKey.status.none': '没有 Key',
   'studioKey.status.failed': '失败',
   'studioKey.status.skipped': '已跳过',
+  'studioKey.status.invalid': '作废',
+  'studioKey.invalidCount': '（含作废 {count}）',
+  'studioKey.invalidHint':
+    '其中 {count} 条是作废的 Key：与其他账户保存的相同或是页面自己的公共 Key（不是这个账户的），或是旧版本保存、没有与页面的 Key 列表核对过的。它们不能复制、不会导出；点“全部获取”或“重试失败的”会重新获取，也可以清除。',
   'studioKey.fillMark': '（补项目信息）',
   'studioKey.projectIdTitle': '项目 ID：{id}',
   'studioKey.delete': '删除',
@@ -548,13 +552,14 @@ const zhCN = {
   'studioKey.clearTab': '清除这一栏的记录（{count}）',
   'studioKey.clearFailure': '清除失败信息',
   'studioKey.deleteRecordConfirm':
-    '删除 {label} 的这条“{tab}”记录？记录只是从列表里消失，不会删除任何已保存的 Key，也不会动 AI Studio 上的任何东西；之后再获取会重新生成记录。',
+    '删除 {label} 的这条“{tab}”记录？记录只是从列表里消失，不会删除账户的 Key（作废的 Key 不当作账户的，随记录删掉），也不会动 AI Studio 上的任何东西；之后再获取会重新生成记录。',
   'studioKey.clearTabConfirm':
-    '清除“{tab}”这一栏的全部 {count} 条记录（包括其他页的）？这些记录只是从列表里消失：已保存的 Key 从不删除，也不会动 AI Studio 上的任何东西；正在处理的账户不动。之后再获取会重新生成记录。',
+    '清除“{tab}”这一栏的全部 {count} 条记录（包括其他页的）？这些记录只是从列表里消失：账户的 Key 不删除（作废的 Key 不当作账户的，随记录删掉），也不会动 AI Studio 上的任何东西；正在处理的账户不动。之后再获取会重新生成记录。',
   'studioKey.clearFailureConfirm':
     '清除 {label} 最近一次没成功的信息？保存着的 Key 与项目信息原样保留，只是不再显示失败原因（这条仍在“成功”里）。',
-  'studioKey.cleared': '已清除：{parts}（保存着的 Key 都没动）',
+  'studioKey.cleared': '已清除：{parts}（账户的 Key 都没动）',
   'studioKey.clearedDeleted': '删掉 {count} 条记录',
+  'studioKey.clearedInvalid': '删掉 {count} 条作废的 Key 记录',
   'studioKey.clearedReset': '清掉 {count} 条失败信息',
   'studioKey.clearedJoin': '，',
   'studioKey.clearedNothing': '没有需要清除的记录',
@@ -1650,7 +1655,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.expand': 'Expand',
   'studioKey.collapse': 'Collapse',
   'studioKey.help':
-    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests; when the page has no key, it clicks the page\'s own "Create API key" to create one (if the account has no Google Cloud project yet, it first creates one through the page; at most one project and one key per run). Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Signed-out, disabled and organization-disabled accounts are skipped; accounts paused for account verification (403) are processed as usual and stay paused afterwards. Only the last 4 characters are listed; the full key is read only when you click Copy. Keys without a project number can be completed with "Fill project info" (read-only: never creates a key or project); failed and skipped records can be deleted (they only disappear from the list; saved keys are never deleted).',
+    'Opens the AI Studio API Keys page in the background with the account\'s saved sign-in and reads the key from the responses of the page\'s own requests, accepting only a key that matches a row of the page\'s key list (the page\'s own public key is never accepted; when the list only shows masked keys, that row\'s details are opened to read the full key); when the page has no key, it clicks the page\'s own "Create API key" to create one (if the account has no Google Cloud project yet, it first creates one through the page; at most one project and one key per run). Accounts are processed one at a time with {delay}s between them (STUDIO_KEY_DELAY in Settings); the account takes no new requests while it is processed. Signed-out, disabled and organization-disabled accounts are skipped; accounts paused for account verification (403) are processed as usual and stay paused afterwards. Only the last 4 characters are listed; the full key is read only when you click Copy. A key shared with other accounts, the public key of the page recognized by the browser, and a key saved by an older version without being checked are invalid: they are listed under "Failed", cannot be copied or exported, and "Get all" fetches them again. Keys without a project number can be completed with "Fill project info" (read-only: never creates a key or project); failed and skipped records can be deleted (they only disappear from the list; the account\'s key is not deleted, but an invalid key is not taken as the account\'s and goes with its record).',
   'studioKey.empty': 'No records yet. Click "Get key" on an account row, or select accounts and get keys in bulk.',
   'studioKey.account': 'Account',
   'studioKey.key': 'Key',
@@ -1669,7 +1674,7 @@ const en: Record<TranslationKey, string> = {
   'studioKey.queued': 'Queued {count} account(s)',
   'studioKey.fetchAll': 'Get all',
   'studioKey.fetchAllConfirm':
-    'Queue every account that has no key yet? They are processed one by one, {delay} seconds apart; an account without a key gets one created (and a project first if it has none). You can click "Stop" at any time; clicking "Get all" again only fills in the missing ones.',
+    'Queue every account that has no key yet (including invalid keys)? They are processed one by one, {delay} seconds apart; an account without a key gets one created (and a project first if it has none). You can click "Stop" at any time; clicking "Get all" again only fills in the missing ones.',
   'studioKey.queuedAll': 'Started: every account without a key is fetched one by one; see the queue above',
   'studioKey.allDone': 'Every account already has a key; nothing to fetch',
   'studioKey.stop': 'Stop',
@@ -1697,6 +1702,10 @@ const en: Record<TranslationKey, string> = {
   'studioKey.status.none': 'No key',
   'studioKey.status.failed': 'Failed',
   'studioKey.status.skipped': 'Skipped',
+  'studioKey.status.invalid': 'Invalid',
+  'studioKey.invalidCount': ' (incl. {count} invalid)',
+  'studioKey.invalidHint':
+    '{count} of these are invalid keys: shared with other accounts or the page\'s own public key (not this account\'s key), or saved by an older version without being checked against the page\'s key list. They cannot be copied and are not exported; "Get all" or "Retry failed" fetches them again, or you can clear them.',
   'studioKey.fillMark': ' (filling project info)',
   'studioKey.projectIdTitle': 'Project ID: {id}',
   'studioKey.delete': 'Delete',
@@ -1704,13 +1713,14 @@ const en: Record<TranslationKey, string> = {
   'studioKey.clearTab': 'Clear records in this tab ({count})',
   'studioKey.clearFailure': 'Clear failure info',
   'studioKey.deleteRecordConfirm':
-    'Delete the "{tab}" record of {label}? The record only disappears from the list: no saved key is ever deleted and nothing on AI Studio is touched. Fetching again creates a new record.',
+    'Delete the "{tab}" record of {label}? The record only disappears from the list: the account\'s key is not deleted (an invalid key is not taken as the account\'s and goes with the record) and nothing on AI Studio is touched. Fetching again creates a new record.',
   'studioKey.clearTabConfirm':
-    'Clear all {count} records in the "{tab}" tab (including other pages)? They only disappear from the list: saved keys are never deleted, nothing on AI Studio is touched, and the account in progress is left alone. Fetching again creates new records.',
+    'Clear all {count} records in the "{tab}" tab (including other pages)? They only disappear from the list: the accounts\' keys are not deleted (invalid keys are not taken as the accounts\' and go with their records), nothing on AI Studio is touched, and the account in progress is left alone. Fetching again creates new records.',
   'studioKey.clearFailureConfirm':
     'Clear the failure info of {label}\'s latest attempt? The saved key and project info stay as they are; only the failure reason is no longer shown (the record stays under "OK").',
-  'studioKey.cleared': 'Cleared: {parts} (no saved key was touched)',
+  'studioKey.cleared': "Cleared: {parts} (no account's key was touched)",
   'studioKey.clearedDeleted': '{count} record(s) deleted',
+  'studioKey.clearedInvalid': '{count} invalid key record(s) deleted',
   'studioKey.clearedReset': 'failure info cleared on {count} record(s)',
   'studioKey.clearedJoin': ', ',
   'studioKey.clearedNothing': 'Nothing to clear',

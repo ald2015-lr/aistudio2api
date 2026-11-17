@@ -30,28 +30,76 @@ import (
 // studioKeyDetailsSettle 为详情对话框出现后等项目编号显示出来的时间（测试里不改；对话框里没有编号时最多多等这么久）
 var studioKeyDetailsSettle = 3 * time.Second
 
-// studioKeyRun 为一次获取里读响应、补项目信息要用到的状态
+// studioKeyRun 为一次获取里读响应、核对 Key、补项目信息要用到的状态
 type studioKeyRun struct {
 	session   *loginSession
 	collector string
 	listener  *studioKeyListener
 	flow      *studioKeyFlow
 	options   StudioKeyOptions
-	keys      []StudioKeyCandidate
+	// keys 为页面接口 JSON 类正文里的候选 Key（含拒绝集合里的；选用前都要核对，见 chooseStudioKeyRow）
+	keys []StudioKeyCandidate
+	// denied 为这次运行的拒绝集合（页面自己的公共 Key 等，见 studio_key_confirm.go），deniedOrder 为进集合的顺序（诊断用）
+	denied      map[string]studioKeyDenySource
+	deniedOrder []string
+	// exclude、excludeLast4、excludeFingerprints 为 StudioKeyOptions 里排除的 Key、它们的末四位与只剩指纹的（见 loadExclusions）
+	exclude             map[string]bool
+	excludeLast4        map[string]bool
+	excludeFingerprints map[string]bool
+	// before 为开始创建之前的状态（之后只认新出现的 Key），没有创建时为空
+	before *studioKeyBefore
+	// list 为最近一次读到的 Key 列表（listed 表示读到过）
+	list   studioKeyListView
+	listed bool
+	// diag 为带像 Key 字符串的响应（诊断用）；responses 为读过正文的响应条数，diagDropped 为超出上限没列出的条数
+	diag        []studioKeyDiag
+	responses   int
+	diagDropped int
 	// notes 为补项目信息的步骤记录（打码、截短，接在 StudioKeyResult.Steps 后面）
 	notes []string
-	// detailsOpened 表示这次已经点过一次 Key 的名称（打开详情最多一次）
+	// detailsOpened 表示这次已经点过一次 Key 的名称（打开详情最多一次）；details 为那次读到的内容
 	detailsOpened bool
+	details       *studioKeyDetailsOutcome
+	// createdClosed 表示这次已经关过一次创建结果对话框；dialogMismatch 表示已记过创建结果对话框里的 Key 与新行对不上；
+	// shownKeys 为创建结果对话框里显示过的新的完整 Key（机密：只在内存里，最多 4 条；对话框关掉之后还要拿它与新出现的行核对），
+	// shownNoted 表示已记过对话框里的新 Key 还没有印证
+	createdClosed  bool
+	dialogMismatch bool
+	shownKeys      []string
+	shownNoted     bool
+	// chosen 为最后选用的 Key（机密：只在内存里，诊断里标出它的末四位）
+	chosen string
 }
 
-// drain 读出新到的响应正文，合并其中的 Key 与项目
+// drain 读出新到的响应正文：页面文档、脚本、样式里像 Key 的字符串进拒绝集合；页面接口的 JSON 类正文里整段是 Key 的字符串记作候选，
+// 项目也只从这类正文里取（见 studioKeyBodyKind）
 func (run *studioKeyRun) drain(ctx context.Context) {
-	for _, requestID := range run.listener.take() {
-		body, ok := run.session.client.studioKeyResponseBody(ctx, run.collector, requestID)
-		if ok {
-			run.keys = mergeStudioKeys(run.keys, ExtractStudioKeys(body))
+	responses, denied := run.listener.take()
+	for _, item := range denied {
+		run.deny(item.key, item.source)
+	}
+	for _, response := range responses {
+		body, ok := run.session.client.studioKeyResponseBody(ctx, run.collector, response.id)
+		if !ok {
+			continue
+		}
+		kind := studioKeyBodyKind(response, body)
+		var found []string
+		if studioKeyScanPattern.Match(body) {
+			found = scanStudioKeyStrings(string(body))
+		}
+		var candidates []StudioKeyCandidate
+		switch kind {
+		case studioKeyBodyPage:
+			for _, key := range found {
+				run.deny(key, studioKeyDenySource{where: "页面文档或脚本（" + response.host + "/" + response.name + "）", strong: true})
+			}
+		case studioKeyBodyJSON:
+			candidates = ExtractStudioKeys(body)
+			run.keys = mergeStudioKeys(run.keys, candidates)
 			run.flow.noteProjects(ExtractStudioProjects(body))
 		}
+		run.noteResponse(response, kind, found, candidates)
 	}
 }
 
@@ -72,9 +120,11 @@ func (run *studioKeyRun) candidate(key string) StudioKeyCandidate {
 	return StudioKeyCandidate{Key: key}
 }
 
-// finish 整理结果；没有项目编号时按顺序补（见文件开头），有编号、没有显示名时只读地补显示名（completeDisplay）；找不到不算失败
+// finish 整理结果；没有项目编号时按顺序补（见文件开头），有编号、没有显示名时只读地补显示名（completeDisplay）；找不到不算失败。
+// 创建过或打开过详情时步骤里附上诊断（只有末四位）
 func (run *studioKeyRun) finish(ctx context.Context, chosen StudioKeyCandidate) StudioKeyResult {
-	result := run.flow.result(chosen, len(run.keys))
+	run.chosen = chosen.Key
+	result := run.flow.result(chosen, len(run.list.Rows))
 	switch {
 	case result.ProjectNumber == "":
 		run.completeProject(ctx, &result)
@@ -82,6 +132,12 @@ func (run *studioKeyRun) finish(ctx context.Context, chosen StudioKeyCandidate) 
 		run.completeDisplay(ctx, &result)
 	}
 	result.Steps = append(result.Steps, run.notes...)
+	result.ClientFingerprints = run.clientFingerprints()
+	if result.Created || run.detailsOpened {
+		if diag := run.diagnostics(); diag != "" {
+			result.Steps = append(result.Steps, "诊断："+diag)
+		}
+	}
 	return result
 }
 
@@ -132,8 +188,15 @@ func (run *studioKeyRun) knownDisplay(ctx context.Context, result *StudioKeyResu
 	return result.ProjectDisplay != ""
 }
 
-// completeProject 依次与响应对照、读 Key 列表里这一行、打开这条 Key 的详情对话框，补上项目编号（以及显示名与项目 ID）
+// completeProject 依次与响应对照、读 Key 列表里这一行、打开这条 Key 的详情对话框，补上项目编号（以及显示名与项目 ID）。
+// 为读完整 Key 已经打开过详情时先用那次读到的（详情按标签写着这条 Key 的项目，最可靠），不再点第二次
 func (run *studioKeyRun) completeProject(ctx context.Context, result *StudioKeyResult) {
+	if run.details != nil {
+		run.applyDetails(result, *run.details)
+		if result.ProjectNumber != "" {
+			return
+		}
+	}
 	if how, ok := run.correlate(result, false); ok {
 		run.note("项目信息：按" + how + "对上响应里的项目")
 		return
@@ -155,7 +218,9 @@ func (run *studioKeyRun) completeProject(ctx context.Context, result *StudioKeyR
 			return
 		}
 	}
-	run.openDetails(ctx, result, last4)
+	if run.details == nil {
+		run.openDetails(ctx, result, last4)
+	}
 	if result.ProjectNumber == "" {
 		run.note("项目信息：没有找到项目编号")
 	}
@@ -466,20 +531,45 @@ func studioKeyDetailsProject(view studioKeyDetailsView) StudioProject {
 
 var studioProjectDigitsOnly = regexp.MustCompile(`^[0-9]{6,}$`)
 
+// studioKeyDetailsOutcome 为打开一次 Key 详情读到的内容：key 为末四位对上、不在拒绝集合里的完整 Key（机密，只在内存里；keyFrom 为
+// 它的来处），view 为按标签读到的项目各项
+type studioKeyDetailsOutcome struct {
+	clicked bool
+	shown   bool
+	key     string
+	keyFrom string
+	view    studioKeyDetailsView
+}
+
 // openDetails 打开这条 Key 的详情对话框读项目（每次运行最多点一次），读完用对话框自己的关闭类按钮关掉
 func (run *studioKeyRun) openDetails(ctx context.Context, result *StudioKeyResult, last4 string) {
+	if run.details == nil {
+		if run.detailsOpened {
+			return
+		}
+		outcome := run.openRowDetails(ctx, last4, result.Key)
+		run.details = &outcome
+	}
+	run.applyDetails(result, *run.details)
+}
+
+// openRowDetails 用真实指针点这一行自己的 Key 名称打开详情（每次运行最多一次；页面上有对话框或下拉列表挡着时不点；删除、复制、
+// 重新生成、编辑、限制、更多操作这类控件与行里的复制图标一律不点），轮询读：known 为空时读完整 Key（点开之后新到的响应里末四位相同、
+// 不在拒绝集合里的那条，或详情对话框里末四位相同的完整 Key），以及按标签写着的项目各项；读完用对话框自己的关闭类按钮关掉
+func (run *studioKeyRun) openRowDetails(ctx context.Context, last4 string, known string) studioKeyDetailsOutcome {
+	var outcome studioKeyDetailsOutcome
 	if run.detailsOpened {
-		return
+		return outcome
 	}
 	session := run.session
 	page, inspected := session.studioKeyInspect(ctx)
 	switch {
 	case !inspected:
 		run.note("读不到页面状态，没有打开 Key 详情")
-		return
+		return outcome
 	case page.Dialog != nil || len(page.Options) > 0:
 		run.note("页面上有对话框挡着，没有打开 Key 详情")
-		return
+		return outcome
 	}
 	run.detailsOpened = true
 	before := page.Path
@@ -493,22 +583,33 @@ func (run *studioKeyRun) openDetails(ctx context.Context, result *StudioKeyResul
 		} else {
 			run.note("读取 Key 名称的位置失败，没有打开详情")
 		}
-		return
+		return outcome
 	}
+	outcome.clicked = true
 	run.note("打开 Key 详情")
 	var (
 		view     studioKeyDetailsView
 		shownAt  time.Time
 		deadline = time.Now().Add(studioKeyTiming.noDialog)
-		// reply 为点开之后新到的响应里对上的项目：只认强依据（Key 的记录、项目 ID、显示名），不认“唯一的项目”；先记下，读完详情再定
-		reply    StudioProject
-		replyHow string
 		replied  bool
 	)
 	for ctx.Err() == nil {
 		run.drain(ctx)
-		if !replied {
-			reply, replyHow, replied = run.match(*result, true)
+		key := known
+		if key == "" {
+			if outcome.key == "" {
+				if found, ok := run.rowKeyFromResponses(last4); ok {
+					outcome.key, outcome.keyFrom = found, "点开详情后的响应"
+				} else if found, err := session.client.evaluateString(ctx, session.contextID, studioKeyDetailsKeyExpression(last4, before)); err == nil &&
+					IsStudioKey(found) && StudioKeyLast4(found) == last4 && !run.isDenied(found) {
+					outcome.key, outcome.keyFrom = found, "详情对话框"
+				}
+			}
+			key = outcome.key
+		}
+		if key != "" && !replied {
+			// 点开之后新到的响应里对上的项目：只认强依据（Key 的记录、项目 ID、显示名）；只用来决定何时不必再等，采用与否见 applyDetails
+			_, _, replied = run.match(StudioKeyResult{Key: key}, true)
 		}
 		if encoded, err := session.client.evaluateString(ctx, session.contextID, studioKeyDetailsExpression(before)); err == nil && encoded != "" {
 			var current studioKeyDetailsView
@@ -520,7 +621,7 @@ func (run *studioKeyRun) openDetails(ctx context.Context, result *StudioKeyResul
 		if (view.Dialog || view.Page) && shownAt.IsZero() {
 			shownAt = now
 		}
-		if studioKeyDetailsProject(view).Number != "" || replied && !shownAt.IsZero() {
+		if key != "" && (studioKeyDetailsProject(view).Number != "" || replied && !shownAt.IsZero()) {
 			break
 		}
 		if !shownAt.IsZero() && now.Sub(shownAt) >= studioKeyDetailsSettle || shownAt.IsZero() && now.After(deadline) {
@@ -530,12 +631,34 @@ func (run *studioKeyRun) openDetails(ctx context.Context, result *StudioKeyResul
 			break
 		}
 	}
-	details := studioKeyDetailsProject(view)
-	found := details.Number != "" || details.Display != "" || details.ID != ""
-	switch {
-	case shownAt.IsZero():
+	outcome.view, outcome.shown = view, !shownAt.IsZero()
+	if !outcome.shown {
 		run.note("点了 Key 名称，没有出现详情")
-	case !found && !replied:
+	}
+	if !view.Dialog {
+		return outcome
+	}
+	closed, err := session.pointerClick(ctx, session.contextID, studioKeyDetailsCloseExpression)
+	switch {
+	case closed && err == nil:
+		run.note("关闭 Key 详情")
+	case closed:
+		run.note("关闭 Key 详情时出错")
+	default:
+		run.note("Key 详情里没有找到关闭按钮")
+	}
+	return outcome
+}
+
+// applyDetails 用详情里读到的项目补上结果的项目信息：与点开之后的响应对照（只认强依据），按标签写着的编号优先
+func (run *studioKeyRun) applyDetails(result *StudioKeyResult, outcome studioKeyDetailsOutcome) {
+	if !outcome.shown {
+		return
+	}
+	reply, replyHow, replied := run.match(*result, true)
+	details := studioKeyDetailsProject(outcome.view)
+	found := details.Number != "" || details.Display != "" || details.ID != ""
+	if !found && !replied {
 		run.note("Key 详情里没有认出项目名与项目编号")
 	}
 	switch {
@@ -575,18 +698,6 @@ func (run *studioKeyRun) openDetails(ctx context.Context, result *StudioKeyResul
 			}
 		}
 	}
-	if !view.Dialog {
-		return
-	}
-	closed, err := session.pointerClick(ctx, session.contextID, studioKeyDetailsCloseExpression)
-	switch {
-	case closed && err == nil:
-		run.note("关闭 Key 详情")
-	case closed:
-		run.note("关闭 Key 详情时出错")
-	default:
-		run.note("Key 详情里没有找到关闭按钮")
-	}
 }
 
 // 详情对话框里各项的标签（英文、简体中文、繁体中文、日文、韩文；写成 Go 与 JS 都能编译的子集，两边都不区分大小写，前后按整段匹配；
@@ -625,43 +736,26 @@ func studioKeyFieldKind(text string) string {
 }
 
 // studioKeyRowHelpers 为找 Key 列表里这一行的函数（依赖 pageDOMHelpers、studioKeyDOMHelpers；外层要有参数 last4）。
-// 打码的 Key 写作“…E6io”“...E6io”“****E6io”（或完整的 Key），只在页面里比较，原文不交给 Go
-var studioKeyRowHelpers = `
-  const keyChar = '[0-9A-Za-z_-]';
-  const maskPrefix = '(?:\\.{3}|…|\\*{2,}|•{2,}|\\bAIza[0-9A-Za-z_-]{31}|\\bAQ\\.[0-9A-Za-z_-]{16,})';
-  const ownKey = new RegExp(maskPrefix + last4 + '(?!' + keyChar + ')');
-  const anyKey = new RegExp(maskPrefix + '(' + keyChar + '{4})(?!' + keyChar + ')', 'g');
-  const keysIn = element => new Set([...textOf(element).matchAll(anyKey)].map(match => match[1])).size;
-  const rowSelector = 'tr, [role=row], mat-row, .mat-mdc-row, li, [role=listitem], mat-list-item, .mat-mdc-list-item';
-  const cellSelector = 'td, th, [role=cell], [role=gridcell], [role=rowheader], mat-cell, .mat-mdc-cell';
-  const keyArea = () => document.querySelector('main, [role=main]') || document.body;
-  // studioKeyRow 找主区域（不在对话框与弹层里）显示着这条 Key 的那一行：表格行、列表项（行里只有这一条 Key）；没有这类结构时
-  // 从显示 Key 的元素往上，取只含这一条 Key 的最外层（最多 6 层，不到主区域本身）。对得上的行不止一个时 row 为 null（不猜）
+// 打码的 Key 写作“…TST1”“...TST1”“****TST1”（或完整的 Key），只在页面里比较，原文不交给 Go
+var studioKeyRowHelpers = studioKeyListHelpers + `
+  // studioKeyRow 找主区域（不在对话框与弹层里）显示着这条 Key 的那一行（见 rowOf）。对得上的行不止一个时 row 为 null（不猜）；
+  // leaves 为显示着这条 Key 的最内层元素
   const studioKeyRow = () => {
     const root = keyArea();
-    if (!root) return {count: 0, row: null, leaf: null};
-    const holders = [...root.querySelectorAll('*')]
-      .filter(element => (element.textContent || '').includes(last4))
-      .filter(element => outsideOverlays(element) && visible(element) && ownKey.test(textOf(element)));
-    const leaves = holders.filter(element => !holders.some(other => other !== element && within(other, element)));
+    if (!root) return {count: 0, row: null, leaf: null, leaves: []};
+    const items = keyItems(root);
+    const leaves = items.filter(item => item.keys.some(key => key.l === last4)).map(item => item.leaf);
     const rows = [];
     for (const leaf of leaves) {
-      let row = leaf.closest(rowSelector);
-      if (row && (!within(row, root) || keysIn(row) !== 1)) row = null;
-      if (!row) {
-        row = leaf;
-        for (let depth = 0; depth < 6; depth++) {
-          const parent = row.parentElement;
-          if (!parent || parent === root || !within(parent, root) || keysIn(parent) !== 1) break;
-          row = parent;
-        }
-      }
+      const row = rowOf(leaf, root, items);
       if (!rows.includes(row)) rows.push(row);
     }
-    return {count: rows.length, row: rows.length === 1 ? rows[0] : null, leaf: rows.length === 1 ? leaves[0] : null};
+    return {count: rows.length, row: rows.length === 1 ? rows[0] : null, leaf: rows.length === 1 ? leaves[0] : null, leaves};
   };
+  // showsKey 判断 element 里有显示着这条 Key 的元素
+  const showsKey = (element, leaves) => leaves.some(leaf => within(leaf, element));
   // rowCells 为这一行的各格（表格的格；不是表格时为有文字的最内层元素），表头数与格数一致时带上表头
-  const rowCells = row => {
+  const rowCells = (row, leaves) => {
     let cells = [...row.querySelectorAll(cellSelector)].filter(visible).filter(cell => {
       const outer = cell.parentElement && cell.parentElement.closest(cellSelector);
       return !(outer && within(outer, row));
@@ -677,7 +771,7 @@ var studioKeyRowHelpers = `
       if (!cells.length) cells = [row];
     }
     return cells.slice(0, 12).map((cell, index) => ({t: short(plainText(cell), 120), h: headers[index] ? short(plainText(headers[index]), 40) : '',
-      k: ownKey.test(textOf(cell))}));
+      k: showsKey(cell, leaves)}));
   };
 `
 
@@ -685,7 +779,7 @@ var studioKeyRowHelpers = `
 func studioKeyRowExpression(last4 string) string {
 	return `((last4) => {` + pageDOMHelpers + studioKeyDOMHelpers + studioKeyRowHelpers + `
   const found = studioKeyRow();
-  return JSON.stringify({count: found.count, cells: found.row ? rowCells(found.row) : []});
+  return JSON.stringify({count: found.count, cells: found.row ? rowCells(found.row, found.leaves) : []});
 })(` + jsString(last4) + `)`
 }
 
@@ -707,7 +801,7 @@ func studioKeyDetailsTargetExpression(last4 string) string {
     });
   let keyCell = found.leaf.closest(cellSelector);
   if (!keyCell && found.leaf.parentElement !== found.row) keyCell = found.leaf.parentElement;
-  return controls.find(element => ownKey.test(textOf(element))) ||
+  return controls.find(element => showsKey(element, found.leaves)) ||
     controls.find(element => keyCell && within(element, keyCell)) || null;
 })(` + jsString(last4) + `)`
 }

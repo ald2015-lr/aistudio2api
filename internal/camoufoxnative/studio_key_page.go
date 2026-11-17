@@ -77,6 +77,37 @@ var studioKeyDOMHelpers = `
   });
   const dialogSelect = dialog => [...dialog.querySelectorAll(selectSelector)].filter(visible)[0] || null;
   const inputValue = element => typeof element.value === 'string' ? element.value : (element.getAttribute('value') || '');
+  // textRuns 为 scope 里可见的文字：每个文本节点一段（按文档顺序；script、style、template、noscript 里的不算），可见输入框的值各成一段。
+  // 元素之间一律当作分隔：真实浏览器里相邻的行内元素之间没有空白时（Angular 去掉了模板里只含空白的文本节点）innerText 会把它们连成一串，
+  // 如 Key 后面紧跟着复制图标的 content_copy、前面紧挨着“API key”标签，找 Key 不能对整段 innerText 用正则
+  const textRuns = scope => {
+    const runs = [];
+    const shown = new Map();
+    const isShown = element => {
+      if (!shown.has(element)) shown.set(element, visible(element));
+      return shown.get(element);
+    };
+    const walk = element => {
+      for (const node of element.childNodes) {
+        if (runs.length >= 5000) return;
+        if (node.nodeType === 3) {
+          const text = clean(node.data);
+          if (text && isShown(element)) runs.push({text, element});
+        } else if (node.nodeType === 1 && !node.matches('script, style, template, noscript')) {
+          if (!node.matches('input, textarea')) {
+            walk(node);
+            continue;
+          }
+          const value = clean(inputValue(node));
+          if (value && isShown(node)) runs.push({text: value, element: node});
+        }
+      }
+    };
+    walk(scope);
+    return runs;
+  };
+  // ownTexts 为元素自己的文本节点（不含子元素里的），每个一段
+  const ownTexts = element => [...element.childNodes].filter(node => node.nodeType === 3).map(node => clean(node.data)).filter(Boolean);
   const fieldLabel = element => {
     const field = element.closest('mat-form-field, .mat-mdc-form-field');
     return field ? textOf(field.querySelector('mat-label, label')) : '';

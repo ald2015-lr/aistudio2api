@@ -10,7 +10,9 @@ import (
 
 // AI Studio API Key（账户在 AI Studio API Keys 页面上的 Key）：管理页按账户获取并记录 Key、项目名、项目编号、显示名与项目 ID，
 // 只提供复制，不做转发。列表接口只返回 Key 末四位；完整 Key 只经 POST /api/studio-keys/{id}/reveal 与 export 返回（需要管理令牌，
-// Cache-Control: no-store）。POST /api/studio-keys/clear 清除记录：没有 Key 的记录删掉，保存着 Key 的只清掉失败或跳过的信息，从不删除 Key
+// Cache-Control: no-store）。POST /api/studio-keys/clear 清除记录：没有 Key 的记录删掉，保存着 Key 的只清掉失败或跳过的信息，不删除账户的 Key；
+// 例外是作废的 Key（与其他账户保存的相同，多半是页面自己的公共 Key，不是这个账户的）：连同记录删掉。作废的 Key 在列表里是 invalid、
+// 不算有 Key，reveal 返回 409 studio_key_invalid，export 不含它
 
 // StudioKeyClearLimit 为一次清除最多的账户数
 const StudioKeyClearLimit = 5000
@@ -19,7 +21,8 @@ const StudioKeyClearLimit = 5000
 type StudioKeyRecord struct {
 	AccountID string `json:"account_id"`
 	Label     string `json:"label,omitempty"`
-	// Status 为最近一次获取的结论：ok（读到 Key）、none（页面上没有 Key 也不能创建）、failed、skipped（账户未登录、停用等）
+	// Status 为最近一次获取的结论：ok（读到 Key）、none（页面上没有 Key 也不能创建）、failed、skipped（账户未登录、停用等），
+	// 或 invalid（保存着的 Key 与其他账户相同、已作废：has_key 为假，不给末四位与项目，Reason 写明原因）
 	Status string `json:"status"`
 	Reason string `json:"reason,omitempty"`
 	// HasKey 表示保存着 Key（最近一次失败时仍保留上一次读到的 Key）；Last4 为它的末四位；
@@ -78,6 +81,8 @@ type StudioKeyClearCounts struct {
 	Reset int `json:"reset"`
 	// Busy 为正在处理、没有动的账户数
 	Busy int `json:"busy"`
+	// Invalid 为删掉的作废记录数（保存着作废的 Key：与其他账户相同，不是这个账户的 Key）
+	Invalid int `json:"invalid"`
 	// Unknown 为不认识的账户数
 	Unknown int `json:"unknown"`
 	// Unchanged 为不用清的账户数（没有记录，或保存着 Key 且本来就是成功）
@@ -115,7 +120,8 @@ type StudioKeyService interface {
 	// StopStudioKeys 清空排队中的账户（正在处理的那个照常做完）
 	StopStudioKeys(context.Context) (StudioKeyStatus, error)
 	ExportStudioKeys(context.Context) (StudioKeyExport, error)
-	// ClearStudioKeys 清除账户的记录：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息（从不删除 Key）；正在处理的账户不动
+	// ClearStudioKeys 清除账户的记录：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息（不删除账户的 Key；作废的 Key 连同记录删掉）；
+	// 正在处理的账户不动
 	ClearStudioKeys(context.Context, StudioKeyClearInput) (StudioKeyClearResult, error)
 }
 

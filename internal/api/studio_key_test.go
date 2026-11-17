@@ -204,3 +204,48 @@ func TestStudioKeyFetchFillRoute(t *testing.T) {
 		t.Fatalf("不合法的请求不应交给管理服务: %+v", admin.inputs)
 	}
 }
+
+// studioKeyInvalidAdmin 为列表里有作废记录、reveal 返回 409 的管理服务替身
+type studioKeyInvalidAdmin struct {
+	studioKeyAdmin
+}
+
+type studioKeyConflict struct{}
+
+func (studioKeyConflict) Error() string {
+	return "这条 Key 与另外 2 个账户保存的相同，已作废"
+}
+func (studioKeyConflict) HTTPStatus() int   { return http.StatusConflict }
+func (studioKeyConflict) ErrorCode() string { return "studio_key_invalid" }
+
+func (admin *studioKeyInvalidAdmin) StudioKeys(context.Context) (StudioKeyStatus, error) {
+	return StudioKeyStatus{Queue: []string{}, Records: []StudioKeyRecord{{AccountID: "a@example.com", Status: "invalid", Reason: "已作废"}}}, nil
+}
+
+func (admin *studioKeyInvalidAdmin) RevealStudioKey(context.Context, string) (StudioKeySecret, error) {
+	return StudioKeySecret{}, studioKeyConflict{}
+}
+
+func (admin *studioKeyInvalidAdmin) ClearStudioKeys(_ context.Context, input StudioKeyClearInput) (StudioKeyClearResult, error) {
+	status, _ := admin.StudioKeys(context.Background())
+	return StudioKeyClearResult{StudioKeyStatus: status, Cleared: StudioKeyClearCounts{Invalid: len(input.AccountIDs)}}, nil
+}
+
+// TestStudioKeyInvalidRoute 作废的记录：列表里 status 为 invalid、has_key 为 false、没有末四位；reveal 原样返回 409 studio_key_invalid；
+// 清除的计数带 invalid
+func TestStudioKeyInvalidRoute(t *testing.T) {
+	handler := NewHandler(modelListService{}, Config{APIKey: "sk-test", AdminToken: testAdminToken, Admin: &studioKeyInvalidAdmin{}})
+	list := studioKeyRequest(handler, http.MethodGet, "/api/studio-keys", "", true)
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), `"status":"invalid"`) || !strings.Contains(list.Body.String(), `"has_key":false`) ||
+		strings.Contains(list.Body.String(), "last4") {
+		t.Fatalf("列表 status=%d body=%s", list.Code, list.Body.String())
+	}
+	reveal := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/a@example.com/reveal", "", true)
+	if reveal.Code != http.StatusConflict || !strings.Contains(reveal.Body.String(), "studio_key_invalid") {
+		t.Fatalf("reveal status=%d body=%s", reveal.Code, reveal.Body.String())
+	}
+	clear := studioKeyRequest(handler, http.MethodPost, "/api/studio-keys/clear", `{"account_ids":["a@example.com"]}`, true)
+	if clear.Code != http.StatusOK || !strings.Contains(clear.Body.String(), `"invalid":1`) {
+		t.Fatalf("清除 status=%d body=%s", clear.Code, clear.Body.String())
+	}
+}

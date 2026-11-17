@@ -11,8 +11,10 @@ import UiPager from './UiPager.vue'
 // AI Studio API Key：显示获取队列与每个账户的记录（Key 只显示末四位），复制按钮按需读取完整 Key、不在页面里保存。
 // 获取由账户行的“获取 Key”按钮或选中账户后的批量按钮触发（见 AccountsPanel），这里只轮询状态。
 // 记录按成功、失败、跳过分标签列出，各自按最近一次尝试从新到旧排序、每页 10 条：账户多时失败原因不再整列铺开。
-// 失败、跳过的记录可以逐条删除或整栏清除，成功标签里保留着上次 Key 的失败信息可以清掉（服务端从不删除已保存的 Key）；
-// 缺项目编号的 Key 可以“补项目信息”（服务端只读打开页面，不创建 Key 与项目）
+// 失败、跳过的记录可以逐条删除或整栏清除，成功标签里保留着上次 Key 的失败信息可以清掉（服务端不删除账户的 Key；作废的 Key 不是
+// 账户的，随记录删掉）；缺项目编号的 Key 可以“补项目信息”（服务端只读打开页面，不创建 Key 与项目）。
+// 作废的 Key（与其他账户相同，多半是旧版本误记的页面公共 Key）由服务端列为 invalid、has_key 为假：进“失败”标签，不能复制、不导出
+
 const { t, tf, locale } = useI18n()
 const emit = defineEmits<{ notice: [message: string, kind: 'success' | 'error'] }>()
 
@@ -23,7 +25,8 @@ const TAB_STORAGE_KEY = 'aistudio2api_studio_keys_tab'
 // CLEAR_LIMIT 为一次清除请求最多的账户数（与服务端一致），更多时分批
 const CLEAR_LIMIT = 5000
 
-// KeyTab：ok 已有 Key（最近一次失败但保留着上次的 Key 也算）；failed 没有 Key 且失败或页面上没有 Key；skipped 没有 Key 且被跳过
+// KeyTab：ok 已有 Key（最近一次失败但保留着上次的 Key 也算）；failed 没有 Key 且失败、页面上没有 Key，或 Key 已作废（invalid）；
+// skipped 没有 Key 且被跳过
 type KeyTab = 'ok' | 'failed' | 'skipped'
 const TABS: readonly KeyTab[] = ['ok', 'failed', 'skipped']
 const tabKeys: Record<KeyTab, TranslationKey> = {
@@ -54,12 +57,14 @@ const statusKeys: Record<string, TranslationKey> = {
   none: 'studioKey.status.none',
   failed: 'studioKey.status.failed',
   skipped: 'studioKey.status.skipped',
+  invalid: 'studioKey.status.invalid',
 }
 const statusClass: Record<string, string> = {
   ok: 'text-green-400',
   none: 'text-yellow-400',
   failed: 'text-red-400',
   skipped: 'text-gray-400',
+  invalid: 'text-orange-400',
 }
 
 const records = computed<StudioKeyRecord[]>(() => status.value?.records ?? [])
@@ -98,6 +103,10 @@ const grouped = computed<Record<KeyTab, StudioKeyRecord[]>>(() => {
   return groups
 })
 const withKey = computed(() => grouped.value.ok.length)
+// invalidCount 为“失败”标签里 Key 已作废的记录数
+const invalidCount = computed(
+  () => grouped.value.failed.filter((record) => record.status === 'invalid').length,
+)
 // missingProject 为保存着 Key 却没有项目编号的记录（“补项目信息”的对象）
 const missingProject = computed(() => grouped.value.ok.filter((record) => !record.project_number))
 
@@ -299,7 +308,8 @@ async function copyFailedEmails(): Promise<void> {
   )
 }
 
-// clearRecords 清除这些账户的记录（服务端：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息，从不删除 Key；正在处理的不动），
+// clearRecords 清除这些账户的记录（服务端：没有 Key 的删掉，保存着 Key 的只清掉失败或跳过的信息，不删除账户的 Key；作废的 Key
+// 随记录删掉；正在处理的不动），
 // 确认后才提交；超过 CLEAR_LIMIT 个时分批。清除后用返回的最新状态刷新列表（页码由 watch(pageCount) 收回到最后一页）
 async function clearRecords(ids: string[], message: string): Promise<void> {
   if (ids.length === 0 || busy.value) return
@@ -307,6 +317,7 @@ async function clearRecords(ids: string[], message: string): Promise<void> {
   busy.value = true
   const total: StudioKeyClearCounts = {
     deleted: 0,
+    invalid: 0,
     reset: 0,
     busy: 0,
     unknown: 0,
@@ -318,6 +329,7 @@ async function clearRecords(ids: string[], message: string): Promise<void> {
       const result = await api.clearStudioKeys(ids.slice(start, start + CLEAR_LIMIT))
       status.value = result
       total.deleted += result.cleared.deleted
+      total.invalid += result.cleared.invalid ?? 0
       total.reset += result.cleared.reset
       total.busy += result.cleared.busy
       total.unknown += result.cleared.unknown
@@ -343,6 +355,7 @@ function processing(record: StudioKeyRecord): boolean {
 function clearedText(counts: StudioKeyClearCounts): string {
   const parts: string[] = []
   if (counts.deleted > 0) parts.push(tf('studioKey.clearedDeleted', { count: counts.deleted }))
+  if (counts.invalid > 0) parts.push(tf('studioKey.clearedInvalid', { count: counts.invalid }))
   if (counts.reset > 0) parts.push(tf('studioKey.clearedReset', { count: counts.reset }))
   const sentences: string[] = []
   if (parts.length > 0) {
@@ -478,7 +491,10 @@ onBeforeUnmount(() => {
         <span class="text-green-400">{{ t('studioKey.tab.ok') }} {{ grouped.ok.length }}</span>
         <span class="text-gray-600">·</span>
         <span class="text-red-400"
-          >{{ t('studioKey.tab.failed') }} {{ grouped.failed.length }}</span
+          >{{ t('studioKey.tab.failed') }} {{ grouped.failed.length
+          }}<template v-if="invalidCount > 0">{{
+            tf('studioKey.invalidCount', { count: invalidCount })
+          }}</template></span
         >
         <span class="text-gray-600">·</span>
         <span class="text-gray-400">
@@ -560,6 +576,9 @@ onBeforeUnmount(() => {
             </button>
           </div>
         </div>
+        <p v-if="tab === 'failed' && invalidCount > 0" class="text-xs text-orange-300/90">
+          {{ tf('studioKey.invalidHint', { count: invalidCount }) }}
+        </p>
         <p v-if="tabRecords.length === 0" class="text-sm text-gray-500">{{ t(emptyKeys[tab]) }}</p>
         <template v-else>
           <!-- 列的显隐与布局按卡片里可用的宽度（容器查询），不按窗口宽度：窗口到 md 时侧栏出现、卡片反而变窄。

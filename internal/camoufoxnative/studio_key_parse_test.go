@@ -7,11 +7,12 @@ import (
 	"testing"
 )
 
-// 测试用的假 Key（不是真实 Key）
+// 测试用的假 Key（不是真实 Key）：fakeClientKey 扮演页面自己的公共 Key
 var (
 	fakeNewKey     = "AQ.TESTKEY" + strings.Repeat("x", 24)
-	fakeOtherKey   = "AQ.TESTKEY" + strings.Repeat("y", 20) + "E6io"
+	fakeOtherKey   = "AQ.TESTKEY" + strings.Repeat("y", 20) + "TST1"
 	fakeClassicKey = "AIza" + "TESTKEY" + strings.Repeat("0", 28)
+	fakeClientKey  = "AIza" + "TESTCLIENT" + strings.Repeat("c", 25)
 )
 
 // TestExtractStudioKeysNestedArrays 带 XSSI 前缀的 protobuf-JSON 嵌套数组：Key 与同一条记录里的 projects/<数字> 配对，
@@ -46,16 +47,52 @@ func TestExtractStudioKeysBatchExecute(t *testing.T) {
 	}
 }
 
-// TestExtractStudioKeysPlainTextFallback 不是 JSON 时按文本扫描，项目取最近的 projects/<数字>
-func TestExtractStudioKeysPlainTextFallback(t *testing.T) {
-	body := `garbage projects/9 ........ key=` + fakeClassicKey + ` projects/444 tail`
-	keys := ExtractStudioKeys([]byte(body))
-	if len(keys) != 1 || keys[0].ProjectNumber != "444" {
-		t.Fatalf("keys = %+v", redactCandidates(keys))
+// TestExtractStudioKeysNoTextScan 不再按文本扫描：不是 JSON 的正文（HTML、脚本、纯文字）、JSON 里嵌在别的文字（地址）里的 Key 都不是候选；
+// 只有整段是 Key 的 JSON 字符串才是
+func TestExtractStudioKeysNoTextScan(t *testing.T) {
+	for _, body := range []string{
+		`garbage projects/9 ........ key=` + fakeClassicKey + ` projects/444 tail`,
+		`<html><script>window.WIZ_global_data={"WIu0Nc":"` + fakeClientKey + `"}</script></html>`,
+		`var k="` + fakeClientKey + `";function g(){return "AQ.getInstanceForTestingOnlyFooBarBaz"}`,
+		`{"url":"https://generativelanguage.googleapis.com/v1beta/models?key=` + fakeClientKey + `"}`,
+		"x" + fakeClassicKey + "TOOLONG",
+	} {
+		if keys := ExtractStudioKeys([]byte(body)); len(keys) != 0 {
+			t.Fatalf("%s: keys = %+v", RedactStudioKeys(body), redactCandidates(keys))
+		}
 	}
-	// 更长串里截出来的片段不算 Key
-	if got := ExtractStudioKeys([]byte("x" + fakeClassicKey + "TOOLONG")); len(got) != 0 {
-		t.Fatalf("截断片段被当成 Key: %d", len(got))
+	if keys := ExtractStudioKeys([]byte(`{"key":" ` + fakeClassicKey + ` "}`)); len(keys) != 1 || keys[0].Key != fakeClassicKey {
+		t.Fatalf("整段是 Key 的字符串应是候选: %+v", redactCandidates(keys))
+	}
+}
+
+// TestStudioKeyBodyKind 正文的种类：文档、脚本、样式（按 MIME、导航、请求目标）进拒绝集合；JSON、json+protobuf、batchexecute 的 text/plain
+// 找候选；MIME 为空时看开头
+func TestStudioKeyBodyKind(t *testing.T) {
+	cases := []struct {
+		response studioKeyResponse
+		body     string
+		want     string
+	}{
+		{studioKeyResponse{mime: "text/html"}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "application/json", document: true}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "", destination: "script"}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "text/javascript"}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "application/x-javascript"}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "text/css"}, `[]`, studioKeyBodyPage},
+		{studioKeyResponse{mime: "application/json+protobuf"}, `[]`, studioKeyBodyJSON},
+		{studioKeyResponse{mime: "application/json"}, `{}`, studioKeyBodyJSON},
+		{studioKeyResponse{mime: "text/plain"}, ")]}'\n12\n[]", studioKeyBodyJSON},
+		{studioKeyResponse{}, "<!doctype html>", studioKeyBodyPage},
+		{studioKeyResponse{}, ")]}'\n[]", studioKeyBodyJSON},
+		{studioKeyResponse{}, "123\n[[1]]", studioKeyBodyJSON},
+		{studioKeyResponse{}, "var a = 1", studioKeyBodyOther},
+		{studioKeyResponse{mime: "image/png"}, "", studioKeyBodyOther},
+	}
+	for _, item := range cases {
+		if got := studioKeyBodyKind(item.response, []byte(item.body)); got != item.want {
+			t.Fatalf("%+v %q = %s，期望 %s", item.response, item.body, got, item.want)
+		}
 	}
 }
 
@@ -81,36 +118,126 @@ func TestRedactStudioKeys(t *testing.T) {
 	}
 }
 
-// TestChooseStudioKeyAfterCreate 创建之后只认创建前没有的新 Key
-func TestChooseStudioKeyAfterCreate(t *testing.T) {
-	keys := []StudioKeyCandidate{{Key: fakeClassicKey}, {Key: fakeNewKey}}
-	chosen, ok := chooseStudioKey(keys, map[string]bool{fakeClassicKey: true}, true, StudioKeyOptions{})
-	if !ok || chosen.Key != fakeNewKey {
-		t.Fatalf("chosen = %+v", redactCandidate(chosen))
+// TestChooseStudioKeyRow 候选只有与 Key 列表里的行对上才算：末四位相同、不在拒绝集合里；行上显示完整 Key 时用它（不在拒绝集合里时）；
+// 已保存的那条所在的行优先；只读时只认已保存的那条（完整相等），列表里没有它那一行时 hasRow 为假
+func TestChooseStudioKeyRow(t *testing.T) {
+	denied := func(key string) bool { return key == fakeClientKey }
+	none := func(string) bool { return false }
+	rows := []studioKeyListRow{{Last4: StudioKeyLast4(fakeNewKey)}, {Last4: StudioKeyLast4(fakeOtherKey)}}
+	candidates := []StudioKeyCandidate{{Key: fakeClientKey}, {Key: fakeOtherKey, ProjectNumber: "210987654321"}, {Key: fakeNewKey}}
+	// 公共 Key 排在第一、却对不上任何一行：选第一条能确认的行
+	if choice := chooseStudioKeyRow(rows, candidates, denied, "", false); !choice.confirmed || choice.candidate.Key != fakeNewKey {
+		t.Fatalf("应确认第一行: %+v", redactChoice(choice))
 	}
-	if _, ok := chooseStudioKey(keys[:1], map[string]bool{fakeClassicKey: true}, true, StudioKeyOptions{}); ok {
-		t.Fatal("只有旧 Key 时不应选中")
+	// 已保存的那条所在的行优先
+	if choice := chooseStudioKeyRow(rows, candidates, denied, fakeOtherKey, false); !choice.confirmed || choice.candidate.Key != fakeOtherKey ||
+		choice.candidate.ProjectNumber != "210987654321" {
+		t.Fatalf("应选已保存的那条: %+v", redactChoice(choice))
+	}
+	// 只有公共 Key、列表里的行对不上：不确认，目标是第一行（之后打开详情）
+	if choice := chooseStudioKeyRow(rows, candidates[:1], denied, "", false); choice.confirmed || !choice.hasRow || choice.row.Last4 != rows[0].Last4 {
+		t.Fatalf("不应确认: %+v", redactChoice(choice))
+	}
+	// 公共 Key 的末四位恰好是某一行的：在拒绝集合里，照样不认
+	clientRow := []studioKeyListRow{{Last4: StudioKeyLast4(fakeClientKey)}}
+	if choice := chooseStudioKeyRow(clientRow, candidates[:1], denied, "", false); choice.confirmed {
+		t.Fatalf("拒绝集合里的 Key 不应确认: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(clientRow, candidates[:1], none, "", false); !choice.confirmed {
+		t.Fatalf("不在拒绝集合里时末四位对上即确认: %+v", redactChoice(choice))
+	}
+	// 行上显示完整 Key：单独不算（可能是截断的前缀），要有响应里完整相等的那条，或就是已保存的那条；没有时目标是这一行（之后打开详情）；
+	// 响应里末四位相同的另一条不认；显示的是拒绝集合里的 Key 时不用
+	full := []studioKeyListRow{{Last4: StudioKeyLast4(fakeClassicKey), Full: fakeClassicKey}}
+	if choice := chooseStudioKeyRow(full, nil, denied, "", false); choice.confirmed || !choice.hasRow || choice.row.Full != fakeClassicKey {
+		t.Fatalf("行上显示的完整 Key 没有印证时不应确认: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(full, []StudioKeyCandidate{{Key: fakeClassicKey, ProjectNumber: "1"}}, denied, "", false); !choice.confirmed ||
+		choice.candidate.Key != fakeClassicKey || choice.candidate.ProjectNumber != "1" {
+		t.Fatalf("响应里有同一条时应确认: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(full, nil, denied, fakeClassicKey, false); !choice.confirmed || choice.candidate.Key != fakeClassicKey {
+		t.Fatalf("行上显示的就是已保存的那条时应确认: %+v", redactChoice(choice))
+	}
+	twinClassic := "AIza" + "TESTKEY" + strings.Repeat("1", 24) + "0000"
+	if choice := chooseStudioKeyRow(full, []StudioKeyCandidate{{Key: twinClassic}}, denied, "", false); choice.confirmed {
+		t.Fatalf("响应里末四位相同、与行上显示的不同的不应确认: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow([]studioKeyListRow{{Last4: "cccc", Full: fakeClientKey}}, nil, denied, "", false); choice.confirmed {
+		t.Fatalf("行上显示的是公共 Key: %+v", redactChoice(choice))
+	}
+	// 同一末四位有两条候选、都不是已保存的：不猜
+	twin := "AQ.TESTKEY" + strings.Repeat("z", 20) + "xxxx"
+	if choice := chooseStudioKeyRow(rows[:1], []StudioKeyCandidate{{Key: fakeNewKey}, {Key: twin}}, none, "", false); choice.confirmed {
+		t.Fatalf("同一末四位有两条候选时不应猜: %+v", redactChoice(choice))
+	}
+	// 只读：只认已保存的那条
+	if choice := chooseStudioKeyRow(rows, candidates, denied, fakeOtherKey, true); !choice.confirmed || choice.candidate.Key != fakeOtherKey {
+		t.Fatalf("只读应选已保存的那条: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(rows, candidates[:1], denied, fakeOtherKey, true); choice.confirmed || !choice.hasRow || choice.row.Last4 != "TST1" {
+		t.Fatalf("只读、响应里没有已保存的那条：目标仍是它那一行: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(rows[:1], candidates, denied, fakeOtherKey, true); choice.confirmed || choice.hasRow {
+		t.Fatalf("只读、列表里没有已保存的那条: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(rows, candidates, denied, "", true); choice.confirmed || choice.hasRow {
+		t.Fatalf("只读、已保存的 Key 不可用（在拒绝集合里）时不应选任何一行: %+v", redactChoice(choice))
+	}
+	if choice := chooseStudioKeyRow(rows, []StudioKeyCandidate{{Key: twin}}, none, fakeNewKey, true); choice.confirmed {
+		t.Fatalf("只读时末四位相同、完整 Key 不同的不算: %+v", redactChoice(choice))
 	}
 }
 
-// TestChooseStudioKeySaved 没有创建时页面上有已保存的那条就选它（不是第一条也选它）；只读时只认已保存的那条（完整相等），没有就不选
-func TestChooseStudioKeySaved(t *testing.T) {
-	keys := []StudioKeyCandidate{{Key: fakeClassicKey}, {Key: fakeNewKey}}
-	if chosen, ok := chooseStudioKey(keys, nil, false, StudioKeyOptions{SavedKey: fakeNewKey}); !ok || chosen.Key != fakeNewKey {
-		t.Fatalf("应选已保存的 Key: %+v", redactCandidate(chosen))
+// TestNewStudioKeyNeedsCorroboration 创建之后，创建结果对话框里显示的完整 Key 单独不算：要有列表里新出现的一行末四位对上，或（还没有新行时）
+// 响应里有同一条才认；对话框关掉之后记下的 Key 仍可与之后出现的新行核对；新行对不上时不用（返回新行，之后打开它的详情）；
+// 拒绝集合里的、创建前就有的不算
+func TestNewStudioKeyNeedsCorroboration(t *testing.T) {
+	newRun := func() *studioKeyRun {
+		run := &studioKeyRun{flow: newStudioKeyFlow()}
+		run.markBefore(studioKeyListView{Rows: []studioKeyListRow{{Last4: "0000"}}})
+		return run
 	}
-	if chosen, ok := chooseStudioKey(keys, nil, false, StudioKeyOptions{SavedKey: fakeOtherKey}); !ok || chosen.Key != fakeClassicKey {
-		t.Fatalf("已保存的不在页面上时取第一条: %+v", redactCandidate(chosen))
+	run := newRun()
+	if _, pending, awaiting, ok := run.newStudioKey(studioKeyListView{}, []string{fakeNewKey}); ok || pending != nil || !awaiting {
+		t.Fatalf("只有对话框里的 Key、没有新行与响应时应等印证: ok=%v awaiting=%v", ok, awaiting)
 	}
-	if chosen, ok := chooseStudioKey(keys, nil, false, StudioKeyOptions{ReadOnly: true, SavedKey: fakeNewKey}); !ok || chosen.Key != fakeNewKey {
-		t.Fatalf("只读应选已保存的 Key: %+v", redactCandidate(chosen))
+	if !strings.Contains(strings.Join(run.notes, "→"), "还没有新出现的行或响应印证") {
+		t.Fatalf("应记一笔: %v", run.notes)
 	}
-	if _, ok := chooseStudioKey(keys, nil, false, StudioKeyOptions{ReadOnly: true, SavedKey: fakeOtherKey}); ok {
-		t.Fatal("只读时页面上没有已保存的 Key 不应选别的")
+	// 对话框关掉之后（读不到对话框里的 Key）出现新的一行，末四位与记下的对上
+	if candidate, _, _, ok := run.newStudioKey(studioKeyListView{Rows: []studioKeyListRow{{Last4: "0000"}, {Last4: "xxxx"}}}, nil); !ok || candidate.Key != fakeNewKey {
+		t.Fatalf("应与新出现的一行核对后认下: ok=%v", ok)
 	}
-	if _, ok := chooseStudioKey(keys, nil, false, StudioKeyOptions{ReadOnly: true, SavedKey: fakeNewKey[:len(fakeNewKey)-1]}); ok {
-		t.Fatal("只读时要完整相等")
+	run = newRun()
+	run.keys = []StudioKeyCandidate{{Key: fakeNewKey, ProjectNumber: "123456789012"}}
+	if candidate, _, _, ok := run.newStudioKey(studioKeyListView{}, []string{fakeNewKey}); !ok || candidate.ProjectNumber != "123456789012" {
+		t.Fatalf("响应里有同一条时应认下（连同响应里的项目）: ok=%v", ok)
 	}
+	// 新出现的行对不上对话框里的 Key：不用，返回这一行（之后打开它的详情）
+	run = newRun()
+	if _, pending, _, ok := run.newStudioKey(studioKeyListView{Rows: []studioKeyListRow{{Last4: "TST1"}}}, []string{fakeNewKey}); ok || pending == nil ||
+		pending.Last4 != "TST1" || !strings.Contains(strings.Join(run.notes, "→"), "对不上") {
+		t.Fatalf("新行对不上时不应认下: ok=%v notes=%v", ok, run.notes)
+	}
+	// 拒绝集合里的、创建前就有的不算
+	run = newRun()
+	run.deny(fakeNewKey, studioKeyDenySource{where: "测试", strong: true})
+	run.keys = []StudioKeyCandidate{{Key: fakeNewKey}}
+	if _, _, awaiting, ok := run.newStudioKey(studioKeyListView{Rows: []studioKeyListRow{{Last4: "xxxx"}}}, []string{fakeNewKey}); ok || awaiting {
+		t.Fatal("拒绝集合里的 Key 不应认下")
+	}
+	run = &studioKeyRun{flow: newStudioKeyFlow(), keys: []StudioKeyCandidate{{Key: fakeNewKey}}}
+	run.markBefore(studioKeyListView{})
+	if _, _, awaiting, ok := run.newStudioKey(studioKeyListView{}, []string{fakeNewKey}); ok || awaiting {
+		t.Fatal("创建前就在响应里的 Key 不应认下")
+	}
+}
+
+func redactChoice(choice studioKeyChoice) studioKeyChoice {
+	choice.candidate = redactCandidate(choice.candidate)
+	choice.row.Full = RedactStudioKeys(choice.row.Full)
+	return choice
 }
 
 // TestExtractStudioKeysOwnRecord Key 自己那条记录里的资源名 projects/<数字>/…/keys/… 算它的项目，并优先于多条 Key 共用的容器里的
@@ -179,7 +306,7 @@ func TestStudioKeyRowProject(t *testing.T) {
 			return ""
 		}
 		return studioKeyRowView{Count: 1, Cells: []studioKeyRowCell{
-			{Text: "Gemini API Key …E6io", Header: header("Key"), Key: true}, {Text: project, Header: header("Project")},
+			{Text: "Gemini API Key …TST1", Header: header("Key"), Key: true}, {Text: project, Header: header("Project")},
 			{Text: "Nov 1, 2026", Header: header("Created on")},
 		}}
 	}
@@ -209,7 +336,7 @@ func TestStudioKeyRowProject(t *testing.T) {
 		t.Fatalf("显示名里带数字、对不上已知项目: %+v", project)
 	}
 	// 项目列有两格：显示名一格、编号一格
-	split := studioKeyRowView{Count: 1, Cells: []studioKeyRowCell{{Text: "Gemini API Key …E6io", Header: "Key", Key: true},
+	split := studioKeyRowView{Count: 1, Cells: []studioKeyRowCell{{Text: "Gemini API Key …TST1", Header: "Key", Key: true},
 		{Text: "Load test 2026111601", Header: "Project"}, {Text: "456789012345", Header: "Project number"}}}
 	if project, _ := studioKeyRowProject(split, projects); project.Number != "456789012345" || project.Display != "Load test 2026111601" {
 		t.Fatalf("项目列分成显示名与编号两格: %+v", project)

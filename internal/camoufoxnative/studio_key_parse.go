@@ -17,10 +17,12 @@ import (
 //   - Key 是完整字符串值，形如 AIza 加 35 位（经典 Google API Key），或 AQ. 加至少 20 位（新格式）。
 //   - 同一条 Key 记录里有形如 projects/<数字> 的项目名；离 Key 最近的那一层数组或对象里的 projects/<数字> 即其所属项目。
 //
-// 解析先按 JSON 递归遍历（逐层尝试解开字符串里的 JSON），对每个 Key 从它所在的最内层容器往外找第一个含 projects/<数字> 的容器；
-// Key 自己那条记录（往外到出现别的 Key 为止）里的资源名 projects/<数字>/…（如 …/keys/…）也算它的项目，并且优先于多条 Key 共用的
-// 容器里的 projects/<数字>；自己那条记录里的项目 ID（gen-lang-client-<数字>）与像显示名的文字另记下来，记录里没有项目编号时
-// 与响应里的项目对照（见 correlateStudioProject）。整段不是 JSON 时退回按文本扫描，项目取 Key 前后一段距离内最近的 projects/<数字>。
+// 只有页面接口的 JSON 类正文（见 studioKeyBodyKind）才找 Key：按 JSON 递归遍历（逐层尝试解开字符串里的 JSON），只认整段就是 Key 的
+// 字符串值，不再按文本扫描（页面文档、脚本、配置里写着页面自己的公共 Key，扫文本会把它当成账户的 Key，见 studio_key_confirm.go）。
+// 对每个 Key 从它所在的最内层容器往外找第一个含 projects/<数字> 的容器；Key 自己那条记录（往外到出现别的 Key 为止）里的资源名
+// projects/<数字>/…（如 …/keys/…）也算它的项目，并且优先于多条 Key 共用的容器里的 projects/<数字>；自己那条记录里的项目 ID
+// （gen-lang-client-<数字>）与像显示名的文字另记下来，记录里没有项目编号时与响应里的项目对照（见 correlateStudioProject）。
+// 这里找到的只是候选：要与页面上 Key 列表里的行对上才算这个账户的 Key（见 chooseStudioKeyRow）。
 // 解析结果只在内存里交给调用方，任何错误文案都不带 Key 原文（见 RedactStudioKeys）。
 
 var (
@@ -30,9 +32,6 @@ var (
 	studioProjectScan      = regexp.MustCompile(`projects/([0-9]+)`)
 	studioDisplayNameRegex = regexp.MustCompile(`^[\p{L}\p{N}][\p{L}\p{N} ._()'-]{1,79}$`)
 )
-
-// studioKeyScanWindow 为按文本扫描时在 Key 前后找项目名的距离（字节）
-const studioKeyScanWindow = 600
 
 // StudioKeyCandidate 为在响应正文里找到的一条 Key 与它所属的项目。Key 是机密：不要写进日志或错误
 type StudioKeyCandidate struct {
@@ -70,14 +69,13 @@ func StudioKeyLast4(key string) string {
 	return key[len(key)-4:]
 }
 
-// ExtractStudioKeys 从一段响应正文里找出全部 Key（按出现顺序去重）
+// ExtractStudioKeys 从一段 JSON 类响应正文里找出整段是 Key 的字符串值（按出现顺序去重）；正文不是 JSON、Key 只嵌在别的文字里时为空
 func ExtractStudioKeys(body []byte) []StudioKeyCandidate {
 	text := string(bytes.TrimSpace(body))
 	if !studioKeyScanPattern.MatchString(text) {
 		return nil
 	}
 	var collector studioKeyCollector
-	parsedAny := false
 	for _, chunk := range studioJSONChunks(text) {
 		var value any
 		decoder := json.NewDecoder(strings.NewReader(chunk))
@@ -85,13 +83,71 @@ func ExtractStudioKeys(body []byte) []StudioKeyCandidate {
 		if err := decoder.Decode(&value); err != nil {
 			continue
 		}
-		parsedAny = true
 		collector.walk(value, nil, 0)
 	}
-	if !parsedAny || len(collector.found) == 0 {
-		return scanStudioKeys(text)
-	}
 	return collector.found
+}
+
+// 响应正文的种类（studioKeyBodyKind）
+const (
+	// studioKeyBodyJSON 为页面接口的 JSON 类正文（application/json、application/json+protobuf、batchexecute 的 text/plain 等）：
+	// 只认整段是 Key 的字符串，作为候选
+	studioKeyBodyJSON = "json"
+	// studioKeyBodyPage 为页面文档、脚本、样式：里面像 Key 的字符串都是页面自己的（如 WIZ_global_data 里的公共 Key），全部进拒绝集合，
+	// 从不当作账户的 Key
+	studioKeyBodyPage = "page"
+	// studioKeyBodyOther 为认不出的正文：不找候选，像 Key 的字符串只计入诊断
+	studioKeyBodyOther = "other"
+)
+
+// studioKeyBodyKind 按响应的类型（导航文档、请求目标、MIME）判断正文的种类；MIME 为空或认不出时看正文开头
+func studioKeyBodyKind(response studioKeyResponse, body []byte) string {
+	mime := response.mime
+	switch {
+	case response.document, response.destination == "document", response.destination == "script", response.destination == "style",
+		response.destination == "iframe", response.destination == "worker", response.destination == "sharedworker",
+		response.destination == "serviceworker":
+		return studioKeyBodyPage
+	case mime == "text/html", mime == "application/xhtml+xml", strings.Contains(mime, "javascript"), strings.Contains(mime, "ecmascript"),
+		mime == "text/css":
+		return studioKeyBodyPage
+	case mime == "application/json", mime == "application/json+protobuf", strings.HasSuffix(mime, "+json"), mime == "text/plain",
+		mime == "application/x-protobuf", mime == "application/protobuf", mime == "application/x-protobuffer":
+		return studioKeyBodyJSON
+	}
+	trimmed := bytes.TrimSpace(body)
+	switch {
+	case len(trimmed) == 0:
+		return studioKeyBodyOther
+	case trimmed[0] == '<':
+		return studioKeyBodyPage
+	case bytes.HasPrefix(trimmed, []byte(")]}'")), trimmed[0] == '[', trimmed[0] == '{':
+		return studioKeyBodyJSON
+	case trimmed[0] >= '0' && trimmed[0] <= '9':
+		// batchexecute 分块：先是一行长度
+		if line, _, _ := bytes.Cut(trimmed, []byte("\n")); len(bytes.Trim(line, "0123456789\r ")) == 0 {
+			return studioKeyBodyJSON
+		}
+	}
+	return studioKeyBodyOther
+}
+
+// studioKeyScanLimit 为一段文字里最多记下的像 Key 的字符串个数
+const studioKeyScanLimit = 64
+
+// scanStudioKeyStrings 返回文字里所有像 Key 的字符串（按出现顺序去重，最多 studioKeyScanLimit 个）。不看前后是否紧接着 Key 字符：
+// 只用于拒绝集合与诊断（宁可多拒），从不当作候选
+func scanStudioKeyStrings(text string) []string {
+	var found []string
+	for _, key := range studioKeyScanPattern.FindAllString(text, -1) {
+		if !slices.Contains(found, key) {
+			found = append(found, key)
+			if len(found) >= studioKeyScanLimit {
+				break
+			}
+		}
+	}
+	return found
 }
 
 // studioJSONChunks 把正文拆成可能的 JSON 段：去掉 XSSI 前缀；batchexecute 按行分块时每行单独尝试；也尝试整段
@@ -300,42 +356,6 @@ func looksLikeDisplayName(value string) bool {
 		return false
 	}
 	return studioDisplayNameRegex.MatchString(value)
-}
-
-// scanStudioKeys 按文本扫描：正文不是 JSON 时的退路
-func scanStudioKeys(text string) []StudioKeyCandidate {
-	var found []StudioKeyCandidate
-	seen := make(map[string]bool)
-	projects := studioProjectScan.FindAllStringSubmatchIndex(text, -1)
-	for _, location := range studioKeyScanPattern.FindAllStringIndex(text, -1) {
-		key := text[location[0]:location[1]]
-		// 前后不能紧接着 Key 字符（避免把更长的串截出一段）
-		if location[0] > 0 && isKeyByte(text[location[0]-1]) || location[1] < len(text) && isKeyByte(text[location[1]]) {
-			continue
-		}
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-		candidate := StudioKeyCandidate{Key: key}
-		best := -1
-		for _, project := range projects {
-			distance := project[0] - location[1]
-			if project[1] <= location[0] {
-				distance = location[0] - project[1]
-			}
-			if distance < 0 {
-				distance = -distance
-			}
-			if distance <= studioKeyScanWindow && (best < 0 || distance < best) {
-				best = distance
-				candidate.ProjectName = text[project[0]:project[1]]
-				candidate.ProjectNumber = text[project[2]:project[3]]
-			}
-		}
-		found = append(found, candidate)
-	}
-	return found
 }
 
 func isKeyByte(value byte) bool {
