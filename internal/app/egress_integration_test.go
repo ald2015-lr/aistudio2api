@@ -437,8 +437,8 @@ func TestEgressPausedColdStartNotWarmFailure(t *testing.T) {
 		hasLogContaining(env.service.requests, "预热等待", "槽位已满") {
 		t.Fatalf("预热等待原因不对：%v", serviceLogMessages(env.service.requests))
 	}
-	if env.manager.runReplacement(ctx, aistudio.PoolScopeNormal, nil, "测试") {
-		t.Fatal("补位并发已满时替补不应启动")
+	if result, spareFault := env.manager.runReplacement(ctx, aistudio.PoolScopeNormal, nil, "测试"); result == replacementStarted || spareFault {
+		t.Fatal("补位并发已满时替补不应启动，也不算挑中的号自己的原因")
 	}
 	if !hasLogContaining(env.service.requests, "替补未启动 | 原因=测试 | "+egressColdStartPausedReason) {
 		t.Fatalf("缺少替补暂停日志：%v", serviceLogMessages(env.service.requests))
@@ -626,7 +626,7 @@ func TestWorkerReadySourceLogged(t *testing.T) {
 	if _, err := manager.Worker(withWorkerStartSource(ctx, workerStartReopen), standby(), testRuntimeModel); err != nil {
 		t.Fatal(err)
 	}
-	if !manager.runReplacement(ctx, aistudio.PoolScopeNormal, nil, "测试") {
+	if result, _ := manager.runReplacement(ctx, aistudio.PoolScopeNormal, nil, "测试"); result != replacementStarted {
 		t.Fatalf("替补没有启动：%v", serviceLogMessages(requests))
 	}
 	for _, source := range []string{workerStartPrewarm, workerStartExpand, workerStartOnDemand, workerStartCoverage, workerStartReopen, workerStartReplacement} {

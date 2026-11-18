@@ -736,6 +736,8 @@ type AccountPool struct {
 	rateWakeAt       int64
 	// continuationSeq 为 long- 自动续写重新预占名额的登记序号（见 ReserveContinuation），只增不减；受 mu 保护
 	continuationSeq uint64
+	// quotaUsage 为每账号今日（太平洋时间额度日）发送数，按账户 ID 存，Remove 再 Add 后不丢（见 quota_usage.go）；受 mu 保护
+	quotaUsage quotaUsage
 	// globalProxy 为全局代理（PROXY），只用于计算出口键；egresses 为出口键 → 出口记录，egressLanes 按编号排列（索引里存编号，
 	// 编号 = 出口序号×2 + 通道；空闲出口的记录删除后两个位置为 nil，编号对的起点记进 egressFree，新出口优先复用），
 	// egressFull 为令牌桶对某类选择不准入、登记了下一个令牌时刻的通道（与 rateFull 共用窗口释放计时器），
@@ -4246,8 +4248,12 @@ func (p *AccountPool) selectionIndicesBruteLocked(selection AccountSelection) ([
 	return p.rotateIndicesLocked(indices, selection), nil
 }
 
-// SetRoutingStrategy 设置账户轮询或优先填满策略
+// SetRoutingStrategy 设置账户轮询或优先填满策略；平均调用（RoutingBalanced）在账户池内与轮询相同，存成 round-robin
+// （账户池里按 "round-robin" 比较的判断不认识 balanced，原样存下会被当成 fill-first，见 RoutingBalanced）
 func (p *AccountPool) SetRoutingStrategy(strategy string) {
+	if strategy == RoutingBalanced {
+		strategy = "round-robin"
+	}
 	p.mu.Lock()
 	p.routingStrategy = strategy
 	p.mu.Unlock()

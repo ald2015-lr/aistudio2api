@@ -157,7 +157,7 @@ func (manager *accountWorkerManager) warmConcurrencyValue() int {
 }
 
 // applyLiveSettings 更新 Worker 容量与启动参数；调小的常驻数由空闲回收逐步收敛，
-// 冷启动名额立即按新的启动预热并发放行排队的启动。普通分区与 Ultra 分区的常驻数、峰值数分别更新
+// 冷启动名额立即按新的启动预热并发放行排队的启动。普通分区与 Ultra 分区的常驻数、峰值数分别更新，平均调用开关同时切换
 func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.warmTarget.Store(int64(cfg.WarmWorkerLimit))
 	manager.maxActive.Store(int64(cfg.MaxActiveWorkers))
@@ -166,6 +166,11 @@ func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.startupSlots.resized()
 	manager.initTimeout.Store(int64(cfg.InitTimeout))
 	manager.temporaryChat.Store(cfg.TemporaryChat)
+	// 平均调用（ROUTING_STRATEGY=balanced，见 balanced.go）立即生效；从开切到关时唤醒淘汰循环，让还在等待的轮换登记按已关闭处理
+	balanced := cfg.RoutingStrategy == aistudio.RoutingBalanced
+	if manager.setBalanced(balanced) && !balanced {
+		manager.wakeRetire()
+	}
 }
 
 // prewarmIfRunning 服务运行中时按最新常驻数补齐预热 Worker
@@ -223,7 +228,7 @@ func (manager *runtimeManager) applyLiveConfig() {
 		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
 		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
-		saved.RoutingStrategy, strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
+		routingStrategySummary(saved.RoutingStrategy), strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 		longOutputSummary(saved.LongOutputEnabled, saved.LongOutputMaxTokens), saved.ProxyPool.Summary(),

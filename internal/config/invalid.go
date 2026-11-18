@@ -327,8 +327,8 @@ var configChecks = []configCheck{
 		return nil
 	}},
 	{keys: []string{"ROUTING_STRATEGY"}, check: func(c Config) error {
-		if c.RoutingStrategy != "round-robin" && c.RoutingStrategy != "fill-first" {
-			return fmt.Errorf("ROUTING_STRATEGY 必须是 round-robin 或 fill-first")
+		if c.RoutingStrategy != "round-robin" && c.RoutingStrategy != "fill-first" && c.RoutingStrategy != "balanced" {
+			return fmt.Errorf("ROUTING_STRATEGY 必须是 round-robin、fill-first 或 balanced")
 		}
 		return nil
 	}},

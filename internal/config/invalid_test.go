@@ -73,6 +73,10 @@ func TestInvalidValuesFallBackToDefaults(t *testing.T) {
 			if item.Reason != "FIRST_EVENT_TIMEOUT 必须小于 REQUEST_TIMEOUT" {
 				t.Fatalf("组合不成立的原因应写明：%+v", item)
 			}
+		case "ROUTING_STRATEGY":
+			if item.Value != "random" || item.Reason != "ROUTING_STRATEGY 必须是 round-robin、fill-first 或 balanced" {
+				t.Fatalf("ROUTING_STRATEGY 无效项 = %+v", item)
+			}
 		case "MEDIA_BASE_URL":
 			if item.Value != "" || strings.Contains(item.Summary(), "secret-value") || !strings.Contains(item.Summary(), "<已隐藏>") {
 				t.Fatalf("服务地址可能带账号密码，不应记录原值：%+v %s", item, item.Summary())
@@ -108,6 +112,11 @@ func TestInvalidValuesEnvironmentAndAdjustedDefaults(t *testing.T) {
 	clearConfigEnv(t)
 	if cfg, err := Load(writeEnv(t, "WARM_WORKER_LIMIT=4\nROUTING_STRATEGY=fill-first\n")); err != nil || len(cfg.Invalid) != 0 {
 		t.Fatalf("有效配置不应有无效项：%v %+v", err, cfg.Invalid)
+	}
+	// 平均调用（balanced）是有效值，原样读出，保存时照样通过校验
+	if cfg, err := Load(writeEnv(t, "ROUTING_STRATEGY=balanced\n")); err != nil || len(cfg.Invalid) != 0 || cfg.RoutingStrategy != "balanced" ||
+		cfg.Validate() != nil {
+		t.Fatalf("ROUTING_STRATEGY=balanced 应有效：%v %+v", err, cfg)
 	}
 	item := InvalidValue{Key: "PROXY_API_KEY", Reason: "x"}
 	if !strings.Contains(item.Summary(), "原值=<已隐藏>") {

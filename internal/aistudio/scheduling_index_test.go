@@ -295,7 +295,7 @@ func (p *AccountPool) syncDerivedLocked(now time.Time) {
 func (fuzzer *indexFuzzer) mutate() {
 	pool, random := fuzzer.pool, fuzzer.random
 	now := time.Now()
-	switch random.Intn(23) {
+	switch random.Intn(25) {
 	case 0, 1, 2:
 		accountID := fuzzer.randomID()
 		until := now.Add(time.Duration(5+random.Intn(60)) * time.Millisecond)
@@ -485,6 +485,24 @@ func (fuzzer *indexFuzzer) mutate() {
 				pool.attachEgressLocked(account)
 			}
 			pool.mu.Unlock()
+		}
+	case 23:
+		// 路由策略在三个取值之间切换（平均调用存成 round-robin）：索引分类与参考实现必须按同一个策略给出相同的顺序
+		if random.Intn(4) == 0 {
+			pool.SetRoutingStrategy([]string{"round-robin", "fill-first", RoutingBalanced}[random.Intn(3)])
+		}
+	case 24:
+		// 取生成租约、记一次发送（今日发送数加一）、释放：计数不进候选索引，分类结果不受影响
+		selection := fuzzer.randomSelection()
+		selection.AccountID, selection.ResourceID, selection.Method = "", "", "generateContent"
+		if random.Intn(2) == 0 {
+			selection.AllowedAccountIDs = nil
+		}
+		if lease, _, err := pool.TryAcquireFor(context.Background(), selection); err == nil && lease != nil {
+			lease.RecordGenerationSent()
+			if err := lease.Release(); err != nil {
+				fuzzer.t.Fatalf("Release: %v", err)
+			}
 		}
 	}
 }

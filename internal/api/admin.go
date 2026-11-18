@@ -72,6 +72,37 @@ type AdminStatus struct {
 	BuildChannel *AdminBuildChannel `json:"build_channel,omitempty"`
 	// Drive 为启用账户的 Google Drive 授权状态计数（见 AdminDriveCounts）：生成服务不报告时省略
 	Drive *AdminDriveCounts `json:"drive,omitempty"`
+	// Balanced 为平均调用（ROUTING_STRATEGY=balanced）的概况（见 AdminBalanced）：开启且服务运行时才有
+	Balanced *AdminBalanced `json:"balanced,omitempty"`
+}
+
+// AdminBalanced 表示平均调用的概况：QuotaDay 为当前太平洋时间额度日（每日限额在太平洋时间零点恢复，北京时间 15 点或 16 点），
+// Gap 为轮换门槛（驻留号比接替它的备用号多发这么多次才换下），Normal、Ultra 为两个分区的今日发送数分布，
+// Rotations1h、RotationsToday 为最近 1 小时与本额度日完成（旧号已关闭）的轮换次数，还在进行、取消或失败的不计。
+// keepWarm 每 30 秒统计一次，状态接口只读缓存。
+// 发送数为本进程真正发往上游的生成请求数（每次发送都计，含换号重试、续写的每一轮与重新生成），与用量页按服务器本地日、
+// 每个请求一行的账本口径不同
+type AdminBalanced struct {
+	QuotaDay       string                 `json:"quota_day"`
+	Gap            int                    `json:"gap"`
+	Normal         AdminBalancedPartition `json:"normal"`
+	Ultra          AdminBalancedPartition `json:"ultra"`
+	Rotations1h    int                    `json:"rotations_1h"`
+	RotationsToday int                    `json:"rotations_today"`
+}
+
+// AdminBalancedPartition 表示一个分区的平均调用概况：Accounts 为可调度账号数（号池内启用、且不是不可调度的：需要验证账号的整户暂停、
+// 需要登录等不算），Used 为其中今天发送过的账号数，Min、Median、P90、Max 为它们今日发送数的最少、中位、p90 与最多；
+// Rotating 为进行中的轮换数，PausedReason 为轮换暂停的原因（没有暂停时省略）
+type AdminBalancedPartition struct {
+	Accounts     int    `json:"accounts"`
+	Used         int    `json:"used"`
+	Min          int    `json:"min"`
+	Median       int    `json:"median"`
+	P90          int    `json:"p90"`
+	Max          int    `json:"max"`
+	Rotating     int    `json:"rotating"`
+	PausedReason string `json:"paused_reason,omitempty"`
 }
 
 // AdminDriveCounts 表示启用账户的 Google Drive 授权状态：Available 为换到过 Drive token、或经本服务登录时完成了 Drive 授权的账户，

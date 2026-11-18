@@ -36,7 +36,12 @@ import (
 // 替补：淘汰（排空开始、空闲淘汰、清扫、轮换）之后在同一分区挑一个能服务登记模型、对热门与主用模型都没有长时间冷却的
 // 备用账号，经后台冷启动名额启动。WARM_WORKER_LIMIT 低于驻留数时预热不会补齐空出的槽位，驻留数靠替补保持；分区低于预热目标时
 // 由预热补齐，替补只补其余部分（在调用预热之前统计，见 replacementsFor；排空开始时除外：旧 Worker 仍驻留，预热不会为它补）。
-// 替补只在分区有空槽（含排空让出的）时启动，不替换其他账号的空闲 Worker
+// 替补只在分区有空槽（含排空让出的）时启动，不替换其他账号的空闲 Worker。
+//
+// 软排空（平均调用轮换的先启后停，见 balanced.go）：startDrain(soft=true) 写入排空状态但不标记账户池的排空，账号照常接所有请求；
+// 让出额度、排空名额与排空总数照样计入（drainCredit、drainSlotCountLocked、drainCountLocked），峰值已满时接替的号也能启动，
+// 浏览器总数仍不超过 峰值 + drainLimit；状态页的排空数与主用供给（drainCounts、drainingAccounts）不计软排空，因为它还在接单。
+// 接替就绪（或让出的槽位被请求路径的扩容占去，replacementNoRoom）后 hardenDrain 改为普通排空，之后与死槽位的排空完全相同
 
 const (
 	// drainTimeoutGrace 为排空超时在进行中请求最长持续时间之外的余量
@@ -52,10 +57,13 @@ const (
 )
 
 const (
-	// replacementPending、replacementStarted、replacementFailed 为排空开始时替补的结果
+	// replacementPending、replacementStarted、replacementFailed 为排空开始时替补的结果；replacementNoRoom 为替补因分区没有空槽
+	// 没有启动（errAccountWorkerCapacity：排空让出的槽位已被请求路径的扩容占去），replacementFailed() 对它同样为真（旧语义不变），
+	// 只有平均调用轮换的软排空把它与真正的失败区分开：前者照样改为普通排空，后者取消轮换
 	replacementPending int32 = iota
 	replacementStarted
 	replacementFailed
+	replacementNoRoom
 )
 
 // drainState 为一个排空中的账号
@@ -65,6 +73,11 @@ type drainState struct {
 	startedAt atomic.Int64
 	// replacement 为排空开始时启动的替补的结果：失败时排空的 Worker 关闭后再补一个，成功或仍在启动时不重复补
 	replacement atomic.Int32
+	// spareFault 为替补没有启动是挑中的那个号自己的原因（浏览器起不来、WAA runtime 由其他进程占用，见 runReplacement），在 replacement
+	// 写入失败之前写入。只有平均调用轮换读它：这种失败只换下一个备用号、分区不暂停（见 advanceRotation）
+	spareFault atomic.Bool
+	// soft 为软排空（平均调用轮换先启后停的第一阶段，见本文件开头）：账户池没有排空标记，账号照常接单；hardenDrain 后为假
+	soft atomic.Bool
 }
 
 // age 返回排空已持续的时间
@@ -72,21 +85,21 @@ func (drain *drainState) age(now time.Time) time.Duration {
 	return now.Sub(time.Unix(0, drain.startedAt.Load()))
 }
 
-// finishReplacement 记录替补结果；drain 为 nil 时不做任何事
-func (drain *drainState) finishReplacement(started bool) {
+// finishReplacement 记录替补结果（replacementStarted、replacementFailed 或 replacementNoRoom）；drain 为 nil 时不做任何事
+func (drain *drainState) finishReplacement(result int32) {
 	if drain == nil {
 		return
 	}
-	if started {
-		drain.replacement.Store(replacementStarted)
-	} else {
-		drain.replacement.Store(replacementFailed)
-	}
+	drain.replacement.Store(result)
 }
 
-// replacementFailed 判断排空开始时的替补是否没有启动起来
+// replacementFailed 判断排空开始时的替补是否没有启动起来（含因分区没有空槽没有启动的）
 func (drain *drainState) replacementFailed() bool {
-	return drain != nil && drain.replacement.Load() == replacementFailed
+	if drain == nil {
+		return false
+	}
+	result := drain.replacement.Load()
+	return result == replacementFailed || result == replacementNoRoom
 }
 
 // drainLimit 返回分区同时排空的上限：max(WARM_STARTUP_CONCURRENCY, 1) × 2，且不超过分区峰值的 1/4（至少 1）；峰值为 0 的分区不排空
@@ -115,16 +128,26 @@ func (manager *accountWorkerManager) drainTotalLimit(partition aistudio.PoolScop
 // 算出的分区，调用方按它核对了能否排空与可接替账户，排空开始后还要在它里面启动替补。ULTRA_INCLUDE_PRO 恰好在取快照与这里之间
 // 切换时，这些判断都是对旧分区做的：照常写入的话，排空记在新分区（poolRuleChanged 会改标），替补却在旧分区启动，新分区少一个
 // Worker 却多记一份让出额度。所以在 drainMu 内按当前成员重算，与 partition 不一致就不排空，登记留到下一轮按新的成员快照重新判断
-// （poolRuleChanged 同样在 drainMu 内改标，写入的排空总记在当前分区）
-func (manager *accountWorkerManager) startDrain(accountID string, partition aistudio.PoolScope) *drainState {
+// （poolRuleChanged 同样在 drainMu 内改标，写入的排空总记在当前分区）。
+// soft 为真时为软排空（平均调用轮换，见本文件开头）：不标记账户池的排空，并且要给死槽位留一个排空名额与一个排空总数（占名额的排空数、
+// 全部排空数加上它都仍低于各自的上限）。只留名额不留总数的话，轮换的旧号转为普通排空后一直有指定账户或文件绑定的请求时，
+// 超过 drainSlotTimeout 就不再占名额，下一次轮换又能先启后停，这样的排空最长留到排空超时（1 小时以上），能把总数占满，
+// 忙碌的死槽位随后排空不了、替补也启动不了。软排空另外要求分区的全部排空数低于 drainLimit：让出额度（drainCredit）最多 drainLimit 个，
+// 已有 drainLimit 个排空（含超过 drainSlotTimeout、不再占名额的）时再软排空不会多让出一个槽位，峰值已满时接替的号必然因槽位已满启动不了
+func (manager *accountWorkerManager) startDrain(accountID string, partition aistudio.PoolScope, soft bool) *drainState {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	// 锁顺序 drainMu 再到账户池锁，与下面的 SetDraining 相同；成员快照写时复制，这里只是一次加锁
 	if partitionOf(accountID, manager.pool.UltraAccountIDs()) != partition {
 		return nil
 	}
-	if manager.drains[accountID] != nil || manager.drainSlotCountLocked(partition, time.Now()) >= manager.drainLimit(partition) ||
-		manager.drainCountLocked(partition) >= manager.drainTotalLimit(partition) {
+	slotLimit, totalLimit := manager.drainLimit(partition), manager.drainTotalLimit(partition)
+	if soft {
+		slotLimit--
+		totalLimit = min(totalLimit-1, manager.drainLimit(partition))
+	}
+	if manager.drains[accountID] != nil || manager.drainSlotCountLocked(partition, time.Now()) >= slotLimit ||
+		manager.drainCountLocked(partition) >= totalLimit {
 		return nil
 	}
 	// 在 drainMu 内核对账号仍有驻留 Worker、没有被其他路径选中淘汰：retirePass 核对驻留之后，现场回收或清扫可能已关闭 Worker 并删除登记，
@@ -135,13 +158,33 @@ func (manager *accountWorkerManager) startDrain(accountID string, partition aist
 	if account == nil || !account.warm.Load() || manager.victimReserved(accountID) {
 		return nil
 	}
-	if !manager.pool.SetDraining(accountID, true) && !manager.pool.Draining(accountID) {
+	if !soft && !manager.pool.SetDraining(accountID, true) && !manager.pool.Draining(accountID) {
 		return nil
 	}
 	drain := &drainState{partition: partition}
 	drain.startedAt.Store(time.Now().UnixNano())
+	drain.soft.Store(soft)
 	manager.drains[accountID] = drain
 	return drain
+}
+
+// hardenDrain 把软排空改为普通排空（标记账户池的排空，不固定账户的请求从此不再分给它），排空开始时间改为现在（排空超时从这里算）；
+// 返回账号是否仍是这次的排空（已是普通排空时同样为真）。排空已被清除或换成另一次（Worker 已被其他路径关闭等）、账号已不在账户池时返回假
+func (manager *accountWorkerManager) hardenDrain(accountID string, drain *drainState) bool {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	if drain == nil || manager.drains[accountID] != drain {
+		return false
+	}
+	if !drain.soft.Load() {
+		return true
+	}
+	if !manager.pool.SetDraining(accountID, true) && !manager.pool.Draining(accountID) {
+		return false
+	}
+	drain.startedAt.Store(time.Now().UnixNano())
+	drain.soft.Store(false)
+	return true
 }
 
 // clearDrain 清除账号的排空标记，返回清除前的排空状态（不在排空时为 nil）
@@ -188,11 +231,14 @@ func (manager *accountWorkerManager) drainCount(partition aistudio.PoolScope) in
 	return manager.drainCountLocked(partition)
 }
 
-// drainCounts 按分区返回排空中的账号数（供状态接口显示），一次加锁
+// drainCounts 按分区返回排空中的账号数（供状态接口显示），一次加锁；软排空（还在接单）不计
 func (manager *accountWorkerManager) drainCounts() (normal int, ultra int) {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	for _, drain := range manager.drains {
+		if drain.soft.Load() {
+			continue
+		}
 		if drain.partition == aistudio.PoolScopeUltra {
 			ultra++
 		} else {
@@ -202,15 +248,28 @@ func (manager *accountWorkerManager) drainCounts() (normal int, ultra int) {
 	return normal, ultra
 }
 
-// drainingAccounts 返回排空中的账号
+// drainingAccounts 返回排空中的账号（主用供给按它把排空中的驻留 Worker 不计为热账户）；软排空（还在接单）不算
 func (manager *accountWorkerManager) drainingAccounts() map[string]struct{} {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	accounts := make(map[string]struct{}, len(manager.drains))
-	for accountID := range manager.drains {
-		accounts[accountID] = struct{}{}
+	for accountID, drain := range manager.drains {
+		if !drain.soft.Load() {
+			accounts[accountID] = struct{}{}
+		}
 	}
 	return accounts
+}
+
+// drainSnapshot 返回全部排空状态（含软排空）的副本，供平均调用轮换判断进行中的轮换与候选（drainState 的字段是原子量，副本外读取）
+func (manager *accountWorkerManager) drainSnapshot() map[string]*drainState {
+	manager.drainMu.Lock()
+	defer manager.drainMu.Unlock()
+	drains := make(map[string]*drainState, len(manager.drains))
+	for accountID, drain := range manager.drains {
+		drains[accountID] = drain
+	}
+	return drains
 }
 
 // drainSlotCount 返回分区内占着排空名额（排空未超过 drainSlotTimeout）的账号数
@@ -437,7 +496,7 @@ func (manager *accountWorkerManager) startReplacement(partition aistudio.PoolSco
 	// 先取 context 再判断运行状态：停止服务时先改状态再取消后台启动，判断通过时取到的 context 一定会被随后的 ResetAll 取消
 	ctx := manager.backgroundContext()
 	if ctx.Err() != nil || !manager.serviceRunning() {
-		drain.finishReplacement(false)
+		drain.finishReplacement(replacementFailed)
 		return
 	}
 	models = slices.Clone(models)
@@ -447,12 +506,21 @@ func (manager *accountWorkerManager) startReplacement(partition aistudio.PoolSco
 			// 替补跟着排空走，让出额度与替补总在同一个分区
 			partition = manager.drainPartition(drain)
 		}
-		drain.finishReplacement(manager.runReplacement(ctx, partition, models, reason))
+		result, spareFault := manager.runReplacement(ctx, partition, models, reason)
+		if drain != nil {
+			drain.spareFault.Store(spareFault)
+		}
+		drain.finishReplacement(result)
 	}()
 }
 
-// runReplacement 挑选并启动替补，返回是否启动成功（替补账号已由其他路径在启动时也算成功）
-func (manager *accountWorkerManager) runReplacement(ctx context.Context, partition aistudio.PoolScope, models []string, reason string) bool {
+// runReplacement 挑选并启动替补，返回结果：replacementStarted 为启动成功（替补账号已由其他路径在启动时也算成功），
+// replacementNoRoom 为分区没有空槽（errAccountWorkerCapacity，排空让出的槽位已被请求路径的扩容占去），其余为 replacementFailed
+// （含 WAA runtime 由其他进程占用：只说明这个号用不了，槽位并没有被别人占去）。spareFault 为没有启动是挑中的那个号自己的原因
+// （浏览器启动失败、WAA runtime 由其他进程占用）：换一个备用号多半就能启动；没有可挑的号、出口限流、服务停止、槽位已满时为假
+func (manager *accountWorkerManager) runReplacement(
+	ctx context.Context, partition aistudio.PoolScope, models []string, reason string,
+) (result int32, spareFault bool) {
 	warm := manager.WarmAccountIDs()
 	scope := retirement{models: models}.scopeLabel()
 	accountID := manager.pickReplacement(ctx, partition, models, warm)
@@ -461,7 +529,7 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 			"%s 替补跳过 | 原因=%s | 范围=%s | 分区内没有能服务这些模型、对热门与主用模型都没有长时间冷却的备用账号",
 			workerLogName(partition), reason, scope,
 		))
-		return false
+		return replacementFailed, false
 	}
 	manager.requests.log(accountID, "INFO", fmt.Sprintf(
 		"%s 替补启动 | 原因=%s | 范围=%s | %s=%d/%d",
@@ -480,26 +548,29 @@ func (manager *accountWorkerManager) runReplacement(ctx context.Context, partiti
 	switch {
 	case err == nil:
 		manager.clearWarmFailure(accountID)
-		return true
+		return replacementStarted, false
 	case errors.Is(err, errAccountWorkerOpening):
-		return true
+		return replacementStarted, false
 	case ctx.Err() != nil:
-		return false
+		return replacementFailed, false
 	case errors.Is(err, errEgressColdStartPaused):
 		// 出口限流中、补位名额已满：不算启动失败，空出的槽位由随后的预热按补位名额补上
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"%s 替补未启动 | 原因=%s | %s", workerLogName(partition), reason, egressColdStartPausedReason,
 		))
-		return false
+		return replacementFailed, false
 	case errors.Is(err, errAccountWorkerCapacity), errors.Is(err, errAccountRuntimeBusy):
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"%s 替补未启动 | 原因=%s | %s", workerLogName(partition), reason, strings.TrimSpace(err.Error()),
 		))
-		return false
+		if errors.Is(err, errAccountWorkerCapacity) {
+			return replacementNoRoom, false
+		}
+		return replacementFailed, true
 	default:
 		manager.noteWarmFailure(accountID)
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("%s 替补启动失败 | 原因=%s | 错误=%v", workerLogName(partition), reason, err))
-		return false
+		return replacementFailed, true
 	}
 }
 

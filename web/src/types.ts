@@ -365,6 +365,34 @@ export interface ServiceStatus {
   build_channel?: BuildChannelStatus
   // drive 为启用账户的 Google Drive 授权状态计数（gemini-omni 的视频输入及不能内联的图片只交给可用或未知的账户，PNG、JPEG、WebP 等能内联的图片不需要 Drive）；旧版服务端不返回
   drive?: DriveCounters
+  // balanced 为平均调用（ROUTING_STRATEGY=balanced）的概况：开启且服务运行时才有；旧版服务端不返回
+  balanced?: BalancedStatus
+}
+
+// BalancedStatus 为平均调用的概况，服务端每 30 秒统计一次：quota_day 为当前太平洋时间额度日（北京时间 15 点或 16 点清零），
+// gap 为轮换门槛（在跑的号比接替它的备用号多发这么多次才换下），normal、ultra 为两个分区的今日发送数分布，
+// rotations_1h、rotations_today 为最近 1 小时与本额度日完成（旧号已关闭）的轮换次数，还在进行、取消或失败的不计。
+// 发送数为本服务真正发往上游的生成请求数（每次发送都计），与用量页按本地日、每个请求一行的口径不同
+export interface BalancedStatus {
+  quota_day: string
+  gap: number
+  normal: BalancedPartition
+  ultra: BalancedPartition
+  rotations_1h: number
+  rotations_today: number
+}
+
+// BalancedPartition 为一个分区的概况：accounts 为可调度账号数（需要验证账号的整户暂停、需要登录等不算），used 为其中今天发送过的账号数，
+// min、median、p90、max 为它们今日发送数的分布；rotating 为进行中的轮换数，paused_reason 为轮换暂停的原因（没有暂停时省略）
+export interface BalancedPartition {
+  accounts: number
+  used: number
+  min: number
+  median: number
+  p90: number
+  max: number
+  rotating: number
+  paused_reason?: string
 }
 
 // DriveCounters 为启用账户的 Google Drive 授权状态：available 为换到过 Drive token 或经本服务登录时完成了 Drive 授权，unavailable 为
@@ -721,7 +749,7 @@ export interface ServiceConfig {
   account_rpm_limit: number
   // studio_key_delay 为批量获取 AI Studio API Key 时相邻两个账户之间的间隔（秒），服务端总是返回该字段
   studio_key_delay: number
-  routing_strategy: 'round-robin' | 'fill-first'
+  routing_strategy: 'round-robin' | 'fill-first' | 'balanced'
   upstream_channels: UpstreamChannel[]
   // stream_playground_models 为流式请求优先走 Playground 的模型；旧版服务端不返回该字段
   stream_playground_models?: string[]

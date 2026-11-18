@@ -1422,6 +1422,7 @@ onBeforeUnmount(() => {
           >
             <option value="round-robin">{{ t('settings.routingRoundRobin') }}</option>
             <option value="fill-first">{{ t('settings.routingFillFirst') }}</option>
+            <option value="balanced">{{ t('settings.routingBalanced') }}</option>
           </UiSelect>
           <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.routingHelp')" />
         </label>

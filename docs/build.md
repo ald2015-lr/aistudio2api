@@ -142,6 +142,7 @@ Build 目录保存在账户内存中，不写入 `runtime-state.json`。读取�
 | --- | --- |
 | `round-robin` | 每个模型记录上次选中的账户与通道，从其后的组合开始 |
 | `fill-first` | 始终从首个可用组合开始 |
+| `balanced` | 组合推进与 `round-robin` 相同（账户池把它存成 `round-robin`）；app 层另让不固定账户的选号先用没有进行中请求的热 Worker，冷启动按今日发送数挑号，并轮换驻留 Worker，见 [README](../README.md#平均调用) |
 
 - 并发槽位、Worker 与 WAA 按账户共享，两个通道占用同一组请求槽位
 - 冷却按通道记录：Playground 为 `<模型>`，Build 为 `build:<模型>`；全局 `*` 冷却对两个通道都生效

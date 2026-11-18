@@ -1,6 +1,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -273,6 +274,16 @@ func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	if len(list) <= 1 {
 		return [2][]string{list, nil}
 	}
+	// 平均调用（见 balanced.go）：前段为今日发送最少的 standbyPreferLimit 个（同分保持原顺序）加上原列表的前 standbyPreferLimit 个
+	// （去重，最多核对 2 × standbyPreferLimit 个），其余保持原顺序；之后照旧按能服务的主用、热门模型个数排前段，同档再按今日发送从少到多。
+	// 原先的列表按 ID 从上次选中的账号往后轮转，上千个备用账号里用得最少的多半不在前 64 个里；只看最少的 64 个又不行：能服务主用模型的号
+	// 还要接主用请求，今日发送天然更多，最少的 64 个往往全是服务不了主用模型的号，为其他模型扩容时启动的 Worker 接不了主用请求，
+	// 而原列表的前段在混合号池里几乎总有能服务的号
+	counts := capacity.manager.balancedUsageCounts()
+	headSize := standbyPreferLimit
+	if counts != nil {
+		list, headSize = balancedStandbyOrder(list, counts, standbyPreferLimit)
+	}
 	if capacity.rankModels == nil {
 		capacity.rankModels = make(map[aistudio.PoolScope]coldRankModels, len(workerPartitions))
 		for _, partition := range workerPartitions {
@@ -283,7 +294,7 @@ func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	if models[aistudio.PoolScopeNormal].empty() && models[aistudio.PoolScopeUltra].empty() {
 		return [2][]string{list, nil}
 	}
-	head := list[:min(standbyPreferLimit, len(list))]
+	head := list[:min(headSize, len(list))]
 	unknown := make(map[aistudio.PoolScope][]string, len(workerPartitions))
 	for _, accountID := range head {
 		if _, checked := capacity.ranks[accountID]; !checked {
@@ -303,9 +314,41 @@ func (capacity *standbyCapacity) preferred(list []string) [2][]string {
 	}
 	ordered := slices.Clone(head)
 	slices.SortStableFunc(ordered, func(left string, right string) int {
-		return compareColdRank(capacity.ranks[left], capacity.ranks[right])
+		if order := compareColdRank(capacity.ranks[left], capacity.ranks[right]); order != 0 || counts == nil {
+			return order
+		}
+		return cmp.Compare(counts[left], counts[right])
 	})
 	return [2][]string{ordered, list[len(head):]}
+}
+
+// balancedStandbyOrder 为平均调用下请求路径挑备用账号的候选顺序（见 standbyCapacity.preferred）：返回重排后的副本与前段长度。
+// 前段为今日发送最少的 limit 个（按发送数从少到多，同分保持原顺序）加上原列表前 limit 个里不在其中的（保持原顺序），其余保持原顺序；
+// 不重复、不丢
+func balancedStandbyOrder(list []string, counts map[string]uint32, limit int) ([]string, int) {
+	if len(list) <= limit {
+		return sortByUsage(list, counts), len(list)
+	}
+	least := leastUsedFirst(list, counts, limit)
+	picked := make(map[string]struct{}, limit)
+	for _, accountID := range least[:limit] {
+		picked[accountID] = struct{}{}
+	}
+	result := make([]string, 0, len(list))
+	result = append(result, least[:limit]...)
+	for _, accountID := range list[:limit] {
+		if _, ok := picked[accountID]; !ok {
+			result = append(result, accountID)
+			picked[accountID] = struct{}{}
+		}
+	}
+	head := len(result)
+	for _, accountID := range list[limit:] {
+		if _, ok := picked[accountID]; !ok {
+			result = append(result, accountID)
+		}
+	}
+	return result, head
 }
 
 func (capacity *standbyCapacity) room(partition aistudio.PoolScope) bool {

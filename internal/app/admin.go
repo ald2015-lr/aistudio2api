@@ -230,6 +230,8 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		ProxyPool:     admin.ipPool().status(),
 		BuildChannel:  buildChannel,
 		Drive:         drive,
+		// 平均调用概况（见 balanced.go）：开启且服务运行时才有，只读 keepWarm 每 30 秒算好的缓存
+		Balanced: admin.workers.balancedStatus(running),
 	}, nil
 }
 

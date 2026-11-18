@@ -78,6 +78,8 @@ func newRuntime(
 		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, cfg.TemporaryChat,
 	)
 	workers.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
+	// 平均调用（ROUTING_STRATEGY=balanced，见 balanced.go）：启动流程不经过 applyLiveSettings，这里写一次开关
+	workers.setBalanced(cfg.RoutingStrategy == aistudio.RoutingBalanced)
 	// 按需替换与扩容的启动宽限、每分区每分钟的替换上限（N6，见 replace_rate.go）
 	workers.replaceGrace.Store(int64(rotationWarmupGrace))
 	workers.replacements.limit.Store(replacementsPerMinute)
@@ -123,6 +125,9 @@ func newRuntime(
 	badAccounts := openBadAccountMemory(badAccountPath(), requests)
 	workers.badAccounts.Store(badAccounts)
 	service.egress.badAccount = badAccounts.bad
+	// 今日发送数（平均调用用，见 quota_usage_store.go）：文件是今天（太平洋时间）的才并回账户池；只在平均调用开启时写盘
+	quotaUsage := openQuotaUsageStore(quotaUsagePath(), pool, requests)
+	workers.balancedState.store.Store(quotaUsage)
 	// 登录复核（见 auth_recheck.go）：租约路径上的上游 401 先记疑似登录失效、写短冷却，用磁盘 Cookie 复核仍是 401 才标需要登录
 	service.authRecheck = newAuthRecheck(service)
 	if service.authRecheck != nil {
@@ -205,6 +210,10 @@ func newRuntime(
 		if flushErr := badAccounts.close(); flushErr != nil {
 			requests.log("service", "WARN", "坏号记忆写入失败 | 错误="+flushErr.Error())
 		}
+		// 今日发送数平时由 keepWarm 每 30 秒写一次（只在平均调用开启时），停止服务时已写过（finishStop）；关闭时再兜底写出（没有变化时是空操作）
+		if flushErr := quotaUsage.close(pool, workers.balancedOn()); flushErr != nil {
+			requests.log("service", "WARN", "今日发送数写入失败 | 错误="+flushErr.Error())
+		}
 		// Drive 授权状态记录平时最多每 30 秒写一次，关闭时立即写出；之后的变化不再写盘（新一代生成服务另开一份）
 		pooled.SetDriveObserver(nil)
 		if flushErr := driveStates.close(); flushErr != nil {
@@ -235,6 +244,10 @@ type accountWorkerManager struct {
 	replaceGrace atomic.Int64
 	// badAccounts 为坏号记忆（连续裸限流的账号移出冷启动候选，见 bad_accounts.go）；只在 newRuntime 挂上，测试构造的管理器为空（不调整候选）
 	badAccounts atomic.Pointer[badAccountMemory]
+	// balanced 为平均调用开关（ROUTING_STRATEGY=balanced，启动时与热更新时由 setBalanced 写入），balancedState 为它的今日发送数缓存、
+	// 状态页概况与写盘记录（见 balanced.go）；测试构造的管理器默认关闭
+	balanced      atomic.Bool
+	balancedState balancedState
 	// bootstrapCache 为预热概况的短时缓存（见 bootstrapSummary）；bootstrapVersion 为计算前读到的号池规则版本
 	bootstrapMu      sync.Mutex
 	bootstrapCache   aistudio.BootstrapSummary
@@ -3345,6 +3358,10 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	if err := service.driveStates.save(); err != nil && service.requests != nil {
 		service.requests.log("service", "WARN", "Drive 授权状态记录写入失败 | 错误="+err.Error())
 	}
+	// 今日发送数同理（平均调用开启时平时每 30 秒写一次，见 quota_usage_store.go）：停止服务时立即写出，新一代并回的是旧一代最后的计数
+	if err := service.workers.saveQuotaUsage(); err != nil && service.requests != nil {
+		service.requests.log("service", "WARN", "今日发送数写入失败 | 错误="+err.Error())
+	}
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.dataContext = nil
@@ -3987,11 +4004,30 @@ func (service *trackedService) acquireLease(
 			egressLimited: groups.EgressLimited,
 		}
 		if len(warmAvailable) > 0 {
+			// 平均调用（见 balanced.go）：不固定账户的选号先在没有进行中请求的热 Worker（WarmReady）里选，取不到再用全部热 Worker，
+			// 每一层内部仍按轮询；轮询只按账号 ID 轮转、不看进行中的请求数，会把新请求叠到已经有请求的号上。热 Worker 都空闲或都有请求时
+			// 两层相同，不多试一次
+			idleFirst := !fixedAccount && len(groups.WarmReady) > 0 && len(groups.WarmAvailable) > 0 && service.workers.balancedOn()
 			// 不在主用与热门模型里的请求先用对这些模型是死槽位的热 Worker（它们本来就服务不了主用模型），
 			// 取不到再用其余热 Worker：还能服务主用模型的 Worker 的租约位留给主用模型
 			if dead := service.deadSlotWorkers(selection, fixedAccount, warmAvailable); len(dead) > 0 {
 				candidate := selection
+				if idleFirst {
+					if idle := intersectAccountIDs(dead, groups.WarmReady); len(idle) > 0 && len(idle) < len(dead) {
+						candidate.AllowedAccountIDs = idle
+						if lease, _, _ := service.pool.TryAcquireFor(ctx, candidate); lease != nil {
+							return lease, nil
+						}
+					}
+				}
 				candidate.AllowedAccountIDs = dead
+				if lease, _, _ := service.pool.TryAcquireFor(ctx, candidate); lease != nil {
+					return lease, nil
+				}
+			}
+			if idleFirst {
+				candidate := selection
+				candidate.AllowedAccountIDs = groups.WarmReady
 				if lease, _, _ := service.pool.TryAcquireFor(ctx, candidate); lease != nil {
 					return lease, nil
 				}

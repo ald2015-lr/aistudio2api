@@ -17,6 +17,7 @@ import type {
   Account,
   AdminLog,
   AdminEvent,
+  BalancedPartition,
   EgressStatus,
   Model,
   Cooldown,
@@ -199,6 +200,41 @@ const driveLine = computed(() => {
     }),
     warn: drive.available + drive.unknown === 0,
   }
+})
+
+// balancedLines 为侧栏的平均调用行（ROUTING_STRATEGY=balanced，开启且服务运行时服务端才返回）：普通分区一行（只有 Ultra 账号的部署不显示），
+// Ultra 分区有可调度账号时再一行。每行为今日（太平洋时间）发送数的最少/中位/最多与已用账号数，有进行中的轮换或暂停原因时追加；
+// 近 1 小时的轮换数是两个分区合计，只写在第一行。悬停看口径说明。暂停原因是服务端的中文说明，原样显示
+const balancedLines = computed(() => {
+  const balanced = status.value?.balanced
+  if (balanced === undefined) return []
+  const parts: Array<{ key: string; ultra: boolean; spread: BalancedPartition }> = []
+  if (balanced.normal.accounts > 0 || balanced.ultra.accounts === 0) {
+    parts.push({ key: 'normal', ultra: false, spread: balanced.normal })
+  }
+  if (balanced.ultra.accounts > 0) parts.push({ key: 'ultra', ultra: true, spread: balanced.ultra })
+  return parts.map(({ key, ultra, spread }, index) => ({
+    key,
+    ultra,
+    paused: !!spread.paused_reason,
+    segments: [
+      t(ultra ? 'app.balancedUltraTitle' : 'app.balancedTitle'),
+      tf('app.balancedSpread', { min: spread.min, median: spread.median, max: spread.max }),
+      tf('app.balancedUsed', { used: spread.used, accounts: spread.accounts }),
+      ...(index === 0 ? [tf('app.balancedRotations', { count: balanced.rotations_1h })] : []),
+      ...(spread.rotating > 0 ? [tf('app.balancedRotating', { count: spread.rotating })] : []),
+      ...(spread.paused_reason ? [tf('app.balancedPaused', { reason: spread.paused_reason })] : []),
+    ],
+    detail: tf('app.balancedDetail', {
+      day: balanced.quota_day,
+      min: spread.min,
+      median: spread.median,
+      p90: spread.p90,
+      max: spread.max,
+      gap: balanced.gap,
+      today: balanced.rotations_today,
+    }),
+  }))
 })
 
 // ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
@@ -834,6 +870,23 @@ onUnmounted(() => {
             >
               {{ tf('app.workersUnschedulable', { count: status.workers.unschedulable ?? 0 }) }}
             </span>
+          </div>
+          <!-- 平均调用：窄侧栏里按段换行，不截断 -->
+          <div
+            v-for="line in balancedLines"
+            :key="`balanced:${line.key}`"
+            v-tooltip="line.detail"
+            class="flex flex-wrap items-baseline gap-x-1"
+            :class="
+              line.paused ? 'text-yellow-400' : line.ultra ? 'text-fuchsia-300' : 'text-emerald-300'
+            "
+          >
+            <span
+              v-for="(segment, index) in line.segments"
+              :key="index"
+              class="max-w-full min-w-0 break-words"
+              >{{ index > 0 ? `· ${segment}` : segment }}</span
+            >
           </div>
           <!-- 模型名过长时数量换到下一行，不被截断 -->
           <div

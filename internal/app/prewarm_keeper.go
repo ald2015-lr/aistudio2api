@@ -19,6 +19,8 @@ const (
 	keepWarmInterval = 5 * time.Second
 	// warmFailureBackoff 为预热失败的账户在此期间内不再被自动预热
 	warmFailureBackoff = 5 * time.Minute
+	// warmFailureMemory 为启动失败记录保留的时长（成功一次即清除）：平均调用把这段时间内失败过的号排在冷启动候选最后（见 rankColdCandidates）
+	warmFailureMemory = balancedColdFailHold
 	// cleanupRetryFirst、cleanupRetryMax 为清理失败（浏览器关不掉、运行时租约释放失败）的账户后台重试间隔
 	cleanupRetryFirst = 30 * time.Second
 	cleanupRetryMax   = 10 * time.Minute
@@ -59,6 +61,8 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 		lastRotation = time.Now()
 		service.rotateCooledWorkers(dataContext)
 	}
+	// 平均调用（见 balanced.go）：自带 30 秒节奏，未开启时什么也不做
+	service.balancedPass(dataContext, time.Now())
 	workers := service.workers
 	workers.sweepFailedWorkers(dataContext)
 	workers.retryPendingCleanup()
@@ -90,13 +94,22 @@ func (manager *accountWorkerManager) clearWarmFailure(accountID string) {
 
 // recentWarmFailures 返回冷却期内预热失败过的账户，并顺带清理过期记录
 func (manager *accountWorkerManager) recentWarmFailures(now time.Time) map[string]struct{} {
+	return manager.warmFailuresWithin(now, warmFailureBackoff)
+}
+
+// warmFailuresWithin 返回 within 之内预热（或替补）启动失败过、之后没有成功过的账户，并顺带清理超过 warmFailureMemory 的记录。
+// 记录保留 warmFailureMemory（平均调用把这段时间内失败过的号排在冷启动候选最后，见 rankColdCandidates）；
+// 只按 warmFailureBackoff 读的地方（recentWarmFailures）与原来一致
+func (manager *accountWorkerManager) warmFailuresWithin(now time.Time, within time.Duration) map[string]struct{} {
 	manager.warmFailMu.Lock()
 	defer manager.warmFailMu.Unlock()
 	recent := make(map[string]struct{}, len(manager.warmFailures))
 	for accountID, failedAt := range manager.warmFailures {
-		if now.Sub(failedAt) < warmFailureBackoff {
+		age := now.Sub(failedAt)
+		if age < within {
 			recent[accountID] = struct{}{}
-		} else {
+		}
+		if age >= max(warmFailureBackoff, warmFailureMemory) {
 			delete(manager.warmFailures, accountID)
 		}
 	}
@@ -251,9 +264,37 @@ func compareColdRank(left coldRank, right coldRank) int {
 // rankColdCandidates 整理预热与替补的冷启动候选：先去掉坏号、把近期成功过的账号整组排前（见 orderColdCandidates），
 // 再按能服务的分区主用模型个数、其次热门模型个数稳定排序（见 preferUncooled），近期成功只在同分时优先。两步不能反过来：近期成功过的账号
 // 多半正是用到冷却的（如对主用模型单模型 403 无权限、仍能服务其他模型），先按能否服务排序、再把近期成功的整组前移，
-// 它们会排在能服务主用模型、从没用过的账号前面，预热一直启动对主用模型冷却的账号
+// 它们会排在能服务主用模型、从没用过的账号前面，预热一直启动对主用模型冷却的账号。
+// 平均调用开启时（见 balanced.go）两步之间再按今日发送数从少到多稳定排序：最终顺序为能服务的主用模型数↓、热门模型数↓、今日发送↑、
+// 近期成功优先、原顺序。今日发送只在同一档里起作用：刚被轮换换下的号比接替它的号多发了至少 50 次，同档时排在接替的号后面；
+// 能服务的模型更多的号仍排在前面，所以轮换只换下能服务的主用、热门模型不比接替的号多的驻留号（见 pickRotation），
+// 否则它关掉后补位的预热或替补又会先挑回它。
+// 平均调用开启时，balancedColdFailHold 内启动失败过（之后没有成功）的号整组排在最后（组内顺序同上）：今日发送最少的往往正是一个
+// 从没启动成功过的号（固定代理失效、启动超时等），预热失败记录只挡 5 分钟，到期后它又排第一，接替、预热、死槽位替补一直先挑它，
+// 平均调用轮换每次都以“替补没有启动”取消，整个分区不再轮换。原先近期成功的号整组排前，坏号自然在健康号后面，不需要这一步
 func (manager *accountWorkerManager) rankColdCandidates(partition aistudio.PoolScope, accountIDs []string) []string {
-	return manager.preferUncooled(partition, manager.orderColdCandidates(accountIDs))
+	ordered := manager.orderColdCandidates(accountIDs)
+	counts := manager.balancedUsageCounts()
+	if counts == nil {
+		return manager.preferUncooled(partition, ordered)
+	}
+	ordered = manager.preferUncooled(partition, sortByUsage(ordered, counts))
+	failed := manager.warmFailuresWithin(time.Now(), balancedColdFailHold)
+	if len(failed) == 0 {
+		return ordered
+	}
+	result := make([]string, 0, len(ordered))
+	for _, accountID := range ordered {
+		if _, ok := failed[accountID]; !ok {
+			result = append(result, accountID)
+		}
+	}
+	for _, accountID := range ordered {
+		if _, ok := failed[accountID]; ok {
+			result = append(result, accountID)
+		}
+	}
+	return result
 }
 
 // sweepDeadWorkers 淘汰预热池中全局长时间冷却（每日限额冻结整个账号）的空闲 Worker。这样的 Worker 对任何模型都是死槽位，

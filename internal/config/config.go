@@ -132,9 +132,11 @@ type Config struct {
 	AccountRPMLimit int `json:"account_rpm_limit"`
 	// StudioKeyDelaySeconds 为批量获取 AI Studio API Key 时相邻两个账户之间的间隔（STUDIO_KEY_DELAY，秒，默认 30，0 到 3600）；
 	// 获取任务每次等待前重新读取，保存后立即生效
-	StudioKeyDelaySeconds int      `json:"studio_key_delay"`
-	RoutingStrategy       string   `json:"routing_strategy"`
-	UpstreamChannels      []string `json:"upstream_channels"`
+	StudioKeyDelaySeconds int `json:"studio_key_delay"`
+	// RoutingStrategy 为账户选择策略（ROUTING_STRATEGY）：round-robin（默认）、fill-first 或 balanced（平均调用：账户池内与 round-robin 相同，
+	// 另在 app 层让流量摊到更多账号上，见 app/balanced.go）；保存后立即生效
+	RoutingStrategy  string   `json:"routing_strategy"`
+	UpstreamChannels []string `json:"upstream_channels"`
 	// StreamPlaygroundModels 为流式请求优先走 Playground 的模型 ID（STREAM_PLAYGROUND_MODELS，逗号分隔，默认为空）：
 	// 列表中的模型流式请求先不等待地取 Playground 账号，没有立即可用的就改用其他通道；为空时 Playground 与 Build 照常轮询
 	StreamPlaygroundModels []string `json:"stream_playground_models"`

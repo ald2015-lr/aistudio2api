@@ -501,7 +501,7 @@ func TestDrainRetaggedOnIncludePro(t *testing.T) {
 				manager.drainCredit(aistudio.PoolScopeNormal, nil), manager.drainCredit(aistudio.PoolScopeUltra, nil), normal, ultra)
 		}
 	}
-	if manager.startDrain(includeProAccount, aistudio.PoolScopeNormal) == nil {
+	if manager.startDrain(includeProAccount, aistudio.PoolScopeNormal, false) == nil {
 		t.Fatal("应能开始排空")
 	}
 	expect("关闭时开始排空", 1, 0)
@@ -511,14 +511,14 @@ func TestDrainRetaggedOnIncludePro(t *testing.T) {
 	manager.clearDrain(includeProAccount)
 	expect("清除排空", 0, 0)
 	// retirePass 一轮开始时按旧成员算出分区、切换后才开始排空：不写入，账号也没有被标记排空
-	if manager.startDrain(includeProAccount, aistudio.PoolScopeNormal) != nil {
+	if manager.startDrain(includeProAccount, aistudio.PoolScopeNormal, false) != nil {
 		t.Fatal("账号已换到 Ultra 分区，按旧分区参数不应开始排空")
 	}
 	expect("开启后用旧分区参数开始排空", 0, 0)
 	if pool.Draining(includeProAccount) {
 		t.Fatal("没有开始排空时账号不应被标记排空")
 	}
-	if manager.startDrain(includeProAccount, aistudio.PoolScopeUltra) == nil {
+	if manager.startDrain(includeProAccount, aistudio.PoolScopeUltra, false) == nil {
 		t.Fatal("按新分区应能再次开始排空")
 	}
 	expect("开启后用新分区参数开始排空", 0, 1)
@@ -563,7 +563,7 @@ func TestReplacementFollowsIncludePro(t *testing.T) {
 		manager, pool := newManager(t)
 		release := holdLease(t, pool, includeProAccount)
 		defer release()
-		drain := manager.startDrain(includeProAccount, aistudio.PoolScopeNormal)
+		drain := manager.startDrain(includeProAccount, aistudio.PoolScopeNormal, false)
 		if drain == nil {
 			t.Fatal("应能开始排空")
 		}

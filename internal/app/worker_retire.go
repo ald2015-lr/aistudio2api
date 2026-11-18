@@ -26,7 +26,9 @@ import (
 // 不可调度的驻留 Worker（账号需要登录、已停用、没有模型目录、需要验证账号的整户暂停生效中等，见 worker_unschedulable.go）共用这张
 // 登记表与淘汰循环，按释放处理：空闲即关，忙碌等请求结束，不排空、不要求可接替账户、不走排空超时，关闭后只补齐预热。
 // 需要验证账号的整户暂停虽是全局冷却，但最长 30 天、只能靠用户操作解除，“冷却到期后能立即服务”对它不成立，因此不按冷却淘汰保留；
-// 死槽位的补登记、冷却清扫与冷却轮换都跳过不可调度的账号（dropUnschedulable），只走释放
+// 死槽位的补登记、冷却清扫与冷却轮换都跳过不可调度的账号（dropUnschedulable），只走释放。
+// 平均调用的驻留 Worker 轮换（见 balanced_rotation.go）同样写在这张表里（rotation 登记），由 retirePass 在核对冷却之前单独处理；
+// 冷却或不可调度登记落到同一账号时轮换登记转成对应类型（冷却登记接管），交给原来的流程
 
 const (
 	// retireDebounce 为淘汰循环两轮之间的最短间隔：租约释放很频繁，忙碌中的登记不必每次都重试
@@ -50,6 +52,13 @@ type retirement struct {
 	// unschedulable 为不可调度登记的原因（需要登录、已停用、没有模型目录等，见 worker_unschedulable.go），空为冷却登记。
 	// 不可调度登记按释放处理（见 retirePass）；账号恢复可调度后清空，原先另有冷却登记的照常按冷却核对，只有不可调度登记的随后放弃
 	unschedulable string
+	// rotation 为平均调用轮换登记（见 balanced_rotation.go）：models 为空，但不按全局冷却处理（retirePass 在核对冷却之前交给 advanceRotation）；
+	// rotationSoft 为先启后停（先软排空、接替就绪后才排空），否则为空闲直接换；rotationUsage、rotationTarget 为登记时被换下的号与接替的号的
+	// 今日发送数，只用于日志。冷却登记（registerRetirement）或不可调度登记（registerUnschedulable、retirePass 核对到不可调度）落到同一账号时清除
+	rotation       bool
+	rotationSoft   bool
+	rotationUsage  uint32
+	rotationTarget uint32
 }
 
 // global 判断登记是否为全局冷却
@@ -128,7 +137,17 @@ func (manager *accountWorkerManager) registerRetirement(accountID string, modelI
 		manager.retirements = make(map[string]*retirement)
 	}
 	if existing := manager.retirements[accountID]; existing != nil {
+		takenOver := false
 		switch {
+		case existing.rotation:
+			// 平均调用轮换中途变成死槽位（登记的 models 为空，必须在 global 之前判断，否则会被当成全局冷却原样留下）：
+			// 转成这次范围的冷却登记，交给原来的冷却淘汰；软排空由 retirePass 立即改为普通排空
+			existing.rotation, existing.rotationSoft = false, false
+			existing.models, existing.retryAt = nil, time.Time{}
+			if modelID != "" {
+				existing.models = []string{modelID}
+			}
+			added, takenOver = true, true
 		case existing.global():
 		case modelID == "":
 			existing.models, added = nil, true
@@ -138,6 +157,10 @@ func (manager *accountWorkerManager) registerRetirement(accountID string, modelI
 			added = true
 		}
 		manager.retireMu.Unlock()
+		if takenOver {
+			manager.logRotationCancel(accountID, rotationCancelTakenOver)
+			manager.wakeRetire()
+		}
 		return true, added
 	}
 	entry := &retirement{since: time.Now()}
@@ -167,11 +190,17 @@ func (manager *accountWorkerManager) registerUnschedulable(accountID string, rea
 		manager.retirements = make(map[string]*retirement)
 	}
 	if existing := manager.retirements[accountID]; existing != nil {
+		// 平均调用轮换登记改为不可调度登记：恢复可调度后按全局冷却核对（没有冷却即放弃），不会再继续一次过时的轮换
+		takenOver := existing.rotation
+		existing.rotation, existing.rotationSoft = false, false
 		if existing.unschedulable == "" {
 			existing.retryAt, added = time.Time{}, true
 		}
 		existing.unschedulable = reason
 		manager.retireMu.Unlock()
+		if takenOver {
+			manager.logRotationCancel(accountID, rotationCancelTakenOver)
+		}
 		if added {
 			manager.wakeRetire()
 		}
@@ -184,13 +213,21 @@ func (manager *accountWorkerManager) registerUnschedulable(accountID string, rea
 	return true, true
 }
 
-// setUnschedulableReason 写回登记的不可调度原因（retirePass 按本轮的账户状态核对后调用；空为已恢复可调度）；没有登记时不做任何事
-func (manager *accountWorkerManager) setUnschedulableReason(accountID string, reason string) {
+// setUnschedulableReason 写回登记的不可调度原因（retirePass 按本轮的账户状态核对后调用；空为已恢复可调度）；没有登记时不做任何事。
+// 平均调用轮换登记的账号变得不可调度时同 registerUnschedulable 一样转成不可调度登记，返回是否发生了这种转换
+func (manager *accountWorkerManager) setUnschedulableReason(accountID string, reason string) bool {
 	manager.retireMu.Lock()
-	if entry := manager.retirements[accountID]; entry != nil {
-		entry.unschedulable = reason
+	defer manager.retireMu.Unlock()
+	entry := manager.retirements[accountID]
+	if entry == nil {
+		return false
 	}
-	manager.retireMu.Unlock()
+	entry.unschedulable = reason
+	if reason == "" || !entry.rotation {
+		return false
+	}
+	entry.rotation, entry.rotationSoft = false, false
+	return true
 }
 
 // wakeRetire 唤醒淘汰循环；没有登记时不唤醒，重复唤醒合并
@@ -227,11 +264,14 @@ func (manager *accountWorkerManager) retirementCount() int {
 	return int(manager.retirePending.Load())
 }
 
-// retirementCounts 按分区返回待淘汰登记数（供状态接口显示）
+// retirementCounts 按分区返回待淘汰登记数（供状态接口显示）；平均调用轮换登记不算（单独统计，见 balancedRotationStats）
 func (manager *accountWorkerManager) retirementCounts(ultra map[string]struct{}) (normal int, ultraCount int) {
 	manager.retireMu.Lock()
 	defer manager.retireMu.Unlock()
-	for accountID := range manager.retirements {
+	for accountID, entry := range manager.retirements {
+		if entry.rotation {
+			continue
+		}
 		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
 			ultraCount++
 		} else {
@@ -322,7 +362,10 @@ func (manager *accountWorkerManager) retirePass() int {
 	pendingIn := make(map[aistudio.PoolScope]int, len(workerPartitions))
 	for index := range candidates {
 		candidates[index].partition = partitionOf(candidates[index].accountID, ultra)
-		pendingIn[candidates[index].partition]++
+		// 轮换登记不按可接替账户核对（接替的号在登记时已按替补挑法选出），不计入
+		if !candidates[index].entry.rotation {
+			pendingIn[candidates[index].partition]++
+		}
 	}
 	occupiedIn := func(partition aistudio.PoolScope) map[string]struct{} {
 		if held, ok := occupied[partition]; ok {
@@ -365,8 +408,11 @@ func (manager *accountWorkerManager) retirePass() int {
 		// 旧请求或独占操作，空闲即关；不核对可接替账户、不排空、不走下面的排空超时分支。账号已恢复可调度（验证通过、重新启用、
 		// 目录恢复）时撤销不可调度登记，原先另有冷却登记的照常按冷却核对，没有的随后放弃
 		release, unschedulable := candidate.entry.stillUnschedulable(states[accountID])
-		if release.unschedulable != candidate.entry.unschedulable {
-			manager.setUnschedulableReason(accountID, release.unschedulable)
+		if release.unschedulable != candidate.entry.unschedulable && manager.setUnschedulableReason(accountID, release.unschedulable) {
+			manager.logRotationCancel(accountID, rotationCancelTakenOver)
+		}
+		if unschedulable {
+			release.rotation, release.rotationSoft = false, false
 		}
 		candidate.entry = release
 		if unschedulable {
@@ -386,6 +432,24 @@ func (manager *accountWorkerManager) retirePass() int {
 			}
 			continue
 		}
+		// 平均调用轮换登记（models 为空）不按冷却核对，否则会被当成“冷却已解除”直接放弃（见 advanceRotation）
+		if candidate.entry.rotation {
+			candidate.drain = manager.drainOf(accountID)
+			if !manager.advanceRotation(now, candidate, account, states[accountID].Busy) || !manager.tryReserveVictim(accountID) {
+				continue
+			}
+			// 选中之前其他路径可能刚关掉它（见上面不可调度的分支）
+			if !account.warm.Load() {
+				manager.releaseVictim(accountID)
+				manager.dropRetirement(accountID)
+				continue
+			}
+			victims = append(victims, candidate)
+			if len(victims) >= max(manager.warmConcurrencyValue(), 1) {
+				break
+			}
+			continue
+		}
 		// 只要登记里还有一个模型（或全局）仍长时间冷却，账号就仍是死槽位；日志只写仍在冷却的范围
 		cooling, ok := candidate.entry.stillCooling(manager.pool, accountID)
 		if !ok {
@@ -399,6 +463,10 @@ func (manager *accountWorkerManager) retirePass() int {
 		partition := candidate.partition
 		busy := states[accountID].Busy
 		candidate.drain = manager.drainOf(accountID)
+		// 平均调用轮换的软排空被冷却登记接管（见 registerRetirement）：立即改为普通排空，死槽位不再接不固定账户的新请求
+		if candidate.drain != nil && candidate.drain.soft.Load() && !manager.hardenDrain(accountID, candidate.drain) {
+			candidate.drain = manager.drainOf(accountID)
+		}
 		if candidate.drain != nil {
 			// 已在排空：替补在排空开始时已经启动，不再核对可接替账户；空闲后照常淘汰
 			if busy {
@@ -431,7 +499,7 @@ func (manager *accountWorkerManager) retirePass() int {
 			if busy {
 				// 账号在取成员快照之后换了分区（ULTRA_INCLUDE_PRO 切换）时 startDrain 同样返回 nil：上面的可接替账户与能否排空
 				// 都是按旧分区判断的，不写入排空，登记没有推迟，下一轮按新的成员快照重新判断
-				drain := manager.startDrain(accountID, partition)
+				drain := manager.startDrain(accountID, partition, false)
 				if drain == nil {
 					continue
 				}
@@ -472,10 +540,14 @@ func (manager *accountWorkerManager) retirePass() int {
 }
 
 // finishRetirement 关闭一个已选中的待淘汰 Worker；调用方已 tryReserveVictim。关闭后补齐预热，并按 replacementsFor 在分区内启动替补
-// （排空开始时的替补已启动或仍在启动时不重复补）。不可调度登记见 finishRelease
+// （排空开始时的替补已启动或仍在启动时不重复补）。不可调度登记见 finishRelease，平均调用轮换登记见 finishRotation
 func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate) {
 	if victim.entry.unschedulable != "" {
 		manager.finishRelease(victim)
+		return
+	}
+	if victim.entry.rotation {
+		manager.finishRotation(victim)
 		return
 	}
 	accountID := victim.accountID
@@ -729,7 +801,13 @@ func (manager *accountWorkerManager) pickIdleVictimFor(
 	return manager.pickIdleVictimWith(excludeID, modelID, deadModels, mode, partition, idleBefore, false)
 }
 
-// pickIdleVictimWith 为淘汰选号的实现；grace 为真时不选就绪不到 rotationWarmupGrace 的 Worker（不可调度与死槽位除外）
+// pickIdleVictimWith 为淘汰选号的实现；grace 为真时不选就绪不到 rotationWarmupGrace 的 Worker（不可调度与死槽位除外）。
+// 同档（不可调度、死槽位、冷却中、服务不了、健康）时先关最久未用的；平均调用开启时先关今日发送多的，同数再比最久未用。
+// 软排空（平均调用轮换的先启后停）中的号一律不选，平均调用开启时普通排空中的号也不选：它们的槽位已经算作让给替补（让出额度），
+// 选了它，按需替换（或现场回收之后的扩容）随后在它空出的槽位里再发布一个 Worker，加上已占着让出额度的替补，一个槽位被用了两次，
+// 分区停在峰值以上、又没有排空可以收回（轮换登记随后因账号不再驻留被删掉，不进冷却期、不计轮换数）。平均调用下同档时今日发送多的
+// 先关，用得最多的被换下的号正好排在最前；软阶段又要维持一次冷启动的时间。它们由淘汰循环在替补就绪、手上的请求结束后关闭。
+// 未开启平均调用时普通排空照旧可选（软排空只在平均调用下出现，关闭时不会有）
 func (manager *accountWorkerManager) pickIdleVictimWith(
 	excludeID string, modelID string, deadModels []string, mode victimMode, partition aistudio.PoolScope, idleBefore time.Time, grace bool,
 ) string {
@@ -737,11 +815,17 @@ func (manager *accountWorkerManager) pickIdleVictimWith(
 	// 启动宽限只在 newRuntime 打开（replaceGrace 为 rotationWarmupGrace）；测试直接构造的管理器为 0，替换照旧立即可选
 	replaceGrace := time.Duration(manager.replaceGrace.Load())
 	grace = grace && replaceGrace > 0
+	// 平均调用开启时同档的今日发送多的先关（见 victimTieBefore），未开启时为 nil
+	usage, balanced := manager.balancedUsageCounts(), manager.balancedOn()
+	drains := manager.drainSnapshot()
 	warm := manager.warmAccountIDsIn(partition)
 	candidates := make([]string, 0, len(warm))
 	readyAt := make(map[string]time.Time, len(warm))
 	for _, accountID := range warm {
 		if accountID == excludeID || manager.victimReserved(accountID) {
+			continue
+		}
+		if drain := drains[accountID]; drain != nil && (drain.soft.Load() || balanced) {
 			continue
 		}
 		manager.mu.RLock()
@@ -821,7 +905,7 @@ func (manager *accountWorkerManager) pickIdleVictimWith(
 			continue
 		}
 		if selected == "" || rank(state) > rank(selectedState) ||
-			rank(state) == rank(selectedState) && state.LastUsed.Before(selectedState.LastUsed) {
+			rank(state) == rank(selectedState) && victimTieBefore(usage, accountID, state, selected, selectedState) {
 			selected, selectedState = accountID, state
 		}
 	}

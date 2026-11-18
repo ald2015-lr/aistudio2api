@@ -35,7 +35,7 @@ func TestPrimarySupplyCounts(t *testing.T) {
 	env := newDrainEnv(t, accounts, 3, 4)
 	env.promote(t, accounts[:3]...)
 	// a 能服务主用模型；b 排空中（主用模型也冷却，排空中的不计入 cooling）；c 驻留但主用模型已冷却
-	if env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal) == nil {
+	if env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal, false) == nil {
 		t.Fatal("b 应进入排空")
 	}
 	defer env.manager.clearDrain(accounts[1])

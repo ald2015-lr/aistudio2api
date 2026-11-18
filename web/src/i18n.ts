@@ -222,7 +222,7 @@ const zhCN = {
   'settings.warmStartupConcurrency': '启动预热并发',
   'settings.perAccountConcurrency': '单账户请求并发',
   'settings.workerPartitionHelp':
-    '常驻 Worker 数与峰值 Worker 上限只约束普通号池；Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为两个峰值之和。启动预热并发与单账户请求并发两个号池共用。',
+    '常驻 Worker 数与峰值 Worker 上限只约束普通号池；Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为两个峰值之和。启动预热并发与单账户请求并发两个号池共用。单账户请求并发是硬上限：同一账号同时进行的请求不超过此数（所有请求类型，含流式与非流式、Playground 与 Build、countTokens 与文件操作）；修改后立即生效，调小时已在进行的请求照常跑完。',
   'settings.accountRpmLimit': '单账号每分钟请求上限',
   'settings.accountRpmLimitHelp':
     '每个账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型、两个通道共用）；满了就算忙碌，请求换到其他账号，热 Worker 都满时启动新的 Worker；只统计本服务，上游的 429 冷却仍然兜底；默认 10，比 12 留出余量；0 表示关闭；修改后立即生效。',
@@ -244,8 +244,9 @@ const zhCN = {
   'settings.routingStrategy': '账户选择策略',
   'settings.routingRoundRobin': '轮询',
   'settings.routingFillFirst': '账号粘性优先',
+  'settings.routingBalanced': '平均调用',
   'settings.routingHelp':
-    '轮询依次分配请求；粘性优先持续使用首个可用账户，达到并发上限或不可用时切换。',
+    '轮询依次分配请求；粘性优先持续使用首个可用账户，达到并发上限或不可用时切换。平均调用让高并发的流量尽量平均落在所有账号上：按每个账号今天（太平洋时间，北京时间 15 点或 16 点清零）发出的请求数，运行中的 Worker 之间先给手上没有请求的号，预热、替补与扩容优先启动今天用得少的号；在跑的号比接替它的备用号多发 50 次（且至少已服务 5 分钟）就换下，先启后停：先在后台启动接替的号，旧号接完手上的请求再关，不打断任何请求。代价是浏览器冷启动会增加（默认每个分区每分钟最多换 1 次，峰值不小于 20 时 2 次；出口被限流时暂停）。排空名额只有 1 个的分区（默认的 Ultra 分区、峰值小于 8 的普通分区）只能在号空闲时换，高负载时基本不轮换，要轮换就把该分区的峰值调到 8 或以上。同时在线的号仍只有峰值 Worker 那么多，其余账号轮流上岗。修改后立即生效，改回轮询也立即停止。',
   'settings.waaBackend': 'WAA 后端',
   'settings.waaBackendCamoufox': 'Camoufox 浏览器',
   'settings.waaBackendGo': '纯 Go',
@@ -713,6 +714,15 @@ const zhCN = {
   'app.ultraWorkersDetail':
     'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 不可调度 {unschedulable} · 预热目标 {target} · 峰值 {max}',
   'app.authRecheckLine': '登录复核 · 疑似失效 {suspects} · 10分钟新增需要登录 {recent} · 坏号 {bad}',
+  'app.balancedTitle': '平均调用',
+  'app.balancedUltraTitle': 'Ultra 平均调用',
+  'app.balancedSpread': '今日 最少/中位/最多 {min}/{median}/{max}',
+  'app.balancedUsed': '已用 {used}/{accounts} 个号',
+  'app.balancedRotations': '近 1 小时轮换 {count} 次',
+  'app.balancedRotating': '轮换中 {count}',
+  'app.balancedPaused': '暂停：{reason}',
+  'app.balancedDetail':
+    '平均调用（ROUTING_STRATEGY=balanced）：今日（太平洋时间 {day}，北京时间 15 点或 16 点清零）每个可调度账号发往上游的生成请求数，最少 {min} · 中位 {median} · p90 {p90} · 最多 {max}；已用为今天发过请求的账号数 / 可调度账号数（需要验证账号的整户暂停、需要登录等不算）。在跑的号比接替它的备用号多发 {gap} 次就换下（先启后停，不打断请求）；近 1 小时与本额度日的轮换次数为两个分区合计，本额度日已轮换 {today} 次。每 30 秒统计一次，只统计本服务。每个账号的明细见用量页“分项排行”里按“账户”排的一栏：那边按服务器本地日、每个请求记一行，这里按太平洋日、每次发送都计（含换号重试、续写的每一轮与重新生成），两边的数不一样',
   'app.driveLine': 'Drive 授权 · 可用 {available} · 不可用 {unavailable} · 未知 {unknown}',
   'app.driveDetail':
     '启用账户的 Google Drive 授权状态：可用为换到过 Drive token 或经本服务登录时完成了 Drive 授权，不可用为没有 Drive 授权（多半是只导入 Cookie 的账户），未知为还没试过。gemini-omni 的视频输入（及不能内联的图片）要先上传到账户的 Drive，只交给可用或未知的账户，只剩不可用的账户时返回 400；PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF 图片按官网直接内联发送（GIF 转为 PNG），不需要 Drive，任何账户都能处理。经本服务的登录流程登录（账户页“登录”或“添加账户”）会完成官网的 Drive 授权，随即记为可用。可用、不可用各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，重启后沿用；更新认证文件后重新探测，管理验证通过时清除不可用记录',
@@ -1370,7 +1380,7 @@ const en: Record<TranslationKey, string> = {
   'settings.warmStartupConcurrency': 'Startup prewarm concurrency',
   'settings.perAccountConcurrency': 'Concurrent requests per account',
   'settings.workerPartitionHelp':
-    'Resident workers and the active worker limit apply to the normal pool only. Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of both limits. Startup prewarm concurrency and per-account concurrency are shared by both pools.',
+    'Resident workers and the active worker limit apply to the normal pool only. Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of both limits. Startup prewarm concurrency and per-account concurrency are shared by both pools. Per-account concurrency is a hard cap: an account never has more requests in flight than this (every request type, streaming or not, Playground or Build, countTokens and file operations included). Changes apply immediately; lowering it lets requests already in flight finish.',
   'settings.accountRpmLimit': 'Requests per minute per account',
   'settings.accountRpmLimitHelp':
     'The most generation requests each account sends in the last 60 seconds (upstream allows 12 per account per minute, shared by all models and both channels). An account that reaches it counts as busy and requests go to other accounts; when every running worker is full a new worker starts. Only requests from this service are counted, and upstream 429 cooldowns still act as the fallback. Defaults to 10, which leaves headroom below 12; 0 turns it off. Changes apply immediately.',
@@ -1392,8 +1402,9 @@ const en: Record<TranslationKey, string> = {
   'settings.routingStrategy': 'Account selection strategy',
   'settings.routingRoundRobin': 'Round robin',
   'settings.routingFillFirst': 'Fill first',
+  'settings.routingBalanced': 'Balanced',
   'settings.routingHelp':
-    'Round robin rotates requests. Fill first keeps using the first available account until it is unavailable or reaches its concurrency limit.',
+    'Round robin rotates requests. Fill first keeps using the first available account until it is unavailable or reaches its concurrency limit. Balanced spreads heavy traffic as evenly as possible over all accounts by how many requests each account has sent today (Pacific time, the day the daily quota resets on): running workers without a request in flight get new requests first, prewarming, replacements and expansion start the accounts used least today, and a running account that has sent 50 more requests than the spare taking its place (and has served for at least 5 minutes) is rotated out start-then-stop: the replacement starts in the background first and the old account closes after finishing its requests, so no request is interrupted. The cost is more browser cold starts (by default at most one rotation per partition per minute, two with a peak of 20 or more; paused while an egress is rate limited). A partition with a single drain slot (the default Ultra partition, or a normal partition whose peak is below 8) only rotates idle accounts and hardly rotates at all under heavy load; raise the peak of that partition to 8 or more for it to rotate. Only as many accounts as the active worker limit are online at once; the rest take turns. Changes apply immediately, and switching back to round robin stops it immediately.',
   'settings.waaBackend': 'WAA backend',
   'settings.waaBackendCamoufox': 'Camoufox browser',
   'settings.waaBackendGo': 'Pure Go',
@@ -1883,6 +1894,15 @@ const en: Record<TranslationKey, string> = {
   'app.ultraWorkersDetail':
     'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · {unschedulable} unschedulable · prewarm target {target} · limit {max}',
   'app.authRecheckLine': 'Login recheck · {suspects} suspected · {recent} new login-required in 10 min · {bad} bad accounts',
+  'app.balancedTitle': 'Balanced',
+  'app.balancedUltraTitle': 'Ultra balanced',
+  'app.balancedSpread': 'today min/median/max {min}/{median}/{max}',
+  'app.balancedUsed': '{used}/{accounts} accounts used',
+  'app.balancedRotations': '{count} rotations in 1 h',
+  'app.balancedRotating': '{count} rotating',
+  'app.balancedPaused': 'paused: {reason}',
+  'app.balancedDetail':
+    "Balanced routing (ROUTING_STRATEGY=balanced): generation requests each schedulable account sent upstream today (Pacific time {day}; the daily quota resets at midnight Pacific time), min {min} · median {median} · p90 {p90} · max {max}. Used is the number of accounts that sent a request today out of the schedulable accounts (accounts paused for verification, accounts that need a login and the like are not counted). A running account that has sent {gap} more requests than the spare taking its place is rotated out (start-then-stop, no request is interrupted); rotation counts cover both partitions, {today} so far this quota day. Refreshed every 30 seconds, counting this service only. Per-account details are on the Usage page under Breakdown, ranked by Account: that view uses the server's local day and one row per request, while this counts every send by Pacific day (including retries on other accounts, every continuation round and regenerations), so the numbers differ",
   'app.driveLine':
     'Drive access · {available} available · {unavailable} unavailable · {unknown} unknown',
   'app.driveDetail':

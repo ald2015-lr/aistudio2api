@@ -607,7 +607,7 @@ func TestCapacityCountsOpeningsAndDrains(t *testing.T) {
 	if _, err := env.manager.ensureWorker(withImmediateStartup(env.ctx), accounts[2], testRuntimeModel, false); !errors.Is(err, errAccountWorkerCapacity) {
 		t.Fatalf("分区已满时不应启动: err = %v", err)
 	}
-	if drain := env.manager.startDrain(accounts[0], aistudio.PoolScopeNormal); drain == nil {
+	if drain := env.manager.startDrain(accounts[0], aistudio.PoolScopeNormal, false); drain == nil {
 		t.Fatal("应能排空")
 	}
 	defer env.manager.clearDrain(accounts[0])
@@ -621,7 +621,7 @@ func TestCapacityCountsOpeningsAndDrains(t *testing.T) {
 	if _, err := env.manager.ensureWorker(withImmediateStartup(env.ctx), accounts[3], testRuntimeModel, false); !errors.Is(err, errAccountWorkerCapacity) {
 		t.Fatalf("峰值 + drainLimit 已满时不应再启动: err = %v", err)
 	}
-	if got := env.manager.startDrain(accounts[2], aistudio.PoolScopeNormal); got != nil {
+	if got := env.manager.startDrain(accounts[2], aistudio.PoolScopeNormal, false); got != nil {
 		t.Fatal("分区排空数达到 drainLimit 时不应再排空")
 	}
 }
@@ -718,7 +718,7 @@ func TestDrainRefusedAfterWorkerClosed(t *testing.T) {
 	if victim, err := env.manager.reclaimDeadWorker(env.ctx, aistudio.PoolScopeNormal, drainProModel); err != nil || victim != accounts[0] {
 		t.Fatalf("应回收 A: victim=%q err=%v", victim, err)
 	}
-	if drain := env.manager.startDrain(accounts[0], aistudio.PoolScopeNormal); drain != nil {
+	if drain := env.manager.startDrain(accounts[0], aistudio.PoolScopeNormal, false); drain != nil {
 		t.Fatal("Worker 已关闭的账号不应再排空")
 	}
 	if env.pool.Draining(accounts[0]) || env.manager.drainOf(accounts[0]) != nil || env.manager.drainCount(aistudio.PoolScopeNormal) != 0 {
@@ -729,7 +729,7 @@ func TestDrainRefusedAfterWorkerClosed(t *testing.T) {
 	if !env.manager.tryReserveVictim(accounts[1]) {
 		t.Fatal("应能预留 B")
 	}
-	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal); drain != nil {
+	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal, false); drain != nil {
 		t.Fatal("已被选中淘汰的账号不应排空")
 	}
 	env.manager.releaseVictim(accounts[1])
@@ -737,7 +737,7 @@ func TestDrainRefusedAfterWorkerClosed(t *testing.T) {
 		t.Fatal("已被选中淘汰的账号不应标记排空")
 	}
 	// 对照：仍驻留、没有被选中的账号照常排空
-	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal); drain == nil || !env.pool.Draining(accounts[1]) {
+	if drain := env.manager.startDrain(accounts[1], aistudio.PoolScopeNormal, false); drain == nil || !env.pool.Draining(accounts[1]) {
 		t.Fatal("驻留的账号应能排空")
 	}
 	env.manager.clearDrain(accounts[1])

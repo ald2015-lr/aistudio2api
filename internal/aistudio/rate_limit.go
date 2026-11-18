@@ -213,7 +213,7 @@ func (p *AccountPool) reserveRateLocked(account *Account, lease *AccountLease, n
 }
 
 // recordGenerationSentLocked 记一次发送：抵掉本租约的预占（只抵一次），追加不减的发送时刻；同时给租约所在的出口通道抵掉预占、
-// 记一次发送。调用方持有 p.mu
+// 记一次发送，并给账号的今日发送数加一（见 quota_usage.go）。调用方持有 p.mu
 func (p *AccountPool) recordGenerationSentLocked(lease *AccountLease, now time.Time) {
 	account := lease.account
 	if account.rate == nil {
@@ -239,6 +239,8 @@ func (p *AccountPool) recordGenerationSentLocked(lease *AccountLease, now time.T
 	p.rateChangedLocked(account, now)
 	// 出口通道同一次加锁内记账（见 egress_rate.go）
 	p.recordEgressSentLocked(lease, now.UnixNano())
+	// 今日发送数（平均调用用，见 quota_usage.go）同一次加锁内记一次
+	p.noteQuotaUsageLocked(account.ID, now)
 }
 
 // releaseRateLocked 在 releaseLocked 里退还没发出的预占（调用方持有 l.operation 与 p.mu）
