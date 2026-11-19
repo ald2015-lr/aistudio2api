@@ -330,9 +330,34 @@ func thinkingBudgetForAlias(modelID string, level string) int64 {
 // 模型目录很少变化，过期后先继续用旧快照，由后台刷新
 const aliasModelCacheTTL = 30 * time.Second
 
+// aliasMissRefreshAfter 为名称按快照解析不到时同步重算目录的门槛：快照建立超过这么久才重算（见 aliasCatalogFor）。
+// 重算之后快照是新的，所以同一号池每这么久最多同步重算一次，客户端一直发目录里没有的名字也不会反复占账户池锁
+const aliasMissRefreshAfter = 10 * time.Second
+
 type aliasModelSnapshot struct {
 	models  []aistudio.Model
 	expires time.Time
+	// builtAt 为开始计算这份目录的时刻：后台刷新与同步重算同时进行时，只留开始得晚的那份（见 storeAliasSnapshot）
+	builtAt time.Time
+}
+
+// newAliasSnapshot 为 started 时开始计算的目录生成快照
+func newAliasSnapshot(models []aistudio.Model, started time.Time) *aliasModelSnapshot {
+	return &aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL), builtAt: started}
+}
+
+// storeAliasSnapshot 写入快照，已有的快照开始计算得更晚时保留它（比如解析不到时的同步重算先完成、更早开始的后台刷新后完成，
+// 后者不能把较新的目录换回去）；返回写入后生效的快照
+func storeAliasSnapshot(cache *aliasCatalogCache, next *aliasModelSnapshot) *aliasModelSnapshot {
+	for {
+		current := cache.models.Load()
+		if current != nil && current.builtAt.After(next.builtAt) {
+			return current
+		}
+		if cache.models.CompareAndSwap(current, next) {
+			return next
+		}
+	}
 }
 
 // aliasCatalogCache 为一个号池的别名目录快照：refreshMu 保证没有快照时只有一个请求计算目录，refreshing 保证后台同时只有一个刷新
@@ -370,12 +395,42 @@ func (s *server) aliasCatalog(ctx context.Context) ([]aistudio.Model, error) {
 	if cached := cache.models.Load(); cached != nil {
 		return cached.models, nil
 	}
+	started := time.Now()
 	models, err := s.service.Models(ctx)
 	if err != nil {
 		return nil, err
 	}
-	cache.models.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
-	return models, nil
+	return storeAliasSnapshot(cache, newAliasSnapshot(models, started)).models, nil
+}
+
+// aliasCatalogFor 返回解析 name 用的别名目录：快照里解析得到时就用快照（见 aliasCatalog）；解析不到、快照又已建立超过
+// aliasMissRefreshAfter 时同步重算一次，返回新目录。快照可能是在账户的模型目录还没载入完时建的（例如刚重启，只在 Build 通道提供的
+// gemini-4-argon 要等 Pro、Ultra 账户的 Build 目录恢复），也可能是 ULTRA_INCLUDE_PRO 切换之前的；原先这时带后缀的名称
+// （gemini-4-argon-medium）解析不到、原名转发后以模型不存在 404，要等快照过期且后台刷新完成才恢复，不带后缀的名称却照常可用。
+// 同一号池同一时间只算一次，等锁期间别人已经重算过就直接用新的；重算失败时返回原快照
+func (s *server) aliasCatalogFor(ctx context.Context, name string) ([]aistudio.Model, error) {
+	models, err := s.aliasCatalog(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if _, _, _, _, ok := resolveLongRequestModel(models, name); ok {
+		return models, nil
+	}
+	cache, _ := s.aliasCache(ctx)
+	if current := cache.models.Load(); current != nil && time.Since(current.builtAt) < aliasMissRefreshAfter {
+		return current.models, nil
+	}
+	cache.refreshMu.Lock()
+	defer cache.refreshMu.Unlock()
+	if current := cache.models.Load(); current != nil && time.Since(current.builtAt) < aliasMissRefreshAfter {
+		return current.models, nil
+	}
+	started := time.Now()
+	fresh, err := s.service.Models(ctx)
+	if err != nil {
+		return models, nil
+	}
+	return storeAliasSnapshot(cache, newAliasSnapshot(fresh, started)).models, nil
 }
 
 // refreshAliasCatalogAsync 在后台刷新号池的别名目录，同一号池同一时间最多一个刷新；失败时保留旧快照，下次过期再试
@@ -393,11 +448,12 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 		}()
 		ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(context.Background(), scope), 2*time.Minute)
 		defer cancel()
+		started := time.Now()
 		models, err := s.service.Models(ctx)
 		if err != nil {
 			return
 		}
-		cache.models.Store(&aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL)})
+		storeAliasSnapshot(cache, newAliasSnapshot(models, started))
 	}()
 }
 
@@ -405,7 +461,7 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 // 模型目录整理视频设置（见 applyOmniVideoAlias），视频设置不成立时返回参数错误。
 // 返回是否需要隐藏思维链。未知模型保持原样，由上游返回原有错误。
 func (s *server) applyModelAlias(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
-	models, err := s.aliasCatalog(ctx)
+	models, err := s.aliasCatalogFor(ctx, request.Model)
 	if err != nil {
 		return false, nil
 	}
@@ -515,7 +571,7 @@ func responseModel(request aistudio.GenerateRequest) string {
 
 // resolveModelName 把带后缀的名称换成目录模型名，供计数等只需要模型名的接口使用
 func (s *server) resolveModelName(ctx context.Context, name string) string {
-	models, err := s.aliasCatalog(ctx)
+	models, err := s.aliasCatalogFor(ctx, name)
 	if err != nil {
 		return name
 	}

@@ -61,8 +61,8 @@ func aliasCatalogIDs(t *testing.T, s *server, ctx context.Context) []string {
 	return ids
 }
 
-// TestAliasCatalogStaleAfterPoolSwitch 固定文档里写的别名快照行为：快照不随号池切换作废，过期后仍先返回旧快照、
-// 只在后台刷新，所以切换后触发刷新的那个请求与刷新完成前的请求都按旧目录解析，与切换过去了多久无关；刷新完成后才换成新目录
+// TestAliasCatalogStaleAfterPoolSwitch 固定 aliasCatalog 本身的快照行为：快照不随号池切换作废，过期后仍先返回旧快照、
+// 只在后台刷新，刷新完成后才换成新目录。名称在快照里解析不到时的同步重算见 aliasCatalogFor（TestAliasCatalogMissRefreshes）
 func TestAliasCatalogStaleAfterPoolSwitch(t *testing.T) {
 	service := &switchingCatalogService{calls: make(chan struct{}, 1)}
 	service.setCatalog([]string{"normal-model"}, nil)
@@ -98,5 +98,129 @@ func TestAliasCatalogStaleAfterPoolSwitch(t *testing.T) {
 			t.Fatal("后台刷新完成后应换成新目录")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// drainCatalogCalls 取走已记下的 Models 调用，返回调用次数
+func drainCatalogCalls(service *switchingCatalogService) int {
+	count := 0
+	for {
+		select {
+		case <-service.calls:
+			count++
+		default:
+			return count
+		}
+	}
+}
+
+// ageAliasSnapshot 把号池快照的建立时刻往前推，模拟快照已经建立了 age
+func ageAliasSnapshot(t *testing.T, s *server, ctx context.Context, age time.Duration) {
+	t.Helper()
+	cache, _ := s.aliasCache(ctx)
+	current := cache.models.Load()
+	if current == nil {
+		t.Fatal("还没有快照")
+	}
+	aged := *current
+	aged.builtAt = time.Now().Add(-age)
+	cache.models.Store(&aged)
+}
+
+// TestAliasCatalogMissRefreshes 快照里没有请求的模型（刚重启时 Pro、Ultra 账户的 Build 目录还没恢复，只在 Build 通道提供的
+// gemini-4-argon 不在快照里；或快照建于号池切换之前）：带后缀的名称原先解析不到、原名转发后 404，不带后缀的名称却照常可用。
+// 现在快照建立超过 aliasMissRefreshAfter 时同步重算一次，当场按新目录解析；快照还新、或名称解析得到时不重算
+func TestAliasCatalogMissRefreshes(t *testing.T) {
+	service := &switchingCatalogService{calls: make(chan struct{}, 16)}
+	service.setCatalog([]string{"normal-model"}, nil)
+	s := &server{service: service}
+	ctx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeNormal)
+	aliasCatalogIDs(t, s, ctx)
+	drainCatalogCalls(service)
+	service.setCatalog([]string{"normal-model", "late-model"}, nil)
+
+	// 快照还新：不重算，仍解析不到，原名保持不变
+	fresh := aistudio.GenerateRequest{Model: "late-model-medium"}
+	if _, err := s.applyModelAlias(ctx, &fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Model != "late-model-medium" || drainCatalogCalls(service) != 0 {
+		t.Fatalf("快照建立不到 %s 时不应重算：模型 = %s", aliasMissRefreshAfter, fresh.Model)
+	}
+
+	// 快照变旧：解析不到时同步重算一次，带后缀的名称当场换成目录模型名
+	ageAliasSnapshot(t, s, ctx, aliasMissRefreshAfter+time.Second)
+	request := aistudio.GenerateRequest{Model: "late-model-medium"}
+	if _, err := s.applyModelAlias(ctx, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Model != "late-model" || request.Alias == nil || request.Alias.Level != "medium" {
+		t.Fatalf("快照过旧时应重算后按新目录解析：模型 = %s，别名 = %+v", request.Model, request.Alias)
+	}
+	if calls := drainCatalogCalls(service); calls != 1 {
+		t.Fatalf("应只同步重算一次，实际 %d 次", calls)
+	}
+	if got := aliasCatalogIDs(t, s, ctx); !slices.Contains(got, "late-model") {
+		t.Fatalf("重算后的目录应写回快照，实际 %v", got)
+	}
+
+	// 刚重算过：目录里没有的名字不再重算（客户端一直发错名字也不会反复占账户池锁）
+	unknown := aistudio.GenerateRequest{Model: "missing-model-low"}
+	if _, err := s.applyModelAlias(ctx, &unknown); err != nil {
+		t.Fatal(err)
+	}
+	if unknown.Model != "missing-model-low" || drainCatalogCalls(service) != 0 {
+		t.Fatalf("快照刚重算过时不应再重算：模型 = %s", unknown.Model)
+	}
+
+	// 快照里解析得到的名称从不触发重算，即使快照已经很旧
+	ageAliasSnapshot(t, s, ctx, time.Hour)
+	if got := s.resolveModelName(ctx, "normal-model-low"); got != "normal-model" {
+		t.Fatalf("解析得到的名称 = %s", got)
+	}
+	if calls := drainCatalogCalls(service); calls != 0 {
+		t.Fatalf("解析得到时不应重算，实际 %d 次", calls)
+	}
+}
+
+// TestAliasCatalogMissRefreshKeepsSnapshotOnError 同步重算失败（例如请求已取消）时照旧返回原快照，不清掉快照
+func TestAliasCatalogMissRefreshKeepsSnapshotOnError(t *testing.T) {
+	service := &switchingCatalogService{calls: make(chan struct{}, 16)}
+	service.setCatalog([]string{"normal-model"}, nil)
+	s := &server{service: service}
+	ctx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeNormal)
+	aliasCatalogIDs(t, s, ctx)
+	ageAliasSnapshot(t, s, ctx, aliasMissRefreshAfter+time.Second)
+	service.setCatalog([]string{"normal-model", "late-model"}, make(chan struct{}))
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	models, err := s.aliasCatalogFor(canceled, "late-model-low")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 1 || models[0].ID != "normal-model" {
+		t.Fatalf("重算失败时应返回原快照，实际 %v", models)
+	}
+	cache, _ := s.aliasCache(ctx)
+	if current := cache.models.Load(); current == nil || len(current.models) != 1 {
+		t.Fatal("重算失败时应保留原快照")
+	}
+}
+
+// TestStoreAliasSnapshotKeepsNewer 开始得早的计算后完成时不覆盖开始得晚的快照（同步重算先完成、后台刷新后完成）
+func TestStoreAliasSnapshotKeepsNewer(t *testing.T) {
+	var cache aliasCatalogCache
+	now := time.Now()
+	newer := newAliasSnapshot([]aistudio.Model{{ID: "newer"}}, now)
+	if got := storeAliasSnapshot(&cache, newer); got != newer {
+		t.Fatal("没有快照时应写入")
+	}
+	older := newAliasSnapshot([]aistudio.Model{{ID: "older"}}, now.Add(-time.Second))
+	if got := storeAliasSnapshot(&cache, older); got != newer || cache.models.Load() != newer {
+		t.Fatal("开始得早的计算不应覆盖开始得晚的快照")
+	}
+	latest := newAliasSnapshot([]aistudio.Model{{ID: "latest"}}, now.Add(time.Second))
+	if got := storeAliasSnapshot(&cache, latest); got != latest || cache.models.Load() != latest {
+		t.Fatal("开始得晚的计算应写入")
 	}
 }

@@ -186,7 +186,7 @@ const anthropicWarmupNote = "max_tokens 为 0：只做提示缓存预热，不�
 func (s *server) writeAnthropicWarmup(w http.ResponseWriter, r *http.Request, request anthropicRequest, id string, generateRequest aistudio.GenerateRequest) {
 	// 请求日志记下模型与预热标记，用量账本不记这次请求（模型不存在的 404 也不记，见 MarkAccessLogWarmup）
 	MarkAccessLogWarmup(r.Context(), generateRequest.Model)
-	if models, err := s.aliasCatalog(r.Context()); err == nil && len(models) > 0 {
+	if models, err := s.aliasCatalogFor(r.Context(), generateRequest.Model); err == nil && len(models) > 0 {
 		if _, _, _, _, ok := resolveLongRequestModel(models, generateRequest.Model); !ok {
 			writeAnthropicRequestError(w, fmt.Errorf("%w: %s", aistudio.ErrModelNotFound, generateRequest.Model))
 			return

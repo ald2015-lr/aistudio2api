@@ -167,7 +167,7 @@ var imageResolutionEdges = map[string]float64{"512": 512, "1K": 1024, "2K": 2048
 
 // imageModelOptions 返回请求模型在别名目录里的图片选项（image_aspect_ratios、image_output_resolutions）；目录取不到或没有这个模型时为 nil
 func (s *server) imageModelOptions(ctx context.Context, name string) map[string][]string {
-	models, err := s.aliasCatalog(ctx)
+	models, err := s.aliasCatalogFor(ctx, name)
 	if err != nil {
 		return nil
 	}
