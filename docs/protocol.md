@@ -1050,6 +1050,8 @@ OpenAI 文件入口接收 `multipart/form-data` 的 `file` 与 `purpose`，单�
 
 ### Omni Interaction
 
+2026-11 起 Google 逐个账户给 `gemini-4-argon`、`gemini-4-neon` 等普通文本模型的目录加上 field 79 `[null,null,1,2]`（类型为模型、field 3 为 1）：按 field 3 算作后台任务，不经 CreateInteractionStream，照常经 GenerateContent 生成，也不算 Interaction 模型（不标 `interactions_api`，照常接模型名后缀、`long-` 续写、Build 通道与额度用完改用）。
+
 模型目录 field 79 类型为 `2` 且不是后台任务的模型（`gemini-omni-1.1-flash`、`gemini-omni-flash-preview`）不接受 `GenerateContent`，四套公开生成接口对这类模型改用 `CreateInteractionStream`，账户选择、Worker 与 WAA 与 GenerateContent 相同，WAA proof 位于 field 5，binding 为发送的全部文本以空格连接：
 
 ```json

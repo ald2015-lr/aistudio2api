@@ -146,6 +146,51 @@ func parseModelCatalog(source io.Reader) (modelCatalog, error) {
 	return catalog, nil
 }
 
+// interactionConfig 为模型目录 field 79（下标 78）InteractionConfig：field 3 为后台任务（0、1 与 false、true 都认），
+// field 4 类型 1 为 agent、2 为模型
+type interactionConfig struct {
+	present    bool
+	kind       int64
+	background bool
+}
+
+// decodeInteractionConfig 读模型目录行的 field 79；没有这项配置时 present 为假
+func decodeInteractionConfig(row []json.RawMessage, path string, evidence json.RawMessage) (interactionConfig, error) {
+	raw := rawAt(row, 78)
+	if isJSONNull(raw) {
+		return interactionConfig{}, nil
+	}
+	values, err := rawArray(raw, path+"[78]", evidence)
+	if err != nil {
+		return interactionConfig{}, withMethod(err, "ListModels")
+	}
+	kind, err := optionalIntField(values, 3, path+"[78]", evidence)
+	if err != nil {
+		return interactionConfig{}, err
+	}
+	config := interactionConfig{present: true, kind: kind}
+	if value := rawAt(values, 2); !isJSONNull(value) {
+		if config.background, err = rawBool(value, path+"[78][2]", evidence); err != nil {
+			return interactionConfig{}, withMethod(err, "ListModels")
+		}
+	}
+	return config, nil
+}
+
+// stream 判断模型经 CreateInteractionStream 生成：类型为模型且不是后台任务（如 gemini-omni-1.1-flash 的 [null,null,false,2]）
+func (config interactionConfig) stream() bool {
+	return config.present && config.kind == 2 && !config.background
+}
+
+// interactionOnly 判断模型只经 Interactions 生成（能力 interactions_api：不是普通文本对话模型、不接模型名后缀与 long- 续写、不走 Build、
+// 不作为额度用完改用的目标、媒体按 Interaction 的方式上传）：带 field 79，且不是“类型为模型、field 3 为真”的配置。
+// 2026-11 起 Google 逐个账户给 gemini-4-argon、gemini-4-neon 等普通文本模型加上 [null,null,1,2]：它们照常经 GenerateContent 生成
+// （stream 为假），原先只要带 field 79 就标成 interactions_api，带后缀的名称（gemini-4-neon-medium）不再解析、原名转发后以模型不存在 404，
+// 这些模型也被排出 Build 通道与改用目标。Omni（field 3 为 false）与 agent（类型 1）照旧
+func (config interactionConfig) interactionOnly() bool {
+	return config.present && !(config.kind == 2 && config.background)
+}
+
 func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 	path := fmt.Sprintf("$[0][%d]", rowIndex)
 	row, err := rawArray(raw, path, raw)
@@ -198,8 +243,11 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 		}
 		capabilities["secondary_capability_code_"+strconv.FormatInt(code, 10)] = true
 	}
-	if !isJSONNull(rawAt(row, 78)) {
-		// field 79 InteractionConfig 表示模型只经 Interactions API 生成
+	interaction, err := decodeInteractionConfig(row, path, raw)
+	if err != nil {
+		return modelEntry{}, err
+	}
+	if interaction.interactionOnly() {
 		capabilities["interactions_api"] = true
 	}
 	accessModes, err := intSliceField(row, 82, path, raw)
@@ -343,25 +391,11 @@ func decodeGenerationDefaults(row []json.RawMessage, path string, evidence json.
 		converted := int(value)
 		defaults.TopK = &converted
 	}
-	if raw := rawAt(row, 78); !isJSONNull(raw) {
-		// field 79 InteractionConfig：field 3 为后台任务，field 4 类型 1 为 agent、2 为模型
-		interaction, err := rawArray(raw, path+"[78]", evidence)
-		if err != nil {
-			return GenerationDefaults{}, withMethod(err, "ListModels")
-		}
-		kind, err := optionalIntField(interaction, 3, path+"[78]", evidence)
-		if err != nil {
-			return GenerationDefaults{}, err
-		}
-		background := false
-		if value := rawAt(interaction, 2); !isJSONNull(value) {
-			background, err = rawBool(value, path+"[78][2]", evidence)
-			if err != nil {
-				return GenerationDefaults{}, withMethod(err, "ListModels")
-			}
-		}
-		defaults.InteractionStream = kind == 2 && !background
+	interaction, err := decodeInteractionConfig(row, path, evidence)
+	if err != nil {
+		return GenerationDefaults{}, err
 	}
+	defaults.InteractionStream = interaction.stream()
 	if raw := rawAt(row, 71); !isJSONNull(raw) {
 		thinking, err := rawArray(raw, path+"[71]", evidence)
 		if err != nil {

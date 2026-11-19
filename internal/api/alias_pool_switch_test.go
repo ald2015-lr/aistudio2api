@@ -1,7 +1,9 @@
 package api
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"slices"
 	"sync"
 	"testing"
@@ -222,5 +224,59 @@ func TestStoreAliasSnapshotKeepsNewer(t *testing.T) {
 	latest := newAliasSnapshot([]aistudio.Model{{ID: "latest"}}, now.Add(time.Second))
 	if got := storeAliasSnapshot(&cache, latest); got != latest || cache.models.Load() != latest {
 		t.Fatal("开始得晚的计算应写入")
+	}
+}
+
+// interactionCatalogService 的模型目录取自 ListModels 现场格式的解析结果
+type interactionCatalogService struct {
+	poolRecordingService
+	models []aistudio.Model
+}
+
+func (service *interactionCatalogService) Models(context.Context) ([]aistudio.Model, error) {
+	return service.models, nil
+}
+
+// TestSuffixWithInteractionConfig 2026-11 起 Google 逐个账户给 gemini-4-neon、gemini-4-argon 的目录加上 field 79 [null,null,1,2]：
+// 原先它们因此被当成 Interaction（Omni）模型、不算文本对话模型，带后缀的名称（gemini-4-neon-medium）不再解析，原名转发后以模型不存在 404，
+// 不带后缀的名称却照常可用。现在照常按后缀改写为目录模型名、设置思考等级；Omni（[null,null,false,2]）仍不按文本模型处理
+func TestSuffixWithInteractionConfig(t *testing.T) {
+	row := func(id string, config any) []any {
+		values := make([]any, 85)
+		values[0] = "models/" + id
+		values[3] = id
+		values[6] = 65536
+		values[7] = []string{"countTokens", "generateContent"}
+		values[64] = []int{1, 25, 52, 91}
+		values[78] = config
+		return values
+	}
+	raw, err := json.Marshal([]any{[]any{
+		row("gemini-4-neon", []any{nil, nil, 1, 2}),
+		row("gemini-omni-test", []any{nil, nil, false, 2}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	models, err := aistudio.ParseModels(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &server{service: &interactionCatalogService{models: models}}
+	ctx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeNormal)
+
+	request := aistudio.GenerateRequest{Model: "gemini-4-neon-medium"}
+	if _, err := s.applyModelAlias(ctx, &request); err != nil {
+		t.Fatal(err)
+	}
+	if request.Model != "gemini-4-neon" || request.Alias == nil || request.Alias.Level != "medium" {
+		t.Fatalf("带 [null,null,1,2] 的 Gemini 4 模型应按后缀改写：模型 = %s，别名 = %+v", request.Model, request.Alias)
+	}
+	omni := aistudio.GenerateRequest{Model: "gemini-omni-test-medium"}
+	if _, err := s.applyModelAlias(ctx, &omni); err != nil {
+		t.Fatal(err)
+	}
+	if omni.Model != "gemini-omni-test-medium" || omni.Alias != nil {
+		t.Fatalf("Omni 不按文本模型处理后缀，实际模型 = %s", omni.Model)
 	}
 }
