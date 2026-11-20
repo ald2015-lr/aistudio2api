@@ -403,8 +403,8 @@ func TestGeminiRound4AfterThreeToolRounds(t *testing.T) {
 	if args := string(contents[5].Parts[0].FunctionCall.Arguments); args != `{}` {
 		t.Fatalf("null 参数应按 {} 处理: %s", args)
 	}
-	if result := contents[4].Parts[1].FunctionResult; result == nil || result.Name != "" || contents[4].Role != aistudio.RoleTool {
-		t.Fatalf("无名结果应原样交给编码层补名: %+v", contents[4])
+	if result := contents[4].Parts[1].FunctionResult; result == nil || result.Name != "search_web" || contents[4].Role != aistudio.RoleTool {
+		t.Fatalf("无名结果应按调用 ID 补上调用的名称（协议层关联调用时补，见 orphanResultsAsText）: %+v", contents[4])
 	}
 	if result := contents[6].Parts[0].FunctionResult; result == nil || len(result.Content) < 20000 {
 		t.Fatalf("20KB 结果应完整保留: %+v", contents[6])
@@ -445,7 +445,7 @@ func TestGeminiRound4AfterThreeToolRounds(t *testing.T) {
 	}
 }
 
-// TestGeminiToolValidationRelaxed 放宽的校验：functionResponse 没有名称时不再 400（编码按调用 ID 补名）；functionCall.args 为 null 按 {}；
+// TestGeminiToolValidationRelaxed 放宽的校验：functionResponse 没有名称时不再 400（按调用 ID 补名）；functionCall.args 为 null 按 {}；
 // 函数结果为 null 按 {}；参数不是对象时仍按 400 返回
 func TestGeminiToolValidationRelaxed(t *testing.T) {
 	path := "/v1beta/models/gemini-3.8-flash:generateContent"
@@ -460,7 +460,7 @@ func TestGeminiToolValidationRelaxed(t *testing.T) {
 	}
 	request := service.request(t, 0)
 	call, result := request.Contents[1].Parts[0].FunctionCall, request.Contents[2].Parts[0].FunctionResult
-	if string(call.Arguments) != `{}` || result == nil || string(result.Content) != `{}` || result.Name != "" {
+	if string(call.Arguments) != `{}` || result == nil || string(result.Content) != `{}` || result.Name != "lookup" {
 		t.Fatalf("call=%+v result=%+v", call, result)
 	}
 	wire, err := aistudio.EncodeCountTokensRequest(aistudio.TokenCountRequest{Model: "gemini-3.8-flash", Contents: request.Contents})

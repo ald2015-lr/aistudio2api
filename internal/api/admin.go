@@ -402,8 +402,11 @@ type AccessLog struct {
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时为空
 	FallbackFrom string
 	Error        string
-	Canceled     bool
-	Generation   bool
+	// TrailingError 为上游在已交给客户端的函数调用之后结束生成的原因（流尾错误、流中断、拦截请求、内容策略类结束原因）：请求按正常完成
+	// 记录（Error 为空、状态不变），原因写进请求日志与用量账本的错误详情
+	TrailingError string
+	Canceled      bool
+	Generation    bool
 	// RequestedModel 为写 request.started 时的模型名（客户端请求的名字，号池目录里的别名还没换成正式 ID）；只在请求结果日志里填写
 	RequestedModel string
 	// Attempts 为最终结果之前未成功的上游尝试

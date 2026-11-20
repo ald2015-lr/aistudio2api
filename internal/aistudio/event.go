@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -35,6 +36,9 @@ type FrameDecoder struct {
 	producedContent bool
 	// live 表示解码 Live 会话的 Part（parseBidiContent）：inline media 没有 MIME 时保留为空（Live 客户端按缺省的 PCM 处理），不按文件头判断
 	live bool
+	// generation 为本流保留的那条生成的标记（帧索引 4 的 [id, 序号] 中 id 的原文）：上游偶尔在同一个流里交错发出两条独立生成，
+	// 只保留第一条出现候选帧（候选不为空）的生成，其他标记的帧整帧丢弃（见 generationMarker）。空串表示还没有出现带标记的候选帧
+	generation string
 }
 
 // gcMethod 为 Playground GenerateContent 写进协议证据与容错日志的方法名
@@ -70,6 +74,13 @@ func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
 		d.tol().note(gcMethod, "$[0][]", "空帧，已跳过", raw)
 		return nil, nil
 	}
+	marker := generationMarker(frame)
+	if marker != "" && d.generation != "" && marker != d.generation {
+		// 同一流交错的另一条生成（正文、工具调用、用量、结束原因与流尾帧都各有一份）：整帧丢弃，免得正文与工具调用重复、
+		// 结束之后还有内容、用量被另一条覆盖
+		d.tol().note(gcMethod, "$[0][][4]", "同一流交错多条生成，只保留第一条，已丢弃其他生成的帧", rawAt(frame, 4))
+		return nil, nil
+	}
 	if isJSONNull(frame[0]) {
 		if feedbackRaw := rawAt(frame, 1); !isJSONNull(feedbackRaw) {
 			if err := d.decodePromptFeedback(feedbackRaw, raw); err != nil {
@@ -94,6 +105,12 @@ func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
 		d.tol().note(gcMethod, "$[0][][0]", "候选为空数组，已跳过候选", frame[0])
 		d.decodeFrameUsage(frame, nil, raw)
 		return nil, nil
+	}
+	if marker != "" && d.generation == "" {
+		// 第一个带生成标记、候选不为空的帧决定保留哪条生成。frame 0 为 null 的帧（流首帧、流尾帧）与候选为空数组的帧（只带用量）不决定：
+		// 另一条生成的用量帧先到时按它锁定，会把随后真正出内容的那条整条丢弃（流里没有完成帧，按“没有完成帧”重新生成或失败）。
+		// 锁定前读到的用量会被保留那条随后的用量帧覆盖
+		d.generation = marker
 	}
 	if len(candidates) > 1 {
 		// 其余候选也必须是数组或 null：有标量（如 [content, 1]）说明这一层不是候选列表（嵌套层次变了），取第一个会把错位的数据当正文交出，
@@ -184,6 +201,42 @@ func (d *FrameDecoder) Decode(raw json.RawMessage) ([]Event, error) {
 		d.finished = true
 	}
 	return events, nil
+}
+
+// generationMarker 返回帧索引 4 的生成标记 [id, 序号] 中 id 的原文（去掉首尾空白）：只认恰好两项、id 为字符串或数字、序号为数字的形状，
+// 其他形状（缺位、null、不是数组、项数或类型不符）返回空串，这一帧不按生成标记过滤（索引 4 以后若有别的用途，不会因此丢帧）
+func generationMarker(frame []json.RawMessage) string {
+	raw := rawAt(frame, 4)
+	if isJSONNull(raw) {
+		return ""
+	}
+	var marker []json.RawMessage
+	if json.Unmarshal(raw, &marker) != nil || len(marker) != 2 {
+		return ""
+	}
+	id := bytes.TrimSpace(marker[0])
+	if len(id) == 0 || !isJSONNumber(marker[1]) {
+		return ""
+	}
+	if id[0] == '"' {
+		var text string
+		if json.Unmarshal(id, &text) != nil {
+			return ""
+		}
+	} else if !isJSONNumber(id) {
+		return ""
+	}
+	return string(id)
+}
+
+// isJSONNumber 判断原文是一个 JSON 数字（不是字符串、null、布尔或其他）
+func isJSONNumber(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '-' && (trimmed[0] < '0' || trimmed[0] > '9') {
+		return false
+	}
+	var number json.Number
+	return json.Unmarshal(trimmed, &number) == nil
 }
 
 // flushPendingFinish 在流正常结束（流尾不是错误）后调用：出现过读不出的结束原因、之后再没有能识别的结束原因时，按 unspecified 结束，

@@ -346,8 +346,13 @@ func interactionThinkingLevel(config GenerationConfig, defaults GenerationDefaul
 		level = 2
 	case "high":
 		level = 3
+	case "xhigh":
+		level = extraHighThinkingLevel
 	}
-	level = closestSupportedThinkingLevel(level, defaults.ThinkingLevels)
+	// Interaction 的 thinking level 枚举没有 Extra High：按模型不支持它处理，xhigh 与目录默认等级 5 都按 HIGH（模型没有 HIGH 时取最接近的），
+	// 原先目录默认等级为 5 时查不到枚举，整次请求以“未识别的 thinking level 5”失败
+	supported := slices.DeleteFunc(slices.Clone(defaults.ThinkingLevels), func(level int64) bool { return level == extraHighThinkingLevel })
+	level = closestSupportedThinkingLevel(level, supported)
 	wire, ok := interactionThinkingLevels[level]
 	if !ok {
 		return 0, fmt.Errorf("未识别的 thinking level %d", level)

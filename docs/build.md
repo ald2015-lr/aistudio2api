@@ -246,7 +246,7 @@ user 与 tool 角色写为 `user`，assistant 写为 `model`，没有 part 的 c
 | `speechConfig` | 单声音为 `voiceConfig.prebuiltVoiceConfig.voiceName`；多说话人为 `multiSpeakerVoiceConfig.speakerVoiceConfigs[{speaker, voiceConfig}]` |
 | `thinkingConfig` | 模型支持思考时发送：`includeThoughts: true`、`thinkingBudget`、`thinkingLevel` |
 
-thinking level 由 Playground 枚举换算：Low=`LOW`、Medium=`MEDIUM`、High=`HIGH`、Minimal=`MINIMAL`。`reasoning_effort`、预算与等级之间的换算规则与 Playground 相同。
+thinking level 由 Playground 枚举换算：Low=`LOW`、Medium=`MEDIUM`、High=`HIGH`、Minimal=`MINIMAL`、Extra High=`EXTRA_HIGH`（GenerationConfig 里的请求编号 `6`，ListModels 编号 `5` 同样认）；只在 Build 可用的模型没有等级列表，`xhigh` 与 `-xhigh` 按 `HIGH`。`reasoning_effort`、预算与等级之间的换算规则与 Playground 相同。
 
 TTS 模型带 `speech_metadata` 能力时，`说话人: 台词` 文本按多说话人配置拆成带 `speechMetadata` 的分段；其他 TTS 模型把分段的说话人与风格折叠回台词文本。Build 代理请求的 `multiSpeakerVoiceConfig` 只含 `speakerVoiceConfigs`，带 `mode` 的请求走 Playground。
 

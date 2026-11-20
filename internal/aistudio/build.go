@@ -23,8 +23,11 @@ const buildProxyUnaryMethod = "ProxyUnaryCall"
 // buildProofField 表示 ProxyRequest 中 WAA proof 的 protobuf field
 const buildProofField = 3
 
-// buildThinkingLevels 把 thinking level 枚举换算为 Gemini API 名称
-var buildThinkingLevels = map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL"}
+// buildThinkingLevels 把 thinking level 枚举换算为 Gemini API 名称。Build 编码读的是 encodeGenerationConfig 已换算成请求编号的
+// GenerationConfig（Extra High 为 6，见 wireThinkingLevel）；ListModels 编号 5 同样认作 EXTRA_HIGH，两种编号都能换算
+var buildThinkingLevels = map[int64]string{
+	1: "LOW", 2: "MEDIUM", 3: "HIGH", 4: "MINIMAL", extraHighThinkingLevel: "EXTRA_HIGH", extraHighThinkingWire: "EXTRA_HIGH",
+}
 
 // buildModelDefaults 返回 Build 独有模型按目录推导的生成默认值
 func buildModelDefaults(model Model) GenerationDefaults {

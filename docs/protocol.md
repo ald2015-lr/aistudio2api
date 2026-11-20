@@ -487,10 +487,12 @@ generation config 字段：
 | temperature | ListModels field 9 | `0..2` |
 | topP | ListModels field 10 | `0..1` |
 | topK | ListModels field 11 | 非负整数 |
-| thinking level | ListModels field 72 | Low=`1`、Medium=`2`、High=`3`、Minimal=`4` |
+| thinking level | ListModels field 72 | Low=`1`、Medium=`2`、High=`3`、Minimal=`4`、Extra High=`5`（ListModels 编号；请求里写 `6`，见下文） |
 | thinking budget | 请求值 | 模型能力码包含 thinking budget |
 
-`reasoning_effort` / `thinkingLevel` / Anthropic `output_config.effort` 接受 `none`、`minimal`、`low`、`medium`、`high`。`none` 在只支持 thinking budget 的模型使用预算 0，支持 thinking level 的模型使用最低可用 level，不支持思考的模型忽略该值。模型只有 thinking budget 能力时，显式 effort 需要同时提供 budget；模型只有 thinking level 能力时，显式 budget 退化为 level。两类能力都缺少时返回参数错误。
+`reasoning_effort` / `thinkingLevel` / Anthropic `output_config.effort` 接受 `none`、`minimal`、`low`、`medium`、`high` 与 `xhigh`；`extra_high`、`extra-high`、`extrahigh`（Gemini 枚举 `EXTRA_HIGH`）、`max`（Anthropic 最高档）、`maximum`、`highest` 同 `xhigh`（Extra High，原先归为 `high`），`min` 同 `minimal`，`off`、`disabled` 同 `none`，`auto` 等其他写法按未设置。
+
+Extra High 在 ListModels field 72 的默认等级（子索引 5）与等级列表（子索引 6）中为 `5`，GenerateContent 请求的 GenerationConfig field 17 第 4 项写 `6`（上游 Mag1cFall/AIStudio2API a68acad 抓包；`xhigh` 与目录默认等级 `5` 都按 `6` 发送，其他等级编号相同）；Live setup 的 GenerationConfig 是同一个结构，目录默认等级为 `5` 时同样写 `6`。等级列表没有列出 `5`（包括目录没有等级列表）、目录默认等级也不是 `5` 时 `xhigh` 按 High（`3`）发送、High 也没有时取最接近的等级，不给不支持的模型发 `6`；目录默认等级为 `5` 的模型不带思考参数时本来就发 `6`，即使等级列表为空或没有列出 `5`，`xhigh` 同样发 `6`（原先按 `3`，比默认还低）；思考预算换算不会得到 Extra High，只支持预算的模型收到 `xhigh` 按 high 的预算。模型目录列出 Extra High（等级列表含 `5` 或默认等级为 `5`，与 `xhigh` 是否按 `6` 发送用同一个判断 `extraHighThinkingSupported`）时 `aistudio.Model.ExtraHighThinking` 为真（多账户合并取或，不写进 JSON：账户目录指纹不变），公开模型列表只给这类模型列出 `-xhigh` 别名。`none` 在只支持 thinking budget 的模型使用预算 0，支持 thinking level 的模型使用最低可用 level，不支持思考的模型忽略该值。模型只有 thinking budget 能力时，显式 effort 需要同时提供 budget；模型只有 thinking level 能力时，显式 budget 退化为 level。两类能力都缺少时返回参数错误。
 
 response modalities：
 
@@ -554,11 +556,14 @@ AUDIO 采用独立输出模态。JSON Schema type code 为 string=`1`、number=`
 | `$[0][frame][0][0][6]` | citations |
 | `$[0][frame][0][0][7]` | grounding metadata |
 | `$[0][frame][2]` | usage |
+| `$[0][frame][4]` | 生成标记 `[id, 序号]`，同一流交错多条生成时出现 |
 | `$[0][frame][7]` | response ID |
 | `$[0][frame][3]` 且 frame 0 为空 | interaction metadata |
 | `$[0][frame][1]` 且 frame 0 为 null 或候选为空数组 | prompt feedback：`[0]` 为 block reason code，`[2]` 为拦截说明（block reason message，不是字符串时忽略） |
 
 传输正文是一个 JSON 根值，网络 chunk 提供字节；解码器在 `$[0]` 中每出现一个完整 repeated frame 时立即消费该 frame。每个内容帧包含一个 candidate，candidate content 为 `[[parts...], "model"]`。完成帧可以同时携带最后一组 Part、usage、response ID 和 finish reason，根数组解析完成后结束读取。
+
+上游有时在同一个流里交错发出两条独立生成（上游 Mag1cFall/AIStudio2API bd7f202）：流首帧 frame 0 为 null、索引 `5` 为 `[id, 0]`，每条生成的内容帧在索引 `4` 带各自的生成标记 `[id, 序号]`，并各有正文、函数调用、usage 与 finish reason，流尾为每条生成各一个 frame 0 为 null、索引 `4` 为生成标记的帧。解码器（`FrameDecoder.Decode`）只保留第一个出现候选帧（frame 0 不为 null、候选不为空）的生成（只带用量的空候选帧 `[[],null,[用量],null,[id, 序号]]` 不决定保留哪条，否则另一条生成的用量帧先到时，随后真正出内容的那条会被整条丢弃；锁定前读到的用量被保留那条随后的用量覆盖），其他标记的帧整帧丢弃（包括它们 frame 0 为 null 的流尾帧，那里的 prompt feedback 不会让保留的生成按拦截结束），并写一行解码容错日志 `同一流交错多条生成，只保留第一条，已丢弃其他生成的帧`（位置 `$[0][][4]`，同一请求只写一次）；原先两条都解码，正文与函数调用各出现两遍、结束之后还有正文、usage 被后一条覆盖。只认恰好两项、id 为字符串或数字、序号为数字的形状，其他形状不过滤；没有生成标记的流与原先完全相同。`long-` 自动续写每一轮新建解码器，各轮按各自的生成标记判断。
 
 从 `$[0]` 提取出的文本帧：
 
@@ -610,6 +615,7 @@ AUDIO 采用独立输出模态。JSON Schema type code 为 string=`1`、number=`
 | Part thought | `...parts[part][12]` | boolean |
 | Part signature | `...parts[part][14]` | signature |
 | frame usage | `$[0][frame][2]` | usage array |
+| frame generation | `$[0][frame][4]` | `[id, 序号]`，交错生成时只保留第一条 |
 | frame response ID | `$[0][frame][7]` | response ID |
 
 Part 文本带 `part[12]=true` 时属于 reasoning summary，普通文本属于可见正文；带 `part[12]=true` 的内联图片是图片模型思考过程中的草图，不作为输出媒体返回，最终图片以普通 Part 另行返回；`part[14]` 是 thought signature。签名可以附在文本、函数调用或独立空 Part 上，下一轮必须原样回传。只带签名、没有其他内容的 Part（Anthropic `thinking`/`redacted_thinking` 块、Responses `reasoning` 项、Gemini 原生只带 `thoughtSignature` 的部分）按官网写法编码为空正文加签名 `[null,"",null,…,null,"<signature>"]`（`part[1]` 为空串、`part[14]` 为签名；上游流里这类 Part 就是空正文加签名，Build 通道同样写 `text:""`）；原先 `part[1]` 也省略，只有 `part[14]`。WAA binding 对这个 Part 照旧计一个空占位，不受影响：
@@ -727,7 +733,9 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 | 内容拦截：`safety`、`recitation`、`blocklist`、`prohibited_content`、`spii`、`image_safety`、`image_prohibited_content`、`image_recitation` | `content_filter` | `incomplete/content_filter` | `refusal` | 对应 Gemini 枚举 |
 | 其他非标准终态：`malformed_function_call`、`unexpected_tool_call`、`malformed_response`、`too_many_tool_calls`、`missing_thought_signature`、`other`、`unspecified`、`provider_*` 等 | `stop`（含函数调用时 `tool_calls`） | `completed` | `end_turn`（含函数调用时 `tool_use`） | 对应 Gemini 枚举（`MALFORMED_FUNCTION_CALL`、`UNEXPECTED_TOOL_CALL`、`MALFORMED_RESPONSE`、`TOO_MANY_TOOL_CALLS`、`MISSING_THOUGHT_SIGNATURE` 等官方枚举名，`missing_thought_signature` 与 `malformed_response` 原先报成 `OTHER`）或 `OTHER` |
 
-内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`malformed_response`（Playground 终止原因 19，与 Build 通道 `FINISH_REASON_MALFORMED_RESPONSE` 同名；原先 Playground 报成 `provider_19`，Gemini 输出 `OTHER` 与 `finishMessage` `AI Studio finish reason 19`）对应 AI Studio 页面的 `Content blocked`，不算内容拦截，客户端还没收到内容时按上文的规则重新生成。
+内容拦截终态优先于同一结果中的工具调用终态，已产生的正文、reasoning、工具事件和 usage 保持在响应中；例外是函数调用已经交给客户端之后才出现的内容拦截，见下一段。非标准终态（包括内容拦截与 `provider_*`）在 Chat choice、Responses response、Anthropic message 或 `message_delta` 的 `provider_finish_reason` 中保留原值。Gemini 的 `finishMessage` 优先原样使用上游给出的结束说明（Playground 的 candidate `[3]`、Build 的 `finishMessage`）；上游没有给出时，`missing_thought_signature` 写 `Missing thought signature`，`provider_*` 写 `AI Studio finish reason <code>` 保留编号。OpenAI、Responses、Anthropic 与 Interactions 不携带这段说明。上游给出结束说明时，管理日志另记一条 `上游结束说明`（见 [logging.md](logging.md)）。`malformed_response`（Playground 终止原因 19，与 Build 通道 `FINISH_REASON_MALFORMED_RESPONSE` 同名；原先 Playground 报成 `provider_19`，Gemini 输出 `OTHER` 与 `finishMessage` `AI Studio finish reason 19`）对应 AI Studio 页面的 `Content blocked`，不算内容拦截，客户端还没收到内容时按上文的规则重新生成。
+
+函数调用之后上游结束生成（Playground 与 Build 代理；Interaction 通道不输出函数调用；`internal/aistudio/trailing.go`，参照上游 Mag1cFall/AIStudio2API a68acad；完成帧之后才出现流尾错误时与上游不同，见本段后半）：已经把函数调用交给生成链路（必须调用时工具约束扣住、没有放出的不算）之后，上游以流尾错误结束、在完成帧之前中断（读取出错、没有完成帧）、拦截请求（frame 0 为 null 的 prompt feedback），或以内容拦截类原因（上表第四行）结束时，这一轮按 `stop` 正常结束：上游的函数调用 Part 总是整个到达，客户端已收到完整的调用，各协议按上表第一行输出，不带 `provider_finish_reason` 与结束说明；上游用量没有到达时按已交出的输出本地估算。原错误或原因挂在结束事件的 `TrailingError` 上（内容拦截类原因为 `ContentPolicyFinishError`，不进 JSON），生成服务写一行 WARN、写进请求结果日志与用量账本的错误详情，内容拦截类原因与拦截请求的 block reason 同时作为请求记录的终止原因；上游错误照流内错误的规则处理账号（4xx 证据、401 复核、额度 429 冷却且不升档），这次结束不算模型资格验证成功（见 [logging.md](logging.md)）。`long-` 续写第二轮起失败（原本按 `max_tokens` 体面结束）而前面已交出函数调用时同样按 `stop` 结束，`TrailingError` 为续写失败的原因，`ContinuationErr` 保留（账号已在续写进度里处理，不重复）。完成帧已经到达、之后才出现流尾错误时以完成帧为准，同一个上游结果是否带流尾错误不改变客户端看到的结束：完成帧为内容拦截类原因时照样按 `stop` 结束，`TrailingError` 为 `ContentPolicyFinishError`，流尾错误挂在它的 `Cause` 上（`Unwrap` 可取得，拦截原因照样作为终止原因，上游错误照样处理账号）；完成帧为其他非 `stop` 原因（`max_tokens`、`malformed_function_call` 等）时原因与结束说明原样交出，只挂上 `TrailingError`。原先这种情况整次请求以错误结束（流式为流内错误、非流式为 5xx）；上游 a68acad 在这种情况下一律改成 `stop` 并去掉结束说明，内容拦截类完成帧的拦截原因也随之丢失，这里不照搬。本服务自己的结束原因不在此列：工具约束违约（`*ToolContractError`，照旧 502）、原生续写被拒改换号、命中停止序列、客户端断开与取消；没有交出函数调用（只有正文、思考）时照旧按原错误或原结束原因处理。已交出函数调用即已交出事件，不会再重新生成，两者互不影响。
 
 ### 解码容错规则
 
@@ -743,6 +751,7 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 | field 1 的 `null` 与稀疏元素、空帧 `[]` | 报“空流帧” | 跳过 |
 | 候选 `[]` | 报“候选数量不是现场确认的 1” | 跳过候选，读取本帧用量；frame `[1]` 的 promptFeedback 与 frame 0 为 `null` 时一样读取（`[[],[1,…]]` 照旧按输入拦截结束，不重新生成） |
 | 多个候选 | 同上 | 取第一个；其余候选有不是数组的元素时仍报错（嵌套层次变了） |
+| 同一流交错多条生成（帧索引 `4` 的生成标记 `[id, 序号]` 不同） | 两条都解码：正文与函数调用重复、结束之后还有正文、usage 被后一条覆盖 | 只保留第一条出现候选帧（候选不为空）的生成，丢弃其他标记的整帧（见[增量流](#5-增量流思考usage来源与错误)） |
 | 响应角色缺失、为 `null` 或不是 `"model"` | 报“期望字符串”“响应角色不是 model” | 按 model 处理 |
 | promptFeedback 没有拦截原因（`null`、缺位或空白字符串，如只有安全评级 `[null,[[1,1],[2,1]]]`、`[null,[""]]`） | 报“期望整数” | 不是拦截，跳过这一帧；有拦截原因时照旧按拦截处理（写成名称时按名称，读不出时按 `unspecified` 拦截） |
 | promptFeedback 本身不是数组（如 `{"blockReason":1}`） | 报“期望数组” | 还没有交出正文时读不出有没有拦截，按 `unspecified` 拦截（对外 400，不重新生成）；已经交出过正文时不可能是输入拦截，按未拦截继续 |
@@ -797,7 +806,7 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 1. **官网续写**（能力码 91 `output_continuation`，如 `gemini-4-argon`）：与上游 Mag1cFall/AIStudio2API 相同。generation config field 46 为 `1`，根 field 11 省略；第 N 轮（从 0 计）的 max output 为 `min(总上限, (N+1) × 32768)`。候选 field 9（JSON 索引 8）给出续写 token；完成帧以终止原因 22 结束，或以 `max_tokens` 结束且同一帧带 token、本轮上限小于总上限时，本轮不形成终态（不发用量与结束事件），下一轮复制原请求、根 field 17 写入最近的 token。22 而没有 token 时按 `max_tokens` 结束（不报错）。
 2. **模拟续写**（其他文本模型）：本轮以 `max_tokens` 结束、本轮的上限是单轮上限（不是总上限的剩余量）、有新的正文、没有函数调用、代码执行、媒体输出与搜索来源（groundingMetadata）时，把各轮已输出的正文作为一个 model 轮接在历史末尾（历史本来以 model 轮结尾时并入那一轮），是否原样以 model 轮结尾与客户端预填充共用同一套规则（见下文 Anthropic assistant prefill 一段：同一份名单与判断函数 `NativePrefillModel`、同一个拒绝判断与同一份按“模型 + 通道”记 1 小时的记忆）：名单内、近期没被拒过的模型原样以 model 轮结尾发送；上游以 400 拒绝时（发送时，或流尾 `[3,"Requests ending with a model turn are not supported"]` 且这一轮还没有任何输出）记住这个模型与通道，在这一轮内改为补用户消息重发（不换号，不经 `PrefillRetryError`；之后各轮都补；被拒的那次已计入每分钟窗口，重发前同样重新预占、等号池准入），之后一小时内同模型的续写与客户端预填充都直接补用户消息；反过来，客户端预填充被拒过的模型续写时也直接补；其余模型在末尾补一条用户消息 `Continue exactly from where your previous message ended. Do not repeat any of it; output only the continuation.`。下一轮的 max output 为 `min(单轮上限, 总上限 − 已输出)`，思考强度降到最低、只降不升：客户端已经要求不思考或最低思考（`reasoning_effort` 为 `none`、`minimal` 及其同义写法，或思考预算 0 到 128）时保留客户端的设置，否则按 `minimal`（不支持时取最接近的等级或预算 128）。新一轮开头最多 1024 字节的正文先扣住，与已输出正文的末尾比对，重复至少 20 字节时去掉重复部分；后续轮次的思考正文与独立的思考签名不输出，正文的签名去掉，函数调用的签名保留；后续轮次的搜索来源（只在没有 Google 工具时偶尔出现，有它的一轮之后不再续写）里正文片段的位置（字节）加上之前各轮放行的正文字节数、减去接缝去掉的重复字节数，换算到合并后的正文。Playground 的引用（候选 field 7）只有地址与标题、不带位置，不需要换算。
 
-各轮的正文、思考与工具事件按顺序接成一条事件流，用量与结束事件只在最后发一次：官网续写的用量以最后一轮为基础（输入取最后一轮，正文、思考与工具 token 逐轮累加，total 为最后一轮 total 加之前各轮的这三项）；模拟续写以第一轮为基础（输入取第一轮：后续轮次的输入含发回上游的已输出正文，不是客户端的输入；total 为之前的 total 加新一轮的这三项），各轮实际的输入写在每轮的进度日志里。结束原因取最后一轮，不再续写时的 22 按 `max_tokens`。第一轮失败与普通请求相同（以该错误结束）；第二轮起发送失败（含发出前被账号冷却拦下）或输出中途失败（连接重置、帧解析错误、流内错误帧、没有完成帧）时不报错：模拟续写先交出扣住待比对接缝的正文，再发合并后的用量（失败的这一轮按已收到的输出估算）与 `max_tokens` 结束，已输出的内容不重发也不丢；生成服务照流内错误的规则处理账号状态（额度 429 写回冷却、401 经复核标记登录失效）并记一行原因（上游 4xx 另记一行证据，末尾带 `| 自动续写第 <N> 轮`，见 [logging.md](logging.md)），这次结束也不算模型资格验证成功（不清掉刚写回的冷却）。续写后的输入超过账号输入上限（模拟续写把已输出的正文发回上游，部分账号的上限为 131072，按 429 返回）同样按 `max_tokens` 结束，不冷却。
+各轮的正文、思考与工具事件按顺序接成一条事件流，用量与结束事件只在最后发一次：官网续写的用量以最后一轮为基础（输入取最后一轮，正文、思考与工具 token 逐轮累加，total 为最后一轮 total 加之前各轮的这三项）；模拟续写以第一轮为基础（输入取第一轮：后续轮次的输入含发回上游的已输出正文，不是客户端的输入；total 为之前的 total 加新一轮的这三项），各轮实际的输入写在每轮的进度日志里。结束原因取最后一轮，不再续写时的 22 按 `max_tokens`。第一轮失败与普通请求相同（以该错误结束）；第二轮起发送失败（含发出前被账号冷却拦下）或输出中途失败（连接重置、帧解析错误、流内错误帧、没有完成帧）时不报错：模拟续写先交出扣住待比对接缝的正文，再发合并后的用量（失败的这一轮按已收到的输出估算）与 `max_tokens` 结束，已输出的内容不重发也不丢；生成服务照流内错误的规则处理账号状态（额度 429 写回冷却、401 经复核标记登录失效）并记一行原因（上游 4xx 另记一行证据，末尾带 `| 自动续写第 <N> 轮`，见 [logging.md](logging.md)），这次结束也不算模型资格验证成功（不清掉刚写回的冷却）。前面的轮次已交出函数调用时改按 `stop` 结束（客户端已收到完整的调用，见“函数调用之后上游结束生成”），账号的处理不变。续写后的输入超过账号输入上限（模拟续写把已输出的正文发回上游，部分账号的上限为 131072，按 429 返回）同样按 `max_tokens` 结束，不冷却。
 
 与重新生成（见“客户端还没收到内容时重新生成”）的嵌套：重新生成只在还没向下游交出任何事件时发生，只可能落在第一轮的正文之前。第一轮的每次发送（含重新生成换了随机后缀、改回补用户消息的重发）都按同一份请求重新生成续写计划，官网续写的编码（generation config field 46、省略根 field 11）照旧；各轮的合并用量在每次发送的解码里从头计，被放弃那次的用量与结束事件不会并进来；第一轮还没交出事件就以 `malformed_function_call`、`unexpected_tool_call` 或 `malformed_response` 结束时不写“第 1 轮结束”进度行（这次结果可能被重新生成放弃，不重新生成时只有一轮，等同普通请求，原因另有请求说明）。续写决定发第二轮之后不再重新生成、也不再按原生续写被拒换号，第二轮起的失败按上文的续写规则结束；接上新一轮之前先关闭上一轮已读完的响应体（第一轮的响应体同样提前关闭，原先各轮都挂到整个请求结束）；每个响应体只关一次（发下一轮之前、取消这一轮与请求结束几处关的是同一个只关一次的包装：`WAA_BACKEND=go` 的 HTTP/2 响应体重复关闭会对已结束的流多发一个 `RST_STREAM(CANCEL)`，浏览器不会这样发帧）；重新生成次数（每个请求 2 次）与续写轮数（64 轮）互不占用。重新生成、续写回退的重发与续写的下一轮共用同一套号池准入（预占每分钟名额与出口令牌、按其他租约的预占判断、自己的预占不挡自己、同一租约不重复预占、没发出的随租约释放退还，不准入的原因写法相同）：重新生成与回退重发不准入时不发，续写的下一轮先预占再等到准入。
 
@@ -967,7 +976,7 @@ AI Studio 网页协议使用自动函数调用：auto 请求只携带根 field 7
 
 | 公开协议 | 自动 / 不调用 | 必须调用 | 指定函数 | 单次调用 |
 | --- | --- | --- | --- | --- |
-| OpenAI Chat / Responses | 默认、`auto`、`none` | `required` | `{"type":"function","function":{"name"}}`；Responses 为 `{"type":"function","name","namespace"?}` | `parallel_tool_calls:false` |
+| OpenAI Chat / Responses | 默认、`auto`、`none` | `required` | `{"type":"function","function":{"name"}}`；Responses 为 `{"type":"function","name","namespace"?}`（`namespace` 为空或 `functions` 时指定原名，其余为 `命名空间.函数名`） | `parallel_tool_calls:false` |
 | Anthropic | 默认、`auto`、`none` | `any` | `{"type":"tool","name"}` | `disable_parallel_tool_use:true` |
 | Gemini | 默认、`AUTO`、`NONE` | `ANY` | `allowedFunctionNames` | — |
 
@@ -1065,7 +1074,7 @@ OpenAI 文件入口接收 `multipart/form-data` 的 `file` 与 `purpose`，单�
 | 26 | `[[<STEP>...]]`，用户 step 为 `[[<CONTENT>...]]`，模型 step 为 `[null,[<CONTENT>...]]`，相邻同角色的消息合并为一条 step；content 按客户端给的顺序：文本为 `[[<TEXT>]]`（Content field 1），内联图片为 `[null,[<MIME>,"<BASE64>"]]`（Content field 2，枚举见下文的媒体 MIME 枚举表：`1` png、`2` jpeg、`3` webp、`4` heic、`5` heif、`8` bmp、`9` tiff，Base64 为原文件字节），Drive 附件为 `[null×8,["<DRIVE_FILE_ID>"]]`（Content field 9） |
 | 53 | 输出格式（field 54）`[[[null,null,null,[null,null,null,<ASPECT>,[<SECONDS>],<RESOLUTION>]]]]`：宽高比 `1` 为 16:9、`2` 为 9:16，未设置（官网 Auto）时为 null；时长未设置时为 null；分辨率 `1`–`4` 为 360p、720p、1080p、4k，未设置时取所选账户目录 `video_output_resolutions` 的第一项（`368p` 按 `360p`；目录没有时为 `1`，即官网默认 360p）；任务为 `edit` 时没有输出格式，interaction 只到索引 26 |
 
-thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。模型目录没有思考等级（能力码 52，如 `gemini-omni-1.2-flash`，官网页面没有 Thinking level）时与官网一样不发送：GenerationConfig 索引 5 为 `null`（与上游 Mag1cFall/AIStudio2API 4c44cb9 相同），`reasoning_effort`、思考预算与模型名的思考等级后缀都不起作用，请求日志各记一行说明（后缀为 `模型名后缀指定的思考等级 <等级> 对 <模型> 不生效：…，已忽略后缀`，客户端参数为 `客户端的思考参数（reasoning_effort=<值>、思考预算=<N>）对 <模型> 不生效：…`）；带 52 的模型（如 `gemini-omni-1.1-flash`，目录为 `{1,25,52,59}`）请求体不变。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件。
+thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_effort` 或思考预算按模型支持的等级换算，默认使用目录默认等级。Interaction 没有 Extra High：`xhigh` 与目录默认等级 `5` 都按 HIGH（目录等级列表没有 High 时取最接近的），原先目录默认等级为 `5` 时以“未识别的 thinking level 5”失败。模型目录没有思考等级（能力码 52，如 `gemini-omni-1.2-flash`，官网页面没有 Thinking level）时与官网一样不发送：GenerationConfig 索引 5 为 `null`（与上游 Mag1cFall/AIStudio2API 4c44cb9 相同），`reasoning_effort`、思考预算与模型名的思考等级后缀都不起作用，请求日志各记一行说明（后缀为 `模型名后缀指定的思考等级 <等级> 对 <模型> 不生效：…，已忽略后缀`，客户端参数为 `客户端的思考参数（reasoning_effort=<值>、思考预算=<N>）对 <模型> 不生效：…`）；带 52 的模型（如 `gemini-omni-1.1-flash`，目录为 `{1,25,52,59}`）请求体不变。Interaction 请求接受 user 与 assistant 的文本内容，以及 user 的图片与视频附件。
 
 图片按官网内联发送（Content field 2），不需要 Drive。官网给 gemini-omni-1.1-flash 附一张图片、输入文字后 Run 的两份抓包：用户 step 的 parts 依次为图片与文本，图片 part 为 `[null,[1,"<PNG 的 Base64>"]]`（PNG）与 `[null,[2,"<JPEG 的 Base64>"]]`（JPEG 照片，原文件字节，JFIF、EXIF 与 XMP 段原样保留，没有转码、没有去掉元数据），没有 Drive 文件引用；GenerationConfig、field 54 与纯文本请求相同（JPEG 那份设了 10 秒时长，field 54 为 `[[[null,null,null,[null,null,null,null,[10],1]]]]`）。本服务按同样的结构编码，两份抓包里的图片与文本经本服务编码（含 Gemini `inlineData` 与 OpenAI `image_url` data URI 两个入口）后与抓包逐字节一致（第 5 项 WAA proof 换成 null 比较）。图片格式以文件头为准（MIME 不分大小写，`image/jpg`、`image/pjpeg` 等别名与 `image/jpeg` 相同，标错 MIME 的图片按实际格式发送），枚举取官网前端的媒体 MIME 枚举表（输入 step 与输出 content delta 是同一种 Content 结构，两份抓包的 PNG `1`、JPEG `2` 与表一致）：PNG `1`（PNG 签名）、JPEG `2`（SOI 标记）、WebP `3`（`RIFF…WEBP`）、HEIC `4`、HEIF `5`（HEIF 容器的 ftyp 品牌：主品牌或兼容品牌有 `heic`、`heix`、`hevc` 等 HEVC 品牌的为 HEIC，通用品牌 `mif1`、`msf1` 的为 HEIF，声明为 `image/heic` 或 `image/heif` 时按声明区分；AVIF 品牌与 `isom`、`mp42` 等视频品牌不算）、BMP `8`（`BM` 加有效的 DIB 头长度）、TIFF `9`（`II*\0` 或 `MM\0*`），原字节发送（WebP、HEIC、HEIF、BMP、TIFF 没有官网抓包，按同一张表编码）。MIME 为空或 `application/octet-stream`（以及 `binary/octet-stream` 等）而文件头是这些格式的附件按图片内联，明确声明为 `video/*`、`audio/*`、`application/pdf` 等其他类型的不按文件头改判。GIF 取首帧转成 PNG 后按枚举 `1` 发送（枚举 `7` 的 GIF 不用于输入）：客户端经各协议内联的 GIF 在解析请求时已转成 PNG（与其他模型相同，画布超过 4096×4096 的不解码），原 GIF 留在不序列化的 `Blob.SourceGIF`（只用于本次请求：Responses 与 Interactions 存续接状态时去掉，续接历史里的这张 PNG 按普通 PNG 内联，不计入下面的转换额度）；从本服务链接恢复的 GIF 在选号前转换（解码前用 DecodeConfig 检查画布不超过 4096×4096，同时最多 2 个转换）；两种转出的 PNG 按出现顺序合计不超过 64MB（与单次请求从媒体目录恢复的上限相同），超出的不转换、协议层已转好的换回原 GIF；枚举表里没有的格式（AVIF、SVG、ICO 等）、数据与声明的格式不符的图片、超过画布或体积上限、解码失败的 GIF 与视频一样先上传 Drive。用户附件、移到 user step 的模型历史图片与从本服务链接恢复的图片同样内联；图片数据是否参与 binding 见下文“带图请求的 binding 与 403”（`OMNI_IMAGE_BINDING`，默认参与）。视频（官网发送视频时同样先上传 Drive，用户 step 为 `[[null×8,["<DRIVE_FILE_ID>"]],[["<TEXT>"]]]`；本服务照官网，不用 field 5 内联视频）与音频、PDF 等其他文件先上传到所选账户的 Drive，再以 file ID 引用，文件 ID 不参与 binding。
 
@@ -1752,7 +1761,7 @@ OpenAI Chat 与 Anthropic 省略转换后没有 parts 的空历史消息；纯�
 
 错误在选号前返回（OpenAI、Responses 为 OpenAI 格式，Anthropic 为 Anthropic 格式，Gemini 与 Interactions 为 Gemini 格式），说明为英文原文；整理说明写进该请求的管理日志（WARN，`来源=service`），不影响响应。
 
-模型名后缀可与 `-low`、`-high`、`-minimal`、`-medium`、`-128`、`-nothinking` 组合，顺序不限、不分大小写，同一项出现多次时以最靠后的为准，例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`；模型目录没有思考等级（能力码 52，如 `gemini-omni-1.2-flash`）时等级后缀照常剥离但不改思考参数，请求日志记一行 `模型名后缀指定的思考等级 <等级> 对 <模型> 不生效：…`（见上文 Omni Interaction）。解析先按原有后缀进行（与原先完全相同）；解析不到时再连同视频后缀解析，且结果必须是能输出视频的 Omni 模型，其他模型名带 `-720p`、`-8s` 等字样时保持原名，目录 ID 本身带这类字样时按目录 ID。视频后缀也可以加在 Omni 的目录别名（`capability_options.aliases`）后面，别名与某个目录 ID 同名时按该 ID；按别名调用时请求与响应里的模型名为去掉后缀的别名，调度前再换成目录 ID。Omni 的思考等级后缀优先于请求参数，不带等级后缀时沿用请求参数与模型默认等级（不像文本模型那样设为最高）；`-online` 对 Omni 不生效。响应里的模型名为去掉后缀的目录模型名。`/v1/models` 不展开这些组合，单模型查询能查到。
+模型名后缀可与 `-low`、`-high`、`-xhigh`（按 HIGH）、`-minimal`、`-medium`、`-128`、`-nothinking` 组合，顺序不限、不分大小写，同一项出现多次时以最靠后的为准，例如 `gemini-omni-1.1-flash-9x16-720p-8s-low`；模型目录没有思考等级（能力码 52，如 `gemini-omni-1.2-flash`）时等级后缀照常剥离但不改思考参数，请求日志记一行 `模型名后缀指定的思考等级 <等级> 对 <模型> 不生效：…`（见上文 Omni Interaction）。解析先按原有后缀进行（与原先完全相同）；解析不到时再连同视频后缀解析，且结果必须是能输出视频的 Omni 模型，其他模型名带 `-720p`、`-8s` 等字样时保持原名，目录 ID 本身带这类字样时按目录 ID。视频后缀也可以加在 Omni 的目录别名（`capability_options.aliases`）后面，别名与某个目录 ID 同名时按该 ID；按别名调用时请求与响应里的模型名为去掉后缀的别名，调度前再换成目录 ID。Omni 的思考等级后缀优先于请求参数，不带等级后缀时沿用请求参数与模型默认等级（不像文本模型那样设为 HIGH）；`-online` 对 Omni 不生效。响应里的模型名为去掉后缀的目录模型名。`/v1/models` 不展开这些组合，单模型查询能查到。
 
 系统提示：`OMNI_IGNORE_SYSTEM_PROMPT=true`（默认，热更新）时，发给能输出视频的 Omni 模型（同上，含带后缀的名称与目录别名）的请求去掉客户端的系统提示，不发给上游：OpenAI Chat 的 `system`、`developer` 消息，Responses 的 `instructions` 与 `input` 里的 `system`、`developer` 消息（含 `previous_response_id` 续接带上的系统指令），Anthropic 的顶层 `system` 与 `messages` 里的 `system` 角色消息（转成的 `<system-reminder>` 用户消息整轮去掉），Gemini 的 `systemInstruction`（`system_instruction`），Interactions 的 `system_instruction`。去掉发生在恢复回传的媒体链接与整理分轮之前（去掉后的请求与不带系统提示时完全相同，例如末尾的 `system` 角色消息去掉后，最后一条用户消息才是“这一轮”），其余消息原样；请求除系统提示外没有任何对话消息时保留（生成服务按用户消息发送），Anthropic 请求除顶层 `system` 外只有 `system` 角色消息时只去掉顶层 `system`，这些消息照常按用户消息发送。Gemini `countTokens` 与 Anthropic `count_tokens` 按同一规则计数。协议层按别名目录没有认出 Omni（启动期间别名目录取不到、别名目录缓存还没刷新，例如新加入的账户是唯一带 Omni 的账户）时只做标记（`GenerateRequest.IgnoreOmniSystemPrompt`），生成服务按所选账户的目录判定为 Omni 时在发送前按同一规则去掉。Omni 请求的工具（含 `tool_choice`）在选号前已整个去掉（见上文），不会追加工具要求。说明写进该请求的管理日志（见 [logging.md](logging.md)）。Chatbox 等客户端自动加的 “You are a helpful assistant.” 会让 Omni 只回文字、说无法生成视频，因此默认开启；`false` 时与原先完全一致。
 
@@ -1866,7 +1875,7 @@ Chat SSE 顺序：
 | `input` | string 或 input item 数组 |
 | `instructions` | 顶层 system instruction |
 | `stream` | boolean |
-| `tools`、`tool_choice` | function、namespace 与 Google tools；namespace 内的 function 以 `命名空间.函数名` 的全名发给上游（不同命名空间可以有同名函数），调用结果还原为原函数名并以 `namespace` 字段标明所属命名空间，全名重复时返回 400；choice 为 auto/none/required/指定函数 |
+| `tools`、`tool_choice` | function、namespace 与 Google tools；namespace 内的 function 以 `命名空间.函数名` 的全名发给上游（不同命名空间可以有同名函数），调用结果还原为原函数名并以 `namespace` 字段标明所属命名空间，全名重复时返回 400；名为 `functions` 的命名空间是默认命名空间，其中的函数与顶层函数相同、按原名发送（与上游 Mag1cFall/AIStudio2API a68acad 相同，原先拼成 `functions.<名>`）；choice 为 auto/none/required/指定函数 |
 | `temperature`、`top_p`、`max_output_tokens` | 生成参数 |
 | `reasoning` | `{"effort":"..."}` |
 | `text` | `{"format":{"type":"text|json_object|json_schema","schema":...}}` |
@@ -1877,7 +1886,7 @@ Chat SSE 顺序：
 | `store` | 省略/`true` 保存续接节点（写进状态库 `response_states`，重启后仍可续接，表里是明文对话，见下文“续接状态”）；`false` 只返回本次结果，也不写库 |
 | `video_config` | Omni 视频设置扩展字段，与 Chat 相同 |
 
-input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。支持 message、`function_call`、`function_call_output`、reasoning 与 `agent_message` item（Codex 多智能体会话里智能体之间的消息，按 user 轮发送：`content` 中 `input_text` 的 `text` 与 `encrypted_content` 的 `encrypted_content` 依次作为文本 Part，空文本与普通 message 一样省略（全部为空时这一轮不发送），其他类型返回 400；与上游 Mag1cFall/AIStudio2API 42fa603 相同，原先整个请求返回 400）；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
+input item 字段为 `type`、`role`、`content`、`call_id`、`name`、`namespace`、`arguments`、`output`、`encrypted_content`。`function_call` 的 `namespace` 与声明相同换算：为空或 `functions`（Codex 给顶层函数的调用记这个默认命名空间）时用原名，其余为 `命名空间.函数名`，历史调用名与声明一致。支持 message、`function_call`、`function_call_output`、reasoning 与 `agent_message` item（Codex 多智能体会话里智能体之间的消息，按 user 轮发送：`content` 中 `input_text` 的 `text` 与 `encrypted_content` 的 `encrypted_content` 依次作为文本 Part，空文本与普通 message 一样省略（全部为空时这一轮不发送），其他类型返回 400；与上游 Mag1cFall/AIStudio2API 42fa603 相同，原先整个请求返回 400）；`function_call.arguments` 为空时按 `{}`，不是 JSON object 时与 Chat 相同包成 `{"_raw":"<原文>"}`，不返回 400；无状态客户端把上一轮输出放回 input 时，`web_search_call`、`code_interpreter_call`、`image_generation_call` 与 `item_reference` 按已在上游执行的调用跳过。message content Part：
 
 | type | 字段 |
 | --- | --- |
@@ -2100,7 +2109,7 @@ delta 联合类型为 `text_delta{text}`、`thinking_delta{thinking}`、`signatu
 
 | 字段 | 映射 |
 | --- | --- |
-| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-low`、`-medium`、`-high`、`-minimal`、`-128`、`-nothinking`、`-online` 后缀与 Omni 的视频后缀与其他入口一样解析，交互资源的 `model` 报告去掉后缀的模型名 |
+| `model` | 必需；可带 `models/` 前缀，文本对话模型的 `-low`、`-medium`、`-high`、`-xhigh`、`-minimal`、`-128`、`-nothinking`、`-online` 后缀与 Omni 的视频后缀与其他入口一样解析，交互资源的 `model` 报告去掉后缀的模型名 |
 | `input` | 字符串、单个内容块、内容块数组或步骤数组；内容类型为 `text`、`image`、`audio`、`video`、`document`。没有输入、续接历史和系统指令时选号前返回 400，只有系统指令时按用户消息生成 |
 | 媒体内容 | `mime_type` 与 `data`（Base64）或 `uri` 二选一，复用 Gemini 文件与内联媒体解析 |
 | 输入步骤 | `user_input`、`model_output`、`thought`、`function_call`、`function_result`；`function_call` 必须带 `id`，函数结果通过 `call_id` 匹配历史调用并补齐名称，对不上任何调用时返回 400；`thought.signature` 挂到随后的模型内容或函数调用上，连续多个签名各自保留 |
@@ -2148,7 +2157,7 @@ Content 字段为 `role` 与 `parts`。Part oneof：
 | executable code | `executableCode:{language,code}` |
 | code result | `codeExecutionResult:{outcome,output,error}`；输出时 `OUTCOME_OK` 写 output、其余写 error，outcome 不确定（上游为 `null` 或不在表中）时两个都写；回放时 `LANGUAGE_<n>`、`OUTCOME_<n>` 按编号发回，其他不认识的名称按 0 |
 
-函数结果的媒体与 OpenAI 入口一致拆分：`functionResponse.response` 里以 base64 内嵌的图片与文件（`{"result":[…]}`，即 new-api 把 OpenAI 的数组结果转成 Gemini 时的包装；`{"content":[…]}`，即 MCP 工具结果；内容块的写法见 OpenAI Chat 一节）与 `functionResponse.parts` 的媒体作为真正的媒体附在这组工具结果之后的用户消息里，结果原位置换成文字说明。历史开头（任何函数调用之前）没有对应调用的工具结果（客户端截断上下文时把调用那一轮裁掉了）改写成 `Tool result <名称>: <结果 JSON>` 文字说明（名称为空时写 `(<调用 ID>)`），这一轮改为用户消息；各协议都经过同一步。
+函数结果的媒体与 OpenAI 入口一致拆分：`functionResponse.response` 里以 base64 内嵌的图片与文件（`{"result":[…]}`，即 new-api 把 OpenAI 的数组结果转成 Gemini 时的包装；`{"content":[…]}`，即 MCP 工具结果；内容块的写法见 OpenAI Chat 一节）与 `functionResponse.parts` 的媒体作为真正的媒体附在这组工具结果之后的用户消息里，结果原位置换成文字说明。历史中任何位置没有对应调用的工具结果（客户端截断或压缩上下文时把调用那一轮裁掉了，同一个结果发了两次）改写成 `Tool result <名称>: <结果 JSON>` 文字说明（名称为空时写 `(<调用 ID>)`）；各协议都经过同一步（`internal/api/turns.go` 的 `orphanResultsAsText`，改写成文字的做法参照上游 Mag1cFall/AIStudio2API d94bf91，关联顺序与说明的位置不同，见下文；放在协议层做：WAA binding 按改写后的历史计算）。按顺序记下待返回的函数调用，普通用户消息（不含工具结果）之后清空，没有部件的用户消息（Responses 的空消息，编码时整条跳过）不清空，与编码时相同；每组连续的工具结果先全部按调用 ID 关联（同 ID 的调用不止一个时先找同名的），剩下的有名称的结果按同名的待返回调用（多个时取最早的）关联，最后没有名称的结果按唯一的待返回调用关联。先按名称再按唯一：排在前面的无名结果不会因为同名结果还没取走调用而被判为孤立。上游 d94bf91 在编码层逐个结果依次按调用 ID、唯一待返回调用、同名调用关联并原位替换成文字：无名结果排在前面、面对两个待返回调用时被改写成文字，留下一个没有结果的调用，改写的说明也留在这组结果中间；原先这种中段的无名结果交给编码层，报“function result 缺少名称且无法唯一关联调用”按 400 返回。关联上的结果没有名称时补上调用的名称；关联不到的改写成文字说明，连同随它取出的媒体作为一条用户消息放在这组工具结果之后（不插在调用与结果之间，整条消息都是孤立结果时整条移走）。原先只改写历史开头（任何函数调用之前）的，中段的孤立结果按原样发出：有名称时上游以函数结果与调用数量不一致拒绝，没有名称时编码报错按 400 返回。
 
 `fileData.fileUri` 指向本服务 `/media/<文件名>` 且文件仍保存着时，用户消息里的恢复为内联媒体，模型消息里的只恢复图片（见下文“生成媒体链接”），不按已上传文件查找。`fileData` 省略 `mimeType` 时（官方 Files API 的 `fileUri` 自带类型）按 `displayName` 的扩展名推断，推断不出再按 `fileUri` 路径（URL 取 path，不含查询参数）的扩展名推断，仍推断不出时留空；本服务上传的文件按文件 ID 发送，不依赖这里的类型，YouTube 等外部媒体 URL 按外部媒体处理。缺少 `fileUri` 时返回 400。
 

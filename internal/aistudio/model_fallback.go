@@ -17,7 +17,7 @@ type RequestAlias struct {
 	// ReasoningEffort、ThinkingBudget 为客户端原来的思考参数（按名称后缀改写之前）
 	ReasoningEffort string
 	ThinkingBudget  *int64
-	// Level 为名称后缀指定的思考等级（minimal、low、medium、high），空串表示没有指定
+	// Level 为名称后缀指定的思考等级（minimal、low、medium、high、xhigh），空串表示没有指定
 	Level string
 	// Online 为名称带 -online；OnlineAppended 为 -online 让协议层在 Tools.Google 里追加了 google_search（客户端原来没有）
 	Online         bool

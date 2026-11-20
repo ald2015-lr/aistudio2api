@@ -207,7 +207,8 @@ func EncodeBidiSetupRequest(request BidiRequest, runtime RequestContext) ([]byte
 			configuration[14] = []any{int64(3)}
 			configuration[15] = []any{[]any{[]any{"Zephyr"}}}
 			if request.generationDefaults.ThinkingLevel {
-				configuration[16] = []any{int64(1), nil, nil, request.generationDefaults.DefaultThinkingLevel}
+				// 与 GenerateContent 是同一个 GenerationConfig：目录默认等级为 Extra High（5）时按请求编号 6 发送
+				configuration[16] = []any{int64(1), nil, nil, wireThinkingLevel(request.generationDefaults.DefaultThinkingLevel)}
 			}
 		}
 	case BidiModeRobotics:

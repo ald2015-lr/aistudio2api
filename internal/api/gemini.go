@@ -802,8 +802,8 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 				ThoughtSignature: part.ThoughtSignature,
 			})
 		case part.FunctionResponse != nil:
-			// 名称可以为空：中转在客户端截掉了对应的 assistant 消息、tool 消息又没有 name 时会这样发，编码时按调用 ID 或唯一待返回的调用补名，
-			// 历史开头没有对应调用的结果改写成文字说明（见 normalizeTurns）；原先这里直接返回 400
+			// 名称可以为空：中转在客户端截掉了对应的 assistant 消息、tool 消息又没有 name 时会这样发，整理历史时按调用 ID、唯一待返回或同名的
+			// 调用补名，历史中任何位置关联不到调用的结果改写成文字说明（见 normalizeTurns）；原先这里直接返回 400
 			response, err := geminiJSONObject(part.FunctionResponse.Response, "functionResponse.response")
 			if err != nil {
 				return nil, false, err

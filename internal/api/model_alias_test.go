@@ -176,3 +176,98 @@ func TestBuildOnlyThinkingModels(t *testing.T) {
 		}
 	}
 }
+
+// TestExtraHighSuffix -xhigh 为官网 Extra High（超高思考）：与其他后缀组合、顺序不限、不分大小写，-high 仍是 high；long- 前缀照常；
+// 应用到思考等级模型写 reasoning_effort=xhigh（编码层按目录换算，没有列出时按 HIGH），只在 Build 可用的模型按 high，只支持预算的模型
+// 按最大预算；不带后缀仍设为 high
+func TestExtraHighSuffix(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		base   string
+		level  string
+		hide   bool
+		online bool
+	}{
+		{name: "gemini-4-argon-xhigh", base: "gemini-4-argon", level: "xhigh"},
+		{name: "gemini-4-argon-XHIGH", base: "gemini-4-argon", level: "xhigh"},
+		{name: "gemini-4-argon-high", base: "gemini-4-argon", level: "high"},
+		{name: "gemini-4-argon-xhigh-nothinking", base: "gemini-4-argon", level: "xhigh", hide: true},
+		{name: "gemini-4-argon-nothinking-xhigh-online", base: "gemini-4-argon", level: "xhigh", hide: true, online: true},
+		{name: "gemini-4-argon-low-xhigh", base: "gemini-4-argon", level: "xhigh"},
+		{name: "gemini-4-argon-xhigh-high", base: "gemini-4-argon", level: "high"},
+	} {
+		alias := parseModelAlias(test.name)
+		if alias.base != test.base || alias.level != test.level || alias.hideThought != test.hide || alias.online != test.online {
+			t.Fatalf("%s 解析为 %+v，期望 base=%s level=%q hide=%v online=%v", test.name, alias, test.base, test.level, test.hide, test.online)
+		}
+	}
+	models := aliasTestModels()
+	for name, want := range map[string]struct {
+		rest  string
+		level string
+		long  bool
+	}{
+		"gemini-4-argon-xhigh":                   {rest: "gemini-4-argon-xhigh", level: "xhigh"},
+		"long-gemini-4-argon-xhigh":              {rest: "gemini-4-argon-xhigh", level: "xhigh", long: true},
+		"LONG-gemini-4-argon-xhigh-nothinking":   {rest: "gemini-4-argon-xhigh-nothinking", level: "xhigh", long: true},
+		"long-gemini-4-argon-high":               {rest: "gemini-4-argon-high", level: "high", long: true},
+		"gemini-4-argon-xhigh-nothinking-online": {rest: "gemini-4-argon-xhigh-nothinking-online", level: "xhigh"},
+	} {
+		model, alias, rest, long, ok := resolveLongRequestModel(models, name)
+		if !ok || model.ID != "gemini-4-argon" || alias.level != want.level || rest != want.rest || long != want.long {
+			t.Fatalf("%s 解析为 model=%s level=%q rest=%s long=%v ok=%v，期望 %+v", name, model.ID, alias.level, rest, long, ok, want)
+		}
+	}
+
+	level, budget := models[0], models[1]
+	config := aistudio.GenerationConfig{ReasoningEffort: "low"}
+	applyThinkingAlias(&config, level, "xhigh")
+	if config.ReasoningEffort != "xhigh" || config.ThinkingBudget != nil {
+		t.Fatalf("思考等级模型 -xhigh：%+v，期望 reasoning_effort=xhigh 覆盖客户端参数", config)
+	}
+	config = aistudio.GenerationConfig{}
+	applyThinkingAlias(&config, level, "")
+	if config.ReasoningEffort != "high" {
+		t.Fatalf("不带后缀：%+v，期望仍为 high", config)
+	}
+	config = aistudio.GenerationConfig{}
+	applyThinkingAlias(&config, budget, "xhigh")
+	if config.ReasoningEffort != "" || config.ThinkingBudget == nil || *config.ThinkingBudget != 32768 {
+		t.Fatalf("只支持预算的模型 -xhigh：%+v，期望最大预算 32768", config)
+	}
+	buildOnly := aistudio.Model{ID: "gemini-4-argon", Channels: []string{"build"}, Capabilities: map[string]bool{"chat_model": true, "thinking": true}}
+	config = aistudio.GenerationConfig{}
+	applyThinkingAlias(&config, buildOnly, "xhigh")
+	if config.ReasoningEffort != "high" {
+		t.Fatalf("只在 Build 可用的模型 -xhigh：%+v，期望按 high", config)
+	}
+}
+
+// TestExtraHighAliasListing 模型列表只给目录列出 Extra High（aistudio.Model.ExtraHighThinking）的思考等级模型列出 -xhigh（超高思考）；
+// 其他模型（包括只支持预算、只在 Build 可用、目录 ID 本身以等级结尾的）不列，但带 -xhigh 的名称照样能解析与单模型查询
+func TestExtraHighAliasListing(t *testing.T) {
+	models := aliasTestModels()
+	models[0].ExtraHighThinking = true
+	models[2].ExtraHighThinking = true
+	models = append(models,
+		aistudio.Model{ID: "gemini-4-carbon", Name: "Carbon", Capabilities: map[string]bool{"chat_model": true, "thinking": true, "thinking_level": true}},
+		aistudio.Model{ID: "gemini-4-neon", Channels: []string{"build"}, ExtraHighThinking: true, Capabilities: map[string]bool{"chat_model": true, "thinking": true}},
+	)
+	names := make(map[string]string)
+	for _, model := range expandModelAliases(models) {
+		names[model.ID] = model.Name
+	}
+	if names["gemini-4-argon-xhigh"] != "Gemini 4 Argon · 超高思考" {
+		t.Fatalf("模型列表应列出 gemini-4-argon-xhigh：%v", names)
+	}
+	for _, unwanted := range []string{"gemini-4-carbon-xhigh", "gemini-2.5-pro-xhigh", "vendor-model-low-xhigh", "gemini-4-neon-xhigh", "gemini-4-argon-high"} {
+		if _, listed := names[unwanted]; listed {
+			t.Fatalf("模型列表不应列出 %s", unwanted)
+		}
+	}
+	for _, name := range []string{"gemini-4-carbon-xhigh", "gemini-4-argon-xhigh-nothinking"} {
+		if model, ok := lookupPublicModel(models, name); !ok || model.ID != name {
+			t.Fatalf("单模型查询 %s：%+v ok=%v", name, model, ok)
+		}
+	}
+}

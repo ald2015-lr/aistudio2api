@@ -23,21 +23,23 @@ import (
 type accessLogContextKey struct{}
 
 type accessLogMetadata struct {
-	mu              sync.Mutex
-	admin           AdminService
-	method          string
-	path            string
-	pool            string
-	started         bool
-	generation      bool
-	model           string
-	account         string
-	channel         string
-	finishReason    string
-	replyHash       string
-	servedModel     string
-	downgrade       *aistudio.DowngradeDecision
-	err             string
+	mu           sync.Mutex
+	admin        AdminService
+	method       string
+	path         string
+	pool         string
+	started      bool
+	generation   bool
+	model        string
+	account      string
+	channel      string
+	finishReason string
+	replyHash    string
+	servedModel  string
+	downgrade    *aistudio.DowngradeDecision
+	err          string
+	// trailingError 为上游在已交给客户端的函数调用之后结束生成的原因（请求仍按正常完成记录，见 SetAccessLogTrailingError）
+	trailingError   string
 	canceled        bool
 	failureStatus   int
 	firstEvent      time.Duration
@@ -110,6 +112,7 @@ type accessLogSnapshot struct {
 	fallbackFrom    string
 	downgrade       *aistudio.DowngradeDecision
 	requestErr      string
+	trailingError   string
 	canceled        bool
 	failureStatus   int
 	firstEvent      time.Duration
@@ -557,7 +560,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 	snapshot := accessLogSnapshot{
 		generation: metadata.generation,
 		model:      metadata.model, startedModel: metadata.startedModel, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
-		requestErr: metadata.err, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
+		requestErr: metadata.err, trailingError: metadata.trailingError, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
 		failureStatus: metadata.failureStatus,
 		firstEvent:    metadata.firstEvent,
 		upstreamBytes: metadata.upstreamBytes, usage: metadata.usage, toolCalls: metadata.toolCalls,
@@ -746,6 +749,19 @@ func SetAccessLogError(ctx context.Context, err error) {
 	}
 }
 
+// SetAccessLogTrailingError 写入上游在已交给客户端的函数调用之后结束生成的原因（结束事件的 TrailingError，见 aistudio/trailing.go）：
+// 请求仍按正常完成记录，原因只作为请求日志与用量账本的错误详情
+func SetAccessLogTrailingError(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.trailingError = strings.TrimSpace(err.Error())
+		metadata.mu.Unlock()
+	}
+}
+
 // SetAccessLogFinishReason 写入生成请求的上游终止原因
 func SetAccessLogFinishReason(ctx context.Context, reason string) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
@@ -840,7 +856,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				Thinking: snapshot.thinking, MaxOutputTokens: snapshot.maxOutputTokens, Seed: snapshot.seed,
 				RequestID: snapshot.requestID, Pool: pool,
 				Method: r.Method, Path: path, Model: snapshot.model, RequestedModel: snapshot.startedModel, Account: snapshot.account, Channel: snapshot.channel,
-				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr,
+				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr, TrailingError: snapshot.trailingError,
 				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
 				Authorized: snapshot.authorized, Warmup: snapshot.warmup, Disconnect: disconnect,

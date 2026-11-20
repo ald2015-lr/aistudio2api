@@ -15,17 +15,19 @@ import (
 
 // 模型名后缀（可以组合，顺序不限，例如 gemini-3.1-pro-preview-128-nothinking-online、gemini-4-argon-low-nothinking）：
 //
-//	不带后缀     思考强度设为最高（客户端显式传了思考参数时以客户端为准）
+//	不带后缀     思考强度设为 high，不是 Extra High（客户端显式传了思考参数时以客户端为准）
 //	-128        最低思考：支持思考等级的模型用最低等级，只支持预算的模型用 128 token（与 -minimal 相同）
-//	-minimal、-low、-medium、-high
+//	-minimal、-low、-medium、-high、-xhigh
 //	            按名称指定思考等级，优先于客户端传入的思考参数；模型不支持该等级时取最接近的等级，
-//	            只支持预算的模型换算为 128、1024、8192 token 与最大预算
+//	            只支持预算的模型换算为 128、1024、8192 token 与最大预算（-high、-xhigh 都是最大预算）。
+//	            -xhigh 为官网的 Extra High（超高思考），模型目录没有列出 Extra High 时按 HIGH 发送；
+//	            模型列表只给目录列出 Extra High（等级列表含或默认等级就是 Extra High）的模型列出 -xhigh 别名
 //	-nothinking 模型照常思考，但不返回思维链
 //	-online     开启 Google 搜索
 //
-// 目录里本身就以等级结尾的模型 ID（例如 xxx-low）不再强制最高思考，按 ID 里的等级设置。
+// 目录里本身就以等级结尾的模型 ID（例如 xxx-low）不再强制 high，按 ID 里的等级设置。
 // 能输出视频的 Omni 模型另有视频后缀（-16x9、-720p、-8s、-i2v 等，见 omni_video.go），可与思考等级、-nothinking 组合，
-// 例如 gemini-omni-1.1-flash-9x16-720p-8s-low；Omni 不带等级后缀时沿用模型默认等级，不强制最高。
+// 例如 gemini-omni-1.1-flash-9x16-720p-8s-low；Omni 不带等级后缀时沿用模型默认等级，不强制 high。
 //
 // 模型名前缀 long-（不分大小写）表示自动续写（见 aistudio/continuation.go）：与上面的全部后缀照常组合，例如 long-gemini-4-argon、
 // long-gemini-4-argon-low、long-gemini-3.8-flash-nothinking。整个名称本身能解析（目录 ID 以 long- 开头）时按目录 ID，不当作前缀；
@@ -69,7 +71,8 @@ func longOutputModel(model aistudio.Model) bool {
 	return isTextChatModel(model) && (len(model.Channels) == 0 || slices.Contains(model.Channels, string(aistudio.ChannelPlayground)))
 }
 
-// thinkingLevelSuffixes 为按名称指定思考等级的后缀与对应的等级（reasoning_effort 写法）
+// thinkingLevelSuffixes 为按名称指定思考等级的后缀与对应的等级（reasoning_effort 写法）。按顺序匹配名称末尾：
+// -xhigh 排在 -high 前（-xhigh 本身不以 -high 结尾，排在前面是为了以后加 -extra-high 这类以 -high 结尾的写法时不被 -high 先剥掉）
 var thinkingLevelSuffixes = []struct {
 	suffix string
 	level  string
@@ -77,10 +80,11 @@ var thinkingLevelSuffixes = []struct {
 	{"-minimal", "minimal"},
 	{"-low", "low"},
 	{"-medium", "medium"},
+	{"-xhigh", "xhigh"},
 	{"-high", "high"},
 }
 
-// modelAlias 表示从模型名解析出的后缀；level 为名称指定的思考等级（minimal、low、medium、high），空串表示没有指定；
+// modelAlias 表示从模型名解析出的后缀；level 为名称指定的思考等级（minimal、low、medium、high、xhigh），空串表示没有指定；
 // video 为 Omni 视频后缀指定的视频设置，没有视频后缀时为零值
 type modelAlias struct {
 	base        string
@@ -90,7 +94,7 @@ type modelAlias struct {
 	video       aistudio.VideoConfig
 }
 
-// trailingThinkingLevel 返回名称末尾的思考等级后缀（-minimal、-low、-medium、-high）对应的等级，没有时返回空串
+// trailingThinkingLevel 返回名称末尾的思考等级后缀（-minimal、-low、-medium、-high、-xhigh）对应的等级，没有时返回空串
 func trailingThinkingLevel(name string) (string, string) {
 	lower := strings.ToLower(name)
 	for _, entry := range thinkingLevelSuffixes {
@@ -150,7 +154,7 @@ func parseModelAlias(name string) modelAlias {
 
 // resolveModelAlias 返回请求名称对应的目录模型：名称本身就是目录模型时不解析后缀；否则从末尾一个一个剥离后缀，
 // 剥到第一个目录里有的名称为止（目录 ID 本身以 -low、-online 之类结尾时不会被多剥一层）。
-// 目录 ID 以思考等级结尾（例如 xxx-low）且后缀没有另外指定等级时按 ID 里的等级设置，不强制最高思考
+// 目录 ID 以思考等级结尾（例如 xxx-low）且后缀没有另外指定等级时按 ID 里的等级设置，不强制 high
 func resolveModelAlias(models []aistudio.Model, name string) (aistudio.Model, modelAlias, bool) {
 	return resolveModelAliasWith(models, name, false)
 }
@@ -282,8 +286,9 @@ func maxThinkingBudget(modelID string) int64 {
 	return 24576
 }
 
-// applyThinkingAlias 设置思考强度：requested 为名称指定的等级（minimal、low、medium、high），优先于客户端传入的思考参数；
-// 为空时设为最高，客户端显式传了思考参数时以客户端为准。支持思考等级的模型写 reasoning_effort（编码时按模型支持的等级取最接近的），
+// applyThinkingAlias 设置思考强度：requested 为名称指定的等级（minimal、low、medium、high、xhigh），优先于客户端传入的思考参数；
+// 为空时设为 high（不是 Extra High：Extra High 只在名称带 -xhigh 或客户端要求时使用），客户端显式传了思考参数时以客户端为准。
+// 支持思考等级的模型写 reasoning_effort（编码时按模型支持的等级取最接近的，目录没有列出 Extra High 时 xhigh 按 HIGH），
 // 只支持思考预算的模型换算为预算
 func applyThinkingAlias(config *aistudio.GenerationConfig, model aistudio.Model, requested string) {
 	level := thinkingLevelControllable(model)
@@ -300,9 +305,15 @@ func applyThinkingAlias(config *aistudio.GenerationConfig, model aistudio.Model,
 	config.ReasoningEffort = ""
 	config.ThinkingBudget = nil
 	if level {
-		// 只在 Build 可用的模型没有目录里的等级列表，编码时无法换成最接近的等级；Gemini 3 Pro、4 Argon 等不支持 MINIMAL，按 LOW 发送
-		if requested == "minimal" && buildOnlyLevelModel(model) {
-			requested = "low"
+		// 只在 Build 可用的模型没有目录里的等级列表，编码时无法换成最接近的等级；Gemini 3 Pro、4 Argon 等不支持 MINIMAL，按 LOW 发送，
+		// Build 目录也看不出是否支持 Extra High，-xhigh 按 HIGH 发送
+		if buildOnlyLevelModel(model) {
+			switch requested {
+			case "minimal":
+				requested = "low"
+			case "xhigh":
+				requested = "high"
+			}
 		}
 		config.ReasoningEffort = requested
 		return
@@ -311,7 +322,7 @@ func applyThinkingAlias(config *aistudio.GenerationConfig, model aistudio.Model,
 	config.ThinkingBudget = &value
 }
 
-// thinkingBudgetForAlias 把名称指定的思考等级换算为只支持预算的模型的预算：最低 128、低 1024、中 8192、最高为模型的最大预算
+// thinkingBudgetForAlias 把名称指定的思考等级换算为只支持预算的模型的预算：最低 128、低 1024、中 8192、high 与 xhigh 为模型的最大预算
 func thinkingBudgetForAlias(modelID string, level string) int64 {
 	switch level {
 	case "minimal":
@@ -561,7 +572,7 @@ func servedModel(ctx context.Context, model string) string {
 }
 
 // responseModel 返回响应里报告的模型名（OpenAI、Anthropic、Responses 的 model，Gemini 的 modelVersion，Interactions 的 model），
-// 取 prepareGenerate 解析后的请求模型：带后缀的别名（-128、-low、-medium、-high、-minimal、-nothinking、-online 及其组合）
+// 取 prepareGenerate 解析后的请求模型：带后缀的别名（-128、-low、-medium、-high、-xhigh、-minimal、-nothinking、-online 及其组合）
 // 报告为目录里的模型名，例如 gemini-3.1-pro-preview-low 报告为 gemini-3.1-pro-preview；不带后缀或无法解析的名称按请求原样报告
 // （去掉首尾空白）。不报告上游返回的实际服务模型版本：中转与客户端按请求的模型名对账、计费，实际服务模型另见 provider_model
 // 与管理日志的 served_model
@@ -596,6 +607,10 @@ func aliasVariants(model aistudio.Model) []aliasVariant {
 			aliasVariant{suffix: "-low", label: "低思考"},
 			aliasVariant{suffix: "-medium", label: "中等思考"},
 		)
+		// -xhigh 只列给目录列出 Extra High 的模型（其他模型带 -xhigh 照样能用，只是按 HIGH 发送，与不带后缀相同）
+		if model.ExtraHighThinking && model.Capabilities["thinking_level"] {
+			variants = append(variants, aliasVariant{suffix: "-xhigh", label: "超高思考"})
+		}
 	}
 	if modelThinks(model) {
 		variants = append(variants, aliasVariant{suffix: suffixHideThought, label: "隐藏思维链"})

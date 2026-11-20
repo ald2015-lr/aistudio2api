@@ -1,6 +1,7 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -7283,23 +7284,7 @@ func (service *trackedService) forwardEvents(
 		}
 		if event.Kind == aistudio.EventError {
 			requestErr = event.Err
-			// 已输出内容后流内收到的上游 4xx 同样记一行证据
-			service.logUpstreamClientError(requestID, accountLabel, event.Err, "已输出内容后")
-			if aistudio.DefinitiveAuthenticationFailure(event.Err) {
-				// 上游 401 先经账户池的 gate（疑似登录失效、复核后才标记，见 auth_recheck.go）；没有标记时不释放 Worker、不写“账号需要登录”
-				if marked, stateErr := lease.MarkAuthenticationFailure(event.Err); stateErr != nil {
-					requestErr = errors.Join(requestErr, stateErr)
-					event.Err = requestErr
-				} else if marked {
-					// 流内确认需要登录：驻留 Worker 不再是任何模型的候选，登记释放（这次请求释放租约后关闭），写“账号需要登录”
-					service.workers.releaseUnschedulable(lease.Account().ID, unschedulableAuthRequired)
-					service.noteAuthRequired(lease.Account().ID, accountLabel, authFromStream, event.Err)
-				}
-			} else if _, ok, stateErr := service.applyQuotaCooldown(
-				lease, accountLabel, requestedModelID, event.Err, "已输出内容后", aistudio.PoolScopeFromContext(requestCtx), false, true,
-			); ok && stateErr != nil {
-				// 已经开始输出后才出现的 429 无法换号重试，但仍写回冷却，后续请求不再选中这个账号或模型；
-				// 这次尝试已经拿到上游输出，裸限流不作为“冷却到期后仍失败”的证据，不升档
+			if stateErr := service.settleStreamError(requestCtx, requestID, accountLabel, lease, requestedModelID, event.Err, "已输出内容后"); stateErr != nil {
 				requestErr = errors.Join(requestErr, stateErr)
 				event.Err = requestErr
 			}
@@ -7307,7 +7292,11 @@ func (service *trackedService) forwardEvents(
 			terminal = true
 		}
 		if event.Kind == aistudio.EventFinish {
-			api.SetAccessLogFinishReason(requestCtx, event.FinishReason)
+			// 函数调用之后上游结束生成（见 aistudio/trailing.go）：拦截类原因作为这次请求的终止原因，原错误写 WARN 与错误详情
+			api.SetAccessLogFinishReason(requestCtx, cmp.Or(aistudio.TrailingFinishReason(event.TrailingError), event.FinishReason))
+			if event.TrailingError != nil {
+				service.settleTrailingError(requestCtx, requestID, accountLabel, lease, requestedModelID, event)
+			}
 			if event.FinishMessage != "" {
 				// 上游对结束原因的说明（如 MALFORMED_FUNCTION_CALL 出错的调用）写进这次请求的管理日志，排查时不用再抓原始响应
 				level, message := upstreamFinishLog(event.FinishReason, event.FinishMessage)
@@ -7347,13 +7336,66 @@ func (service *trackedService) forwardEvents(
 			finishFromContext()
 			return
 		}
-		if !verified && event.Kind == aistudio.EventFinish && event.ContinuationErr == nil {
-			// long- 自动续写后续轮次失败后的结束不算验证成功：验证会清掉刚为这次失败写回的冷却（见 long_output.go）
+		if !verified && event.Kind == aistudio.EventFinish && event.ContinuationErr == nil && !aistudio.TrailingAccountError(event.TrailingError) {
+			// long- 自动续写后续轮次失败后的结束、函数调用之后上游以错误结束（按正常完成交给客户端）不算验证成功：验证会清掉刚为这次失败
+			// 写回的冷却（见 long_output.go 与 settleTrailingError）
 			verified = true
 			service.markModelAccessVerifiedAsync(
 				lease.Account().ID, accountLabel, lease.CooldownScope(requestedModelID), accessGeneration, lease.CheckedAt(),
 			)
 		}
+	}
+}
+
+// settleStreamError 照流内错误的规则处理账号状态（note 写在证据与冷却日志末尾，说明错误出现在哪个阶段）：上游 4xx 记一行证据；上游 401 先经
+// 账户池的 gate（疑似登录失效、复核后才标记，见 auth_recheck.go），确认需要登录时释放驻留 Worker、写“账号需要登录”；额度 429 写回冷却
+// （已输出内容后的失败，不升档）。返回写回账号状态时的错误
+func (service *trackedService) settleStreamError(
+	requestCtx context.Context, requestID string, accountLabel string, lease *aistudio.AccountLease, modelID string, err error, note string,
+) error {
+	service.logUpstreamClientError(requestID, accountLabel, err, note)
+	if aistudio.DefinitiveAuthenticationFailure(err) {
+		// 没有标记时不释放 Worker、不写“账号需要登录”
+		marked, stateErr := lease.MarkAuthenticationFailure(err)
+		if stateErr != nil {
+			return stateErr
+		}
+		if marked {
+			// 流内确认需要登录：驻留 Worker 不再是任何模型的候选，登记释放（这次请求释放租约后关闭），写“账号需要登录”
+			service.workers.releaseUnschedulable(lease.Account().ID, unschedulableAuthRequired)
+			service.noteAuthRequired(lease.Account().ID, accountLabel, authFromStream, err)
+		}
+		return nil
+	}
+	// 已经开始输出后才出现的 429 无法换号重试，但仍写回冷却，后续请求不再选中这个账号或模型；
+	// 这次尝试已经拿到上游输出，裸限流不作为“冷却到期后仍失败”的证据，不升档
+	if _, ok, stateErr := service.applyQuotaCooldown(
+		lease, accountLabel, modelID, err, note, aistudio.PoolScopeFromContext(requestCtx), false, true,
+	); ok && stateErr != nil {
+		return stateErr
+	}
+	return nil
+}
+
+// trailingCallNote 为函数调用之后上游以错误结束时写在证据与冷却日志末尾的阶段说明
+const trailingCallNote = "函数调用之后"
+
+// settleTrailingError 处理上游在已交给客户端的函数调用之后结束生成（结束事件的 TrailingError，见 aistudio/trailing.go）：客户端照常收到
+// 正常结束，这里写一行 WARN，原因写进访问日志与用量账本的错误详情。上游错误（流尾错误、流中断、拦截请求）照流内错误的规则处理账号状态
+// （settleStreamError）：它们原先作为流内错误交出、照常计入，改成正常结束只改变客户端看到的结果，账号的冷却、登录复核与 4xx 证据不变；
+// 内容策略类结束原因原先就是正常的结束，不涉及账号状态。long- 续写后续轮次的失败已在续写进度里处理过（见 long_output.go），不重复处理
+func (service *trackedService) settleTrailingError(
+	requestCtx context.Context, requestID string, accountLabel string, lease *aistudio.AccountLease, modelID string, event aistudio.Event,
+) {
+	trailing := event.TrailingError
+	api.SetAccessLogTrailingError(requestCtx, trailing)
+	service.requests.logRequestProgress(requestID, accountLabel, "WARN",
+		"函数调用之后上游结束生成，客户端已收到完整的函数调用，按正常完成结束 | 原因="+progressReason(trailing))
+	if !aistudio.TrailingAccountError(trailing) || event.ContinuationErr != nil {
+		return
+	}
+	if stateErr := service.settleStreamError(requestCtx, requestID, accountLabel, lease, modelID, trailing, trailingCallNote); stateErr != nil {
+		service.requests.logRequestProgress(requestID, accountLabel, "WARN", "函数调用之后上游结束生成，写回账号状态失败 | 原因="+progressReason(stateErr))
 	}
 }
 

@@ -78,4 +78,6 @@ func mergeModelInto(current *Model, model Model) {
 		current.AccessModes = unionInt64(current.AccessModes, model.AccessModes)
 	}
 	current.Paid = current.Paid || model.Paid
+	// 任一账户的目录列出 Extra High 就算支持（模型列表据此列出 -xhigh）；不支持的账户收到 xhigh 时按 HIGH 发送（见 closestSupportedThinkingLevel）
+	current.ExtraHighThinking = current.ExtraHighThinking || model.ExtraHighThinking
 }

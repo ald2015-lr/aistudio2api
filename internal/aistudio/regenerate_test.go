@@ -842,8 +842,8 @@ const (
 )
 
 // TestGenerateNoRegenerateAfterThoughtOrToolCall 思考与工具调用同样算已交出的内容：先交出思考（HideThinking 关闭）再以函数调用格式错误
-// 或流尾 503 结束、先交出函数调用再断流时都不重新生成，只发送一次（客户端已经看到这段思考或调用，重来会看到两段）；
-// 隐藏思考（HideThinking）且思考没有签名时这段思考不交出，仍然重新生成
+// 或流尾 503 结束、先交出函数调用再断流时都不重新生成，只发送一次（客户端已经看到这段思考或调用，重来会看到两段）；函数调用之后断流
+// 按 stop 正常结束（见 trailing.go）；隐藏思考（HideThinking）且思考没有签名时这段思考不交出，仍然重新生成
 func TestGenerateNoRegenerateAfterThoughtOrToolCall(t *testing.T) {
 	for _, test := range []struct {
 		name  string
@@ -853,7 +853,7 @@ func TestGenerateNoRegenerateAfterThoughtOrToolCall(t *testing.T) {
 	}{
 		{name: "思考后函数调用格式错误", first: streamResponse(regenStream("", regenThoughtFrame, regenMalformedFrame)), kind: EventReasoning, last: EventFinish},
 		{name: "思考后流尾 503", first: streamResponse(regenStream(`[14,"The service is currently unavailable."]`, regenThoughtFrame)), kind: EventReasoning, last: EventError},
-		{name: "函数调用后断流", first: interruptedResponse(`[[` + regenFunctionFrame), kind: EventToolCall, last: EventError},
+		{name: "函数调用后断流", first: interruptedResponse(`[[` + regenFunctionFrame), kind: EventToolCall, last: EventFinish},
 	} {
 		upstream := &regenUpstream{responses: []func() (*RPCResponse, error){
 			test.first, streamResponse(regenStream("", regenTextFrame, regenStopFrame)),

@@ -288,6 +288,7 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
 	if capabilities["output_continuation"] {
 		defaults.ContinuedOutputTokens = inputLimit
 	}
+	model.ExtraHighThinking = extraHighThinkingSupported(defaults)
 	return modelEntry{model: model, defaults: defaults}, nil
 }
 

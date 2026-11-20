@@ -357,6 +357,11 @@ type Model struct {
 	Channels          []string            `json:"channels,omitempty"`
 	// BuildUnary 只在管理页目录中设置：模型需要订阅权益，在 Build 通道只能一次性返回整段回复（见 BuildUsesUnary）
 	BuildUnary bool `json:"build_unary,omitempty"`
+	// ExtraHighThinking 表示 Playground 目录的思考设置（field 72）列出了 Extra High（等级列表含 5，或默认等级就是 5，见
+	// extraHighThinkingSupported）：模型列表只给这类模型列出 -xhigh 别名，这类模型收到 xhigh 时按 Extra High 发送。
+	// 不写进 JSON：账户目录指纹（accountCatalogFingerprint）按目录的 JSON 计算，写进去会让升级后全部账户的指纹变化、目录按过期重新同步；
+	// 写盘缓存保存 ListModels 原文、恢复时重新解析，这一项照样得到。多个账户的目录合并时取或（见 mergeModelInto）
+	ExtraHighThinking bool `json:"-"`
 }
 
 // Usage 表示一次生成的 token 用量
@@ -464,6 +469,10 @@ type Event struct {
 	// ContinuationErr 只出现在 long- 自动续写第二轮起失败后体面结束的结束事件上（见 continuation.go 的 finishFailedRound），为失败的原因：
 	// 生成服务不把这次结束当作模型资格验证成功（否则会清掉刚为这次失败写回的冷却）；协议层照常按结束原因处理
 	ContinuationErr error `json:"-"`
+	// TrailingError 只出现在结束事件上：上游在已交给客户端的函数调用之后结束生成（流尾错误、流中断、拦截请求、内容策略类结束原因、
+	// long- 续写后续轮次失败），这一轮按 stop 正常结束，原错误或原因留在这里（见 trailing.go）。协议层照常按结束原因处理；生成服务据此
+	// 写 WARN、写进访问日志与用量账本的错误详情，上游错误照流内错误的规则处理账号状态
+	TrailingError error `json:"-"`
 }
 
 // Service 定义公开协议适配器依赖的最小能力

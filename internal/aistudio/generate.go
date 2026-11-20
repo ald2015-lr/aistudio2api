@@ -98,7 +98,8 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	}
 	thinkingLevel := defaults.DefaultThinkingLevel
 	thinkingBudget := config.ThinkingBudget
-	// 兼容各家客户端的思考强度写法：xhigh、max 视为最高，auto、default 与未知写法按未设置处理
+	// 兼容各家客户端的思考强度写法：xhigh、extra_high、max 等为 Extra High（模型目录没有列出时按 HIGH，见 closestSupportedThinkingLevel），
+	// auto、default 与未知写法按未设置处理
 	effort := normalizeReasoningEffort(config.ReasoningEffort)
 	hasReasoningEffort := effort != ""
 	switch effort {
@@ -108,6 +109,8 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 		thinkingLevel = 2
 	case "high":
 		thinkingLevel = 3
+	case "xhigh":
+		thinkingLevel = extraHighThinkingLevel
 	case "minimal":
 		thinkingLevel = 4
 	case "none":
@@ -120,7 +123,8 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 			}
 		}
 	}
-	if hasReasoningEffort && defaults.ThinkingLevel {
+	if hasReasoningEffort && defaults.ThinkingLevel && (thinkingLevel != extraHighThinkingLevel || !extraHighThinkingSupported(defaults)) {
+		// 支持 Extra High 的模型（目录默认等级就是 Extra High 而等级列表没有列出它时也算）收到 xhigh 时照发，其余等级取最接近的
 		thinkingLevel = closestSupportedThinkingLevel(thinkingLevel, defaults.ThinkingLevels)
 	}
 	if hasReasoningEffort && !defaults.ThinkingLevel {
@@ -252,7 +256,7 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	if includeThinking {
 		thinking := []any{int64(1)}
 		if defaults.ThinkingLevel {
-			thinking = []any{int64(1), nil, nil, thinkingLevel}
+			thinking = []any{int64(1), nil, nil, wireThinkingLevel(thinkingLevel)}
 		}
 		if thinkingBudget != nil {
 			if len(thinking) < 2 {
@@ -277,15 +281,40 @@ func encodeGenerationConfig(config GenerationConfig, defaults GenerationDefaults
 	return wire, nil
 }
 
-var thinkingLevelsByEffort = []int64{4, 1, 2, 3}
+// extraHighThinkingLevel 为官网 Thinking level 的 Extra High 在 ListModels（field 72 的默认等级与等级列表）中的编号；
+// GenerateContent 请求的 GenerationConfig 里写 extraHighThinkingWire（见 wireThinkingLevel）
+const (
+	extraHighThinkingLevel = int64(5)
+	extraHighThinkingWire  = int64(6)
+)
 
-// normalizeReasoningEffort 统一各家客户端的思考强度写法，返回空串表示未设置（使用模型默认强度）
+// thinkingLevelsByEffort 为按思考强度从低到高排列的等级（ListModels 编号）：Minimal、Low、Medium、High、Extra High
+var thinkingLevelsByEffort = []int64{4, 1, 2, 3, extraHighThinkingLevel}
+
+// extraHighThinkingSupported 判断模型支持 Extra High：可调思考等级，且目录的等级列表列出 5，或目录默认等级就是 5（不带思考参数时本来就按
+// Extra High 发送）。模型列表据此列出 -xhigh（Model.ExtraHighThinking），encodeGenerationConfig 据此照发 xhigh，两处口径相同
+func extraHighThinkingSupported(defaults GenerationDefaults) bool {
+	return defaults.ThinkingLevel &&
+		(slices.Contains(defaults.ThinkingLevels, extraHighThinkingLevel) || defaults.DefaultThinkingLevel == extraHighThinkingLevel)
+}
+
+// wireThinkingLevel 返回 ListModels 编号的思考等级写进 GenerationConfig（field 17 第 4 项）时的编号：官网 Extra High 在 ListModels 中为 5、
+// 在 GenerateContent 与 Live 请求中为 6（上游 Mag1cFall/AIStudio2API a68acad 抓包），其余等级相同
+func wireThinkingLevel(level int64) int64 {
+	if level == extraHighThinkingLevel {
+		return extraHighThinkingWire
+	}
+	return level
+}
+
+// normalizeReasoningEffort 统一各家客户端的思考强度写法，返回空串表示未设置（使用模型默认强度）。
+// xhigh、extra_high（Gemini 枚举 EXTRA_HIGH）、max（Anthropic output_config.effort 的最高档）、maximum、highest 都归为 xhigh
 func normalizeReasoningEffort(value string) string {
 	switch effort := strings.ToLower(strings.TrimSpace(value)); effort {
-	case "none", "minimal", "low", "medium", "high":
+	case "none", "minimal", "low", "medium", "high", "xhigh":
 		return effort
-	case "xhigh", "max", "maximum", "highest":
-		return "high"
+	case "extra_high", "extra-high", "extrahigh", "max", "maximum", "highest":
+		return "xhigh"
 	case "off", "disabled":
 		return "none"
 	case "min":
@@ -323,7 +352,13 @@ func thinkingLevelForBudget(budget int64) int64 {
 	}
 }
 
+// closestSupportedThinkingLevel 返回模型支持的等级中最接近 requested 的（距离相同时取较低的）；supported 为空（目录没有等级列表，
+// 或 Build 独有模型）时原样返回。Extra High 例外：只有等级列表明确列出 5 才发送，没有列出（包括列表为空）时先换成 HIGH 再找最接近的，
+// 不给不支持的模型发 Extra High（目录默认等级为 5 的模型由调用方先按 extraHighThinkingSupported 照发，不经这里）
 func closestSupportedThinkingLevel(requested int64, supported []int64) int64 {
+	if requested == extraHighThinkingLevel && !slices.Contains(supported, extraHighThinkingLevel) {
+		requested = 3
+	}
 	requestedRank := slices.Index(thinkingLevelsByEffort, requested)
 	if requestedRank < 0 || len(supported) == 0 || slices.Contains(supported, requested) {
 		return requested
@@ -784,6 +819,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 		matchedStopSequence := ""
 		// delivered 为已经向客户端交出过内容（正文、思考、工具调用、媒体等任何事件）：之后不再重新生成
 		delivered := false
+		// calledFunction 为已经向客户端交出过函数调用（工具约束扣住、没有放出的不算）：之后上游以错误或内容策略类原因结束时按 stop
+		// 正常结束（见 trailing.go）。与 delivered 一样不随重新生成清零：交出函数调用即已交出内容，之后不会再重新生成
+		calledFunction := false
 		// attemptStarted 为本次发送的开始时刻：重新生成前按它估计再来一次要多久，剩余期限不够时不重新生成
 		attemptStarted := sendStarted
 		emitEvent := func(event Event) error {
@@ -824,6 +862,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 					}
 					if err := send(next); err != nil {
 						return err
+					}
+					if next.Kind == EventToolCall && next.ToolCall != nil {
+						calledFunction = true
 					}
 				}
 				return nil
@@ -989,11 +1030,24 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan 
 				}
 			}
 		}
+		// trailing 为上游在已交出的函数调用之后结束生成的错误：客户端已收到完整的函数调用，这一轮按 stop 正常结束，原错误挂在结束事件上
+		// （见 trailing.go）；上游用量没有到达时下面按已交出的输出本地估算
+		var trailing error
+		if calledFunction && trailingAfterCall(ctx, err) {
+			trailing, err = err, nil
+			if finish == nil {
+				finish = &Event{Kind: EventFinish}
+			}
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				_ = send(Event{Kind: EventError, Err: err})
 			}
 			return
+		}
+		if calledFunction && finish != nil {
+			// 内容策略类结束原因、long- 续写后续轮次失败同样按 stop 结束，原因挂在结束事件上
+			finishAfterCall(finish, trailing)
 		}
 		if usage == nil {
 			usage = localCompleteUsage(request, output)

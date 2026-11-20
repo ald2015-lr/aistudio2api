@@ -32,9 +32,9 @@ func InteractionStopSequencesNote(count int) string {
 	return fmt.Sprintf("未确认 CreateInteractionStream 的停止序列字段，已忽略 %d 个停止序列", count)
 }
 
-// InteractionThinkingSuffixIgnoredNote 为模型名的思考等级后缀（-minimal、-low、-medium、-high、-128）对经 CreateInteractionStream
+// InteractionThinkingSuffixIgnoredNote 为模型名的思考等级后缀（-minimal、-low、-medium、-high、-xhigh、-128）对经 CreateInteractionStream
 // 生成、模型目录却没有思考等级（能力码 52，如 gemini-omni-1.2-flash）的模型不生效时写进请求日志的说明（协议层整理模型名时留下）。
-// level 为后缀对应的等级（minimal、low、medium、high）
+// level 为后缀对应的等级（minimal、low、medium、high、xhigh）
 func InteractionThinkingSuffixIgnoredNote(modelID string, level string) string {
 	return fmt.Sprintf("模型名后缀指定的思考等级 %s 对 %s 不生效：模型目录没有思考等级（能力码 52），与官网一样不发送思考等级，已忽略后缀", level, modelID)
 }

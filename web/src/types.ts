@@ -849,7 +849,7 @@ export type PlaygroundProtocol = 'openai-chat' | 'openai-responses' | 'anthropic
 
 export type PlaygroundMode = 'text' | 'image' | 'speech' | 'music' | 'video'
 
-export type PlaygroundReasoning = '' | 'low' | 'medium' | 'high'
+export type PlaygroundReasoning = '' | 'low' | 'medium' | 'high' | 'xhigh'
 
 export type PlaygroundTool =
   '' | 'web_search' | 'image_search' | 'code_interpreter' | 'url_context' | 'google_maps'

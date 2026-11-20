@@ -407,10 +407,9 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			}
 			contents = append(contents, aistudio.Content{Role: aistudio.RoleUser, Parts: parts})
 		case "function_call":
-			// 命名空间内的函数以 "命名空间.函数名" 的全名发给上游，不同命名空间可以有同名函数
-			if item.Namespace != "" {
-				item.Name = item.Namespace + "." + item.Name
-			}
+			// 命名空间内的函数以 "命名空间.函数名" 的全名发给上游，不同命名空间可以有同名函数；默认命名空间 functions 与没有命名空间
+			// 相同，用原名（见 namespacedName）
+			item.Name = namespacedName(item.Namespace, item.Name)
 			// 参数不是 JSON object 时包成 _raw，见 historyFunctionArguments
 			contents = append(contents, aistudio.Content{Role: aistudio.RoleAssistant, Parts: []aistudio.Part{{FunctionCall: &aistudio.FunctionCall{
 				ID: item.CallID, Name: item.Name, Arguments: historyFunctionArguments(item.Arguments), ThoughtSignature: pendingSignature,
@@ -510,7 +509,7 @@ func mapResponsesTools(tools []responsesTool, choice json.RawMessage) (aistudio.
 				if inner.Name == "" {
 					return aistudio.Tools{}, fmt.Errorf("function tool name is required")
 				}
-				inner.Name = tool.Name + "." + inner.Name
+				inner.Name = namespacedName(tool.Name, inner.Name)
 				if err := addFunction(inner); err != nil {
 					return aistudio.Tools{}, err
 				}
@@ -698,6 +697,16 @@ func responseFunctionCall(call aistudio.FunctionCall, tools []responsesTool) map
 	return item
 }
 
+// namespacedName 返回命名空间中函数的声明名（与上游 Mag1cFall/AIStudio2API a68acad 相同）：没有命名空间或为默认命名空间 functions 时与
+// 顶层函数相同，用原名；其余为 <命名空间>.<名>。Codex 给顶层函数的调用记 namespace "functions"，原先历史里的调用名成了 functions.<名>，
+// 与声明对不上（上游按未声明的函数拒绝或模型改调别的函数）。历史调用、命名空间工具的声明与指定函数的 tool_choice 都经它换算
+func namespacedName(namespace, name string) string {
+	if namespace == "" || namespace == "functions" {
+		return name
+	}
+	return namespace + "." + name
+}
+
 // responsesNamespace 返回函数所属的命名空间工具名
 func responsesNamespace(tools []responsesTool, name string) string {
 	for _, tool := range tools {
@@ -705,7 +714,7 @@ func responsesNamespace(tools []responsesTool, name string) string {
 			continue
 		}
 		for _, inner := range tool.Tools {
-			if tool.Name+"."+inner.Name == name {
+			if namespacedName(tool.Name, inner.Name) == name {
 				return tool.Name
 			}
 		}

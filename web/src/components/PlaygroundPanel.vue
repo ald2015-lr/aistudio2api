@@ -666,6 +666,7 @@ onUnmounted(() => {
             <option value="low">{{ t('playground.reasoningLow') }}</option>
             <option value="medium">{{ t('playground.reasoningMedium') }}</option>
             <option value="high">{{ t('playground.reasoningHigh') }}</option>
+            <option value="xhigh">{{ t('playground.reasoningExtraHigh') }}</option>
           </UiSelect>
         </div>
 

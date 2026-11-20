@@ -16,6 +16,9 @@ import (
 // activeTraces 为正在记录的排查请求（请求 ID → 排查记录）：该请求的进度日志同步写进排查记录的时间线
 var activeTraces sync.Map
 
+// trailingErrorPrefix 为函数调用之后上游结束生成的原因写进请求日志与用量账本错误详情时的前缀
+const trailingErrorPrefix = "函数调用之后上游结束生成（已按正常完成交给客户端）: "
+
 // requestLogData 投影请求身份、参数与端到端用量
 func requestLogData(entry api.AccessLog) *api.RequestLog {
 	data := &api.RequestLog{
@@ -27,6 +30,10 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
 		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect, FallbackFrom: entry.FallbackFrom,
+	}
+	if data.Error == "" && entry.TrailingError != "" {
+		// 函数调用之后上游结束生成：请求按正常完成记录（状态照常为工具调用完成等），原因作为错误详情写进请求日志与用量账本
+		data.Error = trailingErrorPrefix + entry.TrailingError
 	}
 	// 客户端请求的模型名与最终模型不同时（请求了目录别名、经 MODEL_FALLBACKS 改用等）另记 requested_model；只有请求结果日志带
 	if requested := entry.RequestedModel; requested != "" && requested != entry.Model {

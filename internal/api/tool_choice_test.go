@@ -86,6 +86,66 @@ func TestResponsesNamespaceAndOptions(t *testing.T) {
 	}
 }
 
+// TestResponsesDefaultNamespace Codex 的写法：顶层函数的历史调用带 namespace "functions"，也可以把函数放进名为 functions 的命名空间工具，
+// 指定函数时同样带 namespace "functions"。默认命名空间与没有命名空间相同，一律用原名（声明、历史调用、tool_choice 一致，上游 a68acad），
+// 其他命名空间照旧是 <命名空间>.<名>；输出的调用按声明还原命名空间
+func TestResponsesDefaultNamespace(t *testing.T) {
+	var request responsesRequest
+	decodeInto(t, `{"model":"m",
+		"input":[{"type":"message","role":"user","content":"列出文件"},
+			{"type":"function_call","call_id":"call_a","namespace":"functions","name":"shell","arguments":"{\"command\":[\"ls\"]}"},
+			{"type":"function_call_output","call_id":"call_a","output":"README.md"},
+			{"type":"function_call","call_id":"call_b","namespace":"functions","name":"apply_patch","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_b","output":"ok"},
+			{"type":"function_call","call_id":"call_c","namespace":"mcp__docs","name":"search","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_c","output":"hit"}],
+		"tools":[{"type":"function","name":"shell","parameters":{"type":"object","properties":{"command":{"type":"array","items":{"type":"string"}}}}},
+			{"type":"namespace","name":"functions","tools":[{"type":"function","name":"apply_patch"}]},
+			{"type":"namespace","name":"mcp__docs","tools":[{"type":"function","name":"search"}]}],
+		"tool_choice":{"type":"function","name":"apply_patch","namespace":"functions"}}`, &request)
+	generate, _, err := request.toGenerateRequest("id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var declared []string
+	for _, function := range generate.Tools.Functions {
+		declared = append(declared, function.Name)
+	}
+	if !slices.Equal(declared, []string{"shell", "apply_patch", "mcp__docs.search"}) {
+		t.Fatalf("函数声明 = %v", declared)
+	}
+	var called []string
+	for _, content := range generate.Contents {
+		for _, part := range content.Parts {
+			if part.FunctionCall != nil {
+				called = append(called, part.FunctionCall.Name)
+			}
+		}
+	}
+	if !slices.Equal(called, []string{"shell", "apply_patch", "mcp__docs.search"}) {
+		t.Fatalf("历史调用 = %v，期望与声明一致", called)
+	}
+	if config := generate.Tools.ToolConfig; config.Mode != "required" || !slices.Equal(config.AllowedFunctionNames, []string{"apply_patch"}) {
+		t.Fatalf("tool_choice = %+v，期望指定 apply_patch", config)
+	}
+	for namespace, want := range map[string]string{"": "shell", "functions": "shell", "mcp__docs": "mcp__docs.shell"} {
+		choice, err := openAIToolChoice(json.RawMessage(fmt.Sprintf(`{"type":"function","name":"shell","namespace":%q}`, namespace)))
+		if err != nil || !slices.Equal(choice.AllowedFunctionNames, []string{want}) {
+			t.Fatalf("namespace %q 的指定函数 = %+v %v，期望 %s", namespace, choice, err, want)
+		}
+	}
+	for _, test := range []struct{ name, namespace, short string }{
+		{name: "apply_patch", namespace: "functions", short: "apply_patch"},
+		{name: "mcp__docs.search", namespace: "mcp__docs", short: "search"},
+		{name: "shell", short: "shell"},
+	} {
+		item := responseFunctionCall(aistudio.FunctionCall{ID: "c9", Name: test.name, Arguments: json.RawMessage(`{}`)}, request.Tools)
+		if namespace, _ := item["namespace"].(string); namespace != test.namespace || item["name"] != test.short {
+			t.Fatalf("%s 的输出项 = %v", test.name, item)
+		}
+	}
+}
+
 // TestGeminiFunctionCallingModes Gemini 的 ANY、VALIDATED 与 allowedFunctionNames 被接受
 func TestGeminiFunctionCallingModes(t *testing.T) {
 	groups := []geminiToolGroup{}

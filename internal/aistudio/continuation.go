@@ -815,7 +815,8 @@ func (c *Client) decodeLongRounds(
 
 // finishFailedRound 在续写的第 round 轮（从 1 计，至少第 2 轮）发送失败（sending）或输出中途失败时结束整个请求：不报错，
 // 报告 ContinuationFailed（生成服务写日志、照常处理账号状态），再发合并后的用量与 max_tokens 结束。已输出的内容（含前面各轮）
-// 由此完整交给客户端：按错误结束时非流式会丢掉全部已生成的内容、流式没有用量，比不带 long- 的请求更差。
+// 由此完整交给客户端：按错误结束时非流式会丢掉全部已生成的内容、流式没有用量，比不带 long- 的请求更差。前面的轮次已交出函数调用时，
+// Generate 再把这个结束改按 stop（见 trailing.go 的 finishAfterCall）。
 // 续写后的输入超过账号输入上限（模拟续写把已输出的正文发回上游，部分账号的输入上限为 131072）按停止续写处理
 func finishFailedRound(
 	ctx context.Context, plan *longOutputPlan, round int, sending bool, err error, merged *Usage, output int64, emit func(Event) error,

@@ -945,9 +945,8 @@ func openAIToolChoice(raw json.RawMessage) (aistudio.ToolConfig, error) {
 	if object.Type != "function" || object.Name == "" {
 		return aistudio.ToolConfig{}, fmt.Errorf("named tool_choice requires type function and a name")
 	}
-	if object.Namespace != "" {
-		object.Name = object.Namespace + "." + object.Name
-	}
+	// Responses 命名空间内的函数按声明名指定（默认命名空间 functions 用原名，见 namespacedName）
+	object.Name = namespacedName(object.Namespace, object.Name)
 	return aistudio.ToolConfig{Mode: "required", AllowedFunctionNames: []string{object.Name}}, nil
 }
 
