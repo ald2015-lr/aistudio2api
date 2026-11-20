@@ -704,9 +704,15 @@ func TestBalancedRotationNoRoomHardens(t *testing.T) {
 	if drain == nil {
 		t.Fatal("应能开始软排空")
 	}
-	// 请求路径的扩容用掉让出的槽位
-	if _, err := env.manager.ensureWorker(withImmediateStartup(env.ctx), env.spares[1], testRuntimeModel, false); err != nil {
-		t.Fatalf("软排空让出槽位后扩容应能启动：%v", err)
+	// 请求路径的扩容用掉让出的槽位。容量判断把账户锁正被占用的账号按占用 1 个槽位估计（occupiedWorkersIn），而 watchBrowsers
+	// 每 2 毫秒逐个锁一遍全部账号（含备用号）：两者恰好重叠时会多估一个槽位、按容量已满返回（慢机器、-race、少核时偶发，
+	// CI 曾因此失败）。这是设计上的暂时性估计，短时间内重试即可
+	var expandErr error
+	if !waitUntil(5*time.Second, func() bool {
+		_, expandErr = env.manager.ensureWorker(withImmediateStartup(env.ctx), env.spares[1], testRuntimeModel, false)
+		return expandErr == nil
+	}) {
+		t.Fatalf("软排空让出槽位后扩容应能启动：%v", expandErr)
 	}
 	result, spareFault := env.manager.runReplacement(env.ctx, aistudio.PoolScopeNormal, nil, rotationReplacementReason)
 	if result != replacementNoRoom || spareFault {
