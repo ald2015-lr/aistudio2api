@@ -721,7 +721,7 @@ func (fuzzer *indexFuzzer) check(round int) {
 		if got, want := accountBootstrapModelsLocked(account), bruteBootstrapModels(account); !slices.Equal(got, want) {
 			t.Fatalf("第 %d 轮：账户 %s 的初始化模型 %v，期望 %v", round, account.ID, got, want)
 		}
-		if got, want := accountWarmCoverageLocked(account), bruteWarmCoverage(account); got != want {
+		if got, want := pool.accountWarmCoverageLocked(account), bruteWarmCoverage(account); got != want {
 			t.Fatalf("第 %d 轮：账户 %s 的可生成模型数 %d，期望 %d", round, account.ID, got, want)
 		}
 	}

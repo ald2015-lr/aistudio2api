@@ -68,6 +68,9 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	workers.retryPendingCleanup()
 	// 主用模型供给约每 30 秒统计一次（主用模型列表变化时立即重新统计），状态接口只读缓存
 	workers.refreshPrimarySupply(time.Now())
+	// 权益规则与账户目录的对照：目录、权益或规则变化后才重算（账户池按版本缓存）。有新的内容时写日志：目录明确标注可用的写一行 WARN，
+	// 只是没有标注的按配置项与模型合并写一行 INFO，不在任何目录里的名称写一行 WARN（见 checkTierRules）
+	service.checkTierRules()
 	// 普通与 Ultra 分区各自按自己的预热目标判断
 	if workers.prewarmNeeded() {
 		workers.StartPrewarm(dataContext)

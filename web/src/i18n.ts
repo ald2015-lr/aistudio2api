@@ -237,6 +237,20 @@ const zhCN = {
     '开启后权益为 Pro 的账户与 Ultra 账户同属 Ultra 号池，按 Ultra 号池的全部设置调度：经 /ultra 前缀服务并列入 /ultra 的模型列表，受上方“Ultra 号池的账户只服务 /ultra 请求”约束，Worker 计入下方 Ultra 常驻数与峰值上限，适用 Ultra 主用模型列表，也计入侧栏与账户页的 Ultra 号池计数。账户的真实权益不变：账户页仍显示 Pro（另加 Ultra 号池标记），模型资格、输入上限与额度共享仍按 Pro 计。上方设置开启时普通路径不再使用 Pro 账户，普通号池容量随之变小，gemini-4-argon 与需要订阅权益的模型会从普通路径的模型列表（/v1/models）消失，客户端要改用 /ultra 前缀。Pro 与 Ultra 共用下方两个 Worker 上限，默认值偏小，建议调大；Ultra 常驻 Worker 数为 1（ULTRA_WARM_WORKER_LIMIT=1）时常驻的可能是 Pro 账户而不是 Ultra 账户，建议不小于 2。资源不迁移，Pro 账户上已有的文件与视频任务切换后可能要换入口引用：开启本项后，上方设置开启时经普通路径引用会返回 400，要改用 /ultra 前缀（上方设置关闭时不受影响）；关闭本项后经 /ultra 引用会返回 400，要改用普通路径。建议在没有进行中的视频任务时切换。默认关闭；修改后立即生效，不需要重启服务，已运行的 Worker 改按新的分区计数，不会重启。',
   'settings.ultraIncludeProSharedHint':
     '上方“Ultra 号池的账户只服务 /ultra 请求”（ULTRA_EXCLUSIVE）已关闭：普通路径仍会使用 Pro 与 Ultra 账户，并入 Ultra 号池的 Pro 账户照常服务普通路径的请求。要让 Pro 账户只服务 /ultra 请求，请同时开启上方设置。',
+  'settings.ultraOnlyModels': '仅 Ultra 可用的模型',
+  'settings.ultraOnlyModelsHelp':
+    '列表中的模型只分给权益为 Ultra 的账户：并入 Ultra 号池的 Pro 账户不会被选去服务它们，也不计入它们的预热与供给。逗号分隔的模型 ID，默认 gemini-4-carbon；清空即没有规则。',
+  'settings.paidOnlyModels': '仅付费账号可用的模型（Pro 与 Ultra）',
+  'settings.paidOnlyModelsHelp':
+    '列表中的模型只分给权益为 Pro 或 Ultra 的账户，Free 与 Plus 账户不会被选去服务它们。逗号分隔的模型 ID，默认 gemini-3.1-pro-preview；清空即没有规则。',
+  'settings.tierRulesHelp':
+    '账户的模型目录不一定标注哪些模型只限付费或只限 Ultra，这两份列表补上这一层：只收窄、不放宽（目录本身限制的模型仍按目录），按账户的真实权益判断，权益尚未读取的账户按 Free 处理，读到后自动恢复。写基础模型 ID（如 gemini-4-carbon，不要带 -high、-nothinking 等后缀，也不要带 long- 前缀），覆盖它的全部后缀写法与目录别名，大小写不限。号池里没有账户能用的模型会从模型列表消失，请求按模型不可用返回 404。Google 以后放开时请从这里移除：目录标注了被排除的权益可用时，对应输入框下方会醒目提示；目录没有标注权益限制时，那里只用不醒目的说明列出靠规则挡住的账号，不必因此移除。修改后立即生效，进行中的请求不受影响。',
+  'settings.tierRuleHintMarked':
+    '{tier} 账号（{count} 个）的目录已标注 {model} 可用，确认 {tier} 能用后可从这里移除',
+  'settings.tierRuleHintUnmarked':
+    '{model}：{tiers}账号的目录没有标注权益限制，只靠这条规则不被选中。目录没有标注不代表这些账号能用，不必因此移除',
+  'settings.tierRuleHintTier': '{tier}（{count} 个）',
+  'settings.tierRuleHintTierSeparator': '、',
   'settings.ultraWarmWorkerLimit': 'Ultra 常驻 Worker 数',
   'settings.ultraMaxActiveWorkers': 'Ultra 峰值 Worker 上限',
   'settings.ultraWorkersHelp':
@@ -841,6 +855,7 @@ const zhCN = {
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
   'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
   'settings.invalidPrimaryQueueWait': '主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
+  'settings.invalidTierRuleModels': '{field}不能写 long- 开头的名称，请写基础模型 ID',
   'settings.invalidUltraPrimaryQueueWait':
     'Ultra 主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
   'settings.invalidListen': '监听地址格式应为 主机:端口',
@@ -1396,6 +1411,20 @@ const en: Record<TranslationKey, string> = {
     'When on, accounts with the Pro tier join Ultra accounts in the Ultra pool and are scheduled by every Ultra-pool setting: they serve the /ultra prefix and appear in its model list, follow "Ultra-pool accounts only serve /ultra requests" above, count toward the Ultra resident and active worker limits below, follow the Ultra primary model list, and count toward the Ultra-pool figures in the sidebar and on the accounts page. Their real tier does not change: the accounts page still shows Pro (with an Ultra pool tag), and model eligibility, input limits and quota sharing still follow Pro. While the setting above is on, normal paths no longer use Pro accounts, the normal pool shrinks accordingly, and gemini-4-argon and the models that need a subscription disappear from the normal-path model list (/v1/models), so clients have to switch to the /ultra prefix. Pro and Ultra share the two worker limits below, whose defaults are small, so raise them; with 1 Ultra resident worker (ULTRA_WARM_WORKER_LIMIT=1) the resident one may be a Pro account rather than an Ultra account, so keep it at 2 or more. Resources do not move, so files and video jobs that already live on a Pro account may need a different entry point after a switch: after turning this on, referencing them through normal paths returns 400 while the setting above is on, so use the /ultra prefix instead (nothing changes while it is off); after turning this off, referencing them through /ultra returns 400, so use normal paths instead. Switch while no video job is in progress. Off by default; changes apply immediately without a service restart, and running workers are recounted in their new partition instead of being restarted.',
   'settings.ultraIncludeProSharedHint':
     '"Ultra-pool accounts only serve /ultra requests" (ULTRA_EXCLUSIVE) above is off, so normal paths still use Pro and Ultra accounts, and Pro accounts in the Ultra pool keep serving normal-path requests. Turn that setting on as well to keep Pro accounts for /ultra requests only.',
+  'settings.ultraOnlyModels': 'Ultra-only models',
+  'settings.ultraOnlyModelsHelp':
+    'Models in this list are only given to accounts with the Ultra tier: Pro accounts put in the Ultra pool are never picked for them and do not count towards their prewarming or supply. Comma-separated model IDs, default gemini-4-carbon; clear the list to remove the rule.',
+  'settings.paidOnlyModels': 'Paid-only models (Pro and Ultra)',
+  'settings.paidOnlyModelsHelp':
+    'Models in this list are only given to accounts with the Pro or Ultra tier; Free and Plus accounts are never picked for them. Comma-separated model IDs, default gemini-3.1-pro-preview; clear the list to remove the rule.',
+  'settings.tierRulesHelp':
+    'Account model catalogs do not always mark which models are paid-only or Ultra-only, so these two lists add that layer. They only narrow, never widen (a model the catalog itself restricts stays restricted), use the account\'s real tier, and treat accounts whose tier has not been read yet as Free until it is read. Write the base model ID (for example gemini-4-carbon, without suffixes such as -high or -nothinking and without the long- prefix); it covers every suffixed name and catalog alias, case-insensitively. A model no account in the pool can use disappears from the model list and requests for it return 404 model not available. Remove a model here once Google opens it up: a highlighted hint appears under the matching list when the catalogs mark an excluded tier as allowed; when the catalogs merely do not restrict it, a plain note there lists the accounts the rule keeps off it, which is no reason to remove it. Changes apply immediately and do not affect requests in progress.',
+  'settings.tierRuleHintMarked':
+    '{tier} account catalogs ({count}) mark {model} as available. Once you confirm {tier} accounts can use it, remove it here.',
+  'settings.tierRuleHintUnmarked':
+    '{model}: {tiers} account catalogs do not restrict it by tier, so only this rule keeps those accounts off it. An unmarked catalog does not mean they can use it, so this is no reason to remove it.',
+  'settings.tierRuleHintTier': '{tier} ({count})',
+  'settings.tierRuleHintTierSeparator': ', ',
   'settings.ultraWarmWorkerLimit': 'Ultra resident workers',
   'settings.ultraMaxActiveWorkers': 'Ultra active worker limit',
   'settings.ultraWorkersHelp':
@@ -2029,6 +2058,7 @@ const en: Record<TranslationKey, string> = {
     'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',
   'settings.invalidPrimaryQueueWait':
     'Primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
+  'settings.invalidTierRuleModels': '{field} cannot contain names starting with long-; write the base model ID',
   'settings.invalidUltraPrimaryQueueWait':
     'Ultra primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
   'settings.invalidListen': 'Listen address must be host:port',

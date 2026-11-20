@@ -157,11 +157,14 @@ func (p *AccountPool) channelSupportsLocked(account *Account, channel Channel, s
 		if selection.BuildOnly || generationChannelSelection(selection) && !p.channelEnabledLocked(ChannelPlayground) {
 			return false
 		}
-		return accountSupportsSelection(account, selection)
+		return p.accountSupportsSelectionLocked(account, selection)
 	case ChannelBuild:
-		// Build 生成暂停（全局或该账户，见 build_pause.go）时不经 Build 接生成请求，试探请求除外
+		// Build 生成暂停（全局或该账户，见 build_pause.go）时不经 Build 接生成请求，试探请求除外。
+		// 权益规则（tier_rules.go）只在这里与 Playground 分支检查，不放进 buildSupportsModelLocked：那里还用于已取得 Build 租约的发送前校验、
+		// 状态口径的冷却与模型是否存在的判断，热更新规则不能让进行中的请求失败，规则排除的 Build 独有模型也不能被当成目录里没有而去补拉目录
 		return generationChannelSelection(selection) && p.channelEnabledLocked(ChannelBuild) &&
-			!p.buildPauseActiveLocked(account, selection) && p.buildSupportsModelLocked(account, selection.ModelID)
+			!p.buildPauseActiveLocked(account, selection) && p.buildSupportsModelLocked(account, selection.ModelID) &&
+			p.tierRuleAllowsBuildLocked(account, selection.ModelID)
 	default:
 		return false
 	}

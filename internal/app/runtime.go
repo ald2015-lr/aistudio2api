@@ -225,7 +225,7 @@ func newRuntime(
 	return service, admin, closeRuntime, nil
 }
 
-// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、ULTRA_INCLUDE_PRO 与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
+// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、ULTRA_INCLUDE_PRO、权益规则与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
 // 必须在创建 Worker 管理器、同步目录与预热之前调用，第一次 Worker 分区与预热目标就按正确的号池成员计算
 func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 	// 出口键按账户固定代理或全局代理计算（见 aistudio.EgressKey）：先设全局代理，账户按出口分组；PROXY 变化本来就要重建运行时
@@ -233,6 +233,8 @@ func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
 	pool.SetUltraIncludePro(cfg.UltraIncludePro)
+	// 权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）：第一次建立候选集之前写入；运行中由 applyLiveFields 热更新
+	pool.SetModelTierRules(cfg.UltraOnlyModels, cfg.PaidOnlyModels)
 	// 账户池构造时不限速（0），这里按配置打开；运行中由 applyLiveFields 热更新
 	pool.SetAccountRateLimit(cfg.AccountRPMLimit)
 }
@@ -2869,6 +2871,8 @@ type trackedService struct {
 	buildPauseOnce sync.Once
 	// quota 学习各模型 Build 与 Playground 是否共用每日额度，结论跨重启保存
 	quota *quotaSharing
+	// tierRuleNotes 记下已写进运行日志的权益规则提示（见 tier_rules.go），同样的内容不重复写
+	tierRuleNotes tierRuleMonitor
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
 	ignoreSeed atomic.Bool
 	// repeatNonce 为真时对重复提示词加入不可见随机后缀（见 duplicates.go）
@@ -3373,6 +3377,14 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 		close(transitionDone)
 	}
 	service.lifecycleMu.Unlock()
+}
+
+// PoolRuleVersion 返回账户池的号池规则版本（见 aistudio.AccountPool.PoolRuleVersion），没有账户池时为 0
+func (service *trackedService) PoolRuleVersion() uint64 {
+	if service == nil || service.pool == nil {
+		return 0
+	}
+	return service.pool.PoolRuleVersion()
 }
 
 // Models 返回请求号池内启用账户具有模型资格的公开目录：/ultra 只列 Ultra 号池账户可用的模型

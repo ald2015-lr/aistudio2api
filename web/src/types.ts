@@ -716,6 +716,17 @@ export interface DowngradeDecision {
   basis: string
 }
 
+// TierRuleHint 为一条比账户目录更严的权益规则：key（ULTRA_ONLY_MODELS 或 PAID_ONLY_MODELS）里的模型 model 把权益 tier 排除在外，
+// 但 accounts 个这一权益的启用账户的目录显示能用它；marked 为这些账户的目录明确标注了这一权益可用，否则它们的目录只是没有标注
+// 权益限制。同一权益两种账户都有时分成两条，各自计数
+export interface TierRuleHint {
+  key: 'ULTRA_ONLY_MODELS' | 'PAID_ONLY_MODELS'
+  model: string
+  tier: string
+  marked?: boolean
+  accounts: number
+}
+
 export interface ServiceConfig {
   auth_states: string
   listen_addr: string
@@ -741,6 +752,12 @@ export interface ServiceConfig {
   // ultra_include_pro 为真时权益为 Pro 的账户并入 Ultra 号池，按 Ultra 号池的全部设置调度，账户的真实权益不变。
   // 服务端总是返回该字段，因此这里不是可选字段：缺了它，设置页的快照对比会一直显示未保存
   ultra_include_pro: boolean
+  // ultra_only_models 为只有 Ultra 权益的账户能用的模型（ULTRA_ONLY_MODELS），paid_only_models 为只有 Pro 与 Ultra 能用的模型
+  // （PAID_ONLY_MODELS）；空数组表示没有规则，保存后立即生效。旧版服务端不返回这两个字段
+  ultra_only_models?: string[]
+  paid_only_models?: string[]
+  // tier_rule_hints 为比账户目录更严的权益规则（只读，保存时服务端忽略）：某个权益的账户目录显示能用规则排除的模型
+  tier_rule_hints?: TierRuleHint[]
   ultra_warm_worker_limit: number
   ultra_max_active_workers: number
   warm_startup_concurrency: number

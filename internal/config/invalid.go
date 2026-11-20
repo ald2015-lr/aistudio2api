@@ -172,6 +172,10 @@ func (c *Config) resetKey(key string) {
 		c.PrimaryQueueWait = defaultPrimaryQueueWaitFor(c.RequestTimeout)
 	case "ULTRA_PRIMARY_MODELS":
 		c.UltraPrimaryModels = slices.Clone(defaults.UltraPrimaryModels)
+	case "ULTRA_ONLY_MODELS":
+		c.UltraOnlyModels = slices.Clone(defaults.UltraOnlyModels)
+	case "PAID_ONLY_MODELS":
+		c.PaidOnlyModels = slices.Clone(defaults.PaidOnlyModels)
 	case "ULTRA_PRIMARY_QUEUE_WAIT":
 		c.UltraPrimaryQueueWait = defaultPrimaryQueueWaitFor(c.RequestTimeout)
 	case "MODEL_FALLBACKS":
@@ -349,6 +353,12 @@ var configChecks = []configCheck{
 	}},
 	{keys: []string{"ULTRA_PRIMARY_MODELS"}, check: func(c Config) error {
 		return validateModelList("ULTRA_PRIMARY_MODELS", c.UltraPrimaryModels)
+	}},
+	{keys: []string{"ULTRA_ONLY_MODELS"}, check: func(c Config) error {
+		return validateTierRuleModels("ULTRA_ONLY_MODELS", c.UltraOnlyModels)
+	}},
+	{keys: []string{"PAID_ONLY_MODELS"}, check: func(c Config) error {
+		return validateTierRuleModels("PAID_ONLY_MODELS", c.PaidOnlyModels)
 	}},
 	{keys: []string{"ULTRA_PRIMARY_QUEUE_WAIT"}, check: func(c Config) error {
 		if c.UltraPrimaryQueueWait < 0 {

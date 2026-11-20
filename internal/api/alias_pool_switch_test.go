@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,15 +214,15 @@ func TestAliasCatalogMissRefreshKeepsSnapshotOnError(t *testing.T) {
 func TestStoreAliasSnapshotKeepsNewer(t *testing.T) {
 	var cache aliasCatalogCache
 	now := time.Now()
-	newer := newAliasSnapshot([]aistudio.Model{{ID: "newer"}}, now)
+	newer := newAliasSnapshot([]aistudio.Model{{ID: "newer"}}, now, 0)
 	if got := storeAliasSnapshot(&cache, newer); got != newer {
 		t.Fatal("没有快照时应写入")
 	}
-	older := newAliasSnapshot([]aistudio.Model{{ID: "older"}}, now.Add(-time.Second))
+	older := newAliasSnapshot([]aistudio.Model{{ID: "older"}}, now.Add(-time.Second), 0)
 	if got := storeAliasSnapshot(&cache, older); got != newer || cache.models.Load() != newer {
 		t.Fatal("开始得早的计算不应覆盖开始得晚的快照")
 	}
-	latest := newAliasSnapshot([]aistudio.Model{{ID: "latest"}}, now.Add(time.Second))
+	latest := newAliasSnapshot([]aistudio.Model{{ID: "latest"}}, now.Add(time.Second), 0)
 	if got := storeAliasSnapshot(&cache, latest); got != latest || cache.models.Load() != latest {
 		t.Fatal("开始得晚的计算应写入")
 	}
@@ -279,4 +280,96 @@ func TestSuffixWithInteractionConfig(t *testing.T) {
 	if omni.Model != "gemini-omni-test-medium" || omni.Alias != nil {
 		t.Fatalf("Omni 不按文本模型处理后缀，实际模型 = %s", omni.Model)
 	}
+}
+
+// versionedCatalogService 在 switchingCatalogService 之上报告号池规则版本（app 的 runtimeManager 同样实现 PoolRuleVersion）
+type versionedCatalogService struct {
+	*switchingCatalogService
+	version atomic.Uint64
+}
+
+func (service *versionedCatalogService) PoolRuleVersion() uint64 {
+	return service.version.Load()
+}
+
+// TestAliasCatalogMissRefreshesAfterRuleChange 号池规则变化（清除或放宽权益规则、切换 ULTRA_INCLUDE_PRO）后，快照里解析不到的名称
+// 不等快照建立满 aliasMissRefreshAfter 就当场重算一次：清除规则后带后缀的名称立即可用。规则没变时照旧不重算，重算后只算一次
+func TestAliasCatalogMissRefreshesAfterRuleChange(t *testing.T) {
+	service := &versionedCatalogService{switchingCatalogService: &switchingCatalogService{calls: make(chan struct{}, 16)}}
+	service.setCatalog([]string{"normal-model"}, nil)
+	s := &server{service: service}
+	ctx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeUltra)
+	aliasCatalogIDs(t, s, ctx)
+	drainCatalogCalls(service.switchingCatalogService)
+	service.setCatalog([]string{"normal-model", "ruled-model"}, nil)
+
+	// 规则没变、快照还新：不重算
+	before := aistudio.GenerateRequest{Model: "ruled-model-low"}
+	if _, err := s.applyModelAlias(ctx, &before); err != nil {
+		t.Fatal(err)
+	}
+	if before.Model != "ruled-model-low" || drainCatalogCalls(service.switchingCatalogService) != 0 {
+		t.Fatalf("规则没变、快照还新时不应重算：模型 = %s", before.Model)
+	}
+
+	// 规则变了（快照仍不到 aliasMissRefreshAfter）：解析不到时当场重算一次，带后缀的名称换成目录模型名
+	service.version.Add(1)
+	after := aistudio.GenerateRequest{Model: "ruled-model-low"}
+	if _, err := s.applyModelAlias(ctx, &after); err != nil {
+		t.Fatal(err)
+	}
+	if after.Model != "ruled-model" || after.Alias == nil || after.Alias.Level != "low" {
+		t.Fatalf("规则变化后应重算并按新目录解析：模型 = %s，别名 = %+v", after.Model, after.Alias)
+	}
+	if calls := drainCatalogCalls(service.switchingCatalogService); calls != 1 {
+		t.Fatalf("规则变化后应只同步重算一次，实际 %d 次", calls)
+	}
+	// 新快照记下了新版本：目录里没有的名字不再重算
+	unknown := aistudio.GenerateRequest{Model: "missing-model-low"}
+	if _, err := s.applyModelAlias(ctx, &unknown); err != nil {
+		t.Fatal(err)
+	}
+	if unknown.Model != "missing-model-low" || drainCatalogCalls(service.switchingCatalogService) != 0 {
+		t.Fatalf("重算后规则没再变时不应再重算：模型 = %s", unknown.Model)
+	}
+}
+
+// TestAliasSnapshotRecordsRuleVersion 第一次计算与后台刷新得到的快照都记下计算前的号池规则版本：规则之后没变时，快照里解析不到的
+// 名称不会因为版本对不上而同步重算（否则规则变过一次后，每次后台刷新之后的第一个错名请求都要在账户池锁内多算一遍目录）
+func TestAliasSnapshotRecordsRuleVersion(t *testing.T) {
+	service := &versionedCatalogService{switchingCatalogService: &switchingCatalogService{calls: make(chan struct{}, 16)}}
+	service.setCatalog([]string{"normal-model"}, nil)
+	service.version.Store(3)
+	s := &server{service: service}
+	ctx := aistudio.ContextWithPoolScope(context.Background(), aistudio.PoolScopeUltra)
+	miss := func(stage string) {
+		t.Helper()
+		request := aistudio.GenerateRequest{Model: "missing-model-low"}
+		if _, err := s.applyModelAlias(ctx, &request); err != nil {
+			t.Fatal(err)
+		}
+		if calls := drainCatalogCalls(service.switchingCatalogService); calls != 0 {
+			t.Fatalf("%s：规则没变、快照还新时解析不到的名称不应同步重算，实际 %d 次", stage, calls)
+		}
+	}
+	aliasCatalogIDs(t, s, ctx)
+	drainCatalogCalls(service.switchingCatalogService)
+	miss("第一次计算的快照")
+
+	// 规则变化后快照过期：后台刷新得到的快照记下新版本
+	service.version.Store(4)
+	cache, _ := s.aliasCache(ctx)
+	expired := *cache.models.Load()
+	expired.expires = time.Now().Add(-time.Minute)
+	cache.models.Store(&expired)
+	aliasCatalogIDs(t, s, ctx)
+	deadline := time.Now().Add(5 * time.Second)
+	for cache.models.Load() == &expired {
+		if time.Now().After(deadline) {
+			t.Fatal("过期快照应在后台刷新")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	drainCatalogCalls(service.switchingCatalogService)
+	miss("后台刷新的快照")
 }

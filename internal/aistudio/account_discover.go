@@ -495,7 +495,7 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		}
 		until, cooling := p.accountChannelCooldownLocked(account, selection, now)
 		if !cooling && modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
-			accountSupportsSelection(account, AccountSelection{ModelID: modelID}) {
+			p.accountSupportsSelectionLocked(account, AccountSelection{ModelID: modelID}) {
 			// 账户能服务该模型、只是它不走 generateContent（视频、Live 等，请求按模型取 Worker）：退回原先按模型键的口径，
 			// 否则在该模型上冷却的空闲 Worker 不算冷却中，分区满时不被替换
 			if cooldown, active := accountCooldown(account, canonicalAccountModelID(account, modelID), now); active {
@@ -511,7 +511,7 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 			Dead:          p.longCoolingLocked(account, modelID, now, minRemaining),
 			Unschedulable: unschedulableReasonLocked(account, now),
 			Unservable: modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
-				!accountSupportsSelection(account, AccountSelection{ModelID: modelID}),
+				!p.accountSupportsSelectionLocked(account, AccountSelection{ModelID: modelID}),
 		}
 	}
 	return states

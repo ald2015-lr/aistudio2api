@@ -332,6 +332,15 @@ func (manager *runtimeManager) Models(ctx context.Context) ([]aistudio.Model, er
 	return manager.generation().service.Models(ctx)
 }
 
+// PoolRuleVersion 返回当前生成服务账户池的号池规则版本（ULTRA_INCLUDE_PRO、权益规则每次实际变化时加一）：公开 API 的别名目录快照
+// 据此判断建立之后号池规则是否变过（见 api 的 aliasCatalogFor）；服务没有账户池时为 0
+func (manager *runtimeManager) PoolRuleVersion() uint64 {
+	if versioned, ok := manager.generation().service.(interface{ PoolRuleVersion() uint64 }); ok {
+		return versioned.PoolRuleVersion()
+	}
+	return 0
+}
+
 // CountTokens 由当前生成服务计数
 func (manager *runtimeManager) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
 	return manager.generation().service.CountTokens(ctx, request)
@@ -533,6 +542,10 @@ func (manager *runtimeManager) UpdateRuntimeConfig(ctx context.Context, value ap
 	// Worker 数、并发、策略、超时等直接热更新；监听地址仍需重启管理进程
 	manager.applyAPIKey(updated.APIKey)
 	manager.applyLiveConfig()
+	// 规则提示按热更新后生效的规则对照（保存前算的是旧规则）
+	if admin, ok := manager.generation().admin.(*runtimeAdmin); ok {
+		updated.TierRuleHints = tierRuleHintsDTO(admin.pool.TierRuleReport())
+	}
 	return manager.decorateCurrent(updated), nil
 }
 
@@ -672,6 +685,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		DowngradeGuard: active.DowngradeGuard,
 		UltraExclusive: active.UltraExclusive, UltraIncludePro: active.UltraIncludePro, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
+		UltraOnlyModels: active.UltraOnlyModels, PaidOnlyModels: active.PaidOnlyModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait, StreamDataHeartbeat: active.StreamDataHeartbeat,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
 		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
@@ -747,6 +761,13 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.UltraPrimaryModels != nil {
 		saved.UltraPrimaryModels = config.NormalizeModelList(*value.UltraPrimaryModels)
 	}
+	// 权益规则：提交时省略（旧版页面）按生效值比较
+	if value.UltraOnlyModels != nil {
+		saved.UltraOnlyModels = config.NormalizeModelList(*value.UltraOnlyModels)
+	}
+	if value.PaidOnlyModels != nil {
+		saved.PaidOnlyModels = config.NormalizeModelList(*value.PaidOnlyModels)
+	}
 	// 单账户每分钟上限：提交时省略（旧版页面）按生效值比较
 	if value.AccountRPMLimit != nil {
 		saved.AccountRPMLimit = *value.AccountRPMLimit
@@ -772,6 +793,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
+		slices.Equal(saved.UltraOnlyModels, active.UltraOnlyModels) && slices.Equal(saved.PaidOnlyModels, active.PaidOnlyModels) &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)

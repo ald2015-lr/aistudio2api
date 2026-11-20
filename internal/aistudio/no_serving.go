@@ -375,7 +375,8 @@ func (p *AccountPool) noCandidateReportLocked(selection AccountSelection, now ti
 			report.Scoped++
 		case p.accountSupportsAnyChannelLocked(account, selection):
 			report.Servable++
-		case inPlayground && !modelAllowedByTier(model, account.BenefitTier):
+		case inPlayground && !modelAllowedByTier(model, account.BenefitTier) || p.tierRuleExcludesLocked(account, selection.ModelID):
+			// 目录的访问模式或权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS，含 Build 独有的模型）不允许账户的权益
 			report.Tier++
 		case inPlayground && strings.TrimSpace(selection.Method) != "" && !hasMethod(model, selection.Method):
 			report.Method++

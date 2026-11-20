@@ -43,6 +43,14 @@ const (
 // 默认让它在 /ultra 上没有额度时立即返回 429，不在号池里挨个换号、现场冷启动
 var defaultUltraPrimaryModels = []string{"gemini-4-argon"}
 
+// defaultUltraOnlyModels 与 defaultPaidOnlyModels 为权益规则的默认列表（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS，见 Config.UltraOnlyModels）：
+// gemini-4-carbon 只有 Ultra 订阅能用，gemini-3.1-pro-preview 只有付费订阅（Pro 与 Ultra）能用。账户目录不一定标注这些限制，
+// 不标注时 ULTRA_INCLUDE_PRO 并入的 Pro 会被选去服务 carbon 并失败
+var (
+	defaultUltraOnlyModels = []string{"gemini-4-carbon"}
+	defaultPaidOnlyModels  = []string{"gemini-3.1-pro-preview"}
+)
+
 var configKeys = [...]string{
 	"AISTUDIO_AUTH_STATES",
 	"LISTEN_ADDR",
@@ -60,6 +68,8 @@ var configKeys = [...]string{
 	"MAX_ACTIVE_WORKERS",
 	"ULTRA_EXCLUSIVE",
 	"ULTRA_INCLUDE_PRO",
+	"ULTRA_ONLY_MODELS",
+	"PAID_ONLY_MODELS",
 	"ULTRA_WARM_WORKER_LIMIT",
 	"ULTRA_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
@@ -202,6 +212,13 @@ type Config struct {
 	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
 	// 账户权益本身不变（权益请求头、输入上限、模型资格、更高权益重试仍按 Pro）。默认 false，保存后立即生效
 	UltraIncludePro bool `json:"ultra_include_pro"`
+	// UltraOnlyModels 为只有 Ultra 权益的账户能用的模型（ULTRA_ONLY_MODELS，逗号分隔，默认 gemini-4-carbon），PaidOnlyModels 为只有付费权益
+	// （Pro 与 Ultra，不含 Plus）的账户能用的模型（PAID_ONLY_MODELS，默认 gemini-3.1-pro-preview）。只收窄、不放宽：账户还要目录按权益允许；
+	// 按账户真实权益判断（ULTRA_INCLUDE_PRO 并入的 Pro 仍是 Pro），权益尚未读取的账户按 Free 处理；名称与目录模型的 ID 或别名比较，不区分大小写，
+	// 带后缀的名称（-high、-nothinking 等）要写成基础模型 ID，不能写 long- 开头的名称。
+	// 写空值表示没有规则；进程环境变量的空值不生效（与其他配置项相同），清空只能在 .env 里写空值或在管理页清空。保存后立即生效
+	UltraOnlyModels []string `json:"ultra_only_models"`
+	PaidOnlyModels  []string `json:"paid_only_models"`
 	// UltraWarmWorkerLimit 与 UltraMaxActiveWorkers 为 Ultra 分区（Ultra 号池的账户）的常驻与峰值 Worker 数，
 	// 与普通分区分开计算（WarmWorkerLimit、MaxActiveWorkers 只约束普通分区），浏览器总数最多为两个分区峰值之和；
 	// 常驻数可以为 0（只按需启动）
@@ -259,6 +276,8 @@ func Default() Config {
 		PrimaryQueueWait:       defaultPrimaryQueueWait,
 		UltraPrimaryModels:     slices.Clone(defaultUltraPrimaryModels),
 		UltraPrimaryQueueWait:  defaultPrimaryQueueWait,
+		UltraOnlyModels:        slices.Clone(defaultUltraOnlyModels),
+		PaidOnlyModels:         slices.Clone(defaultPaidOnlyModels),
 		ModelFallbacks:         DefaultModelFallbacks,
 		ModelFallbackScope:     ModelFallbackScopeUltra,
 		WAABackend:             WAABackendCamoufox,
@@ -358,6 +377,10 @@ func Load(path string) (Config, error) {
 	integer("MAX_ACTIVE_WORKERS", false, parsePositiveInt, &cfg.MaxActiveWorkers)
 	boolean("ULTRA_EXCLUSIVE", true, &cfg.UltraExclusive)
 	boolean("ULTRA_INCLUDE_PRO", true, &cfg.UltraIncludePro)
+	// 权益规则：键存在时按写的值（空值表示没有规则），键不存在时保持默认列表；进程环境变量的空值在上面已被忽略。
+	// 写法无效（long- 开头等，见 validateTierRuleModels）时由联动校验改回默认列表并记入无效项
+	models("ULTRA_ONLY_MODELS", &cfg.UltraOnlyModels)
+	models("PAID_ONLY_MODELS", &cfg.PaidOnlyModels)
 	integer("ULTRA_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.UltraWarmWorkerLimit)
 	integer("ULTRA_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.UltraMaxActiveWorkers)
 	integer("WARM_STARTUP_CONCURRENCY", false, parsePositiveInt, &cfg.WarmStartupConcurrency)
@@ -489,6 +512,8 @@ func (c Config) save(path string, kept map[string]string) error {
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
 		"ULTRA_EXCLUSIVE":          strconv.FormatBool(c.UltraExclusive),
 		"ULTRA_INCLUDE_PRO":        strconv.FormatBool(c.UltraIncludePro),
+		"ULTRA_ONLY_MODELS":        strings.Join(c.UltraOnlyModels, ","),
+		"PAID_ONLY_MODELS":         strings.Join(c.PaidOnlyModels, ","),
 		"ULTRA_WARM_WORKER_LIMIT":  strconv.Itoa(c.UltraWarmWorkerLimit),
 		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
@@ -599,6 +624,14 @@ func (c Config) MarshalJSON() ([]byte, error) {
 	if ultraPrimaryModels == nil {
 		ultraPrimaryModels = []string{}
 	}
+	// 权益规则同理：清空后写空数组
+	ultraOnlyModels, paidOnlyModels := c.UltraOnlyModels, c.PaidOnlyModels
+	if ultraOnlyModels == nil {
+		ultraOnlyModels = []string{}
+	}
+	if paidOnlyModels == nil {
+		paidOnlyModels = []string{}
+	}
 	type payload struct {
 		AuthStates             string            `json:"auth_states"`
 		ListenAddr             string            `json:"listen_addr"`
@@ -613,6 +646,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MaxActiveWorkers       int               `json:"max_active_workers"`
 		UltraExclusive         bool              `json:"ultra_exclusive"`
 		UltraIncludePro        bool              `json:"ultra_include_pro"`
+		UltraOnlyModels        []string          `json:"ultra_only_models"`
+		PaidOnlyModels         []string          `json:"paid_only_models"`
 		UltraWarmWorkerLimit   int               `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  int               `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int               `json:"warm_startup_concurrency"`
@@ -654,6 +689,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MaxActiveWorkers:       c.MaxActiveWorkers,
 		UltraExclusive:         c.UltraExclusive,
 		UltraIncludePro:        c.UltraIncludePro,
+		UltraOnlyModels:        ultraOnlyModels,
+		PaidOnlyModels:         paidOnlyModels,
 		UltraWarmWorkerLimit:   c.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
@@ -699,6 +736,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		MaxActiveWorkers       int                `json:"max_active_workers"`
 		UltraExclusive         *bool              `json:"ultra_exclusive"`
 		UltraIncludePro        *bool              `json:"ultra_include_pro"`
+		UltraOnlyModels        *[]string          `json:"ultra_only_models"`
+		PaidOnlyModels         *[]string          `json:"paid_only_models"`
 		UltraWarmWorkerLimit   *int               `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  *int               `json:"ultra_max_active_workers"`
 		WarmStartupConcurrency int                `json:"warm_startup_concurrency"`
@@ -758,6 +797,14 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if value.UltraPrimaryModels != nil {
 		ultraPrimaryModels = NormalizeModelList(*value.UltraPrimaryModels)
 	}
+	// 权益规则：旧版数据没有这些字段（或为 null）时取默认列表，显式的空数组表示没有规则
+	ultraOnlyModels, paidOnlyModels := slices.Clone(defaultUltraOnlyModels), slices.Clone(defaultPaidOnlyModels)
+	if value.UltraOnlyModels != nil {
+		ultraOnlyModels = NormalizeModelList(*value.UltraOnlyModels)
+	}
+	if value.PaidOnlyModels != nil {
+		paidOnlyModels = NormalizeModelList(*value.PaidOnlyModels)
+	}
 	ultraPrimaryQueueWait := defaultPrimaryQueueWaitFor(requestTimeout)
 	if strings.TrimSpace(value.UltraPrimaryQueueWait) != "" {
 		if ultraPrimaryQueueWait, err = parseOptionalDuration("ULTRA_PRIMARY_QUEUE_WAIT", value.UltraPrimaryQueueWait); err != nil {
@@ -792,6 +839,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		MaxActiveWorkers:       value.MaxActiveWorkers,
 		UltraExclusive:         value.UltraExclusive == nil || *value.UltraExclusive,
 		UltraIncludePro:        value.UltraIncludePro != nil && *value.UltraIncludePro,
+		UltraOnlyModels:        ultraOnlyModels,
+		PaidOnlyModels:         paidOnlyModels,
 		UltraWarmWorkerLimit:   intOrDefault(value.UltraWarmWorkerLimit, defaultUltraWarmWorkerLimit),
 		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
@@ -1591,6 +1640,21 @@ func ParseModelList(value string) []string {
 // NormalizeModelList 整理模型列表：去空白、去 models/ 前缀、去重
 func NormalizeModelList(models []string) []string {
 	return ParseModelList(strings.Join(models, ","))
+}
+
+// validateTierRuleModels 校验权益规则的模型列表（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）：与其他模型列表相同，另外不能写 long- 开头的名称
+// （long- 是自动续写的前缀，协议层在到达账户池之前就去掉了，规则要写基础模型 ID）。带后缀的名称（-high 等）在这里认不出来，
+// 运行时对照账户目录时提示（见 aistudio.TierRuleReport）
+func validateTierRuleModels(key string, models []string) error {
+	if err := validateModelList(key, models); err != nil {
+		return err
+	}
+	for _, model := range models {
+		if strings.HasPrefix(strings.ToLower(model), "long-") {
+			return fmt.Errorf("%s 的模型 %s 无效：不能写 long- 开头的名称，请写基础模型 ID", key, model)
+		}
+	}
+	return nil
 }
 
 // validateModelList 校验已整理的模型列表：每项非空、不含空白与分隔符、不重复（ParseModelList 与 NormalizeModelList 的结果总能通过）

@@ -562,6 +562,13 @@ type RuntimeConfig struct {
 	UltraIncludePro       *bool `json:"ultra_include_pro,omitempty"`
 	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
 	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
+	// UltraOnlyModels、PaidOnlyModels 为权益规则（ULTRA_ONLY_MODELS：只有 Ultra 能用的模型；PAID_ONLY_MODELS：只有 Pro 与 Ultra 能用的模型），
+	// 保存后立即生效；读取时总是返回（可以为空数组），保存时没有这些字段（旧版页面）则沿用现值
+	UltraOnlyModels *[]string `json:"ultra_only_models,omitempty"`
+	PaidOnlyModels  *[]string `json:"paid_only_models,omitempty"`
+	// TierRuleHints 为比账户目录更严的权益规则（只读，保存时忽略）：某个权益的账户目录显示能用规则排除的模型。目录明确标注了可用
+	// （Marked）的多半是 Google 已开放，确认后可从对应列表移除；只是没有标注权益限制的只作说明
+	TierRuleHints []TierRuleHint `json:"tier_rule_hints,omitempty"`
 	// StreamDataHeartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	StreamDataHeartbeat *bool `json:"stream_data_heartbeat,omitempty"`
 	// OmniIgnoreSystemPrompt 为视频模型忽略系统提示（OMNI_IGNORE_SYSTEM_PROMPT，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
@@ -599,6 +606,17 @@ type RuntimeConfig struct {
 	MediaMaxSize   string  `json:"media_max_size,omitempty"`
 	// InvalidConfig 为 .env 或进程环境变量里取值无效、已按默认值生效的配置项，只读（保存时忽略）；凭据键没有原值
 	InvalidConfig []InvalidConfigValue `json:"invalid_config,omitempty"`
+}
+
+// TierRuleHint 为一条比账户目录更严的权益规则：配置键 Key（ULTRA_ONLY_MODELS 或 PAID_ONLY_MODELS）里的模型 Model 把权益 Tier
+// （Free、Pro、Plus）排除在外，但 Accounts 个这一权益的启用账户的目录显示能用它；Marked 为这些账户的目录明确标注了这一权益可用，
+// 为假时它们的目录只是没有标注权益限制。同一权益两种账户都有时分成两条，各自计数
+type TierRuleHint struct {
+	Key      string `json:"key"`
+	Model    string `json:"model"`
+	Tier     string `json:"tier"`
+	Marked   bool   `json:"marked,omitempty"`
+	Accounts int    `json:"accounts"`
 }
 
 // InvalidConfigValue 为一项取值无效、已按默认值生效的配置

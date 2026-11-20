@@ -74,6 +74,26 @@ func accountCatalogKeyLocked(account *Account) uint64 {
 	return account.catalogKey
 }
 
+// accountBuildKeyLocked 返回账户 Build 目录的内容键（模型 ID 的散列），Build 目录切片被替换时才重算。目录同步每次都换一份切片，
+// 内容多半不变；只用于按内容去重（见 tierRuleReportLocked）；调用方持有 p.mu
+func accountBuildKeyLocked(account *Account) uint64 {
+	if account.buildKeySource != nil && sameModelSlice(account.buildKeySource, account.buildModels) {
+		return account.buildKey
+	}
+	var hash maphash.Hash
+	hash.SetSeed(catalogKeySeed)
+	for _, model := range account.buildModels {
+		_, _ = hash.WriteString(model.ID)
+		_ = hash.WriteByte(0)
+	}
+	account.buildKey = hash.Sum64()
+	account.buildKeySource = account.buildModels
+	if account.buildKeySource == nil {
+		account.buildKeySource = []Model{}
+	}
+	return account.buildKey
+}
+
 // catalogSummary 为一个号池内全部账户 Playground 目录的汇总（不看启用与权益，与原 hasModelLocked 等的口径相同）
 type catalogSummary struct {
 	version uint64
@@ -232,14 +252,16 @@ func accountBootstrapModelsLocked(account *Account) []string {
 	return models
 }
 
-// accountWarmCoverageLocked 返回账户目录中可生成的模型数（PreferWarmPool 的排序依据），目录或权益变化时才重算；调用方持有 p.mu
-func accountWarmCoverageLocked(account *Account) int {
-	if account.warmCoverageSource != nil && sameModelSlice(account.warmCoverageSource, account.Models) && account.warmCoverageTier == account.BenefitTier {
+// accountWarmCoverageLocked 返回账户目录中可生成的模型数（PreferWarmPool 的排序依据）：权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）
+// 排除的模型不计。目录、权益或规则变化时才重算（规则按 tierRulesVersion 判断）；调用方持有 p.mu
+func (p *AccountPool) accountWarmCoverageLocked(account *Account) int {
+	if account.warmCoverageSource != nil && sameModelSlice(account.warmCoverageSource, account.Models) &&
+		account.warmCoverageTier == account.BenefitTier && account.warmCoverageRules == p.tierRulesVersion {
 		return account.warmCoverage
 	}
 	coverage := 0
 	for _, model := range account.Models {
-		if account.SupportsMethod(model.ID, "generateContent") {
+		if account.SupportsMethod(model.ID, "generateContent") && p.tierRuleAllowsAccountModelLocked(account, model) {
 			coverage++
 		}
 	}
@@ -249,6 +271,7 @@ func accountWarmCoverageLocked(account *Account) int {
 		account.warmCoverageSource = []Model{}
 	}
 	account.warmCoverageTier = account.BenefitTier
+	account.warmCoverageRules = p.tierRulesVersion
 	return coverage
 }
 

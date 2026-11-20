@@ -1264,7 +1264,9 @@ func (admin *runtimeAdmin) RuntimeConfig(context.Context) (api.RuntimeConfig, er
 	if err != nil {
 		return api.RuntimeConfig{}, err
 	}
-	return runtimeConfigDTO(cfg), nil
+	value := runtimeConfigDTO(cfg)
+	value.TierRuleHints = tierRuleHintsDTO(admin.pool.TierRuleReport())
+	return value, nil
 }
 
 // adminUneditedConfigKeys 为管理页面不编辑的配置键：保存时沿用 .env 中的现值
@@ -1335,6 +1337,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	}
 	if value.UltraMaxActiveWorkers != nil {
 		ultraMax = *value.UltraMaxActiveWorkers
+	}
+	// 权益规则：旧版页面保存时不带这些字段，沿用现值；空数组表示没有规则，写法无效（long- 开头等）时由下面的 Validate 拒绝
+	ultraOnlyModels, paidOnlyModels := saved.UltraOnlyModels, saved.PaidOnlyModels
+	if value.UltraOnlyModels != nil {
+		ultraOnlyModels = config.NormalizeModelList(*value.UltraOnlyModels)
+	}
+	if value.PaidOnlyModels != nil {
+		paidOnlyModels = config.NormalizeModelList(*value.PaidOnlyModels)
 	}
 	// 数据型心跳：旧版页面保存时不带该字段，沿用现值
 	streamDataHeartbeat := saved.StreamDataHeartbeat
@@ -1431,6 +1441,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		Proxy: proxy, ProxyPool: poolSettings, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
+		UltraOnlyModels: ultraOnlyModels, PaidOnlyModels: paidOnlyModels,
 		StreamDataHeartbeat:    streamDataHeartbeat,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
@@ -2144,6 +2155,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
+	ultraOnlyModels := append([]string{}, cfg.UltraOnlyModels...)
+	paidOnlyModels := append([]string{}, cfg.PaidOnlyModels...)
 	modelFallbacks := cfg.ModelFallbacks
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
@@ -2164,6 +2177,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		DowngradeGuard:         downgradeGuardToAPI(cfg.DowngradeGuard),
 		UltraExclusive:         &cfg.UltraExclusive,
 		UltraIncludePro:        &cfg.UltraIncludePro,
+		UltraOnlyModels:        &ultraOnlyModels,
+		PaidOnlyModels:         &paidOnlyModels,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
 		OmniIgnoreSystemPrompt: &cfg.OmniIgnoreSystemPrompt,
 		OmniImageBinding:       &cfg.OmniImageBinding,

@@ -350,11 +350,27 @@ type aliasModelSnapshot struct {
 	expires time.Time
 	// builtAt 为开始计算这份目录的时刻：后台刷新与同步重算同时进行时，只留开始得晚的那份（见 storeAliasSnapshot）
 	builtAt time.Time
+	// ruleVersion 为开始计算这份目录前读到的号池规则版本（见 poolRuleVersion）：规则变化之后解析不到的名称当场重算（见 aliasCatalogFor）
+	ruleVersion uint64
 }
 
-// newAliasSnapshot 为 started 时开始计算的目录生成快照
-func newAliasSnapshot(models []aistudio.Model, started time.Time) *aliasModelSnapshot {
-	return &aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL), builtAt: started}
+// newAliasSnapshot 为 started 时开始计算、计算前号池规则版本为 ruleVersion 的目录生成快照
+func newAliasSnapshot(models []aistudio.Model, started time.Time, ruleVersion uint64) *aliasModelSnapshot {
+	return &aliasModelSnapshot{models: models, expires: time.Now().Add(aliasModelCacheTTL), builtAt: started, ruleVersion: ruleVersion}
+}
+
+// poolRuleVersioner 由能报告号池规则版本的生成服务实现（app 的 runtimeManager，见 aistudio.AccountPool.PoolRuleVersion）
+type poolRuleVersioner interface {
+	PoolRuleVersion() uint64
+}
+
+// poolRuleVersion 返回号池规则版本：ULTRA_INCLUDE_PRO 与权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）每次实际变化时加一，
+// 号池的模型目录随之变化；生成服务不报告时为 0
+func (s *server) poolRuleVersion() uint64 {
+	if versioned, ok := s.service.(poolRuleVersioner); ok {
+		return versioned.PoolRuleVersion()
+	}
+	return 0
 }
 
 // storeAliasSnapshot 写入快照，已有的快照开始计算得更晚时保留它（比如解析不到时的同步重算先完成、更早开始的后台刷新后完成，
@@ -406,19 +422,20 @@ func (s *server) aliasCatalog(ctx context.Context) ([]aistudio.Model, error) {
 	if cached := cache.models.Load(); cached != nil {
 		return cached.models, nil
 	}
-	started := time.Now()
+	started, version := time.Now(), s.poolRuleVersion()
 	models, err := s.service.Models(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return storeAliasSnapshot(cache, newAliasSnapshot(models, started)).models, nil
+	return storeAliasSnapshot(cache, newAliasSnapshot(models, started, version)).models, nil
 }
 
 // aliasCatalogFor 返回解析 name 用的别名目录：快照里解析得到时就用快照（见 aliasCatalog）；解析不到、快照又已建立超过
-// aliasMissRefreshAfter 时同步重算一次，返回新目录。快照可能是在账户的模型目录还没载入完时建的（例如刚重启，只在 Build 通道提供的
-// gemini-4-argon 要等 Pro、Ultra 账户的 Build 目录恢复），也可能是 ULTRA_INCLUDE_PRO 切换之前的；原先这时带后缀的名称
-// （gemini-4-argon-medium）解析不到、原名转发后以模型不存在 404，要等快照过期且后台刷新完成才恢复，不带后缀的名称却照常可用。
-// 同一号池同一时间只算一次，等锁期间别人已经重算过就直接用新的；重算失败时返回原快照
+// aliasMissRefreshAfter 或建立之后号池规则变过（ULTRA_INCLUDE_PRO、权益规则）时同步重算一次，返回新目录。快照可能是在账户的模型目录
+// 还没载入完时建的（例如刚重启，只在 Build 通道提供的 gemini-4-argon 要等 Pro、Ultra 账户的 Build 目录恢复），也可能是号池规则变化之前的
+// （切换 ULTRA_INCLUDE_PRO、清除或放宽权益规则后，号池才有的模型不在旧快照里）；原先这时带后缀的名称（gemini-4-argon-medium）
+// 解析不到、原名转发后以模型不存在 404，要等快照过期且后台刷新完成才恢复，不带后缀的名称却照常可用。规则变化后只重算一次
+// （新快照记下新版本），同一号池同一时间只算一次，等锁期间别人已经重算过就直接用新的；重算失败时返回原快照
 func (s *server) aliasCatalogFor(ctx context.Context, name string) ([]aistudio.Model, error) {
 	models, err := s.aliasCatalog(ctx)
 	if err != nil {
@@ -428,20 +445,28 @@ func (s *server) aliasCatalogFor(ctx context.Context, name string) ([]aistudio.M
 		return models, nil
 	}
 	cache, _ := s.aliasCache(ctx)
-	if current := cache.models.Load(); current != nil && time.Since(current.builtAt) < aliasMissRefreshAfter {
-		return current.models, nil
+	version := s.poolRuleVersion()
+	current := func() *aliasModelSnapshot {
+		snapshot := cache.models.Load()
+		if snapshot != nil && snapshot.ruleVersion == version && time.Since(snapshot.builtAt) < aliasMissRefreshAfter {
+			return snapshot
+		}
+		return nil
+	}
+	if snapshot := current(); snapshot != nil {
+		return snapshot.models, nil
 	}
 	cache.refreshMu.Lock()
 	defer cache.refreshMu.Unlock()
-	if current := cache.models.Load(); current != nil && time.Since(current.builtAt) < aliasMissRefreshAfter {
-		return current.models, nil
+	if snapshot := current(); snapshot != nil {
+		return snapshot.models, nil
 	}
 	started := time.Now()
 	fresh, err := s.service.Models(ctx)
 	if err != nil {
 		return models, nil
 	}
-	return storeAliasSnapshot(cache, newAliasSnapshot(fresh, started)).models, nil
+	return storeAliasSnapshot(cache, newAliasSnapshot(fresh, started, version)).models, nil
 }
 
 // refreshAliasCatalogAsync 在后台刷新号池的别名目录，同一号池同一时间最多一个刷新；失败时保留旧快照，下次过期再试
@@ -459,12 +484,12 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 		}()
 		ctx, cancel := context.WithTimeout(aistudio.ContextWithPoolScope(context.Background(), scope), 2*time.Minute)
 		defer cancel()
-		started := time.Now()
+		started, version := time.Now(), s.poolRuleVersion()
 		models, err := s.service.Models(ctx)
 		if err != nil {
 			return
 		}
-		storeAliasSnapshot(cache, newAliasSnapshot(models, started))
+		storeAliasSnapshot(cache, newAliasSnapshot(models, started, version))
 	}()
 }
 

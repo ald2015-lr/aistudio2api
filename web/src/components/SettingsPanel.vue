@@ -18,6 +18,7 @@ import type {
   ProxyPoolConfig,
   ProxyPoolStatus,
   ServiceConfig,
+  TierRuleHint,
   UpstreamChannel,
 } from '@/types'
 import ProxyInput from './ProxyInput.vue'
@@ -58,6 +59,8 @@ type EditableKey =
   | 'max_active_workers'
   | 'ultra_exclusive'
   | 'ultra_include_pro'
+  | 'ultra_only_models'
+  | 'paid_only_models'
   | 'ultra_warm_worker_limit'
   | 'ultra_max_active_workers'
   | 'warm_startup_concurrency'
@@ -102,6 +105,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'max_active_workers',
   'ultra_exclusive',
   'ultra_include_pro',
+  'ultra_only_models',
+  'paid_only_models',
   'ultra_warm_worker_limit',
   'ultra_max_active_workers',
   'warm_startup_concurrency',
@@ -136,7 +141,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
 // 这几个字段边输入边保存会出问题（例如密钥只输入了一半），改为输入框失去焦点时保存；
 // IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交；
 // 媒体链接地址、保存期限与总量上限输入到一半时不合法（例如期限只写了 7、地址只写了 https://），同样失焦时保存；
-// 额度用完改用其他模型的规则输入到一半时也不合法（例如只写了 gemini-4-argon=），同样失焦时保存
+// 额度用完改用其他模型的规则输入到一半时也不合法（例如只写了 gemini-4-argon=），同样失焦时保存；
+// 权益规则的模型输入到一半（例如 gemini-4-car）会让规则暂时不匹配原来的模型、放开它，同样失焦时保存
 const BLUR_KEYS: readonly EditableKey[] = [
   'auth_states',
   'listen_addr',
@@ -147,6 +153,8 @@ const BLUR_KEYS: readonly EditableKey[] = [
   'media_retention',
   'media_max_size',
   'model_fallbacks',
+  'ultra_only_models',
+  'paid_only_models',
 ]
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
@@ -177,6 +185,9 @@ function cloneDowngradeGuard(value: DowngradeGuardConfig | undefined): Downgrade
 
 // DEFAULT_ULTRA_PRIMARY_MODELS 与服务端 ULTRA_PRIMARY_MODELS 的默认值一致；旧版服务端不返回该字段时按它显示
 const DEFAULT_ULTRA_PRIMARY_MODELS: readonly string[] = ['gemini-4-argon']
+// DEFAULT_ULTRA_ONLY_MODELS 与 DEFAULT_PAID_ONLY_MODELS 与服务端 ULTRA_ONLY_MODELS、PAID_ONLY_MODELS 的默认值一致；旧版服务端不返回时按它显示
+const DEFAULT_ULTRA_ONLY_MODELS: readonly string[] = ['gemini-4-carbon']
+const DEFAULT_PAID_ONLY_MODELS: readonly string[] = ['gemini-3.1-pro-preview']
 // DEFAULT_MODEL_FALLBACKS 与服务端 MODEL_FALLBACKS 的默认值一致（配置加载前表单的初始值）
 const DEFAULT_MODEL_FALLBACKS = 'gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon'
 
@@ -240,6 +251,8 @@ const form = reactive<ServiceConfig>({
   max_active_workers: 10,
   ultra_exclusive: true,
   ultra_include_pro: false,
+  ultra_only_models: [...DEFAULT_ULTRA_ONLY_MODELS],
+  paid_only_models: [...DEFAULT_PAID_ONLY_MODELS],
   ultra_warm_worker_limit: 2,
   ultra_max_active_workers: 5,
   warm_startup_concurrency: 2,
@@ -306,6 +319,64 @@ function onUltraPrimaryModelsInput(event: Event): void {
   const value = (event.target as HTMLInputElement).value
   ultraPrimaryModelsText.value = value
   form.ultra_primary_models = parseModelList(value)
+}
+
+// 权益规则的两个输入框同样单独保存文字；清空即没有规则。失焦（或回车）时保存，见 BLUR_KEYS
+const ultraOnlyModelsText = ref((form.ultra_only_models ?? []).join(', '))
+const paidOnlyModelsText = ref((form.paid_only_models ?? []).join(', '))
+
+function onUltraOnlyModelsInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value
+  ultraOnlyModelsText.value = value
+  form.ultra_only_models = parseModelList(value)
+}
+
+function onPaidOnlyModelsInput(event: Event): void {
+  const value = (event.target as HTMLInputElement).value
+  paidOnlyModelsText.value = value
+  form.paid_only_models = parseModelList(value)
+}
+
+// TierRuleNote 为设置项下方的一条权益规则说明：actionable 为目录明确标注了被排除的权益可用（醒目显示、建议确认后移除），
+// 否则只是目录没有标注权益限制（不醒目，不建议移除）
+interface TierRuleNote {
+  text: string
+  actionable: boolean
+}
+
+// tierRuleNotes 为服务端对照账户目录后给出的提示（只读），按所在列表分开显示：目录标注了可用的每个权益一条醒目提示；
+// 目录没有标注权益限制的按模型合并成一条说明——规则本来就是为这种目录设的，从第一天起就会一直存在，不说明 Google 已开放
+function tierRuleNotes(key: TierRuleHint['key']): TierRuleNote[] {
+  const hints = (props.config?.tier_rule_hints ?? []).filter((hint) => hint.key === key)
+  const notes: TierRuleNote[] = hints
+    .filter((hint) => hint.marked === true)
+    .map((hint) => ({
+      actionable: true,
+      text: tf('settings.tierRuleHintMarked', {
+        tier: hint.tier,
+        model: hint.model,
+        count: String(hint.accounts),
+      }),
+    }))
+  const unmarked = new Map<string, string[]>()
+  for (const hint of hints) {
+    if (hint.marked === true) {
+      continue
+    }
+    const tiers = unmarked.get(hint.model) ?? []
+    tiers.push(tf('settings.tierRuleHintTier', { tier: hint.tier, count: String(hint.accounts) }))
+    unmarked.set(hint.model, tiers)
+  }
+  for (const [model, tiers] of unmarked) {
+    notes.push({
+      actionable: false,
+      text: tf('settings.tierRuleHintUnmarked', {
+        model,
+        tiers: tiers.join(t('settings.tierRuleHintTierSeparator')),
+      }),
+    })
+  }
+  return notes
 }
 
 // subscriptionModels 为目录中需要订阅权益、可经 Build 调用（在 Build 通道一次性返回整段回复）且可经 Playground 流式调用的模型，
@@ -554,6 +625,15 @@ function validate(value: ServiceConfig): string {
     return t('settings.invalidUltraPrimaryQueueWait')
   }
   if (!modelFallbacksValid(value.model_fallbacks)) return t('settings.invalidModelFallbacks')
+  // 权益规则不能写 long- 开头的名称（续写前缀在到达账户池之前就去掉了），与服务端校验一致
+  for (const [models, key] of [
+    [value.ultra_only_models, 'settings.ultraOnlyModels'],
+    [value.paid_only_models, 'settings.paidOnlyModels'],
+  ] as const) {
+    if ((models ?? []).some((model) => model.toLowerCase().startsWith('long-'))) {
+      return tf('settings.invalidTierRuleModels', { field: label(key) })
+    }
+  }
   const numbers: [unknown, TranslationKey][] = [
     [value.warm_worker_limit, 'settings.warmWorkerLimit'],
     [value.max_active_workers, 'settings.maxActiveWorkers'],
@@ -954,6 +1034,11 @@ watch(
       form.ultra_primary_models = [...(config.ultra_primary_models ?? DEFAULT_ULTRA_PRIMARY_MODELS)]
       ultraPrimaryModelsText.value = form.ultra_primary_models.join(', ')
       form.ultra_primary_queue_wait = config.ultra_primary_queue_wait ?? '10s'
+      // 权益规则：新版服务端总是返回（没有规则时为空数组），旧版不返回时按默认值显示
+      form.ultra_only_models = [...(config.ultra_only_models ?? DEFAULT_ULTRA_ONLY_MODELS)]
+      ultraOnlyModelsText.value = form.ultra_only_models.join(', ')
+      form.paid_only_models = [...(config.paid_only_models ?? DEFAULT_PAID_ONLY_MODELS)]
+      paidOnlyModelsText.value = form.paid_only_models.join(', ')
       // 旧版服务端不返回 IP 池设置：表单里也去掉，保存时不提交，服务端沿用现值
       if (config.proxy_pool !== undefined) form.proxy_pool = cloneProxyPool(config.proxy_pool)
       else delete form.proxy_pool
@@ -1382,6 +1467,79 @@ onBeforeUnmount(() => {
         >
           {{ t('settings.ultraIncludeProSharedHint') }}
         </p>
+        <div class="mt-4 border-t border-[#30363d] pt-4">
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <div class="min-w-0">
+              <label class="block">
+                <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                  t('settings.ultraOnlyModels')
+                }}</span>
+                <input
+                  :value="ultraOnlyModelsText"
+                  class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="gemini-4-carbon"
+                  @input="onUltraOnlyModelsInput"
+                  @change="commitBlurField"
+                />
+              </label>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.ultraOnlyModelsHelp')"
+              />
+              <p
+                v-for="note in tierRuleNotes('ULTRA_ONLY_MODELS')"
+                :key="note.text"
+                :class="[
+                  'mt-2 break-words rounded border px-3 py-2 text-xs leading-5',
+                  note.actionable
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                    : 'border-[#30363d] bg-[#0d1117] text-gray-400',
+                ]"
+                role="note"
+              >
+                {{ note.text }}
+              </p>
+            </div>
+            <div class="min-w-0">
+              <label class="block">
+                <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                  t('settings.paidOnlyModels')
+                }}</span>
+                <input
+                  :value="paidOnlyModelsText"
+                  class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                  type="text"
+                  spellcheck="false"
+                  autocomplete="off"
+                  placeholder="gemini-3.1-pro-preview"
+                  @input="onPaidOnlyModelsInput"
+                  @change="commitBlurField"
+                />
+              </label>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.paidOnlyModelsHelp')"
+              />
+              <p
+                v-for="note in tierRuleNotes('PAID_ONLY_MODELS')"
+                :key="note.text"
+                :class="[
+                  'mt-2 break-words rounded border px-3 py-2 text-xs leading-5',
+                  note.actionable
+                    ? 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+                    : 'border-[#30363d] bg-[#0d1117] text-gray-400',
+                ]"
+                role="note"
+              >
+                {{ note.text }}
+              </p>
+            </div>
+          </div>
+          <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.tierRulesHelp')" />
+        </div>
         <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
           <label class="block">
             <span class="mb-1 block text-sm font-medium text-gray-400">{{

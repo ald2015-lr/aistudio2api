@@ -543,10 +543,20 @@ type Account struct {
 	warmCoverage       int
 	warmCoverageSource []Model
 	warmCoverageTier   BenefitTier
+	// warmCoverageRules 为计算 warmCoverage 时账户池权益规则的版本（tierRulesVersion）
+	warmCoverageRules  uint64
 	statusModels       []string
 	statusModelsSource []Model
 	catalogKey         uint64
 	catalogKeySource   []Model
+	// buildKey 为 Build 目录的内容键（见 accountBuildKeyLocked），buildKeySource 为计算它时的 Build 目录切片
+	buildKey       uint64
+	buildKeySource []Model
+	// tierMasks 为 Playground 目录里受权益规则限制的模型（按模型 ID）允许的权益，没有受限的模型时为 nil；tierMasksSource 与
+	// tierMasksRules 为计算它时的目录切片与规则版本（见 accountTierMasksLocked）
+	tierMasks       map[string]tierMask
+	tierMasksSource []Model
+	tierMasksRules  uint64
 	// draining 为排空中（见 SetDraining）：不固定账户的选号不再给它新租约，分类时按忙碌处理；
 	// 指定账户与文件绑定的请求照常使用。只影响调度，不改变对外状态、Activity 与预热概况。受账户池 mu 保护
 	draining bool
@@ -720,7 +730,17 @@ type AccountPool struct {
 	ultraIncludePro bool
 	// ultraSnapshot 为 UltraAccountIDs 返回的只读副本，nil 表示成员变化后尚未重建；受 mu 保护
 	ultraSnapshot map[string]struct{}
-	// poolRuleVersion 在号池划分规则每次实际切换时加一，无锁读取，供 app 层按版本作废派生缓存
+	// tierRules 为 ULTRA_ONLY_MODELS 与 PAID_ONLY_MODELS 的权益规则（见 tier_rules.go），tierReport 为按 eligibilityVersion 缓存的
+	// 规则与目录对照；均受 mu 保护
+	tierRules  modelTierRules
+	tierReport *tierRuleReportCache
+	// tierRulesVersion 在权益规则每次实际变化时加一（账户上按它缓存的派生值据此作废，见 accountWarmCoverageLocked）；受 mu 保护
+	tierRulesVersion uint64
+	// tierMasksByCatalog 按目录内容键共享各账户的 tierMasks（同一份目录只算一次，见 accountTierMasksLocked），
+	// tierMasksByCatalogRules 为计算时的规则版本；均受 mu 保护
+	tierMasksByCatalog      map[uint64]map[string]tierMask
+	tierMasksByCatalogRules uint64
+	// poolRuleVersion 在号池划分规则（ULTRA_INCLUDE_PRO、权益规则）每次实际切换时加一，无锁读取，供 app 层按版本作废派生缓存
 	poolRuleVersion atomic.Uint64
 	statusCache     []AccountStatus
 	statusCacheAt   time.Time
@@ -1154,7 +1174,9 @@ func (a *Account) SupportsMethod(modelID string, method string) bool {
 	return false
 }
 
-func accountSupportsSelection(account *Account, selection AccountSelection) bool {
+// accountSupportsSelectionLocked 判断账户的 Playground 目录支持选择：目录有这个模型、目录的访问模式与权益规则（ULTRA_ONLY_MODELS、
+// PAID_ONLY_MODELS，见 tier_rules.go）都允许账户的真实权益，并声明了所需的方法与能力；调用方持有 p.mu
+func (p *AccountPool) accountSupportsSelectionLocked(account *Account, selection AccountSelection) bool {
 	modelID := strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/")
 	if modelID == "" {
 		return true
@@ -1163,7 +1185,7 @@ func accountSupportsSelection(account *Account, selection AccountSelection) bool
 	if !exists {
 		return false
 	}
-	if !modelAllowedByTier(model, account.BenefitTier) {
+	if !modelAllowedByTier(model, account.BenefitTier) || !p.tierRuleAllowsAccountModelLocked(account, model) {
 		return false
 	}
 	if strings.TrimSpace(selection.Method) != "" && !hasMethod(model, selection.Method) {
@@ -3117,7 +3139,7 @@ func (p *AccountPool) PreferWarmPool(accountIDs []string) []string {
 		if account == nil {
 			continue
 		}
-		coverage := accountWarmCoverageLocked(account)
+		coverage := p.accountWarmCoverageLocked(account)
 		priority := benefitTierPriority(account.BenefitTier)
 		groups[priority] = append(groups[priority], warmCandidate{id: accountID, coverage: coverage})
 	}

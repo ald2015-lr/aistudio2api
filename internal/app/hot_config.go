@@ -213,6 +213,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		slices.Equal(saved.StreamPlaygroundModels, active.StreamPlaygroundModels) &&
 		slices.Equal(saved.PrimaryModels, active.PrimaryModels) && saved.PrimaryQueueWait == active.PrimaryQueueWait &&
 		slices.Equal(saved.UltraPrimaryModels, active.UltraPrimaryModels) && saved.UltraPrimaryQueueWait == active.UltraPrimaryQueueWait &&
+		slices.Equal(saved.UltraOnlyModels, active.UltraOnlyModels) && slices.Equal(saved.PaidOnlyModels, active.PaidOnlyModels) &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
 		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
@@ -225,14 +226,17 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 权益规则=%s | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
-		admin.pool.UltraIncludePro(), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
+		admin.pool.UltraIncludePro(), tierRulesSummary(admin.pool.ModelTierRules()), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
 		routingStrategySummary(saved.RoutingStrategy), strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 		longOutputSummary(saved.LongOutputEnabled, saved.LongOutputMaxTokens), saved.ProxyPool.Summary(),
 	))
+	// 权益规则变化后立即对照账户目录：目录明确标注可用的写一行 WARN，只是没有标注的按配置项与模型合并写一行 INFO，
+	// 不在任何目录里的名称写一行 WARN；同样的内容不重复写（见 checkTierRules）
+	admin.service.checkTierRules()
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()
 }
@@ -293,6 +297,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	// ULTRA_INCLUDE_PRO 热切换：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同。只在账户池里改成员规则，
 	// 不重启 Worker；Pro Worker 改到新分区计数，候选索引与按号池的缓存在账户池内作废重建
 	membershipChanged := admin.pool.SetUltraIncludePro(saved.UltraIncludePro)
+	// ULTRA_ONLY_MODELS、PAID_ONLY_MODELS 热更新：锁顺序与 SetUltraIncludePro 相同。候选索引与按版本缓存的派生结果在账户池内作废重建，
+	// 进行中的请求不受影响（已取得的租约发送前不看规则）
+	tierRulesChanged := admin.pool.SetModelTierRules(saved.UltraOnlyModels, saved.PaidOnlyModels)
 	admin.service.setRequestTimeout(saved.RequestTimeout)
 	admin.service.firstEventTimeout.Store(int64(saved.FirstEventTimeout))
 	admin.service.ignoreSeed.Store(saved.IgnoreClientSeed)
@@ -314,6 +321,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	if fallbackChanged {
 		manager.requests.log("service", "INFO", "额度用完改用其他模型的设置已更新并立即生效 | "+
 			modelFallbackSummary(saved.ModelFallbacks, saved.ModelFallbackScope))
+	}
+	if tierRulesChanged {
+		manager.requests.log("service", "INFO", "权益规则已更新并立即生效 | "+tierRulesSummary(saved.UltraOnlyModels, saved.PaidOnlyModels))
 	}
 
 	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 峰值与启动并发的变化同样要重新判断端口够不够。
