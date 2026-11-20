@@ -1074,6 +1074,8 @@ func (s *server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 	request.Stream = stream
+	// 按官方形状输出：重新生成用完仍异常结束且没有输出时照旧以该结束原因结束，不按 ABNORMAL_FINISH_ERROR 返回 502
+	request.KeepAbnormalFinish = true
 	events, eventReady, err := s.generateStream(r.Context(), request)
 	if err != nil {
 		if shouldWriteRequestError(r, err) {

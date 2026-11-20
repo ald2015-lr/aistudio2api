@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -137,6 +138,14 @@ type TemporaryFileCopies struct {
 	sources map[string]struct{}
 	once    sync.Once
 	err     error
+	// driveStorageFull 为 UploadInlineMediaToLease 因目标账户的 Drive 存储空间已满把附件改为内联发送（见 DriveStorageFull）
+	driveStorageFull bool
+}
+
+// DriveStorageFull 判断这次的内联附件是否因目标账户的 Drive 存储空间已满（上传返回 403 storageQuotaExceeded，或记忆里这个账户
+// 刚返回过，见 drive_memory.go）改为内联发送：app 层据此写“Drive 空间已满，附件改为内联”，不写“Drive 未授权”
+func (copies *TemporaryFileCopies) DriveStorageFull() bool {
+	return copies != nil && copies.driveStorageFull
 }
 
 // Count 返回本次请求创建的临时文件数
@@ -201,6 +210,14 @@ func (copies *TemporaryFileCopies) Cleanup() error {
 func NewTemporaryFileCopiesForTest(cleanupErr error) *TemporaryFileCopies {
 	copies := &TemporaryFileCopies{}
 	copies.once.Do(func() { copies.err = cleanupErr })
+	return copies
+}
+
+// NewDriveStorageFullCopiesForTest 返回没有临时文件、DriveStorageFull 为真的副本集合，供其他包的测试模拟附件因 Drive 存储空间已满
+// 改为内联发送；请求路径不使用
+func NewDriveStorageFullCopiesForTest() *TemporaryFileCopies {
+	copies := NewTemporaryFileCopiesForTest(nil)
+	copies.driveStorageFull = true
 	return copies
 }
 
@@ -360,11 +377,21 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 	}
 	var file FileRef
 	var uploadErr error
+	// coolingErr 为自动选号时跳过的冷却账户里最早恢复的一个（AcquireFor 对冷却超过排队上限的账户立即返回 AllCoolingError）
+	var coolingErr *AllCoolingError
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if automatic {
 			selection.AccountID = candidateAccountIDs[attempt]
 		}
 		lease, owned, err := resolveAccountLease(ctx, s.pool, selection)
+		var cooling *AllCoolingError
+		if err != nil && automatic && errors.As(err, &cooling) {
+			// 这个候选在冷却、排队等不到：没有发出请求，换下一个候选（冷却中的账户已排在候选最后，见 fileUploadAccountIDs）
+			if coolingErr == nil || cooling.Until.Before(coolingErr.Until) {
+				coolingErr = cooling
+			}
+			continue
+		}
 		if err != nil {
 			if uploadErr != nil && errors.Is(err, ErrNoEligibleAccount) {
 				return file, uploadErr
@@ -396,8 +423,9 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 			}
 		}
 		// 认证失败（登录失效、GenerateAccessToken 或 Drive 的 401）时自动选号的上传换一个账户再试（按候选列表逐个换，不会选回失败的账户）；
-		// 只有登录失效会改账户状态，GenerateAccessToken 的 401 只记“Drive 不可用”，不写冷却，别的请求照常使用这个账户
-		authFailure := uploadAuthFailure(uploadErr)
+		// 只有登录失效会改账户状态，GenerateAccessToken 的 401 只记“Drive 不可用”，不写冷却，别的请求照常使用这个账户。
+		// Drive 存储空间已满（403 storageQuotaExceeded，已记进 Drive 记忆，之后的上传把它排在最后）同样换号、不写冷却
+		switchable := uploadAuthFailure(uploadErr) || driveStorageQuotaExceeded(uploadErr)
 		stateErr := error(nil)
 		if uploadErr != nil {
 			stateErr = s.markLeaseAuthFailure(lease, uploadErr)
@@ -415,22 +443,33 @@ func (s *PooledService) UploadFile(ctx context.Context, request UploadRequest) (
 			releaseErr = lease.Release()
 			uploadErr = errors.Join(uploadErr, releaseErr)
 		}
-		if uploadErr == nil || !automatic || !authFailure || counter.count != 0 || stateErr != nil || releaseErr != nil {
+		if uploadErr == nil || !automatic || !switchable || counter.count != 0 || stateErr != nil || releaseErr != nil {
 			return file, uploadErr
 		}
+	}
+	if uploadErr == nil && coolingErr != nil {
+		return FileRef{}, coolingErr
 	}
 	return file, uploadErr
 }
 
+// fileUploadAccountIDs 返回号池里能承担文件上传的就绪账户：有空闲槽位的在前、忙碌的其次，全局冷却中的排在最后
+// （取租约时冷却超过排队上限的账户立即返回 AllCoolingError，UploadFile 换下一个候选）
 func (p *AccountPool) fileUploadAccountIDs(scope PoolScope) []string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	now := time.Now()
 	available := make([]string, 0, len(p.accounts))
 	busy := make([]string, 0, len(p.accounts))
+	var cooling []string
 	indices, _ := p.selectionIndicesLocked(AccountSelection{Pool: scope})
 	for _, index := range indices {
 		account := p.accounts[index]
 		if account == nil || !account.Config.Enabled || account.schedulingState() != AccountReady {
+			continue
+		}
+		if _, active := accountCooldown(account, "", now); active {
+			cooling = append(cooling, account.ID)
 			continue
 		}
 		if account.active < p.perAccountConcurrency {
@@ -439,7 +478,7 @@ func (p *AccountPool) fileUploadAccountIDs(scope PoolScope) []string {
 		}
 		busy = append(busy, account.ID)
 	}
-	return append(available, busy...)
+	return slices.Concat(available, busy, cooling)
 }
 
 // FileMetadata 返回公开上传文件的持久元数据
@@ -655,6 +694,15 @@ func driveAuthorizationMissing(err error) bool {
 		strings.Contains(strings.ToLower(rpcError.Message), "unauthorized_client")
 }
 
+// driveStorageQuotaExceeded 判断 Drive 上传因账户存储空间已满被拒绝：DriveUpload（及可续传上传的 DriveUploadInit、DriveUploadChunk）
+// 返回 403、正文里的 reason 为 "storageQuotaExceeded"（按上游 Mag1cFall/AIStudio2API efda79b、e6f067a 移植，只认这一种原因；
+// rateLimitExceeded、服务未启用等其他 403 照旧按上传失败处理）
+func driveStorageQuotaExceeded(err error) bool {
+	var rpcError *RPCError
+	return errors.As(err, &rpcError) && strings.HasPrefix(rpcError.Method, "DriveUpload") &&
+		rpcError.StatusCode == http.StatusForbidden && strings.Contains(rpcError.Message, `"storageQuotaExceeded"`)
+}
+
 // CopyFileReferencesToLease 将文件引用复制到目标账户并返回改写内容
 func (s *PooledService) CopyFileReferencesToLease(
 	ctx context.Context,
@@ -762,7 +810,11 @@ func (s *PooledService) CopyFileReferencesToLease(
 // UploadInlineMediaToLease 将内联附件上传到目标账户并改写为临时 Drive 引用。目标账户的 Drive 不可用时（GenerateAccessToken 返回
 // 401 / 协议 Code 16，或记忆里这个账户刚返回过，见 drive_memory.go）不报错，原样保留 inline data Part 随生成请求内联发送：
 // 不写冷却、不换号、不改账户状态。Playground 通道上返回的内容仍带 inline data 即为这种内联发送（Build 通道本来就直接携带 inlineData），
-// app 层据此写“Drive 未授权，附件改为内联”。登录失效（ErrAuthenticationRequired）照旧按认证失败处理并返回错误
+// app 层据此写“Drive 未授权，附件改为内联”。Drive 存储空间已满时（上传返回 403 storageQuotaExceeded，或记忆里这个账户刚返回过）
+// 同样不报错：这次的附件全部保留 inline data（已上传成功的那几份不引用，留在临时副本里随本次尝试结束删除），记下存储空间已满
+// （24 小时内这个账户的附件直接内联、不再上传），不写冷却、不换号、不计入认证失败，返回的副本集合 DriveStorageFull 为真，
+// app 层据此写“Drive 空间已满，附件改为内联”；Interaction 模型需要 Drive 的附件仍是 inline data，由 app 层按需要 Drive 授权换号。
+// 登录失效（ErrAuthenticationRequired）照旧按认证失败处理并返回错误
 func (s *PooledService) UploadInlineMediaToLease(
 	ctx context.Context,
 	target *AccountLease,
@@ -820,9 +872,12 @@ func (s *PooledService) UploadInlineMediaToLease(
 			})
 		}
 	}
-	// 记着 Drive 不可用（认证代际没变、没过期）的账户不再换 token，省掉一次往返，直接内联发送
-	if len(jobs) > 0 && s.driveKnownUnavailable(target) {
-		return rewritten, temporary, nil
+	// 记着 Drive 不可用或存储空间已满（认证代际没变、没过期）的账户不再换 token、不再上传，省掉往返，直接内联发送
+	if len(jobs) > 0 {
+		if unavailable, storageFull := s.driveKnownUnavailable(target); unavailable {
+			temporary.driveStorageFull = storageFull
+			return rewritten, temporary, nil
+		}
 	}
 	token, uploadErr := s.accessTokenForLease(targetCtx, target)
 	drive, ok := s.client.transport.(DriveTransport)
@@ -840,6 +895,8 @@ func (s *PooledService) UploadInlineMediaToLease(
 		uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
 		return nil, nil, errors.Join(uploadErr, temporary.Cleanup())
 	}
+	// 上传之前读认证代际：存储空间已满与上传成功按它记进记忆（见 noteDriveUpload）
+	generation, current := s.driveAuthGeneration(target)
 	uploadCtx, cancelUploads := context.WithCancel(targetCtx)
 	resultChannel := make(chan uploadResult, len(jobs))
 	for index, job := range jobs {
@@ -868,11 +925,28 @@ func (s *PooledService) UploadInlineMediaToLease(
 	}
 	cancelUploads()
 	copyOffset := len(temporary.copies)
+	// storageFull 为有附件的上传返回 403 storageQuotaExceeded，otherFailure 为有别的失败（第一个失败之后取消的其余上传不算）
+	storageFull, otherFailure := false, false
 	for _, result := range results {
 		if result.file.ID != "" {
 			temporary.copies = append(temporary.copies, temporaryDriveCopy{id: result.file.ID, token: token})
 		}
+		switch {
+		case result.err == nil:
+		case driveStorageQuotaExceeded(result.err):
+			storageFull = true
+		case errors.Is(result.err, context.Canceled) && targetCtx.Err() == nil:
+		default:
+			otherFailure = true
+		}
 		uploadErr = errors.Join(uploadErr, result.err)
+	}
+	if storageFull && !otherFailure {
+		// Drive 存储空间已满：附件全部保留 inline data 随生成请求内联发送（rewritten 还没改写），已上传成功的副本未绑定、不引用，
+		// 留在 temporary 里随本次尝试结束删除；不 markLeaseAuthFailure、不写冷却、不换号
+		s.noteDriveUpload(target, generation, current, false, true)
+		temporary.driveStorageFull = true
+		return rewritten, temporary, nil
 	}
 	if uploadErr != nil {
 		uploadErr = errors.Join(uploadErr, s.markLeaseAuthFailure(target, uploadErr))
@@ -887,6 +961,9 @@ func (s *PooledService) UploadInlineMediaToLease(
 		part := &rewritten[job.contentIndex].Parts[job.partIndex]
 		part.InlineData = nil
 		part.File = &file
+	}
+	if len(jobs) > 0 {
+		s.noteDriveUpload(target, generation, current, true, false)
 	}
 	stateErr := errors.Join(
 		target.MarkAuthenticationValid(),

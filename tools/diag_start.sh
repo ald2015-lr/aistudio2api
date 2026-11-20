@@ -3,9 +3,11 @@
 # 最近的 Worker 启动次数、就绪耗时、失败原因与代理日志 → 失败时的页面状态（启动失败与 Worker 重建日志末尾的“页面=…”快照）
 # → AI Studio 首次使用页（自动完成、跳过与未能完成的次数，失败停在哪一步、原因、“已做”与结构摘要样本）
 # 组织停用 AI Studio 的账户（Google Workspace 账号所属组织关闭了 AI Studio，载入时跳到 access.workspace.google.com）：状态段显示
-# 现在的账户数，启动失败原因里单独归类（新旧两种文案），并统计“账号所属组织已停用 AI Studio，停止调度”的来源
+# 现在的账户数（含下面三种受限），启动失败原因里单独归类（新旧两种文案），并统计“账号所属组织已停用 AI Studio，停止调度”的来源；
+# 服务受限（accounts.google.com/info/servicerestricted）、年龄或资格不符、Workspace 未开放三种按种类分开统计启动失败与“<原因>，停止调度”
+# 的来源，出口地区不支持（docs/available-regions，不标记账号）单独一类
 # 官网停用 Build 通道的生成（PROXY_GENERATION_DISABLED）：状态段显示 Build 通道是否全局暂停、开始与下次试探时间、暂停中与等待试探的账号数
-# Google Drive 授权：状态段显示启用账户中 Drive 可用、不可用与未知的账户数（gemini-omni 的视频输入及不能内联的图片只交给可用或未知的账户，
+# Google Drive 授权：状态段显示启用账户中 Drive 可用、不可用（另写空间已满）与未知的账户数（gemini-omni 的视频输入及不能内联的图片只交给可用或未知的账户，
 #   PNG、JPEG、WebP 等能内联的图片直接内联发送，不需要 Drive）
 # 只读：只对本机管理接口发 GET 请求、读运行日志，直连测试只访问 api.ipify.org 与 aistudio.google.com 首页；
 # 不改配置、不重启。输出同时写到 $OUT（默认 logs/diag_start.txt），代理密码与账号邮箱已打码
@@ -65,17 +67,21 @@ p = w.get("prewarm", {})
 print(f"运行 {d.get('running')}；Worker 就绪 {w.get('warm')} / 目标 {w.get('target')} / 峰值 {w.get('max')}，启动中 {w.get('starting')}，占用槽位 {w.get('occupied')}，死槽位 {w.get('dead')}")
 a = d.get("accounts") or {}
 if a:
-    # org_disabled 为所属组织停用了 AI Studio、已停止调度的账户；程序版本早于组织停用识别时没有这个字段，显示为 -
+    # org_disabled 为用不了 AI Studio、已停止调度的账户（所属组织停用，以及服务受限、年龄或资格不符、Workspace 未开放）；
+    # 程序版本早于组织停用识别时没有这个字段，显示为 -
     org = a.get("org_disabled")
     print(f"账户：共 {a.get('total')}，就绪 {a.get('ready')}，忙碌 {a.get('busy')}，冷却 {a.get('cooldown')}，需要登录 {a.get('auth_required')}，"
-          f"组织已停用 AI Studio {'-' if org is None else org}")
+          f"组织停用或受限 {'-' if org is None else org}")
 # drive 为启用账户的 Google Drive 授权状态（gemini-omni 的视频输入及不能内联的图片只交给可用或未知的账户）；程序版本较旧时没有这个字段
 drive = d.get("drive")
 if isinstance(drive, dict):
     available, unavailable, unknown = (drive.get(key) or 0 for key in ("available", "unavailable", "unknown"))
+    # storage_full 为有 Drive 授权、但存储空间已满的账户（为 0 或程序版本较旧时没有这个字段）
+    storage_full = drive.get("storage_full") or 0
     hint = "；没有可用或未知的账户，gemini-omni 的视频输入（及不能内联的图片）会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响（经本服务的登录流程登录可完成 Drive 授权）" \
-        if available + unknown == 0 and unavailable > 0 else ""
-    print(f"Drive 授权：可用 {available}，不可用 {unavailable}，未知 {unknown}{hint}")
+        if available + unknown == 0 and unavailable + storage_full > 0 else ""
+    full = f"，空间已满 {storage_full}" if storage_full else ""
+    print(f"Drive 授权：可用 {available}，不可用 {unavailable}{full}，未知 {unknown}{hint}")
 else:
     print("Drive 授权：-（程序版本较旧）")
 print(f"预热：进行中 {p.get('active')}，在途 {p.get('inflight')}，本轮已启动 {p.get('launched')}，本轮已 {p.get('round_seconds')} 秒，原因 {p.get('reason') or '-'}")
@@ -207,6 +213,33 @@ def org_disabled_error(error):
     return ORG_PREFIX in (error or "") or ORG_HOST in (error or "")
 org_fail_new, org_fail_old, org_fail_accounts = 0, 0, set()
 org_enter_sources, org_enter_accounts, org_catalog_failed = collections.Counter(), set(), 0
+# 账号用不了 AI Studio 的另外三种（与组织停用共用停止调度、持久化与复查，见 docs/logging.md）：启动失败文案以各自的固定文案开头
+# （页面停在对应的拒绝页，错误里带 url=<host+path>），进入状态的日志为“<固定文案>，停止调度 | 来源=…”（同一账户只写一行，原因变了再写）。
+# 旧版程序把 servicerestricted 当成登录页（“隔离登录态失效”）、在年龄要求与 Workspace 说明页干等到“输入框未就绪”，按地址也归到这里
+RESTRICT_KINDS = (
+    ("服务受限", "Google 已限制该账号使用 AI Studio", "accounts.google.com/info/servicerestricted"),
+    ("年龄或资格不符", "账号不满足 AI Studio 的年龄或使用资格要求", "aistudio.google.com/docs/troubleshoot-ai-studio"),
+    ("Workspace 未开放", "账号所属 Google Workspace 没有开放 AI Studio", "aistudio.google.com/docs/workspace"),
+)
+RESTRICT_ENTER = {prefix + "，停止调度": label for label, prefix, _ in RESTRICT_KINDS}
+def restriction_kind(error):
+    """启动失败的原错误属于哪一种受限（按固定文案或拒绝页地址），不是时为 None"""
+    error = error or ""
+    for label, prefix, host in RESTRICT_KINDS:
+        if prefix in error or host in error:
+            return label
+    return None
+restrict_fail = collections.Counter()
+restrict_fail_accounts = collections.defaultdict(set)
+restrict_enter_sources = collections.defaultdict(collections.Counter)
+restrict_enter_accounts = collections.defaultdict(set)
+# AI Studio 不支持当前出口地区（页面停在 docs/available-regions，上游 RPC “Region not supported.”）：出口的问题，不标记账号，单独归类
+REGION_PREFIX = "AI Studio 不支持当前出口地区"
+REGION_HOST = "aistudio.google.com/docs/available-regions"
+REGION_LABEL = "出口地区不支持 AI Studio（页面停在 docs/available-regions）"
+def region_error(error):
+    return REGION_PREFIX in (error or "") or REGION_HOST in (error or "")
+region_fail, region_fail_accounts = 0, set()
 page_total, page_heads, page_groups, page_samples, page_kinds = collections.Counter(), collections.Counter(), collections.Counter(), {}, {}
 # 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
 page_dist = {}
@@ -422,15 +455,28 @@ for p in paths:
                     if seconds is not None:
                         ready_secs.append(seconds)
                 if "失败" in head:
+                    which = "" if head == "WAA Worker 启动失败" else f"（{head}）"
+                    kind = restriction_kind(error)
                     if org_disabled_error(error):
                         # 组织停用单独归类（后台扩容、替补等其他失败日志带同一错误时注明是哪一种）；启动失败另按新旧文案计数、账号去重
-                        fail_reasons[ORG_LABEL + ("" if head == "WAA Worker 启动失败" else f"（{head}）")] += 1
+                        fail_reasons[ORG_LABEL + which] += 1
                         if head == "WAA Worker 启动失败":
                             org_fail_accounts.add(source)
                             if ORG_PREFIX in error:
                                 org_fail_new += 1
                             else:
                                 org_fail_old += 1
+                    elif kind:
+                        # 服务受限、年龄或资格不符、Workspace 未开放：按种类归类，启动失败按种类计数、账号去重
+                        fail_reasons[f"{kind}（页面停在拒绝页，账号用不了 AI Studio）{which}"] += 1
+                        if head == "WAA Worker 启动失败":
+                            restrict_fail[kind] += 1
+                            restrict_fail_accounts[kind].add(source)
+                    elif region_error(error):
+                        fail_reasons[REGION_LABEL + which] += 1
+                        if head == "WAA Worker 启动失败":
+                            region_fail += 1
+                            region_fail_accounts.add(source)
                     else:
                         fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
                     if f.get("端口"):
@@ -529,6 +575,9 @@ for p in paths:
             if head == ORG_ENTER:
                 org_enter_sources[fields(msg).get("来源", "?")] += 1
                 org_enter_accounts.add(source)
+            elif head in RESTRICT_ENTER:
+                restrict_enter_sources[RESTRICT_ENTER[head]][fields(msg).get("来源", "?")] += 1
+                restrict_enter_accounts[RESTRICT_ENTER[head]].add(source)
             elif head == "模型目录同步失败" and "app is disabled" in msg.lower():
                 # 旧版程序：组织停用的账户每分钟重试一次目录同步
                 org_catalog_failed += 1
@@ -563,7 +612,21 @@ if org_fail_new or org_fail_old or org_enter_sources or org_catalog_failed:
     print(f"组织停用 AI Studio：启动失败 {org_fail_new + org_fail_old} 次（新版立即失败 {org_fail_new}、旧版干等到超时 {org_fail_old}），"
           f"涉及 {len(org_fail_accounts)} 个账号；新进入组织停用状态的 {len(org_enter_accounts)} 个（来源：{sources}）；"
           f"模型目录同步因 app is disabled 失败 {org_catalog_failed} 次（新版不再按失败重试，只每 24 小时复查）")
-    print("  这些账号所属组织关闭了 AI Studio，重新登录也没用：管理页“组织已停用 AI Studio 的账户”可复制邮箱、一键删除或恢复调度")
+    print("  这些账号所属组织关闭了 AI Studio，重新登录也没用：管理页“组织停用或受限、用不了 AI Studio 的账户”可复制邮箱、一键删除或恢复调度")
+restricted_any = False
+for label, prefix, _ in RESTRICT_KINDS:
+    entered = restrict_enter_accounts[label]
+    if not restrict_fail[label] and not entered:
+        continue
+    restricted_any = True
+    sources = "、".join(f"{name} {n}" for name, n in restrict_enter_sources[label].most_common()) or "-"
+    print(f"{label}（{prefix}）：启动失败 {restrict_fail[label]} 次，涉及 {len(restrict_fail_accounts[label])} 个账号；"
+          f"新进入该状态的 {len(entered)} 个（来源：{sources}）")
+if restricted_any:
+    print("  这些账号本身被拒绝使用 AI Studio，重新登录也没用：管理页“组织停用或受限、用不了 AI Studio 的账户”（“原因”一栏写明种类）可复制邮箱、一键删除或恢复调度")
+if region_fail:
+    print(f"{REGION_LABEL}：启动失败 {region_fail} 次，涉及 {len(region_fail_accounts)} 个账号（出口的问题，不标记账号）")
+    print("  为这些账户或全局代理换用 AI Studio 支持地区的出口")
 if denied is not None:
     print(f"冷却列表里有 403 无权限冷却的账号 {len(denied)} 个；启动失败的账号 {len(fail_accounts)} 个，其中有 403 冷却的 {len(fail_accounts & denied)} 个；"
           f"就绪的账号 {len(ready_accounts)} 个，其中有 403 冷却的 {len(ready_accounts & denied)} 个")

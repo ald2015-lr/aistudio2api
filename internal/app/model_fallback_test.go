@@ -70,9 +70,11 @@ type fallbackUpstream struct {
 	fail      map[string]func(accountID string) error
 	midStream map[string]error
 	replies   map[string][]aistudio.Event
-	encode    bool
-	block     map[string]bool
-	blocked   chan string
+	// leading 为各模型在正文之前交出的事件
+	leading map[string][]aistudio.Event
+	encode  bool
+	block   map[string]bool
+	blocked chan string
 }
 
 func (upstream *fallbackUpstream) Models(context.Context) ([]aistudio.Model, error) { return nil, nil }
@@ -85,6 +87,7 @@ func (upstream *fallbackUpstream) Generate(ctx context.Context, request aistudio
 	upstream.mu.Lock()
 	upstream.calls = append(upstream.calls, fallbackCall{model: request.Model, account: request.AccountID, request: request})
 	fail, midStream, replies := upstream.fail[request.Model], upstream.midStream[request.Model], upstream.replies[request.Model]
+	leading := upstream.leading[request.Model]
 	block := upstream.block[request.Model]
 	upstream.mu.Unlock()
 	if block {
@@ -104,7 +107,10 @@ func (upstream *fallbackUpstream) Generate(ctx context.Context, request aistudio
 			return nil, err
 		}
 	}
-	events := make(chan aistudio.Event, 3+len(replies))
+	events := make(chan aistudio.Event, 3+len(leading)+len(replies))
+	for _, event := range leading {
+		events <- event
+	}
 	events <- aistudio.Event{Kind: aistudio.EventText, Text: "reply from " + request.Model}
 	for _, reply := range replies {
 		events <- reply

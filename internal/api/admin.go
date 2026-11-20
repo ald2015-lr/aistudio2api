@@ -106,12 +106,15 @@ type AdminBalancedPartition struct {
 }
 
 // AdminDriveCounts 表示启用账户的 Google Drive 授权状态：Available 为换到过 Drive token、或经本服务登录时完成了 Drive 授权的账户，
-// Unavailable 为 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权，多半是只导入 Cookie 的账户）的账户，Unknown 为还没试过、
-// 认证代际变了或记录过期的账户。gemini-omni 的视频输入（及不能内联的图片）只交给可用或未知的账户。可用、不可用各记 24 小时，
-// 写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用（认证文件换成另一个登录时作废）
+// Unavailable 为 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权，多半是只导入 Cookie 的账户）的账户，StorageFull 为有 Drive
+// 授权、但 Drive 上传返回 403 storageQuotaExceeded（存储空间已满）的账户，Unknown 为还没试过、认证代际变了或记录过期的账户。
+// gemini-omni 的视频输入（及不能内联的图片）只交给可用或未知的账户；空间已满的账户与不可用的一样附件直接内联。可用、不可用、空间已满
+// 各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用（认证文件换成另一个登录时作废）。
+// StorageFull 为 0 时省略（旧版前端不认这一项）
 type AdminDriveCounts struct {
 	Available   int `json:"available"`
 	Unavailable int `json:"unavailable"`
+	StorageFull int `json:"storage_full,omitempty"`
 	Unknown     int `json:"unknown"`
 }
 
@@ -366,6 +369,10 @@ type RequestLogUsage struct {
 	OutputTokens           int64   `json:"output_tokens"`
 	TotalTokens            int64   `json:"total_tokens"`
 	AverageTokensPerSecond float64 `json:"average_tokens_per_second"`
+	// GenerationTokensPerSecond 为输出 token 除以首个上游分块到达之后到请求结束的时长（按上游 Mag1cFall/AIStudio2API a68acad 移植）：
+	// 只计生成本身，不含排队、WAA、等待首个分块与被放弃的重新生成；只有一个分块（测不出）或没有用量时省略，管理页请求卡片的“平均速度”显示它。
+	// AverageTokensPerSecond 沿用原口径（输出 token 除以请求总耗时，tools/diag_slow.sh 读它）
+	GenerationTokensPerSecond float64 `json:"generation_tokens_per_second,omitempty"`
 }
 
 // AccessLog 表示一次公开 API 请求的最终访问记录
@@ -373,6 +380,7 @@ type AccessLog struct {
 	Status          int
 	Latency         time.Duration
 	FirstEvent      time.Duration
+	FirstOutput     time.Duration // 交出这次回复的那次生成首个上游分块到达的时刻（从请求进入服务算起），0 为没有或测不出速度
 	QueueWait       time.Duration
 	Proof           time.Duration
 	UpstreamBytes   int64
@@ -466,6 +474,10 @@ type AdminAccount struct {
 	// OrgDisabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户的 state 仍为 disabled、
 	// message 接上这个原因；验证接口的返回在验证遇到组织停用时同样为 true，前端据此提示组织停用而不是登录失效
 	OrgDisabled bool `json:"org_disabled,omitempty"`
+	// Restriction 为 OrgDisabled 时的原因种类：org_disabled（组织停用）、service_restricted（Google 限制了该账号使用 AI Studio）、
+	// age_requirement（年龄或使用资格）、workspace_disabled（所属 Workspace 没有开放 AI Studio）；前端按它显示状态，旧服务没有这个字段
+	// 时按组织停用显示
+	Restriction string `json:"restriction,omitempty"`
 	// Transition 为管理页启停账户之后的后台收尾阶段：draining（已停用，等进行中的请求与账户上的其他操作结束）、closing
 	// （已停用，正在关闭 Worker）或 syncing（已启用，合并模型目录、没有目录时同步一次），没有收尾时省略；
 	// ActiveRequests 为收尾期间账户上进行中的请求数（登录、验证等独占操作不计入）
@@ -576,6 +588,9 @@ type RuntimeConfig struct {
 	// OmniImageBinding 为视频模型带图校验值（OMNI_IMAGE_BINDING，保存后立即生效）：开启时 Omni 带内联图片的请求按 GenerateContent 的写法把图片
 	// 计入 WAA 校验值，关闭时只含文本；读取时总是返回，保存时没有该字段（旧版页面）则沿用现值
 	OmniImageBinding *bool `json:"omni_image_binding,omitempty"`
+	// AbnormalFinishError 为重新生成用完仍异常结束且没有输出时按 502 结束（ABNORMAL_FINISH_ERROR，默认关闭，保存后立即生效）；
+	// 读取时总是返回，保存时没有该字段（旧版页面）则沿用现值
+	AbnormalFinishError *bool `json:"abnormal_finish_error,omitempty"`
 	// LongOutputEnabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED），LongOutputMaxTokens 为没有官网续写能力的模型的默认输出
 	// 总上限（LONG_OUTPUT_MAX_TOKENS，0 表示不模拟续写）；都保存后立即生效，读取时总是返回，保存时没有这些字段（旧版页面）则沿用现值
 	LongOutputEnabled   *bool `json:"long_output_enabled,omitempty"`
@@ -707,17 +722,20 @@ type PermissionDeniedClearResult struct {
 // 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或 RPC 返回 HTTP 403 “AI Studio app is disabled”。重新登录也没用，
 // 账户不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复。Source 为第一次进入的来源（启动、模型目录、验证、登录、请求、
 // 登录复核：疑似登录失效或需要登录账户的复核请求返回 app is disabled），LastSource 为最近一次；CheckAt 为下一次长间隔复查的时间；
-// Message 为最近一次的原文（已打码、截短）
+// Message 为最近一次的原文（已打码、截短）。官网拒绝账号使用 AI Studio 的其他原因（Google 限制了该账号、年龄或使用资格、
+// Workspace 没有开放 AI Studio）同样列在这里：Restriction 为原因种类（同 AdminAccount.Restriction），Reason 为它的说明
 type AdminOrgDisabled struct {
-	ID         string    `json:"id"`
-	Label      string    `json:"label"`
-	Source     string    `json:"source"`
-	LastSource string    `json:"last_source"`
-	Count      int       `json:"count"`
-	FirstAt    time.Time `json:"first_at"`
-	LastAt     time.Time `json:"last_at"`
-	CheckAt    time.Time `json:"check_at"`
-	Message    string    `json:"message,omitempty"`
+	ID          string    `json:"id"`
+	Label       string    `json:"label"`
+	Source      string    `json:"source"`
+	LastSource  string    `json:"last_source"`
+	Count       int       `json:"count"`
+	FirstAt     time.Time `json:"first_at"`
+	LastAt      time.Time `json:"last_at"`
+	CheckAt     time.Time `json:"check_at"`
+	Message     string    `json:"message,omitempty"`
+	Restriction string    `json:"restriction,omitempty"`
+	Reason      string    `json:"reason,omitempty"`
 }
 
 // OrgDisabledService 为管理服务可选实现的组织停用账户能力：实现时 /api/accounts/permission-denied 的返回另带 org_disabled 列表，

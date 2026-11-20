@@ -100,8 +100,9 @@ func (hold *StreamStartHold) Extension() time.Duration {
 	return hold.extension
 }
 
-// RestartWait 记下生成服务在首个事件之前改用了其他模型（额度用完，MODEL_FALLBACKS，见 app 包 model_fallback.go）：API 层写出响应头前的等待
-// 从现在起重新计，至少再等 wait（目标模型的 StreamStartWait；不大于 0 时按 API 层给请求的模型的等待）与 API 层原来的等待中较长的一个，
+// RestartWait 记下生成服务在首个事件之前改用了其他模型（额度用完，MODEL_FALLBACKS，见 app 包 model_fallback.go），或在首个事件之前
+// 重发（ABNORMAL_FINISH_ERROR 打开时的同账号重新生成与续写回退，见 app 包 runtime.go 的 observeHold）：API 层写出响应头前的等待
+// 从现在起重新计，至少再等 wait（这次生成的模型的 StreamStartWait；不大于 0 时按 API 层给请求的模型的等待）与 API 层原来的等待中较长的一个，
 // 合计仍不超过 API 层的上限（streamStartHoldMax）。原先只按源模型等：源模型很晚才额度用完、或目标模型还要排队时，响应头先按源模型提交，
 // 目标模型首事件前的错误也变成 200 之后的流内错误
 func (hold *StreamStartHold) RestartWait(wait time.Duration) {

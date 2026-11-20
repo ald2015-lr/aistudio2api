@@ -325,6 +325,9 @@ type GenerateRequest struct {
 	// Alias 为协议层按模型名整理之前的客户端设置与名称里的选项（只在文本对话模型上设置，见 RequestAlias）：额度用完改用其他模型时
 	// 按目标模型重新整理（MODEL_FALLBACKS，见 app/model_fallback.go），不参与编码
 	Alias *RequestAlias `json:"-"`
+	// KeepAbnormalFinish 为按官方形状输出的 Gemini 原生接口：异常结束且没有输出时仍以该结束原因结束，不按 ABNORMAL_FINISH_ERROR
+	// 改成错误（见 abnormal_finish.go），不参与编码
+	KeepAbnormalFinish bool `json:"-"`
 	// continuation 为官网自动续写本轮的编码设置（轮次、续写 token 与输出总上限），只在 Client 的续写循环内设置
 	continuation *officialContinuation
 }

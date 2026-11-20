@@ -553,13 +553,14 @@ func TestRateLimitCleanupErrorNotEscalated(t *testing.T) {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
 			account := fmt.Sprintf("a-cleanup-%d@example.com", status)
 			cleanupErr := driveDeleteError(status)
-			// 前提：生成错误与清理错误合并后，额度判断与 403 判断会沿错误链找到 Drive 的错误
+			// 前提：生成错误与清理错误合并后，额度判断会沿错误链找到 Drive 的错误；403 判断不认 Drive 的错误（Method 以 Drive 开头，
+			// 见 isPermissionDenied），合并后也不算 403 无权限
 			joined := errors.Join(errors.New("read tcp: connection reset by peer"), cleanupErr)
 			if cooldown, ok := aistudio.QuotaCooldownForError(joined, time.Now()); status == http.StatusTooManyRequests && (!ok || !cooldown.Escalate) {
 				t.Fatalf("合并后的错误 = %+v（ok=%t），期望可逐级的限流", cooldown, ok)
 			}
-			if status == http.StatusForbidden && !isPermissionDenied(joined) {
-				t.Fatal("合并后的错误应被识别为 403 无权限")
+			if status == http.StatusForbidden && isPermissionDenied(joined) {
+				t.Fatal("合并后的 Drive 403 不应被识别为 403 无权限")
 			}
 			upstream := &cleanupRateUpstream{bareRateUpstream: &bareRateUpstream{limited: map[string]bool{}}, cleanupErr: cleanupErr}
 			service, pool := rateLadderService(t, upstream, account)

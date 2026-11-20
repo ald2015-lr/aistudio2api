@@ -2,19 +2,25 @@ package aistudio
 
 import (
 	"encoding/json"
+	"strings"
 )
 
 type generatedOutputParts struct {
 	visible   []Part
 	reasoning []Part
+	// visibleText 与 reasoningText 为两个列表最后一个文字 part 的累加缓冲：逐块 last.Text += text 每次都复制已有的全部文字，
+	// 几万块的长回复总耗时与长度平方成正比（几百 KB 的回复要近 1 秒、分配几 GB）。缓冲按倍数扩容，part 的 Text 每次换成缓冲的
+	// String()（不复制），读到的 Text 与原先逐块拼接的结果相同。结构体按值复制（续写各轮的 parts、重新生成时清空）后各自继续累加时，
+	// 缓冲长度与 Text 对不上的一方从 Text 另起缓冲，不会混进另一方的文字
+	visibleText, reasoningText *strings.Builder
 }
 
 func (output *generatedOutputParts) observe(event Event) {
 	switch event.Kind {
 	case EventText:
-		output.appendText(&output.visible, event.Text, false, event.ThoughtSignature)
+		appendOutputText(&output.visible, &output.visibleText, event.Text, false, event.ThoughtSignature)
 	case EventReasoning:
-		output.appendText(&output.reasoning, event.Text, true, event.ThoughtSignature)
+		appendOutputText(&output.reasoning, &output.reasoningText, event.Text, true, event.ThoughtSignature)
 	case EventToolCall:
 		if event.ToolCall != nil {
 			call := *event.ToolCall
@@ -36,18 +42,27 @@ func (output *generatedOutputParts) observe(event Event) {
 	}
 }
 
-func (output *generatedOutputParts) appendText(parts *[]Part, text string, thought bool, signature string) {
+// appendOutputText 把一段文字并入 parts 最后一个同类（思考与否、签名相同）的文字 part，没有时另起一个；buffer 为这个列表的累加缓冲
+func appendOutputText(parts *[]Part, buffer **strings.Builder, text string, thought bool, signature string) {
 	if text == "" {
 		return
 	}
 	if len(*parts) > 0 {
 		last := &(*parts)[len(*parts)-1]
 		if last.Text != "" && last.Thought == thought && last.ThoughtSignature == signature {
-			last.Text += text
+			// 缓冲只追加：长度与 Text 相同说明之后没有别人往里写过，内容就是 Text；否则（新的 part、结构体复制后对方先写了）从 Text 另起
+			if *buffer == nil || (*buffer).Len() != len(last.Text) {
+				*buffer = &strings.Builder{}
+				(*buffer).Grow(2 * (len(last.Text) + len(text)))
+				(*buffer).WriteString(last.Text)
+			}
+			(*buffer).WriteString(text)
+			last.Text = (*buffer).String()
 			return
 		}
 	}
 	*parts = append(*parts, Part{Text: text, Thought: thought, ThoughtSignature: signature})
+	*buffer = nil
 }
 
 func (output *generatedOutputParts) appendMedia(event Event) {

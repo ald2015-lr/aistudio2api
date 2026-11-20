@@ -40,7 +40,7 @@ func TestOrgDisabledRuntimeWiring(t *testing.T) {
 		registry := newOrgDisabledRegistry(root, nil)
 		for _, accountID := range []string{kept, replaced, gone} {
 			identity, _ := previous.LoginIdentity(accountID)
-			registry.record(accountID, aistudio.OrgDisabledFromStartup, aistudio.OrgDisabledReason, identity, time.Now())
+			registry.record(accountID, aistudio.OrgDisabledFromStartup, aistudio.OrgDisabledReason, identity, aistudio.RestrictionOrgDisabled, time.Now())
 		}
 		registry.flush()
 		previous.WaitBackground()

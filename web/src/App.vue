@@ -186,11 +186,12 @@ const authRecheckLine = computed(() => {
 })
 
 // driveLine 为侧栏的 Drive 授权行：服务端报告了且有启用账户时显示；有启用账户却没有可用、也没有未知的账户时标黄
-// （gemini-omni 的视频输入及不能内联的图片会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）
+// （gemini-omni 的视频输入及不能内联的图片会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）。侧栏宽度下这一行常被截断，
+// 悬停提示先写整行计数再接口径说明
 const driveLine = computed(() => {
   const drive = status.value?.drive
   if (drive === undefined) return null
-  const total = drive.available + drive.unavailable + drive.unknown
+  const total = drive.available + drive.unavailable + (drive.storage_full ?? 0) + drive.unknown
   if (total === 0) return null
   return {
     text: tf('app.driveLine', {
@@ -200,6 +201,13 @@ const driveLine = computed(() => {
     }),
     warn: drive.available + drive.unknown === 0,
   }
+})
+
+// driveStorageFullLine 为侧栏的 Drive 空间已满行：有存储空间已满的账户时才显示、标黄（不算进“不可用”：它们有 Drive 授权，只是空间满了）。
+// 单独一行：接在 Drive 授权行末尾时侧栏宽度下总被截断看不到
+const driveStorageFullLine = computed(() => {
+  const storageFull = status.value?.drive?.storage_full ?? 0
+  return storageFull > 0 ? tf('app.driveLineStorageFull', { storageFull }) : null
 })
 
 // balancedLines 为侧栏的平均调用行（ROUTING_STRATEGY=balanced，开启且服务运行时服务端才返回）：普通分区一行（只有 Ultra 账号的部署不显示），
@@ -973,11 +981,18 @@ onUnmounted(() => {
           </div>
           <div
             v-if="driveLine"
-            v-tooltip="t('app.driveDetail')"
+            v-tooltip="`${driveLine.text} — ${t('app.driveDetail')}`"
             class="cell-truncate"
             :class="driveLine.warn ? 'text-yellow-400' : ''"
           >
             {{ driveLine.text }}
+          </div>
+          <div
+            v-if="driveStorageFullLine"
+            v-tooltip="`${driveStorageFullLine} — ${t('app.driveDetail')}`"
+            class="cell-truncate text-yellow-400"
+          >
+            {{ driveStorageFullLine }}
           </div>
           <div
             v-if="catalogSyncLine"

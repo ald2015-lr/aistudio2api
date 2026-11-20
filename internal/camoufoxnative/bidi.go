@@ -34,6 +34,9 @@ type bidiClient struct {
 	generateHeaders          map[string]string
 	blockedGenerateRequestID string
 	accessTokenStatus        int
+	// browser 为提供这条连接的 Camoufox 进程（测试的假连接为 nil）：连接断开时据它判断浏览器是否已自行退出，
+	// 是则断开的原因写明退出码与最近的输出（见 browser_exit.go）；只在创建时赋值
+	browser *browserProcess
 }
 
 type bidiReply struct {
@@ -62,21 +65,37 @@ const bidiWriteTimeout = 30 * time.Second
 // 不需要关闭连接。原实现一次只能执行一条命令并在命令超时时关闭整个连接，
 // 浏览器稍慢一次，这个 Worker 上所有进行中的请求就一起失败
 func newBiDiClient(connection *websocket.Conn) *bidiClient {
+	return newBrowserBiDiClient(connection, nil)
+}
+
+// newBrowserBiDiClient 同 newBiDiClient，browser 为提供这条连接的 Camoufox 进程：连接断开时浏览器已自行退出的，
+// 断开的原因写明退出码与最近的输出
+func newBrowserBiDiClient(connection *websocket.Conn, browser *browserProcess) *bidiClient {
 	client := &bidiClient{
 		connection:      connection,
 		pending:         make(map[int]chan bidiReply),
 		generateHeaders: make(map[string]string),
+		browser:         browser,
 	}
 	go client.readLoop()
 	return client
 }
 
-// readLoop 读取连接上的全部消息直到连接关闭，然后让所有等待中的命令以连接错误结束
+// readLoop 读取连接上的全部消息直到连接关闭，然后让所有等待中的命令以连接错误结束。连接一断开就先记下原始的断开原因：
+// broken（Worker.Broken、NativeWorker.State）立即报告失败，新命令立即失败，不再把请求分给这个 Worker。之后 Camoufox 进程在
+// browserExitWait 内自行退出的（崩溃、被系统结束），原因换成写明退出码与最近输出的 BrowserExitedError（文案仍以
+// “BiDi 连接已断开: ”开头），等待中的命令以它结束；服务自己关闭浏览器时不等
 func (client *bidiClient) readLoop() {
 	for {
 		var message map[string]any
 		if err := client.connection.ReadJSON(&message); err != nil {
 			readErr := fmt.Errorf("BiDi 连接已断开: %w", err)
+			client.mu.Lock()
+			client.readErr = readErr
+			client.mu.Unlock()
+			if exited := client.browser.exitFailure(browserExitWait); exited != nil {
+				readErr = fmt.Errorf("BiDi 连接已断开: %w", exited)
+			}
 			client.mu.Lock()
 			client.readErr = readErr
 			pending := client.pending

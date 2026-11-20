@@ -43,6 +43,7 @@ type accessLogMetadata struct {
 	canceled        bool
 	failureStatus   int
 	firstEvent      time.Duration
+	firstOutput     time.Duration // 交出这次回复的那次生成首个上游分块到达的时刻（从请求进入服务算起），0 为没有或测不出速度
 	upstreamBytes   int64
 	usage           *aistudio.Usage
 	toolCalls       int
@@ -116,6 +117,7 @@ type accessLogSnapshot struct {
 	canceled        bool
 	failureStatus   int
 	firstEvent      time.Duration
+	firstOutput     time.Duration // 交出这次回复的那次生成首个上游分块到达的时刻（从请求进入服务算起），0 为没有或测不出速度
 	upstreamBytes   int64
 	usage           *aistudio.Usage
 	toolCalls       int
@@ -562,7 +564,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 		model:      metadata.model, startedModel: metadata.startedModel, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
 		requestErr: metadata.err, trailingError: metadata.trailingError, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
 		failureStatus: metadata.failureStatus,
-		firstEvent:    metadata.firstEvent,
+		firstEvent:    metadata.firstEvent, firstOutput: metadata.firstOutput,
 		upstreamBytes: metadata.upstreamBytes, usage: metadata.usage, toolCalls: metadata.toolCalls,
 		inputMessages: metadata.inputMessages, inputTextChars: metadata.inputTextChars,
 		inputMedia: metadata.inputMedia, inputMediaBytes: metadata.inputMediaBytes, inputFiles: metadata.inputFiles,
@@ -650,6 +652,19 @@ func MarkAccessLogUpstreamEvent(ctx context.Context) {
 func SetAccessLogFirstEvent(ctx context.Context, firstEvent time.Duration) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
 		metadata.setFirstEvent(firstEvent)
+	}
+}
+
+// SetAccessLogFirstOutput 写入交出这次回复的那次生成首个上游分块到达的时刻 at（请求日志的生成速度只计它之后，见
+// RequestLogUsage.GenerationTokensPerSecond）；at 为零值时清除（只有一个分块，测不出速度）。重复写入时以最后一次为准
+func SetAccessLogFirstOutput(ctx context.Context, at time.Time) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.firstOutput = 0
+		if !at.IsZero() && !metadata.startedAt.IsZero() {
+			metadata.firstOutput = max(at.Sub(metadata.startedAt), time.Nanosecond)
+		}
+		metadata.mu.Unlock()
 	}
 }
 
@@ -847,7 +862,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		}
 		if admin != nil {
 			admin.RecordAccessLog(AccessLog{
-				Status: status, Latency: time.Since(started), FirstEvent: snapshot.firstEvent,
+				Status: status, Latency: time.Since(started), FirstEvent: snapshot.firstEvent, FirstOutput: snapshot.firstOutput,
 				QueueWait: snapshot.queueWait, Proof: snapshot.proof,
 				UpstreamBytes: snapshot.upstreamBytes, Usage: snapshot.usage, ToolCalls: snapshot.toolCalls,
 				InputMessages: snapshot.inputMessages, InputTextChars: snapshot.inputTextChars,

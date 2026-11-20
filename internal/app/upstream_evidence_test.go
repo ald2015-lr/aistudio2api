@@ -321,8 +321,9 @@ func TestCleanupErrorDoesNotSwitchAccount(t *testing.T) {
 			if progressLogged(service, "上游返回 4xx") {
 				t.Fatalf("清理时的 Drive 错误不应记成上游 4xx 证据: %v", serviceLogMessages(service.requests))
 			}
-			if status == http.StatusForbidden && !isPermissionDenied(err) {
-				t.Fatalf("前提：并入清理错误后的错误 %v 会被识别为 403 无权限", err)
+			// Drive 的 403（Method 以 Drive 开头）不算 403 无权限（见 isPermissionDenied）：并入清理错误后的错误同样不算
+			if status == http.StatusForbidden && isPermissionDenied(err) {
+				t.Fatalf("并入清理错误后的错误 %v 不应被识别为 403 无权限", err)
 			}
 			service.forbidden.mu.Lock()
 			recorded := len(service.forbidden.events[accounts[0]]) + len(service.forbidden.events[accounts[1]])

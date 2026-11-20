@@ -97,7 +97,7 @@ func Start(ctx context.Context, options Options) (*Worker, error) {
 		return nil, fmt.Errorf("连接 Camoufox BiDi: %w", err)
 	}
 	worker.connection = connection
-	worker.client = newBiDiClient(connection)
+	worker.client = newBrowserBiDiClient(connection, process)
 	if err := worker.bootstrap(ctx, options, state); err != nil {
 		return nil, err
 	}
@@ -393,14 +393,16 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 
 // openPromptPage 导航到 target，等页面就绪后定位 WAA 并填好 bootstrap 提示词（启动 5/7 到 7/7 填写提示词，session.subscribe 之前），
 // 返回页面地址与官网 snapshot 函数的键。等到页面就绪时停在首次使用页，或从等就绪起任何一步的页面类失败发生时页面在首次使用页，
-// 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；停在组织停用页（access.workspace.google.com）时
-// 立即以 ServiceNotAllowedError 失败（等就绪时立刻结束等待，不再等满 120 秒），失败处读到的地址或快照在这一页时同样如此；
+// 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；停在拒绝页（组织停用页 access.workspace.google.com、
+// servicerestricted、年龄要求、Workspace 说明页，见 account_restricted.go）时立即以带种类的 ServiceNotAllowedError 失败，
+// 停在地区说明页时以 RegionNotSupportedError 失败（等就绪时立刻结束等待，不再等满 120 秒），失败处读到的地址或快照在这些页时同样如此；
 // 其余页面类失败与原来一样追加页面快照。失败处的识别与快照共用一个短期限（见 startupFailureDiagnosis），浏览器卡住时与原来一样
 // 最多多等 pageSnapshotTimeout
 func (worker *Worker) openPromptPage(ctx context.Context, options Options, target string) (string, string, error) {
 	client := worker.client
 	contextID := worker.contextID
-	// pageFailure 为页面类失败的收尾：在首次使用页时返回 errOnboardingPage，在组织停用页时返回 ServiceNotAllowedError，否则同 withPageSnapshot
+	// pageFailure 为页面类失败的收尾：在首次使用页时返回 errOnboardingPage，在拒绝页时返回停在拒绝页的错误（见 deniedPageError），
+	// 否则同 withPageSnapshot
 	pageFailure := func(err error) error {
 		diagnosis := client.startupFailureDiagnosis(ctx, contextID, false)
 		if diagnosis.onboarding {
@@ -439,8 +441,9 @@ func (worker *Worker) openPromptPage(ctx context.Context, options Options, targe
 	if err != nil {
 		return "", "", pageFailure(err)
 	}
-	// 组织停用页的地址里带回跳地址（continue=https://aistudio.google.com/…），先于登录页判断
-	if isServiceNotAllowedURL(pageURL) {
+	// 组织停用页的地址里带回跳地址（continue=https://aistudio.google.com/…），servicerestricted 页在 accounts.google.com 下：
+	// 拒绝页都先于登录页判断（servicerestricted 原先被当成登录失效，续签、标需要登录都没用）
+	if isDeniedPageURL(pageURL) {
 		return "", "", client.serviceNotAllowed(ctx, contextID, pageURL)
 	}
 	if strings.Contains(pageURL, "accounts.google.com") {
@@ -498,7 +501,8 @@ func (worker *Worker) interceptedPageFailure(ctx context.Context, options Option
 	client := worker.client
 	diagnosis := client.startupFailureDiagnosis(ctx, worker.contextID, false)
 	if !diagnosis.onboarding {
-		// 失败时页面已被跳到组织停用页：原因是账号所属组织停用了 AI Studio，按 ServiceNotAllowedError 返回（附同一份快照）
+		// 失败时页面已被跳到拒绝页：原因是账号用不了 AI Studio（组织停用、服务受限等）或出口地区不受支持，按停在拒绝页的错误返回
+		// （附同一份快照）
 		if blocked := diagnosis.serviceNotAllowed(); blocked != nil {
 			return blocked
 		}
@@ -511,8 +515,8 @@ func (worker *Worker) interceptedPageFailure(ctx context.Context, options Option
 	note, progress, structure := "；已完成首次使用页", "", ""
 	result, finishErr := worker.finishOnboarding(ctx, options, budget)
 	switch {
-	case errors.Is(finishErr, ErrServiceNotAllowed):
-		// 完成首次使用途中被跳到组织停用页：原因是账号所属组织停用了 AI Studio
+	case deniedPageFailure(finishErr):
+		// 完成首次使用途中被跳到拒绝页：原因是账号用不了 AI Studio 或出口地区不受支持
 		return finishErr
 	case finishErr != nil:
 		note = "；首次使用页未能完成"

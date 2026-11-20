@@ -91,7 +91,8 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 	for _, accountID := range request.CandidateAccountIDs {
 		candidates[accountID] = struct{}{}
 	}
-	// driveUnavailable 为上传时 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权）的账户：不写冷却，只在本请求内排除
+	// driveUnavailable 为上传时 GenerateAccessToken 返回 401 / Code 16（没有 Drive 授权）或 Drive 上传返回 403 storageQuotaExceeded
+	// （存储空间已满）的账户：不写冷却，只在本请求内排除
 	driveUnavailable := make(map[string]struct{})
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if request.CandidateAccountIDs != nil {
@@ -163,9 +164,10 @@ func (s *PooledService) Transcribe(ctx context.Context, request TranscriptionReq
 			stateErr = s.markRetryableFailure(lease, modelID, requestErr)
 		} else if DefinitiveAuthenticationFailure(requestErr) {
 			_, stateErr = lease.MarkAuthenticationFailure(requestErr)
-		} else if driveUnavailableError(requestErr) {
-			// 上传阶段换 Drive token 返回 401 / Code 16：账户没有 Drive 授权（已记进“Drive 不可用”记忆），不写冷却，
-			// 别的请求照常使用它；本请求换号时排除它（有候选列表时已按 attempted 排除）。原先写 30 秒全局冷却
+		} else if driveUnavailableError(requestErr) || driveStorageQuotaExceeded(requestErr) {
+			// 上传阶段换 Drive token 返回 401 / Code 16（账户没有 Drive 授权），或 Drive 上传返回 403 storageQuotaExceeded（存储空间已满）：
+			// 都已记进 Drive 记忆，与账户能否生成无关，不写冷却，别的请求照常使用它；本请求换号时排除它（有候选列表时已按 attempted 排除）。
+			// 原先写 30 秒全局冷却，连带挡住这个账户所有模型的生成
 			driveUnavailable[accountID] = struct{}{}
 		} else {
 			stateErr = s.pool.MarkCooldownIfGeneration(

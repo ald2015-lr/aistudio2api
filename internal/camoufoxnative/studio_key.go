@@ -479,8 +479,9 @@ func (session *loginSession) fetchStudioKey(ctx context.Context, options StudioK
 			continue
 		}
 		switch {
-		case isServiceNotAllowedURL(pageURL):
-			return fail(StudioKeyReasonOrgDisabled, nil)
+		case studioKeyDeniedReason(pageURL) != "":
+			// 拒绝页（组织停用页、servicerestricted 等，先于登录页判断；地区说明页）：原因按种类写
+			return fail(studioKeyDeniedReason(pageURL), nil)
 		case isGoogleLoginURL(pageURL):
 			return fail(StudioKeyReasonLoginExpired, nil)
 		case isStudioVerifyURL(pageURL):
@@ -942,3 +943,15 @@ const studioKeyButtonText = `/(create\s+api\s+key|create\s+key|创建\s*api\s*(�
 var studioKeyCreateButtonExpression = `(() => {` + pageDOMHelpers + studioKeyDOMHelpers + `
   return pageCreateButtons().find(buttonEnabled) || null;
 })()`
+
+// studioKeyDeniedReason 返回 API Keys 页面被跳到拒绝页时的失败原因：拒绝账号的页面为种类的固定文案（组织停用为
+// StudioKeyReasonOrgDisabled），地区说明页为 RegionNotSupportedPrefix；不是拒绝页时为空
+func studioKeyDeniedReason(pageURL string) string {
+	if kind := pageRestriction(pageURL); kind != "" {
+		return kind.Reason()
+	}
+	if isRegionNotSupportedURL(pageURL) {
+		return RegionNotSupportedPrefix
+	}
+	return ""
+}

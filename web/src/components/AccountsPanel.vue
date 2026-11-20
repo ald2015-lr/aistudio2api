@@ -20,6 +20,7 @@ import { usePaging } from '@/paging'
 import type {
   Account,
   AccountDraft,
+  AccountRestriction,
   AccountState,
   ChromeImportProfile,
   Cooldown,
@@ -754,6 +755,38 @@ const stateKeys: Record<AccountState, TranslationKey> = {
   org_disabled: 'state.org_disabled',
 }
 
+// restrictionKeys 为 org_disabled 状态各原因种类的显示（组织停用、服务受限、年龄或资格、Workspace 未开放）
+const restrictionKeys: Record<AccountRestriction, TranslationKey> = {
+  org_disabled: 'restriction.org_disabled',
+  service_restricted: 'restriction.service_restricted',
+  age_requirement: 'restriction.age_requirement',
+  workspace_disabled: 'restriction.workspace_disabled',
+}
+
+// restrictionLabel 返回原因种类的短标签；旧版服务没有种类、或种类不认识时按组织停用
+function restrictionLabel(restriction: AccountRestriction | undefined): string {
+  return t(restrictionKeys[restriction ?? 'org_disabled'] ?? 'restriction.org_disabled')
+}
+
+// restrictionReasonKeys 为组织停用以外的原因种类的完整说明（验证提示用）；组织停用沿用原有提示
+const restrictionReasonKeys: Partial<Record<AccountRestriction, TranslationKey>> = {
+  service_restricted: 'restrictionReason.service_restricted',
+  age_requirement: 'restrictionReason.age_requirement',
+  workspace_disabled: 'restrictionReason.workspace_disabled',
+}
+
+// restrictionReason 返回组织停用以外的原因种类的完整说明；组织停用（或旧版服务没有种类）时为空
+function restrictionReason(restriction: AccountRestriction | undefined): string {
+  const key = restriction ? restrictionReasonKeys[restriction] : undefined
+  return key ? t(key) : ''
+}
+
+// accountStateLabel 返回账户状态一栏的文字：org_disabled 按原因种类显示（组织已停用、服务受限等），其余按状态
+function accountStateLabel(account: Account): string {
+  if (account.state === 'org_disabled') return restrictionLabel(account.restriction)
+  return t(stateKeys[account.state])
+}
+
 const stateDotClass: Record<AccountState, string> = {
   ready: 'bg-green-500',
   busy: 'bg-blue-500',
@@ -987,7 +1020,8 @@ function verifiedOrgDisabled(verified: Account): boolean {
 }
 
 // runAccountAction 执行登录或会话验证：验证按返回的 authenticated 提示“有效”或“登录已失效”（HTTP 200 只表示验证做完了）；
-// 未通过且所属组织停用了 AI Studio 时（见 verifiedOrgDisabled）提示组织停用（不是登录失效，重新登录也没用）
+// 未通过且所属组织停用了 AI Studio 时（见 verifiedOrgDisabled）提示组织停用（不是登录失效，重新登录也没用），
+// 服务受限、年龄或资格、Workspace 未开放时按原因种类提示
 async function runAccountAction(account: Account, action: 'login' | 'verify'): Promise<void> {
   pendingAction.value = `${action}:${account.id}`
   try {
@@ -1000,7 +1034,12 @@ async function runAccountAction(account: Account, action: 'login' | 'verify'): P
     const verified = await trackPendingWrite(api.verifyAccount(account.id))
     emit('refresh')
     if (verifiedOrgDisabled(verified)) {
-      emit('notice', t('accounts.verifyOrgDisabled'), 'error')
+      const reason = restrictionReason(verified.restriction)
+      emit(
+        'notice',
+        reason ? tf('accounts.verifyRestricted', { reason }) : t('accounts.verifyOrgDisabled'),
+        'error',
+      )
     } else if (verified.authenticated === false) {
       emit(
         'notice',
@@ -1872,7 +1911,14 @@ async function startVerify(): Promise<void> {
   await startBulk('verify', targets, verifyConcurrency.value, async (account) => {
     const verified = await api.verifyAccount(account.id)
     if (verifiedOrgDisabled(verified)) {
-      return { invalid: true, orgDisabled: true, message: t('accounts.verifyOrgDisabledReason') }
+      const reason = restrictionReason(verified.restriction)
+      return {
+        invalid: true,
+        orgDisabled: true,
+        message: reason
+          ? tf('accounts.verifyRestrictedReason', { reason })
+          : t('accounts.verifyOrgDisabledReason'),
+      }
     }
     if (verified.authenticated === false) {
       return { invalid: true, message: verified.verify_reason || verified.message || '-' }
@@ -2210,7 +2256,8 @@ function closeBulkPanel(): void {
         </div>
       </div>
 
-      <!-- 组织已停用 AI Studio 的账户：Google Workspace 账号所属组织关闭了 AI Studio，已停止调度；24 小时复查、认证文件更新或恢复调度后解除 -->
+      <!-- 组织已停用 AI Studio 的账户：Google Workspace 账号所属组织关闭了 AI Studio，已停止调度；24 小时复查、认证文件更新或恢复调度后解除。
+           服务受限、年龄或资格不符、Workspace 未开放的账户同样列在这里，“原因”一栏区分 -->
       <div
         v-if="orgDisabled.length > 0"
         class="rounded-lg border border-orange-500/30 bg-orange-500/5 p-3 text-sm"
@@ -2280,6 +2327,7 @@ function closeBulkPanel(): void {
             <thead>
               <tr class="text-left text-gray-500">
                 <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.orgDisabledReason') }}</th>
                 <th class="py-1 pr-3 font-normal">{{ t('accounts.orgDisabledSource') }}</th>
                 <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedLast') }}</th>
                 <th class="py-1 pr-3 font-normal">{{ t('accounts.orgDisabledNextCheck') }}</th>
@@ -2295,6 +2343,9 @@ function closeBulkPanel(): void {
                 class="border-t border-[#30363d]"
               >
                 <td class="py-1 pr-3 font-mono text-gray-200">{{ account.label }}</td>
+                <td class="whitespace-nowrap py-1 pr-3 text-orange-300" :title="account.reason ?? ''">
+                  {{ restrictionLabel(account.restriction) }}
+                </td>
                 <td class="max-w-md py-1 pr-3">
                   <div class="cell-truncate text-gray-300" :title="account.message ?? ''">
                     {{ orgDisabledSources(account) }}
@@ -2728,7 +2779,7 @@ function closeBulkPanel(): void {
                 <td>
                   <span class="flex items-center gap-2 text-xs" :class="stateTextClass[account.state]">
                     <span class="dot" :class="stateDotClass[account.state]"></span>
-                    {{ t(stateKeys[account.state]) }}
+                    {{ accountStateLabel(account) }}
                   </span>
                   <span
                     v-if="transitionText(account) !== ''"

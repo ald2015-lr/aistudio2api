@@ -32,7 +32,7 @@ const (
 
 // driveStateEntry 为一个账号的记录（字段取短名）
 type driveStateEntry struct {
-	// State 为 a（可用）或 u（不可用）
+	// State 为 a（可用）、u（不可用）或 f（有授权但 Drive 存储空间已满）；旧版本不认 f，读到时丢掉这条记录（重新探测）
 	State string `json:"s"`
 	// At 为记下的时间（unix 秒）
 	At int64 `json:"at"`
@@ -119,7 +119,7 @@ func (memory *driveStateMemory) log(level string, message string) {
 
 // keep 判断记录是否保留：状态有效、带登录签名、记下时间不在未来且不超过 driveStateKeep
 func (memory *driveStateMemory) keep(entry driveStateEntry, now time.Time) bool {
-	if entry.State != "a" && entry.State != "u" || entry.Identity == "" {
+	if entry.State != "a" && entry.State != "u" && entry.State != "f" || entry.Identity == "" {
 		return false
 	}
 	at := time.Unix(entry.At, 0)
@@ -135,8 +135,11 @@ func (memory *driveStateMemory) attach(service driveRecordStore) {
 	records := make([]aistudio.DriveRecord, 0, len(memory.entries))
 	for accountID, entry := range memory.entries {
 		state := aistudio.DriveStateUnavailable
-		if entry.State == "a" {
+		switch entry.State {
+		case "a":
 			state = aistudio.DriveStateAvailable
+		case "f":
+			state = aistudio.DriveStateStorageFull
 		}
 		records = append(records, aistudio.DriveRecord{
 			AccountID: accountID, State: state, CheckedAt: time.Unix(entry.At, 0), Identity: entry.Identity,
@@ -158,10 +161,13 @@ func (memory *driveStateMemory) observe(record aistudio.DriveRecord) {
 	memory.mu.Lock()
 	defer memory.mu.Unlock()
 	switch record.State {
-	case aistudio.DriveStateAvailable, aistudio.DriveStateUnavailable:
+	case aistudio.DriveStateAvailable, aistudio.DriveStateUnavailable, aistudio.DriveStateStorageFull:
 		state := "u"
-		if record.State == aistudio.DriveStateAvailable {
+		switch record.State {
+		case aistudio.DriveStateAvailable:
 			state = "a"
+		case aistudio.DriveStateStorageFull:
+			state = "f"
 		}
 		entry := driveStateEntry{State: state, At: record.CheckedAt.Unix(), Identity: record.Identity}
 		if memory.entries[record.AccountID] == entry {

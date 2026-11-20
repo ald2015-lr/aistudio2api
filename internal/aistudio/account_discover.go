@@ -393,7 +393,7 @@ type WarmWorkerState struct {
 }
 
 // 账户不可调度的原因（WarmWorkerState.Unschedulable、UnschedulableSet），调度层写进“WAA Worker 释放 | 原因=”；
-// 所属组织停用了 AI Studio 的原因为 UnschedulableOrgDisabled（见 org_disabled.go）
+// 所属组织停用了 AI Studio 的原因为 UnschedulableOrgDisabled，服务受限、年龄或资格、Workspace 未开放各有原因（见 org_disabled.go 的 RestrictionUnschedulable）
 const (
 	UnschedulableDisabled     = "已停用"
 	UnschedulableAuthRequired = "需要登录"
@@ -438,7 +438,7 @@ func unschedulableReasonLocked(account *Account, now time.Time) string {
 	case !account.Config.Enabled:
 		return UnschedulableDisabled
 	case account.orgDisabled:
-		return UnschedulableOrgDisabled
+		return RestrictionUnschedulable(account.orgDisabledKind)
 	case account.State == AccountAuthRequired:
 		return UnschedulableAuthRequired
 	case account.State == AccountUnavailable:

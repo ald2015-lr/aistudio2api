@@ -154,6 +154,7 @@ func newRuntime(
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
 	service.setLongOutput(cfg.LongOutputEnabled, cfg.LongOutputMaxTokens)
 	service.setOmniImageBinding(cfg.OmniImageBinding)
+	service.setAbnormalFinishError(cfg.AbnormalFinishError)
 	service.setDowngradeGuard(cfg.DowngradeGuard)
 	service.setStreamPlaygroundModels(cfg.StreamPlaygroundModels)
 	service.setPrimaryModelSettings(cfg.PrimaryModels, cfg.PrimaryQueueWait, cfg.UltraPrimaryModels, cfg.UltraPrimaryQueueWait)
@@ -195,6 +196,11 @@ func newRuntime(
 		err := workers.Close()
 		if flushErr := pool.FlushAllDeferredStorage(); flushErr != nil {
 			requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+flushErr.Error())
+		}
+		// 推迟写盘的模型资格成功时间（最多 30 秒，见 aistudio/model_access_deferral.go）：Worker 都关了、收尾的请求都已记下成功之后写出，
+		// 之后改为立即写
+		if flushErr := pool.SetModelAccessDeferral(false); flushErr != nil {
+			requests.log("service", "WARN", "推迟的模型资格成功时间写盘失败 | 错误="+flushErr.Error())
 		}
 		// Worker 关闭时归还的端口改变了亲和与归属：立即写出 IP 池记录
 		proxyPool.flush()
@@ -2111,7 +2117,8 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 }
 
 // errWorkerOrgDisabled 与 errWorkerOrgDisabledDuringStart 为账户已处于组织停用状态时不启动、不发布 Worker 的错误
-// （满足 aistudio.OrgDisabledFailure）：账户已在这个状态，不再登记、不累计次数
+// （满足 aistudio.OrgDisabledFailure）：账户已在这个状态，不再登记、不累计次数（不带原因种类，enterOrgDisabled 遇到它们什么都不做，
+// 见 alreadyRestrictedSentinel）
 var (
 	errWorkerOrgDisabled            = fmt.Errorf("%w，不启动 Worker", aistudio.ErrOrgDisabled)
 	errWorkerOrgDisabledDuringStart = fmt.Errorf("%w，刚启动的 Worker 不发布（启动期间确认）", aistudio.ErrOrgDisabled)
@@ -2888,6 +2895,8 @@ type trackedService struct {
 	// omniImageBindingOff 为真时 OMNI_IMAGE_BINDING 关闭（可热更新）：Interaction 带图请求的 binding 只含文本，与 a574e64 相同；
 	// 按“关闭”存，零值即默认开启，见 omni_image_binding.go
 	omniImageBindingOff atomic.Bool
+	// abnormalFinishError 为 ABNORMAL_FINISH_ERROR（默认关闭，可热更新）：重新生成用完仍异常结束且没有输出时按错误结束，见 abnormal_finish.go
+	abnormalFinishError atomic.Bool
 	// firstEventTimeout 为每次尝试等待首个上游事件的上限（FIRST_EVENT_TIMEOUT，0 为关闭，可热更新）
 	firstEventTimeout atomic.Int64
 	// downgradeGuard 为降级判定的生效设置（服务配置页修改后立即替换，见 downgrade_guard.go）
@@ -3057,8 +3066,7 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	service.transitionTimedOut = false
 	service.state.Store(serviceLaunching)
 	service.lifecycleMu.Unlock()
-	// 停止时改为直接写盘的轮换 Cookie 恢复暂存（见 aistudio/cookie_write.go）
-	_ = service.pool.SetStorageDeferral(true)
+	service.startDeferredWrites()
 	stopCaller := context.AfterFunc(ctx, dataCancel)
 	service.replaceModelSnapshot(service.catalog.CachedModels())
 	if launching != nil {
@@ -3334,11 +3342,22 @@ func (service *trackedService) Stop() (bool, error) {
 	return true, errors.Join(transitionErr, cleanupErr)
 }
 
+// startDeferredWrites 在生成服务启动时恢复推迟写盘：停止时改为直接写盘的轮换 Cookie 恢复暂存（见 aistudio/cookie_write.go），
+// 只推进 CheckedAt 的模型资格成功恢复推迟写盘（见 aistudio/model_access_deferral.go）
+func (service *trackedService) startDeferredWrites() {
+	_ = service.pool.SetStorageDeferral(true)
+	_ = service.pool.SetModelAccessDeferral(true)
+}
+
 // stopDeferredCookieWrites 在生成服务停止后（Worker 都已重置）把只有轮换 Cookie 变化、暂存未写盘的认证状态立即写出，之后直接写盘
 // （见 aistudio/cookie_write.go）：停止再启动时新一代生成服务先建好、旧一代最后才关闭，新一代从磁盘载入认证文件，读到的是最新的 Cookie
 func (service *trackedService) stopDeferredCookieWrites() {
 	if err := service.pool.SetStorageDeferral(false); err != nil && service.requests != nil {
 		service.requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+err.Error())
+	}
+	// 推迟写盘的模型资格成功时间同理（见 aistudio/model_access_deferral.go）：全部写出，之后每次成功立即写
+	if err := service.pool.SetModelAccessDeferral(false); err != nil && service.requests != nil {
+		service.requests.log("service", "WARN", "推迟的模型资格成功时间写盘失败 | 错误="+err.Error())
 	}
 }
 
@@ -3851,6 +3870,11 @@ func (service *trackedService) acquireLease(
 	failedWorkers := failures.accounts
 	// 主用模型的选号带排队预算（见 primary_models.go）：容量原因的等待累计超过上限时 wait 返回 CapacityBusyError，没有预算时不限时
 	budget := leaseWaitBudgetFromContext(ctx)
+	// 候选全部冷却时的排队累计（生成请求整个请求共用一份，见 cooling_wait.go）；没有时只按这次选号累计
+	cooled := coolingWaitFromContext(ctx)
+	if cooled == nil {
+		cooled = &coolingWait{}
+	}
 	// 主用模型的生成选号在出口令牌桶受限时优先取得令牌（只影响出口准入，见 aistudio/egress_rate.go）
 	selection.EgressPriority = budget != nil
 	// 出口限流（见 egress_guard.go）：egressKey 为本轮复查时受限的出口（等待原因是出口限速或驻留额度用完时归属它），egressBucketWait 为
@@ -4266,13 +4290,18 @@ func (service *trackedService) acquireLease(
 			continue
 		}
 		if !groups.EarliestCooldown.IsZero() {
-			remaining := time.Until(groups.EarliestCooldown)
+			now := time.Now()
+			remaining := groups.EarliestCooldown.Sub(now)
 			// Ultra 主用模型（额度快速失败）候选全部冷却时立即返回，不原地等一分钟内的恢复，也不因此延后排队截止时间：
-			// 等到的多半是分钟限额刚恢复、随即又被打满的账号，客户端按 Retry-After（最早恢复）重试更快
-			if remaining > cooldownQueueLimit || budget.failFastOnQuota() {
+			// 等到的多半是分钟限额刚恢复、随即又被打满的账号，客户端按 Retry-After（最早恢复）重试更快。
+			// 其他请求只在整个请求累计的冷却排队加上这次不超过 cooldownQueueLimit、且最早恢复不晚于请求期限时原地等（见 cooling_wait.go）
+			if cooled.exceeded(ctx, groups.EarliestCooldown, now) || budget.failFastOnQuota() {
 				return nil, &aistudio.AllCoolingError{ModelID: selection.ModelID, Until: groups.EarliestCooldown}
 			}
-			if err := wait(coolingRecheckDelay(remaining), waitReasonCooling); err != nil {
+			waitStartedAt := time.Now()
+			err := wait(coolingRecheckDelay(remaining), waitReasonCooling)
+			cooled.add(time.Since(waitStartedAt))
+			if err != nil {
 				return nil, err
 			}
 			continue
@@ -4349,9 +4378,6 @@ func coolingRecheckDelay(remaining time.Duration) time.Duration {
 	}
 	return max(remaining, 0) + rand.N(cooldownWakeJitter)
 }
-
-// cooldownQueueLimit 为全部候选账户冷却时请求排队等待恢复的上限，覆盖分钟限额窗口
-const cooldownQueueLimit = time.Minute
 
 // waitScheduling 等待账户或 Worker 可调度状态变化、兜底复查或请求取消
 func waitScheduling(ctx context.Context, changed <-chan struct{}, delay time.Duration) error {
@@ -4749,6 +4775,13 @@ func (service *trackedService) generateWithRetry(
 	destination chan<- aistudio.Event,
 	diag *generationDiagnostics,
 ) {
+	// 候选全部冷却时的排队整个请求累计不超过 cooldownQueueLimit（换号重试与 MODEL_FALLBACKS 改用的目标模型共用），最早恢复晚于请求期限时
+	// 不等（见 cooling_wait.go）
+	requestCtx = withRequestCoolingWait(requestCtx)
+	// ABNORMAL_FINISH_ERROR 每个请求开始时读一次（保存后下一个请求立即按新值），Gemini 原生接口保留结束原因（见 abnormal_finish.go）
+	if diag != nil {
+		diag.abnormalFinish = service.abnormalFinishError.Load() && !request.KeepAbnormalFinish
+	}
 	service.generateForModel(clientCtx, requestCtx, cancel, generationStartedAt, request, resourceID, destination, diag, nil)
 }
 
@@ -4780,8 +4813,10 @@ func (service *trackedService) generateForModel(
 			service.requests.logRequestProgress(request.ID, "service", "WARN", note)
 		}
 	}
-	// regenerations 为本请求剩余的同账号重新生成次数（客户端还没收到内容时，见 aistudio/regenerate.go），各次尝试共用：换号后不再各来一轮
+	// regenerations 为本请求剩余的同账号重新生成次数（客户端还没收到内容时，见 aistudio/regenerate.go），各次尝试共用：换号后不再各来一轮。
+	// regenerationsBefore 为当前这次尝试开始前已经用掉的次数（ABNORMAL_FINISH_ERROR 的共生成次数只计交出结果的那次尝试）
 	regenerations := aistudio.NewRegenerationBudget()
+	regenerationsBefore := 0
 	// 解码上游响应时的容错（跳过空帧、取缺省枚举、丢掉读不出的引用等）同一种每个请求只写一行运行日志与排查记录，各次尝试共用
 	requestCtx = aistudio.ContextWithDecodeTolerance(requestCtx, request.ID)
 	var lease *aistudio.AccountLease
@@ -4846,6 +4881,8 @@ func (service *trackedService) generateForModel(
 	}
 	var first aistudio.Event
 	var activity *upstreamActivity
+	// firstHeldAt 为交出回复的那次发送扣住第一个上游事件的时刻（工具约束要求必须调用，见 firstEventDeadline.heldAt），没有扣住时为零值
+	var firstHeldAt time.Time
 	var err error
 	originalContents := request.Contents
 	// interactionModel：Interaction 模型（gemini-omni，见 aistudio.InteractionModel）的请求带内联附件（没有内联附件时不查模型，与原先相同）。
@@ -5548,14 +5585,19 @@ func (service *trackedService) generateForModel(
 					// 硬上限约束；指定账号的请求按需要 Drive 授权结束（400）
 					driveMissing = true
 					driveMissed++
-					message := "账号没有 Drive 授权，" + driveMediaLabel + "无法发送，换有 Drive 授权的账号"
+					// Drive 存储空间已满（上传返回 403 storageQuotaExceeded）的账号同样传不上，按同样的规则换号，日志写明原因
+					missing := "账号没有 Drive 授权，"
+					if attemptCopies.DriveStorageFull() {
+						missing = "账号 Drive 空间已满，"
+					}
+					message := missing + driveMediaLabel + "无法发送，换有 Drive 授权的账号"
 					err = &aistudio.DriveRequiredError{Reason: aistudio.DriveRequiredExhausted, Model: modelID, Tried: driveMissed, ImageHint: drive.imageHint}
 					if unbound || fileBound {
 						// 不占换号次数（只受每请求换号硬上限约束）：候选用完时下一次选号按号池里没有 Drive 授权的账号（400）或
 						// 有 Drive 授权的账号都试过（429）结束，不按换号次数用完结束
 						maxAttempts++
 					} else {
-						message = "账号没有 Drive 授权，" + driveMediaLabel + "无法发送（指定账号，不能换号）"
+						message = missing + driveMediaLabel + "无法发送（指定账号，不能换号）"
 						err = &aistudio.DriveRequiredError{Reason: aistudio.DriveRequiredAccount, Model: modelID, ImageHint: drive.imageHint}
 					}
 					trace.Note(message)
@@ -5563,13 +5605,18 @@ func (service *trackedService) generateForModel(
 						"%s | 附件=%d | 原始=%dB", message, mediaCount, mediaBytes))
 				} else if err == nil && retained > 0 && lease.Channel() != aistudio.ChannelBuild {
 					// Playground 通道上附件仍是 inline data：账号没有 Drive 授权（GenerateAccessToken 401 / Code 16，或记着它刚返回过），
+					// 或 Drive 存储空间已满（上传返回 403 storageQuotaExceeded，或记着它刚返回过；附件副本集合的 DriveStorageFull 为真），
 					// 附件随生成请求内联发送，不冷却、不换号（见 aistudio.UploadInlineMediaToLease）。只写这一行、不写“内联附件处理完成”，
 					// 诊断按开头分开计数；同账号 10 分钟最多一行。去重名额先占后写，所以走 logDurable：普通日志在控制台队列满时会丢，
 					// 丢了这个账号 10 分钟内都不会再有这一行（带图请求高峰正是队列容易满的时候）
-					trace.Note("Drive 未授权，附件改为内联发送")
+					why := "Drive 未授权"
+					if attemptCopies.DriveStorageFull() {
+						why = "Drive 空间已满"
+					}
+					trace.Note(why + "，附件改为内联发送")
 					if service.driveInlineNotes.allow(request.AccountID, time.Now()) {
 						service.requests.logDurable(accountLabel, "INFO", fmt.Sprintf(
-							"Drive 未授权，附件改为内联 | 附件=%d | 原始=%dB | 耗时=%s", mediaCount, mediaBytes, uploadElapsed,
+							"%s，附件改为内联 | 附件=%d | 原始=%dB | 耗时=%s", why, mediaCount, mediaBytes, uploadElapsed,
 						))
 					}
 				} else if err == nil {
@@ -5595,7 +5642,18 @@ func (service *trackedService) generateForModel(
 		// 生成服务扣住上游事件（工具约束要求必须调用，见 aistudio/tool_guard.go）时请求上下文退出首事件前的固定期限，改按本次尝试的
 		// 上游活动判空闲；同一尝试内重发时空闲计时重新起算（见 generateContext.holdUpstream）
 		attemptActivity := activity
-		firstEvent.observeHold(func() { phase.holdUpstream(attemptActivity.quietFor) }, phase.touchHold)
+		// ABNORMAL_FINISH_ERROR 打开时，首个事件之前的每次重发（同账号重新生成、续写回退的重发）让 API 层写出流式响应头前的等待从重发
+		// 时刻起重新计（与额度用完改用其他模型相同，合计不超过 API 层的上限 50 秒，见 aistudio.StreamStartHold.RestartWait）：重新生成用完
+		// 仍异常结束时尽量在提交响应头之前判定，按 HTTP 502 返回，而不是 200 之后的流内错误。开关关闭时不变
+		onRestart := phase.touchHold
+		if hold := aistudio.StreamStartHoldFromContext(requestCtx); hold != nil && diag != nil && diag.abnormalFinish {
+			restartWait := service.StreamStartWait(requestCtx, modelID)
+			onRestart = func() {
+				phase.touchHold()
+				hold.RestartWait(restartWait)
+			}
+		}
+		firstEvent.observeHold(func() { phase.holdUpstream(attemptActivity.quietFor) }, onRestart)
 		// streamed 为本次尝试已收到首个上游事件或 long- 自动续写已决定发第二轮：之后的阶段切换只来自续写的后续轮次（见 long_output.go），
 		// 不写阶段日志、不启动首事件计时（首事件计时只管第一轮，续写各轮不重新起算）
 		streamed := &atomic.Bool{}
@@ -5638,6 +5696,7 @@ func (service *trackedService) generateForModel(
 			service.requests.logRequestProgress(noteRequestID, noteSource, "INFO", message)
 		})
 		attemptCtx = aistudio.ContextWithRegenerationBudget(attemptCtx, regenerations)
+		regenerationsBefore = regenerations.Used()
 		// 重新生成与续写回退的重发各自重新起算首事件计时，剩余不够再来一次时不重新生成（见 aistudio/regenerate.go）
 		attemptCtx = aistudio.ContextWithFirstEventClock(attemptCtx, firstEvent)
 		// 因结束原因重新生成时换一个随机后缀（每次尝试从本请求原来的后缀起换，见 promptNonceVariant）；没加随机后缀的请求不挂，
@@ -5794,6 +5853,7 @@ func (service *trackedService) generateForModel(
 			service.requests.logRequestProgress(request.ID, accountLabel, "INFO", "收到上游首个事件")
 			api.SetAccessLogTarget(requestCtx, first.ProviderModel, accountLabel)
 			temporaryCopies = attemptCopies
+			firstHeldAt = firstEvent.heldSince()
 			upstreamResponded()
 			trace.FinishAttempt(nil)
 			// 成功尝试的上下文在事件流转发结束后才取消
@@ -6131,6 +6191,12 @@ func (service *trackedService) generateForModel(
 		orgDisabled := aistudio.OrgDisabledFailure(attemptErr) && requestCtx.Err() == nil && !authFailure
 		if orgDisabled {
 			cooled = true
+		}
+		// 上游返回 “Region not supported.”（AI Studio 不支持当前出口地区）：出口的问题，不是账号的，不进组织停用状态、不算 403 无权限
+		// （不冷却、不登记、不自动暂停，见 isPermissionDenied），按一般失败换号；写一行进度说明该查出口
+		if aistudio.RegionNotSupported(attemptErr) && requestCtx.Err() == nil {
+			service.requests.logRequestProgress(request.ID, accountLabel, "WARN",
+				"AI Studio 不支持当前出口地区（Region not supported），检查该账户或全局代理的出口，不标记账号")
 		}
 		// 号池级 403：号池内多个账号对该模型连续 403、这段时间又没有任何成功，多半是 proof、请求形态等号池一侧的问题，不是账号没有
 		// 权限：不写冷却、不升档、不登记淘汰，按一般失败计入连续失败并退避（见 forbiddenSystemicAccounts）
@@ -6523,6 +6589,10 @@ func (service *trackedService) generateForModel(
 		return
 	}
 	forwarding = true
+	if diag != nil {
+		diag.regenerations, diag.regenerationsBefore = regenerations, regenerationsBefore
+		diag.firstHeldAt = firstHeldAt
+	}
 	service.forwardEvents(
 		clientCtx, requestCtx, cancel, request.ID,
 		first, source, destination, lease, temporaryCopies, activity, modelID, diag,
@@ -6716,8 +6786,11 @@ type firstEventDeadline struct {
 	// paused 为生成服务扣住了上游已经返回的事件（见 PauseFirstEvent）：start 不再启动，RestartFirstEvent 照常重新起算
 	paused bool
 	// held 为本次尝试扣住过上游事件（不论是否开启首事件超时），写日志时据此区分“上游没有首事件”与“生成服务扣住中”
-	held  bool
-	fired *firstEventTimeoutError
+	held bool
+	// heldAt 为这次发送扣住第一个上游事件的时刻（同一尝试内重发时清零，重发那次扣住时重新记）：扣住的事件要到调用出现才一起交出，
+	// 请求日志的生成速度按它起算，不按放出的时刻（见 forwardEvents 的 firstChunkAt）
+	heldAt time.Time
+	fired  *firstEventTimeoutError
 	// onHold、onRestart 为扣住上游事件、同一尝试内重发时的回调（见 observeHold）：通知请求上下文退出首事件前的固定期限、
 	// 重新起算扣住期间的空闲计时。在 mu 内调用（锁顺序为 mu → 请求上下文的锁）
 	onHold, onRestart func()
@@ -6761,8 +6834,11 @@ func (deadline *firstEventDeadline) RestartFirstEvent() bool {
 	deadline.mu.Lock()
 	defer deadline.mu.Unlock()
 	if deadline.timeout <= 0 {
-		if !deadline.stopped && deadline.onRestart != nil {
-			deadline.onRestart()
+		if !deadline.stopped {
+			deadline.heldAt = time.Time{}
+			if deadline.onRestart != nil {
+				deadline.onRestart()
+			}
 		}
 		return true
 	}
@@ -6774,6 +6850,7 @@ func (deadline *firstEventDeadline) RestartFirstEvent() bool {
 		return false
 	}
 	deadline.paused = false
+	deadline.heldAt = time.Time{}
 	deadline.timer = time.AfterFunc(deadline.timeout, deadline.expire)
 	if deadline.onRestart != nil {
 		deadline.onRestart()
@@ -6800,6 +6877,9 @@ func (deadline *firstEventDeadline) PauseFirstEvent() {
 		deadline.paused = true
 	}
 	deadline.held = true
+	if deadline.heldAt.IsZero() {
+		deadline.heldAt = time.Now()
+	}
 	if deadline.onHold != nil {
 		deadline.onHold()
 	}
@@ -6817,6 +6897,13 @@ func (deadline *firstEventDeadline) holding() bool {
 	deadline.mu.Lock()
 	defer deadline.mu.Unlock()
 	return deadline.held
+}
+
+// heldSince 返回交出回复的那次发送扣住第一个上游事件的时刻，没有扣住过时为零值
+func (deadline *firstEventDeadline) heldSince() time.Time {
+	deadline.mu.Lock()
+	defer deadline.mu.Unlock()
+	return deadline.heldAt
 }
 
 // stop 停止计时，返回已经触发的超时错误（没有触发时为 nil）。停止与触发互斥：stop 返回 nil 后本次尝试不会再被取消
@@ -7025,6 +7112,20 @@ func (service *trackedService) forwardEvents(
 	var guard *downgradeGate
 	var usage *aistudio.Usage
 	toolCalls := 0
+	// firstChunkAt 为这次生成首个上游分块到达的时刻，laterOutput 为之后还有交出内容的分块：请求日志的生成速度只计这之后
+	// （见 api.SetAccessLogFirstOutput）。同账号重新生成、换号与改用其他模型都在任何事件交到这里之前，首个分块取自交出回复的那次生成；
+	// 生成服务扣住过上游事件（工具约束要求必须调用，扣住的思考与正文到调用出现才一起放出，见 aistudio/tool_guard.go）时按扣住第一个
+	// 事件的时刻（diag.firstHeldAt），不按放出的时刻。只有一个分块时测不出速度，不写；思考正文不返回（HideThinking）而用量带思考 token
+	// 时同样不写：没有返回的思考事件不经这里，首个分块晚于思考开始，扣掉的时长里仍有思考 token
+	var firstChunkAt time.Time
+	laterOutput := false
+	publishFirstOutput := func() {
+		if laterOutput && !diag.hiddenThinkingTokens(usage) {
+			api.SetAccessLogFirstOutput(requestCtx, firstChunkAt)
+		} else {
+			api.SetAccessLogFirstOutput(requestCtx, time.Time{})
+		}
+	}
 	// 清理与 panic 恢复最先注册：之后任何一步（含下面取账号、接上降级判定、核对服务模型等前置步骤）panic 都转成错误事件结束本请求，
 	// 照常释放租约、记录结果并关闭事件流，不让进程退出。原先注册在约百行前置步骤之后，前置步骤 panic 时 generateWithRetry 的恢复
 	// 看到已交给本函数就直接返回：租约永久占用、事件流不关闭，协议层一直等（开着数据型心跳时还会一直写心跳）
@@ -7040,6 +7141,7 @@ func (service *trackedService) forwardEvents(
 				api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 			}
 			api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+			publishFirstOutput()
 			if clientCtx.Err() == nil {
 				select {
 				case destination <- aistudio.Event{Kind: aistudio.EventError, Err: requestErr}:
@@ -7056,6 +7158,7 @@ func (service *trackedService) forwardEvents(
 			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		}
 		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+		publishFirstOutput()
 		if temporaryCopies != nil {
 			if err := temporaryCopies.Cleanup(); err != nil {
 				service.requests.log(accountLabel, "WARN", "临时文件清理失败 | 错误="+err.Error())
@@ -7151,6 +7254,7 @@ func (service *trackedService) forwardEvents(
 	publishResult := func() {
 		api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		api.SetAccessLogGenerationResult(requestCtx, usage, toolCalls)
+		publishFirstOutput()
 	}
 	finishFromContext := func() {
 		if clientCtx.Err() != nil && !terminal {
@@ -7193,6 +7297,8 @@ func (service *trackedService) forwardEvents(
 	}
 	pendingFirst := true
 	verified := false
+	// ABNORMAL_FINISH_ERROR：请求开始时打开时，没有交出内容就以异常原因结束的回复换成错误（见 abnormal_finish.go）
+	abnormal := diag.abnormalFinishGateFor()
 	for {
 		var event aistudio.Event
 		var ok bool
@@ -7272,6 +7378,14 @@ func (service *trackedService) forwardEvents(
 		lastEventAt = now
 		lastProgress = now
 		lastEventKind = string(event.Kind)
+		if firstChunkAt.IsZero() {
+			firstChunkAt = now
+			if diag != nil && !diag.firstHeldAt.IsZero() && diag.firstHeldAt.Before(now) {
+				firstChunkAt = diag.firstHeldAt
+			}
+		} else if !laterOutput && deliversContent(event) {
+			laterOutput = true
+		}
 		api.MarkAccessLogUpstreamEvent(requestCtx)
 		trace.RecordEvent(event)
 		switch event.Kind {
@@ -7293,6 +7407,16 @@ func (service *trackedService) forwardEvents(
 		noteServedModel(event.ProviderModel)
 		if terminal {
 			continue
+		}
+		// 还没交出内容时不算内容的事件（用量、思考签名、来源、引用）先扣住到第一个内容事件或结束事件，结束事件是异常原因时换成错误
+		// （ABNORMAL_FINISH_ERROR，见 abnormal_finish.go）
+		var abnormalErr *aistudio.AbnormalFinishError
+		if event.Kind != aistudio.EventError {
+			var hold bool
+			if hold, abnormalErr = abnormal.admit(event); hold {
+				resetStallTimer()
+				continue
+			}
 		}
 		if event.Kind == aistudio.EventError {
 			requestErr = event.Err
@@ -7328,6 +7452,16 @@ func (service *trackedService) forwardEvents(
 			state = "completed"
 			terminal = true
 		}
+		// finished 为正常交出的结束（换成错误的异常结束同样算：上游正常生成了回复，模型资格验证照旧）；long- 自动续写后续轮次失败后的结束、
+		// 函数调用之后上游以错误结束（按正常完成交给客户端）不算：验证会清掉刚为这次失败写回的冷却（见 long_output.go 与 settleTrailingError）
+		finished := event.Kind == aistudio.EventFinish && event.ContinuationErr == nil && !aistudio.TrailingAccountError(event.TrailingError)
+		if abnormalErr != nil {
+			// 不算账户的问题：已在首事件之后，不冷却、不换号；用量已记下，结束原因照旧写进访问日志
+			requestErr, state = abnormalErr, "failed"
+			service.requests.logRequestProgress(requestID, accountLabel, "WARN", abnormalFinishNote(abnormalErr))
+			trace.Note(abnormalFinishNote(abnormalErr))
+			event = aistudio.Event{Kind: aistudio.EventError, Err: abnormalErr, ProviderModel: event.ProviderModel}
+		}
 		if terminal {
 			stall = nil
 		} else {
@@ -7341,6 +7475,18 @@ func (service *trackedService) forwardEvents(
 			// 额度用完改用了其他模型：记下目标模型交出的思考签名，之后发给别的模型时不原样带上（见 model_fallback.go）
 			service.fallbackSignatures.rememberEvent(fallbackModel, event)
 		}
+		// 扣住的事件照原顺序先放出（异常结束换成错误时已丢弃）；扣住的思考签名同样记进改用期间签发的签名
+		for _, held := range abnormal.release() {
+			if fallbackModel != "" {
+				service.fallbackSignatures.rememberEvent(fallbackModel, held)
+			}
+			select {
+			case destination <- held:
+			case <-requestCtx.Done():
+				finishFromContext()
+				return
+			}
+		}
 		select {
 		case destination <- event:
 			lastProgress = time.Now()
@@ -7348,9 +7494,8 @@ func (service *trackedService) forwardEvents(
 			finishFromContext()
 			return
 		}
-		if !verified && event.Kind == aistudio.EventFinish && event.ContinuationErr == nil && !aistudio.TrailingAccountError(event.TrailingError) {
-			// long- 自动续写后续轮次失败后的结束、函数调用之后上游以错误结束（按正常完成交给客户端）不算验证成功：验证会清掉刚为这次失败
-			// 写回的冷却（见 long_output.go 与 settleTrailingError）
+		if !verified && finished {
+			// 见上面 finished 的说明：续写失败、函数调用之后上游以错误结束不算验证成功
 			verified = true
 			service.markModelAccessVerifiedAsync(
 				lease.Account().ID, accountLabel, lease.CooldownScope(requestedModelID), accessGeneration, lease.CheckedAt(),

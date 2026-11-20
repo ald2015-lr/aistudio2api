@@ -41,6 +41,23 @@ type generationDiagnostics struct {
 	// fallbackModel 为额度用完改用其他模型后实际使用的目标模型（见 model_fallback.go），没有改用时为空：forwardEvents 把它交出的思考签名
 	// 记进 fallbackSignatures
 	fallbackModel string
+	// abnormalFinish 为请求开始时 ABNORMAL_FINISH_ERROR 打开、请求不是 Gemini 原生接口（见 abnormal_finish.go）；regenerations 为
+	// 交给 forwardEvents 时这次运行的重新生成次数（各次尝试共用），regenerationsBefore 为交出结果的那次尝试开始前已经用掉的次数：
+	// 错误的共生成次数只计这次尝试（Used() - regenerationsBefore + 1），不混入之前账号上的重新生成
+	abnormalFinish      bool
+	regenerations       *aistudio.RegenerationBudget
+	regenerationsBefore int
+	// hiddenThinking 为请求不返回思考正文（HideThinking：Anthropic thinking.type=disabled、Gemini includeThoughts=false）；
+	// firstHeldAt 为交给 forwardEvents 时交出回复的那次发送扣住第一个上游事件的时刻（工具约束要求必须调用），没有扣住时为零值。
+	// 两者都用于请求日志的生成速度（见 forwardEvents 的 firstChunkAt）
+	hiddenThinking bool
+	firstHeldAt    time.Time
+}
+
+// hiddenThinkingTokens 判断这次回复有没有返回给客户端、也没经过 forwardEvents 的思考 token：请求不返回思考正文，用量却带思考 token。
+// 这时首个分块晚于思考开始，测不出生成速度（diag 为 nil 时为假）
+func (diag *generationDiagnostics) hiddenThinkingTokens(usage *aistudio.Usage) bool {
+	return diag != nil && diag.hiddenThinking && usage != nil && usage.ReasoningTokens > 0
 }
 
 // replyRecord 为一次完成生成的指纹记录
@@ -118,7 +135,7 @@ func newGenerationDiagnostics(request aistudio.GenerateRequest, seed string) *ge
 	config := request.Config
 	diag := &generationDiagnostics{
 		seed: seed, temperature: "默认", topP: "默认", topK: "默认", thinking: "默认",
-		promptHash: promptFingerprint(request),
+		promptHash: promptFingerprint(request), hiddenThinking: config.HideThinking,
 	}
 	if config.Temperature != nil {
 		diag.temperature = fmt.Sprintf("%g", *config.Temperature)

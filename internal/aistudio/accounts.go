@@ -114,6 +114,10 @@ func (e *AccountCoolingDownError) ErrorCode() string {
 	return "rate_limit_exceeded"
 }
 
+// CooldownQueueLimit 为候选账户全部冷却时一个请求排队等冷却恢复的累计上限（覆盖分钟限额窗口）：最早恢复超过剩余的上限、
+// 或晚于请求期限时不再排队，按 AllCoolingError 返回（按上游 Mag1cFall/AIStudio2API cd3d4ab、6d8ad7d 移植）
+const CooldownQueueLimit = time.Minute
+
 // AllCoolingError 表示请求的全部候选账户都在冷却且不会很快恢复
 type AllCoolingError struct {
 	ModelID string
@@ -520,6 +524,10 @@ type Account struct {
 	buildModels           []Model
 	// buildPaused 为该账户的 Build 生成暂停（官网对它返回 PROXY_GENERATION_DISABLED，见 build_pause.go），受账户池 mu 保护
 	buildPaused bool
+	// pendingAccess 为推迟写盘的模型资格成功时间（作用域 → 最晚的租约时间，含账号全局 *），pendingAccessGeneration 为记下时的
+	// 目录代际（见 model_access_deferral.go）；受账户池 mu 保护
+	pendingAccess           map[string]time.Time
+	pendingAccessGeneration uint64
 	// emptyCatalogs 与 emptyCatalogSince 为 ListModels 连续返回空列表的次数与第一次为空的时间（见 noteCatalogListing），
 	// 由目录写盘缓存保存并在恢复时带回；受账户池 mu 保护
 	emptyCatalogs     int
@@ -572,9 +580,11 @@ type Account struct {
 	// proxyBinding 为 IP 池推送的出口（原子替换，见 proxy_binding.go）：装配前由 SetProxyBinding 直接写，进入账户池后只经
 	// AccountPool.SetProxyBindings / UpdateProxyBindings 在 p.mu 内写；nil 表示没有绑定
 	proxyBinding atomic.Pointer[ProxyBinding]
-	// orgDisabled 为账号所属组织停用了 AI Studio 的标记，orgDisabledReason 为它的说明（见 org_disabled.go）：对外状态与调度按
-	// schedulingState 读取，底层状态 State 照常写入、不被覆盖；受账户池 mu 保护
+	// orgDisabled 为账号所属组织停用了 AI Studio（或服务受限、年龄要求、Workspace 未开放）的标记，orgDisabledKind 为原因种类，
+	// orgDisabledReason 为它的说明（见 org_disabled.go）：对外状态与调度按 schedulingState 读取，底层状态 State 照常写入、
+	// 不被覆盖；受账户池 mu 保护
 	orgDisabled       bool
+	orgDisabledKind   Restriction
 	orgDisabledReason string
 	// transition 为管理页启停账户之后的后台收尾阶段（见 SetTransition），受账户池 mu 保护
 	transition AccountTransition
@@ -605,6 +615,9 @@ type AccountStatus struct {
 	// OrgDisabled 表示账户带着组织停用的标记（见 org_disabled.go），不区分是否启用：停用账户的 State 仍为 disabled，
 	// 管理页靠它看出停用账户所属组织停用了 AI Studio
 	OrgDisabled bool `json:"org_disabled,omitempty"`
+	// Restriction 为 OrgDisabled 时的原因种类：org_disabled（组织停用）、service_restricted（Google 限制了该账号）、
+	// age_requirement（年龄或使用资格）、workspace_disabled（Workspace 没有开放 AI Studio），没有标记时为空（见 org_disabled.go）
+	Restriction Restriction `json:"restriction,omitempty"`
 	// Transition 为管理页启停账户之后的后台收尾阶段（draining、closing、syncing，见 SetTransition），没有收尾时为空；
 	// ActiveRequests 为账户上进行中的普通租约数，只在有收尾阶段时填写（停用后等它们结束）。独占操作（登录、验证、目录同步、
 	// 收尾等着的 Worker 启动等）不计入：draining 而 ActiveRequests 为 0 表示还在等这些操作结束；没有要等的、正在关闭 Worker 时为 closing
@@ -781,6 +794,11 @@ type AccountPool struct {
 	orgDisabledReporter atomic.Pointer[OrgDisabledReporter]
 	// storageDirect 为不再暂存轮换 Cookie、每次都直接写盘（生成服务停止后，见 cookie_write.go 的 SetStorageDeferral）
 	storageDirect atomic.Bool
+	// accessDeferral 为推迟写盘只推进 CheckedAt 的模型资格成功（生成服务运行期间，见 model_access_deferral.go）；
+	// accessFlushScheduled 为已安排计时写盘，受 mu 保护；accessFlushInterval 只给测试改小，为 0 时取 deferredModelAccessFlushInterval
+	accessDeferral       atomic.Bool
+	accessFlushScheduled bool
+	accessFlushInterval  time.Duration
 }
 
 // AccountLease 表示一个账户请求槽位
@@ -1716,7 +1734,11 @@ func (r *AccountReservation) Remove(ctx context.Context, deleteDirectory func(*A
 }
 
 // AcquireFor 按模型方法账户或资源粘性获取账户槽位。ctx 带 WithEgressWaitLimit 时，只因出口令牌桶已满（见 egress_rate.go）
-// 而等待的时间累计超过上限后返回 CapacityBusyError{Reason: "出口限速"}；其余原因的等待不计入
+// 而等待的时间累计超过上限后返回 CapacityBusyError{Reason: "出口限速"}；其余原因的等待不计入。
+// 候选全部冷却（没有候选只是忙碌、排空、每分钟请求已满、等出口令牌或文件租约）时只在最早恢复不超过 CooldownQueueLimit 减去这次已等冷却的时长、
+// 且不晚于 ctx 的期限时排队等它，否则立即返回 AllCoolingError（对外 429 + Retry-After）：数据接口（countTokens、上传、视频、转写等）
+// 原先一直等到最早恢复或请求期限，唯一账户冷却 3 小时时 countTokens 等满期限以 504 结束。不限资源的选择才这样判断
+// （资源绑定的选择不看冷却）
 func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection) (*AccountLease, error) {
 	if p == nil {
 		return nil, PoolNotReady(poolMissingReason, nil)
@@ -1730,6 +1752,8 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 	refreshedCandidates := false
 	egressLimit := egressWaitLimitFrom(ctx)
 	var egressWaited time.Duration
+	// cooled 为这次选号因候选全部冷却而排队的累计时长（计入 CooldownQueueLimit）
+	var cooled time.Duration
 	for {
 		p.mu.Lock()
 		if err := p.validateSelectionLocked(selection); err != nil {
@@ -1786,6 +1810,12 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 			p.mu.Unlock()
 			return nil, egressBusyError(selection, egressWaited, egressLimit, egress.next, time.Now())
 		}
+		// 候选全部冷却：earliest 即最早恢复。超过剩余的排队上限或晚于请求期限时不再等
+		coolingWait := selection.ResourceID == "" && !earliest.IsZero() && egress.coolingOnly()
+		if coolingWait && coolingQueueExceeded(ctx, earliest, now, cooled) {
+			p.mu.Unlock()
+			return nil, &AllCoolingError{ModelID: strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/"), Until: earliest}
+		}
 		changed := p.changed
 		p.mu.Unlock()
 
@@ -1805,8 +1835,28 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 		if egressWaiting {
 			egressWaited += time.Since(waitStart)
 		}
+		if coolingWait {
+			cooled += time.Since(waitStart)
+		}
 	}
 }
+
+// coolingQueueExceeded 判断候选全部冷却、最早恢复为 until 时是否不再排队：距恢复超过 CooldownQueueLimit 减去已排队的 cooled，
+// 或恢复晚于 ctx 的期限（等不到）
+func coolingQueueExceeded(ctx context.Context, until time.Time, now time.Time, cooled time.Duration) bool {
+	limit := CooldownQueueLimit
+	if injected, ok := ctx.Value(cooldownQueueLimitKey{}).(time.Duration); ok && injected > 0 {
+		limit = injected
+	}
+	if until.Sub(now) > limit-cooled {
+		return true
+	}
+	deadline, bounded := ctx.Deadline()
+	return bounded && until.After(deadline)
+}
+
+// cooldownQueueLimitKey 为包内测试经 context 注入的冷却排队上限（time.Duration），生产路径不设
+type cooldownQueueLimitKey struct{}
 
 // waitPoolChange 等账户池变化、delay 到期（为负时不定时）或 ctx 结束，ctx 结束时返回它的错误
 func waitPoolChange(ctx context.Context, changed <-chan struct{}, delay time.Duration) error {
@@ -3022,11 +3072,16 @@ func (p *AccountPool) markModelAccessVerifiedClearing(
 	globalCooldown, globalCooling := account.runtime.Cooldowns[globalCooldownKey]
 	globalBlocks := globalCooling && !shortCooldownActive(globalCooldown, now)
 	// 有可清零的限流档位时必须走下面的慢路径：另一通道成功、该键没有冷却且 CheckedAt 不早于本次时，原先的快路径会漏清
-	unchanged := generation == account.modelAccessGeneration && current.State == ModelAccessVerified &&
-		!cooling && !current.CheckedAt.Before(checkedAt) && !globalBlocks &&
-		!globalAccess.CheckedAt.Before(checkedAt) && !clearableRateStrikeLocked(account, modelID, checkedAt, now)
+	clearable := clearableRateStrikeLocked(account, modelID, checkedAt, now)
+	settled := generation == account.modelAccessGeneration && current.State == ModelAccessVerified && !cooling && !globalBlocks && !clearable
+	unchanged := settled && !current.CheckedAt.Before(checkedAt) && !globalAccess.CheckedAt.Before(checkedAt)
+	// 只推进 CheckedAt 的成功：推迟写盘，并进下一次运行态写入或最多 deferredModelAccessFlushInterval 后写出
+	deferred := !unchanged && settled && p.accessDeferral.Load() && account.RuntimePath != ""
+	if deferred {
+		p.deferModelAccessLocked(account, canonicalModelID, checkedAt)
+	}
 	p.mu.Unlock()
-	if unchanged {
+	if unchanged || deferred {
 		return false, 0, nil
 	}
 	changed, cleared := false, 0
@@ -3683,6 +3738,9 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 		Message:          account.stateMessageLocked(),
 		OrgDisabled:      account.orgDisabled,
 	}
+	if account.orgDisabled {
+		status.Restriction = account.orgDisabledKind
+	}
 	if account.transition != "" {
 		status.Transition, status.ActiveRequests = account.transition, account.active
 		// 停用收尾还没取得独占租约、账户上也没有请求与独占操作（登录、验证、目录同步等）时，下一步就是关闭 Worker：按 closing 显示。
@@ -3919,9 +3977,11 @@ func (p *AccountPool) leaseCandidateLocked(
 ) (*AccountLease, error) {
 	p.leaseAttempts++
 	if account.exclusive || account.exclusiveWaiters > 0 || account.authRefreshers > 0 || account.active >= p.perAccountConcurrency {
+		egress.uncooled = true
 		return nil, nil
 	}
 	if account.draining && sharedSelection(selection) {
+		egress.uncooled = true
 		return nil, nil
 	}
 	if selection.ResourceID == "" {
@@ -3936,6 +3996,7 @@ func (p *AccountPool) leaseCandidateLocked(
 	// 只因预占而满时等租约发出或释放的唤醒（见 rateChangedLocked）
 	gated := generationSelection(selection)
 	if until := rateUntilOf(account); p.rateGateLocked(selection, now).full(until) {
+		egress.uncooled = true
 		if until != rateUntilPending {
 			if at := time.Unix(0, until).UTC(); earliest.IsZero() || at.Before(*earliest) {
 				*earliest = at
@@ -3956,6 +4017,7 @@ func (p *AccountPool) leaseCandidateLocked(
 	if account.active == 0 {
 		leaseLock, leasePath, err := acquireAccountFileLease(account.StoragePath)
 		if errors.Is(err, errAccountLeaseBusy) {
+			egress.uncooled = true
 			pollAt := now.Add(externalLeasePoll)
 			if earliest.IsZero() || pollAt.Before(*earliest) {
 				*earliest = pollAt
@@ -4619,13 +4681,16 @@ func (p *AccountPool) updateRuntimeContext(
 		p.mu.Unlock()
 		return false, err
 	}
+	// 推迟写盘的模型资格成功时间并进去（见 model_access_deferral.go）：这次修改看到的与成功当时立即写盘相同，并顺带写出。
+	// 在同步之后：别的进程改了目录（同步时目录代际加一）时丢弃旧代际的推迟时间
+	merged, pendingChanged := mergePendingAccessLocked(account, &current, time.Now())
 	working := cloneRuntime(current)
 	changed, apply, err := mutate(account, &working)
 	p.mu.Unlock()
 	if err != nil {
 		return false, err
 	}
-	if changed {
+	if changed || pendingChanged {
 		if err := writeRuntime(account.RuntimePath, working); err != nil {
 			return false, err
 		}
@@ -4636,6 +4701,7 @@ func (p *AccountPool) updateRuntimeContext(
 	if p.byID[account.ID] != account {
 		return false, fmt.Errorf("账户不存在: %s", account.ID)
 	}
+	forgetMergedAccessLocked(account, merged)
 	synced, err := p.syncAccountRuntimeLocked(account, working)
 	if err != nil {
 		return false, err

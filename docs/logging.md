@@ -117,6 +117,12 @@ WARN  account@example.com  暂存的认证 Cookie 写盘失败，Worker 照常�
 WARN  service              暂存的认证 Cookie 写盘失败 | 错误=<原因>
 ```
 
+生成成功后只把已验证模型资格的检查时间（CheckedAt）往后推的那次写入同样推迟（见 [protocol.md](protocol.md#账户持久状态)）：并进这个账户下一次运行态写入，最多 30 秒后写出，生成服务停止与进程关闭时全部写出；写盘失败时写一行 WARN：
+
+```text
+WARN  service              推迟的模型资格成功时间写盘失败 | 错误=<原因>
+```
+
 ### 平均调用
 
 `ROUTING_STRATEGY=balanced`（平均调用，见 [README](../README.md#平均调用)）开启时写下面这些行。“今日发送”为本进程在当前太平洋时间额度日里发往上游的生成请求数（每次发送都计）；来源为账户的行写账户 ID（与其他 Worker 日志相同），正文不写其他账号、密码或代理凭据，概况行不列账户。
@@ -163,6 +169,32 @@ Google Workspace 账号所属组织（或 Google）关闭了 AI Studio 时，载
 | `账户验证完成 \| 已认证=false \| 耗时=… \| 接口复核=跳过\|组织停用 \| 页面=access.workspace.google.com/ServiceNotAllowed \| 原因=AI Studio 已被账号所属组织停用` | INFO | 管理验证遇到组织停用页（或浏览器已登录、接口返回 app is disabled）：未通过，不标需要登录 |
 
 模型目录同步返回 `AI Studio app is disabled` 时不写 `模型目录同步失败`、不按失败退避，只排长间隔复查；状态清除（认证文件更新、管理员“恢复调度”）后目录任务改回常规、立即同步，不等原定的复查时间；生成请求遇到时按已冷却换号（不计连续失败上限、不退避），不写 `账号冷却 | 类型=无权限`，不登记为 403 无权限账户。交互式登录遇到组织停用页时写 `账户登录失败 | 错误=AI Studio 已被账号所属组织停用 url=…`，再用账户已保存的认证文件复核一次接口：同样返回 app is disabled 才进入这个状态（来源=登录）；复核通过、401 或出错时（可见浏览器里登录的可能是别的账号）写 `账户登录 | 登录后停在组织停用页，但已保存的认证文件接口复核没有返回 app is disabled（可能在浏览器里登录了别的账号），账户状态不变 | 接口复核=通过|401|出错|跳过`（WARN），账户状态不变。
+
+#### 服务受限、年龄或资格、Workspace 未开放与出口地区
+
+官网拒绝账号使用 AI Studio 的其他几种情况（按上游 a68acad 移植）走上表同一套机制，日志里的原因按种类写：
+
+| 情况 | 识别 | Worker 启动错误开头 | 进入状态的日志 | 释放原因 |
+| --- | --- | --- | --- | --- |
+| Google 限制了该账号 | 页面跳到 `accounts.google.com/info/servicerestricted`（先于登录页判断，原先报 `隔离登录态失效`） | `Google 已限制该账号使用 AI Studio url=accounts.google.com/info/servicerestricted` | `Google 已限制该账号使用 AI Studio，停止调度 \| 来源=… \| 下次复查=… \| 原文=…` | `服务受限` |
+| 年龄或使用资格 | 页面跳到 `aistudio.google.com/docs/troubleshoot-ai-studio#age-requirements`；RPC `HTTP 403、协议错误码 7: Account not supported.（账号不满足 AI Studio 的年龄或使用资格要求）` | `账号不满足 AI Studio 的年龄或使用资格要求 url=aistudio.google.com/docs/troubleshoot-ai-studio#age-requirements` | `账号不满足 AI Studio 的年龄或使用资格要求，停止调度 \| …` | `年龄或资格不符` |
+| Workspace 没有开放 AI Studio | 页面跳到 `aistudio.google.com/docs/workspace`；RPC 403/7 `Early Access Apps disabled.`（含 `Core data access for Early Access Apps disabled.`） | `账号所属 Google Workspace 没有开放 AI Studio url=aistudio.google.com/docs/workspace` | `账号所属 Google Workspace 没有开放 AI Studio，停止调度 \| …` | `Workspace 未开放` |
+
+同一账户再次遇到同一种原因时不再写日志，原因变了（例如先是服务受限、后来接口返回 `Account not supported.`）再写一行；`账户验证完成 \| … \| 原因=` 与 `新账户自动处理 \| 验证未通过，<原因>，停止调度` 同样写具体原因。
+
+AI Studio 不支持当前出口地区（页面跳到 `aistudio.google.com/docs/available-regions`，RPC 403/7 `Region not supported.`）是出口的问题，不标记账号：Worker 启动写 `WAA Worker 启动失败 \| … \| 错误=AI Studio 不支持当前出口地区，为该账户或全局代理换用支持地区的出口 url=aistudio.google.com/docs/available-regions \| 页面={…}`（就绪条件立刻成立、不清浏览器缓存）；管理验证写 `账户验证失败 \| … \| 错误=AI Studio 不支持当前出口地区…`（不标需要登录）；RPC 的错误原文末尾补 `（AI Studio 不支持当前出口地区，为该账户或全局代理换用支持地区的出口）`，生成请求另写一行进度 `AI Studio 不支持当前出口地区（Region not supported），检查该账户或全局代理的出口，不标记账号`（WARN），不写 `账号冷却 \| 类型=无权限`、不登记 403 无权限账户、不计入 403 自动暂停，按一般失败换号。
+
+### Camoufox 退出时的诊断
+
+Camoufox 自行退出时（不是服务关闭它），错误写明退出码与浏览器最近 20 行输出（按上游 c3c9cbc 移植）：
+
+| 时机 | 错误 |
+| --- | --- |
+| 启动时，报告 BiDi 端点之前 | `WAA Worker 启动失败 \| … \| 错误=Camoufox 在报告 BiDi 端点前退出，退出码 255 \| 最近输出=<行> ⏎ <行> …`（旧版本只有 `exit status 255`） |
+| 运行中（BiDi 连接随之断开） | `BiDi 连接已断开: Camoufox 运行中退出，信号 killed \| 最近输出=…`：Worker 状态的失败原因、进行中的命令与随后的启动或请求失败都带这一句。连接一断开 Worker 就报告失败、新命令立即失败（这时原因还是原始的 `BiDi 连接已断开: <连接错误>`）；之后最多等 5 秒（等进程退出与等输出读完合计）确认进程是否退出，退出了就把原因换成上面这句、进行中的命令以它结束。服务自己关闭浏览器时不等、不报 |
+| 浏览器登录期间 | 关掉登录窗口（退出码 0）：`登录窗口已关闭，登录没有完成（Camoufox 退出码 0）`；其他退出：`登录浏览器意外退出: BiDi 连接已断开: Camoufox 运行中退出，退出码 … \| 最近输出=…` |
+
+退出码在 Windows 上为十六进制（如 `退出码 0xC0000005`），被信号结束时为 `信号 <名称>`，没有输出时写 `，没有输出`。`最近输出` 只留最近 20 行（stdout 与 stderr 合在一起，每行最多 200 字，以 ` ⏎ ` 分隔，整条仍是一行），写进错误前去掉敏感内容：URL 只留 scheme、host 与路径（账号密码、查询参数与片段去掉，有查询参数时写 `?…`），不带 scheme 的 `user:password@host` 写成 `***@host`，邮箱打码为前两位加 `***@***`，`Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie`（含 JSON 里带引号的键）冒号或等号之后到行尾整段写 `***`，`Bearer` 之后的令牌写 `***`，`password`、`token`、`api_key`、`secret`、`credentials` 等（键名可带前缀，如 `proxy_password`、`refresh_token`、`x-goog-api-key`；含 JSON 的 `"password":"…"` 写法）只留键名（值写 `***`），网页脚本的控制台消息（`JavaScript error: https://…`）不留。浏览器的输出本身不写运行日志：Worker 与登录构造 `Options`、`LoginOptions` 时都不设置 `Log`（与原先相同），只有这些退出错误带出最近 20 行，脱敏只靠上面的规则。
 
 Worker 启动完成、发布之前，服务把浏览器 Cookie 合并写回认证文件，并用浏览器里 `https://aistudio.google.com` 的 localStorage 替换认证文件里这个 origin 的 localStorage（其他 origin 保留；启动期间保存过新登录或续签时不写，认证文件被外部换成另一个登录、扫描还没载入时 Cookie 与 localStorage 都不写；键名与值合计超过 512 KB 时不写，见[协议文档](protocol.md)第 2 节）。写回 localStorage 失败只记一行警告，不影响启动；`错误` 只写原因与大小，不写 localStorage 的值：
 
@@ -464,12 +496,12 @@ WARN  service  IP 池检查完成 | 出口=http://isp.decodo.com | 端口=200 | 
 | 思考 | `request.usage.reasoning_tokens` |
 | 回复 | `request.usage.reply_tokens`，包含文本、工具调用等非思考输出 |
 | 输出合计 | `request.usage.output_tokens`，等于思考加回复 |
-| 平均速度 | 输出合计除以请求总耗时，单位为 tokens/s，包含准备与等待时间 |
+| 平均速度 | `request.usage.generation_tokens_per_second`：输出合计除以首个上游分块到达之后到请求结束的时长，单位为 tokens/s；排队、WAA、等待首个分块与被放弃的重新生成都不算（同账号重新生成、换号与改用其他模型都在任何事件交到转发之前，首个分块取自交出回复的那次生成；工具约束要求必须调用时正文与思考扣住到调用出现才一起交出，按扣住第一个上游事件的时刻起算，不按交出的时刻）。只有一个分块，或思考不对外（Anthropic 关闭思考、Gemini 不要思考摘要）而用量带思考 token 时测不出，省略该字段，卡片改按 `average_tokens_per_second` 显示，悬停提示说明是哪一种 |
 | 工具调用 | 本次模型输出的函数调用事件数 |
 | 输入用量 | `request.usage.input_tokens`，包含输入消息与工具声明 |
 | 总用量 | `request.usage.total_tokens`，包含输入和输出 |
 
-用量在生成服务返回 usage 后展示；用量未知时省略 `request.usage`。平均速度衡量端到端吞吐，网络缓冲或集中到达的响应也使用同一计算区间。
+用量在生成服务返回 usage 后展示；用量未知时省略 `request.usage`。`request.usage.average_tokens_per_second` 沿用原口径（输出合计除以请求总耗时，含准备与等待），衡量端到端吞吐，`tools/diag_slow.sh` 读它；`generation_tokens_per_second`（按上游 Mag1cFall/AIStudio2API a68acad 移植）只衡量生成本身，请求行右侧的 `tok/s` 与卡片的平均速度都优先显示它，旧版本写下的记录没有它时显示原口径。思考不对外时没有返回的思考事件不经转发，首个分块在思考结束之后才到，按它算会把思考 token 算进很短的时长，所以这时不写生成速度。
 
 `request.state` 区分 `running`、`completed`、`tool_calls`、`limited`、`blocked`、`failed` 和 `cancelled`。策略终止保留 HTTP `200` 并显示原始 `finish_reason`；达到输出上限时显示 `max_tokens`。未知终止原因保留为 `provider_<code>`。
 
@@ -524,6 +556,14 @@ INFO  account@example.com  上游不接受以模型轮结尾的请求，本账�
 ```text
 WARN  account@example.com  上游结束说明 | 结束原因=malformed_function_call | 说明=<上游说明>
 ```
+
+`ABNORMAL_FINISH_ERROR=true`（默认关闭，管理页“服务配置”可改，保存后下一个请求立即按新值；按上游 Mag1cFall/AIStudio2API cd3d4ab 移植）时，重新生成用完（或不能重新生成）仍以 `malformed_function_call`、`unexpected_tool_call` 或 `malformed_response` 结束、客户端没收到任何正文、思考正文、函数调用、代码执行或媒体（思考签名、来源与引用不算）的请求不再交出空回复：上面的 `上游结束说明` 照常写，另写一行 WARN，请求按失败结束（对外 HTTP 502；流式请求在提交响应头之后才判定时为流内错误，见 [协议说明](protocol.md)；Gemini 原生接口不受影响），`request.finished` 的 `error` 为 `AI Studio 异常结束生成且没有输出: <REASON>（共生成 N 次）: <上游说明前 200 字>`（N 与下面的 `共生成=` 为交出结果的那个账号上的次数，含同账号重新生成，不含换号之前别的账号上的发送），`finish_reason` 与用量照旧记下（用量账本同样记这次的 token）。不算账户的问题：不冷却、不换号、不触发 `MODEL_FALLBACKS`，账号成功侧记账与模型资格验证照旧：
+
+```text
+WARN  account@example.com  上游异常结束且没有交出内容，按错误结束（ABNORMAL_FINISH_ERROR，对外 502） | 结束原因=MALFORMED_FUNCTION_CALL | 共生成=3 次
+```
+
+保存 `ABNORMAL_FINISH_ERROR` 且取值变化时运行日志写一行 INFO `异常结束按错误返回设置已更新并立即生效 | 开启=<BOOL>（ABNORMAL_FINISH_ERROR）`。
 
 结束原因为 `missing_thought_signature`（缺少思考签名）、`too_many_tool_calls`（工具调用过多）或 `malformed_response`（响应格式异常，AI Studio 页面显示 Content blocked；Playground 终止原因 19 原先记为 `provider_19`）时，请求时间线另写一行 WARN 写明原因与建议（不论上游有没有给出结束说明）。客户端经 new-api 等中转时只看到 `content_filter` 或空回复（中转把不认识的结束原因一律当作内容拦截），原因只能在这里看；Gemini 响应的 `finishReason` 为官方枚举名 `MISSING_THOUGHT_SIGNATURE`、`TOO_MANY_TOOL_CALLS`、`MALFORMED_RESPONSE`：
 
@@ -664,7 +704,7 @@ WARN  service        视频模型带图请求被官网拒绝（没有权限）�
 
 经排查路由（`/trace/`）的 Omni 请求，排查记录的 `attempts[].requests` 有发往上游的 CreateInteractionStream 请求体（图片 Base64 只留长度、指纹与开头），`attempts[].upstream_head` 为上游原始响应开头（上游返回 HTTP 错误时为错误响应体），`timeline` 有上面的请求结构摘要与 4xx 证据行（与请求日志同一行，来源为执行账号），`notes` 有 `CreateInteractionStream binding | 字节=<N> | sha256=<HEX>`（参与 WAA proof 的 binding 字符串的字节数与摘要，与官网页面算 proof 时的输入对照用；`OMNI_IMAGE_BINDING` 开启且带图时字节数含图片 Base64，是否计入见请求结构摘要的 `校验值含图片`）。
 
-启用账户的 Drive 授权状态计数见 `GET /api/status` 的 `drive`（`available` 换到过 Drive token 或经本服务登录时完成了 Drive 授权、`unavailable` 没有 Drive 授权、`unknown` 还没试过或记录已过期；可用、不可用各 24 小时，写在 `runtime/model-catalogs/drive-accounts.json`，重启后沿用），管理页侧栏写 `Drive 授权 · 可用 N · 不可用 N · 未知 N`（有启用账户却没有可用也没有未知的账户时标黄），`bash tools/diag_start.sh` 状态段写一行 `Drive 授权：可用 N，不可用 N，未知 N`（没有可用或未知的账户时附一句 gemini-omni 的视频输入（及不能内联的图片）会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）。
+启用账户的 Drive 授权状态计数见 `GET /api/status` 的 `drive`（`available` 换到过 Drive token 或经本服务登录时完成了 Drive 授权、`unavailable` 没有 Drive 授权、`unknown` 还没试过或记录已过期；可用、不可用各 24 小时，写在 `runtime/model-catalogs/drive-accounts.json`，重启后沿用），管理页侧栏写 `Drive 授权 · 可用 N · 不可用 N · 未知 N`（有启用账户却没有可用也没有未知的账户时标黄），`bash tools/diag_start.sh` 状态段写一行 `Drive 授权：可用 N，不可用 N，未知 N`（有空间已满的账户时在不可用之后另写 `，空间已满 N`）（没有可用或未知的账户时附一句 gemini-omni 的视频输入（及不能内联的图片）会返回 400，PNG、JPEG、WebP 等能内联的图片不受影响）。
 
 Drive 授权状态记录的运行日志（`service`）：装配运行时恢复写盘的记录时写 `Drive 授权状态载入 | 记录=<N> | 恢复=<M>（账户已删除、重新登录或已过期的不恢复）`（INFO，没有记录时不写）；写盘失败时写 `Drive 授权状态记录写入失败 | 错误=<原因>`（WARN，下次有变化时重写），文件损坏时写 `Drive 授权状态记录读取失败，从空开始 | 文件=<路径> | 错误=<原因>`（WARN）。
 
@@ -673,7 +713,7 @@ Drive 授权状态记录的运行日志（`service`）：装配运行时恢复�
 控制台每行是一条独立 JSON 事件，请求数据与中文摘要分离：
 
 ```json
-{"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"工具调用完成","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064}}}
+{"time":"2026-09-06T14:11:47Z","level":"INFO","msg":"工具调用完成","event":"request.finished","source":"account@example.com","request":{"id":"chatcmpl_example","state":"tool_calls","model":"gemini-3.8-flash","status":200,"duration_ms":4758,"tool_calls":1,"finish_reason":"stop","usage":{"input_tokens":100,"reasoning_tokens":32,"reply_tokens":38,"output_tokens":70,"total_tokens":170,"average_tokens_per_second":14.712064,"generation_tokens_per_second":31.25}}}
 ```
 
 客户端请求的模型名与最终的 `model` 不同时，`request.finished` 另带 `requested_model`，与同一请求 `request.started` 的 `model` 含义相同：协议层已解析名称后缀（`-high`、`-online` 等）与 `long-` 前缀，号池目录里的别名还没换成正式 ID。例如请求一个只作为 Omni 别名存在的名字时，`request.started` 的 `model` 与 `request.finished` 的 `requested_model` 都是这个名字，`request.finished` 的 `model` 为 Omni 的正式 ID；额度用完改用其他模型时 `model` 为目标模型、`fallback_from` 为改用前的模型、`requested_model` 为客户端请求的名字。两者相同时不带这个字段（旧版本也没有），其他字段与用量账本不变：
@@ -1157,6 +1197,7 @@ WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash
 | `文件引用复制` | Drive file 已临时复制到本次目标账户 |
 | `内联附件处理完成` | 本次请求的附件数量、原始字节数与处理耗时：附件已上传为临时 Drive 文件（Build 通道直接携带附件，同样写这一行） |
 | `Drive 未授权，附件改为内联` | `Drive 未授权，附件改为内联 \| 附件=<N> \| 原始=<B>B \| 耗时=<d>`（INFO）：Playground 通道上账号没有 Drive 授权（`GenerateAccessToken` 返回 401 / 协议错误码 16，或 24 小时内记着它返回过，这时不换 token、耗时接近 0），附件随生成请求内联发送，不冷却、不换号（Interaction 模型的视频与不能内联的图片不能内联：不写这一行，改写 `账号没有 Drive 授权，Omni 的视频（及不能内联的图片）无法发送…` 并换号；PNG、JPEG、WebP 等能内联的图片本来就按官网内联发送、不经上传，见上文）；同账号 10 分钟最多一行，走独立的控制台队列（`logDurable`），普通日志挤满控制台队列时也不丢。写这一行时不写 `内联附件处理完成`，诊断按开头分开计数 |
+| `Drive 空间已满，附件改为内联` | `Drive 空间已满，附件改为内联 \| 附件=<N> \| 原始=<B>B \| 耗时=<d>`（INFO）：与上一行相同，只是原因为账号的 Drive 存储空间已满（Drive 上传返回 403 `storageQuotaExceeded`，或 24 小时内记着它返回过，这时不换 token、不上传）；附件随生成请求内联发送，不冷却、不换号，Drive 的 403 不计入 403 自动暂停。Interaction 模型的视频与不能内联的图片改写 `账号 Drive 空间已满，Omni 的视频（及不能内联的图片）无法发送…` 并换号。与 `Drive 未授权` 共用同账号 10 分钟一行的限频 |
 | `临时文件清理失败` | 本次请求的临时 Drive 文件回收失败，原始错误保留（`DriveDelete` 返回 404 时按文件已删除处理、照常解绑，不写这一行；失败的尝试里回收副本的错误照旧并进这次的错误，但不参与是否换号的判断） |
 | `转录账号切换` | 转录生成阶段在首个结果前切换候选 |
 | `Bidi 账号切换` | Live/Robotics setup 阶段切换候选 |

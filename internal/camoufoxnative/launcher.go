@@ -32,8 +32,13 @@ type browserProcess struct {
 	waitErr error
 	profile string
 	lock    *flock.Flock
+	// output 为最近的输出（已去掉敏感内容，见 browser_exit.go），drained 在 stdout 与 stderr 都读完后关闭
+	output  *browserOutput
+	drained chan struct{}
 	mu      sync.Mutex
-	closed  bool
+	// stopping 表示服务已开始关闭这个进程（之后的退出不是自行退出，不报退出码）
+	stopping bool
+	closed   bool
 }
 
 // launchBrowser 启动 Camoufox 并返回原生 WebDriver BiDi 端点
@@ -77,31 +82,56 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 	command := exec.Command(options.ExecutablePath, arguments...)
 	command.Env = environment
 	configureBrowserProcess(command, options.Headless)
-	stdout, err := command.StdoutPipe()
+	// stdout 与 stderr 用 os.Pipe（不用 StdoutPipe）：Wait 不关读端，进程退出前最后的输出读得完（写进退出错误，见 browser_exit.go）
+	stdout, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
 	}
-	stderr, err := command.StderrPipe()
+	stderr, stderrWriter, err := os.Pipe()
 	if err != nil {
+		_ = stdout.Close()
+		_ = stdoutWriter.Close()
 		_ = removeProfile(profile, profileLock)
 		return nil, "", err
 	}
-	if err := command.Start(); err != nil {
+	command.Stdout, command.Stderr = stdoutWriter, stderrWriter
+	err = command.Start()
+	_ = stdoutWriter.Close()
+	_ = stderrWriter.Close()
+	if err != nil {
+		_ = stdout.Close()
+		_ = stderr.Close()
 		_ = removeProfile(profile, profileLock)
 		return nil, "", fmt.Errorf("启动 Camoufox: %w", err)
-	}
-	if err := attachBrowserProcess(command); err != nil {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		_ = removeProfile(profile, profileLock)
-		return nil, "", fmt.Errorf("绑定 Camoufox 进程: %w", err)
 	}
 	process := &browserProcess{
 		command: command,
 		done:    make(chan struct{}),
 		profile: profile,
 		lock:    profileLock,
+		output:  &browserOutput{},
+		drained: make(chan struct{}),
+	}
+	endpoints := make(chan string, 2)
+	var scanned sync.WaitGroup
+	for _, reader := range []*os.File{stdout, stderr} {
+		scanned.Add(1)
+		go func() {
+			defer scanned.Done()
+			scanBrowserOutput(reader, options.Log, endpoints, process.output)
+			_ = reader.Close()
+		}()
+	}
+	go func() {
+		scanned.Wait()
+		close(process.drained)
+	}()
+	if err := attachBrowserProcess(command); err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		_ = removeProfile(profile, profileLock)
+		return nil, "", fmt.Errorf("绑定 Camoufox 进程: %w", err)
 	}
 	go func() {
 		waitErr := command.Wait()
@@ -110,9 +140,6 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		process.mu.Unlock()
 		close(process.done)
 	}()
-	endpoints := make(chan string, 2)
-	go scanBrowserOutput(stdout, options.Log, endpoints)
-	go scanBrowserOutput(stderr, options.Log, endpoints)
 	timeout := options.ReadyTimeout
 	if timeout <= 0 {
 		timeout = 45 * time.Second
@@ -124,14 +151,11 @@ func launchBrowser(ctx context.Context, options Options, config map[string]any) 
 		return process, normalizeBiDiEndpoint(endpoint), nil
 	case <-process.done:
 		process.mu.Lock()
-		err := process.waitErr
 		process.closed = true
 		process.mu.Unlock()
 		_ = removeProfile(profile, profileLock)
-		if err == nil {
-			err = errors.New("Camoufox 在报告 BiDi 端点前退出")
-		}
-		return nil, "", err
+		// 写明退出码与最近的输出（等输出读完有上限，见 exitedError）
+		return nil, "", process.exitedError(browserExitBeforeEndpoint, browserExitWait)
 	case <-timer.C:
 		return nil, "", process.abortLaunch(fmt.Errorf("等待 Camoufox BiDi 端点超时: %s", timeout))
 	case <-ctx.Done():
@@ -180,6 +204,7 @@ func (process *browserProcess) close(timeout time.Duration, terminate browserPro
 		process.mu.Unlock()
 		return nil
 	}
+	process.stopping = true
 	process.mu.Unlock()
 	if timeout <= 0 {
 		timeout = browserProcessCloseTimeout
@@ -207,7 +232,8 @@ func (process *browserProcess) close(timeout time.Duration, terminate browserPro
 	return nil
 }
 
-func scanBrowserOutput(reader io.Reader, mirror io.Writer, endpoints chan<- string) {
+// scanBrowserOutput 逐行读取浏览器输出：照常转写到 mirror、找 BiDi 端点，另把最近几行记进 output（退出时写进错误，见 browser_exit.go）
+func scanBrowserOutput(reader io.Reader, mirror io.Writer, endpoints chan<- string, output *browserOutput) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	for scanner.Scan() {
@@ -215,6 +241,7 @@ func scanBrowserOutput(reader io.Reader, mirror io.Writer, endpoints chan<- stri
 		if mirror != nil {
 			_, _ = fmt.Fprintln(mirror, line)
 		}
+		output.add(line)
 		if endpoint := bidiEndpointPattern.FindString(line); endpoint != "" {
 			select {
 			case endpoints <- endpoint:

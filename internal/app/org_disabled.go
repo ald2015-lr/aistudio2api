@@ -31,7 +31,12 @@ import (
 //     恢复标记（reconcileOrgDisabled）；
 //   - 清除：认证文件更新（外部替换、重新导入、浏览器登录，以及服务停止期间替换，识别方式与 403 登记相同）、管理员在管理页清除、
 //     长间隔复查（orgDisabledRecheck，±10%）时上游不再返回 app is disabled；清除后立即恢复调度，模型目录随即按常规同步。
-//     复查遇到其他失败（5xx、网络、空目录、401 等）时仍是组织停用，复查时间按退避顺延并写回登记表（见 orgRecheckFailedLocked）
+//     复查遇到其他失败（5xx、网络、空目录、401 等）时仍是组织停用，复查时间按退避顺延并写回登记表（见 orgRecheckFailedLocked）。
+//
+// 官网拒绝账号使用 AI Studio 的其他原因（Google 限制了该账号 servicerestricted、年龄或使用资格要求、Workspace 没有开放 AI Studio，
+// 见 aistudio/org_disabled.go，按上游 Mag1cFall/AIStudio2API a68acad 移植）走同一套进入、持久化、复查与清除：登记表另记种类
+// （kind，组织停用为空，旧文件照旧读作组织停用），账户池标记带种类，日志、管理页与状态说明按种类写原因。
+// AI Studio 不支持当前出口地区（aistudio.ErrRegionNotSupported）是出口的问题，不进这个状态
 const (
 	orgDisabledFileName  = ".org-disabled.json"
 	orgDisabledSaveDelay = 3 * time.Second
@@ -47,7 +52,10 @@ const (
 // Message 为最近一次的原文（已打码、截短）；CheckAt 为下一次长间隔复查的时间；RecheckFailures 为复查连续没有结论
 // （上游返回其他失败，见 catalogSyncer.orgRecheckFailedLocked）的次数，复查退避据此计算，再次确认组织停用时清零
 type orgDisabledEntry struct {
-	Identity        string    `json:"identity,omitempty"`
+	Identity string `json:"identity,omitempty"`
+	// Kind 为原因种类（aistudio.Restriction），组织停用为空：服务受限、年龄或使用资格、Workspace 未开放时为对应的种类名，
+	// 重启后按它恢复账户池标记的种类与说明
+	Kind            string    `json:"kind,omitempty"`
 	Source          string    `json:"source"`
 	LastSource      string    `json:"last_source,omitempty"`
 	FirstAt         time.Time `json:"first_at"`
@@ -140,11 +148,12 @@ func (registry *orgDisabledRegistry) nextCheck(now time.Time) time.Time {
 	return now.Add(time.Duration(float64(orgDisabledRecheck) * (0.9 + 0.2*value)))
 }
 
-// record 登记一次组织停用，返回是否新登记的账户与下一次复查的时间。identity 为空时保留之前记下的；
-// 已登记的账户（复查仍是组织停用、其他路径再次遇到）只更新最近一次的来源、时间、次数与原文，复查时间顺延
-func (registry *orgDisabledRegistry) record(accountID, source, message, identity string, now time.Time) (bool, time.Time) {
+// record 登记一次组织停用（kind 为原因种类），返回是否新登记的账户、已登记账户的原因种类是否变了与下一次复查的时间。
+// identity 为空时保留之前记下的；已登记的账户（复查仍是组织停用、其他路径再次遇到）只更新最近一次的来源、时间、次数、原文与种类，
+// 复查时间顺延
+func (registry *orgDisabledRegistry) record(accountID, source, message, identity string, kind aistudio.Restriction, now time.Time) (bool, bool, time.Time) {
 	if registry == nil {
-		return false, time.Time{}
+		return false, false, time.Time{}
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
@@ -154,6 +163,9 @@ func (registry *orgDisabledRegistry) record(accountID, source, message, identity
 		entry = &orgDisabledEntry{Source: source, FirstAt: now}
 		registry.accounts[accountID] = entry
 	}
+	name := restrictionKindName(kind)
+	kindChanged := !added && entry.Kind != name
+	entry.Kind = name
 	if identity != "" {
 		entry.Identity = identity
 	}
@@ -164,7 +176,24 @@ func (registry *orgDisabledRegistry) record(accountID, source, message, identity
 	entry.CheckAt = registry.nextCheck(now)
 	entry.RecheckFailures = 0
 	registry.scheduleSaveLocked()
-	return added, entry.CheckAt
+	return added, kindChanged, entry.CheckAt
+}
+
+// restrictionKindName 返回原因种类写进登记表的名字：组织停用（含空串与不认识的值）为空，其余为种类名
+func restrictionKindName(kind aistudio.Restriction) string {
+	if kind = aistudio.ParseRestriction(string(kind)); kind == aistudio.RestrictionOrgDisabled {
+		return ""
+	}
+	return string(kind)
+}
+
+// restrictionSubject 返回进入状态的日志与新账户自动处理写的原因主语：组织停用沿用“账号所属组织已停用 AI Studio”
+// （诊断脚本按这串识别），其余为种类的固定文案
+func restrictionSubject(kind aistudio.Restriction) string {
+	if kind = aistudio.ParseRestriction(string(kind)); kind == aistudio.RestrictionOrgDisabled {
+		return "账号所属组织已停用 AI Studio"
+	}
+	return kind.Reason()
 }
 
 // postpone 把账户下一次长间隔复查顺延到 at（只往后，不提前），记下复查连续没有结论的次数，返回顺延后的复查时间；
@@ -365,8 +394,8 @@ func orgDisabledCauseSummary(cause error) string {
 	return text
 }
 
-// reportOrgDisabled 为账户池的组织停用回调（aistudio 内部识别出组织停用、Worker 启动时页面停在组织停用页时调用，
-// 见 aistudio.OrgDisabledReporter 与 accountWorkerManager.confirmOrgDisabled）
+// reportOrgDisabled 为账户池的组织停用回调（aistudio 内部识别出组织停用、Worker 启动时页面停在组织停用页等拒绝页时调用，
+// 见 aistudio.OrgDisabledReporter 与 accountWorkerManager.confirmOrgDisabled）；原因种类按 cause 归类（aistudio.RestrictionOf）
 func (service *trackedService) reportOrgDisabled(accountID string, source string, cause error) {
 	if service == nil || service.pool == nil {
 		return
@@ -384,11 +413,29 @@ func (service *trackedService) accountLabel(accountID string) string {
 	return accountID
 }
 
-// enterOrgDisabled 让账户进入组织停用状态（各来源共用）：账户池记标记（不再参与任何调度），登记表记下来源、时间与原文（持久化），
-// 驻留 Worker 登记释放（空闲即关，忙碌等请求结束；不再接新请求），模型目录改为长间隔复查。新进入时写一行持久日志
-// “账号所属组织已停用 AI Studio，停止调度”，已在这个状态的账户再次遇到时不再写。账户不存在（已删除）时什么都不做。
-// 调用方不能持有账户池锁：可能在目录同步、请求的租约内调用（只写标记、不等租约）
+// enterOrgDisabled 让账户进入组织停用状态（各来源共用），原因种类按 cause 归类（页面停在哪种拒绝页、上游 RPC 的文案，
+// 见 aistudio.RestrictionOf；认不出时为组织停用），见 enterRestricted。cause 为账户已在这个状态时不启动、不发布 Worker 的哨兵
+// （errWorkerOrgDisabled、errWorkerOrgDisabledDuringStart，见 alreadyRestrictedSentinel）时什么都不做
 func (service *trackedService) enterOrgDisabled(accountID string, label string, source string, cause error) {
+	if alreadyRestrictedSentinel(cause) {
+		return
+	}
+	service.enterRestricted(accountID, label, source, aistudio.RestrictionOf(cause), cause)
+}
+
+// alreadyRestrictedSentinel 判断错误是否为账户已在组织停用（或受限）状态时不启动、不发布 Worker 的哨兵。它们满足
+// aistudio.OrgDisabledFailure（请求按已冷却换号），但不带原因种类，也不是新的证据：请求尝试（排队等启动名额期间账户被其他路径标记）
+// 与 aistudio 的请求失败回调拿到它们时不再登记。原先按“认不出种类”记成组织停用，服务受限、年龄或资格不符、Workspace 未开放的账户
+// 种类被改写并持久化，登记的原文、复查时间与次数也被这句通用文案改写
+func alreadyRestrictedSentinel(err error) bool {
+	return err != nil && (errors.Is(err, errWorkerOrgDisabled) || errors.Is(err, errWorkerOrgDisabledDuringStart))
+}
+
+// enterRestricted 让账户进入组织停用状态（kind 为原因种类）：账户池记标记（不再参与任何调度），登记表记下来源、时间、原文与种类
+// （持久化），驻留 Worker 登记释放（空闲即关，忙碌等请求结束；不再接新请求），模型目录改为长间隔复查。新进入或原因种类变了时写一行
+// 持久日志“<原因>，停止调度”（组织停用为“账号所属组织已停用 AI Studio，停止调度”），已在这个状态的账户再次遇到时不再写。
+// 账户不存在（已删除）时什么都不做。调用方不能持有账户池锁：可能在目录同步、请求的租约内调用（只写标记、不等租约）
+func (service *trackedService) enterRestricted(accountID string, label string, source string, kind aistudio.Restriction, cause error) {
 	if service == nil || service.pool == nil {
 		return
 	}
@@ -396,10 +443,11 @@ func (service *trackedService) enterOrgDisabled(accountID string, label string, 
 	if !exists {
 		return
 	}
+	kind = aistudio.ParseRestriction(string(kind))
 	now := time.Now()
 	message := orgDisabledCauseSummary(cause)
-	added, checkAt := service.orgDisabled.record(accountID, source, message, identity, now)
-	marked, err := service.pool.MarkOrgDisabled(accountID, aistudio.OrgDisabledReason)
+	added, kindChanged, checkAt := service.orgDisabled.record(accountID, source, message, identity, kind, now)
+	marked, err := service.pool.MarkOrgDisabled(accountID, kind)
 	if err != nil {
 		return
 	}
@@ -407,17 +455,17 @@ func (service *trackedService) enterOrgDisabled(accountID string, label string, 
 		// 没有登记表（测试直接构造的服务）：只在内存里排复查
 		checkAt = now.Add(orgDisabledRecheck)
 	}
-	if (added || marked) && service.requests != nil {
+	if (added || marked || kindChanged) && service.requests != nil {
 		if strings.TrimSpace(label) == "" {
 			label = accountID
 		}
 		// 持久行：控制台队列满时也不丢，诊断脚本按“来源=”分组
 		service.requests.logDurable(label, "WARN", fmt.Sprintf(
-			"账号所属组织已停用 AI Studio，停止调度 | 来源=%s | 下次复查=%s | 原文=%s",
-			source, checkAt.UTC().Format(time.RFC3339), message,
+			"%s，停止调度 | 来源=%s | 下次复查=%s | 原文=%s",
+			restrictionSubject(kind), source, checkAt.UTC().Format(time.RFC3339), message,
 		))
 	}
-	service.workers.releaseUnschedulable(accountID, unschedulableOrgDisabled)
+	service.workers.releaseUnschedulable(accountID, aistudio.RestrictionUnschedulable(kind))
 	service.catalogSync.noteOrgDisabled(accountID, checkAt)
 	if marked {
 		service.publishModelAccess()
@@ -474,6 +522,15 @@ func (service *trackedService) orgDisabledIdentity(accountID string) (string, bo
 	}
 	entry, listed := service.orgDisabled.entryOf(accountID)
 	return entry.Identity, listed
+}
+
+// orgDisabledKind 返回账户登记的原因种类（没有登记时为组织停用）
+func (service *trackedService) orgDisabledKind(accountID string) aistudio.Restriction {
+	if service == nil {
+		return aistudio.RestrictionOrgDisabled
+	}
+	entry, _ := service.orgDisabled.entryOf(accountID)
+	return aistudio.ParseRestriction(entry.Kind)
 }
 
 // orgDisabledListed 返回账户是否处于组织停用状态（登记表或账户池的标记）
@@ -539,7 +596,8 @@ func (service *trackedService) reconcileOrgDisabled() {
 		case identity != "" && current != identity:
 			service.forgetOrgDisabled(accountID, "启动时发现认证文件已更新")
 		default:
-			if _, err := service.pool.MarkOrgDisabled(accountID, aistudio.OrgDisabledReason); err == nil {
+			// 按登记的种类恢复（服务受限等的说明不同；旧文件没有种类，按组织停用）
+			if _, err := service.pool.MarkOrgDisabled(accountID, service.orgDisabledKind(accountID)); err == nil {
 				restored++
 			}
 		}
@@ -579,10 +637,12 @@ func (admin *runtimeAdmin) OrgDisabled(context.Context) ([]api.AdminOrgDisabled,
 		if lastSource == "" {
 			lastSource = item.entry.Source
 		}
+		kind := aistudio.ParseRestriction(item.entry.Kind)
 		result = append(result, api.AdminOrgDisabled{
 			ID: item.accountID, Label: label, Source: item.entry.Source, LastSource: lastSource,
 			Count: item.entry.Count, FirstAt: item.entry.FirstAt, LastAt: item.entry.LastAt,
 			CheckAt: item.entry.CheckAt, Message: item.entry.Message,
+			Restriction: string(kind), Reason: kind.Reason(),
 		})
 	}
 	return result, nil

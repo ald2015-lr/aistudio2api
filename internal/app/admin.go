@@ -199,7 +199,9 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	var drive *api.AdminDriveCounts
 	if source, ok := admin.service.service.(driveSummarySource); ok {
 		summary := source.DriveSummary()
-		drive = &api.AdminDriveCounts{Available: summary.Available, Unavailable: summary.Unavailable, Unknown: summary.Unknown}
+		drive = &api.AdminDriveCounts{
+			Available: summary.Available, Unavailable: summary.Unavailable, StorageFull: summary.StorageFull, Unknown: summary.Unknown,
+		}
 	}
 	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
 	counts.AuthRequired10m = admin.service.authMarks.count(time.Now(), authRecentWindow)
@@ -757,9 +759,9 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 			"账户登录失败 | 耗时=%s | 错误=%s",
 			time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
 		))
-		// 登录后页面被跳到组织停用页：可见浏览器里登录的不一定是这个账户（落到这一页时还读不到登录邮箱），先在租约内用账户已保存的
-		// 认证文件复核接口，也返回 app is disabled 才进入组织停用状态（见 org_disabled.go）
-		confirmed := aistudio.OrgDisabledFailure(err) && admin.loginOrgDisabledConfirmed(ctx, lease)
+		// 登录后页面被跳到组织停用页（或服务受限、年龄要求、Workspace 说明页）：可见浏览器里登录的不一定是这个账户（落到这一页时还读不到
+		// 登录邮箱），先在租约内用账户已保存的认证文件复核接口，也返回拒绝账号的文案才进入组织停用状态（原因种类按页面，见 org_disabled.go）
+		confirmed := aistudio.OrgDisabledFailure(err) && admin.loginOrgDisabledConfirmed(ctx, lease, aistudio.RestrictionOf(err))
 		releaseErr := lease.Release()
 		if confirmed {
 			admin.service.enterOrgDisabled(account.ID, account.Config.Label, aistudio.OrgDisabledFromLogin, err)
@@ -816,11 +818,12 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	return admin.account(account.ID)
 }
 
-// loginOrgDisabledConfirmed 在浏览器登录落到组织停用页后，用账户已保存的认证文件经 Go HTTP 复核一次 GetAiStudioBenefitTier
-// （ProbeLogin，不续签、不改账户状态），返回是否确认是这个账户所属组织停用了 AI Studio：只有接口同样返回 app is disabled 才确认。
+// loginOrgDisabledConfirmed 在浏览器登录落到组织停用页（或服务受限等拒绝页，kind 为页面的原因种类）后，用账户已保存的认证文件经
+// Go HTTP 复核一次 GetAiStudioBenefitTier（ProbeLogin，不续签、不改账户状态），返回是否确认是这个账户用不了 AI Studio：只有接口同样
+// 返回拒绝账号的文案（app is disabled、Account not supported.、Early Access Apps disabled.）才确认。
 // 管理员对账户 A 点“重新登录”却在可见浏览器里登录了被组织停用的 B 时，A 自己的认证文件复核通过（或 401、出错），不把 A 标为组织停用；
 // 不确认时写一行警告，账户状态不变。服务不支持复核时同样不确认
-func (admin *runtimeAdmin) loginOrgDisabledConfirmed(ctx context.Context, lease *aistudio.AccountLease) bool {
+func (admin *runtimeAdmin) loginOrgDisabledConfirmed(ctx context.Context, lease *aistudio.AccountLease, kind aistudio.Restriction) bool {
 	label := lease.Account().Config.Label
 	outcome := "跳过"
 	if prober, ok := admin.service.service.(loginProber); ok {
@@ -838,7 +841,12 @@ func (admin *runtimeAdmin) loginOrgDisabledConfirmed(ctx context.Context, lease 
 			outcome = "出错"
 		}
 	}
-	admin.requests.log(label, "WARN", "账户登录 | 登录后停在组织停用页，但已保存的认证文件接口复核没有返回 app is disabled"+
+	// 组织停用沿用原来的写法；服务受限等写明是哪种拒绝页
+	page, expected := "组织停用页", " app is disabled"
+	if kind = aistudio.ParseRestriction(string(kind)); kind != aistudio.RestrictionOrgDisabled {
+		page, expected = "拒绝页（"+aistudio.RestrictionReason(kind)+"）", "拒绝账号的文案"
+	}
+	admin.requests.log(label, "WARN", "账户登录 | 登录后停在"+page+"，但已保存的认证文件接口复核没有返回"+expected+
 		"（可能在浏览器里登录了别的账号），账户状态不变 | 接口复核="+outcome)
 	return false
 }
@@ -926,11 +934,13 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 				verification.Authenticated = false
 				verification.Reason = verifyAPIRejectedReason
 			case aistudio.OrgDisabledFailure(probeErr):
-				// 浏览器停在 AI Studio，接口却返回 “AI Studio app is disabled”：同样是账号所属组织停用了 AI Studio
+				// 浏览器停在 AI Studio，接口却返回 “AI Studio app is disabled”（或 “Account not supported.”“Early Access Apps disabled.”）：
+				// 同样是账号用不了 AI Studio，原因种类按接口文案
 				apiCheck = "组织停用"
 				verification.Authenticated = false
 				verification.OrgDisabled = true
-				verification.Reason = aistudio.OrgDisabledReason
+				verification.Restriction = aistudio.RestrictionOf(probeErr)
+				verification.Reason = aistudio.RestrictionReason(verification.Restriction)
 			default:
 				// 上游 429、连接失败等不能说明登录失效：按浏览器的结论处理，随后的目录同步照常
 				apiCheck = "出错"
@@ -949,15 +959,16 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 		verification.Reason = reason
 	}
 	if verification.OrgDisabled {
-		// 账号所属组织停用了 AI Studio（页面停在组织停用页，或接口返回 app is disabled）：不是登录失效，不标需要登录，
-		// 释放账户后进入组织停用状态（见 org_disabled.go）
+		// 账号所属组织停用了 AI Studio（页面停在组织停用页，或接口返回 app is disabled；服务受限、年龄要求、Workspace 未开放同样）：
+		// 不是登录失效，不标需要登录，释放账户后按原因种类进入组织停用状态（见 org_disabled.go）
 		if err := lease.Release(); err != nil {
 			return aistudio.LoginVerification{}, err
 		}
-		admin.service.enterOrgDisabled(account.ID, account.Config.Label, aistudio.OrgDisabledFromVerify, errors.New(reason))
+		kind := aistudio.ParseRestriction(string(verification.Restriction))
+		admin.service.enterRestricted(account.ID, account.Config.Label, aistudio.OrgDisabledFromVerify, kind, errors.New(reason))
 		admin.requests.log(account.Config.Label, "INFO", fmt.Sprintf(
 			"账户验证完成 | 已认证=false | 耗时=%s | 接口复核=%s | 页面=%s | 原因=%s",
-			time.Since(startedAt).Round(time.Millisecond), apiCheck, orDash(verification.PageURL), aistudio.OrgDisabledReason,
+			time.Since(startedAt).Round(time.Millisecond), apiCheck, orDash(verification.PageURL), aistudio.RestrictionReason(kind),
 		))
 		return verification, nil
 	}
@@ -1182,11 +1193,16 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 	copy(models, status.Models)
 	message := status.Message
 	if !status.Enabled {
-		// 停用账户显示停用原因与时间；所属组织停用了 AI Studio 时接上这个原因（新账户自动处理验证未通过的停用原因里已经带着时不重复）
+		// 停用账户显示停用原因与时间；所属组织停用了 AI Studio（或服务受限等）时接上这个原因（新账户自动处理验证未通过的停用原因里
+		// 已经带着时不重复）
 		message = accountDisableNotes.message(status.ID)
-		if status.OrgDisabled && !strings.Contains(message, aistudio.OrgDisabledReason) {
-			message += "；" + aistudio.OrgDisabledReason
+		if reason := aistudio.RestrictionReason(status.Restriction); status.OrgDisabled && !strings.Contains(message, reason) {
+			message += "；" + reason
 		}
+	}
+	restriction := ""
+	if status.OrgDisabled {
+		restriction = string(aistudio.ParseRestriction(string(status.Restriction)))
 	}
 	return api.AdminAccount{
 		ID: status.ID, Label: status.Label, Enabled: status.Enabled, State: string(status.State),
@@ -1194,8 +1210,8 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		Models: models, BenefitTier: status.BenefitTier, Message: message,
 		BenefitTierKnown: status.BenefitTierKnown, Pool: status.Pool,
 		ProxyPoolSlot: status.ProxySlot, ProxyPoolActive: status.ProxySlotActive,
-		OrgDisabled: status.OrgDisabled,
-		Transition:  string(status.Transition), ActiveRequests: status.ActiveRequests,
+		OrgDisabled: status.OrgDisabled, Restriction: restriction,
+		Transition: string(status.Transition), ActiveRequests: status.ActiveRequests,
 	}
 }
 
@@ -1361,6 +1377,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.OmniImageBinding != nil {
 		omniImageBinding = *value.OmniImageBinding
 	}
+	// 异常结束按错误返回（ABNORMAL_FINISH_ERROR）：旧版页面保存时不带该字段，沿用现值
+	abnormalFinishError := saved.AbnormalFinishError
+	if value.AbnormalFinishError != nil {
+		abnormalFinishError = *value.AbnormalFinishError
+	}
 	// 自动续写：旧版页面保存时不带这些字段，沿用现值（默认总上限可以为 0，不能用零值判断是否缺省）
 	longOutputEnabled, longOutputMaxTokens := saved.LongOutputEnabled, saved.LongOutputMaxTokens
 	if value.LongOutputEnabled != nil {
@@ -1459,6 +1480,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce,
+		AbnormalFinishError:    abnormalFinishError,
 		MinOutputTokens:        value.MinOutputTokens,
 		OmniIgnoreSystemPrompt: omniIgnoreSystemPrompt,
 		OmniImageBinding:       omniImageBinding,
@@ -2182,6 +2204,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,
 		OmniIgnoreSystemPrompt: &cfg.OmniIgnoreSystemPrompt,
 		OmniImageBinding:       &cfg.OmniImageBinding,
+		AbnormalFinishError:    &cfg.AbnormalFinishError,
 		LongOutputEnabled:      &cfg.LongOutputEnabled,
 		LongOutputMaxTokens:    &cfg.LongOutputMaxTokens,
 		UltraWarmWorkerLimit:   &cfg.UltraWarmWorkerLimit,

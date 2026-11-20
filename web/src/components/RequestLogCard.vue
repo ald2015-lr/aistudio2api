@@ -7,6 +7,16 @@ import UiIcon from './UiIcon.vue'
 const props = defineProps<{ row: LogRow }>()
 const { t, tf, locale } = useI18n()
 const request = computed(() => props.row.entry.request!)
+// speed 为卡片的平均速度：只计首个上游分块之后（generation_tokens_per_second）；只有一个分块或旧版服务端的记录没有该字段时，
+// 按原来的口径（输出除以总耗时）显示，提示随之说明是哪一种
+const speed = computed(() => {
+  const usage = request.value.usage
+  if (usage === undefined) return undefined
+  if (usage.generation_tokens_per_second !== undefined) {
+    return { value: usage.generation_tokens_per_second, help: t('logs.averageSpeedHelp') }
+  }
+  return { value: usage.average_tokens_per_second, help: t('logs.averageSpeedTotalHelp') }
+})
 
 // number 按当前语言格式化统计数值
 function number(value: number, digits = 0): string {
@@ -47,9 +57,8 @@ function number(value: number, digits = 0): string {
       <span
         >{{ t('logs.outputTotal') }} <b>{{ number(request.usage.output_tokens) }}</b> tokens</span
       >
-      <span
-        >{{ t('logs.averageSpeed') }}
-        <b>{{ number(request.usage.average_tokens_per_second, 1) }}</b> tokens/s</span
+      <span v-if="speed" v-tooltip="speed.help"
+        >{{ t('logs.averageSpeed') }} <b>{{ number(speed.value, 1) }}</b> tokens/s</span
       >
     </div>
     <p v-if="request.error" class="request-error">{{ request.error }}</p>

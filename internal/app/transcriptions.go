@@ -162,7 +162,32 @@ func (service *trackedService) transcriptionCandidates(ctx context.Context, mode
 		// 区分原因：全部冷却按 429，账户都不可调度按 503，没有账户支持该模型才按请求本身的原因
 		return nil, service.pool.NoCandidateError(selection, groups)
 	}
+	if source, ok := service.service.(driveCandidateSource); ok {
+		candidates = withoutDriveUnavailable(candidates, source.DriveCandidates(ctx, selection))
+	}
 	return candidates, nil
+}
+
+// withoutDriveUnavailable 去掉记着 Drive 不可用（没有 Drive 授权）或存储空间已满的候选（见 aistudio/drive_memory.go）：转写先把音频
+// 上传到账户的 Drive，选到它们只会白传一次再换号；候选全都记着不可用时照旧全部保留（记录可能已过时，上传成功即清除）
+func withoutDriveUnavailable(candidates []string, drive aistudio.DriveCandidates) []string {
+	if len(drive.Unavailable) == 0 {
+		return candidates
+	}
+	unavailable := make(map[string]struct{}, len(drive.Unavailable))
+	for _, accountID := range drive.Unavailable {
+		unavailable[accountID] = struct{}{}
+	}
+	kept := make([]string, 0, len(candidates))
+	for _, accountID := range candidates {
+		if _, skip := unavailable[accountID]; !skip {
+			kept = append(kept, accountID)
+		}
+	}
+	if len(kept) == 0 {
+		return candidates
+	}
+	return kept
 }
 
 var _ aistudio.TranscriptionService = (*trackedService)(nil)

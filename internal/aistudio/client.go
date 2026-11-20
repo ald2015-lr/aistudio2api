@@ -220,9 +220,9 @@ func CleanUpstreamMessage(message string) string {
 // Error 返回结构化上游错误
 func (e *RPCError) Error() string {
 	if e.Code != 0 {
-		return fmt.Sprintf("AI Studio %s 返回 HTTP %d、协议错误码 %d: %s", e.Method, e.StatusCode, e.Code, e.Message)
+		return fmt.Sprintf("AI Studio %s 返回 HTTP %d、协议错误码 %d: %s%s", e.Method, e.StatusCode, e.Code, e.Message, e.deniedNote())
 	}
-	return fmt.Sprintf("AI Studio %s 返回 HTTP %d: %s", e.Method, e.StatusCode, e.Message)
+	return fmt.Sprintf("AI Studio %s 返回 HTTP %d: %s%s", e.Method, e.StatusCode, e.Message, e.deniedNote())
 }
 
 // HTTPStatus 返回上游 HTTP 状态

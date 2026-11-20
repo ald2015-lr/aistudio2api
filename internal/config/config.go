@@ -88,6 +88,7 @@ var configKeys = [...]string{
 	"TEMPORARY_CHAT",
 	"IGNORE_CLIENT_SEED",
 	"REPEAT_PROMPT_NONCE",
+	"ABNORMAL_FINISH_ERROR",
 	"MIN_OUTPUT_TOKENS",
 	"LONG_OUTPUT_ENABLED",
 	"LONG_OUTPUT_MAX_TOKENS",
@@ -180,6 +181,10 @@ type Config struct {
 	// RepeatPromptNonce 为真时，在最后一条用户消息末尾加入不可见随机后缀（客户端指定 seed 或温度为 0 时除外）。
 	// 键名沿用早期"只对重复提示词加"时的叫法
 	RepeatPromptNonce bool `json:"repeat_prompt_nonce"`
+	// AbnormalFinishError 为重新生成用完仍异常结束且没有输出时按错误结束（ABNORMAL_FINISH_ERROR，默认关闭，保存后立即生效）：
+	// 上游以 MALFORMED_FUNCTION_CALL、UNEXPECTED_TOOL_CALL 或 MALFORMED_RESPONSE 结束、客户端没收到任何内容时返回 502，
+	// 不再交出空回复；Gemini 原生接口照旧以该结束原因结束（见 app/abnormal_finish.go）
+	AbnormalFinishError bool `json:"abnormal_finish_error"`
 	// MinOutputTokens 为最大输出 token 的下限：客户端设置的更小值会提高到它（不超过模型上限）；0 表示不调整
 	MinOutputTokens int `json:"min_output_tokens"`
 	// LongOutputEnabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED，默认开启，保存后立即生效）：关闭时 long- 前缀照常解析，
@@ -431,6 +436,7 @@ func Load(path string) (Config, error) {
 	}
 	boolean("IGNORE_CLIENT_SEED", true, &cfg.IgnoreClientSeed)
 	boolean("REPEAT_PROMPT_NONCE", true, &cfg.RepeatPromptNonce)
+	boolean("ABNORMAL_FINISH_ERROR", true, &cfg.AbnormalFinishError)
 	_ = loader.field("MIN_OUTPUT_TOKENS", true, func(value string) error {
 		parsed, err := strconv.Atoi(strings.TrimSpace(value))
 		if err != nil || parsed < 0 {
@@ -532,6 +538,7 @@ func (c Config) save(path string, kept map[string]string) error {
 		"TEMPORARY_CHAT":           strconv.FormatBool(c.TemporaryChat),
 		"IGNORE_CLIENT_SEED":       strconv.FormatBool(c.IgnoreClientSeed),
 		"REPEAT_PROMPT_NONCE":      strconv.FormatBool(c.RepeatPromptNonce),
+		"ABNORMAL_FINISH_ERROR":    strconv.FormatBool(c.AbnormalFinishError),
 		"MIN_OUTPUT_TOKENS":        strconv.Itoa(c.MinOutputTokens),
 		"LONG_OUTPUT_ENABLED":      strconv.FormatBool(c.LongOutputEnabled),
 		"LONG_OUTPUT_MAX_TOKENS":   strconv.Itoa(c.LongOutputMaxTokens),
@@ -666,6 +673,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		TemporaryChat          bool              `json:"temporary_chat"`
 		IgnoreClientSeed       bool              `json:"ignore_client_seed"`
 		RepeatPromptNonce      bool              `json:"repeat_prompt_nonce"`
+		AbnormalFinishError    bool              `json:"abnormal_finish_error"`
 		MinOutputTokens        int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt bool              `json:"omni_ignore_system_prompt"`
 		OmniImageBinding       bool              `json:"omni_image_binding"`
@@ -709,6 +717,7 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		TemporaryChat:          c.TemporaryChat,
 		IgnoreClientSeed:       c.IgnoreClientSeed,
 		RepeatPromptNonce:      c.RepeatPromptNonce,
+		AbnormalFinishError:    c.AbnormalFinishError,
 		MinOutputTokens:        c.MinOutputTokens,
 		OmniIgnoreSystemPrompt: c.OmniIgnoreSystemPrompt,
 		OmniImageBinding:       c.OmniImageBinding,
@@ -756,6 +765,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		TemporaryChat          bool               `json:"temporary_chat"`
 		IgnoreClientSeed       bool               `json:"ignore_client_seed"`
 		RepeatPromptNonce      *bool              `json:"repeat_prompt_nonce"`
+		AbnormalFinishError    *bool              `json:"abnormal_finish_error"`
 		MinOutputTokens        *int               `json:"min_output_tokens"`
 		OmniIgnoreSystemPrompt *bool              `json:"omni_ignore_system_prompt"`
 		OmniImageBinding       *bool              `json:"omni_image_binding"`
@@ -859,6 +869,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		TemporaryChat:          value.TemporaryChat,
 		IgnoreClientSeed:       value.IgnoreClientSeed,
 		RepeatPromptNonce:      value.RepeatPromptNonce == nil || *value.RepeatPromptNonce,
+		AbnormalFinishError:    value.AbnormalFinishError != nil && *value.AbnormalFinishError,
 		MinOutputTokens:        intOrDefault(value.MinOutputTokens, defaultMinOutputTokens),
 		OmniIgnoreSystemPrompt: value.OmniIgnoreSystemPrompt == nil || *value.OmniIgnoreSystemPrompt,
 		OmniImageBinding:       value.OmniImageBinding == nil || *value.OmniImageBinding,

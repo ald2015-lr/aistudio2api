@@ -130,6 +130,12 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.As(err, &contract) {
 		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: contract.PublicMessage()}
 	}
+	// 重新生成用完仍以 MALFORMED_FUNCTION_CALL、UNEXPECTED_TOOL_CALL 或 MALFORMED_RESPONSE 结束、没有交出任何内容（ABNORMAL_FINISH_ERROR
+	// 打开时，见 app/abnormal_finish.go）：按网关错误返回，客户端与中转可以重试；说明写明结束原因与共生成了几次，上游说明不对外
+	var abnormal *aistudio.AbnormalFinishError
+	if errors.As(err, &abnormal) {
+		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: abnormal.PublicMessage()}
+	}
 	// 上游返回的函数调用没有函数名：无法交给客户端执行，按网关错误返回并写明原因（原先落到兜底的 500 通用措辞）
 	if errors.Is(err, aistudio.ErrFunctionCallMissingName) {
 		return publicError{Status: http.StatusBadGateway, RPC: "INTERNAL", Message: officialUnnamedFunctionCallMessage}
@@ -519,21 +525,50 @@ func retryAfterSeconds(until time.Time, now time.Time) int64 {
 	return seconds
 }
 
-// setRetryAfter 在 429、503 且已知最早恢复时间时写入 Retry-After（整秒，向上取整，至少 1 秒，较长的间隔另加随机抖动，
-// 见 retryAfterSeconds），客户端与中转据此退避，不必盲目重试
-func setRetryAfter(w http.ResponseWriter, err error, status int) {
+// retrySecondsFor 返回 429、503 且错误给出了最早恢复时间时建议重试的整秒数（向上取整，至少 1 秒，较长的间隔另加随机抖动，
+// 见 retryAfterSeconds），否则为 0。同一个错误只算一次：Retry-After 与消息末尾的重试提示（retryHintMessage）写同一个值
+func retrySecondsFor(err error, status int) int64 {
 	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
-		return
+		return 0
 	}
 	var provider retryAtProvider
 	if !errors.As(err, &provider) {
-		return
+		return 0
 	}
 	until := provider.RetryAt()
 	if until.IsZero() {
-		return
+		return 0
 	}
-	w.Header().Set("Retry-After", strconv.FormatInt(retryAfterSeconds(until, time.Now()), 10))
+	return retryAfterSeconds(until, time.Now())
+}
+
+// setRetryAfter 在 seconds 大于 0 时写入 Retry-After（见 retrySecondsFor），客户端与中转据此退避，不必盲目重试
+func setRetryAfter(w http.ResponseWriter, seconds int64) {
+	if seconds > 0 {
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	}
+}
+
+// retryHintMessage 在 seconds 大于 0 时于消息末尾按 OpenAI 限流消息的写法另起一句 "Please try again in <seconds>s."（按上游
+// Mag1cFall/AIStudio2API cd3d4ab 移植）：只读响应体、读不到 Retry-After 的客户端（流内错误事件没有响应头）也知道多久后重试。
+// 这句不含 new-api 的自动禁用关键词（"You exceeded your current quota" 等），不会让中转禁用渠道
+func retryHintMessage(message string, seconds int64) string {
+	if seconds <= 0 {
+		return message
+	}
+	message = strings.TrimSpace(message)
+	if !strings.HasSuffix(message, ".") {
+		message += "."
+	}
+	return message + " Please try again in " + strconv.FormatInt(seconds, 10) + "s."
+}
+
+// publicErrorWithRetry 返回 publicErrorFor 的结果与建议重试的整秒数（见 retrySecondsFor）：有秒数时消息末尾带重试提示
+func publicErrorWithRetry(err error, model string) (publicError, int64) {
+	public := publicErrorFor(err, model)
+	seconds := retrySecondsFor(err, public.Status)
+	public.Message = retryHintMessage(public.Message, seconds)
+	return public, seconds
 }
 
 // LimitReasonHeader 为 429 响应上区分本地与上游原因的响应头（N5）：对外文案与状态码不变（兼容中转与客户端），
@@ -592,9 +627,9 @@ func setLimitReason(w http.ResponseWriter, err error, status int) {
 
 // writeOpenAIRequestError 以 OpenAI 官方格式返回请求错误
 func writeOpenAIRequestError(w http.ResponseWriter, err error) {
-	public := publicErrorFor(err, accessLogModel(w))
+	public, seconds := publicErrorWithRetry(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
-	setRetryAfter(w, err, public.Status)
+	setRetryAfter(w, seconds)
 	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, openAIErrorBody(public))
 }
@@ -608,9 +643,9 @@ func writeOpenAIInvalid(w http.ResponseWriter, err error) {
 
 // writeGeminiRequestError 以 Gemini API 官方格式返回请求错误
 func writeGeminiRequestError(w http.ResponseWriter, err error) {
-	public := publicErrorFor(err, accessLogModel(w))
+	public, seconds := publicErrorWithRetry(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
-	setRetryAfter(w, err, public.Status)
+	setRetryAfter(w, seconds)
 	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, geminiErrorBody(public))
 }
@@ -624,9 +659,9 @@ func writeGeminiInvalid(w http.ResponseWriter, err error) {
 
 // writeAnthropicRequestError 以 Anthropic 官方格式返回请求错误
 func writeAnthropicRequestError(w http.ResponseWriter, err error) {
-	public := publicErrorFor(err, accessLogModel(w))
+	public, seconds := publicErrorWithRetry(err, accessLogModel(w))
 	recordResponseError(w, err, public.Message)
-	setRetryAfter(w, err, public.Status)
+	setRetryAfter(w, seconds)
 	setLimitReason(w, err, public.Status)
 	writeJSON(w, public.Status, anthropicErrorBody(public, accessLogRequestID(w)))
 }
@@ -638,31 +673,36 @@ func writeAnthropicInvalid(w http.ResponseWriter, err error) {
 	writeJSON(w, public.Status, anthropicErrorBody(public, accessLogRequestID(w)))
 }
 
+// 流内错误事件没有响应头（写不了 Retry-After）：429、503 且错误给出了最早恢复时间时消息末尾同样带重试提示（见 publicErrorWithRetry）
+
 // openAIStreamError 为流式响应中途出错时写出的 OpenAI 官方错误结构
 func openAIStreamError(w http.ResponseWriter, err error) map[string]any {
-	return openAIErrorBody(publicErrorFor(err, accessLogModel(w)))
+	public, _ := publicErrorWithRetry(err, accessLogModel(w))
+	return openAIErrorBody(public)
 }
 
 // geminiStreamError 为流式响应中途出错时写出的 Gemini 官方错误结构
 func geminiStreamError(w http.ResponseWriter, err error) map[string]any {
-	return geminiErrorBody(publicErrorFor(err, accessLogModel(w)))
+	public, _ := publicErrorWithRetry(err, accessLogModel(w))
+	return geminiErrorBody(public)
 }
 
 // interactionStreamError 为 Interactions 流式响应中途出错时 error 事件的内容：与 geminiStreamError 同样按官方措辞脱敏，
 // code 为 Google RPC 状态名
 func interactionStreamError(w http.ResponseWriter, err error) map[string]any {
-	public := publicErrorFor(err, accessLogModel(w))
+	public, _ := publicErrorWithRetry(err, accessLogModel(w))
 	return map[string]any{"error": map[string]any{"code": public.RPC, "message": public.Message}}
 }
 
 // anthropicStreamError 为流式响应中途出错时写出的 Anthropic error 事件
 func anthropicStreamError(w http.ResponseWriter, err error) map[string]any {
-	return anthropicErrorBody(publicErrorFor(err, accessLogModel(w)), "")
+	public, _ := publicErrorWithRetry(err, accessLogModel(w))
+	return anthropicErrorBody(public, "")
 }
 
 // responsesErrorObject 为 Responses API response.failed 事件中的 error 对象
 func responsesErrorObject(w http.ResponseWriter, err error) map[string]any {
-	public := publicErrorFor(err, accessLogModel(w))
+	public, _ := publicErrorWithRetry(err, accessLogModel(w))
 	code := "server_error"
 	switch {
 	case public.Kind == publicKindContextLength:

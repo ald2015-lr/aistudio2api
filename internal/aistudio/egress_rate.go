@@ -291,11 +291,19 @@ func (g egressGate) admitsID(id uint32) bool {
 }
 
 // egressAttempt 为一次选号内的出口准入：gate 为门控，blocked 记下有候选只因出口令牌桶已满被跳过（或全部通道满桶短路），
-// next 为其中最早的准入时刻（UnixNano）。AcquireFor 按它累计 WithEgressWaitLimit 的等待
+// next 为其中最早的准入时刻（UnixNano）。AcquireFor 按它累计 WithEgressWaitLimit 的等待。
+// uncooled 记下有候选不是因为冷却而取不到（账户忙碌或独占、排空中、每分钟请求已满、文件租约被其他进程占用；出口令牌另记在 blocked）：
+// 都没有时这次取不到只因候选全部冷却，AcquireFor 据此判断要不要按全部冷却快速返回（见 coolingOnly）
 type egressAttempt struct {
-	gate    egressGate
-	blocked bool
-	next    int64
+	gate     egressGate
+	blocked  bool
+	next     int64
+	uncooled bool
+}
+
+// coolingOnly 判断这次选号取不到租约只因候选全部冷却：没有候选因忙碌、排空、每分钟请求已满、出口令牌或文件租约被跳过
+func (attempt *egressAttempt) coolingOnly() bool {
+	return !attempt.uncooled && !attempt.blocked
 }
 
 // refuse 记下一个只因出口令牌桶已满被跳过的候选

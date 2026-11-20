@@ -873,18 +873,32 @@ func anthropicBlocks(result generationResult, media mediaOutput) []anthropicCont
 		flush()
 		blocks = append(blocks, anthropicContentBlock{Type: "text", Text: text})
 	}
+	// extend 把文字接到最后一个块的正文或思考正文 target 后面。逐个事件 += 每次都复制已有的全部文字，几万个事件的长回复总耗时与长度
+	// 平方成正比（几百 KB 要近 1 秒、分配几 GB）；改为累加进按倍数扩容的缓冲，target 换成缓冲的 String()（不复制），结果与逐个拼接相同。
+	// 缓冲属于 extendAt 那个块，最后一个块换了或长度对不上时从 target 另起
+	var extendBuffer *strings.Builder
+	extendAt := -1
+	extend := func(target *string, text string) {
+		if extendBuffer == nil || extendAt != len(blocks)-1 || extendBuffer.Len() != len(*target) {
+			extendBuffer, extendAt = &strings.Builder{}, len(blocks)-1
+			extendBuffer.Grow(2 * (len(*target) + len(text)))
+			extendBuffer.WriteString(*target)
+		}
+		extendBuffer.WriteString(text)
+		*target = extendBuffer.String()
+	}
 	for _, event := range result.events {
 		switch event.Kind {
 		case aistudio.EventText:
 			if textOpen() {
-				blocks[len(blocks)-1].Text += event.Text
+				extend(&blocks[len(blocks)-1].Text, event.Text)
 			} else {
 				openText(event.Text)
 			}
 		case aistudio.EventReasoning:
 			flush()
 			if len(blocks) > 0 && blocks[len(blocks)-1].Type == "thinking" {
-				*blocks[len(blocks)-1].Thinking += event.Text
+				extend(blocks[len(blocks)-1].Thinking, event.Text)
 				if event.ThoughtSignature != "" {
 					blocks[len(blocks)-1].Signature = event.ThoughtSignature
 				}
@@ -932,7 +946,7 @@ func anthropicBlocks(result generationResult, media mediaOutput) []anthropicCont
 				continue
 			}
 			if textOpen() {
-				blocks[len(blocks)-1].Text += "\n" + rendered + "\n"
+				extend(&blocks[len(blocks)-1].Text, "\n"+rendered+"\n")
 			} else {
 				openText(rendered + "\n")
 			}

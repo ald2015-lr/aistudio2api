@@ -13,6 +13,11 @@ export type TabID =
 export type AccountState =
   'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled' | 'org_disabled'
 
+// AccountRestriction 为 org_disabled 状态的原因种类：org_disabled（组织停用）、service_restricted（Google 限制了该账号使用 AI Studio）、
+// age_requirement（年龄或使用资格）、workspace_disabled（所属 Workspace 没有开放 AI Studio）；旧版服务没有这个字段，按组织停用显示
+export type AccountRestriction =
+  'org_disabled' | 'service_restricted' | 'age_requirement' | 'workspace_disabled'
+
 export interface Account {
   id: string
   label: string
@@ -43,6 +48,8 @@ export interface Account {
   // org_disabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户仍为 disabled、
   // message 接上原因；验证接口的返回在验证遇到组织停用时同样为 true
   org_disabled?: boolean
+  // restriction 为 org_disabled 时的原因种类（见 AccountRestriction），没有标记时没有这个字段
+  restriction?: AccountRestriction
   // transition 为管理页启停之后的后台收尾阶段：draining（已停用，等进行中的请求与账户上的其他操作结束）、closing（已停用，
   // 正在关闭 Worker）或 syncing（已启用，合并模型目录、没有目录时同步一次），没有收尾时没有这个字段；
   // active_requests 为收尾期间进行中的请求数（登录、验证等独占操作不计入，draining 而它为 0 时在等这些操作结束）
@@ -396,11 +403,13 @@ export interface BalancedPartition {
 }
 
 // DriveCounters 为启用账户的 Google Drive 授权状态：available 为换到过 Drive token 或经本服务登录时完成了 Drive 授权，unavailable 为
-// 没有 Drive 授权（GenerateAccessToken 返回 401），unknown 为还没试过、更新认证文件后或记录过期。可用、不可用各记 24 小时，
-// 写在 runtime/model-catalogs/drive-accounts.json，服务重启后沿用
+// 没有 Drive 授权（GenerateAccessToken 返回 401），storage_full 为有授权但 Drive 存储空间已满（上传返回 403 storageQuotaExceeded，
+// 为 0 或旧版服务端时省略），unknown 为还没试过、更新认证文件后或记录过期。各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，
+// 服务重启后沿用
 export interface DriveCounters {
   available: number
   unavailable: number
+  storage_full?: number
   unknown: number
 }
 
@@ -560,7 +569,10 @@ export interface RequestLog {
     reply_tokens: number
     output_tokens: number
     total_tokens: number
+    // average_tokens_per_second 为输出除以请求总耗时（原口径）；generation_tokens_per_second 为输出除以首个上游分块之后到结束的时长，
+    // 只有一个分块或旧版服务端时没有
     average_tokens_per_second: number
+    generation_tokens_per_second?: number
   }
   downgrade?: DowngradeDecision
   // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时不出现
@@ -648,7 +660,8 @@ export interface PermissionDeniedAccount {
 
 // OrgDisabledAccount 为所属组织停用了 AI Studio 的账户（Google Workspace 账号的组织关闭了这项服务，重新登录也没用）：
 // source 为第一次进入的来源（启动、模型目录、验证、登录、请求、登录复核），last_source 为最近一次；check_at 为下一次长间隔复查的时间；
-// message 为最近一次的原文（服务端已打码、截短）
+// message 为最近一次的原文（服务端已打码、截短）。服务受限、年龄或使用资格、Workspace 未开放的账户同样列在这里：
+// restriction 为原因种类、reason 为服务端的说明（旧版服务没有这两个字段，按组织停用显示）
 export interface OrgDisabledAccount {
   id: string
   label: string
@@ -659,6 +672,8 @@ export interface OrgDisabledAccount {
   last_at: string
   check_at: string
   message?: string
+  restriction?: AccountRestriction
+  reason?: string
 }
 
 export type RequestState = 'queued' | 'running' | 'completed' | 'cancelled' | 'failed'
@@ -788,6 +803,9 @@ export interface ServiceConfig {
   temporary_chat: boolean
   ignore_client_seed: boolean
   repeat_prompt_nonce: boolean
+  // abnormal_finish_error 为重新生成用完仍异常结束且没有输出时按 502 返回（ABNORMAL_FINISH_ERROR，默认关闭，保存后立即生效）。
+  // 服务端总是返回该字段，因此这里不是可选字段
+  abnormal_finish_error: boolean
   min_output_tokens: number
   // long_output_enabled 为模型名带 long- 前缀时自动续写（LONG_OUTPUT_ENABLED），long_output_max_tokens 为没有官网续写能力的模型
   // 在客户端没有给出输出上限时的输出总上限（LONG_OUTPUT_MAX_TOKENS，0 表示不模拟续写）；都保存后立即生效。

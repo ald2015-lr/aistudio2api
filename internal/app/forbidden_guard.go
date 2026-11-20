@@ -273,10 +273,16 @@ func verifyRequiredPauseCooldown(_ string, cooldown aistudio.CooldownState) bool
 }
 
 // isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）。“AI Studio app is disabled”（账号所属组织停用了 AI Studio，
-// 见 org_disabled.go）是账户级的，不算：不写单模型冷却、不计多模型连续 403，也不登记为 403 无权限账户
+// 见 org_disabled.go）是账户级的，不算：不写单模型冷却、不计多模型连续 403，也不登记为 403 无权限账户。
+// Drive 的 REST 请求（DriveUpload、DriveUploadInit、DriveUploadChunk、DriveDownload、DriveDelete 等，Method 以 Drive 开头）的 403
+// 也不算：那是 Drive 存储空间已满（storageQuotaExceeded）、Drive 限流等 Drive 自己的拒绝，与 AI Studio 的生成权限无关，
+// 不能计入 403 自动暂停（10 分钟内 ≥2 个模型 3 次整户暂停 30 分钟）、单模型 403 冷却与换号（按上游 efda79b 的修复防御）。
+// “Account not supported.”“Early Access Apps disabled.”与组织停用同属账户级（服务受限等，见 aistudio.RestrictionOf），同样不算；
+// “Region not supported.”（AI Studio 不支持当前出口地区）是出口的问题，不是账号或模型的权限，也不算：不冷却、不登记、不自动暂停
 func isPermissionDenied(err error) bool {
 	var rpcError *aistudio.RPCError
-	if !errors.As(err, &rpcError) || aistudio.OrgDisabledFailure(err) {
+	if !errors.As(err, &rpcError) || aistudio.OrgDisabledFailure(err) || aistudio.RegionNotSupported(err) ||
+		strings.HasPrefix(rpcError.Method, "Drive") {
 		return false
 	}
 	return rpcError.StatusCode == http.StatusForbidden && (rpcError.Code == 7 || rpcError.Code == 0)

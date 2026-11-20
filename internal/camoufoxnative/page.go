@@ -23,9 +23,10 @@ const promptReadyExpression = `(() => {` + pageDOMHelpers + `
   return Boolean(uniqueVisible('ms-prompt-box textarea', '提示词输入框'));
 })()`
 
-// workerPageReadyExpression 等待输入框出现，或页面跳转到登录入口、组织停用页（access.workspace.google.com 的 ServiceNotAllowed 等）、
+// workerPageReadyExpression 等待输入框出现，或页面跳转到登录入口（accounts.google.com，含 servicerestricted 页）、拒绝页（组织停用页
+// access.workspace.google.com 的 ServiceNotAllowed 等，AI Studio 的年龄要求、Workspace、地区说明页，见 deniedPageReadyExpression）、
 // 停在首次使用页（都立刻结束等待，由 bootstrap 分别处理）
-const workerPageReadyExpression = `(location.hostname === 'accounts.google.com' || location.hostname === '` + serviceNotAllowedHost + `' || ` +
+const workerPageReadyExpression = `(location.hostname === '` + accountsHost + `' || ` + deniedPageReadyExpression + ` || ` +
 	onboardingPageExpression + ` || ` + promptReadyExpression + `)`
 
 // normalizePromptNewlines 把 CRLF/CR 统一成 LF，官网 textarea 会把写入值规范化为 LF

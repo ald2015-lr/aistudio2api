@@ -690,7 +690,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
 		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
 		ModelFallbacks: active.ModelFallbacks, ModelFallbackScope: active.ModelFallbackScope,
-		StudioKeyDelaySeconds: active.StudioKeyDelaySeconds,
+		StudioKeyDelaySeconds: active.StudioKeyDelaySeconds, AbnormalFinishError: active.AbnormalFinishError,
 	}
 	// 获取 API Key 的间隔：提交时省略（旧版页面）按生效值比较
 	if value.StudioKeyDelay != nil {
@@ -734,6 +734,10 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	// 视频模型带图校验值：提交时省略（旧版页面）按生效值比较
 	if value.OmniImageBinding != nil {
 		saved.OmniImageBinding = *value.OmniImageBinding
+	}
+	// 异常结束按错误返回：提交时省略（旧版页面）按生效值比较
+	if value.AbnormalFinishError != nil {
+		saved.AbnormalFinishError = *value.AbnormalFinishError
 	}
 	// 自动续写：提交时省略（旧版页面）按生效值比较
 	saved.LongOutputEnabled, saved.LongOutputMaxTokens = active.LongOutputEnabled, active.LongOutputMaxTokens
@@ -784,6 +788,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
+		saved.AbnormalFinishError == active.AbnormalFinishError &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.StreamDataHeartbeat == active.StreamDataHeartbeat &&
 		saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt && saved.OmniImageBinding == active.OmniImageBinding &&
 		saved.LongOutputEnabled == active.LongOutputEnabled && saved.LongOutputMaxTokens == active.LongOutputMaxTokens &&

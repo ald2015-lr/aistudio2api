@@ -277,15 +277,15 @@ func (client *bidiClient) pageDiagnosisBlocked(ctx context.Context, contextID st
 }
 
 // pageDiagnosisWithin 同 pageDiagnosis，地址与快照用调用方给的诊断上下文（与同一处的其他诊断共用期限，见 startupFailureDiagnosis）。
-// blocked 为页面停在组织停用页（access.workspace.google.com，见 ServiceNotAllowedError）时的地址，取自读到的地址或快照里的 href，
-// 不多做 evaluate；不在时为空
+// blocked 为页面停在拒绝页（组织停用页 access.workspace.google.com 等拒绝账号的页面或地区说明页，见 deniedPageError）时的地址，
+// 取自读到的地址或快照里的 href，不多做 evaluate；不在时为空
 func (client *bidiClient) pageDiagnosisWithin(diagnosisCtx context.Context, contextID string, withURL bool) (pageURL string, suffix string, blocked string) {
 	if withURL {
 		pageURL, _ = client.evaluateString(diagnosisCtx, contextID, "location.href")
 	}
 	raw, err := client.evaluateString(diagnosisCtx, contextID, pageSnapshotExpression)
 	switch {
-	case isServiceNotAllowedURL(pageURL):
+	case isDeniedPageURL(pageURL):
 		blocked = pageURL
 	case err == nil:
 		blocked = snapshotServiceNotAllowed(raw)

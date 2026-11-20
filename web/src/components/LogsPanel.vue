@@ -206,9 +206,10 @@ function requestChips(row: LogRow): string[] {
   if (request.duration_ms !== undefined) chips.push(`${(request.duration_ms / 1000).toFixed(2)}s`)
   if (request.usage !== undefined)
     chips.push(`${request.usage.total_tokens.toLocaleString(locale.value)} tok`)
-  if (request.usage !== undefined && request.usage.average_tokens_per_second > 0) {
-    chips.push(`${request.usage.average_tokens_per_second.toFixed(1)} tok/s`)
-  }
+  // 速度只计首个上游分块之后（generation_tokens_per_second），没有时按原来的输出除以总耗时
+  const speed =
+    request.usage?.generation_tokens_per_second ?? request.usage?.average_tokens_per_second ?? 0
+  if (speed > 0) chips.push(`${speed.toFixed(1)} tok/s`)
   if (request.channel !== undefined) chips.push(t(channelLabelKey(request.channel)))
   if (request.tool_calls) chips.push(`${t('logs.tools')} ${request.tool_calls}`)
   return chips

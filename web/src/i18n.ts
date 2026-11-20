@@ -88,7 +88,10 @@ const zhCN = {
     '账号所属组织已停用 AI Studio（不是登录失效，重新登录也没用）',
   'accounts.verifyResult': '验证完成：有效 {ok}，失效 {invalid}，出错 {failed}',
   'accounts.verifyResultOrgDisabled':
-    '验证完成：有效 {ok}，失效 {invalid}，组织停用 {org}，出错 {failed}',
+    '验证完成：有效 {ok}，失效 {invalid}，组织停用或受限 {org}，出错 {failed}',
+  'accounts.verifyRestricted':
+    '验证未通过：{reason}（不是登录失效，重新登录也没用；已停止调度）',
+  'accounts.verifyRestrictedReason': '{reason}（不是登录失效，重新登录也没用）',
   'accounts.saved': '账户已保存',
   'accounts.deleted': '账户已删除',
   'accounts.importComplete': '已导入 {count} 个账户',
@@ -134,6 +137,10 @@ const zhCN = {
   'logs.reply': '回复',
   'logs.outputTotal': '输出合计',
   'logs.averageSpeed': '平均速度',
+  'logs.averageSpeedHelp':
+    '输出 token 除以首个上游分块到达之后到请求结束的时长：排队、WAA、等待首个分块与被放弃的重新生成都不算；工具约束要求必须调用时从扣住第一个上游事件起算',
+  'logs.averageSpeedTotalHelp':
+    '输出 token 除以请求总耗时（含排队与等待首个分块）：只有一个分块、思考不对外而用量带思考 token 时测不出生成速度，或记录来自旧版本',
   'logs.details': '详情',
   'logs.endpoint': '接口',
   'logs.inputTokens': '输入用量',
@@ -344,6 +351,9 @@ const zhCN = {
   'settings.repeatPromptNonce': '给请求加不可见随机后缀',
   'settings.repeatPromptNonceHelp':
     '上游对相同、甚至只差几个字的请求会返回完全相同的回复，换 seed、调高温度都没有用。开启后在最后一条用户消息末尾加入不可见的零宽字符，让每次生成都不同。客户端指定了 seed 或温度设为 0（需要可复现）时不加，带工具结果的轮次不改动。',
+  'settings.abnormalFinishError': '重新生成用完仍异常结束时返回 502',
+  'settings.abnormalFinishErrorHelp':
+    '上游以 MALFORMED_FUNCTION_CALL（函数调用格式错误）、UNEXPECTED_TOOL_CALL（意外的工具调用）或 MALFORMED_RESPONSE（响应格式异常）结束、客户端还没收到任何内容时，本服务先同账号重新生成（每请求最多 2 次）。默认关闭：重新生成用完（或不能重新生成，例如请求没有随机后缀）仍这样结束时，照上游结果返回一个空回复，结束原因原样。开启后改为返回 502 与英文说明（写明结束原因与共生成次数），客户端与 new-api 等中转可以按网关错误重试（流式请求的每次重新生成让写出响应头前的等待重新计、合计不超过 50 秒；第一次生成就超过这个等待（默认 10 秒）或合计超过 50 秒才判定时响应头已经提交，只能以流内错误结束，中转一般不会重试）；已经输出过正文、思考或函数调用的回复不受影响，Gemini 原生接口照官方形状保留结束原因。不算账户的问题：不冷却、不换号、不改用其他模型，用量照旧记入用量账本。修改后立即生效，只影响新请求。',
   'settings.minOutputTokens': '最大输出 token 下限',
   'settings.minOutputTokensHelp':
     '客户端设置的最大输出低于这个值时提高到它（不超过模型上限），避免思考把输出额度用完、回复被截断或为空；客户端没设置时沿用模型上限。图片、语音等模型不调整，0 表示不调整。',
@@ -422,7 +432,14 @@ const zhCN = {
   'state.auth_required': '需要登录',
   'state.unavailable': '不可用',
   'state.disabled': '已停用',
-  'state.org_disabled': '组织已停用',
+  'state.org_disabled': '组织停用或受限',
+  'restriction.org_disabled': '组织已停用',
+  'restriction.service_restricted': '服务受限',
+  'restriction.age_requirement': '年龄或资格不符',
+  'restriction.workspace_disabled': 'Workspace 未开放',
+  'restrictionReason.service_restricted': 'Google 已限制该账号使用 AI Studio',
+  'restrictionReason.age_requirement': '账号不满足 AI Studio 的年龄或使用资格要求',
+  'restrictionReason.workspace_disabled': '账号所属 Google Workspace 没有开放 AI Studio',
   'state.queued': '排队',
   'state.running': '运行中',
   'state.completed': '已完成',
@@ -483,7 +500,7 @@ const zhCN = {
   'accounts.progressInvalid': '登录失效 {count}',
   'accounts.progressErrored': '出错 {count}',
   'accounts.progressInvalidList': '登录失效明细（{count}）',
-  'accounts.progressOrgDisabled': '组织停用 {count}',
+  'accounts.progressOrgDisabled': '组织停用或受限 {count}',
   'accounts.progressNotPassedList': '未通过明细（{count}）',
   'accounts.progressActive': '处理中：{names}',
   'accounts.progressStop': '停止',
@@ -667,16 +684,17 @@ const zhCN = {
     '清除这 {count} 个需要验证账号的账户的 403 记录并解除整户暂停？它们重新参与调度；没在官网验证的账户下一次请求会再返回 403 并重新暂停（那次请求换号重试）。单模型 403 冷却不变。',
   'accounts.verifyRequiredLifted':
     '已清除 {cleared} 个账户的 403 记录，解除 {lifted} 个账户需要验证账号的整户暂停',
-  'accounts.orgDisabledTitle': '组织已停用 AI Studio 的账户',
+  'accounts.orgDisabledTitle': '组织停用或受限、用不了 AI Studio 的账户',
   'accounts.orgDisabledHint':
-    '（账号所属组织关闭了 AI Studio，重新登录也没用；已停止调度，换号或等组织重新开放）',
+    '（账号所属组织关闭了 AI Studio，或 Google 限制了账号、年龄或资格不符、Workspace 未开放，重新登录也没用；已停止调度，换号或等对方重新开放）',
   'accounts.orgDisabledHelp':
-    '载入 AI Studio 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或接口返回 HTTP 403 “AI Studio app is disabled” 的账户（Google Workspace 账号所属组织或 Google 为它关闭了 AI Studio）。这些账户不再参与预热、替补、扩容与选号，驻留 Worker 空闲即关；模型目录每 24 小时复查一次，不再返回 app is disabled 时自动恢复。认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录）或点“恢复调度”也会立即恢复，仍被停用时会重新列出。',
+    '载入 AI Studio 被跳到 access.workspace.google.com 的 ServiceNotAllowed 页，或接口返回 HTTP 403 “AI Studio app is disabled” 的账户（Google Workspace 账号所属组织或 Google 为它关闭了 AI Studio）；被跳到 accounts.google.com/info/servicerestricted（Google 限制了该账号）、AI Studio 的年龄要求说明页或接口返回 “Account not supported.”（年龄或使用资格不符）、Workspace 说明页或接口返回 “Early Access Apps disabled.”（所属 Workspace 没有开放 AI Studio）的账户同样列在这里，“原因”一栏区分。被跳到地区说明页或接口返回 “Region not supported.” 是出口地区的问题，不会列在这里。这些账户不再参与预热、替补、扩容与选号，驻留 Worker 空闲即关；模型目录每 24 小时复查一次，读取成功时自动恢复。认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录）或点“恢复调度”也会立即恢复，仍被拒绝时会重新列出。',
+  'accounts.orgDisabledReason': '原因',
   'accounts.orgDisabledSource': '来源',
   'accounts.orgDisabledNextCheck': '下次复查',
   'accounts.orgDisabledClear': '恢复调度',
   'accounts.orgDisabledClearConfirm':
-    '清除全部 {count} 个账户的组织停用状态、立即恢复调度？仍被组织停用的账户再次启动或同步时会重新列出（启动时立即失败，不再干等）。',
+    '清除全部 {count} 个账户的组织停用或受限状态、立即恢复调度？仍被拒绝的账户再次启动或同步时会重新列出（启动时立即失败，不再干等）。',
   'accounts.orgDisabledCleared': '已恢复 {count} 个账户的调度',
   'accounts.orgDisabledSourceStartup': '启动',
   'accounts.orgDisabledSourceCatalog': '模型目录',
@@ -739,8 +757,9 @@ const zhCN = {
   'app.balancedDetail':
     '平均调用（ROUTING_STRATEGY=balanced）：今日（太平洋时间 {day}，北京时间 15 点或 16 点清零）每个可调度账号发往上游的生成请求数，最少 {min} · 中位 {median} · p90 {p90} · 最多 {max}；已用为今天发过请求的账号数 / 可调度账号数（需要验证账号的整户暂停、需要登录等不算）。在跑的号比接替它的备用号多发 {gap} 次就换下（先启后停，不打断请求）；近 1 小时与本额度日的轮换次数为两个分区合计，本额度日已轮换 {today} 次。每 30 秒统计一次，只统计本服务。每个账号的明细见用量页“分项排行”里按“账户”排的一栏：那边按服务器本地日、每个请求记一行，这里按太平洋日、每次发送都计（含换号重试、续写的每一轮与重新生成），两边的数不一样',
   'app.driveLine': 'Drive 授权 · 可用 {available} · 不可用 {unavailable} · 未知 {unknown}',
+  'app.driveLineStorageFull': 'Drive 空间已满 · {storageFull}',
   'app.driveDetail':
-    '启用账户的 Google Drive 授权状态：可用为换到过 Drive token 或经本服务登录时完成了 Drive 授权，不可用为没有 Drive 授权（多半是只导入 Cookie 的账户），未知为还没试过。gemini-omni 的视频输入（及不能内联的图片）要先上传到账户的 Drive，只交给可用或未知的账户，只剩不可用的账户时返回 400；PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF 图片按官网直接内联发送（GIF 转为 PNG），不需要 Drive，任何账户都能处理。经本服务的登录流程登录（账户页“登录”或“添加账户”）会完成官网的 Drive 授权，随即记为可用。可用、不可用各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，重启后沿用；更新认证文件后重新探测，管理验证通过时清除不可用记录',
+    '启用账户的 Google Drive 授权状态：可用为换到过 Drive token 或经本服务登录时完成了 Drive 授权，不可用为没有 Drive 授权（多半是只导入 Cookie 的账户），空间已满为有 Drive 授权、但上传时 Drive 返回存储空间已满（storageQuotaExceeded，有这类账户时另起一行显示），未知为还没试过。没有 Drive 授权或空间已满的账户，普通模型的附件直接内联发送，不冷却、不换号。gemini-omni 的视频输入（及不能内联的图片）要先上传到账户的 Drive，只交给可用或未知的账户，只剩不可用的账户时返回 400；PNG、JPEG、WebP、HEIC、HEIF、BMP、TIFF 图片按官网直接内联发送（GIF 转为 PNG），不需要 Drive，任何账户都能处理。经本服务的登录流程登录（账户页“登录”或“添加账户”）会完成官网的 Drive 授权，随即记为可用。可用、不可用、空间已满各记 24 小时，写在 runtime/model-catalogs/drive-accounts.json，重启后沿用；换到 Drive token 不清除空间已满、上传成功时清除，更新认证文件后重新探测，管理验证通过时清除不可用与空间已满的记录',
   'app.authRecheckDetail':
     '上游 401 先记疑似登录失效、冷却 5 分钟，用磁盘 Cookie 复核仍是 401 才标需要登录；按接口判定需要登录的账户每 15 分钟低速复核一轮，通过即恢复；浏览器判定未登录的（管理验证判定未登录、Worker 启动时跳到登录页）不复核，需要重新登录或更新认证文件。最近一小时：排除 {cleared}、确认 {confirmed}、恢复 {recovered}、仍失效 {invalid}。坏号为连续裸限流的账号，2 小时内不参与预热与替补',
   'app.catalogSyncPaused': '目录同步暂停到 {time}（{reason}）',
@@ -1258,7 +1277,10 @@ const en: Record<TranslationKey, string> = {
     'The organization that manages this account has turned AI Studio off (not an expired login, signing in again does not help)',
   'accounts.verifyResult': 'Verification finished: {ok} valid, {invalid} invalid, {failed} failed',
   'accounts.verifyResultOrgDisabled':
-    'Verification finished: {ok} valid, {invalid} invalid, {org} disabled by organization, {failed} failed',
+    'Verification finished: {ok} valid, {invalid} invalid, {org} disabled or restricted, {failed} failed',
+  'accounts.verifyRestricted':
+    'Verification failed: {reason} (not an expired login, signing in again does not help; scheduling has stopped)',
+  'accounts.verifyRestrictedReason': '{reason} (not an expired login, signing in again does not help)',
   'accounts.saved': 'Account saved',
   'accounts.deleted': 'Account deleted',
   'accounts.importComplete': 'Imported {count} accounts',
@@ -1306,6 +1328,10 @@ const en: Record<TranslationKey, string> = {
   'logs.reply': 'Reply',
   'logs.outputTotal': 'Output total',
   'logs.averageSpeed': 'Average speed',
+  'logs.averageSpeedHelp':
+    'Output tokens divided by the time from the first upstream chunk to the end of the request: queueing, WAA, waiting for the first chunk and discarded regenerations are not counted; when a tool call is required, timing starts when the first upstream event is held back',
+  'logs.averageSpeedTotalHelp':
+    'Output tokens divided by the total request time (including queueing and waiting for the first chunk): the generation speed cannot be measured with a single chunk or when thinking is hidden but the usage includes thinking tokens, or the record comes from an older version',
   'logs.details': 'Details',
   'logs.endpoint': 'Endpoint',
   'logs.inputTokens': 'Input usage',
@@ -1522,6 +1548,9 @@ const en: Record<TranslationKey, string> = {
   'settings.repeatPromptNonce': 'Add an invisible random suffix to requests',
   'settings.repeatPromptNonceHelp':
     'The upstream returns the exact same reply for identical or near-identical requests, even with a different seed or a higher temperature. When enabled, invisible zero-width characters are appended to the last user message so every generation differs. Requests with a client seed or temperature 0 (reproducibility) and tool-result turns are left unchanged.',
+  'settings.abnormalFinishError': 'Return 502 when regeneration still ends abnormally',
+  'settings.abnormalFinishErrorHelp':
+    'When the upstream ends with MALFORMED_FUNCTION_CALL, UNEXPECTED_TOOL_CALL or MALFORMED_RESPONSE before the client has received any content, the service first regenerates on the same account (at most 2 times per request). Off by default: if the response still ends this way after regeneration is used up (or cannot be used, for example when the request has no random suffix), an empty reply is returned with the finish reason unchanged, as the upstream gave it. When on, a 502 with an English explanation (naming the finish reason and how many times it was generated) is returned instead, so clients and relays such as new-api can retry it as a gateway error (for streaming requests each regeneration restarts the wait before the response headers are written, capped at 50 seconds in total; when the first generation alone exceeds that wait (10 seconds by default) or the total exceeds 50 seconds, the headers are already sent and the request ends with an in-stream error that relays usually do not retry). Replies that already produced text, thinking or function calls are not affected, and the native Gemini API keeps the finish reason in the official shape. It is not treated as an account problem: no cooldown, no account switch and no model fallback; usage is still recorded in the usage ledger. Changes apply immediately to new requests only.',
   'settings.minOutputTokens': 'Minimum max output tokens',
   'settings.minOutputTokensHelp':
     'When a client sets max output tokens below this value it is raised to it (capped at the model limit), so thinking does not use up the budget and truncate or empty the reply. Requests without a value use the model limit. Image and speech models are not changed; 0 disables.',
@@ -1607,7 +1636,16 @@ const en: Record<TranslationKey, string> = {
   'state.auth_required': 'Login required',
   'state.unavailable': 'Unavailable',
   'state.disabled': 'Disabled',
-  'state.org_disabled': 'Disabled by org',
+  'state.org_disabled': 'Disabled or restricted',
+  'restriction.org_disabled': 'Disabled by org',
+  'restriction.service_restricted': 'Service restricted',
+  'restriction.age_requirement': 'Age or eligibility',
+  'restriction.workspace_disabled': 'Not enabled by Workspace',
+  'restrictionReason.service_restricted': 'Google has restricted this account from using AI Studio',
+  'restrictionReason.age_requirement':
+    'The account does not meet the AI Studio age or eligibility requirements',
+  'restrictionReason.workspace_disabled':
+    'The Google Workspace that manages this account has not enabled AI Studio',
   'state.queued': 'Queued',
   'state.running': 'Running',
   'state.completed': 'Completed',
@@ -1669,7 +1707,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.progressInvalid': '{count} login expired',
   'accounts.progressErrored': '{count} failed',
   'accounts.progressInvalidList': 'Expired logins ({count})',
-  'accounts.progressOrgDisabled': '{count} disabled by organization',
+  'accounts.progressOrgDisabled': '{count} disabled or restricted',
   'accounts.progressNotPassedList': 'Not passed ({count})',
   'accounts.progressActive': 'Working on: {names}',
   'accounts.progressStop': 'Stop',
@@ -1863,16 +1901,17 @@ const en: Record<TranslationKey, string> = {
     'Clear the 403 records of these {count} accounts that need account verification and lift their whole-account pause? They are scheduled again; an account not verified on the official site returns 403 on its next request and is paused again (that request switches to another account). Per-model 403 cooldowns stay.',
   'accounts.verifyRequiredLifted':
     'Cleared the 403 records of {cleared} accounts and lifted the whole-account pause for account verification on {lifted} accounts',
-  'accounts.orgDisabledTitle': 'Accounts with AI Studio disabled by their organization',
+  'accounts.orgDisabledTitle': 'Accounts that cannot use AI Studio (disabled by organization or restricted)',
   'accounts.orgDisabledHint':
-    '(the organization that manages the account has turned AI Studio off; signing in again does not help. Scheduling has stopped: replace the account or wait for the organization to re-enable it)',
+    '(the organization has turned AI Studio off, or Google restricted the account, it does not meet the age or eligibility requirements, or its Workspace has not enabled AI Studio; signing in again does not help. Scheduling has stopped: replace the account or wait until it is enabled again)',
   'accounts.orgDisabledHelp':
-    'Accounts whose AI Studio page is redirected to the ServiceNotAllowed page on access.workspace.google.com, or whose RPCs return HTTP 403 "AI Studio app is disabled" (the Google Workspace organization or Google has turned AI Studio off for them). They no longer take part in prewarm, replacement, scale-out or account selection, and their resident Workers are closed once idle. The model catalog is rechecked every 24 hours and the account is restored as soon as it no longer returns "app is disabled". Updating the auth file (uploading a new storage-state.json, a browser login or importing the directory again) or clicking "Resume scheduling" also restores it at once; it is listed again if it is still disabled.',
+    'Accounts whose AI Studio page is redirected to the ServiceNotAllowed page on access.workspace.google.com, or whose RPCs return HTTP 403 "AI Studio app is disabled" (the Google Workspace organization or Google has turned AI Studio off for them). Accounts redirected to accounts.google.com/info/servicerestricted (Google restricted the account), to the AI Studio age requirements page or whose RPCs return "Account not supported." (age or eligibility), and to the Workspace page or whose RPCs return "Early Access Apps disabled." (the Workspace has not enabled AI Studio) are listed here too; the Reason column tells them apart. A redirect to the available regions page or "Region not supported." is a problem with the egress region and is not listed here. These accounts no longer take part in prewarm, replacement, scale-out or account selection, and their resident Workers are closed once idle. The model catalog is rechecked every 24 hours and the account is restored as soon as a read succeeds. Updating the auth file (uploading a new storage-state.json, a browser login or importing the directory again) or clicking "Resume scheduling" also restores it at once; it is listed again if it is still denied.',
+  'accounts.orgDisabledReason': 'Reason',
   'accounts.orgDisabledSource': 'Source',
   'accounts.orgDisabledNextCheck': 'Next recheck',
   'accounts.orgDisabledClear': 'Resume scheduling',
   'accounts.orgDisabledClearConfirm':
-    'Clear the organization-disabled state of all {count} accounts and resume scheduling now? An account that is still disabled is listed again the next time it starts or syncs (startup fails at once instead of waiting).',
+    'Clear the disabled or restricted state of all {count} accounts and resume scheduling now? An account that is still denied is listed again the next time it starts or syncs (startup fails at once instead of waiting).',
   'accounts.orgDisabledCleared': 'Resumed scheduling for {count} accounts',
   'accounts.orgDisabledSourceStartup': 'Startup',
   'accounts.orgDisabledSourceCatalog': 'Model catalog',
@@ -1936,8 +1975,9 @@ const en: Record<TranslationKey, string> = {
     "Balanced routing (ROUTING_STRATEGY=balanced): generation requests each schedulable account sent upstream today (Pacific time {day}; the daily quota resets at midnight Pacific time), min {min} · median {median} · p90 {p90} · max {max}. Used is the number of accounts that sent a request today out of the schedulable accounts (accounts paused for verification, accounts that need a login and the like are not counted). A running account that has sent {gap} more requests than the spare taking its place is rotated out (start-then-stop, no request is interrupted); rotation counts cover both partitions, {today} so far this quota day. Refreshed every 30 seconds, counting this service only. Per-account details are on the Usage page under Breakdown, ranked by Account: that view uses the server's local day and one row per request, while this counts every send by Pacific day (including retries on other accounts, every continuation round and regenerations), so the numbers differ",
   'app.driveLine':
     'Drive access · {available} available · {unavailable} unavailable · {unknown} unknown',
+  'app.driveLineStorageFull': 'Drive storage full · {storageFull}',
   'app.driveDetail':
-    "Google Drive authorization of enabled accounts: available accounts have obtained a Drive token or completed Drive authorization when signing in through this service, unavailable accounts have no Drive authorization (usually accounts imported with cookies only), unknown accounts have not been tried yet. Video input for gemini-omni (and images in formats that cannot be sent inline) is uploaded to the account's Drive first, so it only goes to available or unknown accounts, and returns 400 when only unavailable accounts are left; PNG, JPEG, WebP, HEIC, HEIF, BMP and TIFF images are sent inline like the website does (GIF is converted to PNG), need no Drive and work on any account. Signing an account in through this service's login flow (Login or Add account on the Accounts page) completes the website's Drive authorization and marks the account available. Both states are kept for 24 hours in runtime/model-catalogs/drive-accounts.json and survive a restart; updating the auth file probes the account again, and a passing admin verification clears the unavailable record",
+    "Google Drive authorization of enabled accounts: available accounts have obtained a Drive token or completed Drive authorization when signing in through this service, unavailable accounts have no Drive authorization (usually accounts imported with cookies only), storage full accounts are authorized but Drive rejected an upload because their storage is full (storageQuotaExceeded; shown on a line of its own only when there are such accounts), unknown accounts have not been tried yet. For accounts without Drive authorization or with full storage, attachments for regular models are sent inline, with no cooldown and no account switch. Video input for gemini-omni (and images in formats that cannot be sent inline) is uploaded to the account's Drive first, so it only goes to available or unknown accounts, and returns 400 when only unavailable accounts are left; PNG, JPEG, WebP, HEIC, HEIF, BMP and TIFF images are sent inline like the website does (GIF is converted to PNG), need no Drive and work on any account. Signing an account in through this service's login flow (Login or Add account on the Accounts page) completes the website's Drive authorization and marks the account available. All three states are kept for 24 hours in runtime/model-catalogs/drive-accounts.json and survive a restart; obtaining a Drive token does not clear the storage full state but a successful upload does, updating the auth file probes the account again, and a passing admin verification clears the unavailable and storage full records",
   'app.authRecheckDetail':
     'An upstream 401 first marks the login as suspected (5-minute cooldown); it is rechecked with the saved cookies and only marked as login-required if it is still 401. Accounts marked login-required by the API are rechecked every 15 minutes and restored when the recheck passes; accounts the browser found logged out (an admin verification found no login, or a worker start landed on the sign-in page) are not rechecked and need a new login or an updated auth file. Last hour: {cleared} cleared, {confirmed} confirmed, {recovered} recovered, {invalid} still invalid. Bad accounts kept getting bare rate limits and are left out of prewarm and replacements for 2 hours',
   'app.catalogSyncPaused': 'Catalog sync paused until {time} ({reason})',

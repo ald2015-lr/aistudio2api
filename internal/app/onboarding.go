@@ -483,9 +483,10 @@ func (onboarder *accountOnboarder) process(
 	}
 	initiallyEnabled := status.Enabled
 	if onboarder.admin.service.orgDisabledListed(accountID) {
-		// 账号所属组织停用了 AI Studio（见 org_disabled.go）：验证与启用都没有意义，不启动浏览器，记为跳过并写明原因
-		onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | 跳过 | 原因="+aistudio.OrgDisabledReason)
-		return onboardSkipped, aistudio.OrgDisabledReason, false
+		// 账号所属组织停用了 AI Studio（或服务受限等，见 org_disabled.go）：验证与启用都没有意义，不启动浏览器，记为跳过并写明原因
+		reason := aistudio.RestrictionReason(onboarder.admin.service.orgDisabledKind(accountID))
+		onboarder.admin.requests.log(label, "INFO", "新账户自动处理 | 跳过 | 原因="+reason)
+		return onboardSkipped, reason, false
 	}
 	verified := false
 	if policy.AutoVerify {
@@ -500,7 +501,7 @@ func (onboarder *accountOnboarder) process(
 			outcome := "验证未通过，保持停用"
 			switch {
 			case verification.OrgDisabled:
-				outcome = "验证未通过，账号所属组织已停用 AI Studio，停止调度"
+				outcome = "验证未通过，" + restrictionSubject(verification.Restriction) + "，停止调度"
 			case status.Enabled:
 				outcome = "验证未通过，账户需要重新登录"
 			}

@@ -40,7 +40,8 @@ const (
 
 // unschedulableReasonOrder 为补登记日志里各原因的顺序
 var unschedulableReasonOrder = []string{
-	unschedulableAuthRequired, unschedulableOrgDisabled, unschedulableVerifyRequired, unschedulableDisabled, unschedulableUnavailable,
+	unschedulableAuthRequired, unschedulableOrgDisabled, aistudio.UnschedulableServiceRestricted, aistudio.UnschedulableAgeRequirement,
+	aistudio.UnschedulableWorkspaceDisabled, unschedulableVerifyRequired, unschedulableDisabled, unschedulableUnavailable,
 	unschedulableNoCatalog, unschedulableOther,
 }
 

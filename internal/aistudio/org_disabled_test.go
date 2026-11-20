@@ -62,7 +62,7 @@ func TestOrgDisabledStopsScheduling(t *testing.T) {
 	if err != nil || !added {
 		t.Fatalf("第一次标记应写入: added=%t err=%v", added, err)
 	}
-	if added, err := pool.MarkOrgDisabled(scopeNormalA, OrgDisabledReason); err != nil || added {
+	if added, err := pool.MarkOrgDisabled(scopeNormalA, RestrictionOrgDisabled); err != nil || added {
 		t.Fatalf("重复标记不应算新写入: added=%t err=%v", added, err)
 	}
 	if _, err := pool.MarkOrgDisabled("missing@example.com", ""); !errors.Is(err, ErrAccountNotFound) {

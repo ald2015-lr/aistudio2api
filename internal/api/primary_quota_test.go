@@ -95,7 +95,7 @@ func TestPrimaryQuotaProtocolShapes(t *testing.T) {
 
 func anthropicQuotaShape(t *testing.T, body map[string]any) {
 	t.Helper()
-	if body["type"] != "rate_limit_error" || body["message"] != officialExhaustedMessage {
+	if body["type"] != "rate_limit_error" || !exhaustedMessage(body["message"]) {
 		t.Fatalf("Anthropic 错误对象 = %v", body)
 	}
 }

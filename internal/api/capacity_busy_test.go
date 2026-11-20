@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -83,9 +84,18 @@ func TestCapacityBusyProtocolShapes(t *testing.T) {
 	}
 }
 
+// exhaustedMessage 判断消息是固定的限流文案，错误给出了最早恢复时间时末尾另有一句重试提示（" Please try again in <N>s."，见 retryHintMessage）
+func exhaustedMessage(message any) bool {
+	text, ok := message.(string)
+	return ok && (text == officialExhaustedMessage || retryHintPattern.MatchString(text))
+}
+
+// retryHintPattern 为固定限流文案加重试提示的完整消息
+var retryHintPattern = regexp.MustCompile(`^` + regexp.QuoteMeta(officialExhaustedMessage) + ` Please try again in [1-9][0-9]*s\.$`)
+
 func openAIRateLimitShape(t *testing.T, body map[string]any) {
 	t.Helper()
-	if body["code"] != "rate_limit_exceeded" || body["message"] != officialExhaustedMessage {
+	if body["code"] != "rate_limit_exceeded" || !exhaustedMessage(body["message"]) {
 		t.Fatalf("OpenAI 错误对象 = %v", body)
 	}
 }
@@ -99,7 +109,7 @@ func anthropicRateLimitShape(t *testing.T, body map[string]any) {
 
 func geminiRateLimitShape(t *testing.T, body map[string]any) {
 	t.Helper()
-	if body["status"] != "RESOURCE_EXHAUSTED" || body["message"] != officialExhaustedMessage {
+	if body["status"] != "RESOURCE_EXHAUSTED" || !exhaustedMessage(body["message"]) {
 		t.Fatalf("Gemini 错误对象 = %v", body)
 	}
 }

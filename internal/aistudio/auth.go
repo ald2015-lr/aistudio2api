@@ -138,8 +138,10 @@ type LoginVerification struct {
 	// 判定登录已失效时用来区分普通登录页（会话失效）与安全验证、风控页（challenge、speedbump、rejected 等）
 	PageURL string `json:"page_url,omitempty"`
 	// OrgDisabled 为页面被跳到组织停用页（access.workspace.google.com）：账号所属组织停用了 AI Studio，Authenticated 为假、
-	// Reason 为 OrgDisabledReason，不是登录失效（见 org_disabled.go）
-	OrgDisabled bool `json:"org_disabled,omitempty"`
+	// Reason 为 OrgDisabledReason，不是登录失效（见 org_disabled.go）。页面被跳到服务受限、年龄要求、Workspace 说明页时同样为真，
+	// Restriction 为原因种类、Reason 为它的固定文案
+	OrgDisabled bool        `json:"org_disabled,omitempty"`
+	Restriction Restriction `json:"restriction,omitempty"`
 }
 
 // IsolatedLoginDriver 定义独立浏览器登录与验证合同

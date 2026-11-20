@@ -80,6 +80,7 @@ type EditableKey =
   | 'temporary_chat'
   | 'ignore_client_seed'
   | 'repeat_prompt_nonce'
+  | 'abnormal_finish_error'
   | 'min_output_tokens'
   | 'long_output_enabled'
   | 'long_output_max_tokens'
@@ -126,6 +127,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'temporary_chat',
   'ignore_client_seed',
   'repeat_prompt_nonce',
+  'abnormal_finish_error',
   'min_output_tokens',
   'long_output_enabled',
   'long_output_max_tokens',
@@ -272,6 +274,7 @@ const form = reactive<ServiceConfig>({
   temporary_chat: false,
   ignore_client_seed: false,
   repeat_prompt_nonce: true,
+  abnormal_finish_error: false,
   min_output_tokens: 60000,
   long_output_enabled: true,
   long_output_max_tokens: 262144,
@@ -1926,6 +1929,25 @@ onBeforeUnmount(() => {
             <HelpText
               class="mt-1 block text-xs text-gray-500"
               :text="t('settings.repeatPromptNonceHelp')"
+            />
+          </span>
+        </label>
+      </HelpField>
+
+      <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+        <label class="flex items-start gap-3">
+          <input
+            v-model="form.abnormal_finish_error"
+            class="mt-0.5 h-4 w-4 accent-blue-500"
+            type="checkbox"
+          />
+          <span>
+            <span class="block text-sm font-medium text-gray-300">{{
+              t('settings.abnormalFinishError')
+            }}</span>
+            <HelpText
+              class="mt-1 block text-xs text-gray-500"
+              :text="t('settings.abnormalFinishErrorHelp')"
             />
           </span>
         </label>

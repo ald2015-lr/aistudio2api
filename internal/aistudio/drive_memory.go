@@ -22,13 +22,18 @@ const driveAvailableTTL = 24 * time.Hour
 const driveRecordRefresh = time.Hour
 
 // DriveState 为账号的 Drive 授权状态（进程内记忆，见 driveMemory）：换到过 Drive token 为可用，GenerateAccessToken 返回 401 / Code 16
-// 为不可用，其余（没试过、认证代际变了、记忆过期）为未知
+// 为不可用，Drive 上传返回 403 storageQuotaExceeded 为存储空间已满，其余（没试过、认证代际变了、记忆过期）为未知
 type DriveState string
 
 const (
 	DriveStateUnknown     DriveState = "unknown"
 	DriveStateAvailable   DriveState = "available"
 	DriveStateUnavailable DriveState = "unavailable"
+	// DriveStateStorageFull 为账号有 Drive 授权、但 Drive 存储空间已满（上传返回 403 storageQuotaExceeded，按上游 Mag1cFall/AIStudio2API
+	// efda79b、e6f067a 移植）：选号与附件处理上与不可用相同（内联附件直接内联发送、Interaction 模型需要 Drive 的输入不选它、文件上传排到最后），
+	// 只是原因不同，管理页与日志不把它算作“没有 Drive 授权”。有效期与不可用相同（driveUnavailableTTL）；换到 Drive token 不清除它
+	// （空间满与授权无关），上传成功、重新登录、管理验证通过时清除
+	DriveStateStorageFull DriveState = "storage_full"
 )
 
 // DriveRecord 为一个账号的 Drive 授权状态记录，供写盘与重启后恢复（见 SetDriveObserver、RestoreDriveRecords 与 app 层 drive_state.go）。
@@ -50,6 +55,8 @@ const driveMemoryPruneMin = 1024
 type driveUnavailableEntry struct {
 	// account 为记下时的账户对象：账户删除后以同一 ID 重新添加是另一个对象（认证代际从 0 重新计），不沿用旧记录
 	account *Account
+	// storageFull 为 entries（Drive 不可用）里的记录的原因是存储空间已满（DriveStateStorageFull），不是没有 Drive 授权
+	storageFull bool
 	// generation 为发出那次 GenerateAccessToken 之前账户的认证代际：重新登录、续签、更新认证文件推进代际后记录失效
 	generation uint64
 	until      time.Time
@@ -114,6 +121,18 @@ func (memory *driveMemory) remember(account *Account, generation uint64, now tim
 	return memory.set(account, generation, DriveStateUnavailable, now, now)
 }
 
+// rememberStorageFull 记下账号 Drive 存储空间已满（generation 为上传之前读取的认证代际），有效期 driveUnavailableTTL；
+// 同时删掉它的“Drive 可用”记录。返回是否要通知写盘（见 set）
+func (memory *driveMemory) rememberStorageFull(account *Account, generation uint64, now time.Time) bool {
+	return memory.set(account, generation, DriveStateStorageFull, now, now)
+}
+
+// rememberToken 按一次换到 Drive token 记下账号 Drive 可用（见 rememberAvailable），但同一账户对象、同一认证代际记着存储空间已满
+// 且没有过期时不动：换到 token 只说明授权还在，空间满要等上传成功或记录过期才算解除。返回是否要通知写盘（见 set）
+func (memory *driveMemory) rememberToken(account *Account, generation uint64, now time.Time) bool {
+	return memory.update(account, generation, DriveStateAvailable, now, now, true)
+}
+
 // rememberAvailable 记下账号 Drive 可用（换到了 Drive token；generation 为发出前读取的认证代际），有效期 driveAvailableTTL；
 // 同时删掉它的“Drive 不可用”记录。返回是否要通知写盘（见 set）
 func (memory *driveMemory) rememberAvailable(account *Account, generation uint64, now time.Time) bool {
@@ -123,9 +142,15 @@ func (memory *driveMemory) rememberAvailable(account *Account, generation uint64
 // set 记下账号的 Drive 状态，checkedAt 为记下的时间（恢复写盘的记录时早于 now），有效期按状态取。同一账户对象已有更新代际的记录
 // （另一个请求在重新登录后记下的）时不写：这次结果来自旧的登录。返回是否要通知写盘：状态变了，或距上次通知超过 driveRecordRefresh
 func (memory *driveMemory) set(account *Account, generation uint64, state DriveState, checkedAt time.Time, now time.Time) bool {
+	return memory.update(account, generation, state, checkedAt, now, false)
+}
+
+// update 为 set 的实现：keepFull 为真时（只用于记下可用）同一账户对象、同一认证代际记着存储空间已满且没有过期的账号不改
+func (memory *driveMemory) update(account *Account, generation uint64, state DriveState, checkedAt time.Time, now time.Time, keepFull bool) bool {
 	if account == nil || state == DriveStateUnknown {
 		return false
 	}
+	storageFull := state == DriveStateStorageFull
 	ttl, target, other := driveUnavailableTTL, &memory.entries, &memory.available
 	pruneAt := &memory.pruneAt
 	if state == DriveStateAvailable {
@@ -142,16 +167,24 @@ func (memory *driveMemory) set(account *Account, generation uint64, state DriveS
 			return false
 		}
 	}
+	if entry, exists := memory.entries[account.ID]; keepFull && exists && entry.storageFull &&
+		entry.account == account && entry.generation == generation && now.Before(entry.until) {
+		return false
+	}
 	if *target == nil {
 		*target = make(map[string]driveUnavailableEntry)
 	}
 	pruneDriveEntries(*target, pruneAt, now)
 	previous, same := (*target)[account.ID]
-	same = same && previous.account == account && previous.generation == generation && now.Before(previous.until)
+	same = same && previous.account == account && previous.generation == generation && now.Before(previous.until) &&
+		previous.storageFull == storageFull
 	if _, switched := (*other)[account.ID]; switched {
 		delete(*other, account.ID)
 	}
-	entry := driveUnavailableEntry{account: account, generation: generation, until: checkedAt.Add(ttl), checkedAt: checkedAt, notifiedAt: now}
+	entry := driveUnavailableEntry{
+		account: account, generation: generation, storageFull: storageFull,
+		until: checkedAt.Add(ttl), checkedAt: checkedAt, notifiedAt: now,
+	}
 	notify := true
 	if same {
 		notify = !now.Before(previous.notifiedAt.Add(driveRecordRefresh))
@@ -204,6 +237,9 @@ func (memory *driveMemory) stateLocked(snapshot driveSnapshot, now time.Time) Dr
 	}
 	switch {
 	case validLocked(memory.entries, snapshot, now):
+		if memory.entries[snapshot.account.ID].storageFull {
+			return DriveStateStorageFull
+		}
 		return DriveStateUnavailable
 	case validLocked(memory.available, snapshot, now):
 		return DriveStateAvailable
@@ -255,15 +291,24 @@ func (s *PooledService) driveAuthGeneration(lease *AccountLease) (uint64, bool) 
 	return lease.account.authGeneration, true
 }
 
-// driveKnownUnavailable 判断租约账户是否记着 Drive 不可用（认证代际变化或过期后不算）
-func (s *PooledService) driveKnownUnavailable(lease *AccountLease) bool {
+// driveKnownUnavailable 判断租约账户是否记着 Drive 不可用或存储空间已满（认证代际变化或过期后不算），storageFull 为其中存储空间已满的
+func (s *PooledService) driveKnownUnavailable(lease *AccountLease) (unavailable bool, storageFull bool) {
 	generation, current := s.driveAuthGeneration(lease)
-	return current && s.drive.unavailable(lease.account, generation, time.Now())
+	if !current {
+		return false, false
+	}
+	switch s.drive.states([]driveSnapshot{{account: lease.account, generation: generation}}, time.Now())[0] {
+	case DriveStateUnavailable:
+		return true, false
+	case DriveStateStorageFull:
+		return true, true
+	}
+	return false, false
 }
 
-// noteAccessToken 按一次 GenerateAccessToken 的结果更新记忆：取得 token 时记为 Drive 可用（账户已不在池中时只清除不可用记录）；
-// 返回 401 / Code 16（driveUnavailableError）时按发出前读取的认证代际记下不可用。其他错误（网络、5xx、登录失效）不改记忆。
-// 状态变化（或同一状态距上次通知超过 driveRecordRefresh）时通知写盘（见 SetDriveObserver）
+// noteAccessToken 按一次 GenerateAccessToken 的结果更新记忆：取得 token 时记为 Drive 可用（账户已不在池中时只清除不可用记录；
+// 同一认证代际记着存储空间已满时不改，见 rememberToken）；返回 401 / Code 16（driveUnavailableError）时按发出前读取的认证代际记下不可用。
+// 其他错误（网络、5xx、登录失效）不改记忆。状态变化（或同一状态距上次通知超过 driveRecordRefresh）时通知写盘（见 SetDriveObserver）
 func (s *PooledService) noteAccessToken(lease *AccountLease, generation uint64, current bool, tokenOK bool, err error) {
 	if s == nil || lease == nil || lease.account == nil {
 		return
@@ -271,7 +316,7 @@ func (s *PooledService) noteAccessToken(lease *AccountLease, generation uint64, 
 	now := time.Now()
 	switch {
 	case tokenOK && current:
-		if s.drive.rememberAvailable(lease.account, generation, now) {
+		if s.drive.rememberToken(lease.account, generation, now) {
 			s.notifyDrive(lease.account, generation, DriveStateAvailable, now)
 		}
 	case tokenOK:
@@ -285,6 +330,26 @@ func (s *PooledService) noteAccessToken(lease *AccountLease, generation uint64, 
 	}
 }
 
+// noteDriveUpload 按一次 Drive 上传的结果更新存储空间已满的记忆（generation、current 为上传之前读取的认证代际，见 driveAuthGeneration）：
+// 上传返回 403 storageQuotaExceeded（storageFull）时记下存储空间已满；上传成功（uploaded）时记为 Drive 可用，解除存储空间已满的记录。
+// 其他结果不改记忆。状态变化时通知写盘（见 SetDriveObserver）
+func (s *PooledService) noteDriveUpload(lease *AccountLease, generation uint64, current bool, uploaded bool, storageFull bool) {
+	if s == nil || lease == nil || lease.account == nil || !current {
+		return
+	}
+	now := time.Now()
+	switch {
+	case storageFull:
+		if s.drive.rememberStorageFull(lease.account, generation, now) {
+			s.notifyDrive(lease.account, generation, DriveStateStorageFull, now)
+		}
+	case uploaded:
+		if s.drive.rememberAvailable(lease.account, generation, now) {
+			s.notifyDrive(lease.account, generation, DriveStateAvailable, now)
+		}
+	}
+}
+
 // accessTokenForLease 为租约账户换一次 Drive bearer token，并按结果更新“Drive 不可用”记忆
 func (s *PooledService) accessTokenForLease(ctx context.Context, lease *AccountLease) (string, error) {
 	generation, current := s.driveAuthGeneration(lease)
@@ -294,11 +359,14 @@ func (s *PooledService) accessTokenForLease(ctx context.Context, lease *AccountL
 }
 
 // uploadFileForLease 用租约账户上传 Drive 文件（request.AccountID 须为租约账户），并按其中 GenerateAccessToken 的结果更新记忆：
-// 返回了 token 即换取成功（之后的 Drive 上传失败与 Drive 授权无关）
+// 返回了 token 即换取成功（之后的 Drive 上传失败与 Drive 授权无关）；上传成功或返回存储空间已满时另按 noteDriveUpload 更新
 func (s *PooledService) uploadFileForLease(ctx context.Context, lease *AccountLease, request UploadRequest) (FileRef, string, error) {
 	generation, current := s.driveAuthGeneration(lease)
 	file, token, err := s.client.uploadFile(ContextWithAccountLease(ctx, lease), request)
 	s.noteAccessToken(lease, generation, current, token != "", err)
+	if token != "" {
+		s.noteDriveUpload(lease, generation, current, err == nil && strings.TrimSpace(file.ID) != "", driveStorageQuotaExceeded(err))
+	}
 	return file, token, err
 }
 
@@ -394,7 +462,8 @@ func (s *PooledService) RestoreDriveRecords(records []DriveRecord) int {
 	p := s.pool
 	p.mu.Lock()
 	for _, record := range records {
-		if record.State != DriveStateAvailable && record.State != DriveStateUnavailable || record.Identity == "" {
+		if record.State != DriveStateAvailable && record.State != DriveStateUnavailable && record.State != DriveStateStorageFull ||
+			record.Identity == "" {
 			continue
 		}
 		if account := p.byID[record.AccountID]; account != nil {
@@ -453,16 +522,19 @@ func (s *PooledService) preferDriveCandidates(accountIDs []string) []string {
 
 // DriveCandidates 为一次选号范围内账号的 Drive 授权状态（见 PooledService.DriveCandidates）。切片只读（可能来自短时缓存，调用方不得修改）
 type DriveCandidates struct {
-	// Available 为记着 Drive 可用的账号，Unavailable 为记着 Drive 不可用的账号，Unknown 为状态未知的账号，均按账号 ID 排序
+	// Available 为记着 Drive 可用的账号，Unavailable 为记着 Drive 不可用或存储空间已满的账号（都传不上 Drive），Unknown 为状态未知的账号，
+	// 均按账号 ID 排序
 	Available   []string
 	Unavailable []string
 	Unknown     []string
 }
 
-// DriveCounts 为号池里启用账号的 Drive 授权状态计数（管理页与 /api/status）
+// DriveCounts 为号池里启用账号的 Drive 授权状态计数（管理页与 /api/status）：StorageFull 为有授权但 Drive 存储空间已满的账号，
+// 不计入 Unavailable（没有 Drive 授权）
 type DriveCounts struct {
 	Available   int
 	Unavailable int
+	StorageFull int
 	Unknown     int
 }
 
@@ -511,7 +583,7 @@ func (s *PooledService) DriveCandidates(ctx context.Context, selection AccountSe
 		switch state {
 		case DriveStateAvailable:
 			result.Available = append(result.Available, snapshots[index].account.ID)
-		case DriveStateUnavailable:
+		case DriveStateUnavailable, DriveStateStorageFull:
 			result.Unavailable = append(result.Unavailable, snapshots[index].account.ID)
 		default:
 			result.Unknown = append(result.Unknown, snapshots[index].account.ID)
@@ -547,6 +619,8 @@ func (s *PooledService) DriveSummary() DriveCounts {
 			counts.Available++
 		case DriveStateUnavailable:
 			counts.Unavailable++
+		case DriveStateStorageFull:
+			counts.StorageFull++
 		default:
 			counts.Unknown++
 		}

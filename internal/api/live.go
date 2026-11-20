@@ -383,7 +383,9 @@ func (s *server) writeBidiEvents(
 func bidiErrorMessage(err error) bidiServerMessage {
 	message := bidiServerMessage{Type: "error"}
 	if err != nil {
-		message.Error = publicErrorFor(err, "").Message
+		// 与其他协议的流内错误一样，429、503 且给出了最早恢复时间时消息末尾带重试提示（见 publicErrorWithRetry）
+		public, _ := publicErrorWithRetry(err, "")
+		message.Error = public.Message
 	}
 	if errors.Is(err, aistudio.ErrInvalidArgument) {
 		message.Code = "invalid_request"
@@ -419,7 +421,8 @@ func mapBidiServerEvent(event aistudio.BidiEvent) bidiServerMessage {
 		message.Data = event.Media.Data
 	}
 	if event.Err != nil {
-		message.Error = publicErrorFor(event.Err, "").Message
+		public, _ := publicErrorWithRetry(event.Err, "")
+		message.Error = public.Message
 	}
 	return message
 }

@@ -55,6 +55,10 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		if entry.Latency > 0 {
 			data.Usage.AverageTokensPerSecond = float64(output) / entry.Latency.Seconds()
 		}
+		// 生成速度只计首个上游分块之后：排队、WAA、等首个分块与被放弃的重新生成都不算（见 forwardEvents 的 firstChunkAt）
+		if window := entry.Latency - entry.FirstOutput; entry.FirstOutput > 0 && window > 0 && output > 0 {
+			data.Usage.GenerationTokensPerSecond = float64(output) / window.Seconds()
+		}
 	}
 	return data
 }

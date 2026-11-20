@@ -206,6 +206,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.RoutingStrategy == active.RoutingStrategy && slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
 		saved.TemporaryChat == active.TemporaryChat &&
 		saved.IgnoreClientSeed == active.IgnoreClientSeed && saved.RepeatPromptNonce == active.RepeatPromptNonce &&
+		saved.AbnormalFinishError == active.AbnormalFinishError &&
 		saved.MinOutputTokens == active.MinOutputTokens && saved.DowngradeGuard.Equal(active.DowngradeGuard) &&
 		saved.StreamDataHeartbeat == active.StreamDataHeartbeat && saved.OmniIgnoreSystemPrompt == active.OmniIgnoreSystemPrompt &&
 		saved.OmniImageBinding == active.OmniImageBinding &&
@@ -308,6 +309,8 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	admin.service.setLongOutput(saved.LongOutputEnabled, saved.LongOutputMaxTokens)
 	// OMNI_IMAGE_BINDING：下一次尝试立即按新值计算 Interaction 带图请求的 binding（见 omni_image_binding.go）
 	bindingChanged := admin.service.setOmniImageBinding(saved.OmniImageBinding)
+	// ABNORMAL_FINISH_ERROR：下一个请求立即按新值（见 abnormal_finish.go）
+	abnormalChanged := admin.service.setAbnormalFinishError(saved.AbnormalFinishError)
 	admin.service.setDowngradeGuard(saved.DowngradeGuard)
 	admin.service.setStreamPlaygroundModels(saved.StreamPlaygroundModels)
 	admin.service.setPrimaryModelSettings(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait)
@@ -317,6 +320,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	manager.mu.Unlock()
 	if bindingChanged {
 		manager.requests.log("service", "INFO", fmt.Sprintf("视频模型带图校验值设置已更新并立即生效 | 开启=%t（OMNI_IMAGE_BINDING）", saved.OmniImageBinding))
+	}
+	if abnormalChanged {
+		manager.requests.log("service", "INFO", fmt.Sprintf("异常结束按错误返回设置已更新并立即生效 | 开启=%t（ABNORMAL_FINISH_ERROR）", saved.AbnormalFinishError))
 	}
 	if fallbackChanged {
 		manager.requests.log("service", "INFO", "额度用完改用其他模型的设置已更新并立即生效 | "+

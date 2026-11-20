@@ -333,10 +333,10 @@ const pageInputNotReadyPrefix = "AI Studio 输入框未就绪"
 // 上层可能再包装（本机代理中转的说明追加在原文之后，errors.Join 也保留原文）。等待输入框超时只在页面确实停在 AI Studio
 // （url=https://aistudio.google.com/…）时算：停在代理错误页（about:neterror）、Google sorry 页、登录页、地区不支持页，
 // 或读不到 url 时与缓存无关，清掉只会让下次启动多一次整页冷加载。首次使用页上的失败（没能自动完成首次使用页，
-// 或订阅网络事件之后的失败发生时页面停在首次使用页）与组织停用页（ServiceNotAllowedError，账号所属组织停用了 AI Studio）
-// 也与缓存无关，不算
+// 或订阅网络事件之后的失败发生时页面停在首次使用页）与拒绝页（ServiceNotAllowedError：账号所属组织停用了 AI Studio、服务受限、
+// 年龄要求、Workspace 未开放；RegionNotSupportedError：不支持当前出口地区）也与缓存无关，不算
 func PageStateFailure(err error) (string, bool) {
-	if onboardingRelated(err) || errors.Is(err, ErrServiceNotAllowed) {
+	if onboardingRelated(err) || deniedPageFailure(err) {
 		return "", false
 	}
 	pending := []error{err}
@@ -351,7 +351,8 @@ func PageStateFailure(err error) (string, bool) {
 			if !strings.HasPrefix(message, prefix) {
 				continue
 			}
-			if prefix == pageInputNotReadyPrefix && !strings.HasPrefix(message, prefix+" url="+aiStudioOrigin+"/") {
+			if prefix == pageInputNotReadyPrefix && (!strings.HasPrefix(message, prefix+" url="+aiStudioOrigin+"/") ||
+				isDeniedPageURL(inputNotReadyURL(message))) {
 				break
 			}
 			return prefix, true
@@ -364,4 +365,17 @@ func PageStateFailure(err error) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// inputNotReadyURL 取出“AI Studio 输入框未就绪 url=<当前页面>: <原因>”里的页面地址（旧版本停在年龄要求、Workspace、
+// 地区说明页时也是这条文案，地址后接“: ”）
+func inputNotReadyURL(message string) string {
+	rest, found := strings.CutPrefix(message, pageInputNotReadyPrefix+" url=")
+	if !found {
+		return ""
+	}
+	if cut := strings.Index(rest, ": "); cut >= 0 {
+		rest = rest[:cut]
+	}
+	return rest
 }

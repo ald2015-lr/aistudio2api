@@ -690,7 +690,8 @@ func (client *bidiClient) onboardingPage(ctx context.Context, contextID string) 
 }
 
 // startupDiagnosis 为启动时页面类失败处的诊断结果（见 startupFailureDiagnosis）：onboarding 为停在首次使用页（此时不读地址与快照）；
-// pageURL 为读到的地址（withURL 时），suffix 为页面快照；blocked 为页面停在组织停用页（access.workspace.google.com）时的地址，否则为空
+// pageURL 为读到的地址（withURL 时），suffix 为页面快照；blocked 为页面停在拒绝页（组织停用页 access.workspace.google.com 等拒绝账号的
+// 页面或地区说明页，见 deniedPageError）时的地址，否则为空
 type startupDiagnosis struct {
 	onboarding bool
 	pageURL    string
@@ -698,13 +699,14 @@ type startupDiagnosis struct {
 	blocked    string
 }
 
-// serviceNotAllowed 在页面停在组织停用页时返回 ServiceNotAllowedError（附同一份快照），否则为 nil：
-// 失败的原因是账号所属组织停用了 AI Studio，原来的页面类错误（输入框未就绪、填写提示词失败等）只是表象
+// serviceNotAllowed 在页面停在拒绝页时返回 ServiceNotAllowedError（拒绝账号，带种类）或 RegionNotSupportedError（地区说明页），
+// 附同一份快照，否则为 nil：失败的原因是账号用不了 AI Studio 或出口地区不受支持，原来的页面类错误（输入框未就绪、
+// 填写提示词失败等）只是表象
 func (diagnosis startupDiagnosis) serviceNotAllowed() error {
 	if diagnosis.blocked == "" {
 		return nil
 	}
-	return &ServiceNotAllowedError{URL: serviceNotAllowedPath(diagnosis.blocked), suffix: diagnosis.suffix}
+	return deniedPageError(diagnosis.blocked, diagnosis.suffix)
 }
 
 // startupFailureDiagnosis 为启动时页面类失败处的诊断：先识别首次使用页，不在时再读地址（withURL）与页面快照（同 pageDiagnosis），
@@ -912,12 +914,12 @@ func (client *bidiClient) observeOnboarding(ctx context.Context, contextID strin
 }
 
 // onboardingFailed 组装没能完成首次使用页的错误：原因之后接进度记录 progress（“ | 已做=…”，没有开始完成时为空串）、
-// 失败那一刻的页面快照与结构摘要。快照显示页面已被跳到组织停用页（access.workspace.google.com）时改为返回 ServiceNotAllowedError
-// （附同一份快照）：没能完成的原因是账号所属组织停用了 AI Studio，不是首次使用页本身
+// 失败那一刻的页面快照与结构摘要。快照显示页面已被跳到拒绝页（组织停用页 access.workspace.google.com 等，见 deniedPageError）时
+// 改为返回停在拒绝页的错误（附同一份快照）：没能完成的原因是账号用不了 AI Studio 或出口地区不受支持，不是首次使用页本身
 func (client *bidiClient) onboardingFailed(ctx context.Context, contextID string, reason string, cause error, progress string, summary *onboardingSummary) error {
 	_, snapshot, blocked := client.pageDiagnosisBlocked(ctx, contextID, false)
 	if blocked != "" {
-		return &ServiceNotAllowedError{URL: serviceNotAllowedPath(blocked), suffix: snapshot}
+		return deniedPageError(blocked, snapshot)
 	}
 	return &onboardingFailure{
 		reason:    strings.Join(strings.Fields(reason), " "),
