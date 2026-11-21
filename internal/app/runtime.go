@@ -502,6 +502,12 @@ func (err *accountWorkerInitError) Unwrap() error {
 	return err.err
 }
 
+// startupAuthHandled 判断错误来自 Worker 启动、且启动阶段已经处理过其中的登录失效（authHandled）
+func startupAuthHandled(err error) bool {
+	var startup *accountWorkerInitError
+	return errors.As(err, &startup) && startup.authHandled
+}
+
 // newAccountWorkerManager 创建账户 worker 配置
 func newAccountWorkerManager(
 	pool *aistudio.AccountPool,
@@ -2065,7 +2071,8 @@ func aboveResidentText(above bool) string {
 	return "否"
 }
 
-// startAuthenticatedWorker 启动账户 Worker。启动阶段确认登录失效（登录页跳转、签名 Cookie 失效）时，
+// startAuthenticatedWorker 启动账户 Worker。启动阶段确认登录失效（登录页跳转、签名 Cookie 失效、Camoufox 页面停在 Google 登录或确认身份页，
+// 见 aistudio.DefinitiveAuthenticationFailure）时，
 // 在请求租约内恢复一次认证并重新启动；仍失败时账户标为需要登录，错误带 authHandled，上层不再恢复第二次。
 // 预热与后台扩容没有租约，也不为此另取普通租约（会更新 LastUsed、把账户显示为忙碌，干扰 idleWarmVictimFor
 // 与预热轮换选号）：账户保存了续签材料时留给带租约的按需启动恢复，没有续签材料时按启动前的认证代际标为需要登录
@@ -2075,7 +2082,6 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 		return nil, &accountWorkerInitError{err: errWorkerOrgDisabled}
 	}
 	generation := manager.pool.AuthGeneration(accountID)
-	startedAt := time.Now()
 	worker, err := manager.startOrgCheckedWorker(ctx, accountID, model)
 	if err == nil {
 		manager.persistStartupCookies(accountID, generation, worker)
@@ -2090,7 +2096,7 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 	}
 	lease, leased := aistudio.AccountLeaseFromContext(ctx)
 	if !leased || lease.Account().ID != accountID {
-		marked, markErr := manager.markStartupAuthRequired(accountID, generation, startedAt, err)
+		marked, markErr := manager.markStartupAuthRequired(accountID, generation, time.Now(), err)
 		if !marked && markErr == nil {
 			return nil, err
 		}
@@ -2180,11 +2186,14 @@ func (manager *accountWorkerManager) confirmOrgDisabled(accountID string, cause 
 	manager.pool.ReportOrgDisabled(accountID, aistudio.OrgDisabledFromStartup, cause)
 }
 
-// markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录
+// markStartupAuthRequired 处理没有请求租约的启动路径上的登录失效，返回是否把账户标为需要登录。
+// failedAt 为启动失败的时刻（不是启动开始时刻）：启动要 9–30 秒，期间同账号由 Go 通道完成的请求（CountTokens 等）会把认证检查时间
+// 推到启动开始之后；按开始时刻写，这次标记会被当作陈旧跳过，或者标记之后，一个在启动期间取得、稍后才成功的租约把账户改回就绪，
+// 又被预热选中再冷启动一次。按失败时刻写，标记之前取得的租约都更早，改不回它；认证代际照旧检查（期间保存过新登录时不写）
 func (manager *accountWorkerManager) markStartupAuthRequired(
 	accountID string,
 	generation uint64,
-	startedAt time.Time,
+	failedAt time.Time,
 	cause error,
 ) (bool, error) {
 	account, err := manager.pool.Account(accountID)
@@ -2197,7 +2206,7 @@ func (manager *accountWorkerManager) markStartupAuthRequired(
 		return false, nil
 	}
 	// 启动阶段的登录失效多为登录页跳转或签名 Cookie 失效（本地证据），直接标记；上游 401 的复核只在请求路径（见 auth_recheck.go）
-	marked, err := manager.pool.MarkAuthenticationRequiredIfGeneration(accountID, generation, startedAt, cause.Error())
+	marked, err := manager.pool.MarkAuthenticationRequiredIfGeneration(accountID, generation, failedAt, cause.Error())
 	if marked && manager.refresher != nil && manager.refresher.publish != nil {
 		manager.refresher.publish()
 	}
@@ -6046,10 +6055,15 @@ func (service *trackedService) generateForModel(
 		// authMarked：本次生成的 401 已把账号标成需要登录。它的驻留 Worker 已不是任何模型的候选，租约释放后登记释放（见 worker_unschedulable.go）。
 		// 只按本次尝试本身的错误（attemptErr）判断：随后删除临时 Drive 副本的 401（Bearer token 过期）不是登录失效的证据。
 		// 上游 401 先经账户池的 gate：运行时只记“疑似登录失效”、写短冷却并异步复核（见 auth_recheck.go），复核仍是 401 才标记
+		// Worker 在这次尝试里（重）启动（发送时 Worker 已不在、WAA 运行态失效后在原账号重启），启动阶段已处理过这次登录失效
+		// （startupAuthHandled：已按“来源=启动”标需要登录并登记释放，或已续签恢复过一次）时不再按生成标记、不写“来源=生成”：
+		// 否则登录复核记下的浏览器证据被改成接口证据，定期复核用磁盘 Cookie 探测通过就把账号改回就绪，再被冷启动、再落到登录页
 		authMarked := false
 		authFailure := aistudio.DefinitiveAuthenticationFailure(attemptErr)
 		if authFailure {
-			if marked, stateErr := lease.MarkAuthenticationFailure(attemptErr); stateErr != nil {
+			if startupAuthHandled(attemptErr) {
+				// 只计入下面的登录失效换号上限
+			} else if marked, stateErr := lease.MarkAuthenticationFailure(attemptErr); stateErr != nil {
 				err = errors.Join(err, stateErr)
 				retryable = false
 			} else {

@@ -244,6 +244,13 @@ REGION_LABEL = "出口地区不支持 AI Studio（页面停在 docs/available-re
 def region_error(error):
     return REGION_PREFIX in (error or "") or REGION_HOST in (error or "")
 region_fail, region_fail_accounts = 0, set()
+# 启动停在 Google 登录 / 确认身份页（“隔离登录态失效 url=https://accounts.google.com/…”）：新版按登录失效处理，没有租约的启动在 Linux 上
+# 随即写“账号需要登录 | 来源=启动”，账号不再被预热、扩容启动；带“；本机代理中转：”说明的（这次启动出口有问题）不标。
+# 旧版程序没有这一步，同一批账号每小时被反复冷启动。按 host+path 统计页面（不含查询参数），并对照同期的“账号需要登录 | 来源=启动”
+LOGIN_PREFIX = "隔离登录态失效 url="
+LOGIN_URL_RE = re.compile(r"隔离登录态失效 url=https?://([^?#\s；|]+)")
+login_fail, login_relayed, login_fail_accounts, login_paths = 0, 0, set(), collections.Counter()
+login_marked, login_marked_accounts = 0, set()
 page_total, page_heads, page_groups, page_samples, page_kinds = collections.Counter(), collections.Counter(), collections.Counter(), {}, {}
 # 分组键相同的失败可能根因不同（改版、整页刷新、一直没加载出来）：按（分组, 失败原因）另统计这几项的分布（见 PAGE_DIST），各留最近一条样本
 page_dist = {}
@@ -481,6 +488,15 @@ for p in paths:
                         if head == "WAA Worker 启动失败":
                             region_fail += 1
                             region_fail_accounts.add(source)
+                    elif LOGIN_PREFIX in error:
+                        fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
+                        if head == "WAA Worker 启动失败":
+                            login_fail += 1
+                            login_fail_accounts.add(source)
+                            if "；本机代理中转：" in error:
+                                login_relayed += 1
+                            m = LOGIN_URL_RE.search(error)
+                            login_paths[DIGITS.sub("#", m.group(1)) if m else "?"] += 1
                     else:
                         fail_reasons[DIGITS.sub("#", collapse_exception(error or msg.split("\n")[0]))[:170]] += 1
                     if f.get("端口"):
@@ -576,6 +592,9 @@ for p in paths:
                     onboard_inplace_done += 1
                 elif ONBOARD_INPLACE_LEFT in clean and head == "WAA Worker 启动失败":
                     onboard_inplace_left += 1
+            if head == "账号需要登录" and fields(msg).get("来源") == "启动" and LOGIN_PREFIX in msg:
+                login_marked += 1
+                login_marked_accounts.add(source)
             if head == ORG_ENTER:
                 org_enter_sources[fields(msg).get("来源", "?")] += 1
                 org_enter_accounts.add(source)
@@ -631,6 +650,17 @@ if restricted_any:
 if region_fail:
     print(f"{REGION_LABEL}：启动失败 {region_fail} 次，涉及 {len(region_fail_accounts)} 个账号（出口的问题，不标记账号）")
     print("  为这些账户或全局代理换用 AI Studio 支持地区的出口")
+if login_fail or login_marked:
+    paths = "、".join(f"{path}×{count}" for path, count in login_paths.most_common(5)) or "-"
+    print(f"启动停在 Google 登录或确认身份页（隔离登录态失效）：启动失败 {login_fail} 次，涉及 {len(login_fail_accounts)} 个账号，"
+          f"其中带本机代理中转失败说明的 {login_relayed} 次（出口有问题，不标需要登录）；页面 {paths}")
+    print(f"  同期“账号需要登录 | 来源=启动”（错误为登录页）{login_marked} 条、{len(login_marked_accounts)} 个账号；"
+          f"停在登录页却没有对应需要登录行的账号 {len(login_fail_accounts - login_marked_accounts)} 个")
+    if login_fail - login_relayed > 0 and not login_marked:
+        print("  → 一条“账号需要登录 | 来源=启动”都没有：程序早于“启动落到登录页标需要登录”的修复，这些账号会被预热、扩容反复冷启动，升级后每个账号只再失败一次")
+    else:
+        print("  → 已标需要登录的账号不再被预热、扩容、替补启动（Linux 上不能续签）：重新登录、更新认证文件或在管理页点“验证”后恢复；"
+              "重启后每个账号最多再试一次")
 if denied is not None:
     print(f"冷却列表里有 403 无权限冷却的账号 {len(denied)} 个；启动失败的账号 {len(fail_accounts)} 个，其中有 403 冷却的 {len(fail_accounts & denied)} 个；"
           f"就绪的账号 {len(ready_accounts)} 个，其中有 403 冷却的 {len(ready_accounts & denied)} 个")

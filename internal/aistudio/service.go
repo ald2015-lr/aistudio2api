@@ -12,6 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/Mag1cFall/AIStudio2API/internal/camoufoxnative"
+	"github.com/Mag1cFall/AIStudio2API/internal/proxyrelay"
 )
 
 // PooledService 在账户租约内调用协议客户端
@@ -467,19 +470,32 @@ func (s *PooledService) cachedModels(accountID string) []Model {
 // 或者保存的签名 Cookie 缺失、已过期。与上游 HTTP 401 一样进入认证恢复流程
 var ErrAuthenticationRequired = errors.New("登录态失效")
 
+// ErrLoginPageRedirect 为 Camoufox Worker 启动时页面停在 Google 登录页（登录、确认身份等页，错误文案为“隔离登录态失效 url=…”）的哨兵，
+// 与 camoufoxnative.ErrLoginPageRedirect 是同一个：与纯 Go 运行时的登录页跳转（ErrAuthenticationRequired）一样是登录失效的本地证据。
+// 原先只有文案没有哨兵，启动落到登录页的账户一直显示就绪，被预热、后台扩容反复冷启动（线上约 212 个账号每小时各失败约 25 次）
+var ErrLoginPageRedirect = camoufoxnative.ErrLoginPageRedirect
+
 // DefinitiveAuthenticationFailure 判断上游是否明确要求重新认证：登录页跳转、签名 Cookie 缺失或过期（ErrAuthenticationRequired），
-// 或用 Cookie 认证的 MakerSuite RPC 返回 HTTP 401 / 协议错误码 16。以下 401 不算登录失效证据（第 5 项，需要登录从 334 涨到 2041 的排查）：
+// Camoufox Worker 启动停在 Google 登录页（ErrLoginPageRedirect；这次启动期间本机代理中转记到了连上游代理的失败时不算，
+// 见 loginPageRedirect），或用 Cookie 认证的 MakerSuite RPC 返回 HTTP 401 / 协议错误码 16。以下 401 不算登录失效证据（第 5 项，需要登录从 334 涨到 2041 的排查）：
 //   - Drive*（DriveUpload、DriveDownload、DriveDelete 等）：用的是 GenerateAccessToken 换来的 Bearer token，401 只说明 token 过期；
 //   - GenerateAccessToken：401 / Code 16（含 unauthorized_client）表示账号没有 Drive 授权（见 driveUnavailableError），不改账户状态、
 //     不写冷却：内联附件改为内联发送，其他需要 Drive 的路径只让这次尝试失败。原先一次 401 就把账号标成需要登录，线上带图请求每次尝试都先换 token，
 //     “发送 AI Studio GenerateAccessToken … 返回 HTTP 401”占了需要登录的大头
 func DefinitiveAuthenticationFailure(err error) bool {
-	if errors.Is(err, ErrAuthenticationRequired) {
+	if errors.Is(err, ErrAuthenticationRequired) || loginPageRedirect(err) {
 		return true
 	}
 	var rpcError *RPCError
 	return errors.As(err, &rpcError) && cookieAuthenticatedMethod(rpcError.Method) &&
 		(rpcError.StatusCode == http.StatusUnauthorized || rpcError.Code == 16)
+}
+
+// loginPageRedirect 判断错误是否为 Camoufox Worker 启动停在 Google 登录页（ErrLoginPageRedirect）、且这次启动期间本机代理中转
+// 没有记到连上游代理的失败（错误不带 proxyrelay.ErrUpstream，即没有“；本机代理中转：…”后缀）。带这个后缀说明这次启动的出口有问题，
+// 登录页可能只是出口异常的结果，按普通启动失败处理、不标需要登录（与 healBrowserCache、IP 池端口健康按 ErrUpstream 区分出口问题同一口径）
+func loginPageRedirect(err error) bool {
+	return errors.Is(err, ErrLoginPageRedirect) && !errors.Is(err, proxyrelay.ErrUpstream)
 }
 
 // AccessTokenAuthFailure 判断错误是否为 GenerateAccessToken 返回的认证失败（401 / Code 16，明确的 unauthorized_client 除外，

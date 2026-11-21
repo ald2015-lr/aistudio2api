@@ -27,9 +27,10 @@ func (p *AccountPool) SetAuthFailureGate(gate AuthFailureGate) {
 	p.authGate.Store(&gate)
 }
 
-// upstreamAuthFailure 判断登录失效是否只来自上游 RPC 的 401 / Code 16（没有登录页跳转、签名 Cookie 缺失这类本地证据）
+// upstreamAuthFailure 判断登录失效是否只来自上游 RPC 的 401 / Code 16（没有登录页跳转、签名 Cookie 缺失、
+// Camoufox 启动停在登录页这类本地证据）
 func upstreamAuthFailure(cause error) bool {
-	if errors.Is(cause, ErrAuthenticationRequired) {
+	if errors.Is(cause, ErrAuthenticationRequired) || errors.Is(cause, ErrLoginPageRedirect) {
 		return false
 	}
 	var rpcError *RPCError

@@ -217,8 +217,7 @@ func (refresher *authRuntimeRefresher) markAuthenticationRequired(ctx context.Co
 // 没有续签材料或续签失败时把账户标为需要登录，返回保留原因的错误。
 // Worker 启动阶段已经处理过的登录失效（authHandled）不再恢复第二次
 func (refresher *authRuntimeRefresher) Recover(ctx context.Context, cause error) error {
-	var startup *accountWorkerInitError
-	if errors.As(cause, &startup) && startup.authHandled {
+	if startupAuthHandled(cause) {
 		return cause
 	}
 	if refresher.Available(ctx) {

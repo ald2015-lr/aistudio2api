@@ -391,6 +391,11 @@ func (worker *Worker) bootstrap(ctx context.Context, options Options, storage st
 	return nil
 }
 
+// ErrLoginPageRedirect 为 Worker 启动载入 AI Studio 时页面停在 Google 登录页（accounts.google.com 下的登录、确认身份等页；
+// servicerestricted 等拒绝页先于它判断，见 isDeniedPageURL）的哨兵。错误文案不变（"隔离登录态失效 url=<地址>"），
+// aistudio 据此与纯 Go 运行时的登录页跳转一样按登录失效处理（见 aistudio.DefinitiveAuthenticationFailure）
+var ErrLoginPageRedirect = errors.New("隔离登录态失效")
+
 // openPromptPage 导航到 target，等页面就绪后定位 WAA 并填好 bootstrap 提示词（启动 5/7 到 7/7 填写提示词，session.subscribe 之前），
 // 返回页面地址与官网 snapshot 函数的键。等到页面就绪时停在首次使用页，或从等就绪起任何一步的页面类失败发生时页面在首次使用页，
 // 都返回 errOnboardingPage（不采快照，由 bootstrap 完成首次使用后重做）；停在拒绝页（组织停用页 access.workspace.google.com、
@@ -447,7 +452,7 @@ func (worker *Worker) openPromptPage(ctx context.Context, options Options, targe
 		return "", "", client.serviceNotAllowed(ctx, contextID, pageURL)
 	}
 	if strings.Contains(pageURL, "accounts.google.com") {
-		return "", "", fmt.Errorf("隔离登录态失效 url=%s", pageURL)
+		return "", "", fmt.Errorf("%w url=%s", ErrLoginPageRedirect, pageURL)
 	}
 	if client.onboardingPage(ctx, contextID) {
 		return "", "", errOnboardingPage
