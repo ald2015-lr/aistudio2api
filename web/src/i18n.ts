@@ -187,6 +187,9 @@ const zhCN = {
     '另有 {count} 个需要验证账号的账户整户暂停中，未计入（含 {other} 个需要登录、组织已停用或不可用的账户，它们不在需要验证账号汇总块里）',
   'accounts.cooldownVerifyExcludedHelp':
     '按需要验证账号整户暂停仍生效的账户计，不看账户状态：它们的全部冷却条目（整户暂停按每个模型展开的条目与单模型冷却）都不计入这里的账号数、条目数、恢复时间与主要原因。需要登录、组织已停用、不可用的账户也算在这个数里，但不计入需要验证账号汇总块（与“出问题（403）”一致），所以这里可能多于汇总块里整户暂停中的个数；暂停已到期的账户照常计入冷却。',
+  'accounts.cooldownVerifyModelExcluded': '另有 {count} 个账户的单个模型需要验证暂停未计入',
+  'accounts.cooldownVerifyModelExcludedHelp':
+    '单个模型需要验证账号的暂停只挡住那一个模型（最长 30 天），这些条目不计入这里的账号数、条目数、恢复时间与主要原因（该账户的其他冷却照常计入）；它们另见“403 单个模型需要验证”。',
   'accounts.cooldownShowAll': '展开全部 {count} 个模型',
   'accounts.cooldownShowLess': '收起',
   'accounts.cooldownSoon': '即将恢复',
@@ -480,7 +483,7 @@ const zhCN = {
   'accounts.filterAll': '全部',
   'accounts.filterProblem': '出问题（403）',
   'accounts.problemHelp':
-    '只汇总返回 403 无权限的账户（如需要验证账号），每个账户写明原因；需要登录、组织已停用、不可用的账户各有单独的状态筛选，即使有 403 记录也不计入这里（重新登录或更新认证文件后 403 记录一并清除，上方 403 列表照常列出其中的普通 403）。403 的每个模型带最近一次的时间与次数，只涉及一个模型的归为“403 单个模型无权限”；不是账户级、超过 {hours} 小时没有再出现、账户也不在 403 冷却里的 403 记录视为陈旧，不计入（上方 403 列表里灰显，可逐行清除）',
+    '只汇总返回 403 无权限的账户（如需要验证账号），每个账户写明原因；需要登录、组织已停用、不可用的账户各有单独的状态筛选，即使有 403 记录也不计入这里（重新登录或更新认证文件后 403 记录一并清除，上方 403 列表照常列出其中的普通 403）。403 的每个模型带最近一次的时间与次数，只涉及一个模型的归为“403 单个模型无权限”；需要验证账号只在一个模型上的归为“403 单个模型需要验证”（只暂停那个模型），2 个及以上模型或整户暂停仍生效的归为“403 需要验证账号”；不是账户级、超过 {hours} 小时没有再出现、账户也不在 403 冷却里的 403 记录视为陈旧，不计入（上方 403 列表里灰显，可逐行清除）',
   'accounts.problemCount': '{count} 个返回 403 的账户',
   'accounts.problemCopyWithReason': '复制邮箱与原因',
   'accounts.problemCopied': '已复制 {count} 个账户',
@@ -491,6 +494,10 @@ const zhCN = {
   'accounts.problemKindVerify': '403 需要验证账号',
   'accounts.problemKindForbidden': '403 无权限（多个模型）',
   'accounts.problemKindModelForbidden': '403 单个模型无权限',
+  'accounts.problemKindVerifyModel': '403 单个模型需要验证',
+  'accounts.problemVerifyModel': '单个模型需要验证账号',
+  'accounts.problemVerifyModelOrphan':
+    '单个模型需要验证账号（{models}，403 记录已清除，该模型仍暂停；到官网验证后点“验证”，或在上方“403 单个模型需要验证”里点“清除”）',
   'accounts.problemVerifyPaused':
     '需要验证账号，整户暂停调度（403 记录已清除；到官网验证后点“验证”，或在上方“需要验证账号”汇总块点“清除记录并解除暂停”）',
   'accounts.problemStaleMore': '；另有 {count} 个陈旧记录不计',
@@ -638,7 +645,7 @@ const zhCN = {
   'accounts.permissionDeniedHint': '（多半未同意 Google 政策，重新获取认证文件后上传即可）',
   'accounts.permissionDeniedCount': '{count} 个',
   'accounts.permissionDeniedHelp':
-    '生成请求返回 HTTP 403 PERMISSION_DENIED（The caller does not have permission）的账户，每个模型记下最近一次的时间、次数与请求来源。以下情况清除记录：认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录，同时解除它的 403 冷却）；该模型在该通道上成功一次（只清这个模型这个通道）；需要验证账号的账户在任一模型上成功；管理页“验证”通过；启动时对账（账户已不在号池，或登录签名变了）；号池级 403 撤销；每行的“清除”与“清除记录”（只清这张表里列出的账户，不解除单模型 403 冷却）。超过 {hours} 小时没有再出现、账户也不在 403 冷却里的记录灰显为陈旧，多半是很早以前或别人（new-api 渠道测试、下游用户、模型别名、共用账户目录的另一个实例）调用留下的。号池级 403 不计入。需要验证账号（账户级 403，整户暂停调度 30 天）的账户不列在这里，见下方“需要验证账号”汇总块。',
+    '生成请求返回 HTTP 403 PERMISSION_DENIED（The caller does not have permission）的账户，每个模型记下最近一次的时间、次数与请求来源。以下情况清除记录：认证文件更新（上传新的 storage-state.json、浏览器登录或重新导入目录，同时解除它的 403 冷却）；该模型在该通道上成功一次（只清这个模型这个通道）；需要验证账号的账户通过验证（2 个及以上模型要求验证时任一模型成功，只有一个模型时这个模型本身成功）；管理页“验证”通过；启动时对账（账户已不在号池，或登录签名变了）；号池级 403 撤销；每行的“清除”与“清除记录”（只清这张表里列出的账户，不解除单模型 403 冷却）。超过 {hours} 小时没有再出现、账户也不在 403 冷却里的记录灰显为陈旧，多半是很早以前或别人（new-api 渠道测试、下游用户、模型别名、共用账户目录的另一个实例）调用留下的。号池级 403 不计入。需要验证账号（账户级 403：2 个及以上模型时整户暂停调度，只有一个模型时只暂停那个模型，都最长 30 天）的账户不列在这里，见下方“需要验证账号”汇总块与“403 单个模型需要验证”。',
   'accounts.permissionDeniedEmail': '邮箱',
   'accounts.permissionDeniedModels': '模型 · 通道',
   'accounts.permissionDeniedLast': '最近一次',
@@ -649,11 +656,12 @@ const zhCN = {
   'accounts.permissionDeniedClearConfirm':
     '清除列表中 {count} 个账户的 403 记录？不解除单模型 403 冷却与多模型 403 自动暂停；账户再次返回 403 时会重新列出。',
   'accounts.permissionDeniedClearKeepVerify':
-    '不含需要验证账号的 {count} 个账户：它们的 403 记录与整户暂停不动（见“需要验证账号”汇总块）。',
+    '不含需要验证账号的 {count} 个账户（整户与单个模型）：它们的 403 记录与暂停不动（见“需要验证账号”汇总块与“403 单个模型需要验证”）。',
   'accounts.permissionDeniedClearPartial':
     '已清除 {cleared} 个账户的 403 记录、解除 {lifted} 个账户的整户暂停后出错：{error}',
   'accounts.permissionDeniedCleared': '已清除 {count} 个账户的记录',
-  'accounts.permissionDeniedLiftedMore': '；解除 {count} 个账户需要验证账号的整户暂停',
+  'accounts.permissionDeniedLiftedMore':
+    '；解除 {count} 个账户需要验证账号的暂停（整户或单个模型）',
   'accounts.permissionDeniedDelete': '一键删除',
   'accounts.permissionDeniedDeleteHelp':
     '从号池删除列表中的全部账户（包括折叠未显示的）并删除它们的认证目录，与账户列表里的“删除”相同，不能恢复。',
@@ -701,13 +709,33 @@ const zhCN = {
     '{paused} 个整户暂停调度中（不占 Worker、不预热）、{expired} 个暂停已到期；都不计入 403 列表，模型冷却只不计暂停中的；最近一次 {time}。',
   'accounts.verifyRequiredAdvice': '到官网验证后在管理页点“验证”；不处理的话暂停 30 天后到期再试。',
   'accounts.verifyRequiredHelp':
-    '返回 403 “Your account must be verified … verify-account”（账户级）的账户，以及需要验证账号整户暂停仍生效的账户，与“出问题（403）→ 403 需要验证账号”同一口径。第一次遇到就整户暂停调度 30 天：不参与调度、不占 Worker、不预热，所以不列在 403 无权限账户列表里，模型冷却也不计它们。暂停从第一次 403 起算 30 天，到期后（或旧版本留下、已超过 30 天的登记）账户重新参与调度，登记还在、仍计在这里，状态说明分开写暂停中与已到期的个数；仍未验证的下一次请求会再返回 403 并重新暂停。需要登录、组织已停用、不可用的账户不计入这里（与“出问题（403）”一致），它们各有单独的状态筛选。到 https://aistudio.google.com/verify-account 验证后在账户列表点“验证”即可解除；“清除记录并解除暂停”清除这些账户的 403 记录并解除整户暂停，没在官网验证的账户下一次请求会再返回 403 并重新暂停。',
+    '返回 403 “Your account must be verified … verify-account”（账户级）的账户，以及需要验证账号整户暂停仍生效的账户，与“出问题（403）→ 403 需要验证账号”同一口径。在 2 个及以上模型上返回过，或整户暂停仍生效时整户暂停调度 30 天：不参与调度、不占 Worker、不预热，所以不列在 403 无权限账户列表里，模型冷却也不计它们；只在一个模型上要求验证的只暂停那个模型，另见“403 单个模型需要验证”。暂停从第一次 403 起算 30 天，到期后（或旧版本留下、已超过 30 天的登记）账户重新参与调度，登记还在、仍计在这里，状态说明分开写暂停中与已到期的个数；仍未验证的下一次请求会再返回 403 并重新暂停。需要登录、组织已停用、不可用的账户不计入这里（与“出问题（403）”一致），它们各有单独的状态筛选。到 https://aistudio.google.com/verify-account 验证后在账户列表点“验证”即可解除；“清除记录并解除暂停”清除这些账户的 403 记录并解除整户暂停，没在官网验证的账户下一次请求会再返回 403 并重新暂停。',
   'accounts.verifyRequiredView': '在账户列表查看',
   'accounts.verifyRequiredLift': '清除记录并解除暂停',
   'accounts.verifyRequiredLiftConfirm':
     '清除这 {count} 个需要验证账号的账户的 403 记录并解除整户暂停？它们重新参与调度；没在官网验证的账户下一次请求会再返回 403 并重新暂停（那次请求换号重试）。单模型 403 冷却不变。',
   'accounts.verifyRequiredLifted':
     '已清除 {cleared} 个账户的 403 记录，解除 {lifted} 个账户需要验证账号的整户暂停',
+  'accounts.verifyModelTitle': '403 单个模型需要验证 {count} 个：',
+  'accounts.verifyModelHint':
+    '只暂停所列模型（最长 30 天），其他模型照常调度、Worker 不释放；到官网 https://aistudio.google.com/verify-account 验证后点“验证”，或点“清除”解除该模型的暂停。',
+  'accounts.verifyModelHelp':
+    '只在一个模型上返回 403 “Your account must be verified … verify-account” 的账户（与“出问题（403）→ 403 单个模型需要验证”同一口径，需要登录、组织已停用、不可用的不计）。只暂停这个模型的 Playground 与 Build（最长 30 天），账户其他模型照常调度，Worker 不释放、不淘汰，账户行照常显示就绪或忙碌，模型冷却概况不计这条暂停。其他模型成功不解除它；在官网验证后点“验证”、更新认证文件或“清除”都会解除，没在官网验证的话下一次请求这个模型时会再返回 403 并重新暂停。同一账户在第二个模型上也要求验证时改为整户暂停，移到上方“需要验证账号”汇总块。',
+  'accounts.verifyModelColumn': '需要验证的模型',
+  'accounts.verifyModelPauseColumn': '该模型的暂停',
+  'accounts.verifyModelPaused': '暂停中（最迟 {time}）',
+  'accounts.verifyModelPauseExpired': '未生效（该模型照常调度）',
+  'accounts.verifyModelPauseExpiredHelp':
+    '这个模型的暂停已到期，或生成路径没有写入暂停（目录在这期间变过）：该模型照常调度，仍未验证的下一次请求会再返回 403 并重新暂停',
+  'accounts.verifyModelState': '{paused} 个该模型暂停中。',
+  'accounts.verifyModelStatePartial':
+    '{paused} 个该模型暂停中、{expired} 个暂停未生效（已到期或没有写入，该模型照常调度，仍未验证的下一次请求会再返回 403 并重新暂停）。',
+  'accounts.verifyModelNoRecord': '403 记录已清除',
+  'accounts.verifyModelVerifyHelp':
+    '用隔离浏览器检查这个账户的登录是否有效：有效即清除它的 403 记录并解除该模型的暂停（不检查是否已在官网验证）；没在官网验证的话，下一次请求这个模型时会再返回 403 并重新暂停',
+  'accounts.verifyModelClearRowHelp':
+    '清除这个账户的 403 记录并解除该模型的暂停；没在官网验证的话，下一次请求这个模型时会再返回 403 并重新暂停',
+  'accounts.verifyModelRowCleared': '已清除 {label} 的 403 记录',
   'accounts.orgDisabledTitle': '组织停用或受限、用不了 AI Studio 的账户',
   'accounts.orgDisabledHint':
     '（账号所属组织关闭了 AI Studio，或 Google 限制了账号、年龄或资格不符、Workspace 未开放，重新登录也没用；已停止调度，换号或等对方重新开放）',
@@ -1435,6 +1463,10 @@ const en: Record<TranslationKey, string> = {
     '{count} more accounts paused as a whole for account verification are not counted (including {other} that need sign-in, have AI Studio disabled by their organization or are unavailable, which the verification summary leaves out)',
   'accounts.cooldownVerifyExcludedHelp':
     'Counts the accounts whose whole-account pause for account verification is still in effect, whatever their state: none of their cooldown entries (the pause expanded to every model, and per-model cooldowns) count toward the accounts, entries, recovery times or main reasons here. Accounts that need sign-in, have AI Studio disabled by their organization or are unavailable are included in this number but not in the "Account verification required" summary (as under "Problems (403)"), so this number can be larger than the paused accounts in the summary; accounts whose pause has expired are counted in the cooldowns as usual.',
+  'accounts.cooldownVerifyModelExcluded':
+    '{count} more accounts with a pause for verification on one model are not counted',
+  'accounts.cooldownVerifyModelExcludedHelp':
+    'A pause for account verification on one model only blocks that model (up to 30 days): these entries do not count toward the accounts, entries, recovery times or main reasons here (the other cooldowns of the account are counted as usual); see "403 verification required on one model".',
   'accounts.cooldownShowAll': 'Show all {count} models',
   'accounts.cooldownShowLess': 'Show less',
   'accounts.cooldownSoon': 'any moment',
@@ -1744,7 +1776,7 @@ const en: Record<TranslationKey, string> = {
   'accounts.filterAll': 'All',
   'accounts.filterProblem': 'Problems (403)',
   'accounts.problemHelp':
-    'Only accounts with 403 permission denied (such as account verification required), each with its reason; accounts that need sign-in, have AI Studio disabled by their organization or are unavailable have their own state filters and are not counted here even with 403 records (signing in again or updating the auth file clears those records; the 403 list above still shows their ordinary 403s). Each 403 model shows the time and count of its latest 403, and an account with a 403 on only one model is grouped as "403 permission denied (single model)". A 403 record that is not account-level, has not been seen for more than {hours} hours and whose account is not in a 403 cooldown counts as stale and is left out (it stays greyed out in the 403 list above and can be cleared per row)',
+    'Only accounts with 403 permission denied (such as account verification required), each with its reason; accounts that need sign-in, have AI Studio disabled by their organization or are unavailable have their own state filters and are not counted here even with 403 records (signing in again or updating the auth file clears those records; the 403 list above still shows their ordinary 403s). Each 403 model shows the time and count of its latest 403, and an account with a 403 on only one model is grouped as "403 permission denied (single model)"; account verification required on one model only is grouped as "403 verification required on one model" (only that model is paused), and on 2 or more models, or with the whole-account pause still in effect, as "403 verification required". A 403 record that is not account-level, has not been seen for more than {hours} hours and whose account is not in a 403 cooldown counts as stale and is left out (it stays greyed out in the 403 list above and can be cleared per row)',
   'accounts.problemCount': '{count} accounts with 403',
   'accounts.problemCopyWithReason': 'Copy emails and reasons',
   'accounts.problemCopied': 'Copied {count} accounts',
@@ -1755,6 +1787,10 @@ const en: Record<TranslationKey, string> = {
   'accounts.problemKindVerify': '403 verification required',
   'accounts.problemKindForbidden': '403 permission denied (multiple models)',
   'accounts.problemKindModelForbidden': '403 permission denied (single model)',
+  'accounts.problemKindVerifyModel': '403 verification required on one model',
+  'accounts.problemVerifyModel': 'Account verification required on one model',
+  'accounts.problemVerifyModelOrphan':
+    'Account verification required on one model ({models}; the 403 record was cleared, the model is still paused; verify on the official site and click "Verify", or click "Clear" under "403 verification required on one model" above)',
   'accounts.problemVerifyPaused':
     'Account verification required, whole account paused (403 record already cleared; verify on the official site and click "Verify", or click "Clear records and lift pause" in the "Account verification required" summary above)',
   'accounts.problemStaleMore': '; {count} more stale records not counted',
@@ -1906,7 +1942,7 @@ const en: Record<TranslationKey, string> = {
     "(usually the account has not accepted Google's terms; fetch a new auth file and upload it)",
   'accounts.permissionDeniedCount': '{count}',
   'accounts.permissionDeniedHelp':
-    'Accounts whose generation requests returned HTTP 403 PERMISSION_DENIED (The caller does not have permission); each model keeps the time and count of its latest 403 and where that request came from. A record is cleared when the auth file is updated (a new storage-state.json is uploaded, a browser login, or the directory is imported again; its 403 cooldowns are lifted too); when the model succeeds once on that channel (only that model and channel); when an account that needs verification succeeds on any model; when "Verify" passes on this page; by the startup reconciliation (the account left the pool or its login signature changed); when a pool-wide 403 is revoked; and by the "Clear" button of each row or "Clear records" (only the accounts listed in this table; per-model 403 cooldowns stay). Records not seen for more than {hours} hours while the account is not in a 403 cooldown are greyed out as stale: most likely left over from long ago or from someone else (new-api channel tests, downstream users, a model alias, another instance sharing the account directory). Pool-wide 403s are not counted. Accounts that need account verification (an account-level 403, paused as a whole for 30 days) are not listed here; see the "Account verification required" summary below.',
+    'Accounts whose generation requests returned HTTP 403 PERMISSION_DENIED (The caller does not have permission); each model keeps the time and count of its latest 403 and where that request came from. A record is cleared when the auth file is updated (a new storage-state.json is uploaded, a browser login, or the directory is imported again; its 403 cooldowns are lifted too); when the model succeeds once on that channel (only that model and channel); when an account that needs verification passes it (any model succeeds when 2 or more models asked for verification, that model itself when only one did); when "Verify" passes on this page; by the startup reconciliation (the account left the pool or its login signature changed); when a pool-wide 403 is revoked; and by the "Clear" button of each row or "Clear records" (only the accounts listed in this table; per-model 403 cooldowns stay). Records not seen for more than {hours} hours while the account is not in a 403 cooldown are greyed out as stale: most likely left over from long ago or from someone else (new-api channel tests, downstream users, a model alias, another instance sharing the account directory). Pool-wide 403s are not counted. Accounts that need account verification (an account-level 403: paused as a whole with 2 or more models, only that model paused with one, either for at most 30 days) are not listed here; see the "Account verification required" summary and "403 verification required on one model" below.',
   'accounts.permissionDeniedEmail': 'Email',
   'accounts.permissionDeniedModels': 'Model · channel',
   'accounts.permissionDeniedLast': 'Last seen',
@@ -1917,12 +1953,12 @@ const en: Record<TranslationKey, string> = {
   'accounts.permissionDeniedClearConfirm':
     'Clear the 403 records of the {count} listed accounts? Per-model 403 cooldowns and multi-model 403 auto-pauses stay; an account that returns 403 again is listed again.',
   'accounts.permissionDeniedClearKeepVerify':
-    ' The {count} accounts that need account verification are not included: their 403 records and whole-account pauses stay (see the "Account verification required" summary).',
+    ' The {count} accounts that need account verification (whole account or one model) are not included: their 403 records and pauses stay (see the "Account verification required" summary and "403 verification required on one model").',
   'accounts.permissionDeniedClearPartial':
     'Cleared the 403 records of {cleared} accounts and lifted the whole-account pause on {lifted} accounts, then failed: {error}',
   'accounts.permissionDeniedCleared': 'Cleared records of {count} accounts',
   'accounts.permissionDeniedLiftedMore':
-    '; lifted the whole-account pause for account verification on {count} accounts',
+    '; lifted the pause for account verification (whole account or one model) on {count} accounts',
   'accounts.permissionDeniedDelete': 'Delete all',
   'accounts.permissionDeniedDeleteHelp':
     'Removes every listed account (including collapsed ones) from the pool and deletes its auth directory, the same as "Delete" in the account list. This cannot be undone.',
@@ -1976,13 +2012,33 @@ const en: Record<TranslationKey, string> = {
   'accounts.verifyRequiredAdvice':
     'Verify on the official site, then click "Verify" here; otherwise the pause expires 30 days after it started and the account is tried again.',
   'accounts.verifyRequiredHelp':
-    'Accounts that returned the account-level 403 "Your account must be verified … verify-account", plus accounts whose whole-account pause for account verification is still in effect: the same set as "Problems (403)" → "403 verification required". The first such 403 pauses the whole account for 30 days: it is not scheduled, holds no Worker and is not prewarmed, so it is not listed in the 403 permission denied list and the model cooldowns leave it out. The pause runs 30 days from the first 403; once it expires (or for a record left by an older version that is already more than 30 days old) the account is scheduled again while its record stays and it is still counted here, and the state text gives the paused and expired counts separately; an account that is still unverified returns 403 on its next request and is paused again. Accounts that need sign-in, have AI Studio disabled by their organization or are unavailable are not counted here (as under "Problems (403)"); they have their own state filters. Verify at https://aistudio.google.com/verify-account and click "Verify" in the account list to lift the pause; "Clear records and lift pause" clears the 403 records of these accounts and lifts the pause, and an account that is still unverified returns 403 on its next request and is paused again.',
+    'Accounts that returned the account-level 403 "Your account must be verified … verify-account", plus accounts whose whole-account pause for account verification is still in effect: the same set as "Problems (403)" → "403 verification required". When it was returned on 2 or more models, or the whole-account pause is still in effect, the whole account is paused for 30 days: it is not scheduled, holds no Worker and is not prewarmed, so it is not listed in the 403 permission denied list and the model cooldowns leave it out; an account that asks for verification on one model only has just that model paused, see "403 verification required on one model". The pause runs 30 days from the first 403; once it expires (or for a record left by an older version that is already more than 30 days old) the account is scheduled again while its record stays and it is still counted here, and the state text gives the paused and expired counts separately; an account that is still unverified returns 403 on its next request and is paused again. Accounts that need sign-in, have AI Studio disabled by their organization or are unavailable are not counted here (as under "Problems (403)"); they have their own state filters. Verify at https://aistudio.google.com/verify-account and click "Verify" in the account list to lift the pause; "Clear records and lift pause" clears the 403 records of these accounts and lifts the pause, and an account that is still unverified returns 403 on its next request and is paused again.',
   'accounts.verifyRequiredView': 'View in account list',
   'accounts.verifyRequiredLift': 'Clear records and lift pause',
   'accounts.verifyRequiredLiftConfirm':
     'Clear the 403 records of these {count} accounts that need account verification and lift their whole-account pause? They are scheduled again; an account not verified on the official site returns 403 on its next request and is paused again (that request switches to another account). Per-model 403 cooldowns stay.',
   'accounts.verifyRequiredLifted':
     'Cleared the 403 records of {cleared} accounts and lifted the whole-account pause for account verification on {lifted} accounts',
+  'accounts.verifyModelTitle': '403 verification required on one model: {count}.',
+  'accounts.verifyModelHint':
+    'Only the listed model is paused (up to 30 days); the other models are scheduled as usual and the Worker is kept. Verify at https://aistudio.google.com/verify-account, then click "Verify", or click "Clear" to lift the pause on that model.',
+  'accounts.verifyModelHelp':
+    'Accounts that returned the 403 "Your account must be verified … verify-account" on one model only (the same set as "Problems (403)" → "403 verification required on one model"; accounts that need sign-in, have AI Studio disabled by their organization or are unavailable are left out). Only that model is paused, on Playground and Build (up to 30 days); the other models of the account are scheduled as usual, its Worker is neither released nor retired, the account row keeps showing ready or busy, and the model cooldown summary leaves this pause out. A success on another model does not lift it; verifying on the official site and clicking "Verify", updating the auth file or "Clear" lifts it, and an account that is still unverified returns 403 the next time that model is requested and is paused again. When the same account also asks for verification on a second model it is paused as a whole and moves to the "Account verification required" summary above.',
+  'accounts.verifyModelColumn': 'Model needing verification',
+  'accounts.verifyModelPauseColumn': 'Pause on the model',
+  'accounts.verifyModelPaused': 'Paused (until {time} at the latest)',
+  'accounts.verifyModelPauseExpired': 'Not in effect (model scheduled as usual)',
+  'accounts.verifyModelPauseExpiredHelp':
+    'The pause on this model has expired, or the generation path did not write it (the catalog changed meanwhile): the model is scheduled as usual, and an account still unverified returns 403 on its next request and is paused again',
+  'accounts.verifyModelState': '{paused} with the model paused.',
+  'accounts.verifyModelStatePartial':
+    '{paused} with the model paused, {expired} with the pause not in effect (expired or never written; the model is scheduled as usual, and an account still unverified returns 403 on its next request and is paused again).',
+  'accounts.verifyModelNoRecord': '403 record cleared',
+  'accounts.verifyModelVerifyHelp':
+    'Check in an isolated browser whether this account is still signed in: if it is, its 403 records are cleared and the pause on the model is lifted (whether it was verified on the official site is not checked); if it was not verified, the next request for the model returns 403 and pauses it again',
+  'accounts.verifyModelClearRowHelp':
+    'Clear the 403 record of this account and lift the pause on the model; if it is still unverified on the official site, the next request for the model returns 403 and pauses it again',
+  'accounts.verifyModelRowCleared': 'Cleared the 403 record of {label}',
   'accounts.orgDisabledTitle': 'Accounts that cannot use AI Studio (disabled by organization or restricted)',
   'accounts.orgDisabledHint':
     '(the organization has turned AI Studio off, or Google restricted the account, it does not meet the age or eligibility requirements, or its Workspace has not enabled AI Studio; signing in again does not help. Scheduling has stopped: replace the account or wait until it is enabled again)',

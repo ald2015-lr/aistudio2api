@@ -147,9 +147,10 @@ func newRuntime(
 	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
 	service.reconcilePermissionDenied()
 	service.reconcileOrgDisabled()
-	// 登记里有需要验证账号的 403、却没有整户暂停的账户补写暂停（见 backfillVerifyRequiredPauses）：要在对照之后（认证文件已更新的
-	// 账户先清除登记）、首次预热之前，免得预热为它们冷启动 Worker 只为再吃一次 403
-	service.backfillVerifyRequiredPauses(time.Now())
+	// 按登记整理需要验证账号的暂停（见 reconcileVerifyRequiredPauses）：只在一个模型上要求验证的账户把整户暂停改为只暂停这个模型，
+	// 两个及以上模型、还没有暂停的补写整户暂停。要在对照之后（认证文件已更新的账户先清除登记）、首次预热之前，免得预热为它们冷启动 Worker
+	// 只为再吃一次 403，也免得只在一个模型上要求验证的账户的 Worker 被当成整户暂停释放
+	service.reconcileVerifyRequiredPauses(time.Now())
 	service.ignoreSeed.Store(cfg.IgnoreClientSeed)
 	service.repeatNonce.Store(cfg.RepeatPromptNonce)
 	service.minOutputTokens.Store(int64(cfg.MinOutputTokens))
@@ -2903,8 +2904,9 @@ type trackedService struct {
 	ignoreSeed atomic.Bool
 	// repeatNonce 为真时对重复提示词加入不可见随机后缀（见 duplicates.go）
 	repeatNonce atomic.Bool
-	// modelAccessPublishPending 为真时已有一次合并推送在等待
+	// modelAccessPublishPending 为真时已有一次合并推送在等待；cooldownsPublishPending 为真时这次合并推送另带冷却列表（见 publishCooldowns）
 	modelAccessPublishPending atomic.Bool
+	cooldownsPublishPending   atomic.Bool
 	// minOutputTokens 为最大输出 token 的下限（MIN_OUTPUT_TOKENS，可热更新）
 	minOutputTokens atomic.Int64
 	// longOutputEnabled 为模型名带 long- 前缀时是否自动续写（LONG_OUTPUT_ENABLED，可热更新）；longOutputMaxTokens 为没有官网续写能力的
@@ -3460,10 +3462,29 @@ func (service *trackedService) publishModelAccess() {
 	})
 }
 
-// publishModelAccessNow 立即推送账户列表与模型目录（管理页上的手动操作使用）
+// publishCooldowns 在请求之外改了冷却（认证文件更新、验证通过清除 403 冷却等）后调用：冷却列表随账户列表的下一次合并推送一起推送
+// （冷却列表平时只在请求结束后推送，管理页不重读它）
+func (service *trackedService) publishCooldowns() {
+	service.cooldownsPublishPending.Store(true)
+	service.publishModelAccess()
+}
+
+// publishCooldownsNow 立即推送冷却列表（管理页上的手动操作使用：清除 403 记录、验证通过）
+func (service *trackedService) publishCooldownsNow() {
+	if service == nil || service.pool == nil || service.requests == nil || service.lifecycle != nil && service.lifecycle.Err() != nil {
+		return
+	}
+	service.cooldownsPublishPending.Store(false)
+	service.requests.publish(api.AdminEvent{Type: "cooldowns", Data: adminCooldownList(service.pool)})
+}
+
+// publishModelAccessNow 立即推送账户列表与模型目录（管理页上的手动操作使用）；有待推送的冷却列表时一并推送
 func (service *trackedService) publishModelAccessNow() {
 	if service.lifecycle.Err() != nil {
 		return
+	}
+	if service.cooldownsPublishPending.Swap(false) {
+		defer service.requests.publish(api.AdminEvent{Type: "cooldowns", Data: adminCooldownList(service.pool)})
 	}
 	statuses := service.pool.Status()
 	accounts := make([]api.AdminAccount, 0, len(statuses))
@@ -4315,8 +4336,10 @@ func (service *trackedService) acquireLease(
 			// Ultra 主用模型（额度快速失败）候选全部冷却时立即返回，不原地等一分钟内的恢复，也不因此延后排队截止时间：
 			// 等到的多半是分钟限额刚恢复、随即又被打满的账号，客户端按 Retry-After（最早恢复）重试更快。
 			// 其他请求只在整个请求累计的冷却排队加上这次不超过 cooldownQueueLimit、且最早恢复不晚于请求期限时原地等（见 cooling_wait.go）
+			// 冷却中的候选全部只被需要验证账号的冷却挡住时为 Parked（503、不带重试秒数，见 aistudio.AllCoolingErrorFor）；
+			// 有会自行恢复的候选时 Retry-After 取其中最早的，不取 30 天的验证暂停
 			if cooled.exceeded(ctx, groups.EarliestCooldown, now) || budget.failFastOnQuota() {
-				return nil, &aistudio.AllCoolingError{ModelID: selection.ModelID, Until: groups.EarliestCooldown}
+				return nil, service.pool.AllCoolingErrorFor(aistudio.ScopedSelection(ctx, selection), groups.EarliestCooldown)
 			}
 			waitStartedAt := time.Now()
 			err := wait(coolingRecheckDelay(remaining), waitReasonCooling)
@@ -5852,7 +5875,7 @@ func (service *trackedService) generateForModel(
 			// 真正成功过的账户：清掉登录复核的退避（见 auth_recheck.go）与坏号记录，记为近期成功（预热与替补优先，见 bad_accounts.go）
 			service.authRecheck.noteSuccess(request.AccountID)
 			service.workers.badAccountMemory().observe(request.AccountID, accountLabel, egressSuccess)
-			service.permissionDeniedSucceeded(request.AccountID, modelID, lease.Channel())
+			service.permissionDeniedSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
 			if lease.Channel() == aistudio.ChannelBuild {
 				// Build 生成暂停中的试探成功，或暂停过的账号在 Build 上成功：解除暂停（见 build_pause.go）；没有暂停记录时不加锁
 				pauses.succeeded(request.AccountID, accountLabel, probeAttempt)
@@ -6185,7 +6208,9 @@ func (service *trackedService) generateForModel(
 		// 同一账号在短时间内对多个模型连续返回 403 无权限：自动暂停一段时间，不再参与调度。与单模型 403 一样只按本次尝试本身的错误判断：
 		// 删除临时 Drive 副本时 DriveDelete 返回的 403 与模型权限无关，不计入（原先按并入清理错误后的 err，几次清理 403 就可能暂停正常账号）；
 		// 带图 Interaction 请求的 403 与账户无关，不计入
-		if isPermissionDenied(attemptErr) && !imageDenied {
+		// 需要验证账号的 403 不计入：单个模型的按模型长冷却、两个及以上模型的整户暂停都比这 30 分钟的自动暂停强；计入时同一次尝试里
+		// 先写的 30 分钟全局冷却会让随后的整户暂停按检查时间被当作陈旧跳过（日志却照写“账号暂停调度”）
+		if isPermissionDenied(attemptErr) && !imageDenied && !accountLevelPermissionDenied(attemptErr.Error()) {
 			now := time.Now()
 			if pause, count, models := service.forbidden.record(request.AccountID, modelID, now); pause {
 				until := now.Add(forbiddenPause)
@@ -6238,9 +6263,24 @@ func (service *trackedService) generateForModel(
 				int(forbiddenWindow/time.Minute), forbiddenSystemicAccounts, modelID,
 			))
 		}
+		// verifyModelOnly：需要验证账号、登记里只有这一个模型要求验证（见 verifyAccountWideModels）：只暂停这个模型（两个通道，最长
+		// verifyRequiredPause），不写阶梯冷却、不暂停整个账户、不释放也不淘汰 Worker（它还在服务其他模型）；本请求按已冷却换号
+		// （与组织停用一样不计连续失败上限、不退避，只受每请求换号硬上限约束），不在同账号另一通道再试（两个通道都已暂停）
+		verifyModelOnly := false
 		if modelDenied {
 			// 登记为 403 无权限账户，管理页单独列出（多半是没有同意 Google 的政策，重新获取认证文件上传后清除，见 permission_denied.go）
 			service.recordPermissionDenied(request.AccountID, modelID, lease.Channel(), err.Error(), time.Now(), permissionDeniedRequestOf(requestCtx, entry, modelID))
+			verifyModelOnly = verifyRequired && len(service.permissionDenied.verifyModels(request.AccountID)) < verifyAccountWideModels
+		}
+		if verifyModelOnly {
+			if stateErr := service.markModelVerifyRequired(lease, accountLabel, modelID); stateErr != nil {
+				err = errors.Join(err, stateErr)
+				retryable = false
+			} else {
+				cooled = true
+			}
+			attempted[request.AccountID] = struct{}{}
+		} else if modelDenied {
 			cooldownScope := lease.CooldownScope(modelID)
 			until, level := service.forbidden.recordModel(request.AccountID, cooldownScope, time.Now())
 			reason := forbiddenModelReasonPrefix + err.Error()
@@ -6262,24 +6302,33 @@ func (service *trackedService) generateForModel(
 				service.retireCooledWorker(request.AccountID, modelID, aistudio.QuotaCooldown{Until: until, Kind: "无权限", Reason: reason})
 			}
 			if verifyRequired {
-				// 需要验证账号：整个账户暂停调度（全部模型与通道），直到在管理页验证通过、认证文件更新（这两处按 forbiddenCooldown
-				// 与其他 403 冷却一起清除）或管理页清除 403 记录（只解除这一种暂停，按 verifyRequiredPauseCooldown，见 liftVerifyRequiredPauses）；
-				// verifyRequiredPause 只是兜底的上限，到期后再 403 会重新暂停
-				pauseUntil := time.Now().Add(verifyRequiredPause)
+				// 需要验证账号、登记里两个及以上模型要求验证：整个账户暂停调度（全部模型与通道），直到在管理页验证通过、认证文件更新（这两处按
+				// forbiddenCooldown 与其他 403 冷却一起清除）或管理页清除 403 记录（只解除需要验证账号的暂停，按 verifyCooldown，见
+				// liftVerifyRequiredPauses）；verifyRequiredPause 只是兜底的上限，到期后再 403 会重新暂停。检查时间取现在（不取租约时间）：
+				// 403 之前就取得、之后才成功的请求清不掉它（原先它们按租约时间清掉暂停，账户又被调度、再 403、再释放 Worker）
+				now := time.Now()
+				pauseUntil := now.Add(verifyRequiredPause)
 				pauseReason := verifyRequiredPauseReason
-				if stateErr := service.pool.MarkCooldownIfGeneration(
-					request.AccountID, "", lease.ModelAccessGeneration(), lease.CheckedAt(), pauseUntil, pauseReason,
-				); stateErr == nil {
+				write, stateErr := service.pool.TryMarkCooldownIfGeneration(
+					request.AccountID, "", lease.ModelAccessGeneration(), now, pauseUntil, pauseReason,
+				)
+				switch {
+				case stateErr != nil:
+					err = errors.Join(err, stateErr)
+					retryable = false
+				case write == aistudio.CooldownWritten || write == aistudio.CooldownKeptLater:
 					cooled, modelForbidden = true, true
 					// 同账号的其他通道同样被暂停：不在同账号上再试
 					attempted[request.AccountID] = struct{}{}
 					service.requests.log(accountLabel, "WARN", fmt.Sprintf(
-						"账号暂停调度 | 原因=%s | 恢复=验证通过、认证文件更新或清除 403 记录（最迟 %s）",
-						pauseReason, pauseUntil.Format(time.RFC3339),
+						"账号暂停调度 | 原因=%s | 恢复=验证通过、认证文件更新或清除 403 记录（最迟 %s） | 需要验证的模型=%s",
+						pauseReason, pauseUntil.Format(time.RFC3339), strings.Join(service.permissionDenied.verifyModels(request.AccountID), "、"),
 					))
 					// 暂停期间账号不是任何模型的候选：立即登记释放它的驻留 Worker（本请求还持有租约，请求结束后关闭），
 					// 不按冷却淘汰等分区内有可接替账户、不排空、不启替补，关闭后只补齐预热（见 worker_unschedulable.go）
 					service.workers.releaseUnschedulable(request.AccountID, unschedulableVerifyRequired)
+				default:
+					service.requests.log(accountLabel, "INFO", fmt.Sprintf("账号暂停未写入 | 类型=需要验证账号 | 原因=%s", write))
 				}
 			}
 		}
@@ -6595,6 +6644,12 @@ func (service *trackedService) generateForModel(
 			cut.label(), cut.limit, cut.elapsed.Round(time.Millisecond), where, reason))
 		trace.Note("本服务首事件前期限到期: " + cut.Error())
 	}
+	// 租约账号在发出前被需要验证账号的冷却拦下、请求以此结束（固定账户，或换号次数用完）：补上请求的号池，/pro、/ultra 的对外说明与
+	// 选号就判成 Parked 的全部冷却相同（发出前的检查在账户池里，不知道请求的号池；原先一律按不限号池的通用说法）
+	var verifyBlocked *aistudio.AccountCoolingDownError
+	if errors.As(err, &verifyBlocked) && verifyBlocked.VerifyParked() && verifyBlocked.Pool == aistudio.PoolScopeAll {
+		verifyBlocked.Pool = scope
+	}
 	if err != nil {
 		// 额度用完、还没有交出任何事件：按 MODEL_FALLBACKS 改用其他模型（见 model_fallback.go），按目标模型重新走一遍；
 		// 不改用时 err 不变，改用过而所有目标都不可用时换成按源模型原来的错误、Retry-After 取最早恢复的包装
@@ -6751,9 +6806,13 @@ func quotaCooldownFields(cooldown aistudio.QuotaCooldown) string {
 }
 
 // coolingDownLong 判断租约账号在发出前被拦下的冷却是否为长时间冷却（剩余不少于 rotationMinRemaining），并返回它的恢复时间：
-// AccountCoolingDownError 按其恢复时间；不带恢复时间的裸哨兵（测试替身）按 AccountLongCooling 判断，恢复时间为零值
+// AccountCoolingDownError 按其恢复时间；不带恢复时间的裸哨兵（测试替身）按 AccountLongCooling 判断，恢复时间为零值。
+// 拦下它的是需要验证账号的冷却（整户或单个模型）时不算：那不是额度，不计每日类额度失败
 func coolingDownLong(pool *aistudio.AccountPool, err error, accountID string, modelID string, now time.Time) (time.Time, bool) {
 	var blocked *aistudio.AccountCoolingDownError
+	if errors.As(err, &blocked) && blocked.VerifyParked() {
+		return time.Time{}, false
+	}
 	if errors.As(err, &blocked) && !blocked.Until.IsZero() {
 		return blocked.Until, blocked.Until.Sub(now) >= rotationMinRemaining
 	}

@@ -76,13 +76,18 @@ var (
 )
 
 // AccountCoolingDownError 表示租约账户在请求发出前进入冷却（多半是同账号别的请求刚遇到额度 429）：这次请求没有发到上游。
-// errors.Is(err, ErrAccountCoolingDown) 成立；对外与全部冷却一样按 429 返回，Retry-After 为拦下它的冷却的恢复时间
+// errors.Is(err, ErrAccountCoolingDown) 成立；对外与全部冷却一样按 429 返回，Retry-After 为拦下它的冷却的恢复时间。
+// 拦下它的是需要验证账号的冷却（整户或单个模型，见 VerifyCooldownKind）时按 503 返回、不带重试时间：只能靠人工验证恢复，
+// 30 天只是兜底上限（见 VerifyParked）
 type AccountCoolingDownError struct {
 	AccountID string
 	ModelID   string
 	// Until 与 Reason 为拦下请求的冷却（全局 * 与该通道该模型中恢复较晚的一个，见 accountCooldown）
 	Until  time.Time
 	Reason string
+	// Pool 为请求限定的号池：发出前的检查在账户池里、不知道请求的号池，由生成路径在请求以它结束时补上（app 的 generateForModel），
+	// 拦下它的是需要验证账号的冷却时 /ultra、/pro 的对外说明写明号池（与 Parked 的 AllCoolingError 相同）；没有补上时不限号池
+	Pool PoolScope
 }
 
 func (e *AccountCoolingDownError) Error() string {
@@ -99,18 +104,32 @@ func (e *AccountCoolingDownError) Is(target error) bool {
 	return target == ErrAccountCoolingDown
 }
 
-// RetryAt 返回拦下请求的冷却的恢复时间，供对外错误写 Retry-After
+// VerifyParked 判断拦下请求的是需要验证账号的冷却（整户暂停或单个模型需要验证）
+func (e *AccountCoolingDownError) VerifyParked() bool {
+	return e != nil && VerifyCooldownKind(e.Reason) != ""
+}
+
+// RetryAt 返回拦下请求的冷却的恢复时间，供对外错误写 Retry-After；需要验证账号的冷却不给重试时间（零值）
 func (e *AccountCoolingDownError) RetryAt() time.Time {
+	if e.VerifyParked() {
+		return time.Time{}
+	}
 	return e.Until
 }
 
-// HTTPStatus 返回发出前已冷却对应的公开状态码：与全部冷却一样按限流 429 返回
+// HTTPStatus 返回发出前已冷却对应的公开状态码：与全部冷却一样按限流 429 返回；需要验证账号的冷却按 503（与 Parked 的全部冷却相同）
 func (e *AccountCoolingDownError) HTTPStatus() int {
+	if e.VerifyParked() {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusTooManyRequests
 }
 
-// ErrorCode 返回 OpenAI 兼容的限流错误代码
+// ErrorCode 返回 OpenAI 兼容的限流错误代码；需要验证账号的冷却为 model_unavailable
 func (e *AccountCoolingDownError) ErrorCode() string {
+	if e.VerifyParked() {
+		return "model_unavailable"
+	}
 	return "rate_limit_exceeded"
 }
 
@@ -118,28 +137,45 @@ func (e *AccountCoolingDownError) ErrorCode() string {
 // 或晚于请求期限时不再排队，按 AllCoolingError 返回（按上游 Mag1cFall/AIStudio2API cd3d4ab、6d8ad7d 移植）
 const CooldownQueueLimit = time.Minute
 
-// AllCoolingError 表示请求的全部候选账户都在冷却且不会很快恢复
+// AllCoolingError 表示请求的全部候选账户都在冷却且不会很快恢复。Parked 为冷却中的候选全部只被需要验证账号的冷却挡住
+// （整户暂停或单个模型需要验证，见 AllCoolingErrorFor）：它们只能靠人工验证恢复，30 天只是兜底上限，按 503 返回、不带重试时间
+// （原先按 429 返回、Retry-After 与 “Please try again in 2592000s” 长达 30 天）；有会自行恢复的候选时 Until 为其中最早的。
+// Pool 为请求限定的号池（Parked 时 /ultra、/pro 的对外说明写明号池）
 type AllCoolingError struct {
 	ModelID string
 	Until   time.Time
+	Parked  bool
+	Pool    PoolScope
 }
 
 func (e *AllCoolingError) Error() string {
+	if e.Parked {
+		return verifyParkedText(e.ModelID)
+	}
 	return fmt.Sprintf("模型 %s 的可用账户均在冷却，最早恢复时间 %s", e.ModelID, e.Until.Local().Format(time.RFC3339))
 }
 
-// RetryAt 返回最早恢复时间，供对外错误写 Retry-After
+// RetryAt 返回最早恢复时间，供对外错误写 Retry-After；Parked 时为零值（不写 Retry-After）
 func (e *AllCoolingError) RetryAt() time.Time {
+	if e.Parked {
+		return time.Time{}
+	}
 	return e.Until
 }
 
-// HTTPStatus 返回额度耗尽对应的公开状态码
+// HTTPStatus 返回额度耗尽对应的公开状态码；Parked 时为 503
 func (e *AllCoolingError) HTTPStatus() int {
+	if e.Parked {
+		return http.StatusServiceUnavailable
+	}
 	return http.StatusTooManyRequests
 }
 
-// ErrorCode 返回 OpenAI 兼容的额度错误代码
+// ErrorCode 返回 OpenAI 兼容的额度错误代码；Parked 时为 model_unavailable
 func (e *AllCoolingError) ErrorCode() string {
+	if e.Parked {
+		return "model_unavailable"
+	}
 	return "rate_limit_exceeded"
 }
 
@@ -1837,8 +1873,9 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 		// 候选全部冷却：earliest 即最早恢复。超过剩余的排队上限或晚于请求期限时不再等
 		coolingWait := selection.ResourceID == "" && !earliest.IsZero() && egress.coolingOnly()
 		if coolingWait && coolingQueueExceeded(ctx, earliest, now, cooled) {
+			cooling := p.allCoolingErrorLocked(selection, earliest, now)
 			p.mu.Unlock()
-			return nil, &AllCoolingError{ModelID: strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/"), Until: earliest}
+			return nil, cooling
 		}
 		changed := p.changed
 		p.mu.Unlock()
@@ -2078,10 +2115,11 @@ func (p *AccountPool) emptyPoolErrorLocked(scope PoolScope) *AccountsNotReadyErr
 	return &AccountsNotReadyError{Reasons: []string{reason}, Pool: scope}
 }
 
-// NoCandidateError 返回候选分组为空时的错误：有账户在冷却时按全部冷却（429，带最早恢复时间），否则同 NoEligibleError
+// NoCandidateError 返回候选分组为空时的错误：有账户在冷却时按全部冷却（429，带最早恢复时间；只被需要验证账号挡住时为 Parked，
+// 见 AllCoolingErrorFor），否则同 NoEligibleError
 func (p *AccountPool) NoCandidateError(selection AccountSelection, groups AccountCandidateGroups) error {
 	if !groups.EarliestCooldown.IsZero() {
-		return &AllCoolingError{ModelID: strings.TrimPrefix(strings.TrimSpace(selection.ModelID), "models/"), Until: groups.EarliestCooldown}
+		return p.AllCoolingErrorFor(selection, groups.EarliestCooldown)
 	}
 	return p.NoEligibleError(selection)
 }
@@ -3371,7 +3409,12 @@ func (p *AccountPool) markCooldownIfGeneration(
 		}
 		currentAccess.CheckedAt = checkedAt
 		runtimeState.ModelAccess[modelAccessScope] = currentAccess
-		if current, cooling := runtimeState.Cooldowns[modelAccessScope]; keepLater && cooling && current.Active(time.Now()) && current.Until.After(until) {
+		current, cooling := runtimeState.Cooldowns[modelAccessScope]
+		laterActive := cooling && current.Active(time.Now()) && current.Until.After(until)
+		// 需要验证账号的冷却（整户暂停或单个模型）只能靠人工验证或清除 403 记录解除：不被更短的其他冷却（阶梯 403、每日限额的另一通道同步、
+		// 多模型连续 403 的 30 分钟自动暂停等）替换，否则暂停缩短后账户又被调度、再 403；其他冷却更长时照常写入
+		keepVerify := laterActive && VerifyCooldownKind(current.Reason) != "" && VerifyCooldownKind(reason) == ""
+		if keepLater && laterActive || keepVerify {
 			write, effective = CooldownKeptLater, current.Until
 			return true, nil, nil
 		}
@@ -3693,10 +3736,11 @@ func (p *AccountPool) accountCoolingLocked(account *Account, now time.Time) bool
 // accountModelCoolingLocked 判断账户在模型上的每个可用通道是否都在冷却：Playground 要求通道启用、目录含该模型且权益允许，
 // 冷却键为模型 ID；Build 要求通道启用、没有 Build 生成暂停（全局或该账户，见 buildGenerationOpenLocked）且 Build 目录支持，
 // 冷却键为 build:<模型>。没有可用通道时按不冷却处理（目录已不含该模型，冷却记录不再影响调度）；只有一个通道冷却、另一个通道
-// 还能用时同样不算冷却；调用方持有 p.mu
+// 还能用时同样不算冷却。通道上是单个模型需要验证账号的冷却（ModelVerifyRequiredReason，不看是否到期，与 accountModelCoolingUntilLocked
+// 同口径）时该通道按不可用处理：账户其他模型照常调度，账户行照常显示就绪或忙碌，状态的冷却计数不计它；调用方持有 p.mu
 func (p *AccountPool) accountModelCoolingLocked(account *Account, modelID string, now time.Time) bool {
 	usable := false
-	if p.channelEnabledLocked(ChannelPlayground) {
+	if p.channelEnabledLocked(ChannelPlayground) && !p.modelVerifyChannelLocked(account, modelID) {
 		if model, exists := accountModelLocked(account, modelID); exists && modelAllowedByTier(model, account.BenefitTier) {
 			usable = true
 			if _, active := accountCooldown(account, modelID, now); !active {
@@ -3704,13 +3748,20 @@ func (p *AccountPool) accountModelCoolingLocked(account *Account, modelID string
 			}
 		}
 	}
-	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) {
+	buildKey := ChannelCooldownScope(ChannelBuild, modelID)
+	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) && !p.modelVerifyChannelLocked(account, buildKey) {
 		usable = true
-		if _, active := accountCooldown(account, ChannelCooldownScope(ChannelBuild, modelID), now); !active {
+		if _, active := accountCooldown(account, buildKey, now); !active {
 			return false
 		}
 	}
 	return usable
+}
+
+// modelVerifyChannelLocked 判断冷却键上是单个模型需要验证账号的冷却（不看是否到期）；调用方持有 p.mu
+func (p *AccountPool) modelVerifyChannelLocked(account *Account, key string) bool {
+	cooldown, exists := account.runtime.Cooldowns[key]
+	return exists && modelVerifyCooldown(key, cooldown)
 }
 
 // accountCoolingUntilLocked 返回账户按状态口径冷却到的时刻（UnixNano，0 为没有），与 accountCoolingLocked 同口径：
@@ -3732,7 +3783,7 @@ func (p *AccountPool) accountCoolingUntilLocked(account *Account) int64 {
 // 没有可用通道或任一可用通道没有冷却为 0。通道是否可用与 accountModelCoolingLocked 相同；调用方持有 p.mu
 func (p *AccountPool) accountModelCoolingUntilLocked(account *Account, modelID string) int64 {
 	until := int64(-1)
-	if p.channelEnabledLocked(ChannelPlayground) {
+	if p.channelEnabledLocked(ChannelPlayground) && !p.modelVerifyChannelLocked(account, modelID) {
 		if model, exists := accountModelLocked(account, modelID); exists && modelAllowedByTier(model, account.BenefitTier) {
 			until = cooldownNanos(account.runtime.Cooldowns[modelID])
 			if until <= 0 {
@@ -3740,8 +3791,9 @@ func (p *AccountPool) accountModelCoolingUntilLocked(account *Account, modelID s
 			}
 		}
 	}
-	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) {
-		channelUntil := cooldownNanos(account.runtime.Cooldowns[ChannelCooldownScope(ChannelBuild, modelID)])
+	buildKey := ChannelCooldownScope(ChannelBuild, modelID)
+	if p.buildGenerationOpenLocked(account) && p.buildSupportsModelLocked(account, modelID) && !p.modelVerifyChannelLocked(account, buildKey) {
+		channelUntil := cooldownNanos(account.runtime.Cooldowns[buildKey])
 		if channelUntil <= 0 {
 			return 0
 		}

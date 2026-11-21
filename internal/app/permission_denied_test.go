@@ -1164,7 +1164,9 @@ func TestVerifyRequiredPausesAccount(t *testing.T) {
 		message: "Your account must be verified before it can continue using the Gemini API. Verify your account at https://aistudio.google.com/verify-account.",
 	}
 	service, pool := primaryBusyService(t, upstream, forbiddenBad, forbiddenGood)
-	withPermissionDenied(t, service)
+	registry := withPermissionDenied(t, service)
+	// 另一个模型之前已要求验证：这次是第二个模型，整户暂停
+	registry.record(forbiddenBad, "earlier-model", aistudio.ChannelPlayground, upstream.message, "", time.Now().Add(-time.Hour))
 	preverifyRuntimeModelAccess(t, pool, forbiddenGood)
 	if text, err, _ := runAccountRequest(t, service, "req-verify-pause", ""); err != nil || text != "hello" {
 		t.Fatalf("应换到其他账户完成：text=%q err=%v", text, err)

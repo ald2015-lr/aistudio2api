@@ -272,7 +272,7 @@ type AdminCatalogSync struct {
 // AdminWorkerPartition 表示一个 Worker 分区（Ultra 分区）的实时数量与上限
 type AdminWorkerPartition struct {
 	// Warm 为已就绪的 Worker，Starting 为正在启动的，Occupied 为占用的槽位（含正在关闭的，排空中的按已让出计），
-	// Dead 为 Warm 中账号长时间冷却、等待淘汰的死槽位；Draining 为其中排空中的 Worker（不再接不固定账户的新请求，
+	// Dead 为 Warm 中账号长时间冷却、等待淘汰的死槽位（单个模型需要验证账号的冷却不算：账号其他模型照常调度）；Draining 为其中排空中的 Worker（不再接不固定账户的新请求，
 	// 进行中的请求结束后关闭，替补已先启动），Retiring 为待淘汰登记数
 	Warm     int `json:"warm"`
 	Starting int `json:"starting"`
@@ -280,7 +280,8 @@ type AdminWorkerPartition struct {
 	Dead     int `json:"dead"`
 	Draining int `json:"draining"`
 	Retiring int `json:"retiring"`
-	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放；
+	// 单个模型需要验证账号的暂停不算（账号其他模型照常调度，Worker 不释放）
 	Unschedulable int `json:"unschedulable"`
 	// Target 为预热目标（常驻数与分区内可预热账户数取小），WarmLimit 与 Max 为分区的常驻数与峰值数设置
 	Target    int `json:"target"`
@@ -306,7 +307,7 @@ type AdminWorkerCounts struct {
 	Target   int `json:"target"`
 	Max      int `json:"max"`
 	Occupied int `json:"occupied"`
-	// Dead 为 Warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位；
+	// Dead 为 Warm 中账号长时间冷却（如每日限额）、占着名额却服务不了请求、等待淘汰的死槽位（单个模型需要验证账号的冷却不算）；
 	// Draining 为其中排空中的 Worker（不再接不固定账户的新请求，进行中的请求结束后关闭，替补已先启动），Retiring 为待淘汰登记数
 	Dead        int               `json:"dead"`
 	Draining    int               `json:"draining"`
@@ -314,7 +315,8 @@ type AdminWorkerCounts struct {
 	Prewarm     AdminPrewarmState `json:"prewarm"`
 	WarmIDs     []string          `json:"warm_ids,omitempty"`
 	StartingIDs []string          `json:"starting_ids,omitempty"`
-	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放
+	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放；
+	// 单个模型需要验证账号的暂停不算（账号其他模型照常调度，Worker 不释放）
 	Unschedulable int `json:"unschedulable"`
 }
 
@@ -711,6 +713,9 @@ type AdminCooldown struct {
 	ModelID      string    `json:"model_id"`
 	Until        time.Time `json:"until"`
 	Reason       string    `json:"reason,omitempty"`
+	// Verify 为需要验证账号的冷却种类：account（整户暂停，全局暂停按目录模型展开的每一条都是它）、model（单个模型需要验证，只暂停这个模型），
+	// 其他冷却省略（见 aistudio.VerifyCooldownKind）。管理页据此分桶，不再按原因文字猜
+	Verify string `json:"verify,omitempty"`
 }
 
 // AdminPermissionDenied 表示一个返回过 HTTP 403 无权限（PERMISSION_DENIED）的账户：多半没有同意 Google 的政策，
@@ -754,8 +759,8 @@ type PermissionDeniedClearInput struct {
 	All        bool     `json:"all"`
 }
 
-// PermissionDeniedClearResult 为清除 403 无权限账户记录的结果：Cleared 为清除了登记的账户数，Lifted 为一并解除需要验证账号整户暂停的
-// 账户数（可以多于 Cleared：登记已经清除、暂停还在的账户也会解除，见 app 的 liftVerifyRequiredPauses）
+// PermissionDeniedClearResult 为清除 403 无权限账户记录的结果：Cleared 为清除了登记的账户数，Lifted 为一并解除需要验证账号暂停
+// （整户暂停或单个模型需要验证）的账户数（可以多于 Cleared：登记已经清除、暂停还在的账户也会解除，见 app 的 liftVerifyRequiredPauses）
 type PermissionDeniedClearResult struct {
 	Cleared int `json:"cleared"`
 	Lifted  int `json:"lifted"`

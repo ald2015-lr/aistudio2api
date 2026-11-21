@@ -164,7 +164,9 @@ func TestVerifyPauseGenerationReleasesWorker(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			service := unschedulableTestService(ctx, manager, pool, requests)
-			withPermissionDenied(t, service)
+			registry := withPermissionDenied(t, service)
+			// 另一个模型之前已要求验证：这次是第二个模型，整户暂停（只有一个模型时只暂停那个模型，见 TestSingleModelVerifyCoolsModelOnly）
+			registry.record(partitionNormalA, "earlier-model", aistudio.ChannelPlayground, verifyRequiredMessage, "", time.Now().Add(-time.Hour))
 			upstream := newSwitchUpstream().failAll(verifyRequiredError, partitionNormalA)
 			service.service = upstream
 			service.timeout.Store(int64(time.Minute))
@@ -377,7 +379,7 @@ func TestVerifyPauseLiftedDropsRelease(t *testing.T) {
 			service.forgetPermissionDenied(accountID, "外部更新")
 		}},
 		{name: "任一模型成功", lift: func(_ *testing.T, service *trackedService, accountID string) {
-			service.permissionDeniedSucceeded(accountID, "other-model", aistudio.ChannelPlayground)
+			service.permissionDeniedSucceeded(accountID, "other-model", aistudio.ChannelPlayground, time.Now())
 		}},
 		{name: "清除403记录", lift: func(t *testing.T, service *trackedService, accountID string) {
 			if lifted := service.liftVerifyRequiredPauses([]string{accountID}, false, time.Now()); lifted != 1 {
@@ -400,8 +402,11 @@ func TestVerifyPauseLiftedDropsRelease(t *testing.T) {
 			}
 			release := holdLease(t, pool, partitionNormalA)
 			defer release()
-			service.recordPermissionDenied(partitionNormalA, testRuntimeModel, aistudio.ChannelPlayground,
-				"AI Studio GenerateContent 返回 HTTP 403、协议错误码 7: "+verifyRequiredMessage, time.Now(), nil)
+			// 两个模型要求验证（整户）：任一模型成功即解除
+			for _, modelID := range []string{testRuntimeModel, "second-model"} {
+				service.recordPermissionDenied(partitionNormalA, modelID, aistudio.ChannelPlayground,
+					"AI Studio GenerateContent 返回 HTTP 403、协议错误码 7: "+verifyRequiredMessage, time.Now().Add(-time.Second), nil)
+			}
 			if testCase.short {
 				until := time.Now().Add(800 * time.Millisecond)
 				if err := pool.MarkCooldownIfGeneration(

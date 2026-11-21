@@ -148,7 +148,7 @@ for title, picked in (("429 失败", [r for r in rows if r.get("state") == "fail
         print(f"    {len(values):6}  {model[:28]:<28} {stats(values)}")
 
 section("4. 403 暂停与按模型的 403")
-pause_hours, model_403 = collections.Counter(), collections.Counter()
+pause_hours, model_403, model_verify = collections.Counter(), collections.Counter(), collections.Counter()
 for e in entries:
     msg = e.get("msg") or ""
     if msg.startswith("账号暂停调度"):
@@ -156,7 +156,12 @@ for e in entries:
     elif msg.startswith("账号冷却 | 类型=无权限"):
         m = re.search(r"范围=([^ |]+)", msg)
         model_403[m.group(1) if m else "?"] += 1
-print("  新的整户暂停（需要验证账号）按小时：" + ("，".join(f"{h[5:].replace('T', ' ')}时 {n}" for h, n in sorted(pause_hours.items())) or "无"))
+    elif msg.startswith("账号冷却 | 类型=单个模型需要验证"):
+        # 只在一个模型上要求验证账号：只暂停这个模型，账户其他模型照常调度、Worker 不释放
+        m = re.search(r"范围=([^ |]+)", msg)
+        model_verify[m.group(1) if m else "?"] += 1
+print("  新的整户暂停（需要验证账号，2 个及以上模型）按小时：" + ("，".join(f"{h[5:].replace('T', ' ')}时 {n}" for h, n in sorted(pause_hours.items())) or "无"))
+print("  单个模型需要验证（只暂停该模型）按模型：" + ("，".join(f"{k} {v}" for k, v in model_verify.most_common(10)) or "无"))
 print("  按模型的 403 冷却：" + ("，".join(f"{k} {v}" for k, v in model_403.most_common(10)) or "无"))
 
 accounts = (load("accounts.json") or {}).get("accounts") or []
@@ -168,6 +173,7 @@ def state(a):
     return (acc.get(a) or {}).get("state") or "?"
 def kind(r):
     if r.startswith("需要验证账号（verify-account）"): return "A 需要验证账号，整户暂停 30 天"
+    if r.startswith("单个模型需要验证账号"): return "C 单个模型需要验证，只暂停该模型 30 天"
     if r.endswith("次返回 403 无权限，自动暂停"): return "B 多个模型 403，整户暂停 30 分钟"
     if r.startswith("无权限（模型）"): return "D 单个模型 403"
     if r.startswith("每日限额"): return "E 单个模型每日限额"

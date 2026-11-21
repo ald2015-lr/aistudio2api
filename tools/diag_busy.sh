@@ -481,6 +481,10 @@ def cooldown_kind(reason):
     head = reason.split(":", 1)[0] if ":" in reason[:40] else ""
     if head:
         return head
+    if reason.startswith("单个模型需要验证账号"):
+        return "403 单个模型需要验证"
+    if reason.startswith("需要验证账号（verify-account）"):
+        return "403 需要验证账号（整户）"
     if "自动暂停" in reason:
         return "403 自动暂停"
     return "其他"

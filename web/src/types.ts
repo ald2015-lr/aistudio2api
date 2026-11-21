@@ -660,6 +660,9 @@ export interface Cooldown {
   model_id: string
   until: string
   reason?: string
+  // verify 为需要验证账号的冷却种类：account 为整户暂停（按目录模型展开的每一条），model 为单个模型需要验证（只暂停这个模型）；
+  // 其他冷却与旧版服务省略
+  verify?: 'account' | 'model'
 }
 
 // PermissionDeniedRequest 为一个模型最近一次 403 的请求来源（不含 API 密钥、IP、User-Agent 与提示词）：id 为请求 ID，path 为接口路径，

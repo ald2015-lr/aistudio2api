@@ -26,8 +26,8 @@ import (
 // 认证文件更新（外部更新、浏览器登录、重新导入，以及服务停止期间替换了认证文件，见 reconcilePermissionDenied）时清除该账户的登记，
 // 并清除它的 403 冷却与暂停，让它立即重新参与调度；之后在某个模型的某个通道上成功时清除该模型这个通道的登记。
 // 号池级 403（见 forbiddenSystemicAccounts）不是账户的问题，不登记，判定成立前登记的也撤销（见 dropSystemic）。登记不会过期；管理页可以
-// 按账户或全部清除（见 ClearPermissionDenied，冷却只解除需要验证账号的整户暂停）。启动时为有账户级 403（需要验证账号）登记、
-// 却没有整户暂停的账户按最近一次 403 的时间补写暂停（见 backfillVerifyRequiredPauses）。
+// 按账户或全部清除（见 ClearPermissionDenied，冷却只解除需要验证账号的暂停：整户暂停与单个模型需要验证）。启动时按登记整理需要验证账号的
+// 暂停：一个模型的只暂停这个模型，两个及以上模型的整户暂停（见 reconcileVerifyRequiredPauses）。
 // 保存在账户目录下的 .permission-denied.json，不写入各账户的 account.json 与 runtime-state.json
 const (
 	permissionDeniedFileName  = ".permission-denied.json"
@@ -242,30 +242,41 @@ func (registry *permissionDeniedRegistry) recordRequest(
 	registry.scheduleSaveLocked()
 }
 
-// succeeded 账户在该模型该通道上请求成功：清除这个通道的登记，模型的通道都清除后清除该模型。账户的登记里有账户级的 403
-// （需要验证账号，见 accountLevelPermissionDenied）时，任一模型成功都说明账户已经恢复，清除它的全部登记并返回 true（调用方清除
-// 它其余模型的 403 冷却）。在每个成功的请求上调用，没有登记时只在读锁下查一次表，不与其他成功的请求争用
+// succeeded 与 succeededAt 相同，成功的租约取得时刻为现在（测试与没有租约的调用）
 func (registry *permissionDeniedRegistry) succeeded(accountID string, modelID string, channel aistudio.Channel) bool {
+	return registry.succeededAt(accountID, modelID, channel, time.Now())
+}
+
+// succeededAt 账户在该模型该通道上请求成功（checkedAt 为这次成功的租约取得的时刻）：清除这个通道的登记，模型的通道都清除后清除该模型。
+// 账户的登记里有账户级的 403（需要验证账号，见 accountLevelPermissionDenied）时按 verifyModelsLocked 分两种：
+//   - 账户已通过验证：需要验证的模型有 verifyAccountWideModels 个及以上（整户）时任一模型成功，只有一个模型时这个模型本身成功，
+//     而且这次成功的租约取得得比最近一次需要验证账号的 403 晚——清除全部登记并返回 true（调用方清除它全部 403 冷却与暂停）；
+//   - 其余情况（只有一个模型时别的模型成功：那个模型仍需验证；租约在最近一次需要验证账号的 403 之前就取得了：较晚的 403 为准）
+//     只按通道清除这次成功的模型的普通 403 登记，需要验证账号的条目不动，返回 false。
+//
+// 原先只要有账户级条目，任一模型成功（含 403 之前就已发出、之后才结束的请求）都清除全部登记与暂停：只在一个模型上要求验证的账户
+// 被别的模型的成功解除，又被调度、再 403、再释放 Worker。在每个成功的请求上调用：先在读锁下判断这次成功要不要改登记，
+// 什么都不改时（没有登记；单个模型需要验证的账户在别的模型上成功、这个通道没有普通 403 条目——这类账户照常服务其他模型，
+// 是最常见的情况）只走读锁，不与其他成功的请求争用；要改时再取写锁重新核对
+func (registry *permissionDeniedRegistry) succeededAt(accountID string, modelID string, channel aistudio.Channel, checkedAt time.Time) bool {
 	if registry == nil {
 		return false
 	}
 	registry.mu.RLock()
-	_, listed := registry.channelIndexLocked(accountID, modelID, channel)
-	accountLevel := registry.accountLevelLocked(accountID)
+	verified, index, removable := registry.successChangeLocked(accountID, modelID, channel, checkedAt)
 	registry.mu.RUnlock()
-	if !listed && !accountLevel {
+	if !verified && !removable {
 		return false
 	}
 	registry.mu.Lock()
 	defer registry.mu.Unlock()
-	if registry.accountLevelLocked(accountID) {
+	// 释放读锁后可能已被其他请求改过，重新判断
+	if verified, index, removable = registry.successChangeLocked(accountID, modelID, channel, checkedAt); verified {
 		delete(registry.accounts, accountID)
 		registry.scheduleSaveLocked()
 		return true
 	}
-	// 释放读锁后可能已被其他请求清除，重新查找
-	index, listed := registry.channelIndexLocked(accountID, modelID, channel)
-	if !listed {
+	if !removable {
 		return false
 	}
 	account := registry.accounts[accountID]
@@ -281,11 +292,106 @@ func (registry *permissionDeniedRegistry) succeeded(accountID string, modelID st
 	return false
 }
 
+// successChangeLocked 判断账户在该模型该通道上的这次成功要怎样改登记（规则见 succeededAt）：verified 为账户已通过验证、清除全部登记；
+// 否则 removable 为这个通道有普通 403 条目（不是需要验证账号的）、按通道清除，index 为它在 Channels 里的位置。
+// 这个模型要求验证账号、这次成功却不足以说明已经验证（只有一个模型时别的模型成功，或租约早于最近一次需要验证账号的 403）时
+// 保留它的登记。调用方持有 mu（读锁即可）
+func (registry *permissionDeniedRegistry) successChangeLocked(
+	accountID string, modelID string, channel aistudio.Channel, checkedAt time.Time,
+) (verified bool, index int, removable bool) {
+	index, listed := registry.channelIndexLocked(accountID, modelID, channel)
+	if registry.accountLevelLocked(accountID) {
+		if models, lastAt := registry.verifyModelsLocked(accountID); len(models) > 0 && checkedAt.After(lastAt) &&
+			(len(models) >= verifyAccountWideModels || slices.Contains(models, normalizeGuardModel(modelID))) {
+			return true, 0, false
+		}
+	}
+	if !listed || accountLevelPermissionDenied(registry.accounts[accountID].Models[modelID].Message) {
+		return false, 0, false
+	}
+	return false, index, true
+}
+
 // accountLevelPermissionDenied 判断 403 原文是否说明是账户级的问题（需要验证账号：Your account must be verified …
 // verify-account）：与具体模型无关，账户验证通过后任一模型都能成功
 func accountLevelPermissionDenied(message string) bool {
 	lower := strings.ToLower(message)
 	return strings.Contains(lower, "verify-account") || strings.Contains(lower, "must be verified")
+}
+
+// verifyModels 返回账户登记里返回过账户级 403（需要验证账号，见 accountLevelPermissionDenied）的模型：按 normalizeGuardModel 归一、
+// 去重、排序。登记按模型一条，同一模型的 Playground 与 Build 在同一条的 Channels 里，只算一个；不看条目新旧（登记不过期，
+// 旧记录里在多个模型上要求验证的账户本来就是整户的）
+func (registry *permissionDeniedRegistry) verifyModels(accountID string) []string {
+	if registry == nil {
+		return nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	models, _ := registry.verifyModelsLocked(accountID)
+	return models
+}
+
+// verifyModelsLocked 与 verifyModels 相同，另外返回这些条目里最近一次 403 的时间；调用方持有 mu（读锁即可）
+func (registry *permissionDeniedRegistry) verifyModelsLocked(accountID string) ([]string, time.Time) {
+	account := registry.accounts[accountID]
+	if account == nil {
+		return nil, time.Time{}
+	}
+	var models []string
+	var lastAt time.Time
+	for modelID, model := range account.Models {
+		if model == nil || !accountLevelPermissionDenied(model.Message) {
+			continue
+		}
+		if normalized := normalizeGuardModel(modelID); !slices.Contains(models, normalized) {
+			models = append(models, normalized)
+		}
+		if model.LastAt.After(lastAt) {
+			lastAt = model.LastAt
+		}
+	}
+	slices.Sort(models)
+	return models, lastAt
+}
+
+// verifyEntries 返回登记里有账户级 403 的账户：每个账户的需要验证模型（原样的登记键，按 normalizeGuardModel 去重）与各自最近一次 403 的时间
+func (registry *permissionDeniedRegistry) verifyEntries() map[string]map[string]time.Time {
+	if registry == nil {
+		return nil
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	result := make(map[string]map[string]time.Time)
+	for accountID, account := range registry.accounts {
+		if account == nil {
+			continue
+		}
+		seen := make(map[string]string)
+		for modelID, model := range account.Models {
+			if model == nil || !accountLevelPermissionDenied(model.Message) {
+				continue
+			}
+			entries := result[accountID]
+			if entries == nil {
+				entries = make(map[string]time.Time)
+				result[accountID] = entries
+			}
+			normalized := normalizeGuardModel(modelID)
+			if previous, duplicate := seen[normalized]; duplicate {
+				// 同一模型的不同写法（大小写、models/ 前缀）只算一个，保留较晚的一次（同时的取字典序在前的写法，每次结果一样）
+				if model.LastAt.After(entries[previous]) || model.LastAt.Equal(entries[previous]) && modelID < previous {
+					delete(entries, previous)
+					entries[modelID] = model.LastAt
+					seen[normalized] = modelID
+				}
+				continue
+			}
+			seen[normalized] = modelID
+			entries[modelID] = model.LastAt
+		}
+	}
+	return result
 }
 
 // accountLevelLocked 判断账户的登记里有没有账户级的 403；调用方持有 mu（读锁即可）
@@ -340,7 +446,8 @@ func (registry *permissionDeniedRegistry) dropSystemic(
 	dropped := 0
 	for accountID, account := range registry.accounts {
 		model := account.Models[modelID]
-		if model == nil || model.FirstAt.Before(since) || inPool != nil && !inPool(accountID) {
+		// 需要验证账号的条目不撤销：号池级判定本来就不计它们（见 runtime 的 verifyRequired），撤销只会留下没有登记的长期暂停
+		if model == nil || model.FirstAt.Before(since) || inPool != nil && !inPool(accountID) || accountLevelPermissionDenied(model.Message) {
 			continue
 		}
 		delete(account.Models, modelID)
@@ -628,10 +735,12 @@ func (service *trackedService) forgetPermissionDenied(accountID string, source s
 	service.clearPermissionDeniedState(accountID, source)
 }
 
-// clearPermissionDeniedState 清除账户的 403 无权限登记、冷却与暂停（不动组织停用）：认证文件更新与手动验证通过时调用
-func (service *trackedService) clearPermissionDeniedState(accountID string, source string) {
+// clearPermissionDeniedState 清除账户的 403 无权限登记、冷却与暂停（不动组织停用）：认证文件更新与手动验证通过时调用。
+// 返回清除的冷却条数；清掉了冷却时账户列表与冷却列表随下一次合并推送更新（见 publishModelAccess、publishCooldowns），
+// 管理页上的手动操作要立即看到的另调 publishCooldownsNow
+func (service *trackedService) clearPermissionDeniedState(accountID string, source string) int {
 	if service == nil {
-		return
+		return 0
 	}
 	models := service.permissionDenied.clearAccount(accountID)
 	service.forbidden.forgetAccount(accountID)
@@ -644,7 +753,7 @@ func (service *trackedService) clearPermissionDeniedState(accountID string, sour
 		cooldowns = cleared
 	}
 	if models == 0 && cooldowns == 0 {
-		return
+		return 0
 	}
 	if service.requests != nil {
 		head := "认证文件已更新"
@@ -656,14 +765,16 @@ func (service *trackedService) clearPermissionDeniedState(accountID string, sour
 		))
 	}
 	if cooldowns > 0 {
-		service.publishModelAccess()
+		service.publishCooldowns()
 	}
+	return cooldowns
 }
 
-// permissionDeniedSucceeded 账户在该模型该通道上请求成功：清除对应的 403 登记；账户级的 403（需要验证账号）在任一模型成功时
-// 清除全部登记，并清除它其余模型的 403 冷却与暂停，账户已在官网完成验证后立即重新参与这些模型的调度
-func (service *trackedService) permissionDeniedSucceeded(accountID string, modelID string, channel aistudio.Channel) {
-	if service == nil || !service.permissionDenied.succeeded(accountID, modelID, channel) {
+// permissionDeniedSucceeded 账户在该模型该通道上请求成功（checkedAt 为这次成功的租约取得的时刻）：清除对应的 403 登记；账户已通过验证
+// （见 permissionDeniedRegistry.succeededAt：整户时任一模型、单个模型时这个模型本身，租约晚于最近一次需要验证账号的 403）时清除全部登记，
+// 并清除它全部 403 冷却与暂停，账户已在官网完成验证后立即重新参与这些模型的调度。只在一个模型上要求验证的账户，别的模型成功不解除它
+func (service *trackedService) permissionDeniedSucceeded(accountID string, modelID string, channel aistudio.Channel, checkedAt time.Time) {
+	if service == nil || !service.permissionDenied.succeededAt(accountID, modelID, channel, checkedAt) {
 		return
 	}
 	service.forbidden.forgetAccount(accountID)
@@ -735,42 +846,39 @@ func (service *trackedService) reconcilePermissionDenied() {
 	}
 }
 
-// backfillVerifyRequiredPauses 在启动时（reconcilePermissionDenied 之后、首次预热之前）为登记表里有账户级 403（需要验证账号）、
-// 此刻却没有整户暂停的账户补写暂停，返回补写的账户数。这些账户是第一次遇到就暂停之前登记的、当时写暂停被目录代际或检查时间跳过的，
-// 原先仍是预热与选号的候选：冷启动一个 Worker（10–30 秒），第一次生成就 403，再暂停、释放，还白占一次换号尝试。解除方式与生成路径
-// 写入的暂停相同（管理页验证通过、认证文件更新、任一模型成功、清除 403 记录、到期）。规则：
-//   - 暂停仍生效的跳过（只查内存，不读写文件）；
-//   - 暂停期限从账户级条目最近一次 403 的时间（last_at）起算 verifyRequiredPause，已到期的不补（超过 30 天，与暂停到期后的规则相同），
-//     超过 now+verifyRequiredPause 的（时钟回拨）截到 now+verifyRequiredPause；
-//   - 检查时间用 last_at（晚于 now 时截到 now）：403 之后全局作用域有更晚的记录（任一模型成功、其他整户冷却、启用或同步目录清除冷却）时返回
-//     CooldownSkippedStale，不补写。检查时间不截断的话，时钟回拨时全局作用域的检查时间被写到未来：清除 403 记录解除暂停后，
-//     之后按租约时间写入的整户暂停、每日限额等全局冷却在 last_at 之前都会被当作陈旧跳过。同一进程里成功还会经 permissionDeniedSucceeded 清除登记；认证文件已在停机期间更新的账户
-//     先经 reconcilePermissionDenied 清除，所以必须排在它之后。
-func (service *trackedService) backfillVerifyRequiredPauses(now time.Time) int {
+// verifyReconcileCounts 为启动时整理需要验证账号的暂停的各项计数（见 reconcileVerifyRequiredPauses），汇总行只写计数、不写账户
+type verifyReconcileCounts struct {
+	moved, kept, accountWritten, modelWritten, modelExisting, orphan, expired, stale, failed int
+}
+
+// reconcileVerifyRequiredPauses 在启动时（reconcilePermissionDenied 之后、首次预热之前）按登记整理需要验证账号的暂停，返回计数：
+// 登记里账户级 403（需要验证账号）只在一个模型上的账户只暂停这个模型，两个及以上模型的整户暂停（与生成路径同一规则，见 verifyAccountWideModels）。
+//   - 两个及以上模型：整户暂停生效的保留；没有生效的补写整户暂停（期限从这些条目最近一次 403 的时间起算 verifyRequiredPause，
+//     已到期的不补，超过 now+verifyRequiredPause 的截到它；检查时间用最近一次 403 的时间、晚于 now 时截到 now，之后全局作用域
+//     有更晚的记录时不补写，与原先的补写规则相同）；
+//   - 只有一个模型 M：整户暂停生效的改为 M 上的单个模型需要验证（MoveVerifyPauseToModel：恢复时间沿用原暂停，同一次写盘先写后删）；
+//     没有整户暂停、M 上已有生效的单个模型冷却的不动；都没有的按同样的期限与检查时间规则补写 M 的单个模型冷却；
+//   - 登记里没有账户级条目、整户暂停却生效（旧版本点过“清除记录”留下的、其他进程写入的）：不动，计入“没有登记的整户暂停”。
+//
+// 只按内存判断（VerifyRequiredPaused、ModelVerifyCooled），只对要改的账户写盘。已知的不精确：每个模型只存最后一条原文，
+// 旧版本撤销号池级 403 时也删过 verify 条目，原本在多个模型上要求验证的账户可能只剩一个模型的条目、被改成单个模型——
+// 代价是在另一个模型上白试一次，随即重新整户暂停并释放 Worker
+func (service *trackedService) reconcileVerifyRequiredPauses(now time.Time) verifyReconcileCounts {
+	var counts verifyReconcileCounts
 	if service == nil || service.pool == nil || service.permissionDenied == nil {
-		return 0
+		return counts
 	}
-	lastAt := service.permissionDenied.accountLevelLastAt()
-	if len(lastAt) == 0 {
-		return 0
-	}
-	accountIDs := make([]string, 0, len(lastAt))
-	for accountID := range lastAt {
+	entries := service.permissionDenied.verifyEntries()
+	accountIDs := make([]string, 0, len(entries))
+	for accountID := range entries {
 		accountIDs = append(accountIDs, accountID)
 	}
 	slices.Sort(accountIDs)
-	written, paused, expired, stale, failed := 0, 0, 0, 0, 0
 	limit := now.Add(verifyRequiredPause)
-	for _, accountID := range accountIDs {
-		if service.pool.VerifyRequiredPaused(accountID) {
-			paused++
-			continue
-		}
-		last := lastAt[accountID]
+	window := func(last time.Time) (time.Time, time.Time, bool) {
 		until := last.Add(verifyRequiredPause)
 		if last.IsZero() || !until.After(now) {
-			expired++
-			continue
+			return time.Time{}, time.Time{}, false
 		}
 		if until.After(limit) {
 			until = limit
@@ -779,30 +887,129 @@ func (service *trackedService) backfillVerifyRequiredPauses(now time.Time) int {
 		if checkedAt.After(now) {
 			checkedAt = now
 		}
-		write, err := service.pool.TryMarkCooldownIfGeneration(
-			accountID, "", service.pool.ModelAccessGeneration(accountID), checkedAt, until, verifyRequiredPauseReason,
+		return until, checkedAt, true
+	}
+	fail := func(accountID string, err error) {
+		counts.failed++
+		if service.requests != nil {
+			service.requests.log(accountID, "WARN", "启动时整理需要验证账号的暂停失败 | 错误="+strings.TrimSpace(err.Error()))
+		}
+	}
+	for _, accountID := range accountIDs {
+		models := entries[accountID]
+		paused := service.pool.VerifyRequiredPaused(accountID)
+		if len(models) >= verifyAccountWideModels {
+			if paused {
+				counts.kept++
+				continue
+			}
+			var last time.Time
+			for _, at := range models {
+				if at.After(last) {
+					last = at
+				}
+			}
+			until, checkedAt, ok := window(last)
+			if !ok {
+				counts.expired++
+				continue
+			}
+			write, err := service.pool.TryMarkCooldownIfGeneration(
+				accountID, "", service.pool.ModelAccessGeneration(accountID), checkedAt, until, verifyRequiredPauseReason,
+			)
+			switch {
+			case errors.Is(err, aistudio.ErrAccountNotFound):
+			case err != nil:
+				fail(accountID, err)
+			case write == aistudio.CooldownWritten || write == aistudio.CooldownKeptLater:
+				counts.accountWritten++
+			default:
+				counts.stale++
+			}
+			continue
+		}
+		var modelID string
+		var last time.Time
+		for id, at := range models {
+			modelID, last = id, at
+		}
+		if paused {
+			moved, err := service.pool.MoveVerifyPauseToModel(accountID, modelID, now)
+			switch {
+			case errors.Is(err, aistudio.ErrAccountNotFound):
+			case err != nil:
+				fail(accountID, err)
+			case moved:
+				counts.moved++
+			}
+			continue
+		}
+		if _, cooled := service.pool.ModelVerifyCooled(accountID, modelID); cooled {
+			counts.modelExisting++
+			continue
+		}
+		until, checkedAt, ok := window(last)
+		if !ok {
+			counts.expired++
+			continue
+		}
+		written, _, err := service.pool.MarkModelVerifyCooldownIfGeneration(
+			accountID, modelID, service.pool.ModelAccessGeneration(accountID), checkedAt, until,
 		)
 		switch {
 		case errors.Is(err, aistudio.ErrAccountNotFound):
 		case err != nil:
-			failed++
-			if service.requests != nil {
-				service.requests.log(accountID, "WARN", "启动时补写需要验证账号的整户暂停失败 | 错误="+strings.TrimSpace(err.Error()))
-			}
-		case write == aistudio.CooldownWritten:
-			written++
+			fail(accountID, err)
+		case written > 0:
+			counts.modelWritten++
 		default:
-			stale++
+			counts.stale++
 		}
 	}
-	if written+expired+stale+failed > 0 && service.requests != nil {
+	for _, accountID := range service.pool.AccountIDs() {
+		if _, listed := entries[accountID]; !listed && service.pool.VerifyRequiredPaused(accountID) {
+			counts.orphan++
+		}
+	}
+	if counts.moved+counts.accountWritten+counts.modelWritten+counts.expired+counts.stale+counts.failed > 0 && service.requests != nil {
 		// 持久行：启动时控制台队列可能还没有消费者
 		service.requests.logDurable("service", "INFO", fmt.Sprintf(
-			"启动时补写需要验证账号的整户暂停 | 补写=%d | 已暂停=%d | 最近一次 403 超过 %d 天=%d | 之后有更新的记录=%d | 失败=%d",
-			written, paused, int(verifyRequiredPause/(24*time.Hour)), expired, stale, failed,
+			"启动时整理需要验证账号的暂停 | 整户暂停改为单个模型=%d | 整户暂停保留=%d | 补写整户暂停=%d | 补写单个模型=%d | 已有单个模型=%d"+
+				" | 没有登记的整户暂停=%d | 最近一次 403 超过 %d 天=%d | 之后有更新的记录=%d | 失败=%d",
+			counts.moved, counts.kept, counts.accountWritten, counts.modelWritten, counts.modelExisting,
+			counts.orphan, int(verifyRequiredPause/(24*time.Hour)), counts.expired, counts.stale, counts.failed,
 		))
 	}
-	return written
+	if counts.moved+counts.accountWritten+counts.modelWritten > 0 {
+		service.publishModelAccess()
+	}
+	return counts
+}
+
+// markModelVerifyRequired 处理生成请求只在一个模型上返回需要验证账号（已登记，见 recordPermissionDenied）：在 modelID 的 Playground 键与
+// Build 键上写 verifyRequiredPause 的单个模型需要验证冷却（检查时间取现在：403 之前就取得、之后才成功的租约清不掉它，见
+// aistudio.MarkModelVerifyCooldownIfGeneration），不写阶梯 403 冷却、不暂停整个账户、不释放也不淘汰 Worker（它还在服务其他模型）。
+// 写入时写“账号冷却 | 类型=单个模型需要验证”，没有写入（目录代际变了、两个键都有更晚的记录）时写“账号冷却未写入”，调用方照样按已冷却换号
+func (service *trackedService) markModelVerifyRequired(lease *aistudio.AccountLease, accountLabel string, modelID string) error {
+	now := time.Now()
+	until := now.Add(verifyRequiredPause)
+	accountID := lease.Account().ID
+	written, write, err := service.pool.MarkModelVerifyCooldownIfGeneration(accountID, modelID, lease.ModelAccessGeneration(), now, until)
+	if err != nil {
+		return err
+	}
+	if written == 0 {
+		service.requests.log(accountLabel, "INFO", fmt.Sprintf(
+			"账号冷却未写入 | 类型=单个模型需要验证 | 范围=%s | 原因=%s", modelID, write,
+		))
+		return nil
+	}
+	service.requests.log(accountLabel, "WARN", fmt.Sprintf(
+		"账号冷却 | 类型=单个模型需要验证 | 范围=%s | 通道=playground、build | 恢复=验证通过、认证文件更新或清除 403 记录（最迟 %s）",
+		modelID, until.Format(time.RFC3339),
+	))
+	service.publishModelAccess()
+	return nil
 }
 
 // rotatingCookies 为 Google 用 Set-Cookie 定期轮换的会话 Cookie：同一登录会话里一直在变，每个进程都会把它们回写到认证文件
@@ -882,9 +1089,9 @@ func (admin *runtimeAdmin) PermissionDenied(context.Context) ([]api.AdminPermiss
 	return result, nil
 }
 
-// ClearPermissionDenied 按管理页的操作清除 403 无权限账户的登记，返回清除了登记的账户数与解除需要验证账号整户暂停的账户数。
-// 冷却只解除一种：指定的账户（all 时为号池里的全部账户）需要验证账号的整户暂停（见 liftVerifyRequiredPauses），登记表里没有它们时
-// 同样解除；单模型 403 冷却与多模型连续 403 的自动暂停不变。账户 ID 只去掉首尾空白，不转小写（与其他管理接口一致；从磁盘导入的
+// ClearPermissionDenied 按管理页的操作清除 403 无权限账户的登记，返回清除了登记的账户数与解除需要验证账号暂停的账户数。
+// 冷却只解除需要验证账号的两种：指定的账户（all 时为号池里的全部账户）的整户暂停与单个模型需要验证（见 liftVerifyRequiredPauses），
+// 登记表里没有它们时同样解除；单模型 403 阶梯冷却与多模型连续 403 的自动暂停不变。账户 ID 只去掉首尾空白，不转小写（与其他管理接口一致；从磁盘导入的
 // 账户 ID 是目录名，可能带大写），匹配时不区分大小写（见 permissionDeniedRegistry.clear 与 matchPoolAccountIDs）
 func (admin *runtimeAdmin) ClearPermissionDenied(
 	ctx context.Context, input api.PermissionDeniedClearInput,
@@ -908,21 +1115,20 @@ func (admin *runtimeAdmin) ClearPermissionDenied(
 	}
 	// 按账户清除时解除指定的账户：登记表里清到的（登记表的写法），以及登记表里没有、暂停还在的（管理页“解除暂停”传入的账户）
 	lifted := admin.service.liftVerifyRequiredPauses(append(cleared, accountIDs...), input.All, time.Now())
-	if lifted > 0 && admin.pool != nil {
+	if lifted > 0 {
 		// 冷却列表只在请求结束后推送：立即推送一次，管理页的冷却概况与“出问题”马上不再显示这些暂停
-		if cooldowns, err := admin.Cooldowns(ctx); err == nil {
-			admin.requests.publish(api.AdminEvent{Type: "cooldowns", Data: cooldowns})
-		}
+		admin.service.publishCooldownsNow()
 	}
 	return api.PermissionDeniedClearResult{Cleared: len(cleared), Lifted: lifted}, nil
 }
 
-// liftVerifyRequiredPauses 管理页清除 403 记录时解除需要验证账号的整户暂停（原因等于 verifyRequiredPauseReason、此刻仍生效的冷却，
-// 见 verifyRequiredPauseCooldown），返回解除的账户数。原先只清列表：账户从 403 列表与“出问题”里消失，暂停却留着（最长 verifyRequiredPause），
-// 管理员看不出它为什么不参与调度。accountIDs 为要解除的账户（按号池的账户 ID 不区分大小写匹配，号池里没有的跳过）；all 时对号池里的
-// 全部账户清，覆盖登记已经清空、暂停还在的账户（旧版本点过“清除记录”留下的）。只清这一种：单模型 403 冷却与多模型连续 403 的
-// 自动暂停保持不变（与管理页确认框的说明一致）。now 之前已经到期的暂停（运行态里到期的冷却不会自动删除）不算解除：不计数、不写日志。
-// 账户仍未验证时下一次请求会重新暂停
+// liftVerifyRequiredPauses 管理页清除 403 记录时解除需要验证账号的暂停：整户暂停（原因等于 verifyRequiredPauseReason）与单个模型需要验证
+// （原因等于 modelVerifyRequiredReason，Playground 键与 Build 键），都只解除此刻仍生效的（见 verifyCooldown），返回解除了任一种的账户数。
+// 原先只清列表：账户从 403 列表与“出问题”里消失，暂停却留着（最长 verifyRequiredPause），管理员看不出它为什么不参与调度。
+// accountIDs 为要解除的账户（按号池的账户 ID 不区分大小写匹配，号池里没有的跳过）；all 时对号池里的全部账户清，覆盖登记已经清空、
+// 暂停还在的账户（旧版本点过“清除记录”留下的）。只清这两种：单模型 403 阶梯冷却与多模型连续 403 的自动暂停保持不变（与管理页确认框的
+// 说明一致）。now 之前已经到期的暂停（运行态里到期的冷却不会自动删除）不算解除：不计数、不写日志。账户仍未验证时下一次请求会重新暂停。
+// 两种各写一行：整户的“解除需要验证账号的整户暂停”保留原文（诊断脚本按它判断整户暂停已解除），单个模型的另写“解除单个模型需要验证的暂停”
 func (service *trackedService) liftVerifyRequiredPauses(accountIDs []string, all bool, now time.Time) int {
 	if service == nil || service.pool == nil {
 		return 0
@@ -932,23 +1138,37 @@ func (service *trackedService) liftVerifyRequiredPauses(accountIDs []string, all
 	} else {
 		accountIDs = matchPoolAccountIDs(service.pool.AccountIDs(), accountIDs)
 	}
-	active := func(scope string, cooldown aistudio.CooldownState) bool {
+	accountPause := func(scope string, cooldown aistudio.CooldownState) bool {
 		return verifyRequiredPauseCooldown(scope, cooldown) && cooldown.Active(now)
+	}
+	modelPause := func(scope string, cooldown aistudio.CooldownState) bool {
+		return verifyCooldown(scope, cooldown) && !verifyRequiredPauseCooldown(scope, cooldown) && cooldown.Active(now)
 	}
 	lifted := 0
 	for _, accountID := range accountIDs {
-		// 取号池账户列表之后被删除的账户返回 ErrAccountNotFound，跳过
-		cleared, err := service.pool.ClearCooldownsMatching(accountID, active)
-		if err != nil && !errors.Is(err, aistudio.ErrAccountNotFound) && service.requests != nil {
-			service.requests.log(accountID, "WARN", "解除需要验证账号的整户暂停失败 | 错误="+strings.TrimSpace(err.Error()))
+		liftedAccount := false
+		for _, kind := range []struct {
+			match   func(string, aistudio.CooldownState) bool
+			message string
+		}{
+			{accountPause, "已清除 403 记录，解除需要验证账号的整户暂停，账户重新参与调度 | 来源=管理页清除 403 记录 | 单模型 403 冷却不变（仍未验证时下一次请求会重新暂停）"},
+			{modelPause, "已清除 403 记录，解除单个模型需要验证的暂停，该模型重新参与调度 | 来源=管理页清除 403 记录 | 单模型 403 冷却不变（仍未验证时下一次请求会重新暂停）"},
+		} {
+			// 取号池账户列表之后被删除的账户返回 ErrAccountNotFound，跳过
+			cleared, err := service.pool.ClearCooldownsMatching(accountID, kind.match)
+			if err != nil && !errors.Is(err, aistudio.ErrAccountNotFound) && service.requests != nil {
+				service.requests.log(accountID, "WARN", "解除需要验证账号的暂停失败 | 错误="+strings.TrimSpace(err.Error()))
+			}
+			if err != nil || cleared == 0 {
+				continue
+			}
+			liftedAccount = true
+			if service.requests != nil {
+				service.requests.log(accountID, "INFO", kind.message)
+			}
 		}
-		if err != nil || cleared == 0 {
-			continue
-		}
-		lifted++
-		if service.requests != nil {
-			service.requests.log(accountID, "INFO",
-				"已清除 403 记录，解除需要验证账号的整户暂停，账户重新参与调度 | 来源=管理页清除 403 记录 | 单模型 403 冷却不变（仍未验证时下一次请求会重新暂停）")
+		if liftedAccount {
+			lifted++
 		}
 	}
 	if lifted > 0 {

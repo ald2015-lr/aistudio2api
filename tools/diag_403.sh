@@ -7,7 +7,9 @@
 #   2. 403 登记：每个登记账户在这个模型上的通道、首次与最近一次的时间、次数、上游方法，以及新版本记下的最近一次请求来源
 #      （last_request：请求 ID、接口、请求名、消息条数、内联图片数、文件引用数）；需要验证账号的账户的登记默认只给个数与时间范围。
 #      需要验证账号按账户判断，与管理页 403 列表隐藏的账户同一口径：登记里任一模型是账户级 403（verify-account）的账户，以及冷却列表
-#      （GET /api/cooldowns）里需要验证账号整户暂停仍生效的账户（读不到时按运行日志近似）；读得到冷却列表时另写其中暂停已到期的个数
+#      （GET /api/cooldowns）里需要验证账号的暂停仍生效的账户（读不到时按运行日志近似）；读得到冷却列表时另写其中暂停已到期的个数
+#      （单个模型的写暂停未生效的个数：已到期或没有写入，与管理页同一说法；第 7 段按运行日志另写其中从没写入的）。
+#      分两类汇总，与管理页同一口径：整户（整户暂停生效，或登记里 2 个及以上模型要求验证）与单个模型需要验证（只暂停那个模型，另写模型分布）
 #   3. 用量账本最近 DAYS 天（默认 92，最多 92）这个模型的请求：按接口、按天（总数/成功）；每个模型最多统计最近的 10000 条，超过时写明
 #   4. 每个登记账户最近一次 403 对应的请求与经过：登记带 last_request 时按请求 ID 找（本实例账本里没有这个 ID 时写明），没有时按时间
 #      在账本里单独查一个窄窗口（请求结束时间在最近一次 403 前 2 分钟到后 60 分钟、且这个账户在其中返回过 403），再到运行日志的
@@ -23,12 +25,14 @@
 #      渠道测试的上限按同一次运行里已确认是渠道测试的请求校准（没有样本时只认不超过 8 的），下游的门槛为校准值（没有样本时为后缀可能的
 #      最大贡献 96）加 100；逐条输出时多一行“账本补判”：正文有/无/被截断/读取失败与原因、上游尝试里改用过的模型、账本的输入/回复 tokens
 #   5. 目录里这个模型的别名（别名本身不是目录 ID 时，请求这个别名会落到这个模型上、登记在它名下）
-#   6. 运行日志里这个模型的 403 冷却与需要验证账号的暂停行（需要验证账号的账户的暂停、解除与 403 冷却行默认只给行数、账户数与时间范围）
+#   6. 运行日志里这个模型的 403 冷却与需要验证账号的暂停行（需要验证账号的账户的整户暂停、单个模型暂停、解除与 403 冷却行默认只给行数、
+#      账户数与时间范围）
 #   7. 结论：每个登记账户一行（带最近一次 403 的本机时间与请求 ID，对应管理页 403 列表的行），按 README“没有调用过的模型出现在 403 列表里”
 #      的判断：多半是旧记录（含升级到含 93c16fa 的版本之前带图 Omni 请求的误登记）/ new-api 渠道测试 / 下游主动调用 / 别名 /
 #      额度用完改用（本服务的 MODEL_FALLBACKS）/ 模型重定向或改用（未确认）/ 直连 interactions /
-#      账本里没有对应请求（可能是共用账户目录的其他实例或复制来的目录）。需要验证账号的账户（账户级 403，第一次遇到即整户暂停调度
-#      30 天，管理页整个账户不列在 403 列表里、另有汇总块；这个账户在其他模型上的普通 403 也算在内）同样判断请求来源，默认汇总成一小段：
+#      账本里没有对应请求（可能是共用账户目录的其他实例或复制来的目录）。需要验证账号的账户（账户级 403：2 个及以上模型或整户暂停生效的
+#      整户暂停调度 30 天，只在一个模型上的只暂停那个模型；管理页整个账户不列在 403 列表里、另有汇总块与“403 单个模型需要验证”；这个账户
+#      在其他模型上的普通 403 也算在内）同样判断请求来源，整户与单个模型各汇总成一小段：
 #      账户数、最近一次 403 的时间范围、按请求来源分类的账户数、涉及的请求 ID 数与账户数最多的前 5 个请求（一个请求依次换号、每个都 403）。
 #      账户级 403 的那条登记不套用旧记录、升级前带图误登记与下游带图三条（它们针对的是 The caller does not have permission 被误登记的
 #      情形，结论是“账户本身多半正常”），按请求形态归入渠道测试、下游等；同一账户在其他模型上的普通 403 照常套用。
@@ -398,8 +402,18 @@ def account_keys(account_id, label):
 
 
 # 需要验证账号按账户判断（与管理页 403 列表隐藏的账户同一口径，不受 MODEL 过滤）：登记里任一模型的原文是账户级 403 的账户，以及
-# 需要验证账号整户暂停此刻仍生效的账户（冷却列表里原因含 verify-account、以“次返回 403 无权限，自动暂停”结尾的冷却，登记已清除、暂停还在的
-# 也算）。这些账户整个不列在管理页 403 列表里（见需要验证账号汇总块），这里同样默认只汇总；同一账户其他模型上的普通 403 也算在它名下
+# 需要验证账号的暂停此刻仍生效的账户（冷却列表里 verify 为 account 的整户暂停、为 model 的单个模型需要验证；旧版本没有 verify 字段时
+# 按原因：含 verify-account、以“次返回 403 无权限，自动暂停”结尾，以“单个模型需要验证账号”开头的是单个模型。登记已清除、暂停还在的也算）。
+# 分两类，与服务端、管理页同一口径：整户（整户暂停此刻生效，或登记里账户级 403 涉及 2 个及以上模型，按小写、去掉 models/ 归一）与单个模型
+# （其余：只暂停那个模型，账户其他模型照常调度）。这些账户整个不列在管理页 403 列表里（见需要验证账号汇总块与“403 单个模型需要验证”），
+# 这里同样默认只汇总；同一账户其他模型上的普通 403 也算在它名下
+MODEL_VERIFY_PREFIX = "单个模型需要验证账号"
+
+
+def norm_model(model):
+    return re.sub(r"^models/", "", (model or "").strip()).lower()
+
+
 VERIFY_MODELS = {}  # 账户（小写 ID 与邮箱）→ 登记里账户级 403 的模型
 for account in listed.get("accounts") or []:
     verify_models = [m.get("model") or "" for m in account.get("models") or [] if ACCOUNT_LEVEL.search(m.get("message") or "")]
@@ -415,17 +429,38 @@ if cooldown_list is None and api_before["value"] == "ok" and API_STATE["value"] 
     API_STATE.update(api_before)
 COOLDOWNS_OK = cooldown_list is not None
 PAUSED = set()  # 需要验证账号整户暂停此刻仍生效的账户（小写 ID 与邮箱）
+MODEL_VERIFY = {}  # 单个模型需要验证的暂停此刻仍生效的账户（小写 ID 与邮箱）→ 归一的模型
+
+
+def verify_kind(cooldown, reason):
+    """冷却的需要验证账号种类：account、model 或空；优先用冷却列表的 verify 字段，旧版本没有时按原因判断"""
+    kind = cooldown.get("verify") or ""
+    if kind in ("account", "model"):
+        return kind
+    if reason.endswith("次返回 403 无权限，自动暂停") and ACCOUNT_LEVEL.search(reason):
+        return "model" if reason.startswith(MODEL_VERIFY_PREFIX) else "account"
+    return ""
+
+
 for cooldown in (cooldown_list or {}).get("cooldowns") or []:
     reason = (cooldown.get("reason") or "").strip()
     until = parse_time(cooldown.get("until"))
-    if reason.endswith("次返回 403 无权限，自动暂停") and ACCOUNT_LEVEL.search(reason) and until and until > NOW:
+    if not until or until <= NOW:
+        continue
+    kind = verify_kind(cooldown, reason)
+    if kind == "account":
         PAUSED.update(account_keys(cooldown.get("account_id"), cooldown.get("account_label")))
+    elif kind == "model":
+        for key in account_keys(cooldown.get("account_id"), cooldown.get("account_label")):
+            MODEL_VERIFY.setdefault(key, set()).add(norm_model(cooldown.get("model_id")))
 
 
 def log_paused():
-    """读不到冷却列表时按本实例运行日志近似需要验证账号整户暂停仍生效的账户：这个账户最后一行需要验证账号的“账号暂停调度”之后
-    没有“解除需要验证账号的整户暂停”、且不到 30 天（管理页“验证”通过与认证文件更新解除暂停时不写这一行，这里看不出来）"""
-    last = {}
+    """读不到冷却列表时按本实例运行日志近似需要验证账号的暂停仍生效的账户，返回（整户暂停的账户，单个模型需要验证的账户 → 模型）：
+    整户为这个账户最后一行需要验证账号的“账号暂停调度”之后没有“解除需要验证账号的整户暂停”；单个模型为这个账户这个模型最后一行
+    “账号冷却 | 类型=单个模型需要验证”之后没有“解除单个模型需要验证的暂停”；都要不到 30 天（管理页“验证”通过与认证文件更新解除暂停时
+    不写解除行，这里看不出来）"""
+    last, models = {}, {}
     for name in ("aistudio2api.log.1", "aistudio2api.log"):
         try:
             handle = open(os.path.join(APP, "logs", name), encoding="utf-8", errors="replace")
@@ -433,22 +468,33 @@ def log_paused():
             continue
         with handle:
             for line in handle:
-                if "账号暂停调度" not in line and "解除需要验证账号的整户暂停" not in line:
+                if "账号暂停调度" not in line and "解除需要验证账号的整户暂停" not in line and \
+                        "类型=单个模型需要验证" not in line and "解除单个模型需要验证的暂停" not in line:
                     continue
                 try:
                     item = json.loads(line)
                 except ValueError:
                     continue
                 message, account = item.get("msg") or "", (item.get("source") or "").lower()
+                moment = parse_time(item.get("time"))
                 if "账号暂停调度" in message and ACCOUNT_LEVEL.search(message):
-                    last[account] = parse_time(item.get("time"))
+                    last[account] = moment
                 elif "解除需要验证账号的整户暂停" in message and "失败" not in message:
                     last[account] = None
-    return {account for account, moment in last.items() if moment and NOW - moment < datetime.timedelta(days=30)}
+                elif message.startswith("账号冷却 | 类型=单个模型需要验证"):
+                    scope = re.search(r"范围=([^ |]+)", message)
+                    if scope:
+                        models.setdefault(account, {})[norm_model(scope.group(1))] = moment
+                elif "解除单个模型需要验证的暂停" in message and "失败" not in message:
+                    models.pop(account, None)
+    recent = lambda moment: moment and NOW - moment < datetime.timedelta(days=30)
+    paused = {account for account, moment in last.items() if recent(moment)}
+    cooled = {account: {model for model, moment in items.items() if recent(moment)} for account, items in models.items()}
+    return paused, {account: items for account, items in cooled.items() if items}
 
 
 if not COOLDOWNS_OK:
-    PAUSED = log_paused()
+    PAUSED, MODEL_VERIFY = log_paused()
 
 entries = []
 for account in listed.get("accounts") or []:
@@ -458,6 +504,10 @@ for account in listed.get("accounts") or []:
     keys = account_keys(account_id, label)
     verify_models = next((VERIFY_MODELS[key] for key in keys if key in VERIFY_MODELS), [])
     paused = bool(keys & PAUSED)
+    cooled_models = set().union(*[MODEL_VERIFY.get(key, set()) for key in keys])
+    registry_models = {norm_model(model) for model in verify_models}
+    # verify_scope：整户（整户暂停此刻生效，或登记里账户级 403 涉及 2 个及以上模型）、单个模型（其余有账户级登记或单个模型暂停的）、空
+    verify_scope = "account" if paused or len(registry_models) >= 2 else "model" if registry_models or cooled_models else ""
     models = account.get("models") or []
     for item in models:
         if not ALL and item.get("model") != MODEL:
@@ -471,10 +521,15 @@ for account in listed.get("accounts") or []:
             # 第一次遇到就整户暂停调度 30 天，管理页不列在 403 列表里、另有汇总块；verify_models 为登记里账户级 403 的模型；
             # paused 为整户暂停此刻仍生效（读不到冷却列表时按运行日志近似，见 log_paused）
             "verify": bool(ACCOUNT_LEVEL.search(item.get("message") or "")),
-            "verify_account": bool(verify_models) or paused, "verify_models": verify_models, "paused": paused,
+            "verify_account": bool(verify_scope), "verify_models": verify_models, "paused": paused,
+            # verify_scope 见上；model_paused 为单个模型需要验证的暂停此刻仍生效；verify_targets 为单个模型时暂停的模型（登记 ∪ 冷却）
+            "verify_scope": verify_scope, "model_paused": bool(cooled_models),
+            "verify_targets": sorted(registry_models | cooled_models),
         })
 entries.sort(key=lambda e: e["last"] or datetime.datetime.min.replace(tzinfo=UTC), reverse=True)
 VERIFY_ENTRIES = [e for e in entries if e["verify_account"]]
+VERIFY_ACCOUNT_ENTRIES = [e for e in VERIFY_ENTRIES if e["verify_scope"] == "account"]
+VERIFY_MODEL_ENTRIES = [e for e in VERIFY_ENTRIES if e["verify_scope"] == "model"]
 
 
 def detailed(entry):
@@ -483,9 +538,24 @@ def detailed(entry):
 
 
 def pause_expired(entry):
-    # 整户暂停已到期（读得到冷却列表、账户却不在暂停里：暂停 30 天到期，或旧版本留下、启动时已到期没有补写暂停的登记）；
-    # 读不到冷却列表时不知道，不算到期
+    # 暂停不在生效中（读得到冷却列表、账户却不在暂停里）。整户看整户暂停：暂停 30 天到期，或旧版本留下、启动时已到期没有补写暂停的登记，
+    # 写“暂停已到期”；单个模型看那个模型的暂停：除了到期，生成路径也可能没有写入（目录代际变化等，运行日志为“账号冷却未写入”），
+    # 与管理页同一说法写“暂停未生效（已到期或没有写入）”，第 6 段读到运行日志后能分出没有写入的（见 model_pause_unwritten）。
+    # 读不到冷却列表时不知道，不算
+    if entry.get("verify_scope") == "model":
+        return COOLDOWNS_OK and not entry["model_paused"]
     return COOLDOWNS_OK and not entry["paused"]
+
+
+# MODEL_UNWRITTEN 为运行日志里有“账号冷却未写入 | 类型=单个模型需要验证”、却没有一行写入成功（账号冷却 | 类型=单个模型需要验证）的账户
+# （小写邮箱或 ID），第 6 段读运行日志时填入；之前为 None（第 2、4 段只能写“已到期或没有写入”）
+MODEL_UNWRITTEN = None
+
+
+def model_pause_unwritten(entry):
+    # 单个模型需要验证的暂停此刻不生效、运行日志里只有没有写入的行：暂停从没写入，不是 30 天到期
+    return entry.get("verify_scope") == "model" and pause_expired(entry) and bool(MODEL_UNWRITTEN) and \
+        bool(account_keys(entry["id"], entry["label"]) & MODEL_UNWRITTEN)
 
 
 def per_account(items):
@@ -499,13 +569,27 @@ def per_account(items):
 
 
 def verify_brief(items):
-    # 需要验证账号的账户数、登记条数与最近一次 403 的时间范围（每个账户取一条，见 per_account），读得到冷却列表时另写暂停已到期的个数
+    # 需要验证账号的账户数、登记条数与最近一次 403 的时间范围（每个账户取一条，见 per_account），读得到冷却列表时另写暂停已到期的个数；
+    # 单个模型的另写模型分布
     accounts = per_account(items)
     times = [item["last"] for item in accounts if item["last"]]
     span = "最近一次 403 在 %s 至 %s" % (show(min(times)), show(max(times))) if times else "登记里没有时间"
     expired = sum(1 for item in accounts if pause_expired(item))
-    state = "；其中 %d 个整户暂停仍生效、%d 个暂停已到期（重新参与调度）" % (len(accounts) - expired, expired) if expired else ""
-    return "%d 个账户（%d 条登记），%s%s" % (len(accounts), len(items), span, state)
+    single = bool(accounts) and accounts[0].get("verify_scope") == "model"
+    if not expired:
+        state = ""
+    elif single:
+        # 与管理页“403 单个模型需要验证”同一说法：暂停未生效（已到期或没有写入）；读到运行日志后另写其中没有写入的个数
+        unwritten = sum(1 for item in accounts if model_pause_unwritten(item))
+        state = "；其中 %d 个该模型的暂停仍生效、%d 个暂停未生效（已到期或没有写入，该模型照常调度%s）" % (
+            len(accounts) - expired, expired, "；其中 %d 个运行日志里只有“账号冷却未写入”，暂停从没写入" % unwritten if unwritten else "")
+    else:
+        state = "；其中 %d 个整户暂停仍生效、%d 个暂停已到期（重新参与调度）" % (len(accounts) - expired, expired)
+    spread = ""
+    if single:
+        counts = collections.Counter(model for item in accounts for model in item["verify_targets"])
+        spread = "；模型分布 " + "、".join("%s %d" % item for item in counts.most_common())
+    return "%d 个账户（%d 条登记），%s%s%s" % (len(accounts), len(items), span, state, spread)
 
 
 for entry in entries:
@@ -515,20 +599,24 @@ for entry in entries:
     line = "%s | %s | 通道 %s | 首次 %s | 最近 %s | %d 次 | 方法 %s | 该账户其他 403 模型 %d 个" % (
         mask(entry["label"]), entry["model"], ",".join(entry["channels"]) or "-", show(entry["first"]), show(entry["last"]),
         entry["count"], method.group(1) if method else "-", len(entry["others"]))
+    scope = "整户" if entry["verify_scope"] == "account" else "单个模型，只暂停 " + "、".join(entry["verify_targets"])
     if entry["verify"]:
-        line += " | 需要验证账号（账户级）"
+        line += " | 需要验证账号（账户级，%s）" % scope
     elif entry["verify_account"]:
-        line += " | 该账户需要验证账号（%s）" % (
-            "账户级 403 登记在 " + "、".join(entry["verify_models"]) if entry["verify_models"] else "登记里没有账户级条目，整户暂停仍生效")
+        line += " | 该账户需要验证账号（%s；%s）" % (scope,
+            "账户级 403 登记在 " + "、".join(entry["verify_models"]) if entry["verify_models"] else "登记里没有账户级条目，暂停仍生效")
     print(line)
     last = entry["last_request"]
     if last:
         print("    最近一次请求：%s · 请求名 %s · %d 条消息 · 图片 %d · 文件 %d · ID %s" % (
             last.get("path") or "-", last.get("requested_model") or entry["model"], last.get("messages") or 0,
             last.get("images") or 0, last.get("files") or 0, last.get("id") or "-"))
-if VERIFY_ENTRIES and not VERIFY_LIST:
-    print("需要验证账号的账户（账户级 403，第一次遇到即整户暂停调度 30 天，管理页不在 403 列表里）：%s；不逐个列出（VERIFY=list 逐个列出）" % (
-        verify_brief(VERIFY_ENTRIES)))
+if VERIFY_ACCOUNT_ENTRIES and not VERIFY_LIST:
+    print("需要验证账号（整户：2 个及以上模型要求验证或整户暂停生效，整户暂停调度 30 天，管理页不在 403 列表里）：%s；不逐个列出（VERIFY=list 逐个列出）" % (
+        verify_brief(VERIFY_ACCOUNT_ENTRIES)))
+if VERIFY_MODEL_ENTRIES and not VERIFY_LIST:
+    print("单个模型需要验证（只暂停该模型最长 30 天，其他模型照常，管理页列在“403 单个模型需要验证”）：%s；不逐个列出（VERIFY=list 逐个列出）" % (
+        verify_brief(VERIFY_MODEL_ENTRIES)))
 print("共 %d 条%s（来源：%s）" % (len(entries), "，其中需要验证账号的账户 %d 条" % len(VERIFY_ENTRIES) if VERIFY_ENTRIES else "", source)
       if entries else "没有%s的登记（来源：%s）" % ("" if ALL else "这个模型", source))
 
@@ -1448,7 +1536,9 @@ for entry in entries:
     for item in shape:
         print("    " + item)
 if VERIFY_ENTRIES and not VERIFY_LIST:
-    print("需要验证账号的账户的登记不逐条列出：%s；请求来源见第 7 段的汇总（VERIFY=list 逐条列出）" % verify_brief(VERIFY_ENTRIES))
+    for group, title in ((VERIFY_ACCOUNT_ENTRIES, "需要验证账号（整户）"), (VERIFY_MODEL_ENTRIES, "单个模型需要验证")):
+        if group:
+            print("%s的账户的登记不逐条列出：%s；请求来源见第 7 段的汇总（VERIFY=list 逐条列出）" % (title, verify_brief(group)))
 if BODY_SKIPPED:
     print("⚠ 需要读请求正文的请求有 %d 个，超过上限 %d 个：其中 %d 个没有读正文，按账本的 tokens 与其他信息判断" % (
         len(BODY_CACHE) + len(BODY_SKIPPED) + len(BODY_ABORTED), BODY_FETCH_LIMIT, len(BODY_SKIPPED)))
@@ -1487,27 +1577,38 @@ if targets:
 # ---------- 6. 403 冷却与暂停行 ----------
 print("\n== 6. 运行日志里的 403 冷却与需要验证账号的暂停（没有请求 ID，按时间与账户对照；时间为本机时区）")
 # 需要验证账号的账户的行（暂停、解除，以及它们的 403 冷却行）默认只给行数、账户数与时间范围，VERIFY=list 时与其他行一起逐行列出：
-# 运行时遇到需要验证账号的 403 先写一行这个模型的 403 冷却（账号冷却 | 类型=无权限），再写整户暂停（账号暂停调度），上千个账户
-# 各有这两行时，最近 20 行全是它们，看不到其他账户这个模型的 403 冷却。需要验证账号的账户与第 2 段同一口径（登记里有账户级 403、
-# 或整户暂停仍生效，读不到冷却列表时按运行日志近似）
-log_rows = []  # (时间, 账户, 原文, 行的种类：cool 403 冷却、pause 暂停、lift 解除)
+# 运行时遇到需要验证账号的 403，登记里只有这一个模型时只写一行单个模型暂停（账号冷却 | 类型=单个模型需要验证；没有写入时为
+# “账号冷却未写入 | 类型=单个模型需要验证”，另计、不算暂停，与 log_paused 同一口径），两个及以上模型时先写一行这个模型的 403 冷却
+# （账号冷却 | 类型=无权限）、再写整户暂停（账号暂停调度）；上千个账户各有这些行时，最近 20 行全是它们，看不到其他账户这个模型的
+# 403 冷却。需要验证账号的账户与第 2 段同一口径（登记里有账户级 403、或需要验证账号的暂停仍生效，读不到冷却列表时按运行日志近似）
+log_rows = []  # (时间, 账户, 原文, 行的种类：cool 403 冷却、model 单个模型暂停、unwritten 单个模型暂停未写入、pause 整户暂停、lift 解除)
 for name in log_files:
     with open(os.path.join(APP, "logs", name), encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if "类型=无权限" not in line and "账号暂停调度" not in line and "解除需要验证账号的整户暂停" not in line:
+            if "类型=无权限" not in line and "账号暂停调度" not in line and "解除需要验证账号的整户暂停" not in line and \
+                    "类型=单个模型需要验证" not in line and "解除单个模型需要验证的暂停" not in line:
                 continue
             try:
                 item = json.loads(line)
             except ValueError:
                 continue
             message = item.get("msg") or ""
-            if "类型=无权限" in message and not ALL and not re.search(r"范围=(build:)?%s( |$)" % re.escape(MODEL), message):
+            scoped = "类型=无权限" in message or "类型=单个模型需要验证" in message
+            if scoped and not ALL and not re.search(r"范围=(build:)?%s( |$)" % re.escape(MODEL), message):
                 continue
             if not wanted_account(item.get("source"), item.get("source")):
                 continue
-            kind = "cool" if "类型=无权限" in message else "pause" if "账号暂停调度" in message else "lift"
+            # cool 403 冷却、model 单个模型需要验证的暂停（只认以“账号冷却 | 类型=单个模型需要验证”开头的写入行）、unwritten 没有写入的
+            # （账号冷却未写入 | 类型=单个模型需要验证）、pause 整户暂停、lift 解除（两种）
+            kind = "cool" if "类型=无权限" in message else \
+                "model" if message.startswith("账号冷却 | 类型=单个模型需要验证") else \
+                "unwritten" if "类型=单个模型需要验证" in message else \
+                "pause" if "账号暂停调度" in message else "lift"
             log_rows.append((item.get("time"), item.get("source") or "", message, kind))
-log_verify = set(VERIFY_MODELS) | PAUSED
+log_verify = set(VERIFY_MODELS) | PAUSED | set(MODEL_VERIFY)
+# 只有“账号冷却未写入”、没有一行写入成功的单个模型需要验证的账户（第 7 段据此写“暂停没有写入”，见 model_pause_unwritten）
+MODEL_UNWRITTEN = {account.lower() for _, account, _, kind in log_rows if kind == "unwritten"} - \
+    {account.lower() for _, account, _, kind in log_rows if kind == "model"}
 rows = []
 verify_rows, verify_sources, verify_times = collections.Counter(), set(), []
 for moment, account, message, kind in log_rows:
@@ -1522,7 +1623,8 @@ for moment, account, message, kind in log_rows:
 if verify_rows:
     print("需要验证账号的账户：%d 个账户、%d 行（%s）%s；不逐行列出（VERIFY=list 逐行列出）" % (
         len(verify_sources), sum(verify_rows.values()), "、".join("%s %d 行" % (label, verify_rows[kind]) for kind, label in (
-            ("pause", "暂停"), ("lift", "解除"), ("cool", "403 冷却")) if verify_rows[kind]),
+            ("pause", "整户暂停"), ("model", "单个模型暂停"), ("unwritten", "单个模型暂停未写入"), ("lift", "解除"),
+            ("cool", "403 冷却")) if verify_rows[kind]),
         "，%s 至 %s" % (show(min(verify_times)), show(max(verify_times))) if verify_times else ""))
 print("\n".join(rows[-20:]) if rows else "运行日志里没有%s" % ("其他账户的 403 冷却行" if verify_rows else "这些行"))
 
@@ -1541,6 +1643,11 @@ ADVICE = {
     "需要验证": "整户已暂停调度（不占 Worker，最长 30 天）：到官网验证后在管理页点“验证”；不要这些号就删除；请求来源见结论",
     "需要验证（暂停已到期）": "整户暂停已到期、重新参与调度，仍未验证的下一次请求会再返回 403 并重新暂停：到官网验证后在管理页点“验证”；"
                        "不要这些号就删除；请求来源见结论",
+    # 只在一个模型上要求验证：只暂停这个模型，账户其他模型照常调度
+    "单个模型需要验证": "只暂停这个模型（最长 30 天），其他模型照常调度、Worker 不释放：到官网验证后在管理页点“验证”，或在“403 单个模型需要验证”里点“清除”；"
+                  "不要这个号就删除；请求来源见结论",
+    "单个模型需要验证（暂停未生效）": "这个模型的暂停未生效（已到期或没有写入）、照常调度，仍未验证的下一次请求会再返回 403 并重新暂停："
+                         "到官网验证后在管理页点“验证”；请求来源见结论",
     "账本没有": "看第 1 段有没有多个实例共用账户目录、账户目录是不是从别处复制或恢复来的；确认后点这一行的“清除”",
     "无法对照": "按最近一次 403 的时间（或账本里这个请求的时间）到 new-api 查",
     # 账本里有这个请求，登记、运行日志与账本都看不出形态（见 ledger_judge）
@@ -1771,12 +1878,23 @@ def request_source(entry):
 
 def conclude(entry):
     """结论与分类；需要验证账号的账户（按账户，见第 2 段）的登记写成“需要验证账号（…）；请求来源：…”，分类为“需要验证”（读得到冷却列表、
-    整户暂停已到期时为“需要验证（暂停已到期）”），来源的分类另记在 entry["source_kind"]。这个账户在其他模型上的普通 403 同样归在
+    整户暂停已到期时为“需要验证（暂停已到期）”；单个模型的暂停不生效时为“单个模型需要验证（暂停未生效）”），来源的分类另记在 entry["source_kind"]。这个账户在其他模型上的普通 403 同样归在
     需要验证账号名下（管理页按账户把它整个移出 403 列表），结论写明账户级 403 登记在哪个模型、这一条是普通 403"""
     text, kind = request_source(entry)
     entry["source_kind"] = kind
     if not entry["verify_account"]:
         return text, kind
+    if entry["verify_scope"] == "model":
+        targets = "、".join(entry["verify_targets"])
+        # 暂停不生效：运行日志里只有没有写入的行时写“没有写入”，否则与管理页同一说法写“未生效（已到期或没有写入）”，不说成 30 天已到期
+        if model_pause_unwritten(entry):
+            state = "%s 的暂停没有写入（运行日志：账号冷却未写入），照常调度" % targets
+        elif pause_expired(entry):
+            state = "%s 的暂停未生效（已到期或没有写入），照常调度" % targets
+        else:
+            state = "只暂停 %s，其他模型照常" % targets
+        head = "单个模型需要验证（%s%s）" % (state, "" if entry["verify"] else "；这一条是普通 403")
+        return "%s；请求来源：%s" % (head, text), "单个模型需要验证（暂停未生效）" if pause_expired(entry) else "单个模型需要验证"
     state = "整户暂停已到期，重新参与调度" if pause_expired(entry) else "整户暂停调度中"
     if entry["verify"]:
         head = "需要验证账号（账户级，%s）" % state
@@ -1797,12 +1915,15 @@ def path_label(item):
     return "接口不明（请求 ID 前缀 %s）" % prefix if prefix else "接口不明"
 
 
-def verify_summary():
-    # 需要验证账号的账户汇总成一小段（每个账户取一条登记，见 per_account）：账户数与时间范围、按请求来源分类的账户数、按接口的账户数、
-    # 涉及的请求 ID，以及账户数最多的前 5 个请求（一个请求依次换号、每个账户都 403，管理页里就多出这么多需要验证账号的账户）；
+def verify_summary(group, single):
+    # 需要验证账号的账户汇总成一小段（每个账户取一条登记，见 per_account），整户与单个模型各一段：账户数与时间范围、按请求来源分类的账户数、
+    # 按接口的账户数、涉及的请求 ID，以及账户数最多的前 5 个请求（一个请求依次换号、每个账户都 403，管理页里就多出这么多需要验证账号的账户）；
     # 大部分账户无法判断请求形态时写明主要原因与下一步
-    accounts = per_account(VERIFY_ENTRIES)
-    print("需要验证账号的账户（账户级，第一次遇到即整户暂停调度 30 天，管理页不在 403 列表里）：%s" % verify_brief(VERIFY_ENTRIES))
+    accounts = per_account(group)
+    if single:
+        print("单个模型需要验证（只在一个模型上要求验证，只暂停该模型最长 30 天，其他模型照常，管理页列在“403 单个模型需要验证”）：%s" % verify_brief(group))
+    else:
+        print("需要验证账号（整户：2 个及以上模型要求验证或整户暂停生效，整户暂停调度 30 天，管理页不在 403 列表里）：%s" % verify_brief(group))
     kinds = collections.Counter(item["source_kind"] for item in accounts)
     print("  按请求来源（账户数）：" + "、".join("%s %d" % item for item in kinds.most_common()))
     print("  按接口（账户数）：" + "、".join("%s %d" % item for item in collections.Counter(path_label(item) for item in accounts).most_common()))
@@ -1852,7 +1973,9 @@ def verify_summary():
     if BODY_ABORTED:
         print("  ⚠ 读请求正文%s，之后 %d 个请求的正文没有读（见第 4 段末尾）" % (BODY_ABORT["reason"], len(BODY_ABORTED)))
     expired = sum(1 for item in accounts if pause_expired(item))
-    print("  → " + ADVICE["需要验证"] + ("；暂停已到期的 %d 个已重新参与调度，仍未验证的下一次请求会再返回 403 并重新暂停" % expired if expired else "") +
+    print("  → " + ADVICE["单个模型需要验证" if single else "需要验证"] +
+          (("；暂停未生效（已到期或没有写入）的 %d 个该模型照常调度" if single else "；暂停已到期的 %d 个已重新参与调度") % expired +
+           "，仍未验证的下一次请求会再返回 403 并重新暂停" if expired else "") +
           ("" if VERIFY_LIST else "（VERIFY=list 逐个列出这些账户与各自的请求来源）"))
 
 
@@ -1862,7 +1985,10 @@ if not entries:
     print("没有要判断的登记。")
 concluded = [(entry,) + conclude(entry) for entry in entries]
 if VERIFY_ENTRIES:
-    verify_summary()
+    if VERIFY_ACCOUNT_ENTRIES:
+        verify_summary(VERIFY_ACCOUNT_ENTRIES, False)
+    if VERIFY_MODEL_ENTRIES:
+        verify_summary(VERIFY_MODEL_ENTRIES, True)
     if any(detailed(entry) for entry in entries):
         print("逐条结论%s：" % ("" if VERIFY_LIST else "（需要验证账号以外的账户）"))
 for entry, text, kind in concluded:
@@ -1871,11 +1997,11 @@ for entry, text, kind in concluded:
     notes = []
     if entry["id_missing"] and (entry["start"] or entry["finish"]):
         notes.append(LEDGER_PENDING)
-    if entry["others"] and not kind.startswith("需要验证"):
+    if entry["others"] and not kind.startswith("需要验证") and not kind.startswith("单个模型需要验证"):
         notes.append("该账户另有 %d 个模型 403，账户本身可能受限" % len(entry["others"]))
     stats = by_model.get(entry["model"])
     day = show(entry["last"])[:10] if entry["last"] else ""
-    if kind not in ("旧记录", "需要验证", "需要验证（暂停已到期）", "账本没有") and entry["count"] >= 3 and entry["last"] and (NOW - entry["last"]).days < 3 and stats and stats["days"].get(day, [0, 0])[1] > 0:
+    if kind not in ("旧记录", "需要验证", "需要验证（暂停已到期）", "单个模型需要验证", "单个模型需要验证（暂停未生效）", "账本没有") and entry["count"] >= 3 and entry["last"] and (NOW - entry["last"]).days < 3 and stats and stats["days"].get(day, [0, 0])[1] > 0:
         notes.append("近期反复 403、同一天这个模型有成功：这个账户多半确实不能用这个模型")
     where = "最近 %s" % short(entry["last"])
     if entry["request_id"]:

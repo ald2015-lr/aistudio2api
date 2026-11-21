@@ -709,8 +709,16 @@ func normalQuotaSwitchMessage(tracker *primaryQuotaTracker, kind string, sameAcc
 }
 
 // primaryAllCoolingMessage 为 Ultra 主用模型还没遇到额度 429 时选号就遇到候选全部冷却、立即返回时写进请求进度的一句话：
-// 最早恢复写还剩多久（与 Retry-After 一致）
+// 最早恢复写还剩多久（与 Retry-After 一致）。候选全部只被需要验证账号的冷却挡住（Parked）时对外为 503、不带 Retry-After，
+// 写“候选都在等人工验证账号……立即返回 503”，不写 30 天兜底上限的最早恢复（原先写“立即返回 429 | 最早恢复=720h0m0s”，实际返回 503）
 func primaryAllCoolingMessage(cooling *aistudio.AllCoolingError, fallback bool) string {
+	if cooling.Parked {
+		ending := "立即返回 503"
+		if fallback {
+			ending = modelFallbackEnding
+		}
+		return "Ultra 主用模型候选都在等人工验证账号（需要验证账号的暂停，不会自行恢复），" + ending
+	}
 	ending := "立即返回 429"
 	if fallback {
 		ending = modelFallbackEnding
@@ -734,6 +742,12 @@ func primaryQuotaSelectionReason(err error) (string, *aistudio.AllCoolingError, 
 	switch {
 	case errors.As(err, &noImmediate):
 		return primaryQuotaReasonNoWarm, nil, true
+	case errors.As(err, &cooling) && cooling.Parked:
+		// 本请求已在会自行恢复的账号上遇到额度失败（调用方只在 quota.hits() > 0 时调用），换号时其余候选全部只被需要验证账号的冷却挡住
+		// （Parked 不看已尝试、被排除的账号）：与其余候选全部冷却一样按额度不足的 429 结束，Retry-After 只取本请求遇到的额度冷却
+		// （不传 Parked 的冷却：它的 Until 是 30 天兜底上限）。同一时刻的新请求候选里有那个额度冷却的账号、同样得到 429 与它的恢复时间；
+		// 原先原样上抛，这次请求得到 503、不带 Retry-After，与新请求不一致
+		return primaryQuotaReasonCooling, nil, true
 	case errors.As(err, &cooling):
 		return primaryQuotaReasonCooling, cooling, true
 	case errors.As(err, &notReady):

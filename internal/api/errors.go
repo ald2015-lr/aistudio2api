@@ -137,6 +137,10 @@ func statusFromError(err error) int {
 	if errors.Is(err, aistudio.ErrModelNotFound) {
 		return http.StatusNotFound
 	}
+	// 候选全部只被需要验证账号的冷却挡住、或租约账号在发出前被需要验证账号的冷却拦下：按 503（与 publicErrorFor 一致，见 verifyParkedPool）
+	if _, parked := verifyParkedPool(err); parked {
+		return http.StatusServiceUnavailable
+	}
 	// 租约账号在请求发出前进入冷却（请求没有发到上游）：与全部冷却一样按限流 429 返回，覆盖测试替身的裸哨兵与 errors.Join 包装过的错误
 	if errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return http.StatusTooManyRequests

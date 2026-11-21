@@ -27,7 +27,8 @@ import (
 //   - MODEL_FALLBACK_SCOPE 为 all，或为 ultra 且请求经 /ultra 进入（PoolScopeUltra）；off 时所有请求与没有这项设置时相同
 //   - 请求的模型（startGenerate 已解析成目录模型 ID：后缀与 long- 前缀在协议层去掉，目录别名按号池解析）有规则；规则的源模型与目标也接受目录别名
 //   - 以额度类错误结束（modelQuotaEnd）：候选全部冷却（AllCoolingError，含 Ultra 主用模型的立即 429）、额度不足（PrimaryQuotaError，
-//     出口限流除外）、换号到最后仍是每日或分钟额度 429（按模型的，不是整个账号的全局额度）、租约账号发出前已冷却又不能再换号（ErrAccountCoolingDown）
+//     出口限流除外）、换号到最后仍是每日或分钟额度 429（按模型的，不是整个账号的全局额度）、租约账号发出前已冷却又不能再换号（ErrAccountCoolingDown）。
+//     候选全部只被需要验证账号的冷却挡住（Parked）或租约账号发出前被它拦下同样改用，但它不会自行恢复、不计最早恢复（不进 Retry-After）
 //   - 不固定账户、没有文件绑定（资源属于某个账户）、不在降级判定里（DOWNGRADE_GUARD_MODELS：事件流已交给按源模型建立的判定）、
 //     是文本对话生成（图片、语音、转录、Interaction 即 Omni 等不触发）
 //
@@ -60,7 +61,8 @@ import (
 // 照常以 HTTP 状态返回，响应开头报告目标模型；改用前响应头已经提交（源模型很晚才额度用完）时，已写出的块保留源模型，之后的块按目标模型。
 // 所有目标都额度用完或不可用时按源模型原来的错误返回（状态码、对外文案与原因响应头不变），Retry-After 取源模型与各目标的建议重试中
 // 最早的时刻：额度用完的目标为它的恢复时间，目标只是暂时不可用（号池繁忙、出口限流等）时为它自己建议的重试时间（无论哪个先恢复，
-// 下一次请求都能用上：源模型恢复就直接用，目标先恢复就再改用过去），日志写明试过哪些目标；请求日志与账本的模型恢复为源模型，
+// 下一次请求都能用上：源模型恢复就直接用，目标先恢复就再改用过去）；源模型与目标都只被需要验证账号挡住时没有建议重试时间，
+// 按 Parked 的 503 返回、不带 Retry-After。日志写明试过哪些目标；请求日志与账本的模型恢复为源模型，
 // 账户与通道恢复为源模型运行结束时的值。
 // 改用之后请求超时或取消时按那次的错误结束（504、499）
 
@@ -226,6 +228,12 @@ func canonicalFallbackModel(pool *aistudio.AccountPool, scope aistudio.PoolScope
 	return strings.TrimPrefix(strings.TrimSpace(pool.CanonicalModelIDIn(scope, name)), "models/")
 }
 
+// 以需要验证账号的冷却结束时 modelQuotaEnd 的原因（写进改用日志的括号里；首段“模型 … 额度用完”不变，诊断脚本按它匹配）
+const (
+	verifyParkedEndReason  = "候选都在等人工验证账号，不会自行恢复"
+	verifyBlockedEndReason = "租约账号发出前被需要验证账号的暂停拦下，不会自行恢复"
+)
+
 // modelQuotaEnd 判断生成请求以“这个模型在号池里没有可用额度”结束（触发条件见文件开头），返回原因与最早恢复时间（不知道时为零值）
 func modelQuotaEnd(err error, now time.Time) (string, time.Time, bool) {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -242,12 +250,21 @@ func modelQuotaEnd(err error, now time.Time) (string, time.Time, bool) {
 		}
 		return "额度不足：" + quota.Reason, quota.Until, true
 	}
+	// 需要验证账号的冷却（候选全部只被它挡住的 Parked，或租约账号发出前被它拦下）只能靠人工验证恢复，30 天只是兜底上限：照常改用其他模型，
+	// 恢复时间按 RetryAt（零值）而不按 Until，不进 Retry-After 与日志的最早恢复。原先取 Until（30 天后），所有目标都不可用时
+	// 最终错误（modelFallbackExhaustedError 的 RetryAt）带 Retry-After≈2592000 与 “Please try again in 2592001s”
 	var cooling *aistudio.AllCoolingError
 	if errors.As(err, &cooling) {
+		if cooling.Parked {
+			return verifyParkedEndReason, cooling.RetryAt(), true
+		}
 		return "候选全部冷却", cooling.Until, true
 	}
 	var blocked *aistudio.AccountCoolingDownError
 	if errors.As(err, &blocked) {
+		if blocked.VerifyParked() {
+			return verifyBlockedEndReason, blocked.RetryAt(), true
+		}
 		reason := "租约账号发出前已冷却"
 		if kind, _, _ := strings.Cut(blocked.Reason, ":"); strings.TrimSpace(kind) != "" {
 			reason += "（" + strings.TrimSpace(kind) + "）"

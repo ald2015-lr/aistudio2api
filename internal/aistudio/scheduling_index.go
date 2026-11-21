@@ -555,8 +555,14 @@ func (set *candidateSet) expireLocked(p *AccountPool, nowNanos int64) {
 // earliestCoolingLocked 返回仍在冷却、且不在 exclusion 中的候选里最早的恢复时间；调用方已先执行 expireLocked。
 // 堆顶与 until 不符的旧项直接丢弃；被排除账户的堆项先弹出，找到结果后放回（排除的账户通常只有几个）
 func (set *candidateSet) earliestCoolingLocked(exclusion accountExclusion) (int64, bool) {
+	entry, found := set.earliestCoolingEntryLocked(exclusion)
+	return entry.until, found
+}
+
+// earliestCoolingEntryLocked 与 earliestCoolingLocked 相同，另返回该候选的下标（恢复时间相同的有多个时为其中之一）
+func (set *candidateSet) earliestCoolingEntryLocked(exclusion accountExclusion) (coolingEntry, bool) {
 	var held []coolingEntry
-	until, found := int64(0), false
+	earliest, found := coolingEntry{}, false
 	for len(set.cooling) > 0 {
 		top := set.cooling[0]
 		if set.until[top.position] != top.until {
@@ -567,13 +573,13 @@ func (set *candidateSet) earliestCoolingLocked(exclusion accountExclusion) (int6
 			held = append(held, set.cooling.pop())
 			continue
 		}
-		until, found = top.until, true
+		earliest, found = top, true
 		break
 	}
 	for _, entry := range held {
 		set.cooling.push(entry)
 	}
-	return until, found
+	return earliest, found
 }
 
 // liveMembersLocked 判断候选集除去被排除的账户后还有成员（含冷却中的）

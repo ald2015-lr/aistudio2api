@@ -365,10 +365,12 @@ func (p *AccountPool) longCoolingLocked(account *Account, modelID string, now ti
 	return playground && build
 }
 
-// longCooldownActive 判断账户某个冷却键是否生效且剩余不少于 minRemaining
+// longCooldownActive 判断账户某个冷却键是否生效且剩余不少于 minRemaining。单个模型需要验证账号的冷却（ModelVerifyRequiredReason）不算：
+// 账户其他模型照常调度，它的驻留 Worker 还在服务其他模型，不能按死槽位淘汰、补登记淘汰、清扫或轮换（30 天的冷却若照常算，
+// 主用模型会因为一批要求验证的账号成为“热门冷却模型”，反复关掉这些还能用的 Worker）；该模型的候选集照常不选它
 func longCooldownActive(account *Account, key string, now time.Time, minRemaining time.Duration) bool {
 	cooldown, exists := account.runtime.Cooldowns[key]
-	return exists && cooldown.Active(now) && cooldown.Until.Sub(now) >= minRemaining
+	return exists && !modelVerifyCooldown(key, cooldown) && cooldown.Active(now) && cooldown.Until.Sub(now) >= minRemaining
 }
 
 // AccountLongCooling 判断单个账户当前是否长时间不可用：全局冷却，或在该模型上所有启用通道都冷却，剩余不少于 minRemaining；
@@ -514,12 +516,12 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		if account == nil {
 			continue
 		}
-		until, cooling := p.accountChannelCooldownLocked(account, selection, now)
+		until, cooling := p.evictionChannelCooldownLocked(account, selection, now)
 		if !cooling && modelID != "" && !p.accountSupportsAnyChannelLocked(account, selection) &&
 			p.accountSupportsSelectionLocked(account, AccountSelection{ModelID: modelID}) {
 			// 账户能服务该模型、只是它不走 generateContent（视频、Live 等，请求按模型取 Worker）：退回原先按模型键的口径，
 			// 否则在该模型上冷却的空闲 Worker 不算冷却中，分区满时不被替换
-			if cooldown, active := accountCooldown(account, canonicalAccountModelID(account, modelID), now); active {
+			if cooldown, active := accountCooldown(account, canonicalAccountModelID(account, modelID), now); active && cooldown.Reason != ModelVerifyRequiredReason {
 				until, cooling = cooldown.Until, true
 			}
 		}
@@ -536,6 +538,27 @@ func (p *AccountPool) WarmWorkerStates(accountIDs []string, modelID string, minR
 		}
 	}
 	return states
+}
+
+// evictionChannelCooldownLocked 与 accountChannelCooldownLocked 相同（该模型生成请求的每个支持通道都冷却时返回最早恢复的），
+// 但某通道上挡住它的只是单个模型需要验证账号的冷却时按未冷却处理：淘汰选号（WarmWorkerStates.Cooling）不把这样的 Worker 当成
+// 冷却中优先换掉，它还在服务其他模型。调用方持有 p.mu
+func (p *AccountPool) evictionChannelCooldownLocked(account *Account, selection AccountSelection, now time.Time) (time.Time, bool) {
+	scope := selectionAccessScope(selection)
+	var earliest time.Time
+	for _, channel := range p.selectionChannelsLocked(selection) {
+		if !p.channelSupportsLocked(account, channel, selection) {
+			continue
+		}
+		cooldown, active := accountCooldown(account, ChannelCooldownScope(channel, scope), now)
+		if !active || cooldown.Reason == ModelVerifyRequiredReason {
+			return time.Time{}, false
+		}
+		if earliest.IsZero() || cooldown.Until.Before(earliest) {
+			earliest = cooldown.Until
+		}
+	}
+	return earliest, !earliest.IsZero()
 }
 
 // cooldownModelID 从冷却键中取出模型：Playground 键即模型名，Build 键为 build:<模型>

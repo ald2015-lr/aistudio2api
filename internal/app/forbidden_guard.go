@@ -42,6 +42,15 @@ const (
 	// 账户池按它把暂停中的账户派生为不可调度（需要验证账号），驻留 Worker 按释放处理（见 worker_unschedulable.go）。
 	// 文字必须与已持久化的暂停逐字相同，并以 forbiddenPauseReasonSuffix 结尾（见 TestVerifyRequiredPauseReasonStable）
 	verifyRequiredPauseReason = aistudio.VerifyRequiredPauseReason
+	// modelVerifyRequiredReason 为只在一个模型上返回需要验证账号时，这个模型在该账户上的按模型冷却原因（Playground 键与 Build 键，
+	// 最长 verifyRequiredPause；定义在账户池 aistudio.ModelVerifyRequiredReason，账户池据此不把它算死槽位、冷却状态与淘汰对象）。
+	// 文字必须与已持久化的冷却逐字相同，以 forbiddenPauseReasonSuffix 结尾（认证文件更新、验证通过时与其他 403 冷却一起清除），
+	// 不以 verifyRequiredPauseReason 的开头开头（管理页与诊断脚本据此与整户暂停区分，见 TestModelVerifyReasonStable）
+	modelVerifyRequiredReason = aistudio.ModelVerifyRequiredReason
+	// verifyAccountWideModels 为整户暂停的门槛：账户登记里有这么多个不同模型（按 normalizeGuardModel 归一，同一模型的 Playground 与
+	// Build 算一个）返回过需要验证账号时才暂停整个账户、释放 Worker；只有一个模型时只暂停这个模型（线上 141 个 Pro 账号里 66 个
+	// 只在 /pro 的主用模型上要求验证、其他模型照常，原先整户暂停 30 天，任一模型成功又解除，反复被调度、403、释放 Worker）
+	verifyAccountWideModels = 2
 )
 
 type forbiddenEvent struct {
@@ -266,10 +275,15 @@ func forbiddenCooldown(_ string, cooldown aistudio.CooldownState) bool {
 		strings.HasSuffix(cooldown.Reason, forbiddenPauseReasonSuffix)
 }
 
-// verifyRequiredPauseCooldown 判断冷却是否为需要验证账号时的整户暂停（原因等于 verifyRequiredPauseReason）：管理页清除 403 记录时
-// 只解除它，单模型 403 冷却与多模型连续 403 的自动暂停不动
+// verifyRequiredPauseCooldown 判断冷却是否为需要验证账号时的整户暂停（原因等于 verifyRequiredPauseReason）
 func verifyRequiredPauseCooldown(_ string, cooldown aistudio.CooldownState) bool {
 	return cooldown.Reason == verifyRequiredPauseReason
+}
+
+// verifyCooldown 判断冷却是否为需要验证账号的暂停：整户暂停或单个模型需要验证（见 aistudio.VerifyCooldownKind）。管理页清除 403 记录时
+// 只解除这两种，单模型 403 阶梯冷却与多模型连续 403 的自动暂停不动
+func verifyCooldown(_ string, cooldown aistudio.CooldownState) bool {
+	return aistudio.VerifyCooldownKind(cooldown.Reason) != ""
 }
 
 // isPermissionDenied 判断上游是否返回 HTTP 403 无权限（协议错误码 7）。“AI Studio app is disabled”（账号所属组织停用了 AI Studio，

@@ -159,6 +159,12 @@ func publicErrorFor(err error, model string) publicError {
 	if errors.As(err, &rpcError) {
 		return upstreamPublicError(rpcError)
 	}
+	// 候选全部只被需要验证账号的冷却挡住（整户暂停或单个模型需要验证，只能靠人工验证恢复，30 天只是兜底上限）：按 503 UNAVAILABLE 返回，
+	// 不带 Retry-After 与 “Please try again in …”（原先按 429 返回、重试提示长达 2592000 秒）；/ultra、/pro 写明号池，其余按
+	// “模型在列、暂时没有账户能接”（与 NoServingAccountError 同一措辞与 code）。不暴露上游原文
+	if pool, parked := verifyParkedPool(err); parked {
+		return verifyParkedPublicError(pool, model)
+	}
 	var cooling *aistudio.AllCoolingError
 	if errors.As(err, &cooling) {
 		return rateLimitPublicError()
@@ -290,6 +296,35 @@ func statusPublicError(status int, err error) publicError {
 		return result
 	}
 	return publicError{Status: http.StatusInternalServerError, RPC: "INTERNAL", Message: officialInternalMessage}
+}
+
+// verifyParkedPool 判断错误是否为候选全部只被需要验证账号的冷却挡住（Parked 的 AllCoolingError），或租约账号在发出前被需要验证账号的
+// 冷却拦下（AccountCoolingDownError.VerifyParked），返回请求的号池（两种错误各自带的 Pool：后者由生成路径在请求以它结束时补上，
+// /pro、/ultra 的说法与选号就判成 Parked 时相同）
+func verifyParkedPool(err error) (aistudio.PoolScope, bool) {
+	var cooling *aistudio.AllCoolingError
+	if errors.As(err, &cooling) && cooling.Parked {
+		return cooling.Pool, true
+	}
+	var blocked *aistudio.AccountCoolingDownError
+	if errors.As(err, &blocked) && blocked.VerifyParked() {
+		return blocked.Pool, true
+	}
+	return aistudio.PoolScopeAll, false
+}
+
+// verifyParkedPublicError 为 verifyParkedPool 成立时的对外错误：503 UNAVAILABLE、OpenAI code model_unavailable；/ultra、/pro 用号池的说法
+func verifyParkedPublicError(pool aistudio.PoolScope, model string) publicError {
+	public := publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Code: "model_unavailable"}
+	switch pool {
+	case aistudio.PoolScopeUltra:
+		public.Message = officialUltraUnavailableMessage
+	case aistudio.PoolScopePro:
+		public.Message = officialProUnavailableMessage
+	default:
+		public.Message = (&aistudio.NoServingAccountError{Model: model, Listed: true}).PublicMessage()
+	}
+	return public
 }
 
 func unavailablePublicError() publicError {
@@ -622,6 +657,9 @@ func limitReasonFor(err error) string {
 	var rpcError *aistudio.RPCError
 	if errors.As(err, &rpcError) {
 		return LimitReasonUpstreamQuota
+	}
+	if _, parked := verifyParkedPool(err); parked {
+		return ""
 	}
 	var cooling *aistudio.AllCoolingError
 	if errors.As(err, &cooling) || errors.Is(err, aistudio.ErrAccountCoolingDown) {

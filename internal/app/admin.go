@@ -874,8 +874,12 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 	authenticated := !failed
 	if authenticated && !verification.OrgDisabled {
 		// 手动验证通过（登录有效）：清除 403 无权限记录与冷却（与认证文件更新相同）。需要验证账号（verify-account）的账户在官网完成
-		// 验证后点“验证”即从 403 列表移出、重新参与调度；仍然 403 时下一次请求会重新登记
-		admin.service.clearPermissionDeniedState(accountID, "账户验证")
+		// 验证后点“验证”即从 403 列表移出、重新参与调度；仍然 403 时下一次请求会重新登记。清掉了冷却时立即推送冷却列表
+		// （冷却列表平时只在请求结束后推送，管理页只重读账户与 403 登记：空闲时“403 单个模型需要验证”与整户汇总块会一直按旧列表
+		// 显示这个账户“该模型仍暂停”）
+		if admin.service.clearPermissionDeniedState(accountID, "账户验证") > 0 {
+			admin.service.publishCooldownsNow()
+		}
 		if refreshed, refreshErr := admin.account(accountID); refreshErr == nil {
 			account = refreshed
 		}
@@ -1533,7 +1537,13 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 }
 
 func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, error) {
-	statuses := admin.pool.Status()
+	return adminCooldownList(admin.pool), nil
+}
+
+// adminCooldownList 为管理接口的冷却列表（GET /api/cooldowns 与“cooldowns”推送事件共用）：全局 * 冷却按账户目录里的每个模型展开，
+// 每个键取较晚的一条
+func adminCooldownList(pool *aistudio.AccountPool) []api.AdminCooldown {
+	statuses := pool.Status()
 	cooldowns := make([]api.AdminCooldown, 0)
 	now := time.Now()
 	for _, account := range statuses {
@@ -1573,11 +1583,11 @@ func (admin *runtimeAdmin) Cooldowns(context.Context) ([]api.AdminCooldown, erro
 			}
 			cooldowns = append(cooldowns, api.AdminCooldown{
 				AccountID: account.ID, AccountLabel: account.Label, Channel: channel,
-				ModelID: modelID, Until: cooldown.Until, Reason: cooldown.Reason,
+				ModelID: modelID, Until: cooldown.Until, Reason: cooldown.Reason, Verify: aistudio.VerifyCooldownKind(cooldown.Reason),
 			})
 		}
 	}
-	return cooldowns, nil
+	return cooldowns
 }
 
 func (admin *runtimeAdmin) Requests(context.Context) ([]api.AdminRequest, error) {

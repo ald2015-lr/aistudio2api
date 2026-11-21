@@ -109,12 +109,18 @@ const cooldownSummary = computed(() => {
   const now = clock.value
   const { verifyPaused } = forbiddenCooldownState.value
   const accountIDs = new Set<string>()
+  // verifyModelIDs 为有单个模型需要验证冷却的账户：只跳过这一条（30 天的暂停会占满该模型的账号数与全部恢复），该账户其他冷却照计
+  const verifyModelIDs = new Set<string>()
   const groups = new Map<string, { group: CooldownGroup; ids: Set<string>; reasons: Map<string, number> }>()
   let entries = 0
   let earliest = Number.POSITIVE_INFINITY
   let latest = 0
   for (const { cooldown, until } of parsedCooldowns.value) {
     if (until <= now || verifyPaused.has(cooldown.account_id)) continue
+    if (cooldownVerifyKind(cooldown) === 'model') {
+      verifyModelIDs.add(cooldown.account_id)
+      continue
+    }
     entries += 1
     accountIDs.add(cooldown.account_id)
     earliest = Math.min(earliest, until)
@@ -155,6 +161,7 @@ const cooldownSummary = computed(() => {
     latest,
     groups: list,
     verifyExcluded: verifyPaused.size,
+    verifyModelExcluded: verifyModelIDs.size,
   }
 })
 
@@ -294,36 +301,76 @@ const FORBIDDEN_MODEL_REASON_PREFIX = '无权限（模型）: '
 const FORBIDDEN_PAUSE_REASON_SUFFIX = '次返回 403 无权限，自动暂停'
 // 账户级的 403（需要验证账号）：与服务端 accountLevelPermissionDenied 相同
 const ACCOUNT_LEVEL_DENIED = /verify-account|must be verified/i
+// 单个模型需要验证账号的冷却原因开头（服务端 ModelVerifyRequiredReason）：旧版服务的冷却列表不带 verify 字段时按它区分整户暂停
+const MODEL_VERIFY_REASON_PREFIX = '单个模型需要验证账号'
+// 需要验证账号的两个桶：account 为整户（整户暂停此刻生效，或登记里账户级 403 涉及 2 个及以上模型），model 为单个模型需要验证（其余）。
+// 与服务端判定同一口径（见 permission_denied.go 的 verifyAccountWideModels），一个账户只进一个桶
+const VERIFY_ACCOUNT_WIDE_MODELS = 2
+type VerifyBucket = 'account' | 'model'
+
+// normalizeVerifyModel 把模型名归一（去掉 models/ 前缀、转小写），与服务端 normalizeGuardModel 相同：同一模型的不同写法只算一个
+function normalizeVerifyModel(model: string): string {
+  return model
+    .trim()
+    .replace(/^models\//, '')
+    .toLowerCase()
+}
+
+// cooldownVerifyKind 返回冷却的需要验证账号种类：优先用服务端的 verify 字段；旧版服务没有这个字段时按原因判断
+// （以 403 自动暂停的后缀结尾、含 verify-account；以单个模型需要验证的开头开头的是单个模型，其余为整户）
+function cooldownVerifyKind(cooldown: Cooldown): VerifyBucket | undefined {
+  if (cooldown.verify === 'account' || cooldown.verify === 'model') return cooldown.verify
+  const reason = (cooldown.reason ?? '').trim()
+  if (!reason.endsWith(FORBIDDEN_PAUSE_REASON_SUFFIX) || !ACCOUNT_LEVEL_DENIED.test(reason))
+    return undefined
+  return reason.startsWith(MODEL_VERIFY_REASON_PREFIX) ? 'model' : 'account'
+}
 const DAY_MS = 24 * 60 * 60 * 1000
 
 // minuteClock 为按分钟取整的当前时间：陈旧判断不需要秒级精度，“出问题”的统计不随每秒的倒计时重新计算
 const minuteClock = computed(() => Math.floor(clock.value / 60000) * 60000)
 
-// forbiddenCooldownState 为此刻仍在 403 冷却或暂停里的账户，以及其中需要验证账号整户暂停的账户（账户 ID → 暂停原因与邮箱）。
-// 冷却列表把整户暂停按账户目录里的每个模型展开、原因相同，这里按账户合并
+// forbiddenCooldownState 为此刻仍在 403 冷却或暂停里的账户，其中需要验证账号整户暂停的账户（账户 ID → 暂停原因与邮箱），
+// 以及有单个模型需要验证冷却的账户（账户 ID → 邮箱与各模型：归一的模型名 → 显示用的模型名与恢复时间）。冷却列表把整户暂停按账户目录里的
+// 每个模型展开、原因相同，单个模型的 Playground 与 Build 各一条，这里按账户合并。种类按服务端的 verify 字段，不再按原因猜
+// （原先按后缀与 verify-account 判断，单个模型需要验证的冷却会被当成整户暂停）
 const forbiddenCooldownState = computed(() => {
   const now = minuteClock.value
   const cooling = new Set<string>()
   const verifyPaused = new Map<string, { reason: string; label: string }>()
+  const verifyModelCooled = new Map<
+    string,
+    { label: string; models: Map<string, { model: string; until: number }> }
+  >()
   for (const { cooldown, until } of parsedCooldowns.value) {
     if (until <= now) continue
     const reason = (cooldown.reason ?? '').trim()
     const pause = reason.endsWith(FORBIDDEN_PAUSE_REASON_SUFFIX)
     if (pause || reason.startsWith(FORBIDDEN_MODEL_REASON_PREFIX)) cooling.add(cooldown.account_id)
-    if (pause && ACCOUNT_LEVEL_DENIED.test(reason)) {
-      verifyPaused.set(cooldown.account_id, {
-        reason,
-        label: cooldown.account_label || cooldown.account_id,
-      })
+    const kind = cooldownVerifyKind(cooldown)
+    const label = cooldown.account_label || cooldown.account_id
+    if (kind === 'account') {
+      verifyPaused.set(cooldown.account_id, { reason, label })
+    } else if (kind === 'model') {
+      let entry = verifyModelCooled.get(cooldown.account_id)
+      if (entry === undefined) {
+        entry = { label, models: new Map() }
+        verifyModelCooled.set(cooldown.account_id, entry)
+      }
+      const key = normalizeVerifyModel(cooldown.model_id)
+      const current = entry.models.get(key)
+      if (current === undefined || until > current.until)
+        entry.models.set(key, { model: cooldown.model_id, until })
     }
   }
-  return { cooling, verifyPaused }
+  return { cooling, verifyPaused, verifyModelCooled }
 })
 
-// PermissionDeniedView 为一个 403 账户的分类：verify 为有账户级条目（需要验证账号）；fresh 与 stale 为不是账户级的条目里
-// 不陈旧与陈旧的；staleDays 为陈旧条目里最近一次 403 距今的天数
+// PermissionDeniedView 为一个 403 账户的分类：verify 为有账户级条目（需要验证账号），verifyModels 为这些账户级条目；fresh 与 stale
+// 为不是账户级的条目里不陈旧与陈旧的；staleDays 为陈旧条目里最近一次 403 距今的天数
 interface PermissionDeniedView {
   verify: boolean
+  verifyModels: PermissionDeniedModel[]
   fresh: PermissionDeniedModel[]
   stale: PermissionDeniedModel[]
   staleDays: number
@@ -334,11 +381,18 @@ const permissionDeniedViews = computed(() => {
   const { cooling } = forbiddenCooldownState.value
   const views = new Map<string, PermissionDeniedView>()
   for (const account of permissionDenied.value) {
-    const view: PermissionDeniedView = { verify: false, fresh: [], stale: [], staleDays: 0 }
+    const view: PermissionDeniedView = {
+      verify: false,
+      verifyModels: [],
+      fresh: [],
+      stale: [],
+      staleDays: 0,
+    }
     let staleLatest = 0
     for (const model of account.models) {
       if (ACCOUNT_LEVEL_DENIED.test(model.message ?? '')) {
         view.verify = true
+        view.verifyModels.push(model)
         continue
       }
       const last = Date.parse(model.last_at)
@@ -372,10 +426,21 @@ function permissionDeniedStaleView(
 // verifyHiddenIDs 为不在“403 无权限账户”卡片里列出的账户：登记里有账户级条目（需要验证账号）的，以及需要验证账号整户暂停仍生效的，
 // 不看账户状态。线上这类账户成百上千、整户暂停 30 天，原先和普通 403 列在一起，真正要看的普通 403 被淹没；它们另见需要验证账号汇总块
 // （汇总块的计数与“出问题（403）→ 需要验证账号”同一口径，不含需要登录、组织已停用、不可用的账户）
-const verifyHiddenIDs = computed(() => {
-  const hidden = new Set<string>(forbiddenCooldownState.value.verifyPaused.keys())
-  for (const [id, view] of permissionDeniedViews.value) if (view.verify) hidden.add(id)
-  return hidden
+const verifyHiddenIDs = computed(() => new Set<string>(verifyBuckets.value.keys()))
+
+// verifyBuckets 为需要验证账号的账户分到的桶（与服务端同一口径，见 VERIFY_ACCOUNT_WIDE_MODELS）：整户暂停此刻生效、或登记里账户级 403
+// 涉及 2 个及以上模型的为 account；其余有账户级登记、或只有单个模型需要验证冷却（登记已清除）的为 model。不看账户状态
+const verifyBuckets = computed(() => {
+  const { verifyPaused, verifyModelCooled } = forbiddenCooldownState.value
+  const buckets = new Map<string, VerifyBucket>()
+  for (const id of verifyPaused.keys()) buckets.set(id, 'account')
+  for (const [id, view] of permissionDeniedViews.value) {
+    if (buckets.has(id) || view.verifyModels.length === 0) continue
+    const models = new Set(view.verifyModels.map((model) => normalizeVerifyModel(model.model)))
+    buckets.set(id, models.size >= VERIFY_ACCOUNT_WIDE_MODELS ? 'account' : 'model')
+  }
+  for (const id of verifyModelCooled.keys()) if (!buckets.has(id)) buckets.set(id, 'model')
+  return buckets
 })
 
 // permissionDeniedListed 为卡片里列出的普通 403 账户（含陈旧的）：标题计数、陈旧个数、行、展开全部、复制全部邮箱、下载列表、
@@ -477,6 +542,11 @@ function downloadVerifyRequired(): void {
   downloadEmails(verifyRequiredAccounts.value, 'verify-required-accounts')
 }
 
+// downloadVerifyModel 下载“403 单个模型需要验证”块的邮箱列表（txt，每行一个）
+function downloadVerifyModel(): void {
+  downloadEmails(verifyModelAccounts.value, 'verify-model-accounts')
+}
+
 // downloadOrgDisabled 下载组织停用账户的邮箱列表（txt，每行一个）
 function downloadOrgDisabled(): void {
   downloadEmails(orgDisabled.value, 'org-disabled-accounts')
@@ -576,7 +646,7 @@ function afterClear(progress: ClearProgress): void {
 async function clearPermissionDenied(): Promise<void> {
   const confirmed = permissionDeniedListed.value.map((account) => account.id)
   if (confirmed.length === 0 || clearBusy()) return
-  const verify = verifyRequiredAccounts.value.length
+  const verify = verifyRequiredAccounts.value.length + verifyModelAccounts.value.length
   const text =
     tf('accounts.permissionDeniedClearConfirm', { count: confirmed.length }) +
     (verify > 0 ? tf('accounts.permissionDeniedClearKeepVerify', { count: verify }) : '')
@@ -636,6 +706,29 @@ async function clearPermissionDeniedAccount(account: PermissionDeniedAccount): P
           : 'accounts.permissionDeniedRowMissing',
         { label: account.label },
       ) + liftedNotice(result),
+      'success',
+    )
+    emit('refresh')
+    void loadPermissionDenied()
+  } catch (error) {
+    actionError(error)
+  } finally {
+    permissionDeniedRowClearing.value = ''
+  }
+}
+
+// clearVerifyModelAccount 清除“403 单个模型需要验证”块里一个账户的 403 记录并解除它这个模型的暂停（服务端按清除 403 记录解除需要验证账号的
+// 两种暂停）：该模型重新参与调度，没在官网验证的下一次请求会再返回 403 并重新暂停。成功后刷新列表与账户状态
+async function clearVerifyModelAccount(row: { id: string; label: string }): Promise<void> {
+  if (clearBusy()) return
+  permissionDeniedRowClearing.value = row.id
+  try {
+    const result = await trackPendingWrite(api.clearPermissionDenied({ account_ids: [row.id] }))
+    permissionDeniedVersion += 1
+    permissionDenied.value = permissionDenied.value.filter((item) => item.id !== row.id)
+    emit(
+      'notice',
+      tf('accounts.verifyModelRowCleared', { label: row.label }) + liftedNotice(result),
       'success',
     )
     emit('refresh')
@@ -1028,14 +1121,18 @@ function verifiedOrgDisabled(verified: Account): boolean {
 async function runAccountAction(account: Account, action: 'login' | 'verify'): Promise<void> {
   pendingAction.value = `${action}:${account.id}`
   try {
+    // 登录完成、验证通过（登录有效）时服务端清除这个账户的 403 记录与冷却（冷却列表随即推送）：立即重读 403 列表，
+    // 不等账户变化后的 15 秒节流，否则“403 单个模型需要验证”与汇总块里这一行要过一阵才消失
     if (action === 'login') {
       await trackPendingWrite(api.loginAccount(account.id))
       emit('refresh')
+      void loadPermissionDenied()
       emit('notice', t('accounts.loginComplete'), 'success')
       return
     }
     const verified = await trackPendingWrite(api.verifyAccount(account.id))
     emit('refresh')
+    if (verified.authenticated !== false && !verifiedOrgDisabled(verified)) void loadPermissionDenied()
     if (verifiedOrgDisabled(verified)) {
       const reason = restrictionReason(verified.restriction)
       emit(
@@ -1080,9 +1177,10 @@ async function removeAccount(account: Account): Promise<void> {
 type StateFilter = 'all' | 'problem' | AccountState
 // ProblemKind 为出问题账户的 403 类型：需要验证账号（含 403 记录已清除、整户暂停还在的账户）、多个模型、只有一个模型；
 // 陈旧的 403 记录不计入（见 PERMISSION_DENIED_STALE_HOURS）。以后有新的 403 类型在这里加
-type ProblemKind = 'verify' | 'forbidden' | 'model_forbidden'
+type ProblemKind = 'verify' | 'verify_model' | 'forbidden' | 'model_forbidden'
 const problemKindOptions: { value: ProblemKind; label: TranslationKey }[] = [
   { value: 'verify', label: 'accounts.problemKindVerify' },
+  { value: 'verify_model', label: 'accounts.problemKindVerifyModel' },
   { value: 'forbidden', label: 'accounts.problemKindForbidden' },
   { value: 'model_forbidden', label: 'accounts.problemKindModelForbidden' },
 ]
@@ -1391,14 +1489,18 @@ const problemInfo = computed(() => {
     ]
     const models = counted.map((model) => `${model.model} ${modelSeen(model)}`).join(', ')
     const kind: ProblemKind = view.verify
-      ? 'verify'
+      ? verifyBuckets.value.get(account.id) === 'model'
+        ? 'verify_model'
+        : 'verify'
       : view.fresh.length === 1
         ? 'model_forbidden'
         : 'forbidden'
     const label = t(
       kind === 'model_forbidden'
         ? 'accounts.problemKindModelForbidden'
-        : 'accounts.problemPermissionDenied',
+        : kind === 'verify_model'
+          ? 'accounts.problemVerifyModel'
+          : 'accounts.problemPermissionDenied',
     )
     const stale =
       !view.verify && view.stale.length > 0
@@ -1415,6 +1517,13 @@ const problemInfo = computed(() => {
     if (problemExcluded.has(id) || kinds.get(id)?.has('verify')) continue
     add(id, `${t('accounts.problemVerifyPaused')}：${pause.reason}`, 'verify')
   }
+  // 单个模型需要验证的暂停还在、登记表里却没有账户级记录（清除过记录、或手工改过登记）：同样列为单个模型需要验证
+  for (const [id, cooled] of forbiddenCooldownState.value.verifyModelCooled) {
+    const set = kinds.get(id)
+    if (problemExcluded.has(id) || set?.has('verify') || set?.has('verify_model')) continue
+    const models = [...cooled.models.values()].map((item) => item.model).join(', ')
+    add(id, tf('accounts.problemVerifyModelOrphan', { models }), 'verify_model')
+  }
   const joined = new Map<string, string>()
   for (const [id, list] of reasons) joined.set(id, list.join('；'))
   return { reasons: joined, kinds }
@@ -1422,7 +1531,12 @@ const problemInfo = computed(() => {
 const problemReasons = computed(() => problemInfo.value.reasons)
 // problemKindCounts 为各问题类型的账户数（下拉里显示）
 const problemKindCounts = computed(() => {
-  const counts: Record<ProblemKind, number> = { verify: 0, forbidden: 0, model_forbidden: 0 }
+  const counts: Record<ProblemKind, number> = {
+    verify: 0,
+    verify_model: 0,
+    forbidden: 0,
+    model_forbidden: 0,
+  }
   for (const set of problemInfo.value.kinds.values()) for (const kind of set) counts[kind] += 1
   return counts
 })
@@ -1441,6 +1555,95 @@ const verifyRequiredAccounts = computed(() => {
   }
   return list.sort((left, right) => left.label.localeCompare(right.label))
 })
+
+// VerifyModelRow 为“403 单个模型需要验证”块的一行：模型取登记的账户级条目与单个模型需要验证冷却的并集（全部列出），lastAt 与 count
+// 为登记里这些条目的最近一次与次数（只有冷却、登记已清除时为空与 0），account 为账户列表里的账户（已不在列表里时为空，不显示“验证”）。
+// pausedUntil 为这个账户单个模型需要验证的暂停此刻仍生效时最晚的恢复时间（毫秒），没有生效的暂停时为 0：登记不会过期，30 天的暂停
+// 到期后（或生成路径没写入暂停时）登记还在、该模型已重新参与调度，与诊断脚本一样分开写暂停中与已到期
+interface VerifyModelRow {
+  id: string
+  label: string
+  models: string[]
+  lastAt: string
+  count: number
+  account: Account | undefined
+  pausedUntil: number
+}
+
+// verifyModelAccounts 为“403 单个模型需要验证”块的账户：problemInfo 里类型为 verify_model 的账户，与“出问题（403）→ 403 单个模型需要验证”
+// 的计数完全相同（需要登录、组织已停用、不可用的不计）。按最近一次从新到旧排列，没有登记的排在最后
+const verifyModelAccounts = computed<VerifyModelRow[]>(() => {
+  const { verifyModelCooled } = forbiddenCooldownState.value
+  const registry = new Map(permissionDenied.value.map((account) => [account.id, account]))
+  const accounts = new Map(props.accounts.map((account) => [account.id, account]))
+  const rows: VerifyModelRow[] = []
+  for (const [id, kinds] of problemInfo.value.kinds) {
+    if (!kinds.has('verify_model')) continue
+    const listed = registry.get(id)
+    const view = permissionDeniedViews.value.get(id)
+    const models = new Map<string, string>()
+    let lastAt = ''
+    let latest = Number.NEGATIVE_INFINITY
+    let count = 0
+    for (const model of view?.verifyModels ?? []) {
+      models.set(normalizeVerifyModel(model.model), model.model)
+      count += model.count
+      const at = Date.parse(model.last_at)
+      if (Number.isFinite(at) && at > latest) {
+        latest = at
+        lastAt = model.last_at
+      }
+    }
+    let pausedUntil = 0
+    for (const [key, item] of verifyModelCooled.get(id)?.models ?? []) {
+      if (!models.has(key)) models.set(key, item.model)
+      pausedUntil = Math.max(pausedUntil, item.until)
+    }
+    const account = accounts.get(id)
+    rows.push({
+      id,
+      label: account?.label ?? listed?.label ?? verifyModelCooled.get(id)?.label ?? id,
+      models: [...models.values()].sort(),
+      lastAt,
+      count,
+      account,
+      pausedUntil,
+    })
+  }
+  return rows.sort((left, right) => {
+    const leftAt = left.lastAt === '' ? Number.NEGATIVE_INFINITY : Date.parse(left.lastAt)
+    const rightAt = right.lastAt === '' ? Number.NEGATIVE_INFINITY : Date.parse(right.lastAt)
+    return rightAt - leftAt || left.label.localeCompare(right.label)
+  })
+})
+
+// verifyModelStateText 为“403 单个模型需要验证”块的状态说明：暂停中与暂停已到期的账户数（与诊断脚本同一口径）
+const verifyModelStateText = computed(() => {
+  const total = verifyModelAccounts.value.length
+  const paused = verifyModelAccounts.value.filter((row) => row.pausedUntil > 0).length
+  return paused >= total
+    ? tf('accounts.verifyModelState', { paused })
+    : tf('accounts.verifyModelStatePartial', { paused, expired: total - paused })
+})
+
+const showAllVerifyModel = ref(false)
+const visibleVerifyModel = computed(() =>
+  showAllVerifyModel.value
+    ? verifyModelAccounts.value
+    : verifyModelAccounts.value.slice(0, PERMISSION_DENIED_COLLAPSED),
+)
+
+// viewVerifyModel 在账户列表里查看单个模型需要验证的账户（同 viewVerifyRequired，问题类型切到“403 单个模型需要验证”）
+async function viewVerifyModel(): Promise<void> {
+  stateFilter.value = 'problem'
+  problemKind.value = 'verify_model'
+  query.value = ''
+  workerFilter.value = 'all'
+  tierFilter.value = 'all'
+  poolFilter.value = 'all'
+  await nextTick()
+  accountListAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
 
 // verifyRequiredLatest 为汇总块账户最近一次账户级 403 的时间（取登记里的账户级条目；只有暂停、登记里没有账户级条目的账户没有这个
 // 时间），都没有时为空字符串
@@ -2310,6 +2513,132 @@ function closeBulkPanel(): void {
         </div>
       </div>
 
+      <!-- 403 单个模型需要验证：只在一个模型上要求验证账号、只暂停这个模型（最长 30 天），账户其他模型照常调度；与“出问题（403）→
+           403 单个模型需要验证”同一口径。逐个列出模型、最近一次与次数，可验证或清除记录 -->
+      <div
+        v-if="verifyModelAccounts.length > 0"
+        class="rounded-lg border border-yellow-500/30 bg-yellow-500/5 p-3 text-sm"
+        data-testid="verify-model-block"
+      >
+        <div class="flex flex-wrap items-center justify-between gap-2">
+          <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+            <span
+              v-tooltip="t('accounts.verifyModelHelp')"
+              class="font-bold text-yellow-200"
+              tabindex="0"
+            >
+              {{ tf('accounts.verifyModelTitle', { count: verifyModelAccounts.length }) }}
+            </span>
+            <span class="min-w-0 text-xs text-gray-300" data-testid="verify-model-state">
+              {{ verifyModelStateText }}
+            </span>
+            <span class="min-w-0 text-xs text-gray-300">{{ t('accounts.verifyModelHint') }}</span>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <button
+              class="btn btn-sm"
+              type="button"
+              @click="copyEmails(verifyModelAccounts.map((row) => row.label))"
+            >
+              {{ t('accounts.copyEmails') }}
+            </button>
+            <button class="btn btn-sm" type="button" @click="downloadVerifyModel">
+              {{ t('accounts.permissionDeniedDownload') }}
+            </button>
+            <button class="btn btn-sm" type="button" @click="viewVerifyModel">
+              {{ t('accounts.verifyRequiredView') }}
+            </button>
+          </div>
+        </div>
+        <div class="mt-2 overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead class="text-gray-500">
+              <tr>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedEmail') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.verifyModelColumn') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.verifyModelPauseColumn') }}</th>
+                <th class="py-1 pr-3 font-normal">{{ t('accounts.permissionDeniedLast') }}</th>
+                <th class="py-1 text-right font-normal">
+                  {{ t('accounts.permissionDeniedTimes') }}
+                </th>
+                <th class="py-1 pl-3 text-right font-normal">{{ t('accounts.actions') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in visibleVerifyModel" :key="row.id" class="border-t border-[#30363d]">
+                <td class="py-1 pr-3 font-mono text-gray-200">{{ row.label }}</td>
+                <td class="max-w-md py-1 pr-3">
+                  <div
+                    class="cell-truncate font-mono text-yellow-200"
+                    :title="row.models.join(', ')"
+                  >
+                    {{ row.models.join(', ') }}
+                  </div>
+                </td>
+                <td
+                  class="whitespace-nowrap py-1 pr-3"
+                  :class="row.pausedUntil > 0 ? 'text-yellow-300' : 'text-gray-400'"
+                  :title="row.pausedUntil > 0 ? undefined : t('accounts.verifyModelPauseExpiredHelp')"
+                  data-testid="verify-model-pause"
+                >
+                  {{
+                    row.pausedUntil > 0
+                      ? tf('accounts.verifyModelPaused', {
+                          time: formatShortTime(new Date(row.pausedUntil).toISOString()),
+                        })
+                      : t('accounts.verifyModelPauseExpired')
+                  }}
+                </td>
+                <td class="whitespace-nowrap py-1 pr-3 font-mono text-gray-300">
+                  {{
+                    row.lastAt === ''
+                      ? t('accounts.verifyModelNoRecord')
+                      : formatDateTime(row.lastAt)
+                  }}
+                </td>
+                <td class="py-1 text-right font-mono text-yellow-300">
+                  {{ row.count > 0 ? row.count : '—' }}
+                </td>
+                <td class="whitespace-nowrap py-1 pl-3 text-right">
+                  <button
+                    v-if="row.account"
+                    class="btn btn-sm"
+                    type="button"
+                    :title="t('accounts.verifyModelVerifyHelp')"
+                    :disabled="busy"
+                    @click="row.account && runAccountAction(row.account, 'verify')"
+                  >
+                    {{ t('common.verify') }}
+                  </button>
+                  <button
+                    class="btn btn-sm ml-1"
+                    type="button"
+                    :title="t('accounts.verifyModelClearRowHelp')"
+                    :disabled="clearBusy() || permissionDeniedDeleting"
+                    :aria-busy="permissionDeniedRowClearing === row.id"
+                    @click="clearVerifyModelAccount(row)"
+                  >
+                    {{ t('accounts.permissionDeniedClearRow') }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <button
+          v-if="verifyModelAccounts.length > PERMISSION_DENIED_COLLAPSED"
+          class="mt-2 text-xs text-blue-400 hover:underline"
+          type="button"
+          @click="showAllVerifyModel = !showAllVerifyModel"
+        >
+          {{
+            showAllVerifyModel
+              ? t('accounts.cooldownShowLess')
+              : tf('accounts.permissionDeniedShowAll', { count: verifyModelAccounts.length })
+          }}
+        </button>
+      </div>
+
       <!-- 组织已停用 AI Studio 的账户：Google Workspace 账号所属组织关闭了 AI Studio，已停止调度；24 小时复查、认证文件更新或恢复调度后解除。
            服务受限、年龄或资格不符、Workspace 未开放的账户同样列在这里，“原因”一栏区分 -->
       <div
@@ -2447,6 +2776,18 @@ function closeBulkPanel(): void {
                     other: cooldownVerifyOther,
                   })
                 : tf('accounts.cooldownVerifyExcluded', { count: cooldownSummary.verifyExcluded })
+            }}
+          </span>
+          <span
+            v-if="cooldownSummary.verifyModelExcluded > 0"
+            v-tooltip="t('accounts.cooldownVerifyModelExcludedHelp')"
+            class="text-xs text-gray-400"
+            tabindex="0"
+          >
+            {{
+              tf('accounts.cooldownVerifyModelExcluded', {
+                count: cooldownSummary.verifyModelExcluded,
+              })
             }}
           </span>
           <span class="text-gray-300">
