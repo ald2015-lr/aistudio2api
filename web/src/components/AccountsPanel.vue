@@ -19,6 +19,7 @@ import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
 import { usePaging } from '@/paging'
 import type {
   Account,
+  AccountPool,
   AccountDraft,
   AccountRestriction,
   AccountState,
@@ -29,7 +30,7 @@ import type {
   PermissionDeniedModel,
   ProxyPoolAssignment,
   ProxyPoolStatus,
-  UltraWorkerCounters,
+  PartitionWorkerCounters,
   WorkerCounters,
   WorkerState,
 } from '@/types'
@@ -47,7 +48,9 @@ const props = defineProps<{
   error: string
   workerSets: { warm: Set<string>; starting: Set<string> }
   workerCounts: WorkerCounters | null
-  ultraWorkerCounts: UltraWorkerCounters | null
+  ultraWorkerCounts: PartitionWorkerCounters | null
+  // proWorkerCounts 为 Pro 分区的 Worker 计数（旧版服务端不返回时为 null）
+  proWorkerCounts?: PartitionWorkerCounters | null
   // proxyPool 为状态接口的 IP 池实时状态（每 3 秒更新）：assignments 给出每个账户当前用的端口或会话；没有开启时为 null
   proxyPool: ProxyPoolStatus | null
   cooldowns: Cooldown[]
@@ -1120,6 +1123,15 @@ const workerFilterOptions: { value: WorkerFilter; label: TranslationKey }[] = [
   { value: 'starting', label: 'accounts.workerFilterStarting' },
   { value: 'none', label: 'accounts.workerFilterNone' },
 ]
+// PoolFilter 按号池成员关系（account.pool）筛选，与按真实权益的 TierFilter 不同：关闭 PRO_POOL、开启 ULTRA_INCLUDE_PRO 时
+// Pro 账户属于 Ultra 号池，开启 PRO_POOL 时属于 Pro 号池
+type PoolFilter = 'all' | AccountPool
+const poolFilterOptions: { value: PoolFilter; label: TranslationKey }[] = [
+  { value: 'all', label: 'accounts.poolFilterAll' },
+  { value: 'normal', label: 'accounts.poolFilterNormal' },
+  { value: 'pro', label: 'accounts.poolFilterPro' },
+  { value: 'ultra', label: 'accounts.poolFilterUltra' },
+]
 const tierFilterOptions: { value: TierFilter; label: TranslationKey }[] = [
   { value: 'all', label: 'accounts.tierFilterAll' },
   { value: 'Ultra', label: 'accounts.tierFilterUltra' },
@@ -1149,7 +1161,8 @@ const workerDotClass: Record<WorkerState, string> = {
 // 也仍能用“权益：Pro”筛出来。权益尚未读取时为 unknown（服务端暂按 Free 显示，计入普通号池）；
 // 已经属于 Ultra 号池的账户不按 unknown 显示，这样有权益但还没有目录指纹的已入池账户仍显示它的权益
 function accountTier(account: Account): AccountTier {
-  if (account.benefit_tier_known === false && account.pool !== 'ultra') return 'unknown'
+  if (account.benefit_tier_known === false && account.pool !== 'ultra' && account.pool !== 'pro')
+    return 'unknown'
   const tier = account.benefit_tier
   return tier === 'Ultra' || tier === 'Pro' || tier === 'Plus' ? tier : 'Free'
 }
@@ -1158,6 +1171,11 @@ function accountTier(account: Account): AccountTier {
 // 开启 ULTRA_INCLUDE_PRO 时其中含权益为 Pro 的账户，所以号池计数不能按权益统计
 function inUltraPool(account: Account): boolean {
   return account.pool === 'ultra'
+}
+
+// inProPool 判断账户是否属于 Pro 号池（开启 PRO_POOL 时权益为 Pro 的账户）：经 /pro 前缀的请求只用这些账户
+function inProPool(account: Account): boolean {
+  return account.pool === 'pro'
 }
 
 // workerState 账户 Worker 的实时状态：运行中、启动中或未启动
@@ -1262,6 +1280,7 @@ const stateFilter = ref<StateFilter>('all')
 const problemKind = ref<'all' | ProblemKind>('all')
 const workerFilter = ref<WorkerFilter>('all')
 const tierFilter = ref<TierFilter>('all')
+const poolFilter = ref<PoolFilter>('all')
 const sortKey = ref<SortKey>('default')
 const selected = ref<Set<string>>(new Set())
 
@@ -1294,6 +1313,22 @@ const tierCounts = computed(() => {
   return counts
 })
 const ultraPoolCount = computed(() => props.accounts.filter(inUltraPool).length)
+// poolCounts 按号池成员关系统计账户数，供号池筛选显示数量；proPoolCount 与 proReady 为 Pro 号池的账户数与其中就绪的账户数
+const poolCounts = computed(() => {
+  const counts: Record<PoolFilter, number> = {
+    all: props.accounts.length,
+    normal: 0,
+    pro: 0,
+    ultra: 0,
+  }
+  for (const account of props.accounts)
+    counts[account.pool === 'ultra' || account.pool === 'pro' ? account.pool : 'normal'] += 1
+  return counts
+})
+const proPoolCount = computed(() => poolCounts.value.pro)
+const proReady = computed(
+  () => props.accounts.filter((account) => inProPool(account) && account.state === 'ready').length,
+)
 // poolTagShown 表示有账户要在权益旁另加 Ultra 号池标记（权益不是 Ultra 却属于 Ultra 号池）。原来的权益列放不下
 // “权益 + 标记”，只在这时加宽权益列并同样加大表格最小宽度，账户列不被挤窄；开关关闭时表格布局与原来一致
 const poolTagShown = computed(() =>
@@ -1472,6 +1507,7 @@ async function viewVerifyRequired(): Promise<void> {
   query.value = ''
   workerFilter.value = 'all'
   tierFilter.value = 'all'
+  poolFilter.value = 'all'
   await nextTick()
   accountListAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
@@ -1486,6 +1522,7 @@ const filtered = computed(() => {
     } else if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
+    if (poolFilter.value !== 'all' && (account.pool ?? 'normal') !== poolFilter.value) return false
     if (term === '') return true
     // 代理按掩码后的显示值匹配，搜不到账号密码；IP 池的端口号或会话号也能搜
     return [
@@ -1524,7 +1561,7 @@ const { page, pageSize, pageItems } = usePaging(
   50,
 )
 
-watch([query, stateFilter, problemKind, workerFilter, tierFilter, sortKey], () => {
+watch([query, stateFilter, problemKind, workerFilter, tierFilter, poolFilter, sortKey], () => {
   page.value = 1
 })
 
@@ -2013,6 +2050,23 @@ function closeBulkPanel(): void {
               tf('accounts.ultraWorkers', {
                 warm: ultraWorkerCounts.warm,
                 target: ultraWorkerCounts.target,
+              })
+            }}
+          </span>
+          <!-- Pro 号池只在开启 PRO_POOL 且有 Pro 账户时有成员 -->
+          <span
+            v-if="proPoolCount > 0"
+            v-tooltip="t('accounts.proCountHelp')"
+            class="tag tag-pro"
+            tabindex="0"
+          >
+            {{ tf('accounts.proCount', { ready: proReady, total: proPoolCount }) }}
+          </span>
+          <span v-if="proWorkerCounts && proPoolCount > 0" class="font-mono text-xs text-sky-300">
+            {{
+              tf('accounts.proWorkers', {
+                warm: proWorkerCounts.warm,
+                target: proWorkerCounts.target,
               })
             }}
           </span>
@@ -2616,6 +2670,17 @@ function closeBulkPanel(): void {
         <select v-model="tierFilter" class="input" :aria-label="t('accounts.benefitTier')">
           <option v-for="option in tierFilterOptions" :key="option.value" :value="option.value">
             {{ t(option.label) }} ({{ tierCounts[option.value] }})
+          </option>
+        </select>
+        <select
+          v-model="poolFilter"
+          v-tooltip="t('accounts.poolFilterHelp')"
+          class="input"
+          :aria-label="t('accounts.poolFilter')"
+          data-testid="accounts-pool-filter"
+        >
+          <option v-for="option in poolFilterOptions" :key="option.value" :value="option.value">
+            {{ t(option.label) }} ({{ poolCounts[option.value] }})
           </option>
         </select>
         <select v-model="sortKey" class="input" :aria-label="t('accounts.sortDefault')">

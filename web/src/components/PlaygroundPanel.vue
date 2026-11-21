@@ -12,6 +12,7 @@ import { copyText } from '@/clipboard'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
+  AccountPool,
   Model,
   PlaygroundError,
   PlaygroundInput,
@@ -30,6 +31,15 @@ const props = defineProps<{
   models: Model[]
   accounts: Account[]
   apiKey: string
+  // proPool 为是否开启 Pro 独立号池（PRO_POOL）：关闭时 /pro 返回 404，Pro 选项置灰
+  proPool?: boolean
+  // ultraOnlyModels 为只有 Ultra 权益能用的模型（ULTRA_ONLY_MODELS，如 gemini-4-carbon）：Pro 账户的目录照样列出它们，
+  // /pro 按这项设置不分给 Pro 账户（模型列表不列、请求 404），选 Pro 号池时从模型列表里去掉
+  ultraOnlyModels?: string[]
+  // paidOnlyModels 为只有 Pro 与 Ultra 权益能用的模型（PAID_ONLY_MODELS，如 gemini-3.1-pro-preview）；ultraExclusive 为 ULTRA_EXCLUSIVE。
+  // 开启 PRO_POOL 且 ULTRA_EXCLUSIVE=true 时默认地址只用 Free、Plus 账户，选“默认”时从模型列表里去掉这两份规则里的模型
+  paidOnlyModels?: string[]
+  ultraExclusive?: boolean
 }>()
 
 const { t, tf, errorText } = useI18n()
@@ -67,8 +77,14 @@ const form = reactive<PlaygroundInput>({
   imageQuality: 'auto',
   voice: '',
   apiKey: props.apiKey,
-  ultra: false,
+  pool: 'normal',
 })
+// poolOptions 为号池选择：默认地址、Pro（/pro）、Ultra（/ultra）
+const poolOptions: { id: AccountPool; label: TranslationKey }[] = [
+  { id: 'normal', label: 'playground.poolNormal' },
+  { id: 'pro', label: 'playground.poolPro' },
+  { id: 'ultra', label: 'playground.poolUltra' },
+]
 const result = reactive<PlaygroundResult>({
   text: '',
   reasoning: '',
@@ -99,28 +115,51 @@ let lastInput: PlaygroundInput | undefined
 // 有请求在进行或输入框里有没发出的内容时，页面文件载入失败后不自动刷新（试用页切走后保留，见 assetRecovery.ts）
 useUnsavedGuard(() => isRunning.value || form.prompt.trim() !== '' || form.system.trim() !== '')
 
-// ultraModelIDs 为 Ultra 号池账户的模型并集：使用 Ultra 号池时模型列表只显示这些模型，还没有读到时显示全部模型。
+// defaultPools 为“默认”选项（默认地址）使用的号池：开启 PRO_POOL 时 ULTRA_EXCLUSIVE=true 只有普通号池，为 false 时还有 Ultra 号池
+// （Pro 账户只服务 /pro）；关闭 PRO_POOL 时为空，“默认”与没有 Pro 号池之前一样列出全部模型
+const defaultPools = computed<AccountPool[]>(() => {
+  if (props.proPool === false) return []
+  return props.ultraExclusive === false ? ['normal', 'ultra'] : ['normal']
+})
+// poolModelIDs 为所选号池账户的模型并集（“默认”为 defaultPools 的账户）：模型列表只显示这些模型，还没有读到时显示全部模型。
 // 账户的 models 只含 Playground 目录，只在 Build 通道提供的模型（如 gemini-4-argon）不会出现在这里，过滤时要放过它们
-const ultraModelIDs = computed(
-  () =>
-    new Set(
-      props.accounts
-        .filter((account) => account.pool === 'ultra')
-        .flatMap((account) => account.models),
-    ),
-)
+const poolModelIDs = computed(() => {
+  const pools = form.pool === 'normal' ? defaultPools.value : [form.pool]
+  return new Set(
+    props.accounts
+      .filter((account) => pools.includes(account.pool))
+      .flatMap((account) => account.models),
+  )
+})
+// normalizeModelNames 与服务端一样不分大小写、去掉 models/ 前缀
+function normalizeModelNames(names: string[] | undefined): string[] {
+  return (names ?? []).map((id) =>
+    id
+      .trim()
+      .replace(/^models\//, '')
+      .toLowerCase(),
+  )
+}
+// excludedModels 为按权益规则去掉的模型：选 Pro 时为 ULTRA_ONLY_MODELS；选“默认”且默认地址只用 Free、Plus 账户（开启 PRO_POOL、
+// ULTRA_EXCLUSIVE=true）时为 ULTRA_ONLY_MODELS 与 PAID_ONLY_MODELS（Free、Plus 的目录照样列出它们，默认地址接不了，选了会 404）
+const excludedModels = computed(() => {
+  if (form.pool === 'pro') return new Set(normalizeModelNames(props.ultraOnlyModels))
+  if (form.pool === 'normal' && defaultPools.value.length === 1) {
+    return new Set([
+      ...normalizeModelNames(props.ultraOnlyModels),
+      ...normalizeModelNames(props.paidOnlyModels),
+    ])
+  }
+  return new Set<string>()
+})
 const availableModels = computed(() =>
   props.models.filter((model) => {
-    // 只在 Build 通道提供的模型无法按账户的 Playground 目录判断 Ultra 号池能否服务，照常列出，由服务端按号池选号；
-    // 否则勾选“使用 Ultra 号池”后这类模型会被滤掉，没法在这里验证 Ultra 号池（含并入的 Pro 账户）能否使用它们
+    if (excludedModels.value.has(model.id.toLowerCase())) return false
+    // 只在 Build 通道提供的模型无法按账户的 Playground 目录判断所选号池能否服务，照常列出，由服务端按号池选号；
+    // 否则选了号池后这类模型会被滤掉，没法在这里验证所选号池能否使用它们
     const channels = model.channels ?? []
     const buildOnly = channels.includes('build') && !channels.includes('playground')
-    if (
-      form.ultra &&
-      ultraModelIDs.value.size > 0 &&
-      !buildOnly &&
-      !ultraModelIDs.value.has(model.id)
-    ) {
+    if (poolModelIDs.value.size > 0 && !buildOnly && !poolModelIDs.value.has(model.id)) {
       return false
     }
     const capabilities = model.capabilities ?? {}
@@ -139,6 +178,21 @@ const availableModels = computed(() =>
   }),
 )
 const selectedModel = computed(() => availableModels.value.find((model) => model.id === form.model))
+// poolHelp 为号池选择下方的说明：所选号池还没有读到账户模型时说明显示全部模型；关闭 PRO_POOL 时说明 Pro 不可选
+const poolHelp = computed(() => {
+  if (form.pool === 'normal') {
+    if (props.proPool === false) return t('playground.poolNormalProOffHelp')
+    return t(
+      props.ultraExclusive === false
+        ? 'playground.poolNormalSharedHelp'
+        : 'playground.poolNormalHelp',
+    )
+  }
+  if (poolModelIDs.value.size === 0) {
+    return t(form.pool === 'pro' ? 'playground.poolProNoModels' : 'playground.ultraNoModels')
+  }
+  return t(form.pool === 'pro' ? 'playground.poolProHelp' : 'playground.ultraHelp')
+})
 const supportsThinking = computed(() => {
   const capabilities = selectedModel.value?.capabilities ?? {}
   return (
@@ -157,8 +211,17 @@ function modeLabel(mode: (typeof modes)[number]): string {
   return mode.label === undefined ? 'Veo' : t(mode.label)
 }
 
+// 关闭 PRO_POOL 后 /pro 返回 404：已选的 Pro 号池改回默认地址
 watch(
-  [() => props.models, () => form.mode, () => form.ultra, ultraModelIDs],
+  () => props.proPool,
+  (enabled) => {
+    if (enabled === false && form.pool === 'pro') form.pool = 'normal'
+  },
+  { immediate: true },
+)
+
+watch(
+  [() => props.models, () => form.mode, () => form.pool, poolModelIDs],
   () => {
     if (!availableModels.value.some((model) => model.id === form.model)) {
       form.model = availableModels.value[0]?.id ?? ''
@@ -741,16 +804,30 @@ onUnmounted(() => {
       </div>
 
       <div>
-        <label class="flex items-center justify-between gap-2">
-          <span class="text-xs font-bold text-gray-500 uppercase">{{ t('playground.ultra') }}</span>
-          <input v-model="form.ultra" class="h-4 w-4 accent-blue-600" type="checkbox" />
-        </label>
+        <span class="mb-2 block text-xs font-bold text-gray-500 uppercase">{{
+          t('playground.pool')
+        }}</span>
+        <div class="flex gap-1" role="radiogroup" :aria-label="t('playground.pool')">
+          <button
+            v-for="option in poolOptions"
+            :key="option.id"
+            type="button"
+            role="radio"
+            :aria-checked="form.pool === option.id"
+            :disabled="option.id === 'pro' && proPool === false"
+            :class="[
+              'min-w-0 flex-1 truncate rounded border px-2 py-1 text-xs transition disabled:cursor-not-allowed disabled:opacity-40',
+              form.pool === option.id
+                ? 'border-blue-500 bg-blue-600 text-white'
+                : 'border-[#30363d] text-gray-400 hover:text-white',
+            ]"
+            @click="form.pool = option.id"
+          >
+            {{ t(option.label) }}
+          </button>
+        </div>
         <p class="mt-1 text-[11px] leading-4 text-gray-500">
-          {{
-            form.ultra && ultraModelIDs.size === 0
-              ? t('playground.ultraNoModels')
-              : t('playground.ultraHelp')
-          }}
+          {{ poolHelp }}
         </p>
       </div>
 

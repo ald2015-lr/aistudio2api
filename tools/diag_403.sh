@@ -268,9 +268,9 @@ def env_value(name):
 
 
 def base_path(path):
-    # 排查路由 /trace/ 与 Ultra 路由 /ultra/ 的请求去掉前缀后再归类
+    # 排查路由 /trace/ 与号池路由 /ultra/、/pro/ 的请求去掉前缀后再归类（/trace/ultra/、/trace/pro/ 依次去掉）
     path = path or ""
-    for prefix in ("/trace", "/ultra"):
+    for prefix in ("/trace", "/ultra", "/pro"):
         if path.startswith(prefix + "/"):
             path = path[len(prefix):]
     return path
@@ -314,10 +314,15 @@ OMNI_SYSTEM_DROP = not env_off("OMNI_IGNORE_SYSTEM_PROMPT")
 
 
 def fallback_applies(path):
-    # MODEL_FALLBACK_SCOPE：ultra（默认）只对 /ultra 路径的请求改用，all 对所有路径，off 关闭；路径不知道时按可能
+    # MODEL_FALLBACK_SCOPE：ultra（默认）只对 /ultra 路径（含 /trace/ultra）的请求改用，不含 /pro；all 对所有路径（默认地址、/pro 与 /ultra）；
+    # off 关闭；路径不知道时按可能
     if FALLBACK_SCOPE == "off":
         return False
-    return FALLBACK_SCOPE == "all" or not path or path.startswith("/ultra/")
+    if FALLBACK_SCOPE == "all" or not path:
+        return True
+    if path.startswith("/trace/"):
+        path = path[len("/trace"):]
+    return path.startswith("/ultra/")
 
 
 # ---------- 管理接口（只发 GET） ----------
@@ -1783,7 +1788,7 @@ def conclude(entry):
 
 
 def path_label(item):
-    # 汇总用的接口：登记或账本记录的路径，按 base_path 去掉 /trace、/ultra 前缀，Gemini 原生路径里的模型名换成 *（别名与正式名不分开计）；
+    # 汇总用的接口：登记或账本记录的路径，按 base_path 去掉 /trace、/ultra、/pro 前缀，Gemini 原生路径里的模型名换成 *（别名与正式名不分开计）；
     # 都没有时按请求 ID 前缀写接口类型
     path = base_path((item["last_request"] or {}).get("path") or (item["record"] or {}).get("path") or "")
     if path:

@@ -1,7 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { api } from '@/api'
-import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
+import {
+  channelLabelKey,
+  poolTagClass,
+  poolTagged,
+  poolTagHelpKey,
+  poolTagLabelKey,
+  useI18n,
+  type TranslationKey,
+} from '@/i18n'
 import { usePaging } from '@/paging'
 import type { Account, Cooldown, RequestState, RequestSummary } from '@/types'
 import UiIcon from './UiIcon.vue'
@@ -289,10 +297,11 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                     <td>
                       <div class="flex min-w-0 items-center gap-1.5">
                         <span
-                          v-if="request.pool === 'ultra'"
-                          v-tooltip="t('pool.ultraHelp')"
-                          class="tag tag-ultra shrink-0"
-                          >{{ t('pool.ultra') }}</span
+                          v-if="poolTagged(request.pool)"
+                          v-tooltip="t(poolTagHelpKey(request.pool))"
+                          class="tag shrink-0"
+                          :class="poolTagClass(request.pool)"
+                          >{{ t(poolTagLabelKey(request.pool)) }}</span
                         >
                         <span class="cell-truncate text-gray-200">{{ request.model || '—' }}</span>
                         <span

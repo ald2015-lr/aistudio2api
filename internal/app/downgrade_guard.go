@@ -1303,10 +1303,10 @@ func (memory *downgradeMemory) size() int {
 	return memory.total
 }
 
-// downgradeMemoryKey 返回降级记录的键：记录按号池分开，经 /ultra 的请求只看 Ultra 号池的记录；
-// 普通号池与不限号池沿用原有的键
+// downgradeMemoryKey 返回降级记录的键：记录按号池分开，经 /ultra（/pro）的请求只看 Ultra（Pro）号池的记录；
+// 普通路径（普通号池、不限号池、普通号池与 Ultra 号池）沿用原有的键
 func downgradeMemoryKey(scope aistudio.PoolScope, hash string) string {
-	if scope == aistudio.PoolScopeUltra {
+	if scope == aistudio.PoolScopeUltra || scope == aistudio.PoolScopePro {
 		return hash + "|" + scope.String()
 	}
 	return hash

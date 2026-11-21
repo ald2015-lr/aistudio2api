@@ -131,7 +131,8 @@ func (value *entry) dimension(name string) string {
 	return ""
 }
 
-// poolValue 把账本中的号池换成用量接口的取值：普通号池的请求保存为空，对外为 normal
+// poolValue 把账本中的号池换成用量接口的取值：普通号池的请求保存为空，对外为 normal；经 /ultra、/pro 进入的请求保存为 ultra、pro，
+// 原样对外（号池列是自由文本，新增号池不需要迁移）
 func poolValue(stored string) string {
 	if stored == "" {
 		return api.UsagePoolNormal
@@ -139,7 +140,7 @@ func poolValue(stored string) string {
 	return stored
 }
 
-// storedPool 把用量接口的号池筛选值换成账本中保存的取值
+// storedPool 把用量接口的号池筛选值换成账本中保存的取值：normal 为空，ultra、pro 原样
 func storedPool(value string) string {
 	if value == api.UsagePoolNormal {
 		return ""

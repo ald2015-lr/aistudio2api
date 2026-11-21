@@ -2,11 +2,13 @@ package app
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 	"github.com/Mag1cFall/AIStudio2API/internal/api"
+	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
 // 权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS，判断在账户池，见 aistudio/tier_rules.go）的运行日志与管理页提示。
@@ -18,11 +20,12 @@ import (
 // 规则里的名称不在任何账户的 Playground 或 Build 目录里（写错、带了后缀，或模型还没上线）时写一行 WARN。对照在后台周期（keepWarm）
 // 与配置热更新后进行，只读账户池内存（按版本缓存），不在请求路径上，不发上游请求；同样的内容只写一次，消失后再出现时重新写
 
-// tierRuleMonitor 记下已写进运行日志的提示与没有匹配的名称
+// tierRuleMonitor 记下已写进运行日志的提示、没有匹配的名称与 Pro 号池能服务的只限 Ultra 的模型
 type tierRuleMonitor struct {
 	mu        sync.Mutex
 	hints     map[string]struct{}
 	unmatched map[string]struct{}
+	proUltra  map[string]struct{}
 }
 
 // checkTierRules 对照规则与账户目录，有新的内容时写日志（不含账户）：目录明确标注被排除的权益可用的每条写一行 WARN（账户数只数
@@ -35,6 +38,9 @@ func (service *trackedService) checkTierRules() {
 	if !report.Checked {
 		return
 	}
+	// PRO_POOL=true 时“Pro 不能用只限 Ultra 的模型”只靠 ULTRA_ONLY_MODELS：默认列表里的模型（gemini-4-carbon）与某个目录明确标注只有 Ultra
+	// 能用的模型，Pro 号池却能服务（不在 ULTRA_ONLY_MODELS 里、Pro 账户的目录又没有标注）时提示加进去。模型通道按目录版本记忆，锁外逐个查
+	proUltra := service.proServableUltraModels(report.UltraMarked)
 	hints := make(map[string]struct{}, len(report.Hints))
 	unmatched := make(map[string]struct{}, len(report.Unmatched))
 	type logLine struct {
@@ -82,12 +88,44 @@ func (service *trackedService) checkTierRules() {
 				"规则模型目前不在任何账户目录里（带后缀的名称要写成基础模型 ID） | 配置项=%s | 模型=%s", name.Key, name.Name)})
 		}
 	}
+	proUltraLogged := make(map[string]struct{}, len(proUltra))
+	for _, model := range proUltra {
+		key := strings.ToLower(model)
+		proUltraLogged[key] = struct{}{}
+		if _, logged := monitor.proUltra[key]; !logged {
+			lines = append(lines, logLine{level: "WARN", message: fmt.Sprintf(
+				"PRO_POOL=true 时 Pro 号池能服务只限 Ultra 的模型 | 模型=%s | 它不在 %s 里，Pro 账户的目录也没有标注不能用，/pro 会选 Pro 账户服务它并失败；"+
+					"Pro 不能用这类模型只靠 %s，请把它加回去", model, aistudio.TierRuleUltraOnlyKey, aistudio.TierRuleUltraOnlyKey)})
+		}
+	}
 	// 只记住这次仍在的：消失后再出现时重新写
-	monitor.hints, monitor.unmatched = hints, unmatched
+	monitor.hints, monitor.unmatched, monitor.proUltra = hints, unmatched, proUltraLogged
 	monitor.mu.Unlock()
 	for _, line := range lines {
 		service.requests.log("service", line.level, line.message)
 	}
+}
+
+// proServableUltraModels 返回 PRO_POOL=true 时 Pro 号池能服务的只限 Ultra 的模型：ULTRA_ONLY_MODELS 的默认列表与 marked（某个目录明确标注
+// 只有 Ultra 能用的模型）里，Pro 号池有启用账户能经启用通道调用的，按名称排序去重；PRO_POOL=false 时为空
+func (service *trackedService) proServableUltraModels(marked []string) []string {
+	if !service.pool.ProPool() {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var servable []string
+	for _, model := range append(config.Default().UltraOnlyModels, marked...) {
+		key := strings.ToLower(model)
+		if _, done := seen[key]; done {
+			continue
+		}
+		seen[key] = struct{}{}
+		if service.pool.ModelServableIn(aistudio.PoolScopePro, model) {
+			servable = append(servable, model)
+		}
+	}
+	slices.Sort(servable)
+	return servable
 }
 
 // tierRuleHintLine 返回目录明确标注被排除的权益可用时的运行日志（WARN）

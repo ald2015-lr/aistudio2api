@@ -88,6 +88,10 @@ print(f"预热：进行中 {p.get('active')}，在途 {p.get('inflight')}，本�
 u = d.get("ultra_workers") or {}
 if u:
     print(f"Ultra 分区：就绪 {u.get('warm')}，启动中 {u.get('starting')}，目标 {u.get('target')}，峰值 {u.get('max')}")
+# Pro 分区（PRO_POOL=true 时权益为 Pro 的账户）：有 Pro 号池账户或 Pro Worker 时才显示
+pro = d.get("pro_workers") or {}
+if pro and ((d.get("pro_accounts") or {}).get("total") or pro.get("warm") or pro.get("starting")):
+    print(f"Pro 分区：就绪 {pro.get('warm')}，启动中 {pro.get('starting')}，目标 {pro.get('target')}，峰值 {pro.get('max')}")
 for item in d.get("primary_supply") or []:
     print("主用模型供给：" + json.dumps(item, ensure_ascii=False)[:240])
 pool = d.get("proxy_pool") or {}
@@ -438,7 +442,7 @@ for p in paths:
             step = STEP_RE.match(msg)
             if step:
                 last_step[source] = f"{step.group(1)}/7 {step.group(2).strip()}"
-            if head.startswith("WAA Worker") or head.startswith("Ultra Worker"):
+            if head.startswith(("WAA Worker", "Ultra Worker", "Pro Worker")):
                 heads[head] += 1
                 f = fields(msg)
                 if head == "WAA Worker 就绪":

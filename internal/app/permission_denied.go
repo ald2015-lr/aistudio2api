@@ -356,16 +356,16 @@ func (registry *permissionDeniedRegistry) dropSystemic(
 	return dropped
 }
 
-// poolMembership 返回判断账户当前是否属于号池的函数；不限号池或没有账户池时为空（不限）
+// poolMembership 返回判断账户当前是否属于号池的函数；不限号池或没有账户池时为空（不限）。
+// 按账户所在分区是否在号池内判断：/pro 的号池级 403 只撤销 Pro 账户的登记，普通号池与 Ultra 号池（PRO_POOL=true、
+// ULTRA_EXCLUSIVE=false 时的普通路径）不含 Pro 账户
 func poolMembership(pool *aistudio.AccountPool, scope aistudio.PoolScope) func(string) bool {
 	if pool == nil || scope == aistudio.PoolScopeAll {
 		return nil
 	}
-	ultra := pool.UltraAccountIDs()
-	wantUltra := scope == aistudio.PoolScopeUltra
+	members := pool.PartitionMembers()
 	return func(accountID string) bool {
-		_, isUltra := ultra[accountID]
-		return isUltra == wantUltra
+		return scope.Contains(members.Of(accountID))
 	}
 }
 

@@ -1,6 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { channelLabelKey, useI18n } from '@/i18n'
+import {
+  channelLabelKey,
+  poolTagClass,
+  poolTagged,
+  poolTagHelpKey,
+  poolTagLabelKey,
+  useI18n,
+} from '@/i18n'
 import type { LogRow } from '@/logs'
 import UiIcon from './UiIcon.vue'
 
@@ -30,9 +37,13 @@ function number(value: number, digits = 0): string {
       <span class="request-state" :class="`state-${request.state}`">{{
         request.status ?? t('logs.running')
       }}</span>
-      <span v-if="request.pool === 'ultra'" v-tooltip="t('pool.ultraHelp')" class="tag tag-ultra">{{
-        t('pool.ultra')
-      }}</span>
+      <span
+        v-if="poolTagged(request.pool)"
+        v-tooltip="t(poolTagHelpKey(request.pool))"
+        class="tag"
+        :class="poolTagClass(request.pool)"
+        >{{ t(poolTagLabelKey(request.pool)) }}</span
+      >
       <strong>{{ request.model || `${request.method} ${request.path}` }}</strong>
       <span
         v-if="request.fallback_from"
@@ -81,9 +92,9 @@ function number(value: number, digits = 0): string {
         <dd>{{ request.id }}</dd>
         <dt>{{ t('logs.endpoint') }}</dt>
         <dd>{{ request.method }} {{ request.path }}</dd>
-        <template v-if="request.pool === 'ultra'">
+        <template v-if="poolTagged(request.pool)">
           <dt>{{ t('logs.pool') }}</dt>
-          <dd>{{ t('pool.ultra') }}</dd>
+          <dd>{{ t(poolTagLabelKey(request.pool)) }}</dd>
         </template>
         <template v-if="request.channel">
           <dt>{{ t('logs.channel') }}</dt>

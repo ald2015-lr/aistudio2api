@@ -5,6 +5,7 @@ import (
 	"hash/maphash"
 	"slices"
 	"sort"
+	"sync/atomic"
 	"time"
 )
 
@@ -92,6 +93,35 @@ func accountBuildKeyLocked(account *Account) uint64 {
 		account.buildKeySource = []Model{}
 	}
 	return account.buildKey
+}
+
+// buildModelScans 统计 hasBuildModelLocked 逐个账户扫描 Build 目录的次数，只给包内测试核对不存在的模型名不扫描账户
+var buildModelScans atomic.Int64
+
+// buildModelIDsLocked 返回全部账户 Build 目录中出现过的模型 ID（不看号池、启用状态与通道），目录版本变化后重建，按 Build 目录内容
+// 去重。只作 hasBuildModelLocked 的先决条件：Build 目录只经 SetBuildCatalog 与目录恢复替换，两处都递增 eligibilityVersion；
+// 删除账户后多出的 ID 只会让判断退回原来的逐个账户扫描。调用方持有 p.mu
+func (p *AccountPool) buildModelIDsLocked() map[string]struct{} {
+	if p.buildModelIDs != nil && p.buildModelIDsVersion == p.eligibilityVersion {
+		return p.buildModelIDs
+	}
+	ids := make(map[string]struct{})
+	seen := make(map[uint64]struct{})
+	for _, account := range p.accounts {
+		if account == nil || len(account.buildModels) == 0 {
+			continue
+		}
+		key := accountBuildKeyLocked(account)
+		if _, done := seen[key]; done {
+			continue
+		}
+		seen[key] = struct{}{}
+		for _, model := range account.buildModels {
+			ids[model.ID] = struct{}{}
+		}
+	}
+	p.buildModelIDs, p.buildModelIDsVersion = ids, p.eligibilityVersion
+	return ids
 }
 
 // catalogSummary 为一个号池内全部账户 Playground 目录的汇总（不看启用与权益，与原 hasModelLocked 等的口径相同）

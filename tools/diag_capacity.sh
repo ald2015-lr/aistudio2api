@@ -17,7 +17,7 @@ AUTH="${AUTH:-auth}"
 case "$AUTH" in /*) ;; *) AUTH="$APP_DIR/$AUTH" ;; esac
 
 echo "==================== 0. 相关设置（.env 里没写的按默认值） ===================="
-grep -E '^(ROUTING_STRATEGY|REQUEST_TIMEOUT|FIRST_EVENT_TIMEOUT|INIT_TIMEOUT|WARM_STARTUP_CONCURRENCY|WARM_WORKER_LIMIT|MAX_ACTIVE_WORKERS|ULTRA_WARM_WORKER_LIMIT|ULTRA_MAX_ACTIVE_WORKERS|PER_ACCOUNT_CONCURRENCY|ACCOUNT_RPM_LIMIT|PRIMARY_MODELS|PRIMARY_QUEUE_WAIT|ULTRA_PRIMARY_MODELS|ULTRA_PRIMARY_QUEUE_WAIT|ULTRA_INCLUDE_PRO|ULTRA_EXCLUSIVE)=' .env 2>/dev/null | sed 's/^/  /'
+grep -E '^(ROUTING_STRATEGY|REQUEST_TIMEOUT|FIRST_EVENT_TIMEOUT|INIT_TIMEOUT|WARM_STARTUP_CONCURRENCY|WARM_WORKER_LIMIT|MAX_ACTIVE_WORKERS|ULTRA_WARM_WORKER_LIMIT|ULTRA_MAX_ACTIVE_WORKERS|PER_ACCOUNT_CONCURRENCY|ACCOUNT_RPM_LIMIT|PRIMARY_MODELS|PRIMARY_QUEUE_WAIT|ULTRA_PRIMARY_MODELS|ULTRA_PRIMARY_QUEUE_WAIT|ULTRA_INCLUDE_PRO|ULTRA_EXCLUSIVE|PRO_POOL|PRO_WARM_WORKER_LIMIT|PRO_MAX_ACTIVE_WORKERS)=' .env 2>/dev/null | sed 's/^/  /'
 git log --oneline -1 2>/dev/null | cut -c1-7 | sed 's/^/  版本：/'
 
 for path in status accounts cooldowns accounts/permission-denied; do
@@ -269,6 +269,13 @@ section("7. 常驻浏览器与能用付费模型的账号（按权益）")
 status = load("status.json") or {}
 warm = (status.get("workers") or {}).get("warm_ids") or []
 print("  常驻浏览器按权益：" + (str(dict(collections.Counter(tier(a) for a in warm))) if warm else "读不到"))
+# 号池（成员关系，不是权益）：PRO_POOL=true（默认）时 Pro 账户在 Pro 号池（只服务 /pro），关闭时留在普通号池或经 ULTRA_INCLUDE_PRO 并入 Ultra 号池
+pool_of = {a.get("id"): a.get("pool") or "normal" for a in accounts}
+print("  常驻浏览器按号池：" + (str(dict(collections.Counter(pool_of.get(a, "?") for a in warm))) if warm else "读不到"))
+for key, name in (("workers", "普通"), ("ultra_workers", "Ultra"), ("pro_workers", "Pro")):
+    part = status.get(key) or {}
+    if part.get("max"):
+        print(f"  {name} 分区 Worker：就绪 {part.get('warm')} / 预热目标 {part.get('target')} / 峰值 {part.get('max')}")
 for model in ("gemini-3.1-pro-preview", "gemini-4-carbon"):
     usable = collections.Counter((tier(a.get("id")), a.get("state")) for a in accounts if model in (a.get("models") or []))
     print(f"  目录里有 {model} 的账号（权益, 状态）：" + (", ".join(f"{t}/{s} {n}" for (t, s), n in usable.most_common(12)) or "无"))

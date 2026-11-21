@@ -44,6 +44,8 @@ func newIncludeProRuntime(t *testing.T) *includeProRuntime {
 		os.Unsetenv(key)
 	}
 	cfg := config.Default()
+	// ULTRA_INCLUDE_PRO 只在 PRO_POOL=false 时生效（PRO_POOL 默认开启）：这组测试验证并入 Ultra 号池的行为，固定关闭 Pro 独立号池
+	cfg.ProPool = false
 	cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency = 1, 2, 1
 	cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers = 1, 1
 	cfg.UltraPrimaryModels = []string{testRuntimeModel}
@@ -215,7 +217,7 @@ func TestUltraIncludeProHotReload(t *testing.T) {
 	if !env.pool.UltraIncludePro() || !env.manager.current.config.UltraIncludePro {
 		t.Fatal("保存后账户池与生效配置都应开启 ULTRA_INCLUDE_PRO")
 	}
-	if _, member := env.pool.UltraAccountIDs()[includeProAccount]; !member {
+	if member := env.pool.PartitionMembers().Of(includeProAccount) == aistudio.PoolScopeUltra; !member {
 		t.Fatal("保存后 Ultra 号池成员应包含 Pro 账户")
 	}
 	if got := sortedUnique(env.workers.warmAccountIDsIn(aistudio.PoolScopeUltra)); !slices.Equal(got, []string{includeProAccount, partitionUltraA}) {
@@ -249,7 +251,7 @@ func TestUltraIncludeProHotReload(t *testing.T) {
 	if env.pool.UltraIncludePro() || env.manager.current.config.UltraIncludePro {
 		t.Fatal("再保存 false 后应关闭")
 	}
-	if _, member := env.pool.UltraAccountIDs()[includeProAccount]; member {
+	if member := env.pool.PartitionMembers().Of(includeProAccount) == aistudio.PoolScopeUltra; member {
 		t.Fatal("关闭后 Ultra 号池成员不应包含 Pro 账户")
 	}
 	if got := env.workers.warmAccountIDsIn(aistudio.PoolScopeNormal); !slices.Equal(got, []string{includeProAccount}) {
@@ -307,7 +309,7 @@ func TestUltraIncludeProConcurrentSaves(t *testing.T) {
 	if pool := env.pool.UltraIncludePro(); pool != saved.UltraIncludePro || active != saved.UltraIncludePro {
 		t.Fatalf("并发保存后 账户池=%t 生效配置=%t .env=%t，三者应一致", pool, active, saved.UltraIncludePro)
 	}
-	_, member := env.pool.UltraAccountIDs()[includeProAccount]
+	member := env.pool.PartitionMembers().Of(includeProAccount) == aistudio.PoolScopeUltra
 	if member != saved.UltraIncludePro {
 		t.Fatalf("并发保存后 Ultra 号池含 Pro=%t，与 .env=%t 不一致", member, saved.UltraIncludePro)
 	}
@@ -386,7 +388,7 @@ func TestPartitionFollowsIncludePro(t *testing.T) {
 	}
 	toggle := func(manager *accountWorkerManager, pool *aistudio.AccountPool, on bool) {
 		if pool.SetUltraIncludePro(on) {
-			manager.poolRuleChanged(true)
+			manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 		}
 	}
 
@@ -406,7 +408,7 @@ func TestPartitionFollowsIncludePro(t *testing.T) {
 		if capacity.partition(includeProAccount) != aistudio.PoolScopeUltra || capacity.active[aistudio.PoolScopeUltra] != 2 || capacity.room(aistudio.PoolScopeUltra) {
 			t.Fatalf("容量判断应把 Pro 计入 Ultra 分区：占用 %d", capacity.active[aistudio.PoolScopeUltra])
 		}
-		if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeUltra, pool.UltraAccountIDs()); occupied.slots != 2 {
+		if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeUltra, pool.PartitionMembers()); occupied.slots != 2 {
 			t.Fatalf("Ultra 分区占用 %d 个槽位，期望 2", occupied.slots)
 		}
 		toggle(manager, pool, false)
@@ -492,7 +494,8 @@ func TestDrainRetaggedOnIncludePro(t *testing.T) {
 	defer release()
 	expect := func(step string, normal int, ultra int) {
 		t.Helper()
-		gotNormal, gotUltra := manager.drainCounts()
+		drains := manager.drainCounts()
+		gotNormal, gotUltra := drains[aistudio.PoolScopeNormal], drains[aistudio.PoolScopeUltra]
 		if gotNormal != normal || gotUltra != ultra {
 			t.Fatalf("%s：排空计数 普通 %d · Ultra %d，期望 %d · %d", step, gotNormal, gotUltra, normal, ultra)
 		}
@@ -506,7 +509,7 @@ func TestDrainRetaggedOnIncludePro(t *testing.T) {
 	}
 	expect("关闭时开始排空", 1, 0)
 	pool.SetUltraIncludePro(true)
-	manager.poolRuleChanged(true)
+	manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 	expect("开启后改标", 0, 1)
 	manager.clearDrain(includeProAccount)
 	expect("清除排空", 0, 0)
@@ -523,7 +526,7 @@ func TestDrainRetaggedOnIncludePro(t *testing.T) {
 	}
 	expect("开启后用新分区参数开始排空", 0, 1)
 	pool.SetUltraIncludePro(false)
-	manager.poolRuleChanged(true)
+	manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 	expect("关闭后改标", 1, 0)
 	manager.clearDrain(includeProAccount)
 }
@@ -569,7 +572,7 @@ func TestReplacementFollowsIncludePro(t *testing.T) {
 		}
 		defer manager.clearDrain(includeProAccount)
 		pool.SetUltraIncludePro(true)
-		manager.poolRuleChanged(true)
+		manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 		// 与 retirePass 相同：用排空开始时的分区参数启动替补
 		manager.startReplacement(aistudio.PoolScopeNormal, []string{testRuntimeModel}, "排空", drain)
 		if !waitUntil(5*time.Second, func() bool { return drain.replacement.Load() != replacementPending }) {
@@ -601,7 +604,7 @@ func TestReplacementFollowsIncludePro(t *testing.T) {
 			partition: aistudio.PoolScopeNormal,
 		}
 		pool.SetUltraIncludePro(true)
-		manager.poolRuleChanged(true)
+		manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 		manager.finishRetirement(victim)
 		if slices.Contains(manager.WarmAccountIDs(), includeProAccount) {
 			t.Fatal("空闲的 Pro Worker 应已关闭")

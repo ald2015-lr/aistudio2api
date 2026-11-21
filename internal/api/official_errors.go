@@ -32,6 +32,8 @@ const (
 	officialUnnamedFunctionCallMessage = "The model returned a function call without a function name, so it cannot be executed. Please retry."
 	// officialUltraUnavailableMessage 用于 /ultra 请求时 Ultra 号池没有可用账户（没有官方原文，措辞沿用服务不可用的官方说法）
 	officialUltraUnavailableMessage = "The service is currently unavailable: no account in the Ultra pool is ready."
+	// officialProUnavailableMessage 用于 /pro 请求时 Pro 号池没有可用账户（含请求进行中 PRO_POOL 被关闭），措辞与 Ultra 号池的相同
+	officialProUnavailableMessage = "The service is currently unavailable: no account in the Pro pool is ready."
 	// officialBuildDisabledMessage 用于官网停用了 Build 通道的生成（PROXY_GENERATION_DISABLED）、又没有其他通道接下请求的兜底（没有官方原文）
 	officialBuildDisabledMessage = "The service is currently unavailable: AI Studio has disabled generation through the Build channel. Please try again later."
 )
@@ -173,14 +175,18 @@ func publicErrorFor(err error, model string) publicError {
 	// 号池一侧的暂时性原因（账户需要重新登录、已停用、被占用，号池为空或目录尚未加载）：按服务暂时不可用返回
 	var notReady *aistudio.AccountsNotReadyError
 	if errors.As(err, &notReady) {
-		if notReady.Pool == aistudio.PoolScopeUltra {
+		switch notReady.Pool {
+		case aistudio.PoolScopeUltra:
 			// /ultra 请求：说明是 Ultra 号池暂时没有可用账户，调用方可以改走普通路径或稍后重试
 			return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialUltraUnavailableMessage}
+		case aistudio.PoolScopePro:
+			// /pro 请求：Pro 号池暂时没有可用账户（不借用其他号池），或请求进行中 PRO_POOL 被关闭
+			return publicError{Status: http.StatusServiceUnavailable, RPC: "UNAVAILABLE", Message: officialProUnavailableMessage}
 		}
 		return unavailablePublicError()
 	}
 	if errors.Is(err, aistudio.ErrModelNotFound) {
-		return modelNotFoundPublicError(model)
+		return withOtherPoolHint(err, modelNotFoundPublicError(model))
 	}
 	// 不固定账户的生成选号没有候选（见 aistudio.NoServingAccountError）：模型不在这个号池的模型列表里（权益、方法或启用的上游通道接不了）
 	// 按 404 NOT_FOUND 与写明原因类别的英文说明（OpenAI code 为 model_not_found），模型在列、暂时没有账户能接按 503 UNAVAILABLE
@@ -190,6 +196,7 @@ func publicErrorFor(err error, model string) publicError {
 		public := publicError{Status: noServing.HTTPStatus(), RPC: noServing.RPCStatus(), Message: noServing.PublicMessage(), Code: "model_unavailable"}
 		if !noServing.Listed {
 			public.Kind, public.Code = publicKindModelNotFound, ""
+			public = withOtherPoolHint(err, public)
 		}
 		return public
 	}
@@ -297,6 +304,21 @@ func rateLimitPublicError() publicError {
 
 func invalidPublicError(err error) publicError {
 	return publicError{Status: http.StatusBadRequest, RPC: "INVALID_ARGUMENT", Message: publicInvalidMessage(err)}
+}
+
+// withOtherPoolHint 在普通路径的模型不存在说明后追加改用入口的英文提示：请求号池里没有账户能服务、Pro 或 Ultra 号池里有
+// （aistudio.ModelInOtherPoolError，只在 app 选号失败的错误路径上构造，见 missingModelError），
+// 如 "... Call ListModels to see the list of available models. This model is available through the /pro or /ultra endpoints."；
+// 状态码、错误代码（model_not_found）不变，其他错误原样返回
+func withOtherPoolHint(err error, public publicError) publicError {
+	var other *aistudio.ModelInOtherPoolError
+	if !errors.As(err, &other) {
+		return public
+	}
+	if hint := other.PublicHint(); hint != "" {
+		public.Message = strings.TrimSpace(public.Message) + " " + hint
+	}
+	return public
 }
 
 func modelNotFoundPublicError(model string) publicError {

@@ -154,27 +154,30 @@ func newRequestRegistry(ctx context.Context) *requestRegistry {
 }
 
 func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
-	// 只统计数量，不构建上千个账户的完整状态，避免长时间占用账户池锁；同一次加锁同时统计 Ultra 号池
-	stateCounts, ultraCounts := admin.pool.PoolStateCounts()
+	// 只统计数量，不构建上千个账户的完整状态，避免长时间占用账户池锁；同一次加锁同时统计 Ultra 与 Pro 号池
+	stateCounts, partitionStates := admin.pool.PoolStateCounts()
 	counts := adminAccountCounts(stateCounts)
 	state := admin.service.State()
 	running := state == "RUNNING"
 	warm := admin.workers.WarmAccountIDs()
 	sort.Strings(warm)
 	starting := admin.workers.OpeningAccountIDs()
-	// Worker 计数按分区：workers 的数量与上限只含普通分区，ultra_workers 为 Ultra 分区；Worker 列表包含两个分区
-	ultra := admin.pool.UltraAccountIDs()
-	normalOccupied, ultraOccupied := admin.workers.occupiedSlotsApprox(ultra)
+	// Worker 计数按分区：workers 的数量与上限只含普通分区，ultra_workers、pro_workers 为 Ultra 与 Pro 分区；Worker 列表包含全部分区
+	members := admin.pool.PartitionMembers()
+	occupied := admin.workers.occupiedSlotsApprox(members)
 	// 死槽位：驻留 Worker 的账号长时间冷却（见 worker_retire.go），占着名额却服务不了请求，等待淘汰
-	normalDead, ultraDead := admin.workers.deadWarmCounts(warm, ultra)
+	dead := admin.workers.deadWarmCounts(warm, members)
 	// 排空中（见 worker_drain.go）与待淘汰登记的数量
-	normalDraining, ultraDraining := admin.workers.drainCounts()
-	normalRetiring, ultraRetiring := admin.workers.retirementCounts(ultra)
+	draining := admin.workers.drainCounts()
+	retiring := admin.workers.retirementCounts(members)
 	// 不可调度：驻留 Worker 的账号需要登录、已停用、没有模型目录（见 worker_unschedulable.go），等待释放；口径与死槽位分开
-	normalUnschedulable, ultraUnschedulable := admin.workers.unschedulableWarmCounts(warm, ultra)
-	ultraWorkers := admin.workers.ultraWorkerCounts(ultra, warm, starting, ultraOccupied, ultraDead)
-	ultraWorkers.Draining, ultraWorkers.Retiring = ultraDraining, ultraRetiring
-	ultraWorkers.Unschedulable = ultraUnschedulable
+	unschedulable := admin.workers.unschedulableWarmCounts(warm, members)
+	paidWorkers := func(partition aistudio.PoolScope) api.AdminWorkerPartition {
+		workers := admin.workers.partitionWorkerCounts(partition, members, warm, starting, occupied[partition], dead[partition])
+		workers.Draining, workers.Retiring = draining[partition], retiring[partition]
+		workers.Unschedulable = unschedulable[partition]
+		return workers
+	}
 	// 主用模型供给读 keepWarm 的缓存（见 primary_supply.go），不在状态请求里对账户分类；服务没有运行时不显示
 	var primarySupply []api.AdminPrimarySupply
 	var catalogSync *api.AdminCatalogSync
@@ -213,16 +216,19 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Version:        buildVersion(),
 		ActiveRequests: admin.requests.count(),
 		Accounts:       counts,
-		UltraAccounts:  adminAccountCounts(ultraCounts),
+		UltraAccounts:  adminAccountCounts(partitionStates[aistudio.PoolScopeUltra]),
 		Workers: api.AdminWorkerCounts{
-			Warm: len(inPartition(warm, ultra, normal)), Starting: len(inPartition(starting, ultra, normal)),
+			Warm: len(inPartition(warm, members, normal)), Starting: len(inPartition(starting, members, normal)),
 			Target: admin.workers.prewarmTargetFor(normal), Max: admin.workers.maxActiveFor(normal),
-			Occupied: normalOccupied, Dead: normalDead, Draining: normalDraining, Retiring: normalRetiring,
+			Occupied: occupied[normal], Dead: dead[normal], Draining: draining[normal], Retiring: retiring[normal],
 			Prewarm: admin.workers.prewarmState(),
 			WarmIDs: warm, StartingIDs: starting,
-			Unschedulable: normalUnschedulable,
+			Unschedulable: unschedulable[normal],
 		},
-		UltraWorkers:  ultraWorkers,
+		UltraWorkers:  paidWorkers(aistudio.PoolScopeUltra),
+		ProAccounts:   adminAccountCounts(partitionStates[aistudio.PoolScopePro]),
+		ProWorkers:    paidWorkers(aistudio.PoolScopePro),
+		ProPoolNotice: admin.service.proPoolNotice(partitionStates[aistudio.PoolScopePro].Total),
 		PrimarySupply: primarySupply,
 		CatalogSync:   catalogSync,
 		Egress:        egress,
@@ -1348,6 +1354,17 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.UltraIncludePro != nil {
 		ultraIncludePro = *value.UltraIncludePro
 	}
+	// Pro 号池设置：旧版页面保存时不带这些字段，沿用现值（漏掉时每次保存都会把 PRO_POOL 写成 false、峰值写成 0）
+	proPool, proWarm, proMax := saved.ProPool, saved.ProWarmWorkerLimit, saved.ProMaxActiveWorkers
+	if value.ProPool != nil {
+		proPool = *value.ProPool
+	}
+	if value.ProWarmWorkerLimit != nil {
+		proWarm = *value.ProWarmWorkerLimit
+	}
+	if value.ProMaxActiveWorkers != nil {
+		proMax = *value.ProMaxActiveWorkers
+	}
 	if value.UltraWarmWorkerLimit != nil {
 		ultraWarm = *value.UltraWarmWorkerLimit
 	}
@@ -1462,6 +1479,7 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		Proxy: proxy, ProxyPool: poolSettings, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
+		ProPool: proPool, ProWarmWorkerLimit: proWarm, ProMaxActiveWorkers: proMax,
 		UltraOnlyModels: ultraOnlyModels, PaidOnlyModels: paidOnlyModels,
 		StreamDataHeartbeat:    streamDataHeartbeat,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
@@ -1496,7 +1514,14 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
 	}
-	if err := cfg.SaveKeeping(admin.configPath, uneditedInvalidConfigKeys(saved.Invalid)); err != nil {
+	// PRO_POOL 默认开启的升级提示（见 pro_pool.go）：.env 与进程环境变量都没有写 PRO_POOL 时，只有这次保存改了 Pro 号池的设置
+	// （开关或两个 Worker 数）才写出 PRO_POOL，算运维做过选择、不再提示；只保存其他设置时不写这一行，开关仍按默认开启、照旧提示
+	var unset []string
+	if !config.KeyConfigured(admin.configPath, "PRO_POOL") &&
+		proPool == saved.ProPool && proWarm == saved.ProWarmWorkerLimit && proMax == saved.ProMaxActiveWorkers {
+		unset = []string{"PRO_POOL"}
+	}
+	if err := cfg.SaveKeepingUnset(admin.configPath, uneditedInvalidConfigKeys(saved.Invalid), unset); err != nil {
 		return api.RuntimeConfig{}, err
 	}
 	admin.requests.log("service", "INFO", "服务配置已保存")
@@ -2199,6 +2224,9 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		DowngradeGuard:         downgradeGuardToAPI(cfg.DowngradeGuard),
 		UltraExclusive:         &cfg.UltraExclusive,
 		UltraIncludePro:        &cfg.UltraIncludePro,
+		ProPool:                &cfg.ProPool,
+		ProWarmWorkerLimit:     &cfg.ProWarmWorkerLimit,
+		ProMaxActiveWorkers:    &cfg.ProMaxActiveWorkers,
 		UltraOnlyModels:        &ultraOnlyModels,
 		PaidOnlyModels:         &paidOnlyModels,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,

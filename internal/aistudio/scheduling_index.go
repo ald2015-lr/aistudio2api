@@ -28,7 +28,9 @@ import (
 const (
 	// schedulingSetMaxAge 为候选集两次全量重建的间隔
 	schedulingSetMaxAge = time.Minute
-	// schedulingSetMaxCount 为候选集数量上限，超过时淘汰最久未用的
+	// schedulingSetMaxCount 为候选集数量上限，超过时淘汰最久未用的。候选集按选择条件（含号池）分开：请求路径上的号池有普通路径
+	// （普通号池，或 ULTRA_EXCLUSIVE=false 时的不限号池 / 普通号池与 Ultra 号池，同一时刻只有一种）、/ultra、/pro 与指定账户（不限号池），
+	// 每个模型的一组条件最多 4 个，比只有两个号池时多 /pro 一个；常用的几十个模型 × 少数几组条件远低于上限
 	schedulingSetMaxCount = 256
 	// schedulingBuildRebuildInterval 为 Build 通道候选集在目录版本变化后重建的最短间隔：Build 通道能否调用模型
 	// 还取决于其他账户 Playground 目录中的同名模型（见 buildSupportsModelLocked），这个跨账户依赖按节流重建
@@ -435,24 +437,29 @@ func (p *AccountPool) indexAccountAddedLocked(account *Account) {
 	p.accountChangedLocked(account)
 }
 
-// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集、Ultra 号池成员集合与缓存的状态列表；调用方持有 p.mu。
+// accountChangedLocked 在账户的目录、权益、状态、启用或运行态变化后更新各候选集、分区成员集合与缓存的状态列表；调用方持有 p.mu。
 // 每条修改这些字段的路径都必须调用，否则候选集要等下次全量重建才能反映变化，Status() 要等缓存过期才与 StatusOf 一致
 func (p *AccountPool) accountChangedLocked(account *Account) {
 	if account == nil {
 		return
 	}
-	// 只在成员实际变化时修改集合并作废 UltraAccountIDs 的快照：这里每秒被冷却、状态与运行态变化调用很多次，
-	// 每次都作废等于没有写时复制
-	want := ultraPoolTier(account.BenefitTier, p.ultraIncludePro) && p.byID[account.ID] == account
-	if _, has := p.ultraAccounts[account.ID]; has != want {
-		if want {
-			p.ultraAccounts[account.ID] = struct{}{}
+	// 只在分区实际变化时修改集合并作废 PartitionMembers 的快照：这里每秒被冷却、状态与运行态变化调用很多次，
+	// 每次都作废等于没有写时复制。权益尚未读取的账户按 Free 在普通分区，读到 Pro 或 Ultra 后在这里换到对应分区
+	want := PoolScopeNormal
+	if p.byID[account.ID] == account {
+		want = p.rules.partitionOf(account.BenefitTier)
+	}
+	if have := p.memberPartitionLocked(account.ID); have != want {
+		if want == PoolScopeNormal {
+			delete(p.partitionMembers, account.ID)
 		} else {
-			delete(p.ultraAccounts, account.ID)
+			p.partitionMembers[account.ID] = want
 		}
-		p.ultraSnapshot = nil
-		// Ultra 号池的账户挂在出口的 Ultra 通道上（见 egress_rate.go），成员变化时换通道
-		p.attachEgressLocked(account)
+		p.membersSnapshot = nil
+		// 只有 Ultra 分区的账户挂在出口的 Ultra 通道上（见 egress_rate.go）：进出 Ultra 分区时换通道，普通与 Pro 之间的移动不换
+		if have == PoolScopeUltra || want == PoolScopeUltra {
+			p.attachEgressLocked(account)
+		}
 	}
 	if p.sched != nil {
 		if p.sched.positionValid(p, account) {

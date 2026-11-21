@@ -508,9 +508,12 @@ function toolPayload(input: PlaygroundInput): unknown[] | undefined {
   return [{ type: input.tool }]
 }
 
-// playgroundPrefix 返回试用请求的路径前缀：使用 Ultra 账户时经 /ultra 发送，只由 Ultra 号池的账户处理
-export function playgroundPrefix(input: Pick<PlaygroundInput, 'ultra'>): string {
-  return input.ultra ? '/ultra' : ''
+// playgroundPrefix 返回试用请求的路径前缀：选 Ultra 号池时经 /ultra 发送、只由 Ultra 号池的账户处理，选 Pro 号池时经 /pro 发送、
+// 只由 Pro 号池的账户处理，默认地址没有前缀
+export function playgroundPrefix(input: Pick<PlaygroundInput, 'pool'>): string {
+  if (input.pool === 'ultra') return '/ultra'
+  if (input.pool === 'pro') return '/pro'
+  return ''
 }
 
 // buildPlaygroundRequest 将输出类型和协议映射为公开 API 请求（路径不含号池前缀）

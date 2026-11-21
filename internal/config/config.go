@@ -30,6 +30,9 @@ const (
 	// defaultUltraWarmWorkerLimit 与 defaultUltraMaxActiveWorkers 为 Ultra 分区的常驻与峰值 Worker 数
 	defaultUltraWarmWorkerLimit  = 2
 	defaultUltraMaxActiveWorkers = 5
+	// defaultProWarmWorkerLimit 与 defaultProMaxActiveWorkers 为 Pro 分区（PRO_POOL=true）的常驻与峰值 Worker 数
+	defaultProWarmWorkerLimit  = 2
+	defaultProMaxActiveWorkers = 5
 	// defaultAccountRPMLimit 为单账号每分钟生成请求上限的默认值：上游每账号每分钟 12 次（所有模型、两个通道共用），留出余量；
 	// maxAccountRPMLimit 为允许配置的最大值
 	defaultAccountRPMLimit = 10
@@ -68,10 +71,13 @@ var configKeys = [...]string{
 	"MAX_ACTIVE_WORKERS",
 	"ULTRA_EXCLUSIVE",
 	"ULTRA_INCLUDE_PRO",
+	"PRO_POOL",
 	"ULTRA_ONLY_MODELS",
 	"PAID_ONLY_MODELS",
 	"ULTRA_WARM_WORKER_LIMIT",
 	"ULTRA_MAX_ACTIVE_WORKERS",
+	"PRO_WARM_WORKER_LIMIT",
+	"PRO_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ACCOUNT_RPM_LIMIT",
@@ -215,8 +221,14 @@ type Config struct {
 	// UltraExclusive 为真（默认）时 Ultra 号池的账户只服务 /ultra 前缀的请求，普通路径只用其余账户；为假时普通路径也可以用 Ultra 号池的账户
 	UltraExclusive bool `json:"ultra_exclusive"`
 	// UltraIncludePro 为真时权益为 Pro 的账户并入 Ultra 号池（付费号池）与 Ultra Worker 分区，按全部 ULTRA_* 设置调度；
-	// 账户权益本身不变（权益请求头、输入上限、模型资格、更高权益重试仍按 Pro）。默认 false，保存后立即生效
+	// 账户权益本身不变（权益请求头、输入上限、模型资格、更高权益重试仍按 Pro）。默认 false，保存后立即生效。
+	// ProPool 为真时不生效（只保存原值，关闭 PRO_POOL 后按它划分）
 	UltraIncludePro bool `json:"ultra_include_pro"`
+	// ProPool 为 Pro 独立号池（PRO_POOL，默认开启，保存后立即生效、不重启浏览器）：为真时权益为 Pro 的账户单独组成 Pro 号池与 Pro Worker 分区，
+	// 只服务 /pro 前缀的请求，不再服务普通路径与 /ultra；/pro 只用 Pro 账户，不借用 Ultra 或其他账户（没有就绪的 Pro 账户为 503，
+	// 候选全部冷却、主用模型额度不足或繁忙为 429）。Pro 不能用的模型靠 ULTRA_ONLY_MODELS 挡住（默认 gemini-4-carbon）。
+	// 为真时 UltraIncludePro 不生效。为假时与没有这项设置之前相同，/pro 前缀返回 404
+	ProPool bool `json:"pro_pool"`
 	// UltraOnlyModels 为只有 Ultra 权益的账户能用的模型（ULTRA_ONLY_MODELS，逗号分隔，默认 gemini-4-carbon），PaidOnlyModels 为只有付费权益
 	// （Pro 与 Ultra，不含 Plus）的账户能用的模型（PAID_ONLY_MODELS，默认 gemini-3.1-pro-preview）。只收窄、不放宽：账户还要目录按权益允许；
 	// 按账户真实权益判断（ULTRA_INCLUDE_PRO 并入的 Pro 仍是 Pro），权益尚未读取的账户按 Free 处理；名称与目录模型的 ID 或别名比较，不区分大小写，
@@ -229,6 +241,10 @@ type Config struct {
 	// 常驻数可以为 0（只按需启动）
 	UltraWarmWorkerLimit  int `json:"ultra_warm_worker_limit"`
 	UltraMaxActiveWorkers int `json:"ultra_max_active_workers"`
+	// ProWarmWorkerLimit 与 ProMaxActiveWorkers 为 Pro 分区（PRO_POOL=true 时 Pro 号池的账户）的常驻与峰值 Worker 数，
+	// 与普通分区、Ultra 分区分开计算，浏览器总数最多为三个分区峰值之和（PRO_POOL=false 时 Pro 分区为空）；常驻数可以为 0（只按需启动）
+	ProWarmWorkerLimit  int `json:"pro_warm_worker_limit"`
+	ProMaxActiveWorkers int `json:"pro_max_active_workers"`
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
@@ -267,11 +283,14 @@ func Default() Config {
 		MaxActiveWorkers:       defaultMaxActiveWorkers,
 		UltraExclusive:         true,
 		UltraIncludePro:        false,
+		ProPool:                true,
 		StreamDataHeartbeat:    true,
 		OmniIgnoreSystemPrompt: true,
 		OmniImageBinding:       true,
 		UltraWarmWorkerLimit:   defaultUltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
+		ProWarmWorkerLimit:     defaultProWarmWorkerLimit,
+		ProMaxActiveWorkers:    defaultProMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		AccountRPMLimit:        defaultAccountRPMLimit,
@@ -382,12 +401,16 @@ func Load(path string) (Config, error) {
 	integer("MAX_ACTIVE_WORKERS", false, parsePositiveInt, &cfg.MaxActiveWorkers)
 	boolean("ULTRA_EXCLUSIVE", true, &cfg.UltraExclusive)
 	boolean("ULTRA_INCLUDE_PRO", true, &cfg.UltraIncludePro)
+	// PRO_POOL：空值与写法无效时保持默认开启（无效值记入无效项、不阻止启动，与 ULTRA_EXCLUSIVE 相同）
+	boolean("PRO_POOL", true, &cfg.ProPool)
 	// 权益规则：键存在时按写的值（空值表示没有规则），键不存在时保持默认列表；进程环境变量的空值在上面已被忽略。
 	// 写法无效（long- 开头等，见 validateTierRuleModels）时由联动校验改回默认列表并记入无效项
 	models("ULTRA_ONLY_MODELS", &cfg.UltraOnlyModels)
 	models("PAID_ONLY_MODELS", &cfg.PaidOnlyModels)
 	integer("ULTRA_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.UltraWarmWorkerLimit)
 	integer("ULTRA_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.UltraMaxActiveWorkers)
+	integer("PRO_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.ProWarmWorkerLimit)
+	integer("PRO_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.ProMaxActiveWorkers)
 	integer("WARM_STARTUP_CONCURRENCY", false, parsePositiveInt, &cfg.WarmStartupConcurrency)
 	integer("PER_ACCOUNT_CONCURRENCY", false, parsePositiveInt, &cfg.PerAccountConcurrency)
 	// 空值沿用默认值，关闭必须写 0
@@ -477,15 +500,21 @@ func Load(path string) (Config, error) {
 
 // Save 将配置原子写入指定 env 文件
 func (c Config) Save(path string) error {
-	return c.save(path, nil)
+	return c.save(path, nil, nil)
 }
 
 // SaveKeeping 与 Save 相同，只是 keep 里的键在现有文件里有这一行时沿用文件里的原值，不写 c 的值（文件里没有时照常写 c 的值）。
 // 管理页不编辑的键（REQUEST_BODY_LOG 等）在 .env 里取值无效、按默认值生效时，保存其他设置不把默认值写回、抹掉原值：
 // 下次加载照旧记为无效项，要在 .env 里改正
 func (c Config) SaveKeeping(path string, keep []string) error {
-	if len(keep) == 0 {
-		return c.save(path, nil)
+	return c.SaveKeepingUnset(path, keep, nil)
+}
+
+// SaveKeepingUnset 与 SaveKeeping 相同，另外 unset 里的键在现有文件里没有这一行（或值为空）时不写这一行：仍按默认值生效、保持“没有设置”，
+// 供默认值改变了行为的升级提示判断用户是否自己选过（见 KeyConfigured，如 PRO_POOL 默认开启）；文件里有这一行时照常写 c 的值
+func (c Config) SaveKeepingUnset(path string, keep []string, unset []string) error {
+	if len(keep) == 0 && len(unset) == 0 {
+		return c.save(path, nil, nil)
 	}
 	existing, err := readEnvFile(path)
 	if err != nil {
@@ -497,11 +526,17 @@ func (c Config) SaveKeeping(path string, keep []string) error {
 			kept[key] = value
 		}
 	}
-	return c.save(path, kept)
+	omitted := make(map[string]struct{}, len(unset))
+	for _, key := range unset {
+		if strings.TrimSpace(existing[key]) == "" {
+			omitted[key] = struct{}{}
+		}
+	}
+	return c.save(path, kept, omitted)
 }
 
-// save 校验后按 configKeys 的顺序整体重写 env 文件；kept 里的键写它的值
-func (c Config) save(path string, kept map[string]string) error {
+// save 校验后按 configKeys 的顺序整体重写 env 文件；kept 里的键写它的值，omitted 里的键不写
+func (c Config) save(path string, kept map[string]string, omitted map[string]struct{}) error {
 	if err := c.Validate(); err != nil {
 		return err
 	}
@@ -518,10 +553,13 @@ func (c Config) save(path string, kept map[string]string) error {
 		"MAX_ACTIVE_WORKERS":       strconv.Itoa(c.MaxActiveWorkers),
 		"ULTRA_EXCLUSIVE":          strconv.FormatBool(c.UltraExclusive),
 		"ULTRA_INCLUDE_PRO":        strconv.FormatBool(c.UltraIncludePro),
+		"PRO_POOL":                 strconv.FormatBool(c.ProPool),
 		"ULTRA_ONLY_MODELS":        strings.Join(c.UltraOnlyModels, ","),
 		"PAID_ONLY_MODELS":         strings.Join(c.PaidOnlyModels, ","),
 		"ULTRA_WARM_WORKER_LIMIT":  strconv.Itoa(c.UltraWarmWorkerLimit),
 		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
+		"PRO_WARM_WORKER_LIMIT":    strconv.Itoa(c.ProWarmWorkerLimit),
+		"PRO_MAX_ACTIVE_WORKERS":   strconv.Itoa(c.ProMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ACCOUNT_RPM_LIMIT":        strconv.Itoa(c.AccountRPMLimit),
@@ -564,6 +602,9 @@ func (c Config) save(path string, kept map[string]string) error {
 
 	var output strings.Builder
 	for _, key := range configKeys {
+		if _, skip := omitted[key]; skip {
+			continue
+		}
 		output.WriteString(key)
 		output.WriteByte('=')
 		output.WriteString(formatEnvValue(values[key]))
@@ -653,10 +694,13 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MaxActiveWorkers       int               `json:"max_active_workers"`
 		UltraExclusive         bool              `json:"ultra_exclusive"`
 		UltraIncludePro        bool              `json:"ultra_include_pro"`
+		ProPool                bool              `json:"pro_pool"`
 		UltraOnlyModels        []string          `json:"ultra_only_models"`
 		PaidOnlyModels         []string          `json:"paid_only_models"`
 		UltraWarmWorkerLimit   int               `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  int               `json:"ultra_max_active_workers"`
+		ProWarmWorkerLimit     int               `json:"pro_warm_worker_limit"`
+		ProMaxActiveWorkers    int               `json:"pro_max_active_workers"`
 		WarmStartupConcurrency int               `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int               `json:"per_account_concurrency"`
 		AccountRPMLimit        int               `json:"account_rpm_limit"`
@@ -697,10 +741,13 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		MaxActiveWorkers:       c.MaxActiveWorkers,
 		UltraExclusive:         c.UltraExclusive,
 		UltraIncludePro:        c.UltraIncludePro,
+		ProPool:                c.ProPool,
 		UltraOnlyModels:        ultraOnlyModels,
 		PaidOnlyModels:         paidOnlyModels,
 		UltraWarmWorkerLimit:   c.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
+		ProWarmWorkerLimit:     c.ProWarmWorkerLimit,
+		ProMaxActiveWorkers:    c.ProMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		AccountRPMLimit:        c.AccountRPMLimit,
@@ -745,10 +792,13 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		MaxActiveWorkers       int                `json:"max_active_workers"`
 		UltraExclusive         *bool              `json:"ultra_exclusive"`
 		UltraIncludePro        *bool              `json:"ultra_include_pro"`
+		ProPool                *bool              `json:"pro_pool"`
 		UltraOnlyModels        *[]string          `json:"ultra_only_models"`
 		PaidOnlyModels         *[]string          `json:"paid_only_models"`
 		UltraWarmWorkerLimit   *int               `json:"ultra_warm_worker_limit"`
 		UltraMaxActiveWorkers  *int               `json:"ultra_max_active_workers"`
+		ProWarmWorkerLimit     *int               `json:"pro_warm_worker_limit"`
+		ProMaxActiveWorkers    *int               `json:"pro_max_active_workers"`
 		WarmStartupConcurrency int                `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int                `json:"per_account_concurrency"`
 		AccountRPMLimit        *int               `json:"account_rpm_limit"`
@@ -787,7 +837,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有主用模型排队上限时按默认 10s 处理；
+	// 旧版数据没有该字段时按关闭处理；没有 Ultra 字段时按默认值处理（ULTRA_INCLUDE_PRO 默认关闭）；没有 Pro 字段时按默认值处理（PRO_POOL 默认开启）；没有主用模型排队上限时按默认 10s 处理；
 	// 没有单账号每分钟上限时按默认 10 处理（显式 0 表示关闭）；没有数据型心跳字段、视频模型忽略系统提示字段、视频模型带图校验值字段时
 	// 按默认开启处理
 	var firstEventTimeout time.Duration
@@ -849,10 +899,13 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		MaxActiveWorkers:       value.MaxActiveWorkers,
 		UltraExclusive:         value.UltraExclusive == nil || *value.UltraExclusive,
 		UltraIncludePro:        value.UltraIncludePro != nil && *value.UltraIncludePro,
+		ProPool:                value.ProPool == nil || *value.ProPool,
 		UltraOnlyModels:        ultraOnlyModels,
 		PaidOnlyModels:         paidOnlyModels,
 		UltraWarmWorkerLimit:   intOrDefault(value.UltraWarmWorkerLimit, defaultUltraWarmWorkerLimit),
 		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
+		ProWarmWorkerLimit:     intOrDefault(value.ProWarmWorkerLimit, defaultProWarmWorkerLimit),
+		ProMaxActiveWorkers:    intOrDefault(value.ProMaxActiveWorkers, defaultProMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		AccountRPMLimit:        intOrDefault(value.AccountRPMLimit, defaultAccountRPMLimit),
@@ -1263,6 +1316,19 @@ func escapeUserinfo(value string) string {
 		builder.WriteByte(hex[character&15])
 	}
 	return builder.String()
+}
+
+// KeyConfigured 判断配置键是否显式写了非空值：进程环境变量或 env 文件里有这一项（与 Load 相同，空值视为没有设置）。
+// 供“默认值改变了行为”的升级提示判断用户是否自己选过（如 PRO_POOL 默认开启）；env 文件读取失败时按没有设置
+func KeyConfigured(path string, key string) bool {
+	if value, ok := os.LookupEnv(key); ok && strings.TrimSpace(value) != "" {
+		return true
+	}
+	values, err := readEnvFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(values[key]) != ""
 }
 
 func readEnvFile(path string) (map[string]string, error) {

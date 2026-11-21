@@ -91,7 +91,7 @@ func (store *Store) Records(ctx context.Context, query api.UsageRecordQuery) (ap
 	return page, nil
 }
 
-// csvHeader 是导出文件的列名；pool 为号池（ultra 或 normal）
+// csvHeader 是导出文件的列名；pool 为号池（ultra、pro 或 normal）
 var csvHeader = []string{
 	"time", "id", "protocol", "path", "model", "account", "channel", "pool", "status", "state", "duration_ms", "first_event_ms",
 	"queue_ms", "input_tokens", "reasoning_tokens", "reply_tokens", "total_tokens", "tool_calls", "error", "attempts",

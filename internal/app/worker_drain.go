@@ -138,7 +138,7 @@ func (manager *accountWorkerManager) startDrain(accountID string, partition aist
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	// 锁顺序 drainMu 再到账户池锁，与下面的 SetDraining 相同；成员快照写时复制，这里只是一次加锁
-	if partitionOf(accountID, manager.pool.UltraAccountIDs()) != partition {
+	if partitionOf(accountID, manager.pool.PartitionMembers()) != partition {
 		return nil
 	}
 	slotLimit, totalLimit := manager.drainLimit(partition), manager.drainTotalLimit(partition)
@@ -232,20 +232,17 @@ func (manager *accountWorkerManager) drainCount(partition aistudio.PoolScope) in
 }
 
 // drainCounts 按分区返回排空中的账号数（供状态接口显示），一次加锁；软排空（还在接单）不计
-func (manager *accountWorkerManager) drainCounts() (normal int, ultra int) {
+func (manager *accountWorkerManager) drainCounts() partitionCounts {
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
+	var counts partitionCounts
 	for _, drain := range manager.drains {
 		if drain.soft.Load() {
 			continue
 		}
-		if drain.partition == aistudio.PoolScopeUltra {
-			ultra++
-		} else {
-			normal++
-		}
+		counts[namesPartition(drain.partition)]++
 	}
-	return normal, ultra
+	return counts
 }
 
 // drainingAccounts 返回排空中的账号（主用供给按它把排空中的驻留 Worker 不计为热账户）；软排空（还在接单）不算
@@ -376,12 +373,12 @@ func (manager *accountWorkerManager) primaryModelLists() (normal []string, ultra
 	return nil, nil
 }
 
-// primaryModelListFor 返回 Worker 分区判断死槽位、挑替补与统计供给用的主用模型：Ultra 分区用 Ultra 列表，其余用普通列表。
-// ULTRA_EXCLUSIVE=false 时普通路径也能用 Ultra 账号，但 Ultra 分区仍不并入普通列表：否则普通号池的主用模型冷却会把稀缺的
-// Ultra Worker 当成死槽位淘汰，而它们还能服务 Ultra 列表的模型
+// primaryModelListFor 返回 Worker 分区判断死槽位、挑替补与统计供给用的主用模型：Ultra 分区与 Pro 分区（/pro 沿用 ULTRA_PRIMARY_MODELS）
+// 用 Ultra 列表，其余用普通列表。ULTRA_EXCLUSIVE=false 时普通路径也能用 Ultra 账号，但 Ultra 分区仍不并入普通列表：否则普通号池的
+// 主用模型冷却会把稀缺的 Ultra Worker 当成死槽位淘汰，而它们还能服务 Ultra 列表的模型
 func (manager *accountWorkerManager) primaryModelListFor(partition aistudio.PoolScope) []string {
 	normal, ultra := manager.primaryModelLists()
-	if partition == aistudio.PoolScopeUltra {
+	if partition == aistudio.PoolScopeUltra || partition == aistudio.PoolScopePro {
 		return ultra
 	}
 	return normal
@@ -393,11 +390,11 @@ func (manager *accountWorkerManager) deadSlotModelsFor(partition aistudio.PoolSc
 	return mergeModelLists(manager.hotModelList(), manager.primaryModelListFor(partition))
 }
 
-// deadSlotModelsForScope 返回按选号号池判断死槽位用的模型：Ultra 号池与普通号池各用自己分区的列表，不限号池（候选跨两个分区）
-// 用两者的并集
+// deadSlotModelsForScope 返回按选号号池判断死槽位用的模型：Ultra、Pro 与普通号池各用自己分区的列表，不限号池与普通号池与 Ultra 号池
+// （候选跨多个分区）用普通与 Ultra 列表的并集
 func (manager *accountWorkerManager) deadSlotModelsForScope(scope aistudio.PoolScope) []string {
 	switch scope {
-	case aistudio.PoolScopeUltra, aistudio.PoolScopeNormal:
+	case aistudio.PoolScopeUltra, aistudio.PoolScopeNormal, aistudio.PoolScopePro:
 		return manager.deadSlotModelsFor(scope)
 	default:
 		normal, ultra := manager.primaryModelLists()
@@ -460,11 +457,11 @@ func (manager *accountWorkerManager) replacementsFor(evicted []evictedWorker) []
 	if len(pending) == 0 {
 		return nil
 	}
-	ultra := manager.pool.UltraAccountIDs()
+	members := manager.pool.PartitionMembers()
 	resident := make(map[aistudio.PoolScope]map[string]struct{}, len(workerPartitions))
 	for _, ids := range [][]string{manager.WarmAccountIDs(), manager.OpeningAccountIDs()} {
 		for _, accountID := range ids {
-			partition := partitionOf(accountID, ultra)
+			partition := partitionOf(accountID, members)
 			if resident[partition] == nil {
 				resident[partition] = make(map[string]struct{})
 			}

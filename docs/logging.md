@@ -229,7 +229,7 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 
 不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`，换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回去等待，写 `换号次数已用完，回到原账号等待 Worker 恢复后重放` 或 `已连续 5 次失败，回到原账号等待 Worker 恢复后重放`。这次失败计入连续失败上限后就到上限的请求不再换号，直接等原账户关闭完成。换号后的选号在排队（其他账户都忙）时原账户关闭完成，写 `换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号`：不再排除原账户，按原来的排队位置重新选号，不固定到原账户（关闭后它没有 Worker，要冷启动并占一个 Worker 槽位），原账户与其他账户哪个先能用就用哪个。回到原账户等待时请求超时或被取消，错误为 `回到原账号等待 <DURATION> 后请求超时（最后原因=WAA Worker 恢复，上次失败=...）: context deadline exceeded`（取消时为 `请求已取消`），对外仍是 504 或取消的官方措辞；经生成服务以首事件前期限结束时，`request.error` 前面另加 `本服务首事件前期限 <DURATION> 到期: `（见[流式等待](#流式等待)）。
 
-按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满` 表示 Ultra 分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`，`N/M` 为该分区驻留的 Worker 数与预热目标。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）；`OMNI_IGNORE_SYSTEM_PROMPT` 发生变化时记录 `视频模型忽略系统提示设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后进入的请求按新设置整理，Omni 请求去掉系统提示时的说明见 [API 请求](#api-请求)）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`；`策略=<ROUTING_STRATEGY>`（平均调用写成 `策略=balanced（平均调用）`，其余取值原样）之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；`IP 池` 之前带 `自动续写=<关闭 / 开启（默认总上限 N）>`，为保存并随这次热更新生效的 `LONG_OUTPUT_ENABLED` 与 `LONG_OUTPUT_MAX_TOKENS`（之后开始的请求立即按新设置）；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
+按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`PRO_POOL=false`、`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`；Pro 分区（`PRO_POOL=true` 时权益为 Pro 的账户）的同类事件以 `Pro WAA Worker` 开头，`M` 为 `PRO_MAX_ACTIVE_WORKERS`，常驻数为 `PRO_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满`、`Pro Worker 槽位已满` 表示该分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`（Pro 分区为 `Pro WAA Worker 预热等待`），`N/M` 为该分区驻留的 Worker 数与预热目标；冷却轮换、平均调用轮换与分区相关的日志同样按 `普通`、`Ultra`、`Pro` 写明分区。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）；`OMNI_IGNORE_SYSTEM_PROMPT` 发生变化时记录 `视频模型忽略系统提示设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后进入的请求按新设置整理，Omni 请求去掉系统提示时的说明见 [API 请求](#api-请求)）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`（`PRO_POOL=true` 时为 `false`），之后为 `Pro 独立号池=<BOOL> | Pro 常驻 Worker=<N> | Pro 峰值 Worker=<N>`（`PRO_POOL=false` 时同样写出）；主用模型一段写作 `主用模型=… | Ultra/Pro 主用模型=…`（Ultra 列表同时作用于 `/ultra` 与 `/pro`）；`策略=<ROUTING_STRATEGY>`（平均调用写成 `策略=balanced（平均调用）`，其余取值原样）之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；`IP 池` 之前带 `自动续写=<关闭 / 开启（默认总上限 N）>`，为保存并随这次热更新生效的 `LONG_OUTPUT_ENABLED` 与 `LONG_OUTPUT_MAX_TOKENS`（之后开始的请求立即按新设置）；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
 
 空闲回收与按需替换只在 `rebalanceMu` 内选中并预留被关闭的 Worker（`tryReserveVictim`），关闭浏览器在锁外进行：关一个浏览器要几秒，原先这期间所有账户的冷启动、扩容、替换与删除都排队等它，日志里表现为一批 `WAA Worker 启动 | 1/7` 在某个 `WAA Worker 已停止` 之后才集中出现。被关闭的 Worker 关完之前照常占着它的槽位（按需替换时新 Worker 的启动占位也一直保留），容量判断不会多放出槽位；预留期间其他淘汰路径（替换、冷却轮换、死槽位回收）不会再选它；空闲回收关闭期间同分区的按需启动不走按需替换（不会为它再关掉另一个空闲 Worker），等回收关完后按空槽写 `按需扩容`。淘汰对象在关闭期间被删除时按已淘汰处理，不写 `WAA Worker 空闲回收失败`，按需替换的请求也不失败。淘汰对象的 `account.json` 或认证文件被外部移走、目录扫描还没把它移出账户池时（它的 Worker 还活着），空闲回收照旧写 `WAA Worker 空闲回收失败 | 错误=淘汰对象的账户文件已不在…` 并结束本轮；按需替换写 `WAA Worker 按需替换跳过淘汰对象 | 错误=…`（来源为该账户）并换下一个淘汰对象，请求不失败，驻留数不超过峰值；等下一个淘汰对象期间分区空出了槽位（跳过的账户被目录扫描移出、其他 Worker 被删除或回收）时直接发布新 Worker、写 `按需扩容`，跳过的账户文件放回后重新参与选号；一直没有空出槽位、也没有别的淘汰对象（例如只删了 `account.json`、目录还在，目录扫描不会移出它）时最多等约 70 秒，随后关掉没发布的新浏览器，后台扩容写 `WAA Worker 后台扩容失败 | 错误=淘汰对象的账户文件已不在…：等了 1m10s 仍没有空出槽位或其他可淘汰的 Worker`。按需替换的 `WAA Worker 停止`、`WAA Worker 已停止` 两行与新 Worker 的 `就绪`、`按需替换` 之间因此可能夹着其他账户的启动日志。
 
@@ -243,6 +243,24 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 INFO  service  Pro 账户并入 Ultra 号池设置已更新并立即生效 | 并入=true | Ultra 号池账户=42 | Ultra 分区 Worker=7/5 | 普通分区 Worker=6/10
 WARN  service  Ultra 分区 Worker 超过峰值 | 当前=7 | 峰值=5 | 空闲 Worker 将逐步回收，可调大对应峰值
 WARN  service  ULTRA_EXCLUSIVE=true 时 Pro 账户不再服务普通路径；Pro 账户上的文件与视频改从 /ultra 引用
+```
+
+上面三行只在 `PRO_POOL=false` 时出现（`PRO_POOL=true` 时 `ULTRA_INCLUDE_PRO` 不生效，切换它不改变成员、不写这几行），文案与没有 `PRO_POOL` 之前逐字相同。保存服务配置使 `PRO_POOL` 实际切换时（同样是热更新，随重建生效时不写），`service` 依次记录：
+
+- INFO `Pro 独立号池设置已更新并立即生效 | 开启=<BOOL> | Pro 号池账户=<N> | Pro 分区 Worker=<N>/<M> | Ultra 分区 Worker=<N>/<M> | 普通分区 Worker=<N>/<M>`：成员与 `/pro` 的开关已在同一段锁内生效，排空中的 Worker 已按新成员改标分区；`/` 后为三个分区的峰值。
+- WARN `<分区> Worker 超过峰值 | …`：与上面相同，开启时通常是 Pro 分区，可调大 `PRO_MAX_ACTIVE_WORKERS`。
+- 开启时 WARN `PRO_POOL=true 时 Pro 账户只服务 /pro 前缀，不再服务默认地址与 /ultra；Pro 账户上的文件与视频改从 /pro 引用`；关闭时 WARN `PRO_POOL=false 时 /pro 前缀返回 404；Pro 账户回到普通号池（ULTRA_INCLUDE_PRO=true 时并入 Ultra 号池），Pro 账户上的文件与视频改从对应路径引用`。
+
+此外还有三条只在 `PRO_POOL=true` 时出现的 WARN：
+
+- `ULTRA_INCLUDE_PRO=true 在 PRO_POOL=true 时不生效：Pro 账户只服务 /pro`：两项都开启时，启动时写一次，之后只在两项之一变化的那次保存写，不是每次保存都写。
+- `PRO_POOL 默认开启：<N> 个 Pro 账户只服务 /pro 前缀，默认地址与 /ultra 不再使用它们 | Pro 常驻/峰值 Worker=<A>/<B> | 建议 PRO_WARM_WORKER_LIMIT=<a>、PRO_MAX_ACTIVE_WORKERS=<b>（Pro 可用账户 <p>，普通可用账户 <q>），普通分区可相应减为 WARM_WORKER_LIMIT=<c>、MAX_ACTIVE_WORKERS=<d> | 要保持升级前的行为请设置 PRO_POOL=false，写明 PRO_POOL 后不再提示`：`.env` 与进程环境变量都没有写 `PRO_POOL`、又有 Pro 号池账户时，服务启动后第一次后台检查（`keepWarm`）写一次，之后只在提示里的 Worker 设置或来源分区变化时再写（可用账户数的波动不重复写）；提示消失后再出现时重新写。保存的 `ULTRA_INCLUDE_PRO` 为 `true` 时（升级前 Pro 账户在 Ultra 分区）括号内改为 `ULTRA_INCLUDE_PRO=true，升级前 Pro 账户在 Ultra 分区；Pro 可用账户 <p>，Ultra 可用账户 <u>），Ultra 分区可相应减为 ULTRA_WARM_WORKER_LIMIT=<c>、ULTRA_MAX_ACTIVE_WORKERS=<d>`，建议值按 Pro 占 Pro 与 Ultra 可用账户之和的比例分 `ULTRA_*`，普通分区不变（算法见 README“Pro 独立号池”的升级提醒）。同样的内容在 `/api/status` 的 `pro_pool_notice` 与管理页侧栏。
+- `PRO_POOL=true 时 Pro 号池能服务只限 Ultra 的模型 | 模型=<MODEL> | 它不在 ULTRA_ONLY_MODELS 里，Pro 账户的目录也没有标注不能用，/pro 会选 Pro 账户服务它并失败；Pro 不能用这类模型只靠 ULTRA_ONLY_MODELS，请把它加回去`：默认只限 Ultra 的模型（`gemini-4-carbon`）或某个目录明确标注只有 Ultra 能用的模型被移出 `ULTRA_ONLY_MODELS`、Pro 号池又有账户能服务它时，每个模型写一次（消失后再出现时重新写）。
+
+```text
+INFO  service  Pro 独立号池设置已更新并立即生效 | 开启=true | Pro 号池账户=38 | Pro 分区 Worker=6/5 | Ultra 分区 Worker=2/5 | 普通分区 Worker=4/10
+WARN  service  Pro 分区 Worker 超过峰值 | 当前=6 | 峰值=5 | 空闲 Worker 将逐步回收，可调大对应峰值
+WARN  service  PRO_POOL=true 时 Pro 账户只服务 /pro 前缀，不再服务默认地址与 /ultra；Pro 账户上的文件与视频改从 /pro 引用
 ```
 
 单个 Worker 停止事件：
@@ -992,7 +1010,7 @@ INFO  service  额度用完改用其他模型的设置已更新并立即生效 |
 | `模型目录同步失败 \| 错误=<err> \| 下次=<d> \| 连续失败=<f>` | WARN | 同账户只在第 1、2、4、8… 次失败时写 |
 | `模型目录为空，保留原目录 \| 模型=<n> \| 连续空结果=<k> \| 首次为空=<d> 前` | WARN | 已有目录时空结果不覆盖 |
 | `模型目录为空，已接受 \| 连续空结果=<k> \| 首次为空=<d> 前` | WARN | 连续 3 次且跨 1 小时后才接受 |
-| `目录缺少请求模型，立即读取 \| 模型=<请求的模型> \| 号池=不限\|普通号池\|Ultra 号池 \| 已读=<账户,…或 -> \| 跳过=<n> \| 结果=已读到（<账户>），已合并进目录\|仍没有这个模型\|没有可读的空闲账户[，因上游 429 停止] \| 耗时=<d>[ \| 错误=<摘要>]` | INFO/WARN | 请求的模型不在号池任何账户的目录里时，后台按权益从高到低读最多 3 个空闲账户的目录（同一模型名 10 分钟一次、全局 1 分钟一次，上游 429 暂停期间不读）；`跳过` 为忙碌、出口限流、疑似登录失效或正在后台同步的候选；读到错误且没找到时为 WARN。当前请求照旧以目录中没有请求模型结束 |
+| `目录缺少请求模型，立即读取 \| 模型=<请求的模型> \| 号池=不限\|普通号池\|Ultra 号池\|Pro 号池\|普通号池与 Ultra 号池 \| 已读=<账户,…或 -> \| 跳过=<n> \| 结果=已读到（<账户>），已合并进目录\|仍没有这个模型\|没有可读的空闲账户[，因上游 429 停止] \| 耗时=<d>[ \| 错误=<摘要>]` | INFO/WARN | 请求的模型不在号池任何账户的目录里时，后台按权益从高到低读最多 3 个空闲账户的目录（同一模型名 10 分钟一次、全局 1 分钟一次，上游 429 暂停期间不读）；`跳过` 为忙碌、出口限流、疑似登录失效或正在后台同步的候选；读到错误且没找到时为 WARN。当前请求照旧以目录中没有请求模型结束 |
 
 有缓存以后重启不再清掉“需要登录”与账号全局冷却：原先启动全量同步顺带把它们清了（所以“重启就好”），现在由下面的登录复核恢复。后台刷新目录成功也不清账号的全局冷却（全局每日限额、403 自动暂停、出口限流期间的账号冷却都到期自然恢复）；管理页刷新目录与验证照旧清。删除的账户超过 7 天的条目在每小时一次的清理里从 index 与内存一并删掉。
 
@@ -1167,7 +1185,7 @@ WARN  account@example.com  账号切换 | 模型=gemini-3.7-flash
 
 同一账户 Build 与 Playground 是否共用某模型每日额度的判定每记录一次证据，`service` 写一行 `每日额度通道判定 | 模型=<MODEL> | 另一通道也达到限额=<N> | 另一通道仍可用=<N> | 结论=<VERDICT>`，结论为 `共用（达到每日限额时同时冷却两个通道）`、`独立（两个通道分别计算额度）` 或 `观察中`，结论变化的那次为 WARN、其余为 INFO。判定按账户真实权益分组：权益为 Ultra 的账户单独一组，这一行在模型后带 `权益=Ultra`（`每日额度通道判定 | 模型=<MODEL> | 权益=Ultra | ...`）；其余权益不带这个字段，`ULTRA_INCLUDE_PRO=true` 时并入 Ultra 号池的 Pro 账户同样不带。
 
-账户页的 `Free`、`Pro`、`Ultra` 与 `Plus` 来自 `GetAiStudioBenefitTier`，始终是账户的真实权益：`ULTRA_INCLUDE_PRO=true` 时并入 Ultra 号池的 Pro 账户仍显示 `Pro`，另带“Ultra 号池”标记。Paid 模型先按权益和模型访问方式筛选，成功调用过目标模型的账户排在同模型未知账户之前。
+账户页的 `Free`、`Pro`、`Ultra` 与 `Plus` 来自 `GetAiStudioBenefitTier`，始终是账户的真实权益：`PRO_POOL=false`、`ULTRA_INCLUDE_PRO=true` 时并入 Ultra 号池的 Pro 账户仍显示 `Pro`，另带“Ultra 号池”标记；`PRO_POOL=true` 时 Pro 账户属于 Pro 号池（权益与号池一致，不另加标记，账户页可按号池筛选）。Paid 模型先按权益和模型访问方式筛选，成功调用过目标模型的账户排在同模型未知账户之前。
 
 管理端账户操作事件：
 
@@ -1261,7 +1279,7 @@ INFO  account@example.com  账号每分钟请求已满 | 上限=10 次/60 秒 | 
 
 ## 用量账本
 
-`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta`、`/trace/` 与 `/ultra/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、号池（按请求入口记录：`/ultra` 请求为 `ultra`，其余为空，用量接口中显示为 `normal`；并入 Ultra 号池的 Pro 账户服务的 `/ultra` 请求同样为 `ultra`，`ULTRA_INCLUDE_PRO` 切换前写入的记录不改写）、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试（额度用完改用其他模型时另有一条改用备注，模型记实际使用的目标模型，见[额度用完改用其他模型](#额度用完改用其他模型)），以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）与 Anthropic `max_tokens` 为 `0` 的预热请求（不调用上游，见 [API 请求](#api-请求)的预热说明）不写入，避免抬高请求数、拉低耗时分位；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由与 Ultra 路由的请求按去掉 `/trace`、`/ultra` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
+`runtime/requests.db` 是本地 SQLite 账本（纯 Go 驱动，`CGO_ENABLED=0` 构建同样可用）。`/v1`、`/v1beta`、`/trace/`、`/ultra/` 与 `/pro/` 下通过 API key 校验的每个 POST 请求完成后写入一行：请求 ID、完成时间、协议、路径、号池（按请求入口记录：`/ultra` 请求为 `ultra`，`/pro` 请求为 `pro`，其余为空，用量接口中显示为 `normal`；并入 Ultra 号池的 Pro 账户服务的 `/ultra` 请求同样为 `ultra`，`PRO_POOL=false` 时 Pro 账户服务的普通路径请求为空，`ULTRA_INCLUDE_PRO`、`PRO_POOL` 切换前写入的记录不改写；`PRO_POOL=false` 时被拒绝的 `/pro` 请求是 404，同样按 `pro` 记）、模型、账户、通道、HTTP 状态、`request.state`、耗时、首个上游事件、排队时间、token 用量、工具调用数、错误摘要、最终结果之前未成功的上游尝试（额度用完改用其他模型时另有一条改用备注，模型记实际使用的目标模型，见[额度用完改用其他模型](#额度用完改用其他模型)），以及本地的实际服务模型、降级判定结论与回复指纹。token 计数请求（`/v1/messages/count_tokens`、`:countTokens`）与 Anthropic `max_tokens` 为 `0` 的预热请求（不调用上游，见 [API 请求](#api-请求)的预热说明）不写入，避免抬高请求数、拉低耗时分位；协议按路径归为 `openai-chat`、`openai-responses`、`anthropic`、`interactions`（`/v1/interactions` 与 `/v1beta/interactions`，不并入 `gemini`）、`gemini`、`images`、`audio`、`videos`、`files` 或 `other`，排查路由、Ultra 路由与 Pro 路由的请求按去掉 `/trace`、`/ultra`、`/pro` 前缀后的协议归类。账户与错误内容与请求日志相同，不保存 API key、管理令牌、Cookie 与请求头；错误摘要与路径按 2000 字截断；模型名来自客户端，没有通过模型目录校验的请求也会记录，模型名与实际服务模型按 200 字截断。
 
 同一事务按 UTC 小时与服务器本地日累加汇总与耗时分布（汇总键包含号池）：完整落在范围与单个分桶内的本地日读取日汇总，其余整小时读取小时汇总，范围边缘与跨分桶的部分读取原始记录。服务器时区变化后，下次启动时从小时汇总与原始记录重建本地日汇总。写入由后台协程批量提交，不阻塞响应：等待写入的记录超过 4096 条时丢弃新记录，写入恢复后输出丢弃数。记录与汇总按服务器本地日整日保留 90 天，启动时与之后每天清理一次。账本打开失败时写一条 WARN，本次运行不记录用量、不注册用量接口，服务照常运行。
 

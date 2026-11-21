@@ -358,10 +358,17 @@ func (p *AccountPool) hasPlaygroundModelLocked(modelID string) bool {
 	return exists
 }
 
+// hasBuildModelLocked 判断号池内有账户的 Build 目录列出模型（方法不为空时还要支持这个方法）且 Build 通道能调用它。先查全部账户
+// Build 目录的模型 ID 集合（按目录版本缓存，见 buildModelIDsLocked），任何账户的 Build 目录都没有的名称（如写错的模型名）直接返回，
+// 不在账户池锁内逐个账户扫描；调用方持有 p.mu
 func (p *AccountPool) hasBuildModelLocked(modelID string, method string, scope PoolScope) bool {
 	if !p.channelEnabledLocked(ChannelBuild) {
 		return false
 	}
+	if _, listed := p.buildModelIDsLocked()[modelID]; !listed {
+		return false
+	}
+	buildModelScans.Add(1)
 	for _, account := range p.accounts {
 		if account == nil || !p.inPoolLocked(scope, account) {
 			continue

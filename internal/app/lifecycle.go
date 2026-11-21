@@ -80,6 +80,9 @@ type runtimeManager struct {
 	// ultraExclusive 为生效的 ULTRA_EXCLUSIVE：公开 API 按它决定普通路径的请求能否使用 Ultra 号池的账户，保存配置后立即生效，
 	// 启动生成服务时按新读取的配置同步
 	ultraExclusive atomic.Bool
+	// proPool 为 /pro 前缀是否启用（PRO_POOL，见 pro_pool.go）：只从当前生成服务的账户池读取并在 manager.mu 内写（热更新、构造与换上新实例时），
+	// 不在进程级设置里按读取到的配置写——需要重建生成服务的变化挂起期间，开关仍与正在服务的账户池的成员一致
+	proPool atomic.Bool
 	// streamDataHeartbeat 为生效的 STREAM_DATA_HEARTBEAT（数据型心跳）：与 ultraExclusive 一样是进程级设置，公开 API 在每个流式请求开始时读取，
 	// 保存配置后立即生效，启动生成服务时按新读取的配置同步
 	streamDataHeartbeat atomic.Bool
@@ -145,7 +148,7 @@ func newRuntimeManager(
 	if err != nil {
 		return nil, err
 	}
-	manager.current = generation
+	manager.installGeneration(generation)
 	go manager.superviseService()
 	return manager, nil
 }
@@ -242,10 +245,8 @@ func (manager *runtimeManager) startService(ctx context.Context, user bool) (api
 		return manager.Status(ctx)
 	}
 
-	manager.mu.Lock()
-	current = manager.current
-	manager.current = next
-	manager.mu.Unlock()
+	// /pro 的开关随新实例的账户池（唯一来源），与它的成员规则一致
+	current = manager.installGeneration(next)
 	// 独占设置、数据型心跳、视频模型忽略系统提示与媒体设置与新生成服务读到的配置一致：手动改过 .env 后停止再启动时同样生效
 	manager.applyUltraExclusive(cfg.UltraExclusive)
 	manager.applyStreamDataHeartbeat(cfg.StreamDataHeartbeat)
@@ -685,6 +686,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		DowngradeGuard: active.DowngradeGuard,
 		UltraExclusive: active.UltraExclusive, UltraIncludePro: active.UltraIncludePro, UltraWarmWorkerLimit: active.UltraWarmWorkerLimit,
 		UltraMaxActiveWorkers: active.UltraMaxActiveWorkers, StreamPlaygroundModels: active.StreamPlaygroundModels,
+		ProPool: active.ProPool, ProWarmWorkerLimit: active.ProWarmWorkerLimit, ProMaxActiveWorkers: active.ProMaxActiveWorkers,
 		UltraOnlyModels: active.UltraOnlyModels, PaidOnlyModels: active.PaidOnlyModels,
 		PrimaryModels: active.PrimaryModels, PrimaryQueueWait: primaryQueueWait, StreamDataHeartbeat: active.StreamDataHeartbeat,
 		UltraPrimaryModels: active.UltraPrimaryModels, UltraPrimaryQueueWait: ultraPrimaryQueueWait,
@@ -756,6 +758,16 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.UltraMaxActiveWorkers != nil {
 		saved.UltraMaxActiveWorkers = *value.UltraMaxActiveWorkers
 	}
+	// Pro 号池设置：提交时省略（旧版页面）按生效值比较
+	if value.ProPool != nil {
+		saved.ProPool = *value.ProPool
+	}
+	if value.ProWarmWorkerLimit != nil {
+		saved.ProWarmWorkerLimit = *value.ProWarmWorkerLimit
+	}
+	if value.ProMaxActiveWorkers != nil {
+		saved.ProMaxActiveWorkers = *value.ProMaxActiveWorkers
+	}
 	if value.StreamPlaygroundModels != nil {
 		saved.StreamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
 	}
@@ -784,6 +796,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.UltraExclusive == active.UltraExclusive && saved.UltraIncludePro == active.UltraIncludePro &&
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
+		saved.ProPool == active.ProPool && saved.ProWarmWorkerLimit == active.ProWarmWorkerLimit &&
+		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.TemporaryChat == active.TemporaryChat &&

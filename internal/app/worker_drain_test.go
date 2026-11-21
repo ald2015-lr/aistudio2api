@@ -116,7 +116,7 @@ func leaseCount(counts *sync.Map, accountID string) int64 {
 // 并没有浏览器的账户也算进去，误报超过 峰值 + drainLimit
 func (env *drainEnv) browsers() int {
 	manager := env.manager
-	ultra := env.pool.UltraAccountIDs()
+	ultra := env.pool.PartitionMembers()
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
 	for _, account := range manager.accounts {
@@ -276,7 +276,7 @@ func TestDrainStartsReplacementBeforeRetirement(t *testing.T) {
 	if got := env.browsers(); got != 4+env.manager.drainLimit(aistudio.PoolScopeNormal) {
 		t.Fatalf("排空期间浏览器数应为 峰值 + drainLimit，实际 %d", got)
 	}
-	normalOccupied, _ := env.manager.occupiedSlotsApprox(env.pool.UltraAccountIDs())
+	normalOccupied := env.manager.occupiedSlotsApprox(env.pool.PartitionMembers())[aistudio.PoolScopeNormal]
 	if normalOccupied != 4 {
 		t.Fatalf("状态接口的占用应按排空让出计为 4，实际 %d", normalOccupied)
 	}

@@ -537,7 +537,7 @@ func TestProxyPoolHotConfig(t *testing.T) {
 	workers := newAccountWorkerManager(pool, accounts, requests, "", "", time.Minute, cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, false)
 	t.Cleanup(func() { _ = workers.Close() })
 	ipPool, _ := newTestProxyPool(t, newProxyPoolTestClock(), "", "")
-	ipPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg))
+	ipPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg, false))
 	ipPool.attach(pool)
 	workers.proxyPool = ipPool
 	service := &trackedService{
@@ -570,7 +570,7 @@ func TestProxyPoolHotConfig(t *testing.T) {
 	if !manager.current.config.ProxyPool.Equal(want) || !liveFieldsEqual(saved, manager.current.config) || requiresRebuild(saved, manager.current.config) {
 		t.Fatal("IP 池应已热更新到生效配置")
 	}
-	if status := ipPool.status(); status == nil || status.Mode != "static" || status.Total != 200 || status.Capacity != proxyPoolCapacity(saved) {
+	if status := ipPool.status(); status == nil || status.Mode != "static" || status.Total != 200 || status.Capacity != proxyPoolCapacity(saved, false) {
 		t.Fatalf("热更新后 IP 池状态 = %+v", status)
 	}
 	if binding, ok := accounts[0].CurrentProxyBinding(); !ok || binding.Slot == "" {
@@ -622,8 +622,8 @@ func TestProxyPoolHotConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	saved, _ = config.Load(path)
-	if status := ipPool.status(); status.Capacity != proxyPoolCapacity(saved) || status.Capacity <= proxyPoolCapacity(cfg) {
-		t.Fatalf("改峰值后容量 = %d，期望 %d", status.Capacity, proxyPoolCapacity(saved))
+	if status := ipPool.status(); status.Capacity != proxyPoolCapacity(saved, false) || status.Capacity <= proxyPoolCapacity(cfg, false) {
+		t.Fatalf("改峰值后容量 = %d，期望 %d", status.Capacity, proxyPoolCapacity(saved, false))
 	}
 	assertNoPoolSecretInLogs(t, requests)
 }

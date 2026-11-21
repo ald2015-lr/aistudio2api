@@ -562,6 +562,14 @@ button[aria-busy='true']::before {
     font-weight: 600;
   }
 
+  /* Pro 号池标记：与 Ultra 号池同样醒目，换成天蓝色区分 */
+  .tag-pro {
+    border-color: rgb(14 165 233 / 55%);
+    background: rgb(14 165 233 / 14%);
+    color: #bae6fd;
+    font-weight: 600;
+  }
+
   .dot {
     display: inline-block;
     width: 0.5rem;

@@ -46,11 +46,18 @@ type AdminStatus struct {
 	ActiveRequests int                `json:"active_requests"`
 	Accounts       AdminAccountCounts `json:"accounts"`
 	Workers        AdminWorkerCounts  `json:"workers"`
-	// UltraAccounts 为 Ultra 号池成员（权益为 Ultra 的账户，ULTRA_INCLUDE_PRO=true 时也含权益为 Pro 的账户）的状态计数，
+	// UltraAccounts 为 Ultra 号池成员（权益为 Ultra 的账户，PRO_POOL=false、ULTRA_INCLUDE_PRO=true 时也含权益为 Pro 的账户）的状态计数，
 	// Accounts 包含全部账户
 	UltraAccounts AdminAccountCounts `json:"ultra_accounts"`
-	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含两个分区）
+	// UltraWorkers 为 Ultra 分区的 Worker 计数；Workers 的计数与上限只含普通分区（WarmIDs、StartingIDs 包含全部分区）
 	UltraWorkers AdminWorkerPartition `json:"ultra_workers"`
+	// ProAccounts 为 Pro 号池成员（PRO_POOL=true 时权益为 Pro 的账户）的状态计数，PRO_POOL=false 时各项为 0
+	ProAccounts AdminAccountCounts `json:"pro_accounts"`
+	// ProWorkers 为 Pro 分区的 Worker 计数，PRO_POOL=false 时分区为空
+	ProWorkers AdminWorkerPartition `json:"pro_workers"`
+	// ProPoolNotice 为 PRO_POOL 默认开启的升级提示（见 AdminProPoolNotice）：.env 与进程环境变量都没有写 PRO_POOL、开关为默认开启
+	// 且有 Pro 号池账户时才有
+	ProPoolNotice *AdminProPoolNotice `json:"pro_pool_notice,omitempty"`
 	// PrimarySupply 为每个主用模型的可用供给：普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）
 	// 统计 Ultra 分区（Pool 为 ultra），keepWarm 约每 30 秒统计一次并缓存；没有主用模型或服务还没统计过时为空
 	PrimarySupply []AdminPrimarySupply `json:"primary_supply,omitempty"`
@@ -83,12 +90,43 @@ type AdminStatus struct {
 // 发送数为本进程真正发往上游的生成请求数（每次发送都计，含换号重试、续写的每一轮与重新生成），与用量页按服务器本地日、
 // 每个请求一行的账本口径不同
 type AdminBalanced struct {
-	QuotaDay       string                 `json:"quota_day"`
-	Gap            int                    `json:"gap"`
-	Normal         AdminBalancedPartition `json:"normal"`
-	Ultra          AdminBalancedPartition `json:"ultra"`
-	Rotations1h    int                    `json:"rotations_1h"`
-	RotationsToday int                    `json:"rotations_today"`
+	QuotaDay string                 `json:"quota_day"`
+	Gap      int                    `json:"gap"`
+	Normal   AdminBalancedPartition `json:"normal"`
+	Ultra    AdminBalancedPartition `json:"ultra"`
+	// Pro 为 Pro 分区的今日发送数分布：只在 Pro 号池有可调度账号时有（PRO_POOL=false 时省略）
+	Pro            *AdminBalancedPartition `json:"pro,omitempty"`
+	Rotations1h    int                     `json:"rotations_1h"`
+	RotationsToday int                     `json:"rotations_today"`
+}
+
+// AdminProPoolNotice 为 PRO_POOL 默认开启的升级提示：升级前 Pro 账户留在默认地址（或经 ULTRA_INCLUDE_PRO 并入 /ultra），
+// 默认开启后它们只服务 /pro，Pro 分区只有 PRO_WARM_WORKER_LIMIT、PRO_MAX_ACTIVE_WORKERS 的默认值。ProAccounts 为 Pro 号池账户数，
+// ProAvailable、NormalAvailable、UltraAvailable 为 Pro、普通与 Ultra 号池里可预热（启用、就绪或忙碌、有初始化模型）的账户数。
+// Source 为升级前 Pro 账户所在、建议从中分出 Pro 容量的分区：ULTRA_INCLUDE_PRO 写为 true 时为 "ultra"（那时 Pro 账户在 Ultra 分区，
+// 用 ULTRA_* 的容量，普通分区只服务 Free 与 Plus），否则为 "normal"。建议值按 Pro 可用账户占它与来源分区可用账户之和的比例分
+// 来源分区的常驻与峰值数：Pro 的建议值为分到的份额，不少于默认值；来源分区的建议值为原值减去分到的份额（不是减去 Pro 的建议值：
+// 份额小于默认值时 Pro 按默认值，浏览器总数多出差额），不少于该分区的默认值（当前值更小时为当前值），普通分区常驻另不少于
+// WARM_STARTUP_CONCURRENCY（照建议保存能通过校验），峰值不少于常驻数；另一个分区的建议值与当前值相同。
+// 写了 PRO_POOL（true 或 false）后不再提示
+type AdminProPoolNotice struct {
+	ProAccounts                    int    `json:"pro_accounts"`
+	Source                         string `json:"source"`
+	ProAvailable                   int    `json:"pro_available"`
+	NormalAvailable                int    `json:"normal_available"`
+	UltraAvailable                 int    `json:"ultra_available"`
+	WarmWorkerLimit                int    `json:"warm_worker_limit"`
+	MaxActiveWorkers               int    `json:"max_active_workers"`
+	UltraWarmWorkerLimit           int    `json:"ultra_warm_worker_limit"`
+	UltraMaxActiveWorkers          int    `json:"ultra_max_active_workers"`
+	ProWarmWorkerLimit             int    `json:"pro_warm_worker_limit"`
+	ProMaxActiveWorkers            int    `json:"pro_max_active_workers"`
+	SuggestedProWarmWorkerLimit    int    `json:"suggested_pro_warm_worker_limit"`
+	SuggestedProMaxActiveWorkers   int    `json:"suggested_pro_max_active_workers"`
+	SuggestedWarmWorkerLimit       int    `json:"suggested_warm_worker_limit"`
+	SuggestedMaxActiveWorkers      int    `json:"suggested_max_active_workers"`
+	SuggestedUltraWarmWorkerLimit  int    `json:"suggested_ultra_warm_worker_limit"`
+	SuggestedUltraMaxActiveWorkers int    `json:"suggested_ultra_max_active_workers"`
 }
 
 // AdminBalancedPartition 表示一个分区的平均调用概况：Accounts 为可调度账号数（号池内启用、且不是不可调度的：需要验证账号的整户暂停、
@@ -150,8 +188,8 @@ type AdminAuthRecheck struct {
 	PauseReason    string    `json:"pause_reason,omitempty"` // 出口限流
 }
 
-// AdminPrimarySupply 表示一个主用模型在它所在分区的可用供给：Pool 为 ultra 时是 Ultra 主用模型、统计 Ultra 分区，为空时是普通主用模型、
-// 统计普通分区。Warm 为能服务它的驻留 Worker（对它没有冷却、不在排空中），Standby 为能服务它的空闲备用账号（没有驻留 Worker、
+// AdminPrimarySupply 表示一个主用模型在它所在分区的可用供给：Pool 为 ultra 时是 Ultra/Pro 主用模型、统计 Ultra 分区，为 pro 时是
+// Ultra/Pro 主用模型在 Pro 分区的供给（只在 PRO_POOL=true 时有，跳过权益规则不让 Pro 用的模型），为空时是普通主用模型、统计普通分区。Warm 为能服务它的驻留 Worker（对它没有冷却、不在排空中），Standby 为能服务它的空闲备用账号（没有驻留 Worker、
 // 不在启动中、对它没有冷却），最多统计 1000 个，达到上限时 StandbyCapped 为真。
 // Standby 为 0 表示没有还能服务该模型的空闲账号（多半是当天额度已用完，太平洋时间零点重置）
 type AdminPrimarySupply struct {
@@ -423,7 +461,7 @@ type AccessLog struct {
 	Authorized bool
 	// Warmup 表示 Anthropic max_tokens 为 0 的预热请求：不调用上游，不写入用量账本（见 MarkAccessLogWarmup）
 	Warmup bool
-	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空
 	Pool string
 	// Disconnect 为请求取消（状态 499）时的现场，其余请求为 nil
 	Disconnect *RequestDisconnect
@@ -457,8 +495,8 @@ type AdminAccount struct {
 	Message     string   `json:"message"`
 	// BenefitTierKnown 表示权益已经从官网读取过；为 false 时 benefit_tier 按 Free 显示，账户属于普通号池
 	BenefitTierKnown bool `json:"benefit_tier_known"`
-	// Pool 为账户当前所属的号池（成员关系）：ultra（权益为 Ultra，ULTRA_INCLUDE_PRO=true 时也含 Pro）或 normal；
-	// benefit_tier 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍显示 Pro
+	// Pool 为账户当前所属的号池（成员关系）：ultra（权益为 Ultra，PRO_POOL=false、ULTRA_INCLUDE_PRO=true 时也含 Pro）、
+	// pro（PRO_POOL=true 时权益为 Pro）或 normal；benefit_tier 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍显示 Pro
 	Pool string `json:"pool"`
 	// Authenticated 与 VerifyReason 只在验证接口的返回里填写：验证结论（浏览器已登录且接口复核通过才为 true）与它的原因。
 	// 停用账户的状态始终是 disabled，前端按 Authenticated 计“有效 / 登录失效”，不能看状态或 HTTP 200
@@ -574,6 +612,11 @@ type RuntimeConfig struct {
 	UltraIncludePro       *bool `json:"ultra_include_pro,omitempty"`
 	UltraWarmWorkerLimit  *int  `json:"ultra_warm_worker_limit,omitempty"`
 	UltraMaxActiveWorkers *int  `json:"ultra_max_active_workers,omitempty"`
+	// ProPool、ProWarmWorkerLimit、ProMaxActiveWorkers 为 Pro 号池设置（PRO_POOL、PRO_WARM_WORKER_LIMIT、PRO_MAX_ACTIVE_WORKERS）；
+	// 旧版页面不带这些字段时沿用现值（false 与 0 都是有效值，用指针区分缺省）
+	ProPool             *bool `json:"pro_pool,omitempty"`
+	ProWarmWorkerLimit  *int  `json:"pro_warm_worker_limit,omitempty"`
+	ProMaxActiveWorkers *int  `json:"pro_max_active_workers,omitempty"`
 	// UltraOnlyModels、PaidOnlyModels 为权益规则（ULTRA_ONLY_MODELS：只有 Ultra 能用的模型；PAID_ONLY_MODELS：只有 Pro 与 Ultra 能用的模型），
 	// 保存后立即生效；读取时总是返回（可以为空数组），保存时没有这些字段（旧版页面）则沿用现值
 	UltraOnlyModels *[]string `json:"ultra_only_models,omitempty"`
@@ -754,7 +797,7 @@ type AdminRequest struct {
 	Channel      string    `json:"channel,omitempty"`
 	State        string    `json:"state"`
 	StartedAt    time.Time `json:"started_at"`
-	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空
 	Pool string `json:"pool,omitempty"`
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后的模型；没有改用时为空
 	FallbackFrom string `json:"fallback_from,omitempty"`

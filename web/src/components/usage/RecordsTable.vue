@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, shallowRef, useId, watch } from 'vue'
 import { api } from '@/api'
-import { useI18n } from '@/i18n'
+import { poolTagClass, poolTagged, poolTagHelpKey, poolTagLabelKey, useI18n } from '@/i18n'
 import type { UsageRecord } from '@/types'
 import UiPopover from '../UiPopover.vue'
 import UiSelect from '../UiSelect.vue'
@@ -290,10 +290,11 @@ function latencyWidth(milliseconds: number): number {
                 }}</span>
                 <span class="ml-1.5 text-gray-500 tabular-nums">{{ record.status }}</span>
                 <span
-                  v-if="record.pool === 'ultra'"
-                  v-tooltip="t('pool.ultraHelp')"
-                  class="tag tag-ultra ml-1.5"
-                  >{{ t('pool.ultra') }}</span
+                  v-if="poolTagged(record.pool)"
+                  v-tooltip="t(poolTagHelpKey(record.pool))"
+                  class="tag ml-1.5"
+                  :class="poolTagClass(record.pool)"
+                  >{{ t(poolTagLabelKey(record.pool)) }}</span
                 >
                 <span
                   v-if="record.downgrade === 'rejected'"
@@ -377,8 +378,8 @@ function latencyWidth(milliseconds: number): number {
                 dimensionLabel('state', record.state)
               }}</span>
               <span class="text-gray-500 tabular-nums">{{ record.status }}</span>
-              <span v-if="record.pool === 'ultra'" class="tag tag-ultra">{{
-                t('pool.ultra')
+              <span v-if="poolTagged(record.pool)" class="tag" :class="poolTagClass(record.pool)">{{
+                t(poolTagLabelKey(record.pool))
               }}</span>
               <span class="ml-auto text-gray-400 tabular-nums">{{
                 dateTime(record.time, true)

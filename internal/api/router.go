@@ -25,8 +25,12 @@ type Config struct {
 	TraceDir string
 	// Ledger 为用量账本；为 nil 时不注册用量接口、不记录正文。必须是 nil 接口值，不能是包着 nil 指针的接口
 	Ledger RequestLedger
-	// UltraExclusive 每次请求读取当前的 ULTRA_EXCLUSIVE：为真时普通路径只用普通号池，为假时不限号池；为 nil 时按独占
+	// UltraExclusive 每次请求读取当前的 ULTRA_EXCLUSIVE：为真时普通路径只用普通号池，为假时不限号池（ProPool 为真时为普通号池与 Ultra 号池）；
+	// 为 nil 时按独占
 	UltraExclusive func() bool
+	// ProPool 每次请求读取当前的 PRO_POOL：为真时 /pro 只用 Pro 号池、普通路径不用 Pro 账户，为假时 /pro 返回 404（见 proPoolGate）；
+	// 为 nil 时按默认开启
+	ProPool func() bool
 	// StreamDataHeartbeat 每个流式请求开始时读取是否使用数据型心跳（STREAM_DATA_HEARTBEAT，见 streamDataHeartbeat）；为 nil 时按默认开启
 	StreamDataHeartbeat func() bool
 	// OmniIgnoreSystemPrompt 每个生成请求整理时读取是否对能输出视频的 Omni 模型去掉系统提示（OMNI_IGNORE_SYSTEM_PROMPT，见 omni_system.go）；
@@ -48,8 +52,9 @@ type server struct {
 	responseStates    *responseStateStore
 	thoughtSignatures *thoughtSignatureStore
 	// aliasCaches 按号池缓存模型后缀解析用的模型目录（下标为 aistudio.PoolScope），避免每个请求都在账户池锁内重算；
-	// /ultra 只看 Ultra 号池账户的目录，普通路径按是否独占看普通号池或全部账户
-	aliasCaches [3]aliasCatalogCache
+	// /ultra 只看 Ultra 号池账户的目录，/pro 只看 Pro 号池，普通路径按 ULTRA_EXCLUSIVE 与 PRO_POOL 看普通号池、普通号池与 Ultra 号池或全部账户。
+	// 按号池取值个数定长，每个号池都有自己的缓存，不会落到不限号池的缓存（见 aliasCache）
+	aliasCaches [aistudio.PoolScopeCount]aliasCatalogCache
 	// traces 保存 /trace/ 排查路由的请求记录
 	traces *traceStore
 	// mediaStore 为生成媒体的保存目录（见 media_output.go），没有配置 MediaDir 时为 nil
@@ -92,7 +97,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	public.HandleFunc("GET /v1beta/models/{model}", s.handleGeminiModel)
 	public.HandleFunc("POST /v1beta/models/{action}", s.handleGeminiAction)
 	public.HandleFunc("GET /v1beta/operations/{operation}", s.handleGeminiVideoOperation)
-	// 未知路由（含方法不对）按所属协议返回错误体，/trace 与 /ultra 前缀共用这条处理链
+	// 未知路由（含方法不对）按所属协议返回错误体，/trace、/ultra 与 /pro 前缀共用这条处理链
 	public.HandleFunc("/", writeRouteNotFound)
 
 	control := http.NewServeMux()
@@ -116,17 +121,21 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
 	if s.mediaStore != nil {
 		root.HandleFunc("/media/", s.handleMedia)
 	}
-	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文
+	// 正文记录放在密钥校验与排查记录之后：未通过校验的请求不保存正文。PRO_POOL=false 时 /pro 的 404 紧跟在密钥校验之后：
+	// 没有密钥照常 401，CORS 头与请求日志照常写，不读请求体、不写排查记录
 	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.currentAPIKey,
-		authMiddleware(config.currentAPIKey, traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, s.withThoughtSignatureRestore(public))))))
-	// 号池标记在最外层：/ultra 入口已标记为 Ultra 号池时保留，其余请求按 ULTRA_EXCLUSIVE 标记为普通号池或不限号池
-	publicChain := poolScopeMiddleware(config.ultraExclusive, requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
+		authMiddleware(config.currentAPIKey, proPoolGate(config.proPool,
+			traceCaptureMiddleware(requestBodyMiddleware(config.Ledger, s.withThoughtSignatureRestore(public)))))))
+	// 号池标记在最外层：/ultra、/pro 入口已标记号池时保留，其余请求按 ULTRA_EXCLUSIVE 与 PRO_POOL 标记为普通号池、
+	// 普通号池与 Ultra 号池或不限号池
+	publicChain := poolScopeMiddleware(config.ultraExclusive, config.proPool, requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler)))
 	root.Handle("/v1/", publicChain)
 	root.Handle("/v1beta/", publicChain)
 	// 排查路由：与主路由完全相同的处理链，额外为每个 POST 请求写完整排查记录（见 trace.go）
 	root.Handle("/trace/", s.traceEntry(publicChain))
-	// Ultra 路由：与主路由完全相同的处理链，请求只使用 Ultra 号池的账户（见 ultra.go）
+	// Ultra 路由与 Pro 路由：与主路由完全相同的处理链，请求只使用 Ultra 号池或 Pro 号池的账户（见 ultra.go）
 	root.Handle(ultraPrefix+"/", ultraEntry(publicChain))
+	root.Handle(proPrefix+"/", proEntry(publicChain))
 	// 先拒绝跨站请求，再校验令牌或密码：浏览器对跨站请求也会自动附带缓存的 Basic 凭据，不能让它们计入密码失败次数
 	root.Handle("/api/", sameOriginMiddleware(adminAccessMiddleware(config.AdminPassword, config.AdminToken, controlPlaneMiddleware(control))))
 	return root

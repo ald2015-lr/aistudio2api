@@ -265,20 +265,16 @@ func (manager *accountWorkerManager) retirementCount() int {
 }
 
 // retirementCounts 按分区返回待淘汰登记数（供状态接口显示）；平均调用轮换登记不算（单独统计，见 balancedRotationStats）
-func (manager *accountWorkerManager) retirementCounts(ultra map[string]struct{}) (normal int, ultraCount int) {
+func (manager *accountWorkerManager) retirementCounts(members aistudio.PartitionSet) (counts partitionCounts) {
 	manager.retireMu.Lock()
 	defer manager.retireMu.Unlock()
 	for accountID, entry := range manager.retirements {
 		if entry.rotation {
 			continue
 		}
-		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
-			ultraCount++
-		} else {
-			normal++
-		}
+		counts[partitionOf(accountID, members)]++
 	}
-	return normal, ultraCount
+	return counts
 }
 
 // retireLoop 处理待淘汰登记：由 retireWorker 与账户池变化（租约释放）唤醒，仍有登记时按兜底间隔重试
@@ -345,7 +341,7 @@ func (manager *accountWorkerManager) retirePass() int {
 	sort.Slice(candidates, func(left int, right int) bool {
 		return candidates[left].entry.since.Before(candidates[right].entry.since)
 	})
-	ultra := manager.pool.UltraAccountIDs()
+	members := manager.pool.PartitionMembers()
 	warm := manager.WarmAccountIDs()
 	opening := manager.OpeningAccountIDs()
 	// 各登记账号是否忙碌一次加锁取得（keepWarm 补登记后登记可能有上百条，逐条查询要对账户池加锁上百次）；
@@ -361,7 +357,7 @@ func (manager *accountWorkerManager) retirePass() int {
 	occupied := make(map[aistudio.PoolScope]map[string]struct{}, len(workerPartitions))
 	pendingIn := make(map[aistudio.PoolScope]int, len(workerPartitions))
 	for index := range candidates {
-		candidates[index].partition = partitionOf(candidates[index].accountID, ultra)
+		candidates[index].partition = partitionOf(candidates[index].accountID, members)
 		// 轮换登记不按可接替账户核对（接替的号在登记时已按替补挑法选出），不计入
 		if !candidates[index].entry.rotation {
 			pendingIn[candidates[index].partition]++
@@ -372,10 +368,10 @@ func (manager *accountWorkerManager) retirePass() int {
 			return held
 		}
 		held := make(map[string]struct{}, len(warm)+len(opening))
-		for _, id := range inPartition(warm, ultra, partition) {
+		for _, id := range inPartition(warm, members, partition) {
 			held[id] = struct{}{}
 		}
-		for _, id := range inPartition(opening, ultra, partition) {
+		for _, id := range inPartition(opening, members, partition) {
 			held[id] = struct{}{}
 		}
 		occupied[partition] = held
@@ -564,7 +560,7 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 		manager.dropRetirement(accountID)
 		// 替补补在 Worker 关闭时所在的分区：victim.partition 是选中时的成员快照，ULTRA_INCLUDE_PRO 在选中之后切换时
 		// 关闭的 Pro Worker 空出的是新分区的槽位（排空中的已由 poolRuleChanged 改记到新分区），按当前成员重算
-		victim.partition = partitionOf(accountID, manager.pool.UltraAccountIDs())
+		victim.partition = partitionOf(accountID, manager.pool.PartitionMembers())
 		plan := manager.replacementsFor([]evictedWorker{{partition: victim.partition, models: victim.entry.models, drain: victim.drain}})
 		drained := ""
 		if victim.drain != nil {
@@ -598,7 +594,7 @@ func (manager *accountWorkerManager) finishRelease(victim retirementCandidate) {
 		// 取独占租约时账号又有了请求（指定账户的请求、独占操作），等下一次唤醒
 	default:
 		manager.dropRetirement(accountID)
-		partition := partitionOf(accountID, manager.pool.UltraAccountIDs())
+		partition := partitionOf(accountID, manager.pool.PartitionMembers())
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"WAA Worker 释放 | 原因=%s | 登记后=%s | %s=%d/%d",
 			victim.entry.unschedulable, time.Since(victim.entry.since).Round(time.Millisecond),
@@ -650,11 +646,11 @@ func (service *trackedService) registerDeadWorkers() int {
 		return 0
 	}
 	allWarm := workers.WarmAccountIDs()
-	ultra := service.pool.UltraAccountIDs()
+	members := service.pool.PartitionMembers()
 	added, deadTotal := 0, 0
 	var logged []string
 	for _, partition := range workerPartitions {
-		warm := inPartition(allWarm, ultra, partition)
+		warm := inPartition(allWarm, members, partition)
 		if len(warm) == 0 {
 			continue
 		}
@@ -780,10 +776,10 @@ func (manager *accountWorkerManager) replaceVictimFor(excludeID string, modelID 
 
 // openingInSet 返回分区内是否有 Worker 正在启动（读无锁镜像 openingSet）
 func (manager *accountWorkerManager) openingInSet(partition aistudio.PoolScope) bool {
-	ultra := manager.pool.UltraAccountIDs()
+	members := manager.pool.PartitionMembers()
 	opening := false
 	manager.openingSet.Range(func(key, _ any) bool {
-		if accountID, ok := key.(string); ok && partitionOf(accountID, ultra) == partition {
+		if accountID, ok := key.(string); ok && partitionOf(accountID, members) == partition {
 			opening = true
 			return false
 		}
@@ -939,23 +935,23 @@ func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, part
 
 // deadWarmCounts 统计各分区驻留 Worker 中的死槽位数（账号全局长时间冷却，或在预热池的热门冷却模型、所在分区的主用模型上长时间不可用），
 // 供状态页显示；口径与 registerDeadWorkers 的补登记一致
-func (manager *accountWorkerManager) deadWarmCounts(warm []string, ultra map[string]struct{}) (normal int, ultraDead int) {
-	normal = len(manager.pool.LongCoolingSet(inPartition(warm, ultra, aistudio.PoolScopeNormal),
-		manager.deadSlotModelsFor(aistudio.PoolScopeNormal), rotationMinRemaining, false))
-	ultraDead = len(manager.pool.LongCoolingSet(inPartition(warm, ultra, aistudio.PoolScopeUltra),
-		manager.deadSlotModelsFor(aistudio.PoolScopeUltra), rotationMinRemaining, false))
-	return normal, ultraDead
+func (manager *accountWorkerManager) deadWarmCounts(warm []string, members aistudio.PartitionSet) (counts partitionCounts) {
+	for _, partition := range workerPartitions {
+		accountIDs := inPartition(warm, members, partition)
+		if len(accountIDs) == 0 && partition == aistudio.PoolScopePro {
+			// PRO_POOL=false 或没有 Pro 账户时 Pro 分区为空：不为它多加一次锁
+			continue
+		}
+		counts[partition] = len(manager.pool.LongCoolingSet(accountIDs, manager.deadSlotModelsFor(partition), rotationMinRemaining, false))
+	}
+	return counts
 }
 
 // unschedulableWarmCounts 统计各分区驻留 Worker 中不可调度的账号数（需要登录、已停用、不可用、没有模型目录、需要验证账号的整户暂停，等待释放），供状态页显示；
 // 口径与补登记释放（registerUnschedulableWorkers）一致，与死槽位分开计：死槽位的口径不变，同一账号既长时间冷却又不可调度时两边都计
-func (manager *accountWorkerManager) unschedulableWarmCounts(warm []string, ultra map[string]struct{}) (normal int, ultraCount int) {
+func (manager *accountWorkerManager) unschedulableWarmCounts(warm []string, members aistudio.PartitionSet) (counts partitionCounts) {
 	for accountID := range manager.pool.UnschedulableSet(warm) {
-		if partitionOf(accountID, ultra) == aistudio.PoolScopeUltra {
-			ultraCount++
-		} else {
-			normal++
-		}
+		counts[partitionOf(accountID, members)]++
 	}
-	return normal, ultraCount
+	return counts
 }

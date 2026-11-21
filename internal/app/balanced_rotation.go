@@ -412,10 +412,7 @@ func (book *rotationBook) stats(now time.Time) (map[aistudio.PoolScope]string, i
 
 // balancedPartitionName 为轮换日志里的分区名
 func balancedPartitionName(partition aistudio.PoolScope) string {
-	if partition == aistudio.PoolScopeUltra {
-		return "Ultra"
-	}
-	return "普通"
+	return namesOf(partition).balanced
 }
 
 // rotationRegistrations 为一次加锁取得的登记概况：registered 为有任何登记的账号，others 为非轮换登记（冷却或不可调度）的副本与分区，
@@ -426,8 +423,8 @@ type rotationRegistrations struct {
 	rotations  map[aistudio.PoolScope][]string
 }
 
-// rotationRegistrationsIn 在 retireMu 内取得登记概况（分区按 ultra 成员快照）
-func (manager *accountWorkerManager) rotationRegistrationsIn(ultra map[string]struct{}) rotationRegistrations {
+// rotationRegistrationsIn 在 retireMu 内取得登记概况（分区按成员快照）
+func (manager *accountWorkerManager) rotationRegistrationsIn(members aistudio.PartitionSet) rotationRegistrations {
 	manager.retireMu.Lock()
 	defer manager.retireMu.Unlock()
 	view := rotationRegistrations{
@@ -436,7 +433,7 @@ func (manager *accountWorkerManager) rotationRegistrationsIn(ultra map[string]st
 	}
 	for accountID, entry := range manager.retirements {
 		view.registered[accountID] = struct{}{}
-		partition := partitionOf(accountID, ultra)
+		partition := partitionOf(accountID, members)
 		if entry.rotation {
 			view.rotations[partition] = append(view.rotations[partition], accountID)
 		} else {
@@ -574,10 +571,10 @@ func (service *trackedService) balancedRotate(ctx context.Context, now time.Time
 	running := workers.serviceRunning()
 	limited := service.egress.anyLimited()
 	snapshot := service.pool.QuotaDayUsage()
-	ultra := service.pool.UltraAccountIDs()
+	members := service.pool.PartitionMembers()
 	ready := workers.ReadyWarmAccountIDs()
 	allWarm := workers.WarmAccountIDs()
-	view := workers.rotationRegistrationsIn(ultra)
+	view := workers.rotationRegistrationsIn(members)
 	drains := workers.drainSnapshot()
 	retiring := workers.retiringIn(view.others, drains, now)
 	records := book.snapshot(now)
@@ -585,9 +582,9 @@ func (service *trackedService) balancedRotate(ctx context.Context, now time.Time
 		if ctx.Err() != nil {
 			return
 		}
-		accountIDs := inPartition(ready, ultra, partition)
+		accountIDs := inPartition(ready, members, partition)
 		if len(accountIDs) == 0 {
-			// 分区里没有在跑的 Worker：没有可换的，也不写暂停（只有普通账号的部署里 Ultra 分区一直如此）
+			// 分区里没有在跑的 Worker：没有可换的，也不写暂停（只有普通账号的部署里 Ultra 与 Pro 分区一直如此）
 			book.notePause(partition, "", now)
 			continue
 		}
@@ -604,7 +601,7 @@ func (service *trackedService) balancedRotate(ctx context.Context, now time.Time
 			rate:       balancedRotateRate(workers.maxActiveFor(partition), workers.warmConcurrencyValue()),
 			drainSlots: workers.drainSlotCount(partition), drainLimit: workers.drainLimit(partition),
 			drainTotal: workers.drainCount(partition), drainTotalLimit: workers.drainTotalLimit(partition),
-			resident: len(inPartition(allWarm, ultra, partition)), warmTarget: workers.warmTargetFor(partition),
+			resident: len(inPartition(allWarm, members, partition)), warmTarget: workers.warmTargetFor(partition),
 		}
 		// 暂停条件不成立时才收集候选与干跑替补挑法
 		if running && !limited && !input.pendingOther && !inProgress {
@@ -779,7 +776,7 @@ func (manager *accountWorkerManager) finishRotation(victim retirementCandidate) 
 		book.noteCooloff(accountID, now)
 		book.noteDone(now)
 		// 替补补在 Worker 关闭时所在的分区（见 finishRetirement）
-		victim.partition = partitionOf(accountID, manager.pool.UltraAccountIDs())
+		victim.partition = partitionOf(accountID, manager.pool.PartitionMembers())
 		plan := manager.replacementsFor([]evictedWorker{{partition: victim.partition, drain: victim.drain}})
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"WAA Worker 平均调用轮换 | 今日发送=%d | 登记后=%s | %s=%d/%d",

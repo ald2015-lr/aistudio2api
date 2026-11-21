@@ -26,13 +26,14 @@ func (manager *accountWorkerManager) OpeningAccountIDs() []string {
 // 关闭或替换 Worker 期间会持有账户锁（关闭浏览器可能几秒，WAA proof 在锁外生成），拿不到锁的账户按占用 1 个槽位计；
 // 排空中的 Worker 按已让出计，与调度的容量判断口径一致（排空期间浏览器数可以比槽位数多 drainLimit 个）。
 // 调度路径仍使用精确的 occupiedWorkersIn
-func (manager *accountWorkerManager) occupiedSlotsApprox(ultra map[string]struct{}) (normal int, ultraSlots int) {
+func (manager *accountWorkerManager) occupiedSlotsApprox(members aistudio.PartitionSet) partitionCounts {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
 	for _, account := range manager.accounts {
 		accounts = append(accounts, account)
 	}
 	manager.mu.RUnlock()
+	var counts partitionCounts
 	for _, account := range accounts {
 		slots := 0
 		if !account.mu.TryLock() {
@@ -52,16 +53,13 @@ func (manager *accountWorkerManager) occupiedSlotsApprox(ultra map[string]struct
 			}
 			account.mu.Unlock()
 		}
-		if partitionOf(account.id, ultra) == aistudio.PoolScopeUltra {
-			ultraSlots += slots
-		} else {
-			normal += slots
-		}
+		counts[partitionOf(account.id, members)] += slots
 	}
 	// 与调度的容量判断一致：排空中的 Worker 按已让出槽位计（先启后停，见 worker_drain.go）
-	normal -= manager.drainCredit(aistudio.PoolScopeNormal, nil)
-	ultraSlots -= manager.drainCredit(aistudio.PoolScopeUltra, nil)
-	return normal, ultraSlots
+	for _, partition := range workerPartitions {
+		counts[partition] -= manager.drainCredit(partition, nil)
+	}
+	return counts
 }
 
 // Onboarding 返回当前生成服务的新账户自动处理状态

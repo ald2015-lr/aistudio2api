@@ -524,7 +524,7 @@ def open_db(path):
 
 def load_rows(connection):
     # requests 表（internal/requestdb/requestdb.go）：time 为完成时间（Unix 毫秒），*_ms 为毫秒；attempts 为最终结果之前每次失败的上游尝试
-    # （JSON 数组，元素含 account、channel、error、duration_ms，见 api/ledger.go RequestAttempt）；pool 为号池（ultra，普通为空），
+    # （JSON 数组，元素含 account、channel、error、duration_ms，见 api/ledger.go RequestAttempt）；pool 为号池（ultra、pro，普通为空），
     # 旧账本没有 pool 列时按空读
     columns = ("id, time, protocol, model, account, channel, status, state, duration_ms, first_event_ms, queue_ms, "
                "reasoning_tokens, reply_tokens, tool_calls, error, attempts")
@@ -766,7 +766,21 @@ if dropped:
 section("0. 版本、配置与当前容量")
 workers = status.get("workers") or {}
 ultra_workers = status.get("ultra_workers") or {}
+# pro_workers、pro_accounts 为 Pro 分区与 Pro 号池（PRO_POOL=true 时权益为 Pro 的账户）；旧版状态接口没有，PRO_POOL=false 时为空
+pro_workers = status.get("pro_workers") or {}
+pro_accounts = status.get("pro_accounts") or {}
 account_counts = status.get("accounts") or {}
+
+
+def pool_label(pool, normal="普通号池"):
+    # 请求与账本的号池标记：ultra、pro 或空（普通路径）
+    return {"ultra": "Ultra 号池", "pro": "Pro 号池"}.get(pool or "", normal)
+
+
+def partition_label(pool):
+    # 主用模型供给条目的分区：pool 为 ultra、pro 时是 Ultra/Pro 主用模型在该分区的供给，空为普通主用模型
+    return {"ultra": "Ultra 分区", "pro": "Pro 分区"}.get(pool or "", "普通分区")
+
 rpm_limit = config.get("account_rpm_limit")
 concurrency = config.get("per_account_concurrency")
 supplies = [s for s in status.get("primary_supply") or [] if isinstance(s, dict)]
@@ -796,14 +810,20 @@ if status:
     if ultra_workers.get("max"):
         print(f"  Ultra 分区 Worker：就绪 {ultra_workers.get('warm')} / 预热目标 {ultra_workers.get('target')} / 峰值 {ultra_workers.get('max')}，"
               f"启动中 {ultra_workers.get('starting')}，死槽位 {ultra_workers.get('dead') or 0}，排空中 {ultra_workers.get('draining') or 0}")
+    # Pro 分区只在 Pro 号池有账户或有 Pro Worker 时显示（PRO_POOL=false 时为空）
+    if pro_workers.get("max") and (pro_accounts.get("total") or pro_workers.get("warm") or pro_workers.get("starting")):
+        print(f"  Pro 分区 Worker：就绪 {pro_workers.get('warm')} / 预热目标 {pro_workers.get('target')} / 峰值 {pro_workers.get('max')}，"
+              f"启动中 {pro_workers.get('starting')}，死槽位 {pro_workers.get('dead') or 0}，排空中 {pro_workers.get('draining') or 0}；"
+              f"Pro 号池账户 {pro_accounts.get('total') or 0}，就绪 {pro_accounts.get('ready') or 0}")
     # 不可调度（app/worker_unschedulable.go）：驻留 Worker 的账号需要登录、已停用、不可用、没有模型目录或需要验证账号（整户暂停中），不是任何模型的候选，等待释放
     if "unschedulable" in workers:
-        print(f"  驻留 Worker 不可调度={(workers.get('unschedulable') or 0) + (ultra_workers.get('unschedulable') or 0)}"
-              f"（普通 {workers.get('unschedulable') or 0}，Ultra {ultra_workers.get('unschedulable') or 0}；需要登录、已停用、没有模型目录或需要验证账号，空闲即释放）")
+        print(f"  驻留 Worker 不可调度={(workers.get('unschedulable') or 0) + (ultra_workers.get('unschedulable') or 0) + (pro_workers.get('unschedulable') or 0)}"
+              f"（普通 {workers.get('unschedulable') or 0}，Ultra {ultra_workers.get('unschedulable') or 0}，Pro {pro_workers.get('unschedulable') or 0}；"
+              "需要登录、已停用、没有模型目录或需要验证账号，空闲即释放）")
     else:
         print("  驻留 Worker 不可调度=-（这个版本的状态接口没有 unschedulable 字段）")
     for supply in supplies:
-        pool = "Ultra 分区" if supply.get("pool") == "ultra" else "普通分区"
+        pool = partition_label(supply.get("pool"))
         cooling = (f"，对它冷却中的驻留 Worker {supply.get('cooling')} 个" if "cooling" in supply
                    else "（这个版本的状态接口没有 cooling 字段）")
         print(f"  主用模型供给 {supply.get('model')}（{pool}）：能服务它的驻留 Worker {supply.get('warm')} 个，"
@@ -860,12 +880,16 @@ if config:
     print(f"  主用模型 PRIMARY_MODELS={','.join(config.get('primary_models') or []) or '(空)'}  排队上限 PRIMARY_QUEUE_WAIT={config.get('primary_queue_wait')}  "
           f"REQUEST_TIMEOUT={config.get('request_timeout')}  FIRST_EVENT_TIMEOUT={config.get('first_event_timeout')}")
     if config.get("ultra_primary_models"):
-        print(f"  Ultra 主用模型 ULTRA_PRIMARY_MODELS={','.join(config.get('ultra_primary_models') or [])}  "
+        print(f"  Ultra/Pro 主用模型（/ultra 与 /pro）ULTRA_PRIMARY_MODELS={','.join(config.get('ultra_primary_models') or [])}  "
               f"排队上限 ULTRA_PRIMARY_QUEUE_WAIT={config.get('ultra_primary_queue_wait')}")
+    if "pro_pool" in config:
+        print(f"  Pro 独立号池 PRO_POOL={str(config.get('pro_pool')).lower()}  Pro 常驻 PRO_WARM_WORKER_LIMIT={config.get('pro_warm_worker_limit')}  "
+              f"Pro 峰值 PRO_MAX_ACTIVE_WORKERS={config.get('pro_max_active_workers')}"
+              + ("（ULTRA_INCLUDE_PRO 在 PRO_POOL=true 时不生效）" if config.get("pro_pool") and config.get("ultra_include_pro") else ""))
 elif API_STATE not in ("down", "denied", "offline"):
     print("  无法读取 /api/config")
 primary_listed = MODEL and MODEL in [model_key(m) for m in (config.get("primary_models") or []) + (config.get("ultra_primary_models") or [])]
-normal_supply = next((s for s in model_supplies if s.get("pool") != "ultra"), None) or (model_supplies[0] if model_supplies else None)
+normal_supply = next((s for s in model_supplies if s.get("pool") not in ("ultra", "pro")), None) or (model_supplies[0] if model_supplies else None)
 if normal_supply and isinstance(rpm_limit, int) and rpm_limit > 0:
     demand = len(model_rows) / MINUTES
     warm = normal_supply.get("warm") or 0
@@ -888,7 +912,7 @@ else:
         failures = collections.Counter(row["class"] for row in data if row["class"])
         empty = sum(1 for row in data if row["success"] and not row["reply"] and not row["tools"])
         broken = sum(1 for row in data if row["state"] == "failed" and row["first"])
-        label = f"{model}{'（Ultra 号池）' if pool == 'ultra' else ''}"
+        label = f"{model}{'（' + pool_label(pool) + '）' if pool in ('ultra', 'pro') else ''}"
         print(f"  {label}：请求 {len(data)}，成功 {share(success, len(data))}，失败/取消 {len(data) - success}")
         if failures:
             print(f"    失败原因：{top(failures, 7, len(data))}")
@@ -944,7 +968,7 @@ else:
         prior = collections.Counter(len(row["attempts"]) for row, _ in parsed)
         prior_classes = collections.Counter(attempt_class(a.get("error")) for row, _ in parsed for a in row["attempts"])
         if title == "全部模型" or len(model_busy) != len(busy_rows):
-            pools = collections.Counter("Ultra 号池" if row["pool"] == "ultra" else "普通号池" for row, _ in parsed)
+            pools = collections.Counter(pool_label(row["pool"]) for row, _ in parsed)
             print(f"    {title}：{len(data)} 个（{top(pools)}）；最后等待原因：{top(reasons, 6, len(data))}")
             paused = reasons.get("出口限流中，冷启动按配额进行", 0)
             if title == "全部模型" and (reasons.get("出口限速") or reasons.get("驻留账号该模型额度已用完") or paused):
@@ -1043,7 +1067,7 @@ else:
                     "看第 4 段的连续限流档位与第 6 段的驻留冷却：裸限流连续出现会逐级加长冷却，第 3 档（30 分钟）起驻留 Worker 成为死槽位，排空淘汰后换上备用账号",
                 "热 Worker 多半每分钟已满（ACCOUNT_RPM_LIMIT）": "每分钟上限是瓶颈：增加驻留 Worker（MAX_ACTIVE_WORKERS），或减少该模型的并发",
                 "热 Worker 全忙且没有备用账号": "号池里已经没有还能服务它的空闲账号，多半是当天额度已用完：加入账号，或等太平洋时间零点",
-                "热 Worker 全忙、分区已满，备用账号起不来": "分区峰值不够：调大 MAX_ACTIVE_WORKERS（Ultra 为 ULTRA_MAX_ACTIVE_WORKERS），或减少并发",
+                "热 Worker 全忙、分区已满，备用账号起不来": "分区峰值不够：调大 MAX_ACTIVE_WORKERS（Ultra 为 ULTRA_MAX_ACTIVE_WORKERS，Pro 为 PRO_MAX_ACTIVE_WORKERS），或减少并发",
                 "热 Worker 全忙（并发超过容量）": "并发超过驻留 Worker × 单账户并发：增加 Worker，或减少并发",
             }.get(cause, "")
             VERDICTS.append(f"排队超限时的候选快照：{share(count, len(focus))} 属于“{cause}”" + (f"。{advice}" if advice else ""))
@@ -1706,7 +1730,7 @@ elif MODEL:
             print("    剩余时间：" + "，".join(f"{key} {share(remaining[key], any_cooled)}" for key in order if remaining[key]))
         if title == "驻留 Worker" and pool_ids:
             supply_text = "；".join(
-                f"{'Ultra 分区' if s.get('pool') == 'ultra' else '普通分区'} 热 {s.get('warm')} · 驻留冷却 {s.get('cooling', '-')}"
+                f"{partition_label(s.get('pool'))} 热 {s.get('warm')} · 驻留冷却 {s.get('cooling', '-')}"
                 for s in model_supplies)
             print(f"    驻留 Worker 中两个通道都没冷却 {len(pool_ids) - any_cooled} 个，至少一个通道没冷却 {len(pool_ids) - all_cooled} 个" +
                   (f"；状态接口的主用模型供给（调度口径，约 30 秒统计一次）：{supply_text}" if supply_text else ""))
@@ -1753,8 +1777,11 @@ for e in logs:
     if e["t"] < SINCE:
         continue
     message = e["msg"]
-    partition = "Ultra·" if message.startswith("Ultra WAA Worker") else ""
-    message = message[len("Ultra "):] if partition else message
+    # 分区前缀：Ultra 分区与 Pro 分区的 Worker 日志以 "Ultra WAA Worker"、"Pro WAA Worker" 开头（app/worker_partition.go workerLogName）
+    partition = ""
+    for prefix in ("Ultra ", "Pro "):
+        if message.startswith(prefix + "WAA Worker"):
+            partition, message = prefix.strip() + "·", message[len(prefix):]
     for prefix, name in LIFECYCLE:
         if message.startswith(prefix):
             info = fields(message)
@@ -1773,11 +1800,11 @@ if lifecycle:
         print(f"    冷却淘汰/排空的范围：{top(retire_scopes, 5)}")
     if release_reasons:
         print(f"    不可调度释放的原因：{top(release_reasons, 5)}")
-    starts = lifecycle.get("新启动就绪", 0) + lifecycle.get("Ultra·新启动就绪", 0)
+    starts = lifecycle.get("新启动就绪", 0) + lifecycle.get("Ultra·新启动就绪", 0) + lifecycle.get("Pro·新启动就绪", 0)
     warm_now = workers.get("warm") or 0
     if warm_now and starts >= warm_now:
         VERDICTS.append(f"{MINUTES} 分钟内新启动 Worker {starts} 个，超过驻留数 {warm_now}：Worker 在频繁更换，每次冷启动都占名额、拖慢排队")
-    skipped = lifecycle.get("替补跳过", 0) + lifecycle.get("Ultra·替补跳过", 0)
+    skipped = lifecycle.get("替补跳过", 0) + lifecycle.get("Ultra·替补跳过", 0) + lifecycle.get("Pro·替补跳过", 0)
     if skipped:
         VERDICTS.append(f"替补跳过 {skipped} 次：分区内没有能服务这些模型、没有长时间冷却的备用账号，淘汰死槽位后换不上新号")
     # 就绪按启动来源（预热、替补、扩容、按需、补覆盖、重开；旧版本不写来源）；按需扩容与按需替换按是否超出常驻、是否在出口限流判定期内分开
@@ -1786,7 +1813,10 @@ if lifecycle:
     for e in logs:
         if e["t"] < SINCE:
             continue
-        message = e["msg"][len("Ultra "):] if e["msg"].startswith("Ultra WAA Worker") else e["msg"]
+        message = e["msg"]
+        for prefix in ("Ultra ", "Pro "):
+            if message.startswith(prefix + "WAA Worker"):
+                message = message[len(prefix):]
         if message.startswith("WAA Worker 就绪"):
             sources[fields(message).get("来源", "未写")] += 1
         elif message.startswith(("WAA Worker 按需扩容", "WAA Worker 按需替换")):
@@ -1801,8 +1831,8 @@ if lifecycle:
 else:
     print("  窗口内日志没有 Worker 变动记录")
 # 驻留 Worker 中不可调度的超过 10%：它们占着槽位却不是任何模型的候选，释放应在持续发生
-unschedulable_now = (workers.get("unschedulable") or 0) + (ultra_workers.get("unschedulable") or 0)
-resident_now = (workers.get("warm") or 0) + (ultra_workers.get("warm") or 0)
+unschedulable_now = (workers.get("unschedulable") or 0) + (ultra_workers.get("unschedulable") or 0) + (pro_workers.get("unschedulable") or 0)
+resident_now = (workers.get("warm") or 0) + (ultra_workers.get("warm") or 0) + (pro_workers.get("warm") or 0)
 if resident_now and unschedulable_now * 10 > resident_now:
     released = lifecycle.get("不可调度释放", 0)
     VERDICTS.append(f"驻留 Worker 中 {unschedulable_now} 个账号已不可调度，检查‘WAA Worker 释放’是否在发生"

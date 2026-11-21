@@ -206,11 +206,11 @@ type balancedRotationStats struct {
 // balancedRotationStats 返回轮换的计数（见 balancedRotationStats 类型的说明）：登记数在 retireMu 内数，其余读轮换记录
 func (manager *accountWorkerManager) balancedRotationStats(now time.Time) balancedRotationStats {
 	stats := balancedRotationStats{rotating: make(map[aistudio.PoolScope]int, len(workerPartitions))}
-	ultra := manager.pool.UltraAccountIDs()
+	members := manager.pool.PartitionMembers()
 	manager.retireMu.Lock()
 	for accountID, entry := range manager.retirements {
 		if entry.rotation {
-			stats.rotating[partitionOf(accountID, ultra)]++
+			stats.rotating[partitionOf(accountID, members)]++
 		}
 	}
 	manager.retireMu.Unlock()
@@ -268,10 +268,16 @@ func (service *trackedService) balancedOverview(snapshot aistudio.QuotaUsageSnap
 		spread := usageSpread(counts)
 		spread.Rotating = rotation.rotating[partition]
 		spread.PausedReason = rotation.paused[partition]
-		if partition == aistudio.PoolScopeUltra {
-			status.Ultra = spread
-		} else {
+		switch partition {
+		case aistudio.PoolScopeNormal:
 			status.Normal = spread
+		case aistudio.PoolScopeUltra:
+			status.Ultra = spread
+		case aistudio.PoolScopePro:
+			// 只有 Pro 号池有可调度账号时列出（PRO_POOL=false 时 Pro 号池为空，状态与概况日志与原先相同）
+			if spread.Accounts > 0 {
+				status.Pro = &spread
+			}
 		}
 	}
 	return status
@@ -311,10 +317,12 @@ func balancedSummaryLine(status *api.AdminBalanced) string {
 		}
 		return line
 	}
-	return strings.Join([]string{
-		"平均调用概况", "额度日=" + status.QuotaDay, part("普通", status.Normal), part("Ultra", status.Ultra),
-		fmt.Sprintf("近 1 小时轮换=%d", status.Rotations1h),
-	}, " | ")
+	parts := []string{"平均调用概况", "额度日=" + status.QuotaDay, part("普通", status.Normal), part("Ultra", status.Ultra)}
+	if status.Pro != nil {
+		parts = append(parts, part("Pro", *status.Pro))
+	}
+	parts = append(parts, fmt.Sprintf("近 1 小时轮换=%d", status.Rotations1h))
+	return strings.Join(parts, " | ")
 }
 
 // balancedStatus 返回状态页的平均调用概况：开启、服务在运行且已统计过时才有；只读缓存，不对账户池加锁

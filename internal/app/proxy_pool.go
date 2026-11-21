@@ -448,6 +448,24 @@ func (pool *proxyPool) configure(cfg config.ProxyPool, globalProxy string, capac
 	return cfgChanged || globalChanged
 }
 
+// setCapacity 只更新可能同时运行的浏览器数（见 proxyPoolCapacity），与 configure 只有上限变化时相同：重新判断端口够不够与本机中转的
+// 连接上限，状态切换时记一行。还没按配置生效（configure 之前）或上限不变时什么也不做
+func (pool *proxyPool) setCapacity(capacity int) {
+	if pool == nil {
+		return
+	}
+	capacity = max(capacity, 0)
+	pool.mu.Lock()
+	if !pool.settings.initialized || pool.settings.capacity == capacity {
+		pool.mu.Unlock()
+		return
+	}
+	pool.settings.capacity = capacity
+	logs := pool.capacityLogsLocked(false)
+	pool.mu.Unlock()
+	pool.emit(logs)
+}
+
 // configureLogsLocked 为配置变化时的日志：更新或关闭、运行中的 Worker 仍走默认代理、不再使用 PROXY、固定了默认代理的账户
 func (pool *proxyPool) configureLogsLocked(old proxyPoolSettings, wasEnabled bool) []proxyPoolLog {
 	cfg := pool.settings.cfg

@@ -143,6 +143,8 @@ type BootstrapSummary struct {
 	Available int
 	// UltraAvailable 为 Available 中属于 Ultra 号池的账户数（Ultra Worker 分区的预热目标上限）
 	UltraAvailable int
+	// ProAvailable 为 Available 中属于 Pro 号池的账户数（Pro Worker 分区的预热目标上限，PRO_POOL=false 时为 0）
+	ProAvailable int
 	// ModelIDs 为全部账户出现过的初始化模型，去重并按首次出现顺序排列
 	ModelIDs []string
 }
@@ -178,12 +180,29 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 		// 与 Status 共用状态推导（按候选索引的紧凑数组）：需要登录的账户即使还有未结束的租约也不计入可预热
 		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {
 			summary.Available++
-			if ultraPoolTier(account.BenefitTier, p.ultraIncludePro) {
+			switch p.rules.partitionOf(account.BenefitTier) {
+			case PoolScopeUltra:
 				summary.UltraAvailable++
+			case PoolScopePro:
+				summary.ProAvailable++
 			}
 		}
 	}
 	return summary
+}
+
+// AvailableIn 返回 Available 中属于分区 partition 的账户数：普通分区为其余账户；非分区取值为 0
+func (summary BootstrapSummary) AvailableIn(partition PoolScope) int {
+	switch partition {
+	case PoolScopeNormal:
+		return summary.Available - summary.UltraAvailable - summary.ProAvailable
+	case PoolScopeUltra:
+		return summary.UltraAvailable
+	case PoolScopePro:
+		return summary.ProAvailable
+	default:
+		return 0
+	}
 }
 
 // PrimaryDirectory 返回第一个账户路径对应的目录（绝对路径），用于保存账户集合级别的状态文件
@@ -253,11 +272,15 @@ func (p *AccountPool) StateCounts() AccountStateCounts {
 	return counts
 }
 
-// PoolStateCounts 一次加锁统计全部账户与其中 Ultra 号池账户的各状态数量
-func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts) {
-	var counts, ultra AccountStateCounts
+// PartitionStateCounts 为按 Worker 分区（普通、Ultra、Pro）的账户状态数量，按 PoolScope 下标；非分区下标为零值
+type PartitionStateCounts [PoolScopeCount]AccountStateCounts
+
+// PoolStateCounts 一次加锁统计全部账户与各分区账户的各状态数量
+func (p *AccountPool) PoolStateCounts() (AccountStateCounts, PartitionStateCounts) {
+	var counts AccountStateCounts
+	var partitions PartitionStateCounts
 	if p == nil {
-		return counts, ultra
+		return counts, partitions
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -271,11 +294,9 @@ func (p *AccountPool) PoolStateCounts() (AccountStateCounts, AccountStateCounts)
 		}
 		state := index.derivedStateAt(position, nowNanos)
 		counts.add(state)
-		if ultraPoolTier(index.tier[position], p.ultraIncludePro) {
-			ultra.add(state)
-		}
+		partitions[p.rules.partitionOf(index.tier[position])].add(state)
 	}
-	return counts, ultra
+	return counts, partitions
 }
 
 // add 计入一个账户的对外状态
@@ -668,7 +689,7 @@ func (p *AccountPool) ServeableCounts(accountIDs []string, modelIDs []string, mi
 			counts[account.ID] = 0
 			continue
 		}
-		// 索引只存真实权益，号池由权益加 ULTRA_INCLUDE_PRO 推导：并入的 Pro 按 Ultra 号池的候选集计分，
+		// 索引只存真实权益，号池由权益加 PRO_POOL、ULTRA_INCLUDE_PRO 推导：并入的 Pro 按 Ultra 号池的候选集计分、Pro 号池的 Pro 按 Pro 号池计分，
 		// 否则独占模式下它在普通候选集里得 0 分，永远不会为 Ultra 主用模型预热
 		scope := p.poolOfTierLocked(index.tier[position])
 		scoped, built := sets[scope]

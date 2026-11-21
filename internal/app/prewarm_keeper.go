@@ -71,7 +71,11 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	// 权益规则与账户目录的对照：目录、权益或规则变化后才重算（账户池按版本缓存）。有新的内容时写日志：目录明确标注可用的写一行 WARN，
 	// 只是没有标注的按配置项与模型合并写一行 INFO，不在任何目录里的名称写一行 WARN（见 checkTierRules）
 	service.checkTierRules()
-	// 普通与 Ultra 分区各自按自己的预热目标判断
+	// PRO_POOL 默认开启的升级提示（见 pro_pool.go）：变成需要提示时写一行 WARN
+	service.checkProPoolNotice()
+	// IP 池的浏览器上限随 Pro 分区有没有账户变化（见 worker_proxy.go）
+	service.syncProxyPoolCapacity()
+	// 各分区各自按自己的预热目标判断
 	if workers.prewarmNeeded() {
 		workers.StartPrewarm(dataContext)
 	}
@@ -315,7 +319,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		return 0
 	}
 	budget := max(workers.warmConcurrencyValue(), 1)
-	ultra := service.pool.UltraAccountIDs()
+	members := service.pool.PartitionMembers()
 	opening := workers.OpeningAccountIDs()
 	type victim struct {
 		accountID string
@@ -326,7 +330,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		if len(victims) >= budget {
 			break
 		}
-		warm := inPartition(allWarm, ultra, partition)
+		warm := inPartition(allWarm, members, partition)
 		candidates := make([]string, 0, len(warm))
 		for _, accountID := range warm {
 			if _, cooled := dead[accountID]; !cooled {
@@ -351,7 +355,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		for _, accountID := range warm {
 			occupied[accountID] = struct{}{}
 		}
-		for _, accountID := range inPartition(opening, ultra, partition) {
+		for _, accountID := range inPartition(opening, members, partition) {
 			occupied[accountID] = struct{}{}
 		}
 		limit := min(budget-len(victims), len(candidates))
@@ -422,7 +426,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 // 一轮最多替换的数量两个分区共用启动预热并发。按模型的轮换有阈值；全局冷却的账号见 sweepDeadWorkers
 func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	workers := service.workers
-	ultra := service.pool.UltraAccountIDs()
+	members := service.pool.PartitionMembers()
 	allWarm := workers.WarmAccountIDs()
 	opening := workers.OpeningAccountIDs()
 	var allHot []string
@@ -432,7 +436,7 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	rotated := 0
 	budget := workers.warmConcurrencyValue()
 	for _, partition := range workerPartitions {
-		warm := inPartition(allWarm, ultra, partition)
+		warm := inPartition(allWarm, members, partition)
 		if len(warm) == 0 {
 			continue
 		}
@@ -449,9 +453,10 @@ func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 			evicted = append(evicted, evictedWorker{partition: partition, models: hot, drain: drain})
 		}
 		rotated += count
+		// 普通分区不加前缀（原有写法），Ultra 与 Pro 分区的模型前加分区名
 		prefix := ""
-		if partition == aistudio.PoolScopeUltra {
-			prefix = "Ultra "
+		if partition != aistudio.PoolScopeNormal {
+			prefix = balancedPartitionName(partition) + " "
 		}
 		for _, modelID := range hot {
 			details = append(details, fmt.Sprintf("%s%s %d/%d", prefix, modelID, counts[modelID], len(warm)))

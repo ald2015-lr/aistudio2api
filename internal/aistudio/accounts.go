@@ -149,7 +149,7 @@ func (e *AllCoolingError) ErrorCode() string {
 // 由客户端稍后重试。只在等待原因是账号忙碌、没有空闲槽位、Worker 启动或扩容中时产生；候选全部冷却仍按 AllCoolingError 处理
 type CapacityBusyError struct {
 	ModelID string
-	// Pool 为请求限定的号池；Ultra 号池的错误写明 Ultra 号池
+	// Pool 为请求限定的号池；Ultra 号池与 Pro 号池的错误写明号池
 	Pool PoolScope
 	// Reason 为最后一次等待的原因（账号全部忙碌、没有空闲的 Worker 槽位等）
 	Reason string
@@ -172,7 +172,7 @@ type CapacityBusyError struct {
 
 func (e *CapacityBusyError) Error() string {
 	pool := ""
-	if e.Pool == PoolScopeUltra {
+	if labeledPool(e.Pool) {
 		pool = e.Pool.Label() + "，"
 	}
 	detail := ""
@@ -368,13 +368,18 @@ type AccountsNotReadyError struct {
 	Reasons []string
 	// Cause 为触发该错误的内部原因（如账户 runtime 被其他进程占用），可为空
 	Cause error
-	// Pool 为请求限定的号池；Ultra 号池的错误原因前写明 Ultra 号池（普通号池的措辞与不分号池时相同）
+	// Pool 为请求限定的号池；Ultra 号池与 Pro 号池的错误原因前写明号池（普通号池的措辞与不分号池时相同）
 	Pool PoolScope
+}
+
+// labeledPool 判断号池错误文案是否写明号池：只写 Ultra 与 Pro 号池，普通路径（普通号池、不限号池、普通号池与 Ultra 号池）的措辞与不分号池时相同
+func labeledPool(scope PoolScope) bool {
+	return scope == PoolScopeUltra || scope == PoolScopePro
 }
 
 func (e *AccountsNotReadyError) Error() string {
 	message := ErrNoEligibleAccount.Error() + "："
-	if e.Pool == PoolScopeUltra {
+	if labeledPool(e.Pool) {
 		message += e.Pool.Label() + "："
 	}
 	message += strings.Join(e.Reasons, "；")
@@ -407,7 +412,7 @@ func PoolNotReady(reason string, cause error) *AccountsNotReadyError {
 	return &AccountsNotReadyError{Reasons: []string{reason}, Cause: cause}
 }
 
-// PoolNotReadyIn 返回限定号池的请求暂时无法调度的无账户错误：请求路径上号池已知时使用，/ultra 请求的错误写明 Ultra 号池
+// PoolNotReadyIn 返回限定号池的请求暂时无法调度的无账户错误：请求路径上号池已知时使用，/ultra 与 /pro 请求的错误写明号池
 func PoolNotReadyIn(scope PoolScope, reason string, cause error) *AccountsNotReadyError {
 	notReady := PoolNotReady(reason, cause)
 	notReady.Pool = scope
@@ -430,6 +435,16 @@ const (
 	emptyUltraPoolWithProReason = "没有权益为 Ultra 或 Pro 的账户"
 	// emptyNormalPoolWithProReason 为 ULTRA_INCLUDE_PRO=true 时账户都属于 Ultra 号池、独占模式下普通路径没有可用账户的原因
 	emptyNormalPoolWithProReason = "账户都属于 Ultra 号池（权益为 Ultra，或 ULTRA_INCLUDE_PRO=true 时的 Pro），ULTRA_EXCLUSIVE=true 时只服务 /ultra 前缀的请求"
+	// emptyProPoolReason 为 PRO_POOL=true 时 Pro 号池中没有任何账户的原因
+	emptyProPoolReason = "没有权益为 Pro 的账户"
+	// proPoolDisabledReason 为 PRO_POOL=false 时 Pro 号池的选择（开关关闭前进入、仍在进行的 /pro 请求）没有账户的原因；
+	// 新的 /pro 请求由 api 层按 404 返回，不会走到选号
+	proPoolDisabledReason = "PRO_POOL=false，Pro 号池未启用"
+	// emptyNormalPoolProReason 为 PRO_POOL=true 时账户都属于 Pro 或 Ultra 号池、独占模式下普通路径没有可用账户的原因
+	// （有 Pro 账户时才用；只有 Ultra 账户时仍用 emptyNormalPoolReason）
+	emptyNormalPoolProReason = "账户都属于 Pro 或 Ultra 号池（PRO_POOL=true 时 Pro 只服务 /pro；ULTRA_EXCLUSIVE=true 时 Ultra 只服务 /ultra）"
+	// emptyNormalUltraPoolReason 为 PRO_POOL=true、ULTRA_EXCLUSIVE=false 时账户都是 Pro 账户、普通路径没有可用账户的原因
+	emptyNormalUltraPoolReason = "账户都是 Pro 账户，PRO_POOL=true 时只服务 /pro 前缀的请求"
 )
 
 // accountStateLabels 为不可调度账户状态的中文说明
@@ -603,7 +618,7 @@ type AccountStatus struct {
 	BenefitTier string       `json:"benefit_tier"`
 	// BenefitTierKnown 表示账户权益已经从官网读取过（运行态里有目录指纹）；尚未读取的账户按 Free 显示，属于普通号池
 	BenefitTierKnown bool `json:"benefit_tier_known"`
-	// Pool 为账户当前所属的号池（成员关系，随 ULTRA_INCLUDE_PRO 变化）：ultra 或 normal；BenefitTier 始终是真实权益
+	// Pool 为账户当前所属的号池（成员关系，随 PRO_POOL 与 ULTRA_INCLUDE_PRO 变化）：ultra、pro 或 normal；BenefitTier 始终是真实权益
 	Pool      string                   `json:"pool"`
 	Cooldowns map[string]CooldownState `json:"-"`
 	LastUsed  *time.Time               `json:"last_used,omitempty"`
@@ -731,18 +746,23 @@ type AccountPool struct {
 	sortedIndicesVersion uint64
 	// sched 为候选索引（见 scheduling_index.go），nil 表示下次调度时重建；eligibilityVersion 在影响"号池内哪些账户
 	// 支持哪些模型"的变化时递增（账户增删、目录或权益变化、启用状态、Build 目录、上游通道、号池划分规则），按版本缓存的目录汇总、
-	// 别名解析与模型通道（见 pool_catalog_cache.go）在版本变化后重建；ultraAccounts 为当前属于 Ultra 号池的账户（见 ultraPoolTier）。
-	// statusCache 为账户多时缓存的状态列表
+	// 别名解析与模型通道（见 pool_catalog_cache.go）在版本变化后重建；partitionMembers 为当前属于普通分区以外（Ultra、Pro）的账户
+	// 与所属分区（见 poolOfTier）。statusCache 为账户多时缓存的状态列表
 	sched              *schedulingIndex
 	eligibilityVersion uint64
 	catalogSummaries   map[PoolScope]*catalogSummary
 	canonicalIndexes   map[PoolScope]*canonicalIndex
 	modelChannelsMemos map[PoolScope]*modelChannelsMemo
-	ultraAccounts      map[string]struct{}
-	// ultraIncludePro 为 ULTRA_INCLUDE_PRO：为真时权益为 Pro 的账户也属于 Ultra 号池（Worker 分区）；受 mu 保护
-	ultraIncludePro bool
-	// ultraSnapshot 为 UltraAccountIDs 返回的只读副本，nil 表示成员变化后尚未重建；受 mu 保护
-	ultraSnapshot map[string]struct{}
+	// buildModelIDs 为全部账户 Build 目录中出现过的模型 ID（不分号池，见 buildModelIDsLocked），版本为 buildModelIDsVersion
+	buildModelIDs        map[string]struct{}
+	buildModelIDsVersion uint64
+	partitionMembers     map[string]PoolScope
+	// rules 为号池划分规则（ULTRA_INCLUDE_PRO、PRO_POOL 与预先算好的表，见 poolRules）；受 mu 保护
+	rules poolRules
+	// proPoolLive 为 rules.proPool 的无锁副本（见 ProPool），只在 setPoolRulesLocked 内与成员一同写
+	proPoolLive atomic.Bool
+	// membersSnapshot 为 PartitionMembers 返回的只读副本，nil 表示成员变化后尚未重建；受 mu 保护
+	membersSnapshot PartitionSet
 	// tierRules 为 ULTRA_ONLY_MODELS 与 PAID_ONLY_MODELS 的权益规则（见 tier_rules.go），tierReport 为按 eligibilityVersion 缓存的
 	// 规则与目录对照；均受 mu 保护
 	tierRules  modelTierRules
@@ -753,7 +773,7 @@ type AccountPool struct {
 	// tierMasksByCatalogRules 为计算时的规则版本；均受 mu 保护
 	tierMasksByCatalog      map[uint64]map[string]tierMask
 	tierMasksByCatalogRules uint64
-	// poolRuleVersion 在号池划分规则（ULTRA_INCLUDE_PRO、权益规则）每次实际切换时加一，无锁读取，供 app 层按版本作废派生缓存
+	// poolRuleVersion 在号池划分规则（PRO_POOL、ULTRA_INCLUDE_PRO、权益规则）每次实际切换时加一，无锁读取，供 app 层按版本作废派生缓存
 	poolRuleVersion atomic.Uint64
 	statusCache     []AccountStatus
 	statusCacheAt   time.Time
@@ -1316,16 +1336,18 @@ func NewAccountPool(accounts []*Account, perAccountConcurrency int) *AccountPool
 		resources: make(map[string]string), perAccountConcurrency: perAccountConcurrency, changed: make(chan struct{}),
 		routingStrategy: "round-robin", lastPicked: make(map[string]string), lastPickedChannel: make(map[string]Channel),
 		catalogSummaries: make(map[PoolScope]*catalogSummary), canonicalIndexes: make(map[PoolScope]*canonicalIndex),
-		modelChannelsMemos: make(map[PoolScope]*modelChannelsMemo), ultraAccounts: make(map[string]struct{}),
+		modelChannelsMemos: make(map[PoolScope]*modelChannelsMemo), partitionMembers: make(map[string]PoolScope),
+		// 构造时两个开关都为 false（只有普通与 Ultra 两个号池）；PRO_POOL、ULTRA_INCLUDE_PRO 由随后的 SetPoolRules 重算成员
+		// （见 app 的 configurePool）
+		rules: newPoolRules(false, false),
 	}
 	for position, account := range p.accounts {
 		if account == nil {
 			continue
 		}
 		account.position = position
-		// 构造时开关为 false；ULTRA_INCLUDE_PRO=true 由随后的 SetUltraIncludePro 重算成员（见 app 的 configurePool）
-		if ultraPoolTier(account.BenefitTier, false) {
-			p.ultraAccounts[account.ID] = struct{}{}
+		if partition := p.rules.partitionOf(account.BenefitTier); partition != PoolScopeNormal {
+			p.partitionMembers[account.ID] = partition
 		}
 		if account.runtime.Cooldowns == nil {
 			account.runtime.Cooldowns = make(map[string]CooldownState)
@@ -1524,8 +1546,10 @@ func (p *AccountPool) removeExclusive(account *Account, leaseLock *flock.Flock, 
 		}
 	}
 	delete(p.byID, accountID)
-	delete(p.ultraAccounts, accountID)
-	p.ultraSnapshot = nil
+	if _, member := p.partitionMembers[accountID]; member {
+		delete(p.partitionMembers, accountID)
+		p.membersSnapshot = nil
+	}
 	// Remove 与批量删除（AccountReservation.Remove）都经这里：同一锁段摘下出口通道，出口账户数不漂移
 	p.detachEgressLocked(account)
 	// 移出号池的账户不再排空：调用方另建同 ID 账户时从未排空开始
@@ -1964,7 +1988,7 @@ func (p *AccountPool) refreshAndValidateLease(
 			return false, err
 		}
 	} else if !p.inPoolLocked(selection.Pool, account) {
-		// 刷新运行态期间账户权益或 ULTRA_INCLUDE_PRO 变化、已不属于请求的号池：放弃这个账户重新选号
+		// 刷新运行态期间账户权益或号池开关（PRO_POOL、ULTRA_INCLUDE_PRO）变化、已不属于请求的号池：放弃这个账户重新选号
 		return false, nil
 	}
 	if selection.ModelID != "" && !p.channelSupportsLocked(account, lease.Channel(), selection) {
@@ -2026,20 +2050,30 @@ func (p *AccountPool) noEligibleErrorLocked(selection AccountSelection) error {
 	return ErrNoEligibleAccount
 }
 
-// emptyPoolErrorLocked 返回号池中没有任何账户时的号池暂时不可调度错误：Ultra 号池为空说明没有属于 Ultra 号池的账户；
-// 普通号池为空而账户池不为空，说明账户都属于 Ultra 号池、独占模式下普通路径不能使用。ULTRA_INCLUDE_PRO=true 时原因写明
-// Pro 也属于 Ultra 号池，关闭时保持原文。调用方持有 p.mu
+// emptyPoolErrorLocked 返回号池中没有任何账户时的号池暂时不可调度错误：Ultra（Pro）号池为空说明没有属于该号池的账户；
+// 普通号池为空而账户池不为空，说明账户都属于其他号池、独占模式下普通路径不能使用。ULTRA_INCLUDE_PRO=true（PRO_POOL=false）时
+// 原因写明 Pro 也属于 Ultra 号池；PRO_POOL=true 且有 Pro 账户时写明 Pro 只服务 /pro；两个开关都关闭时保持原文。
+// PRO_POOL=false 时 Pro 号池总是为空，原因写明开关关闭。调用方持有 p.mu
 func (p *AccountPool) emptyPoolErrorLocked(scope PoolScope) *AccountsNotReadyError {
 	reason := emptyPoolReason
+	includePro := p.rules.includePro && !p.rules.proPool
 	switch {
-	case scope == PoolScopeUltra && p.ultraIncludePro:
+	case scope == PoolScopePro && !p.rules.proPool:
+		reason = proPoolDisabledReason
+	case scope == PoolScopePro:
+		reason = emptyProPoolReason
+	case scope == PoolScopeUltra && includePro:
 		reason = emptyUltraPoolWithProReason
 	case scope == PoolScopeUltra:
 		reason = emptyUltraPoolReason
-	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll) && p.ultraIncludePro:
+	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll) && includePro:
 		reason = emptyNormalPoolWithProReason
+	case scope == PoolScopeNormal && p.rules.proPool && p.hasAccountLocked(PoolScopePro):
+		reason = emptyNormalPoolProReason
 	case scope == PoolScopeNormal && p.hasAccountLocked(PoolScopeAll):
 		reason = emptyNormalPoolReason
+	case scope == PoolScopeNormalUltra && p.hasAccountLocked(PoolScopeAll):
+		reason = emptyNormalUltraPoolReason
 	}
 	return &AccountsNotReadyError{Reasons: []string{reason}, Pool: scope}
 }

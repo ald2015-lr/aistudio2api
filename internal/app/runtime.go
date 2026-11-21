@@ -57,7 +57,7 @@ func newRuntime(
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")
 	// IP 池（进程级）先按本次配置生效，再给还没进入账户池的账户对象写默认出口：账户池、公共头与 Go 侧请求第一次就按带绑定的
 	// EffectiveProxy 取出口（见 proxy_pool.go）
-	proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg))
+	proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg, hasProAccounts(accounts)))
 	for _, account := range accounts {
 		proxyPool.prime(account)
 	}
@@ -79,6 +79,7 @@ func newRuntime(
 		cfg.WarmWorkerLimit, cfg.MaxActiveWorkers, cfg.WarmStartupConcurrency, cfg.TemporaryChat,
 	)
 	workers.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
+	workers.setProCapacity(cfg.ProWarmWorkerLimit, cfg.ProMaxActiveWorkers)
 	// 平均调用（ROUTING_STRATEGY=balanced，见 balanced.go）：启动流程不经过 applyLiveSettings，这里写一次开关
 	workers.setBalanced(cfg.RoutingStrategy == aistudio.RoutingBalanced)
 	// 按需替换与扩容的启动宽限、每分区每分钟的替换上限（N6，见 replace_rate.go）
@@ -182,6 +183,7 @@ func newRuntime(
 		"协议运行时就绪 | 账户=%d | 耗时=%s",
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
 	))
+	logPoolRuleNotes(requests, cfg)
 	closeRuntime := func() error {
 		// 管理页启停账户的后台收尾（见 account_transition.go）：先取消并等它们退出，之后不会再为账户关闭 Worker
 		admin.transitions.close()
@@ -231,14 +233,15 @@ func newRuntime(
 	return service, admin, closeRuntime, nil
 }
 
-// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、ULTRA_INCLUDE_PRO、权益规则与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
+// configurePool 把配置里属于账户池的设置写入新建的账户池：路由策略、上游通道、号池划分规则（PRO_POOL、ULTRA_INCLUDE_PRO）、
+// 权益规则与单账户每分钟上限（ACCOUNT_RPM_LIMIT）。
 // 必须在创建 Worker 管理器、同步目录与预热之前调用，第一次 Worker 分区与预热目标就按正确的号池成员计算
 func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 	// 出口键按账户固定代理或全局代理计算（见 aistudio.EgressKey）：先设全局代理，账户按出口分组；PROXY 变化本来就要重建运行时
 	pool.SetGlobalProxy(cfg.Proxy)
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
-	pool.SetUltraIncludePro(cfg.UltraIncludePro)
+	pool.SetPoolRules(cfg.UltraIncludePro, cfg.ProPool)
 	// 权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）：第一次建立候选集之前写入；运行中由 applyLiveFields 热更新
 	pool.SetModelTierRules(cfg.UltraOnlyModels, cfg.PaidOnlyModels)
 	// 账户池构造时不限速（0），这里按配置打开；运行中由 applyLiveFields 热更新
@@ -303,6 +306,8 @@ type accountWorkerManager struct {
 	maxActive       atomic.Int64
 	ultraWarmTarget atomic.Int64
 	ultraMaxActive  atomic.Int64
+	proWarmTarget   atomic.Int64
+	proMaxActive    atomic.Int64
 	warmConcurrency atomic.Int64
 	temporaryChat   atomic.Bool
 	lifecycle       context.Context
@@ -523,6 +528,7 @@ func newAccountWorkerManager(
 	manager.warmTarget.Store(int64(warmTarget))
 	manager.maxActive.Store(int64(maxActive))
 	manager.setUltraCapacity(defaultUltraCapacity())
+	manager.setProCapacity(defaultProCapacity())
 	manager.warmConcurrency.Store(int64(warmConcurrency))
 	manager.temporaryChat.Store(temporaryChat)
 	manager.background, manager.stopBackground = context.WithCancel(lifecycle)
@@ -703,8 +709,8 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 func (manager *accountWorkerManager) reserveReapVictim(partition aistudio.PoolScope, before time.Time) string {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
-	ultra := manager.pool.UltraAccountIDs()
-	if manager.openingIn(partition, ultra) || len(inPartition(manager.WarmAccountIDs(), ultra, partition)) <= manager.warmTargetFor(partition) {
+	members := manager.pool.PartitionMembers()
+	if manager.openingIn(partition, members) || len(inPartition(manager.WarmAccountIDs(), members, partition)) <= manager.warmTargetFor(partition) {
 		return ""
 	}
 	victim := manager.pickIdleVictimFor("", "", manager.deadSlotModelsFor(partition), victimAny, partition, before)
@@ -1086,11 +1092,11 @@ func (manager *accountWorkerManager) occupiedWorkers() workerOccupancy {
 }
 
 // occupiedWorkersIn 返回分区内仍持有进程或运行锁的账户与容量槽位；partition 为不限号池时统计全部分区（不计排空让出的槽位）
-func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolScope, ultra map[string]struct{}) workerOccupancy {
+func (manager *accountWorkerManager) occupiedWorkersIn(partition aistudio.PoolScope, members aistudio.PartitionSet) workerOccupancy {
 	manager.mu.RLock()
 	accounts := make([]*accountWorker, 0, len(manager.accounts))
 	for _, account := range manager.accounts {
-		if partition == aistudio.PoolScopeAll || partitionOf(account.id, ultra) == partition {
+		if partition == aistudio.PoolScopeAll || partitionOf(account.id, members) == partition {
 			accounts = append(accounts, account)
 		}
 	}
@@ -1265,7 +1271,7 @@ func (manager *accountWorkerManager) Worker(ctx context.Context, accountID strin
 	}
 	preparer, err := manager.ensureWorker(ctx, accountID, modelID, true)
 	if err != nil && errors.Is(err, errEgressColdStartPaused) {
-		return nil, newEgressColdStartBusy(modelID, partitionOf(accountID, manager.pool.UltraAccountIDs()), err)
+		return nil, newEgressColdStartBusy(modelID, partitionOf(accountID, manager.pool.PartitionMembers()), err)
 	}
 	return preparer, err
 }
@@ -1713,11 +1719,11 @@ func accountFilesPresent(account *aistudio.Account) bool {
 // 同分区每个启动占位计 1 个槽位，含这次替换自己的），合计不超过峰值时新 Worker 可以直接发布。等淘汰对象期间分区可能已空出槽位：
 // 跳过的淘汰对象被目录扫描移出、其他 Worker 被删除或回收。调用方持有 rebalanceMu
 func (manager *accountWorkerManager) replacementFitsLocked(partition aistudio.PoolScope) bool {
-	ultra := manager.pool.UltraAccountIDs()
-	occupancy := manager.occupiedWorkersIn(partition, ultra)
+	members := manager.pool.PartitionMembers()
+	occupancy := manager.occupiedWorkersIn(partition, members)
 	slots := occupancy.effectiveSlots()
 	for openingAccountID := range manager.openings {
-		if partitionOf(openingAccountID, ultra) != partition {
+		if partitionOf(openingAccountID, members) != partition {
 			continue
 		}
 		// 与扩容判断相同：账户锁被占用的已按 1 个槽位估计，不再重复计入
@@ -1808,16 +1814,16 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return preparer, nil
 		}
-		// 容量只计账户所在分区：Worker 按账户当前所在号池（权益与 ULTRA_INCLUDE_PRO 共同决定）计入普通或 Ultra 分区
-		ultra := manager.pool.UltraAccountIDs()
-		partition := partitionOf(accountID, ultra)
-		occupancy := manager.occupiedWorkersIn(partition, ultra)
+		// 容量只计账户所在分区：Worker 按账户当前所在号池（权益与 PRO_POOL、ULTRA_INCLUDE_PRO 共同决定）计入普通、Ultra 或 Pro 分区
+		members := manager.pool.PartitionMembers()
+		partition := partitionOf(accountID, members)
+		occupancy := manager.occupiedWorkersIn(partition, members)
 		occupied := make(map[string]struct{}, len(occupancy.accountIDs)+len(manager.openings))
 		for _, occupiedAccountID := range occupancy.accountIDs {
 			occupied[occupiedAccountID] = struct{}{}
 		}
 		for openingAccountID := range manager.openings {
-			if partitionOf(openingAccountID, ultra) != partition {
+			if partitionOf(openingAccountID, members) != partition {
 				continue
 			}
 			occupied[openingAccountID] = struct{}{}
@@ -2339,7 +2345,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		manager.fillInflight.Store(int32(len(inflight)))
 		warm := manager.WarmAccountIDs()
 		// 每个分区从自己的账户补齐到自己的常驻数（见 worker_partition.go）
-		ultra := manager.pool.UltraAccountIDs()
+		members := manager.pool.PartitionMembers()
 		summary := manager.bootstrapSummary()
 		targets := make(map[aistudio.PoolScope]int, len(workerPartitions))
 		warmCounts := make(map[aistudio.PoolScope]int, len(workerPartitions))
@@ -2350,7 +2356,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		filled := true
 		for _, partition := range workerPartitions {
 			targets[partition] = manager.fillTargetFor(partition, summary)
-			warmCounts[partition] = len(inPartition(warm, ultra, partition))
+			warmCounts[partition] = len(inPartition(warm, members, partition))
 			filled = filled && warmCounts[partition] >= targets[partition]
 		}
 		if filled && len(inflight) == 0 {
@@ -2458,7 +2464,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				case anyPaused && !anyFull:
 					reason = egressColdStartPausedReason
 				case anyFull:
-					occupancy := manager.occupiedWorkersIn(full, manager.pool.UltraAccountIDs())
+					occupancy := manager.occupiedWorkersIn(full, manager.pool.PartitionMembers())
 					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.effectiveSlots(), manager.maxActiveFor(full))
 					level = "WARN"
 				case classifyErr != nil:
@@ -2880,6 +2886,10 @@ type trackedService struct {
 	quota *quotaSharing
 	// tierRuleNotes 记下已写进运行日志的权益规则提示（见 tier_rules.go），同样的内容不重复写
 	tierRuleNotes tierRuleMonitor
+	// proPoolConfigured 为 PRO_POOL 写在 .env 或进程环境变量里（为假时开关只是默认开启，见 pro_pool.go 的升级提示）；
+	// proPoolNotes 记下已写进运行日志的升级提示
+	proPoolConfigured atomic.Bool
+	proPoolNotes      proPoolNoticeMonitor
 	// ignoreSeed 为真时丢弃客户端传入的 seed：客户端固定 seed 会让相同提示词得到几乎相同的回复
 	ignoreSeed atomic.Bool
 	// repeatNonce 为真时对重复提示词加入不可见随机后缀（见 duplicates.go）
@@ -3880,7 +3890,8 @@ func (service *trackedService) acquireLease(
 	// 出口限流（见 egress_guard.go）：egressKey 为本轮复查时受限的出口（等待原因是出口限速或驻留额度用完时归属它），egressBucketWait 为
 	// 候选里有因出口令牌桶已满按忙碌分组的；egressLeave 为进入“出口限速”排队的离开函数（原因变化或选号结束时调用）。
 	// 非主用模型按出口排队的时间整个请求累计（egressWaitBudgetFrom，没有时只按本次选号累计），超过上限按 429 返回
-	ultraLane := selection.Pool == aistudio.PoolScopeUltra
+	// 只有 /ultra 的选号用出口的 Ultra 通道（Pro 分区与普通分区同用普通通道，见 aistudio.LaneOf）
+	ultraLane := aistudio.LaneOf(selection.Pool) == aistudio.EgressLaneUltra
 	egressKey, egressBucketWait := "", false
 	var egressLeave func()
 	leaveEgressWait := func() {
@@ -3995,9 +4006,9 @@ func (service *trackedService) acquireLease(
 		active := service.workers.WarmAccountIDs()
 		groups, err := service.pool.ClassifyCandidates(ctx, selection, warm)
 		if err != nil {
-			// 请求的模型不在号池任何账户的目录里：限频地挑高权益的空闲账户在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）
-			service.noteMissingModel(selection, err)
-			return nil, err
+			// 请求的模型不在号池任何账户的目录里：限频地挑高权益的空闲账户在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）；
+			// 普通路径上只有 Pro 或 Ultra 号池能服务的模型带上改用哪个入口的提示，不读目录（见 missingModelError）
+			return nil, service.missingModelError(selection, err)
 		}
 		groups.WarmReady = excludeAccountIDs(groups.WarmReady, failedWorkers)
 		groups.WarmAvailable = excludeAccountIDs(groups.WarmAvailable, failedWorkers)
@@ -6537,6 +6548,10 @@ func (service *trackedService) generateForModel(
 		trace.Note("选号没有候选（" + decision + "）: " + noServing.Summary)
 		service.requests.logRequestProgress(request.ID, "service", "WARN", "选号没有候选："+decision+" | "+noServing.Summary)
 		err = noServing
+		// 普通路径上只有 Pro 或 Ultra 号池能服务这个模型：对外说明里加一句改用哪个入口（见 missingModelError）
+		if hinted := service.otherPoolHint(aistudio.AccountSelection{ModelID: modelID, Method: "generateContent", Pool: scope}, noServing); hinted != nil {
+			err = hinted
+		}
 	}
 	if err == nil && (lease == nil || source == nil) {
 		// 兜底：循环结束却没有拿到可用的上游流时按号池暂时没有可用账号结束（503），不能把空租约交给 forwardEvents

@@ -195,7 +195,8 @@ func modelFallbackSummary(value string, scope string) string {
 	return fmt.Sprintf("MODEL_FALLBACKS=%s | MODEL_FALLBACK_SCOPE=%s", value, scope)
 }
 
-// applies 判断规则对请求的号池生效：all 都生效，ultra 只对 /ultra 请求生效，off、未设置或没有规则时都不生效
+// applies 判断规则对请求的号池生效：all 都生效（默认地址、/pro 与 /ultra），ultra 只对 /ultra 请求生效（不含 /pro），
+// off、未设置或没有规则时都不生效
 func (settings *modelFallbackSettings) applies(scope aistudio.PoolScope) bool {
 	if settings == nil || len(settings.rules) == 0 {
 		return false

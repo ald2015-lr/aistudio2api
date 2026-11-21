@@ -34,7 +34,7 @@ func verifyIndex(t *testing.T, pool *AccountPool, step string) {
 }
 
 // sameMap 判断两次返回的是不是同一份 map（写时复制的快照没有重建）
-func sameMap(left map[string]struct{}, right map[string]struct{}) bool {
+func sameMap[M ~map[K]V, K comparable, V any](left M, right M) bool {
 	return reflect.ValueOf(left).UnsafePointer() == reflect.ValueOf(right).UnsafePointer()
 }
 
@@ -67,27 +67,29 @@ func TestUltraPoolTierMembership(t *testing.T) {
 		{tier: unknown, includePro: true, ultra: false},
 	} {
 		name := fmt.Sprintf("权益 %d 并入=%t", test.tier, test.includePro)
-		if got := ultraPoolTier(test.tier, test.includePro); got != test.ultra {
+		if got := baseUltraPoolTier(test.tier, test.includePro); got != test.ultra {
 			t.Fatalf("%s：ultraPoolTier = %t，期望 %t", name, got, test.ultra)
 		}
 		wantPool := PoolScopeNormal
 		if test.ultra {
 			wantPool = PoolScopeUltra
 		}
-		if got := poolOfTier(test.tier, test.includePro); got != wantPool {
+		// PRO_POOL=false 时与只有两个号池时的规则相同
+		if got := poolOfTier(test.tier, test.includePro, false); got != wantPool {
 			t.Fatalf("%s：poolOfTier = %v，期望 %v", name, got, wantPool)
 		}
-		if !PoolScopeAll.allowsTier(test.tier, test.includePro) {
+		rules := newPoolRules(test.includePro, false)
+		if !rules.allowsTier(PoolScopeAll, test.tier) {
 			t.Fatalf("%s：不限号池应允许任何权益", name)
 		}
-		if got := PoolScopeUltra.allowsTier(test.tier, test.includePro); got != test.ultra {
+		if got := rules.allowsTier(PoolScopeUltra, test.tier); got != test.ultra {
 			t.Fatalf("%s：Ultra 号池 allowsTier = %t，期望 %t", name, got, test.ultra)
 		}
-		if got := PoolScopeNormal.allowsTier(test.tier, test.includePro); got == test.ultra {
+		if got := rules.allowsTier(PoolScopeNormal, test.tier); got == test.ultra {
 			t.Fatalf("%s：普通号池 allowsTier = %t，期望 %t", name, got, !test.ultra)
 		}
 		account := &Account{ID: "a", BenefitTier: test.tier}
-		if PoolScopeUltra.allows(account, test.includePro) != test.ultra || PoolScopeNormal.allows(nil, test.includePro) {
+		if PoolScopeUltra.allows(account, &rules) != test.ultra || PoolScopeNormal.allows(nil, &rules) {
 			t.Fatalf("%s：allows 与 allowsTier 不一致", name)
 		}
 	}
@@ -269,7 +271,8 @@ func TestUltraIncludeProToggleMovesAccount(t *testing.T) {
 		if err != nil || slices.Contains(groups.StandbyReady, pro) != on {
 			t.Fatalf("%s：Ultra 候选 %v（%v）", step, groups.StandbyReady, err)
 		}
-		if _, ultra := pool.PoolStateCounts(); ultra.Total != wantUltra {
+		if _, partitions := pool.PoolStateCounts(); partitions[PoolScopeUltra].Total != wantUltra {
+			ultra := partitions[PoolScopeUltra]
 			t.Fatalf("%s：Ultra 号池状态计数 = %+v，期望 %d 个", step, ultra, wantUltra)
 		}
 		if summary := pool.BootstrapSummary(); summary.UltraAvailable != wantUltra {
@@ -391,18 +394,18 @@ func TestUltraIncludeProTierChangeWhileOn(t *testing.T) {
 		{tier: BenefitTierUltra, want: PoolScopeUltra},
 		{tier: BenefitTierPlus, want: PoolScopeNormal},
 	} {
-		before := pool.UltraAccountIDs()
+		before := pool.PartitionMembers()
 		if err := pool.SetCatalog(account, step.tier, models); err != nil {
 			t.Fatal(err)
 		}
 		if got := pool.PoolOf(account); got != step.want {
 			t.Fatalf("权益改为 %s 后号池 = %v，期望 %v", step.tier, got, step.want)
 		}
-		after := pool.UltraAccountIDs()
-		if _, member := after[account]; member != (step.want == PoolScopeUltra) {
-			t.Fatalf("权益改为 %s 后 UltraAccountIDs = %v", step.tier, after)
+		after := pool.PartitionMembers()
+		if member := after.Of(account) == PoolScopeUltra; member != (step.want == PoolScopeUltra) {
+			t.Fatalf("权益改为 %s 后 PartitionMembers = %v", step.tier, after)
 		}
-		_, wasMember := before[account]
+		wasMember := before.Of(account) == PoolScopeUltra
 		if changed := wasMember != (step.want == PoolScopeUltra); changed == sameMap(before, after) {
 			t.Fatalf("权益改为 %s：成员变化=%t，快照是否重建与之不符", step.tier, changed)
 		}
@@ -556,22 +559,24 @@ func TestUltraIncludeProEmptyPoolReasons(t *testing.T) {
 // 冷却、状态与启用变化不作废快照
 func TestUltraAccountIDsSnapshot(t *testing.T) {
 	pool := scopeTestPool(t, map[string]BenefitTier{scopeNormalA: BenefitTierFree, scopeNormalB: BenefitTierPro, scopeUltraA: BenefitTierUltra})
-	snapshot := pool.UltraAccountIDs()
+	snapshot := pool.PartitionMembers()
 	expectSame := func(step string) {
 		t.Helper()
-		if next := pool.UltraAccountIDs(); !sameMap(snapshot, next) {
+		if next := pool.PartitionMembers(); !sameMap(snapshot, next) {
 			t.Fatalf("%s：成员没有变化，快照不应重建", step)
 		}
 	}
 	expectNew := func(step string, want ...string) {
 		t.Helper()
-		next := pool.UltraAccountIDs()
+		next := pool.PartitionMembers()
 		if sameMap(snapshot, next) {
 			t.Fatalf("%s：成员已变化，快照应重建", step)
 		}
 		got := make([]string, 0, len(next))
-		for accountID := range next {
-			got = append(got, accountID)
+		for accountID, partition := range next {
+			if partition == PoolScopeUltra {
+				got = append(got, accountID)
+			}
 		}
 		slices.Sort(got)
 		slices.Sort(want)

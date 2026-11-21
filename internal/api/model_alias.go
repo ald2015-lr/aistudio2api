@@ -66,6 +66,31 @@ func resolveLongRequestModel(models []aistudio.Model, name string) (model aistud
 	return model, alias, rest, true, true
 }
 
+// RequestModelBases 返回请求模型名按 resolveLongRequestModel 的后缀规则可能对应的目录 ID：去掉首尾空白与 models/ 的原名在前，
+// 其后依次为逐个剥离思考等级、-nothinking、-online、-128 后缀的名称，带 long- 前缀时再对去掉前缀的名称做同样的剥离；去重、保持顺序。
+// 不剥 Omni 视频后缀（那套写法只对能输出视频的 Omni 模型生效，不看目录分不出来）。
+// 供请求号池的目录里没有这个名称时，在其他号池里按同一套写法找模型（见 app 的 otherPoolHint），只在错误路径上调用
+func RequestModelBases(name string) []string {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	var bases []string
+	collect := func(name string) {
+		alias := modelAlias{base: name}
+		for {
+			if alias.base != "" && !slices.Contains(bases, alias.base) {
+				bases = append(bases, alias.base)
+			}
+			if !stripModelSuffix(&alias, false) || alias.base == "" {
+				return
+			}
+		}
+	}
+	collect(name)
+	if rest, prefixed := cutLongPrefix(name); prefixed {
+		collect(rest)
+	}
+	return bases
+}
+
 // longOutputModel 判断 long- 前缀对模型生效（自动续写）：文本对话模型且能经 Playground 调用（续写只在 Playground GenerateContent 进行）
 func longOutputModel(model aistudio.Model) bool {
 	return isTextChatModel(model) && (len(model.Channels) == 0 || slices.Contains(model.Channels, string(aistudio.ChannelPlayground)))
@@ -364,7 +389,7 @@ type poolRuleVersioner interface {
 	PoolRuleVersion() uint64
 }
 
-// poolRuleVersion 返回号池规则版本：ULTRA_INCLUDE_PRO 与权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）每次实际变化时加一，
+// poolRuleVersion 返回号池规则版本：PRO_POOL、ULTRA_INCLUDE_PRO 与权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）每次实际变化时加一，
 // 号池的模型目录随之变化；生成服务不报告时为 0
 func (s *server) poolRuleVersion() uint64 {
 	if versioned, ok := s.service.(poolRuleVersioner); ok {
@@ -394,11 +419,12 @@ type aliasCatalogCache struct {
 	refreshing atomic.Bool
 }
 
-// aliasCache 返回请求号池的别名目录缓存：各号池的模型目录不同，不能共用快照
+// aliasCache 返回请求号池的别名目录缓存：各号池的模型目录不同，不能共用快照（/pro 只看 Pro 号池，不能落到不限号池的缓存）。
+// 缓存按号池取值个数定长，不认识的取值（不会出现）每次给一个不保存的空缓存、按原号池计算，不借用其他号池的快照
 func (s *server) aliasCache(ctx context.Context) (*aliasCatalogCache, aistudio.PoolScope) {
 	scope := aistudio.PoolScopeFromContext(ctx)
 	if int(scope) >= len(s.aliasCaches) {
-		scope = aistudio.PoolScopeAll
+		return &aliasCatalogCache{}, scope
 	}
 	return &s.aliasCaches[scope], scope
 }
@@ -431,9 +457,9 @@ func (s *server) aliasCatalog(ctx context.Context) ([]aistudio.Model, error) {
 }
 
 // aliasCatalogFor 返回解析 name 用的别名目录：快照里解析得到时就用快照（见 aliasCatalog）；解析不到、快照又已建立超过
-// aliasMissRefreshAfter 或建立之后号池规则变过（ULTRA_INCLUDE_PRO、权益规则）时同步重算一次，返回新目录。快照可能是在账户的模型目录
+// aliasMissRefreshAfter 或建立之后号池规则变过（PRO_POOL、ULTRA_INCLUDE_PRO、权益规则）时同步重算一次，返回新目录。快照可能是在账户的模型目录
 // 还没载入完时建的（例如刚重启，只在 Build 通道提供的 gemini-4-argon 要等 Pro、Ultra 账户的 Build 目录恢复），也可能是号池规则变化之前的
-// （切换 ULTRA_INCLUDE_PRO、清除或放宽权益规则后，号池才有的模型不在旧快照里）；原先这时带后缀的名称（gemini-4-argon-medium）
+// （切换 PRO_POOL、ULTRA_INCLUDE_PRO，清除或放宽权益规则后，号池才有的模型不在旧快照里）；原先这时带后缀的名称（gemini-4-argon-medium）
 // 解析不到、原名转发后以模型不存在 404，要等快照过期且后台刷新完成才恢复，不带后缀的名称却照常可用。规则变化后只重算一次
 // （新快照记下新版本），同一号池同一时间只算一次，等锁期间别人已经重算过就直接用新的；重算失败时返回原快照
 func (s *server) aliasCatalogFor(ctx context.Context, name string) ([]aistudio.Model, error) {

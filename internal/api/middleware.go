@@ -689,7 +689,7 @@ func SetAccessLogUpstreamBytes(ctx context.Context, bytes int64) {
 	}
 }
 
-// AccessLogRequestInfo 返回请求日志记下的接口路径（带 /ultra、/trace 前缀，与 request.finished 的 path 相同）与 request.started 写下的
+// AccessLogRequestInfo 返回请求日志记下的接口路径（带 /ultra、/pro、/trace 前缀，与 request.finished 的 path 相同）与 request.started 写下的
 // 模型名（见 accessLogMetadata.startedModel）。不经公开 API 进入的调用（没有请求日志）都为空；还没写 request.started 时模型名为空
 func AccessLogRequestInfo(ctx context.Context) (string, string) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
@@ -798,15 +798,11 @@ func SetAccessLogGenerationResult(
 func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
-		path := r.URL.Path
-		pool := ""
-		if ultraRequest(r) {
-			// Ultra 路由的请求在管理日志里显示带 /ultra 前缀的路径，并标记号池
-			path = ultraPrefix + path
-			pool = aistudio.PoolScopeUltra.String()
-		}
+		// Ultra 路由与 Pro 路由的请求在管理日志里显示带 /ultra、/pro 前缀的路径，并标记号池（ultra、pro）；普通路径号池为空
+		path := routePoolPrefix(r) + r.URL.Path
+		pool := routePoolLabel(r)
 		if aistudio.TraceFromContext(r.Context()) != nil {
-			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径（/trace/ultra/... 保持原顺序）
+			// 排查路由的请求在管理日志里显示带 /trace 前缀的路径（/trace/ultra/...、/trace/pro/... 保持原顺序）
 			path = tracePrefix + path
 		}
 		metadata := &accessLogMetadata{admin: admin, method: r.Method, path: path, pool: pool, requestID: newID("req"), startedAt: started}

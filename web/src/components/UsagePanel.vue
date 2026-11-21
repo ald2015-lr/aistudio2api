@@ -52,14 +52,14 @@ let clockTimer: number | undefined
 // reportQuery 为当前报告的查询参数（时间已解析为绝对时间）：展开排行行读取组合明细时沿用，范围与主报告相同
 let reportQuery = ''
 
-// filterDimensions 为下拉多选的筛选维度；号池只有两个取值，单独用分段按钮筛选
+// filterDimensions 为下拉多选的筛选维度；号池只有三个取值（普通、Pro、Ultra），单独用分段按钮筛选
 const filterDimensions = dimensions.filter((item) => item !== 'pool')
 const poolChoices = ['all', ...poolValues] as const
 type PoolChoice = (typeof poolChoices)[number]
 const poolFilter = computed<PoolChoice>(() => {
   const values = state.filters.pool ?? []
   const value = values.length === 1 ? values[0] : undefined
-  return value === 'normal' || value === 'ultra' ? value : 'all'
+  return poolValues.find((pool) => pool === value) ?? 'all'
 })
 const resolved = computed(() => resolveRange(state, new Date(now.value)))
 const live = computed(() => liveRange(state.range))

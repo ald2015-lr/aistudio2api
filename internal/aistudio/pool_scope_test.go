@@ -321,7 +321,8 @@ func TestPoolScopeCountsAndUploads(t *testing.T) {
 	if err := pool.MarkAuthRequired(scopeUltraA, "Cookie 失效"); err != nil {
 		t.Fatal(err)
 	}
-	all, ultra := pool.PoolStateCounts()
+	all, partitions := pool.PoolStateCounts()
+	ultra := partitions[PoolScopeUltra]
 	if all.Total != 3 || all.Ready != 2 || all.AuthRequired != 1 {
 		t.Fatalf("全部账户计数 = %+v", all)
 	}

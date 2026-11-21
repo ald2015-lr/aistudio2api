@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestRootHandlerRoutesUltraToPublicAPI /ultra/ 与 /v1、/trace/ 一样交给公开 API，不需要管理令牌；管理页面仍需要令牌
+// TestRootHandlerRoutesUltraToPublicAPI /ultra/、/pro/ 与 /v1、/trace/ 一样交给公开 API，不需要管理令牌；管理页面仍需要令牌
 func TestRootHandlerRoutesUltraToPublicAPI(t *testing.T) {
 	var reached []string
 	apiHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -14,7 +14,8 @@ func TestRootHandlerRoutesUltraToPublicAPI(t *testing.T) {
 		w.WriteHeader(http.StatusTeapot)
 	})
 	handler := rootHandler(apiHandler, "", "secret-token")
-	for _, path := range []string{"/ultra/v1/models", "/ultra/v1beta/models", "/ultra/unknown", "/trace/v1/models", "/v1/models"} {
+	for _, path := range []string{"/ultra/v1/models", "/ultra/v1beta/models", "/ultra/unknown", "/pro/v1/models", "/pro/v1beta/models", "/pro/unknown",
+		"/trace/v1/models", "/trace/pro/v1/models", "/v1/models"} {
 		reached = nil
 		request := httptest.NewRequest(http.MethodGet, path, nil)
 		request.RemoteAddr = "127.0.0.1:5555"

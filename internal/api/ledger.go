@@ -37,13 +37,14 @@ type RequestLedger interface {
 	RequestBody(context.Context, string) (RequestBody, error)
 }
 
-// UsageDimensions 是用量可筛选与分组的维度；pool 为号池，取值见 UsagePoolNormal 与 UsagePoolUltra
+// UsageDimensions 是用量可筛选与分组的维度；pool 为号池，取值见 UsagePoolNormal、UsagePoolPro 与 UsagePoolUltra
 var UsageDimensions = []string{"model", "account", "channel", "protocol", "state", "pool"}
 
-// UsagePoolNormal 与 UsagePoolUltra 为用量接口中号池维度的取值：经 /ultra 进入的请求为 ultra，其余为 normal
-// （账本中普通号池的请求保存为空）
+// UsagePoolNormal、UsagePoolPro 与 UsagePoolUltra 为用量接口中号池维度的取值：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，
+// 其余为 normal（账本中普通号池的请求保存为空）。号池按请求的入口记，不按账户：PRO_POOL=false 时 Pro 账户服务的普通路径请求仍为 normal
 const (
 	UsagePoolNormal = "normal"
+	UsagePoolPro    = "pro"
 	UsagePoolUltra  = "ultra"
 )
 
@@ -231,7 +232,7 @@ type UsageRecord struct {
 	ReplyHash string `json:"reply_hash,omitempty"`
 	Duplicate bool   `json:"duplicate,omitempty"`
 	HasBody   bool   `json:"has_body"`
-	// Pool 为请求的号池：ultra 或 normal
+	// Pool 为请求的号池：ultra、pro 或 normal
 	Pool string `json:"pool"`
 }
 

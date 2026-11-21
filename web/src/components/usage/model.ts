@@ -17,8 +17,8 @@ export const dimensions: UsageDimension[] = [
   'pool',
 ]
 
-// poolValues 为号池维度的全部取值：经 /ultra 进入的请求为 ultra，其余为 normal
-export const poolValues = ['normal', 'ultra'] as const
+// poolValues 为号池维度的全部取值：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为 normal
+export const poolValues = ['normal', 'pro', 'ultra'] as const
 
 // maxSpan 与服务端校验一致；retention 为账本保留时长
 export const maxSpan = 93 * 86_400_000

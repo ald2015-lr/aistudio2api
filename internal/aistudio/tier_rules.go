@@ -1,6 +1,7 @@
 package aistudio
 
 import (
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -154,6 +155,18 @@ func (p *AccountPool) SetModelTierRules(ultraOnly []string, paidOnly []string) b
 	return true
 }
 
+// TierRulesAllow 判断权益规则是否允许真实权益为 tier 的账户使用模型 modelID（按规则名称与模型 ID 比较，不区分大小写；不看目录），
+// 供 app 层挑要统计的主用模型（如 Pro 分区不统计 ULTRA_ONLY_MODELS 里的模型）
+func (p *AccountPool) TierRulesAllow(modelID string, tier BenefitTier) bool {
+	if p == nil {
+		return true
+	}
+	modelID = strings.TrimPrefix(strings.TrimSpace(modelID), "models/")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.tierRules.maskFor(Model{ID: modelID})&tierBit(tier) != 0
+}
+
 // ModelTierRules 返回生效的两份规则（写的名称，按配置顺序）
 func (p *AccountPool) ModelTierRules() (ultraOnly []string, paidOnly []string) {
 	if p == nil {
@@ -271,11 +284,14 @@ type TierRuleHint struct {
 }
 
 // TierRuleReport 为规则与账户目录的对照（见 AccountPool.TierRuleReport）。Checked 为号池里已有账户读到目录（没有时无法对照，
-// Hints 与 Unmatched 都为空）；Unmatched 为不在任何账户 Playground 或 Build 目录里的规则名称（写错、带了后缀，或模型还没上线）
+// Hints 与 Unmatched 都为空）；Unmatched 为不在任何账户 Playground 或 Build 目录里的规则名称（写错、带了后缀，或模型还没上线）；
+// UltraMarked 为某个账户的 Playground 目录明确标注只有 Ultra 能用的模型 ID（访问模式不为空、允许 Ultra 不允许 Pro），按 ID 排序去重，
+// 供 app 层在 PRO_POOL=true 时核对 Pro 号池是否还能服务它们（其他账户的目录可能没有标注）
 type TierRuleReport struct {
-	Checked   bool
-	Hints     []TierRuleHint
-	Unmatched []TierRuleName
+	Checked     bool
+	Hints       []TierRuleHint
+	Unmatched   []TierRuleName
+	UltraMarked []string
 }
 
 // TierRuleName 为规则里的一个名称及其配置键
@@ -310,6 +326,7 @@ func (p *AccountPool) TierRuleReport() TierRuleReport {
 func cloneTierRuleReport(report TierRuleReport) TierRuleReport {
 	report.Hints = slices.Clone(report.Hints)
 	report.Unmatched = slices.Clone(report.Unmatched)
+	report.UltraMarked = slices.Clone(report.UltraMarked)
 	return report
 }
 
@@ -349,6 +366,7 @@ func (p *AccountPool) tierRuleReportLocked() TierRuleReport {
 	}
 	computed := make(map[catalogTier]*catalogHints)
 	counts := make(map[tierHintKey]int)
+	ultraMarked := make(map[string]struct{})
 	for _, account := range p.accounts {
 		if account == nil || len(account.Models) == 0 {
 			continue
@@ -360,6 +378,9 @@ func (p *AccountPool) tierRuleReportLocked() TierRuleReport {
 			hints = &catalogHints{}
 			computed[key] = hints
 			for _, model := range account.Models {
+				if len(model.AccessModes) > 0 && modelAllowedByTier(model, BenefitTierUltra) && !modelAllowedByTier(model, BenefitTierPro) {
+					ultraMarked[model.ID] = struct{}{}
+				}
 				names := append([]string{model.ID}, model.CapabilityOptions["aliases"]...)
 				for _, name := range names {
 					markPresent(name)
@@ -411,6 +432,7 @@ func (p *AccountPool) tierRuleReportLocked() TierRuleReport {
 			markPresent(model.ID)
 		}
 	}
+	report.UltraMarked = slices.Sorted(maps.Keys(ultraMarked))
 	for hint, accounts := range counts {
 		entry := entries[hint.entry]
 		report.Hints = append(report.Hints, TierRuleHint{

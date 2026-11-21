@@ -33,7 +33,7 @@ export interface Account {
   // benefit_tier_known 为 false 表示权益尚未从官网读取：benefit_tier 按 Free 显示，账户属于普通号池
   benefit_tier_known: boolean
   // pool 为账户当前所属的号池，表示成员关系而不是权益：权益为 Ultra 的账户属于 ultra；
-  // 开启 ULTRA_INCLUDE_PRO 时权益为 Pro 的账户也属于 ultra；其余属于 normal
+  // 开启 PRO_POOL（默认）时权益为 Pro 的账户属于 pro，关闭 PRO_POOL、开启 ULTRA_INCLUDE_PRO 时属于 ultra；其余属于 normal
   pool: AccountPool
   // authenticated 与 verify_reason 只在验证接口的返回里有：验证结论（浏览器已登录且接口复核通过才为 true）与原因。
   // 停用账户的状态始终是 disabled，验证结果按 authenticated 判断，不能看状态或 HTTP 200
@@ -60,8 +60,11 @@ export interface Account {
 // AccountTransition 为账户启停之后的后台收尾阶段
 export type AccountTransition = 'draining' | 'closing' | 'syncing'
 
-// AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户
-export type AccountPool = 'ultra' | 'normal'
+// AccountPool 为账户所属的号池；经 /ultra 前缀的请求只用 ultra 号池的账户，经 /pro 前缀的请求只用 pro 号池的账户
+export type AccountPool = 'ultra' | 'pro' | 'normal'
+
+// RequestPool 为请求日志里的号池标记：经 /ultra 进入为 ultra，经 /pro 进入为 pro，普通路径没有标记
+export type RequestPool = 'ultra' | 'pro'
 
 export interface AccountDraft {
   label: string
@@ -220,10 +223,10 @@ export interface WorkerCounters {
   starting_ids?: string[]
 }
 
-// UltraWorkerCounters 为 Ultra 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
+// PartitionWorkerCounters 为 Ultra 分区或 Pro 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
 // dead 为其中账号长时间冷却、等待淘汰的死槽位，draining 为其中排空中的，retiring 为待淘汰登记数，
-// unschedulable 为其中账号已不能服务任何模型、等待释放的，warm_limit 与 max 为 Ultra 常驻数与峰值数设置
-export interface UltraWorkerCounters {
+// unschedulable 为其中账号已不能服务任何模型、等待释放的，warm_limit 与 max 为该分区的常驻数与峰值数设置
+export interface PartitionWorkerCounters {
   warm: number
   starting: number
   occupied: number
@@ -240,8 +243,9 @@ export interface UltraWorkerCounters {
 // standby 为还能服务它的空闲备用账号，最多统计 1000 个，达到上限时 standby_capped 为 true。
 // cooling 为对它冷却中的常驻 Worker（不在排空中、所有支持的启用通道都在冷却，含剩余不到 2 分钟的短冷却），
 // 既不计入 warm 也不计入 standby；旧版服务端不返回 cooling。
-// pool 为 "ultra" 时是 Ultra 主用模型（ULTRA_PRIMARY_MODELS），只统计 Ultra 分区的 Worker 与 Ultra 号池的账号；
-// 没有该字段时是普通主用模型（PRIMARY_MODELS），只统计普通分区。旧版服务端不返回 pool
+// pool 为 "ultra" 时是 Ultra/Pro 主用模型（ULTRA_PRIMARY_MODELS），只统计 Ultra 分区的 Worker 与 Ultra 号池的账号；
+// 为 "pro" 时是同一份列表在 Pro 分区的供给（只在开启 PRO_POOL 时有）；没有该字段时是普通主用模型（PRIMARY_MODELS），
+// 只统计普通分区。旧版服务端不返回 pool
 export interface PrimarySupply {
   model: string
   pool?: string
@@ -347,11 +351,17 @@ export interface ServiceStatus {
   version: string
   active_requests: number
   accounts: AccountCounters
-  // workers 的数量与上限只含普通分区，warm_ids、starting_ids 包含两个分区
+  // workers 的数量与上限只含普通分区，warm_ids、starting_ids 包含全部分区
   workers?: WorkerCounters
-  // ultra_accounts 为 Ultra 号池的账户计数（开启 ULTRA_INCLUDE_PRO 时含并入的 Pro 账户），ultra_workers 为 Ultra 分区的 Worker 计数
+  // ultra_accounts 为 Ultra 号池的账户计数（关闭 PRO_POOL、开启 ULTRA_INCLUDE_PRO 时含并入的 Pro 账户），ultra_workers 为 Ultra 分区的 Worker 计数
   ultra_accounts?: AccountCounters
-  ultra_workers?: UltraWorkerCounters
+  ultra_workers?: PartitionWorkerCounters
+  // pro_accounts 为 Pro 号池（开启 PRO_POOL 时权益为 Pro 的账户）的账户计数，pro_workers 为 Pro 分区的 Worker 计数；
+  // 关闭 PRO_POOL 时各项为 0。旧版服务端不返回
+  pro_accounts?: AccountCounters
+  pro_workers?: PartitionWorkerCounters
+  // pro_pool_notice 为 PRO_POOL 默认开启的升级提示：.env 与环境变量都没有写 PRO_POOL、又有 Pro 号池账户时才有
+  pro_pool_notice?: ProPoolNotice
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
   // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
@@ -376,8 +386,34 @@ export interface ServiceStatus {
   balanced?: BalancedStatus
 }
 
+// ProPoolNotice 为 PRO_POOL 默认开启的升级提示：升级前 Pro 账户服务默认地址（或经 ULTRA_INCLUDE_PRO 并入 /ultra），默认开启后
+// 只服务 /pro。pro_accounts 为 Pro 号池账户数，pro_available、normal_available、ultra_available 为 Pro、普通与 Ultra 号池里可预热的账户数；
+// source 为升级前 Pro 账户所在、建议从中分出 Pro 容量的分区（ULTRA_INCLUDE_PRO 写为 true 时为 ultra，否则为 normal）；
+// suggested_* 为按 Pro 可用账户占它与来源分区可用账户之和的比例分来源分区常驻与峰值数得到的建议值（Pro 不少于默认值，来源分区减去分走的份额，
+// 不少于该分区默认值），另一个分区的建议值与当前值相同。旧版服务端没有 source 与 Ultra 字段，按 normal
+export interface ProPoolNotice {
+  pro_accounts: number
+  source?: 'normal' | 'ultra'
+  pro_available: number
+  normal_available: number
+  ultra_available?: number
+  warm_worker_limit: number
+  max_active_workers: number
+  ultra_warm_worker_limit?: number
+  ultra_max_active_workers?: number
+  pro_warm_worker_limit: number
+  pro_max_active_workers: number
+  suggested_pro_warm_worker_limit: number
+  suggested_pro_max_active_workers: number
+  suggested_warm_worker_limit: number
+  suggested_max_active_workers: number
+  suggested_ultra_warm_worker_limit?: number
+  suggested_ultra_max_active_workers?: number
+}
+
 // BalancedStatus 为平均调用的概况，服务端每 30 秒统计一次：quota_day 为当前太平洋时间额度日（北京时间 15 点或 16 点清零），
 // gap 为轮换门槛（在跑的号比接替它的备用号多发这么多次才换下），normal、ultra 为两个分区的今日发送数分布，
+// pro 为 Pro 分区的分布（只在 Pro 号池有可调度账号时有），
 // rotations_1h、rotations_today 为最近 1 小时与本额度日完成（旧号已关闭）的轮换次数，还在进行、取消或失败的不计。
 // 发送数为本服务真正发往上游的生成请求数（每次发送都计），与用量页按本地日、每个请求一行的口径不同
 export interface BalancedStatus {
@@ -385,6 +421,7 @@ export interface BalancedStatus {
   gap: number
   normal: BalancedPartition
   ultra: BalancedPartition
+  pro?: BalancedPartition
   rotations_1h: number
   rotations_today: number
 }
@@ -544,9 +581,9 @@ export interface RequestLog {
   state: 'running' | 'completed' | 'tool_calls' | 'limited' | 'blocked' | 'failed' | 'cancelled'
   model?: string
   method?: string
-  // path 保留 /ultra 前缀；pool 为 ultra 表示请求经 /ultra 进入，只用 Ultra 号池的账户
+  // path 保留 /ultra、/pro 前缀；pool 为 ultra 表示请求经 /ultra 进入，只用 Ultra 号池的账户，pro 表示经 /pro 进入，只用 Pro 号池的账户
   path?: string
-  pool?: 'ultra'
+  pool?: RequestPool
   status?: number
   duration_ms?: number
   tool_calls?: number
@@ -686,8 +723,8 @@ export interface RequestSummary {
   channel?: UpstreamChannel
   state: RequestState
   started_at: string
-  // pool 为 ultra 表示请求经 /ultra 进入
-  pool?: 'ultra'
+  // pool 为 ultra 表示请求经 /ultra 进入，pro 表示经 /pro 进入
+  pool?: RequestPool
   // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后的模型；没有改用时不出现
   fallback_from?: string
 }
@@ -758,15 +795,20 @@ export interface ServiceConfig {
   // stream_data_heartbeat 为数据型心跳（STREAM_DATA_HEARTBEAT）：流式心跳写中转会转发的空数据块，保存后立即生效。
   // 服务端总是返回该字段，因此这里不是可选字段
   stream_data_heartbeat: boolean
-  // warm_worker_limit 与 max_active_workers 只约束普通分区的 Worker
+  // warm_worker_limit 与 max_active_workers 只约束普通分区的 Worker（不含 Pro 与 Ultra）
   warm_worker_limit: number
   max_active_workers: number
   // ultra_exclusive 为真时 Ultra 号池的账户只服务 /ultra 请求；ultra_warm_worker_limit 可以为 0（只按需启动），
   // ultra_max_active_workers 至少为 1 且不小于 Ultra 常驻数
   ultra_exclusive: boolean
-  // ultra_include_pro 为真时权益为 Pro 的账户并入 Ultra 号池，按 Ultra 号池的全部设置调度，账户的真实权益不变。
-  // 服务端总是返回该字段，因此这里不是可选字段：缺了它，设置页的快照对比会一直显示未保存
+  // ultra_include_pro 为真时权益为 Pro 的账户并入 Ultra 号池，按 Ultra 号池的全部设置调度，账户的真实权益不变；
+  // 开启 pro_pool 时不生效（保存原值）。服务端总是返回该字段，因此这里不是可选字段：缺了它，设置页的快照对比会一直显示未保存
   ultra_include_pro: boolean
+  // pro_pool 为 Pro 独立号池（PRO_POOL，默认开启，保存后立即生效）：权益为 Pro 的账户只服务 /pro 前缀，不借用其他号池；
+  // pro_warm_worker_limit 可以为 0，pro_max_active_workers 至少为 1 且不小于 Pro 常驻数。服务端总是返回这三个字段
+  pro_pool: boolean
+  pro_warm_worker_limit: number
+  pro_max_active_workers: number
   // ultra_only_models 为只有 Ultra 权益的账户能用的模型（ULTRA_ONLY_MODELS），paid_only_models 为只有 Pro 与 Ultra 能用的模型
   // （PAID_ONLY_MODELS）；空数组表示没有规则，保存后立即生效。旧版服务端不返回这两个字段
   ultra_only_models?: string[]
@@ -789,13 +831,13 @@ export interface ServiceConfig {
   // 这份列表只作用于普通号池
   primary_models?: string[]
   primary_queue_wait?: string
-  // ultra_primary_models 为 Ultra 主用模型（空数组表示关闭），只作用于 /ultra 请求（以及 ULTRA_EXCLUSIVE 关闭时普通路径上
+  // ultra_primary_models 为 Ultra/Pro 主用模型（空数组表示关闭），作用于 /ultra 与 /pro 请求（以及 ULTRA_EXCLUSIVE 关闭时普通路径上
   // 只有 Ultra 号池的账户能服务的模型），这些模型没有额度时立即返回 429；ultra_primary_queue_wait 为它们的排队上限，
   // 规则与 primary_queue_wait 相同。旧版服务端不返回这两个字段
   ultra_primary_models?: string[]
   ultra_primary_queue_wait?: string
   // model_fallbacks 为额度用完时改用的模型（MODEL_FALLBACKS，规则 源模型=目标1|目标2，逗号分隔，空字符串表示没有规则），
-  // model_fallback_scope 为生效范围（MODEL_FALLBACK_SCOPE：ultra 只对 /ultra 请求、all 普通路径与 /ultra、off 关闭）；都保存后立即生效。
+  // model_fallback_scope 为生效范围（MODEL_FALLBACK_SCOPE：ultra 只对 /ultra 请求、all 普通路径、/pro 与 /ultra、off 关闭）；都保存后立即生效。
   // 服务端总是返回这两个字段，因此这里不是可选字段
   model_fallbacks: string
   model_fallback_scope: 'ultra' | 'all' | 'off'
@@ -902,8 +944,8 @@ export interface PlaygroundInput {
   imageQuality: 'auto' | 'low' | 'medium' | 'high'
   voice: string
   apiKey: string
-  // ultra 为真时请求经 /ultra 前缀发送，只由 Ultra 号池的账户处理
-  ultra: boolean
+  // pool 为请求经哪个入口发送：normal 为默认地址，pro 经 /pro 前缀（只由 Pro 号池的账户处理），ultra 经 /ultra 前缀
+  pool: AccountPool
 }
 
 export interface PlaygroundMedia {
@@ -937,7 +979,7 @@ export interface PlaygroundResult {
   error?: PlaygroundError
 }
 
-// UsageDimension 为用量可筛选与分组的维度；pool 为号池，取值为 normal 或 ultra
+// UsageDimension 为用量可筛选与分组的维度；pool 为号池，取值为 normal、pro 或 ultra
 export type UsageDimension = 'model' | 'account' | 'channel' | 'protocol' | 'state' | 'pool'
 
 export type UsageFilters = Partial<Record<UsageDimension, string[]>>
@@ -1044,8 +1086,8 @@ export interface UsageRecord {
   reply_hash?: string
   duplicate?: boolean
   has_body: boolean
-  // pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为 normal
-  pool: 'normal' | 'ultra'
+  // pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为 normal
+  pool: AccountPool
 }
 
 export interface UsageRecordPage {

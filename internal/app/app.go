@@ -193,7 +193,7 @@ func publicAPIConfig(manager *runtimeManager, cfg config.Config, adminToken stri
 		APIKey: cfg.ProxyAPIKey, APIKeyFunc: manager.activeAPIKey,
 		Admin: manager, AdminPassword: cfg.AdminPassword, AdminToken: adminToken, Stopping: stopping,
 		Ledger: manager.requestLedger(), ResponseStates: manager.responseStatePersister(), UltraExclusive: manager.activeUltraExclusive,
-		StreamDataHeartbeat: manager.activeStreamDataHeartbeat, OmniIgnoreSystemPrompt: manager.activeOmniIgnoreSystemPrompt,
+		ProPool: manager.activeProPool, StreamDataHeartbeat: manager.activeStreamDataHeartbeat, OmniIgnoreSystemPrompt: manager.activeOmniIgnoreSystemPrompt,
 		MediaDir: mediaDir, MediaLinks: manager.mediaLinks,
 	}
 }
@@ -297,8 +297,8 @@ func runServer(ctx context.Context, cfg config.Config, options commandOptions, m
 	}
 }
 
-// rootHandler 将公开 API 与内嵌管理端挂载到同一服务；/trace/ 与 /ultra/ 和 /v1 一样交给公开 API（只校验 API key），
-// 不经过管理页面的令牌校验；/media/ 为生成媒体的链接（不校验 API key，见 api.handleMedia）
+// rootHandler 将公开 API 与内嵌管理端挂载到同一服务；/trace/、/ultra/ 与 /pro/ 和 /v1 一样交给公开 API（只校验 API key），
+// 不经过管理页面的令牌校验（PRO_POOL=false 时 /pro 由公开 API 按协议返回 404）；/media/ 为生成媒体的链接（不校验 API key，见 api.handleMedia）
 func rootHandler(apiHandler http.Handler, adminPassword string, adminToken string) http.Handler {
 	root := http.NewServeMux()
 	root.Handle("/health", apiHandler)
@@ -307,6 +307,7 @@ func rootHandler(apiHandler http.Handler, adminPassword string, adminToken strin
 	root.Handle("/v1beta/", apiHandler)
 	root.Handle("/trace/", apiHandler)
 	root.Handle("/ultra/", apiHandler)
+	root.Handle("/pro/", apiHandler)
 	root.Handle("/media/", apiHandler)
 	root.Handle("/", api.AdminPageMiddleware(adminPassword, adminToken, webui.Handler()))
 	return securityHeaders(root)

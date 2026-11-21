@@ -64,7 +64,7 @@ const rollupKeyFields = `start, model, account, channel, protocol, state, status
 // rollupColumnsV1 是加入号池之前的小时与本地日汇总表的列（迁移旧账本时按它复制）
 const rollupColumnsV1 = `start, model, account, channel, protocol, state, status, ` + rollupFields
 
-// rollupColumns 是小时与本地日汇总表的列，start 是分段起点；pool 为请求的号池（ultra，普通号池为空），
+// rollupColumns 是小时与本地日汇总表的列，start 是分段起点；pool 为请求的号池（ultra、pro，普通号池为空），
 // 放在最后，与旧账本迁移时追加的列位置一致
 const rollupColumns = `
  start INTEGER NOT NULL, model TEXT NOT NULL, account TEXT NOT NULL, channel TEXT NOT NULL, protocol TEXT NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS response_states (
 
 // 本地相对上游新增 served_model（上游标明的实际模型）、downgrade（降级判定结论）、reply_hash（回复正文指纹）
 // 与 duplicate（窗口内出现过相同回复），用于统计降级拦截率与重复回复率；指纹只用于比对，不保存回复内容。
-// pool 为请求的号池（经 /ultra 进入的请求为 ultra，其余为空），旧账本打开时由 migrate 补上（见 migrate）
+// pool 为请求的号池（经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空），旧账本打开时由 migrate 补上（见 migrate）
 const schema = `
 CREATE TABLE IF NOT EXISTS requests (
  id TEXT PRIMARY KEY, time INTEGER NOT NULL, protocol TEXT NOT NULL, path TEXT NOT NULL,
@@ -140,7 +140,7 @@ type Row struct {
 	Downgrade string
 	// ReplyHash 为回复正文指纹，只用于判断两次回复是否相同
 	ReplyHash string
-	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，其余为空
+	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空
 	Pool string
 }
 

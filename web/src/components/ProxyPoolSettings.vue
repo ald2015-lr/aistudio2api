@@ -36,6 +36,9 @@ const props = defineProps<{
   // 设置页表单里的峰值与启动并发（可能是输入到一半的值），用于估算端口需求
   maxActive: number | string
   ultraMaxActive: number | string
+  // proMaxActive 为 Pro 峰值，proCounted 为开启 PRO_POOL 且有 Pro 号池账户（只有这时 Pro 分区才占端口）
+  proMaxActive?: number | string
+  proCounted?: boolean
   warmConcurrency: number | string
   hasDefaultProxy: boolean
   // serverError 为服务端拒绝表单里当前这份设置时的错误（前端组合校验查不出的地址格式问题），显示在地址框旁
@@ -124,7 +127,13 @@ const urlPlaceholder = computed(() =>
 
 const portCount = computed(() => proxyPoolPortCount(model.value))
 const capacity = computed(() =>
-  proxyPoolCapacity(props.maxActive, props.ultraMaxActive, props.warmConcurrency),
+  proxyPoolCapacity(
+    props.maxActive,
+    props.ultraMaxActive,
+    props.warmConcurrency,
+    props.proMaxActive ?? 0,
+    props.proCounted ?? false,
+  ),
 )
 const spare = computed(() => (capacity.value === null ? 0 : portCount.value - capacity.value.total))
 const capacityShown = computed(
@@ -392,13 +401,15 @@ onBeforeUnmount(clearPending)
       <template v-if="capacityShown && capacity !== null">
         <span class="mt-2 block text-xs text-gray-400">
           {{
-            tf('settings.proxyPoolCapacity', {
+            tf(props.proCounted ? 'settings.proxyPoolCapacityPro' : 'settings.proxyPoolCapacity', {
               ports: portCount,
               need: capacity.total,
               normal: capacity.normal,
               normalDrain: capacity.normalDrain,
               ultra: capacity.ultra,
               ultraDrain: capacity.ultraDrain,
+              pro: capacity.pro,
+              proDrain: capacity.proDrain,
               spare: Math.max(spare, 0),
             })
           }}

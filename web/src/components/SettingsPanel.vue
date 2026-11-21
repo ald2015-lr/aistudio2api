@@ -39,6 +39,8 @@ const props = defineProps<{
   proxyPoolStatus: ProxyPoolStatus | null
   // buildChannelStatus 为状态接口的 Build 通道生成暂停状态（没有启用 Build、服务未运行或旧版服务端时为 null）
   buildChannelStatus?: BuildChannelStatus | null
+  // proAccounts 为权益为 Pro 的账户数（按账户列表）：开启 Pro 独立号池且有 Pro 账户时 IP 池的端口需求才计入 Pro 分区
+  proAccounts?: number
 }>()
 
 const emit = defineEmits<{
@@ -59,6 +61,9 @@ type EditableKey =
   | 'max_active_workers'
   | 'ultra_exclusive'
   | 'ultra_include_pro'
+  | 'pro_pool'
+  | 'pro_warm_worker_limit'
+  | 'pro_max_active_workers'
   | 'ultra_only_models'
   | 'paid_only_models'
   | 'ultra_warm_worker_limit'
@@ -106,6 +111,9 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'max_active_workers',
   'ultra_exclusive',
   'ultra_include_pro',
+  'pro_pool',
+  'pro_warm_worker_limit',
+  'pro_max_active_workers',
   'ultra_only_models',
   'paid_only_models',
   'ultra_warm_worker_limit',
@@ -253,6 +261,9 @@ const form = reactive<ServiceConfig>({
   max_active_workers: 10,
   ultra_exclusive: true,
   ultra_include_pro: false,
+  pro_pool: true,
+  pro_warm_worker_limit: 2,
+  pro_max_active_workers: 5,
   ultra_only_models: [...DEFAULT_ULTRA_ONLY_MODELS],
   paid_only_models: [...DEFAULT_PAID_ONLY_MODELS],
   ultra_warm_worker_limit: 2,
@@ -711,6 +722,14 @@ function validate(value: ServiceConfig): string {
   if (!isPositiveInteger(value.ultra_max_active_workers) || value.ultra_max_active_workers < ultraWarm) {
     return t('settings.invalidUltraMaxWorkers')
   }
+  // Pro 常驻数与峰值的规则与 Ultra 相同
+  const proWarm = value.pro_warm_worker_limit
+  if (typeof proWarm !== 'number' || !Number.isInteger(proWarm) || proWarm < 0) {
+    return t('settings.invalidProWarmWorkers')
+  }
+  if (!isPositiveInteger(value.pro_max_active_workers) || value.pro_max_active_workers < proWarm) {
+    return t('settings.invalidProMaxWorkers')
+  }
   if (!isMediaBaseURL(value.media_base_url)) return t('settings.invalidMediaBaseURL')
   const retention = mediaRetentionMillis(value.media_retention)
   if (Number.isNaN(retention) || (retention > 0 && retention < MIN_MEDIA_RETENTION_MS)) {
@@ -774,6 +793,10 @@ const proxyPoolForm = computed<ProxyPoolConfig>({
 // ultraMaxFloor 为 Ultra 峰值输入框的下限：至少为 1，且不小于 Ultra 常驻数
 const ultraMaxFloor = computed(() =>
   typeof form.ultra_warm_worker_limit === 'number' ? Math.max(1, form.ultra_warm_worker_limit) : 1,
+)
+// proMaxFloor 为 Pro 峰值输入框的下限：至少为 1，且不小于 Pro 常驻数
+const proMaxFloor = computed(() =>
+  typeof form.pro_warm_worker_limit === 'number' ? Math.max(1, form.pro_warm_worker_limit) : 1,
 )
 
 // payload 构造保存内容；自动保存时所有失焦字段沿用已保存的值，避免把输入到一半的内容写进去
@@ -1246,6 +1269,8 @@ onBeforeUnmount(() => {
         :status="proxyPoolStatus"
         :max-active="form.max_active_workers"
         :ultra-max-active="form.ultra_max_active_workers"
+        :pro-max-active="form.pro_max_active_workers"
+        :pro-counted="form.pro_pool && (proAccounts ?? 0) > 0"
         :warm-concurrency="form.warm_startup_concurrency"
         :has-default-proxy="form.proxy.trim() !== ''"
         :server-error="proxyPoolServerError"
@@ -1419,6 +1444,59 @@ onBeforeUnmount(() => {
         </label>
       </HelpField>
 
+      <fieldset
+        class="block rounded-lg border border-sky-500/30 bg-[#161b22] p-4"
+        data-testid="settings-pro-pool"
+      >
+        <legend class="sr-only">{{ t('settings.proTitle') }}</legend>
+        <div class="mb-1 flex items-center gap-2">
+          <span class="tag tag-pro">{{ t('pool.pro') }}</span>
+          <span class="text-sm font-medium text-gray-300">{{ t('settings.proTitle') }}</span>
+        </div>
+        <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.proHelp')" />
+        <HelpField>
+          <label class="flex items-start gap-3">
+            <input v-model="form.pro_pool" class="mt-0.5 h-4 w-4 accent-blue-500" type="checkbox" />
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.proPool')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.proPoolHelp')"
+              />
+            </span>
+          </label>
+        </HelpField>
+        <div class="mt-4 grid grid-cols-1 gap-4 border-t border-[#30363d] pt-4 md:grid-cols-2">
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.proWarmWorkerLimit')
+            }}</span>
+            <input
+              v-model.number="form.pro_warm_worker_limit"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="number"
+              min="0"
+              required
+            />
+          </label>
+          <label class="block">
+            <span class="mb-1 block text-sm font-medium text-gray-400">{{
+              t('settings.proMaxActiveWorkers')
+            }}</span>
+            <input
+              v-model.number="form.pro_max_active_workers"
+              class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+              type="number"
+              :min="proMaxFloor"
+              required
+            />
+          </label>
+        </div>
+        <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.proWorkersHelp')" />
+      </fieldset>
+
       <fieldset class="block rounded-lg border border-fuchsia-500/30 bg-[#161b22] p-4">
         <legend class="sr-only">{{ t('settings.ultraTitle') }}</legend>
         <div class="mb-1 flex items-center gap-2">
@@ -1444,12 +1522,19 @@ onBeforeUnmount(() => {
             </span>
           </label>
         </HelpField>
+        <!-- 开启 Pro 独立号池时并入开关不生效：置灰但保留已保存的值，关闭 Pro 独立号池后按它并入 -->
         <HelpField class="mt-3">
-          <label class="flex items-start gap-3">
+          <label
+            class="flex items-start gap-3"
+            :class="form.pro_pool ? 'cursor-not-allowed opacity-60' : ''"
+          >
             <input
               v-model="form.ultra_include_pro"
               class="mt-0.5 h-4 w-4 accent-blue-500"
               type="checkbox"
+              :disabled="form.pro_pool"
+              :aria-describedby="form.pro_pool ? 'ultra-include-pro-ignored' : undefined"
+              data-testid="ultra-include-pro"
             />
             <span>
               <span class="block text-sm font-medium text-gray-300">{{
@@ -1462,9 +1547,18 @@ onBeforeUnmount(() => {
             </span>
           </label>
         </HelpField>
+        <p
+          v-if="form.pro_pool"
+          id="ultra-include-pro-ignored"
+          class="mt-3 rounded border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-xs leading-5 text-sky-200"
+          role="note"
+          data-testid="ultra-include-pro-ignored"
+        >
+          {{ t('settings.ultraIncludeProIgnoredHint') }}
+        </p>
         <!-- 并入开关开启而独占关闭时，普通路径仍会用到 Pro，用户想要的“Pro 不服务普通路径”没有达成，这里明确提示 -->
         <p
-          v-if="form.ultra_include_pro && !form.ultra_exclusive"
+          v-else-if="form.ultra_include_pro && !form.ultra_exclusive"
           class="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
           role="note"
         >

@@ -126,10 +126,10 @@ func TestWorkerPartitionCaps(t *testing.T) {
 	if got := sortedWarm(manager); !slices.Equal(got, []string{partitionNormalA, partitionNormalB, partitionUltraB}) {
 		t.Fatalf("扩容后驻留 Worker = %v", got)
 	}
-	if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeUltra, pool.UltraAccountIDs()); occupied.slots != 1 {
+	if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeUltra, pool.PartitionMembers()); occupied.slots != 1 {
 		t.Fatalf("Ultra 分区占用 %d 个槽位，期望 1", occupied.slots)
 	}
-	if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeNormal, pool.UltraAccountIDs()); occupied.slots != 2 {
+	if occupied := manager.occupiedWorkersIn(aistudio.PoolScopeNormal, pool.PartitionMembers()); occupied.slots != 2 {
 		t.Fatalf("普通分区占用 %d 个槽位，期望 2", occupied.slots)
 	}
 }

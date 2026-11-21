@@ -143,14 +143,21 @@ func (store *traceStore) list() ([]traceFile, error) {
 }
 
 // traceEntry 处理 /trace/ 前缀：去掉前缀后交给与主路由相同的处理链，POST 请求结束后写出排查记录。
-// /trace/ultra/v1/... 同时去掉 /ultra 并标记为 Ultra 号池，Ultra 号池的请求也能写排查记录
+// /trace/ultra/v1/... 与 /trace/pro/v1/... 同时去掉号池前缀并标记为 Ultra 号池或 Pro 号池，这两个号池的请求也能写排查记录；
+// /trace/pro 与 /pro 一样受 PRO_POOL 控制（见 proPoolGate）
 func (s *server) traceEntry(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		path, rawPath, ok := stripRoutePrefix(r.URL, tracePrefix)
-		if !ok {
-			if path, rawPath, ok = stripRoutePrefix(r.URL, tracePrefix+ultraPrefix); ok {
-				ctx = aistudio.ContextWithPoolScope(ctx, aistudio.PoolScopeUltra)
+		for _, pool := range [...]struct {
+			prefix string
+			scope  aistudio.PoolScope
+		}{{ultraPrefix, aistudio.PoolScopeUltra}, {proPrefix, aistudio.PoolScopePro}} {
+			if ok {
+				break
+			}
+			if path, rawPath, ok = stripRoutePrefix(r.URL, tracePrefix+pool.prefix); ok {
+				ctx = aistudio.ContextWithPoolScope(ctx, pool.scope)
 			}
 		}
 		if !ok {

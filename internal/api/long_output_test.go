@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -277,5 +278,34 @@ func TestLongOutputHeartbeatBetweenRounds(t *testing.T) {
 	got := collapseRuns(geminiStreamKinds(t, recorder.Body.String()))
 	if want := []string{"text", "hb-text", "text", "finish"}; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("流 = %v，期望两轮之间有心跳: %s", got, recorder.Body.String())
+	}
+}
+
+// TestRequestModelBases 请求模型名可能对应的目录 ID：原名在前，依次逐个剥离后缀，long- 前缀去掉后再剥一遍；能按这些名称解析到的目录 ID
+// 都在里面（与 resolveLongRequestModel 同一套写法），不剥 Omni 视频后缀
+func TestRequestModelBases(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		want []string
+	}{
+		{"gemini-4-argon", []string{"gemini-4-argon"}},
+		{" models/gemini-4-argon-medium ", []string{"gemini-4-argon-medium", "gemini-4-argon"}},
+		{"gemini-4-argon-high-nothinking-online", []string{"gemini-4-argon-high-nothinking-online", "gemini-4-argon-high-nothinking", "gemini-4-argon-high", "gemini-4-argon"}},
+		{"long-gemini-4-argon", []string{"long-gemini-4-argon", "gemini-4-argon"}},
+		{"LONG-gemini-4-argon-low", []string{"LONG-gemini-4-argon-low", "LONG-gemini-4-argon", "gemini-4-argon-low", "gemini-4-argon"}},
+		{"gemini-omni-1.1-flash-720p", []string{"gemini-omni-1.1-flash-720p"}},
+		{"", nil},
+	} {
+		if got := RequestModelBases(test.name); !reflect.DeepEqual(got, test.want) {
+			t.Errorf("RequestModelBases(%q) = %q，期望 %q", test.name, got, test.want)
+		}
+	}
+	// 能解析的写法，解析到的目录 ID 总在候选里
+	models := longTestModels()
+	for _, name := range []string{"long-gemini-3.8-flash-low-online", "gemini-3.8-flash-xhigh", "long-context-model", "gemini-3.8-flash-128"} {
+		model, _, _, _, ok := resolveLongRequestModel(models, name)
+		if !ok || !slices.Contains(RequestModelBases(name), model.ID) {
+			t.Errorf("%s 解析为 %q（%t），候选 %q 应包含它", name, model.ID, ok, RequestModelBases(name))
+		}
 	}
 }

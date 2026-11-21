@@ -286,12 +286,14 @@ def is_model(model):
 
 
 def protocol_of(path):
-    # 与 app/request_logging.go requestProtocol 一致：去掉 /trace、/ultra 前缀后按路径归类
+    # 与 app/request_logging.go requestProtocol 一致：去掉 /trace、/ultra、/pro 前缀后按路径归类
     path = path or ""
     if path.startswith("/trace"):
         path = path[len("/trace"):]
     if path.startswith("/ultra"):
         path = path[len("/ultra"):]
+    if path.startswith("/pro/"):
+        path = path[len("/pro"):]
     if path.endswith("/count_tokens") or path.endswith(":countTokens"):
         return "count_tokens"
     if path == "/v1/chat/completions":
@@ -953,7 +955,7 @@ else:
     print("    · 账本与日志里没有“本服务…期限”文本：要么运行的是旧版本，要么这段时间本服务期限没有到期过；"
           "error 只有 context deadline exceeded 本身的按旧版本的整段期限看")
 if config.get("ultra_primary_models") is not None:
-    print(f"  Ultra 主用模型={','.join(config.get('ultra_primary_models') or []) or '(空)'}  排队上限={config.get('ultra_primary_queue_wait')}")
+    print(f"  Ultra/Pro 主用模型={','.join(config.get('ultra_primary_models') or []) or '(空)'}  排队上限={config.get('ultra_primary_queue_wait')}")
 guard = config.get("downgrade_guard") or {}
 if guard.get("enabled") and guard.get("models"):
     hold = guard.get("max_hold_ms") or 0
@@ -1011,7 +1013,7 @@ else:
     print(f"  状态/状态码：{top(statuses, 8)}")
     streams = collections.Counter(row["stream"] for row in window_rows)
     print(f"  流式与否：{top(streams, 3)}（账本不记 stream 参数：只有 Gemini 路径或开启 REQUEST_BODY_LOG 时能判断）")
-    protocols = collections.Counter(f"{row['protocol'] or protocol_of(row['path'])}{'(ultra)' if row['pool'] == 'ultra' else ''}" for row in window_rows)
+    protocols = collections.Counter(f"{row['protocol'] or protocol_of(row['path'])}{'(' + row['pool'] + ')' if row['pool'] in ('ultra', 'pro') else ''}" for row in window_rows)
     print(f"  协议：{top(protocols, 6)}")
     ok_rows = [row for row in window_rows if row["success"]]
     bad_rows = [row for row in window_rows if not row["success"]]

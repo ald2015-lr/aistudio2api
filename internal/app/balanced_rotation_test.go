@@ -506,7 +506,7 @@ func TestBalancedRotationSoftPath(t *testing.T) {
 	if env.pool.Draining(w) || !env.unpinnedLease(t, w) {
 		t.Fatal("软阶段 W 应照常接不固定账户的请求")
 	}
-	if normal, _ := env.manager.drainCounts(); normal != 0 || len(env.manager.drainingAccounts()) != 0 {
+	if normal := env.manager.drainCounts()[aistudio.PoolScopeNormal]; normal != 0 || len(env.manager.drainingAccounts()) != 0 {
 		t.Fatalf("软排空不计入状态页的排空数与主用供给：%d、%v", normal, env.manager.drainingAccounts())
 	}
 	if credit := env.manager.drainCredit(aistudio.PoolScopeNormal, nil); credit != 1 || env.manager.drainSlotCount(aistudio.PoolScopeNormal) != 1 {
@@ -571,7 +571,7 @@ func TestBalancedRotationSoftPath(t *testing.T) {
 	if until, ok := env.manager.balancedState.rotation.snapshot(time.Now()).cooloff[w]; !ok || time.Until(until) < 29*time.Minute {
 		t.Fatalf("被换下的号应进入 30 分钟冷却期：%v %v", ok, until)
 	}
-	if normal, _ := env.manager.retirementCounts(env.pool.UltraAccountIDs()); normal != 0 {
+	if normal := env.manager.retirementCounts(env.pool.PartitionMembers())[aistudio.PoolScopeNormal]; normal != 0 {
 		t.Fatalf("轮换登记不计入状态页的待淘汰数，实际 %d", normal)
 	}
 }
@@ -887,7 +887,7 @@ func TestBalancedRotationTakenOver(t *testing.T) {
 		if !waitUntil(5*time.Second, func() bool { return env.pool.Draining(w) }) {
 			t.Fatal("冷却登记接管后软排空应立即改为普通排空")
 		}
-		if normal, _ := env.manager.retirementCounts(env.pool.UltraAccountIDs()); normal != 1 {
+		if normal := env.manager.retirementCounts(env.pool.PartitionMembers())[aistudio.PoolScopeNormal]; normal != 1 {
 			t.Fatalf("接管后计入状态页的待淘汰数，实际 %d", normal)
 		}
 		close(env.gate.release)
@@ -1383,7 +1383,7 @@ func TestBalancedSoftDrainFollowsIncludePro(t *testing.T) {
 		t.Fatal("软排空计入普通分区的让出额度，账号不标记排空")
 	}
 	pool.SetUltraIncludePro(true)
-	manager.poolRuleChanged(true)
+	manager.poolRuleChanged(true, poolRuleChange{includePro: true})
 	if manager.drainPartition(drain) != aistudio.PoolScopeUltra || manager.drainCredit(aistudio.PoolScopeUltra, nil) != 1 ||
 		manager.drainCredit(aistudio.PoolScopeNormal, nil) != 0 || manager.drainSlotCount(aistudio.PoolScopeUltra) != 1 {
 		t.Fatal("软排空应改记到 Ultra 分区")
@@ -1391,8 +1391,8 @@ func TestBalancedSoftDrainFollowsIncludePro(t *testing.T) {
 	if !drain.soft.Load() || pool.Draining(includeProAccount) {
 		t.Fatal("改记分区不改变软排空")
 	}
-	if normal, ultra := manager.drainCounts(); normal != 0 || ultra != 0 {
-		t.Fatalf("软排空不计入状态页的排空数：%d · %d", normal, ultra)
+	if counts := manager.drainCounts(); counts[aistudio.PoolScopeNormal] != 0 || counts[aistudio.PoolScopeUltra] != 0 {
+		t.Fatalf("软排空不计入状态页的排空数：%d · %d", counts[aistudio.PoolScopeNormal], counts[aistudio.PoolScopeUltra])
 	}
 	manager.startReplacement(aistudio.PoolScopeNormal, nil, rotationReplacementReason, drain)
 	if !waitUntil(5*time.Second, func() bool { return drain.replacement.Load() != replacementPending }) {
@@ -1405,7 +1405,7 @@ func TestBalancedSoftDrainFollowsIncludePro(t *testing.T) {
 	if !manager.hardenDrain(includeProAccount, drain) || !pool.Draining(includeProAccount) || drain.soft.Load() {
 		t.Fatal("hardenDrain 应改为普通排空")
 	}
-	if _, ultra := manager.drainCounts(); ultra != 1 {
+	if ultra := manager.drainCounts()[aistudio.PoolScopeUltra]; ultra != 1 {
 		t.Fatal("普通排空计入状态页的排空数")
 	}
 	if manager.hardenDrain(includeProAccount, &drainState{}) {

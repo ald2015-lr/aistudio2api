@@ -144,6 +144,10 @@ func (c *Config) resetKey(key string) {
 		c.UltraWarmWorkerLimit = defaults.UltraWarmWorkerLimit
 	case "ULTRA_MAX_ACTIVE_WORKERS":
 		c.UltraMaxActiveWorkers = defaults.UltraMaxActiveWorkers
+	case "PRO_WARM_WORKER_LIMIT":
+		c.ProWarmWorkerLimit = defaults.ProWarmWorkerLimit
+	case "PRO_MAX_ACTIVE_WORKERS":
+		c.ProMaxActiveWorkers = defaults.ProMaxActiveWorkers
 	case "WARM_STARTUP_CONCURRENCY":
 		// 不超过当前的 WARM_WORKER_LIMIT：只设了 WARM_WORKER_LIMIT=1 时不必连它一起改回默认值
 		c.WarmStartupConcurrency = defaults.WarmStartupConcurrency
@@ -291,6 +295,24 @@ var configChecks = []configCheck{
 	{keys: []string{"ULTRA_MAX_ACTIVE_WORKERS", "ULTRA_WARM_WORKER_LIMIT"}, check: func(c Config) error {
 		if c.UltraMaxActiveWorkers < c.UltraWarmWorkerLimit {
 			return fmt.Errorf("ULTRA_MAX_ACTIVE_WORKERS 必须大于或等于 ULTRA_WARM_WORKER_LIMIT")
+		}
+		return nil
+	}},
+	{keys: []string{"PRO_WARM_WORKER_LIMIT"}, check: func(c Config) error {
+		if c.ProWarmWorkerLimit < 0 {
+			return fmt.Errorf("PRO_WARM_WORKER_LIMIT 必须是 0 或正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"PRO_MAX_ACTIVE_WORKERS"}, check: func(c Config) error {
+		if c.ProMaxActiveWorkers <= 0 {
+			return fmt.Errorf("PRO_MAX_ACTIVE_WORKERS 必须是正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"PRO_MAX_ACTIVE_WORKERS", "PRO_WARM_WORKER_LIMIT"}, check: func(c Config) error {
+		if c.ProMaxActiveWorkers < c.ProWarmWorkerLimit {
+			return fmt.Errorf("PRO_MAX_ACTIVE_WORKERS 必须大于或等于 PRO_WARM_WORKER_LIMIT")
 		}
 		return nil
 	}},

@@ -63,10 +63,10 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 	return data
 }
 
-// requestPoolLabel 返回活动请求与请求日志使用的号池标记：经 /ultra 进入的请求为 ultra，其余为空
+// requestPoolLabel 返回活动请求与请求日志使用的号池标记：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余（普通路径）为空
 func requestPoolLabel(ctx context.Context) string {
-	if aistudio.PoolScopeFromContext(ctx) == aistudio.PoolScopeUltra {
-		return aistudio.PoolScopeUltra.String()
+	if scope := aistudio.PoolScopeFromContext(ctx); scope == aistudio.PoolScopeUltra || scope == aistudio.PoolScopePro {
+		return scope.String()
 	}
 	return ""
 }
@@ -233,9 +233,13 @@ func requestRow(entry api.AccessLog, finished time.Time) requestdb.Row {
 	return row
 }
 
-// requestProtocol 按公开 API 路径归类请求协议；排查路由 /trace/ 与 Ultra 路由 /ultra/ 的请求先去掉前缀，与主路由归为同一协议
+// requestProtocol 按公开 API 路径归类请求协议；排查路由 /trace/、Ultra 路由 /ultra/ 与 Pro 路由 /pro/ 的请求先去掉前缀，与主路由归为同一协议
+// （/pro 只在后面跟着 / 时去掉）
 func requestProtocol(path string) string {
 	path = strings.TrimPrefix(strings.TrimPrefix(path, "/trace"), "/ultra")
+	if strings.HasPrefix(path, "/pro/") {
+		path = strings.TrimPrefix(path, "/pro")
+	}
 	switch {
 	case api.CountTokensPath(path):
 		return "count_tokens"

@@ -19,7 +19,7 @@ import (
 // 同一出口上的账户共用上游按出口 IP 计的限流；判定与行为在 app 层（egress_guard.go），账户池只按出口与分区通道记账、准入。
 //
 // 每出口、每分区通道一条令牌桶（GCRA）：
-//   - 账户按出口键与是否属于 Ultra 号池挂到一个通道（attachEgressLocked）：构造、加入、SetGlobalProxy、SaveConfig 改代理、
+//   - 账户按出口键与是否属于 Ultra 分区（Pro 分区与普通分区同用普通通道，见 LaneOf）挂到一个通道（attachEgressLocked）：构造、加入、SetGlobalProxy、SaveConfig 改代理、
 //     IP 池绑定变化（SetProxyBindings、UpdateProxyBindings，与写绑定在同一次加锁内）、Ultra 成员变化时重挂，删除时摘下；
 //     候选索引按账户下标存通道编号（egressID）
 //   - 限速只由 app 层判定器经 SetEgressRateLimit 写入，为 0 时只记账不拦：生成租约照常预占、发送照常记录，供状态与判定使用
@@ -147,13 +147,23 @@ func egressHash(value string, n int) string {
 	return hex.EncodeToString(sum[:])[:n]
 }
 
-// EgressLane 为出口内的分区通道：Ultra 分区的账户单独一条令牌桶，普通号池的流量不会限住 Ultra 号池
+// EgressLane 为出口内的分区通道：Ultra 分区的账户单独一条令牌桶，普通号池的流量不会限住 Ultra 号池。
+// Pro 分区（PRO_POOL=true）与普通分区共用普通通道，见 LaneOf
 type EgressLane uint8
 
 const (
 	EgressLaneNormal EgressLane = iota
 	EgressLaneUltra
 )
+
+// LaneOf 返回分区的账户挂在出口的哪条通道：只有 Ultra 分区用 Ultra 通道，普通与 Pro 分区（以及非分区取值）用普通通道。
+// Ultra 通道的限速阈值按 Ultra 账户少的号池设定，Pro 账户多，放进去会让 Pro 的限流证据限住 Ultra
+func LaneOf(partition PoolScope) EgressLane {
+	if partition == PoolScopeUltra {
+		return EgressLaneUltra
+	}
+	return EgressLaneNormal
+}
 
 // EgressLaneStatus 为一个出口通道的账户池侧计数（状态接口与判定器使用）
 type EgressLaneStatus struct {
@@ -438,11 +448,7 @@ func (p *AccountPool) attachEgressLocked(account *Account) bool {
 	}
 	var next *egressRate
 	if p.byID[account.ID] == account {
-		lane := EgressLaneNormal
-		if _, ultra := p.ultraAccounts[account.ID]; ultra {
-			lane = EgressLaneUltra
-		}
-		next = p.egressLaneLocked(p.egressKeyOfLocked(account), lane)
+		next = p.egressLaneLocked(p.egressKeyOfLocked(account), LaneOf(p.memberPartitionLocked(account.ID)))
 	}
 	if account.egress == next {
 		return false
@@ -795,8 +801,8 @@ func (p *AccountPool) EgressKeyOf(accountID string) (key string, lane EgressLane
 	lane = EgressLaneNormal
 	if account.egress != nil {
 		lane = account.egress.lane
-	} else if _, ultra := p.ultraAccounts[account.ID]; ultra {
-		lane = EgressLaneUltra
+	} else {
+		lane = LaneOf(p.memberPartitionLocked(account.ID))
 	}
 	return p.egressKeyOfLocked(account), lane
 }
@@ -1131,10 +1137,7 @@ func (p *AccountPool) verifyEgressLocked() error {
 			}
 			continue
 		}
-		lane := EgressLaneNormal
-		if _, ultra := p.ultraAccounts[account.ID]; ultra {
-			lane = EgressLaneUltra
-		}
+		lane := LaneOf(p.memberPartitionLocked(account.ID))
 		record := p.egresses[p.egressKeyOfLocked(account)]
 		if record == nil || account.egress != record.lanes[lane] {
 			return fmt.Errorf("账户 %s 的出口通道与出口 %s、通道 %d 不符", account.ID, EgressLabel(p.egressKeyOfLocked(account)), lane)

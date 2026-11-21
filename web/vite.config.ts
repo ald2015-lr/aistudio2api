@@ -33,6 +33,10 @@ export default defineConfig({
       '/health': serviceTarget,
       '/v1': serviceTarget,
       '/v1beta': serviceTarget,
+      // API 试用经号池前缀发送（/pro、/ultra），排查路由为 /trace
+      '/pro/': serviceTarget,
+      '/ultra/': serviceTarget,
+      '/trace/': serviceTarget,
     },
   },
 })

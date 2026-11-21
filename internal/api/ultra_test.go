@@ -50,8 +50,11 @@ func (service *poolRecordingService) Models(ctx context.Context) ([]aistudio.Mod
 		ID: "normal-model", Name: "Normal", Methods: []string{"generateContent"},
 		Capabilities: map[string]bool{"chat_model": true, "thinking": true},
 	}
-	if aistudio.PoolScopeFromContext(ctx) == aistudio.PoolScopeUltra {
+	switch aistudio.PoolScopeFromContext(ctx) {
+	case aistudio.PoolScopeUltra:
 		model.ID, model.Name = "ultra-model", "Ultra"
+	case aistudio.PoolScopePro:
+		model.ID, model.Name = "pro-model", "Pro"
 	}
 	return []aistudio.Model{model}, nil
 }
@@ -130,7 +133,8 @@ func TestUltraRouting(t *testing.T) {
 		{path: "/ultra/v1/models", exclusive: false, want: aistudio.PoolScopeUltra},
 		{path: "/v1/models", exclusive: true, want: aistudio.PoolScopeNormal},
 		{path: "/v1beta/models", exclusive: true, want: aistudio.PoolScopeNormal},
-		{path: "/v1/models", exclusive: false, want: aistudio.PoolScopeAll},
+		// 不独占时普通路径不用 Pro 账户：没有配置 PRO_POOL 读取函数时按默认开启，为普通号池与 Ultra 号池（关闭时不限号池见 TestDefaultPathScopeWithProPool）
+		{path: "/v1/models", exclusive: false, want: aistudio.PoolScopeNormalUltra},
 		{path: "/trace/v1/models", exclusive: true, want: aistudio.PoolScopeNormal},
 		{path: "/trace/ultra/v1/models", exclusive: true, want: aistudio.PoolScopeUltra},
 		{path: "/trace/ultra/v1beta/models", exclusive: false, want: aistudio.PoolScopeUltra},
@@ -401,7 +405,7 @@ func TestUltraGeminiVideoURIKeepsPrefix(t *testing.T) {
 	}
 }
 
-// TestPrefixRoutesKeepEscapedPath /ultra 与 /trace 去掉前缀后保留客户端的转义：ID 中的 %2F、%2e%2e 等路径段
+// TestPrefixRoutesKeepEscapedPath /ultra、/pro 与 /trace 去掉前缀后保留客户端的转义：ID 中的 %2F、%2e%2e 等路径段
 // 与直接请求 /v1 时由同一个路由匹配，状态码与重定向都相同
 func TestPrefixRoutesKeepEscapedPath(t *testing.T) {
 	service := &poolRecordingService{}
@@ -410,7 +414,7 @@ func TestPrefixRoutesKeepEscapedPath(t *testing.T) {
 	handler := NewHandler(service, Config{APIKey: "sk-test", UltraExclusive: exclusive.Load, TraceDir: t.TempDir()})
 	for _, path := range []string{"/v1/files/a%2Fb", "/v1/%2e%2e/api/status", "/v1/models%2Fx", "/v1%2Fmodels"} {
 		direct := serve(handler, authorizedRequest(http.MethodGet, path, ""))
-		for _, prefix := range []string{ultraPrefix, tracePrefix} {
+		for _, prefix := range []string{ultraPrefix, proPrefix, tracePrefix} {
 			prefixed := serve(handler, authorizedRequest(http.MethodGet, prefix+path, ""))
 			if prefixed.Code != direct.Code || prefixed.Header().Get("Location") != direct.Header().Get("Location") {
 				t.Fatalf("%s%s：%d Location=%q，直接请求 %s：%d Location=%q", prefix, path,

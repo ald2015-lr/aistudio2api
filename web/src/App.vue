@@ -3,6 +3,7 @@ import {
   computed,
   defineAsyncComponent,
   h,
+  nextTick,
   onMounted,
   onUnmounted,
   reactive,
@@ -210,23 +211,32 @@ const driveStorageFullLine = computed(() => {
   return storageFull > 0 ? tf('app.driveLineStorageFull', { storageFull }) : null
 })
 
-// balancedLines 为侧栏的平均调用行（ROUTING_STRATEGY=balanced，开启且服务运行时服务端才返回）：普通分区一行（只有 Ultra 账号的部署不显示），
-// Ultra 分区有可调度账号时再一行。每行为今日（太平洋时间）发送数的最少/中位/最多与已用账号数，有进行中的轮换或暂停原因时追加；
-// 近 1 小时的轮换数是两个分区合计，只写在第一行。悬停看口径说明。暂停原因是服务端的中文说明，原样显示
+// balancedLines 为侧栏的平均调用行（ROUTING_STRATEGY=balanced，开启且服务运行时服务端才返回）：普通分区一行（只有 Ultra、Pro 账号的部署不显示），
+// Ultra 分区、Pro 分区有可调度账号时各再一行。每行为今日（太平洋时间）发送数的最少/中位/最多与已用账号数，有进行中的轮换或暂停原因时追加；
+// 近 1 小时的轮换数是全部分区合计，只写在第一行。悬停看口径说明。暂停原因是服务端的中文说明，原样显示
+const BALANCED_TITLES: Record<'normal' | 'ultra' | 'pro', TranslationKey> = {
+  normal: 'app.balancedTitle',
+  ultra: 'app.balancedUltraTitle',
+  pro: 'app.balancedProTitle',
+}
 const balancedLines = computed(() => {
   const balanced = status.value?.balanced
   if (balanced === undefined) return []
-  const parts: Array<{ key: string; ultra: boolean; spread: BalancedPartition }> = []
-  if (balanced.normal.accounts > 0 || balanced.ultra.accounts === 0) {
-    parts.push({ key: 'normal', ultra: false, spread: balanced.normal })
+  const parts: Array<{ key: 'normal' | 'ultra' | 'pro'; spread: BalancedPartition }> = []
+  const pro = balanced.pro
+  if (
+    balanced.normal.accounts > 0 ||
+    (balanced.ultra.accounts === 0 && (pro?.accounts ?? 0) === 0)
+  ) {
+    parts.push({ key: 'normal', spread: balanced.normal })
   }
-  if (balanced.ultra.accounts > 0) parts.push({ key: 'ultra', ultra: true, spread: balanced.ultra })
-  return parts.map(({ key, ultra, spread }, index) => ({
+  if (balanced.ultra.accounts > 0) parts.push({ key: 'ultra', spread: balanced.ultra })
+  if (pro !== undefined && pro.accounts > 0) parts.push({ key: 'pro', spread: pro })
+  return parts.map(({ key, spread }, index) => ({
     key,
-    ultra,
     paused: !!spread.paused_reason,
     segments: [
-      t(ultra ? 'app.balancedUltraTitle' : 'app.balancedTitle'),
+      t(BALANCED_TITLES[key]),
       tf('app.balancedSpread', { min: spread.min, median: spread.median, max: spread.max }),
       tf('app.balancedUsed', { used: spread.used, accounts: spread.accounts }),
       ...(index === 0 ? [tf('app.balancedRotations', { count: balanced.rotations_1h })] : []),
@@ -245,7 +255,7 @@ const balancedLines = computed(() => {
   }))
 })
 
-// ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
+// ultraWorkers 为侧栏显示的 Ultra 分区 Worker 计数；Ultra 号池没有账户（关闭 PRO_POOL、开启 ULTRA_INCLUDE_PRO 时 Pro 账户也计入）
 // 也没有 Ultra Worker 时不显示
 const ultraWorkers = computed(() => {
   const workers = status.value?.ultra_workers
@@ -253,6 +263,99 @@ const ultraWorkers = computed(() => {
   const accounts = status.value?.ultra_accounts?.total ?? 0
   return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0 ? workers : null
 })
+
+// proWorkers 为侧栏显示的 Pro 分区 Worker 计数：Pro 号池（开启 PRO_POOL 时权益为 Pro 的账户）没有账户也没有 Pro Worker 时不显示
+// （关闭 PRO_POOL 时 Pro 分区为空）；旧版服务端不返回
+const proWorkers = computed(() => {
+  const workers = status.value?.pro_workers
+  if (workers === undefined) return null
+  const accounts = status.value?.pro_accounts?.total ?? 0
+  return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0
+    ? workers
+    : null
+})
+
+// proPoolNotice 为 PRO_POOL 默认开启的升级提示（.env 与环境变量都没有写 PRO_POOL、又有 Pro 号池账户时服务端才返回）：
+// 侧栏显示一条可关闭的提示。关闭只记在本浏览器，按稳定的值记：来源分区与当前各分区的常驻、峰值设置（与运行日志的去重相同，见服务端
+// checkProPoolNotice），运维改了这些设置或来源分区变化时才再出现；建议值随可用账户数（冷却、需要登录）波动，只用于显示，变化不会让
+// 关掉的提示重新出现。写明 PRO_POOL 后服务端不再返回
+const PRO_NOTICE_STORAGE_KEY = 'aistudio2api_pro_pool_notice_dismissed'
+const proNoticeDismissed = ref(readStorage(PRO_NOTICE_STORAGE_KEY) ?? '')
+const proPoolNotice = computed(() => {
+  const notice = status.value?.pro_pool_notice
+  if (notice === undefined) return null
+  // 来源分区为 Ultra（升级前 ULTRA_INCLUDE_PRO=true，Pro 账户在 Ultra 分区）时建议减 ULTRA_*，普通分区不变
+  const fromUltra = notice.source === 'ultra'
+  const sourceWarm = fromUltra
+    ? (notice.suggested_ultra_warm_worker_limit ?? 0)
+    : notice.suggested_warm_worker_limit
+  const sourceMax = fromUltra
+    ? (notice.suggested_ultra_max_active_workers ?? 0)
+    : notice.suggested_max_active_workers
+  const key = [
+    notice.source ?? 'normal',
+    notice.warm_worker_limit,
+    notice.max_active_workers,
+    notice.ultra_warm_worker_limit ?? 0,
+    notice.ultra_max_active_workers ?? 0,
+    notice.pro_warm_worker_limit,
+    notice.pro_max_active_workers,
+  ].join('/')
+  if (key === proNoticeDismissed.value) return null
+  return {
+    key,
+    text: tf(fromUltra ? 'app.proPoolNoticeUltra' : 'app.proPoolNotice', {
+      count: notice.pro_accounts,
+      proWarm: notice.suggested_pro_warm_worker_limit,
+      proMax: notice.suggested_pro_max_active_workers,
+      warm: sourceWarm,
+      max: sourceMax,
+    }),
+    detail: tf(fromUltra ? 'app.proPoolNoticeDetailUltra' : 'app.proPoolNoticeDetail', {
+      count: notice.pro_accounts,
+      proAvailable: notice.pro_available,
+      normalAvailable: notice.normal_available,
+      ultraAvailable: notice.ultra_available ?? 0,
+      currentProWarm: notice.pro_warm_worker_limit,
+      currentProMax: notice.pro_max_active_workers,
+      proWarm: notice.suggested_pro_warm_worker_limit,
+      proMax: notice.suggested_pro_max_active_workers,
+      currentWarm: fromUltra ? (notice.ultra_warm_worker_limit ?? 0) : notice.warm_worker_limit,
+      currentMax: fromUltra ? (notice.ultra_max_active_workers ?? 0) : notice.max_active_workers,
+      warm: sourceWarm,
+      max: sourceMax,
+    }),
+  }
+})
+
+function dismissProPoolNotice(key: string): void {
+  proNoticeDismissed.value = key
+  writeStorage(PRO_NOTICE_STORAGE_KEY, key)
+}
+
+// openProPoolSettings 为提示里的“去设置”：切到设置页并滚动到 Pro 号池分组（开关与 PRO_* 都在这里）。设置页的配置可能还在读取，
+// 分组出现后再滚动，最多等约 3 秒，等不到就停在设置页顶部
+async function openProPoolSettings(): Promise<void> {
+  currentTab.value = 'settings'
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await nextTick()
+    if (currentTab.value !== 'settings') return
+    const section = document.querySelector('[data-testid="settings-pro-pool"]')
+    if (section) {
+      section.scrollIntoView({ block: 'start' })
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
+// proTierAccounts 为权益为 Pro 的账户数（按账户列表的真实权益，与服务端装配时判断 Pro 分区是否为空的口径相同），设置页估算 IP 池端口需求时用
+const proTierAccounts = computed(
+  () =>
+    accounts.value.filter(
+      (account) => account.benefit_tier_known !== false && account.benefit_tier === 'Pro',
+    ).length,
+)
 
 // proxyPoolLine 为侧栏 Worker 区下方的 IP 池一行：静态显示端口占用、冷却与共用，动态显示会话数与换会话次数，
 // 有旧出口、仍走默认代理的 Worker、外部占用、已删账户占用时追加；悬停列出冷却端口与裸 429 最多的端口
@@ -353,7 +456,7 @@ const proxyPoolLine = computed(() => {
 })
 
 // primarySupplyRows 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+。
-// 普通条目与 Ultra 条目（pool 为 ultra）分开：同一个模型可能同时在两份列表里，Ultra 条目显示在 Ultra Worker 行下面
+// 普通条目与 Ultra、Pro 条目（pool 为 ultra、pro）分开：同一个模型可能同时在几份列表里，Ultra、Pro 条目显示在各自的 Worker 行下面
 const primarySupplyRows = computed(() =>
   (status.value?.primary_supply ?? []).map((supply) => ({
     ...supply,
@@ -361,12 +464,16 @@ const primarySupplyRows = computed(() =>
   })),
 )
 const primarySupply = computed(() =>
-  primarySupplyRows.value.filter((supply) => supply.pool !== 'ultra'),
+  primarySupplyRows.value.filter((supply) => supply.pool !== 'ultra' && supply.pool !== 'pro'),
 )
 // Ultra 条目与 Ultra Worker 行一样只在有 Ultra 号池时显示：ULTRA_PRIMARY_MODELS 默认非空，Ultra 号池没有账户的部署也会统计出
 // 全为 0 的条目，显示出来会被误读为备用账号已经用完
 const ultraPrimarySupply = computed(() =>
   ultraWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'ultra') : [],
+)
+// Pro 条目（开启 PRO_POOL 时同一份 Ultra/Pro 主用模型列表在 Pro 分区的供给）同样只在有 Pro 号池时显示
+const proPrimarySupply = computed(() =>
+  proWorkers.value ? primarySupplyRows.value.filter((supply) => supply.pool === 'pro') : [],
 )
 
 // limitedEgress 为侧栏的出口限流行：只显示判定成立（limited，黄色）或已撤销（rejected，灰色）的出口，正常的不显示
@@ -814,6 +921,39 @@ onUnmounted(() => {
         :class="serviceState === 'launching' ? 'launching-shell' : ''"
       >
         <div v-if="serviceState === 'launching'" class="launching-scan" aria-hidden="true"></div>
+        <!-- PRO_POOL 默认开启的升级提示：可关闭，点“去设置”打开设置页并滚动到 Pro 号池分组；悬停看完整说明 -->
+        <div
+          v-if="proPoolNotice"
+          v-tooltip="proPoolNotice.detail"
+          class="mb-3 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-[11px] leading-4 text-amber-200"
+          role="status"
+          data-testid="pro-pool-notice"
+        >
+          <div class="flex items-start gap-1">
+            <span class="min-w-0 flex-1 font-bold break-words">{{ t('app.proPoolNoticeTitle') }}</span>
+            <button
+              type="button"
+              class="shrink-0 rounded p-0.5 text-amber-300 transition hover:bg-amber-500/20 hover:text-white"
+              :aria-label="t('app.proPoolNoticeDismiss')"
+              :title="t('app.proPoolNoticeDismiss')"
+              data-testid="pro-pool-notice-dismiss"
+              @click="dismissProPoolNotice(proPoolNotice.key)"
+            >
+              <UiIcon name="close" :size="12" />
+            </button>
+          </div>
+          <p class="break-words">
+            {{ proPoolNotice.text }}
+            <button
+              type="button"
+              class="whitespace-nowrap text-amber-100 underline underline-offset-2 hover:text-white"
+              data-testid="pro-pool-notice-open"
+              @click="openProPoolSettings"
+            >
+              {{ t('app.proPoolNoticeOpen') }}
+            </button>
+          </p>
+        </div>
         <div class="mb-2 text-xs text-gray-500">{{ t('app.status') }}</div>
         <div class="mb-1 flex items-center justify-between">
           <span class="font-mono font-bold" :class="statusTextColor">
@@ -886,7 +1026,13 @@ onUnmounted(() => {
             v-tooltip="line.detail"
             class="flex flex-wrap items-baseline gap-x-1"
             :class="
-              line.paused ? 'text-yellow-400' : line.ultra ? 'text-fuchsia-300' : 'text-emerald-300'
+              line.paused
+                ? 'text-yellow-400'
+                : line.key === 'ultra'
+                  ? 'text-fuchsia-300'
+                  : line.key === 'pro'
+                    ? 'text-sky-300'
+                    : 'text-emerald-300'
             "
           >
             <span
@@ -960,6 +1106,44 @@ onUnmounted(() => {
           >
             <span class="max-w-full min-w-0 truncate">
               {{ tf('app.ultraPrimarySupplyModel', { model: supply.model }) }}
+            </span>
+            <span class="whitespace-nowrap">
+              {{
+                tf('app.primarySupply', {
+                  warm: supply.warm,
+                  cooling: supply.cooling ?? 0,
+                  standby: supply.standbyLabel,
+                })
+              }}
+            </span>
+          </div>
+          <div
+            v-if="proWorkers"
+            v-tooltip="
+              tf('app.proWorkersDetail', {
+                warm: proWorkers.warm,
+                starting: proWorkers.starting,
+                dead: proWorkers.dead ?? 0,
+                draining: proWorkers.draining ?? 0,
+                unschedulable: proWorkers.unschedulable ?? 0,
+                target: proWorkers.target,
+                max: proWorkers.max,
+              })
+            "
+            data-testid="sidebar-pro-workers"
+            :class="proWorkers.occupied >= proWorkers.max ? 'text-yellow-400' : 'text-sky-300'"
+          >
+            {{ tf('app.proWorkers', { occupied: proWorkers.occupied, max: proWorkers.max }) }}
+          </div>
+          <div
+            v-for="supply in proPrimarySupply"
+            :key="`pro:${supply.model}`"
+            v-tooltip="tf('app.proPrimarySupplyDetail', { model: supply.model })"
+            class="flex flex-wrap items-baseline gap-x-1"
+            :class="supply.standby === 0 ? 'text-yellow-400' : 'text-sky-300'"
+          >
+            <span class="max-w-full min-w-0 truncate">
+              {{ tf('app.proPrimarySupplyModel', { model: supply.model }) }}
             </span>
             <span class="whitespace-nowrap">
               {{
@@ -1091,6 +1275,7 @@ onUnmounted(() => {
           :worker-sets="workerSets"
           :worker-counts="status?.workers ?? null"
           :ultra-worker-counts="status?.ultra_workers ?? null"
+          :pro-worker-counts="status?.pro_workers ?? null"
           :proxy-pool="status?.proxy_pool ?? null"
           :cooldowns="cooldowns"
           @refresh="loadAccountData"
@@ -1123,6 +1308,7 @@ onUnmounted(() => {
           :models="models"
           :proxy-pool-status="status?.proxy_pool ?? null"
           :build-channel-status="status?.build_channel ?? null"
+          :pro-accounts="proTierAccounts"
           @saved="config = $event"
           @notice="showNotice"
         />
@@ -1131,6 +1317,10 @@ onUnmounted(() => {
           :models="models"
           :accounts="accounts"
           :api-key="config?.proxy_api_key ?? ''"
+          :pro-pool="config?.pro_pool ?? true"
+          :ultra-only-models="config?.ultra_only_models ?? []"
+          :paid-only-models="config?.paid_only_models ?? []"
+          :ultra-exclusive="config?.ultra_exclusive ?? true"
         />
       </KeepAlive>
     </main>

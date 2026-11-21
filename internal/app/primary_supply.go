@@ -11,7 +11,8 @@ import (
 
 // 主用模型供给：keepWarm 约每 30 秒统计一次每个主用模型的可用供给并缓存，状态接口直接读缓存，不在每次状态请求时对上万个账户分类。
 // 普通主用模型（PRIMARY_MODELS）统计普通分区，Ultra 主用模型（ULTRA_PRIMARY_MODELS）统计 Ultra 分区（条目 pool 为 ultra），
-// 同一个模型在两份列表里时各有一条：
+// PRO_POOL=true 时 Ultra 主用模型另统计 Pro 分区（条目 pool 为 pro，/pro 沿用 Ultra 主用模型；权益规则不让 Pro 用的模型如 gemini-4-carbon
+// 不统计，免得一直显示 0 供给），同一个模型在几份列表里时各有一条：
 //   - warm 为能服务它的驻留 Worker：分区内的驻留 Worker 中，是该模型的候选、对它没有冷却、不在排空中的账号；
 //   - standby 为能服务它的空闲备用账号：分区内没有驻留 Worker、不在启动中、空闲、对它没有冷却的候选账号，最多统计 primarySupplyStandbyLimit 个；
 //   - cooling 为对它冷却中的驻留 Worker：分区内不在排空中的驻留 Worker 中，是该模型的候选、但所有支持的启用通道都在冷却的账号
@@ -42,30 +43,47 @@ type primarySupplyTarget struct {
 	pool  aistudio.PoolScope
 }
 
-// primarySupplyTargets 返回两份列表要统计的模型：普通列表在前
-func primarySupplyTargets(normal []string, ultra []string) []primarySupplyTarget {
-	targets := make([]primarySupplyTarget, 0, len(normal)+len(ultra))
+// primarySupplyTargets 返回各列表要统计的模型：普通列表在前，其次 Ultra 列表，最后 Pro 分区要统计的 Ultra 主用模型（pro，见 proPrimaryModels）
+func primarySupplyTargets(normal []string, ultra []string, pro []string) []primarySupplyTarget {
+	targets := make([]primarySupplyTarget, 0, len(normal)+len(ultra)+len(pro))
 	for _, modelID := range normal {
 		targets = append(targets, primarySupplyTarget{model: modelID, pool: aistudio.PoolScopeNormal})
 	}
 	for _, modelID := range ultra {
 		targets = append(targets, primarySupplyTarget{model: modelID, pool: aistudio.PoolScopeUltra})
 	}
+	for _, modelID := range pro {
+		targets = append(targets, primarySupplyTarget{model: modelID, pool: aistudio.PoolScopePro})
+	}
 	return targets
 }
 
-// supplyPoolLabel 返回供给条目的 pool 字段：Ultra 列表的条目为 ultra，普通列表的为空
+// proPrimaryModels 返回 Pro 分区要统计供给的 Ultra 主用模型：PRO_POOL=false 时为空（Pro 分区为空）；权益规则不让 Pro 用的模型不统计
+func (manager *accountWorkerManager) proPrimaryModels(ultra []string) []string {
+	if len(ultra) == 0 || !manager.pool.ProPool() {
+		return nil
+	}
+	models := make([]string, 0, len(ultra))
+	for _, modelID := range ultra {
+		if manager.pool.TierRulesAllow(modelID, aistudio.BenefitTierPro) {
+			models = append(models, modelID)
+		}
+	}
+	return models
+}
+
+// supplyPoolLabel 返回供给条目的 pool 字段：Ultra 列表的条目为 ultra，Pro 分区的为 pro，普通列表的为空
 func supplyPoolLabel(pool aistudio.PoolScope) string {
-	if pool == aistudio.PoolScopeUltra {
+	if pool == aistudio.PoolScopeUltra || pool == aistudio.PoolScopePro {
 		return pool.String()
 	}
 	return ""
 }
 
 // refreshPrimarySupply 在缓存过期（超过 primarySupplyInterval）、任一份主用模型列表变化或号池规则版本变化时重新统计
-// （keepWarm 每个周期调用），返回这次是否重新统计；两份列表都为空时清空缓存。供给按分区统计，ULTRA_INCLUDE_PRO 切换后
-// Pro 账户换了分区，版本不同就在下一个 keepWarm 周期重算，不等满 30 秒。先读版本再统计：统计期间发生的切换让快照带上旧版本，
-// 下一个周期照样重算
+// （keepWarm 每个周期调用），返回这次是否重新统计；两份列表都为空时清空缓存。供给按分区统计，PRO_POOL 或 ULTRA_INCLUDE_PRO 切换后
+// Pro 账户换了分区，版本不同就在下一个 keepWarm 周期重算，不等满 30 秒（Pro 分区要统计的模型由 Ultra 列表、PRO_POOL 与权益规则推出，
+// 后两者变化时版本同样加一）。先读版本再统计：统计期间发生的切换让快照带上旧版本，下一个周期照样重算
 func (manager *accountWorkerManager) refreshPrimarySupply(now time.Time) bool {
 	normal, ultra := manager.primaryModelLists()
 	version := manager.pool.PoolRuleVersion()
@@ -82,7 +100,7 @@ func (manager *accountWorkerManager) refreshPrimarySupply(now time.Time) bool {
 	}
 	manager.primarySupply.Store(&primarySupplySnapshot{
 		models: slices.Clone(normal), ultraModels: slices.Clone(ultra), at: now, ruleVersion: version,
-		entries: manager.computePrimarySupply(primarySupplyTargets(normal, ultra), primarySupplyStandbyLimit),
+		entries: manager.computePrimarySupply(primarySupplyTargets(normal, ultra, manager.proPrimaryModels(ultra)), primarySupplyStandbyLimit),
 	})
 	return true
 }
@@ -102,7 +120,7 @@ func (manager *accountWorkerManager) primarySupplyStatus() []api.AdminPrimarySup
 	entries := make([]api.AdminPrimarySupply, 0, len(snapshot.entries))
 	for _, entry := range snapshot.entries {
 		models := normal
-		if entry.Pool == aistudio.PoolScopeUltra.String() {
+		if entry.Pool == aistudio.PoolScopeUltra.String() || entry.Pool == aistudio.PoolScopePro.String() {
 			models = ultra
 		}
 		if slices.Contains(models, entry.Model) {
@@ -116,7 +134,7 @@ func (manager *accountWorkerManager) primarySupplyStatus() []api.AdminPrimarySup
 }
 
 // supplyCoolingField 返回排队超限快照里的驻留冷却字段（“ | 驻留冷却=N”）：读主用模型供给缓存（约 30 秒内的统计），
-// pool 为 Ultra 号池时找 Ultra 列表的条目，其余找普通列表的条目；没有缓存或没有对应条目时为空。只读缓存，不加锁扫描账户
+// pool 为 Ultra 号池时找 Ultra 列表的条目，Pro 号池时找 Pro 分区的条目，其余找普通列表的条目；没有缓存或没有对应条目时为空。只读缓存，不加锁扫描账户
 func (manager *accountWorkerManager) supplyCoolingField(pool aistudio.PoolScope, modelID string) string {
 	if manager == nil {
 		return ""

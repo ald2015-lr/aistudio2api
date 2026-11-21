@@ -244,6 +244,22 @@ func TestUltraLedgerRows(t *testing.T) {
 	}
 }
 
+// TestProLedgerRows Pro 路由的请求去掉 /pro 前缀后归类协议，计数请求不计入账本，账本记录带 pool=pro 并保留带前缀的路径
+func TestProLedgerRows(t *testing.T) {
+	if ledgerEntry(api.AccessLog{Method: http.MethodPost, Path: "/pro/v1/messages/count_tokens", Authorized: true}) {
+		t.Fatal("Pro 路由的计数请求同样不计入账本")
+	}
+	if !ledgerEntry(api.AccessLog{Method: http.MethodPost, Path: "/pro/v1/chat/completions", Authorized: true}) {
+		t.Fatal("Pro 路由的生成请求应计入账本")
+	}
+	row := requestRow(api.AccessLog{
+		RequestID: "req_pro", Method: http.MethodPost, Path: "/trace/pro/v1/chat/completions", Status: http.StatusOK, Pool: api.UsagePoolPro,
+	}, time.Now().UTC())
+	if row.Pool != "pro" || row.Protocol != "openai-chat" || row.Path != "/trace/pro/v1/chat/completions" {
+		t.Fatalf("Pro 账本记录不对: %+v", row)
+	}
+}
+
 // TestWarmupRequestLog max_tokens 为 0 的预热请求在请求日志里单独写明“预热完成”（INFO、状态 completed），不记成普通的请求完成；
 // 预热请求出错（如模型不存在）仍按失败记录
 func TestWarmupRequestLog(t *testing.T) {

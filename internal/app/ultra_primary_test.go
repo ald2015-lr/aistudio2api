@@ -33,7 +33,7 @@ func normalPoolContext() context.Context {
 
 // normalSupplyTargets 返回只统计普通主用模型供给的目标
 func normalSupplyTargets(models ...string) []primarySupplyTarget {
-	return primarySupplyTargets(models, nil)
+	return primarySupplyTargets(models, nil, nil)
 }
 
 // setUltraPrimaryModels 只替换 Ultra 主用模型列表，普通列表保持不变
@@ -478,7 +478,7 @@ func TestUltraPrimaryModelsHotReload(t *testing.T) {
 	if !slices.Equal(manager.current.config.UltraPrimaryModels, []string{testRuntimeModel}) || manager.current.config.UltraPrimaryQueueWait != 2*time.Second {
 		t.Fatalf("热更新后生效配置 = %v / %s", manager.current.config.UltraPrimaryModels, manager.current.config.UltraPrimaryQueueWait)
 	}
-	if !hasLogContaining(requests, "配置已热更新", "Ultra 主用模型="+testRuntimeModel+"（排队上限 2s）") {
+	if !hasLogContaining(requests, "配置已热更新", "Ultra/Pro 主用模型="+testRuntimeModel+"（排队上限 2s）") {
 		t.Fatalf("热更新日志应写明 Ultra 主用模型，日志 = %v", serviceLogMessages(requests))
 	}
 
@@ -548,8 +548,8 @@ func TestDeadSlotsPerPartition(t *testing.T) {
 	coolModelFor(t, pool, partitionUltraA, drainProModel, 2*time.Hour)
 	coolModelFor(t, pool, partitionUltraB, ultraModel, 2*time.Hour)
 	coolModelFor(t, pool, partitionNormalA, ultraModel, 2*time.Hour)
-	ultra := pool.UltraAccountIDs()
-	normalDead, ultraDead := manager.deadWarmCounts(manager.WarmAccountIDs(), ultra)
+	dead := manager.deadWarmCounts(manager.WarmAccountIDs(), pool.PartitionMembers())
+	normalDead, ultraDead := dead[aistudio.PoolScopeNormal], dead[aistudio.PoolScopeUltra]
 	if normalDead != 0 || ultraDead != 1 {
 		t.Fatalf("死槽位 = 普通 %d · Ultra %d，期望 0 · 1（只有在 Ultra 列表模型上冷却的 Ultra Worker）", normalDead, ultraDead)
 	}

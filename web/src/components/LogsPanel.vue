@@ -1,6 +1,14 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
+import {
+  channelLabelKey,
+  poolTagClass,
+  poolTagged,
+  poolTagHelpKey,
+  poolTagLabelKey,
+  useI18n,
+  type TranslationKey,
+} from '@/i18n'
 import {
   aggregateRows,
   groupLogs,
@@ -420,10 +428,11 @@ onBeforeUnmount(() => {
                       requestStatus(item.row)
                     }}</span>
                     <span
-                      v-if="item.row.entry.request.pool === 'ultra'"
-                      v-tooltip="t('pool.ultraHelp')"
-                      class="tag tag-ultra shrink-0"
-                      >{{ t('pool.ultra') }}</span
+                      v-if="poolTagged(item.row.entry.request.pool)"
+                      v-tooltip="t(poolTagHelpKey(item.row.entry.request.pool))"
+                      class="tag shrink-0"
+                      :class="poolTagClass(item.row.entry.request.pool)"
+                      >{{ t(poolTagLabelKey(item.row.entry.request.pool)) }}</span
                     >
                     <strong class="log-title">{{ requestTitle(item.row) }}</strong>
                     <span

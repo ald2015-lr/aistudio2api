@@ -113,6 +113,7 @@ export function useUsageFormat() {
     }
     if (dimension === 'pool') {
       if (key === 'ultra') return t('pool.ultra')
+      if (key === 'pro') return t('pool.pro')
       if (key === 'normal') return t('pool.normal')
     }
     return key

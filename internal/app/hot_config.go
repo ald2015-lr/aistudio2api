@@ -157,11 +157,12 @@ func (manager *accountWorkerManager) warmConcurrencyValue() int {
 }
 
 // applyLiveSettings 更新 Worker 容量与启动参数；调小的常驻数由空闲回收逐步收敛，
-// 冷启动名额立即按新的启动预热并发放行排队的启动。普通分区与 Ultra 分区的常驻数、峰值数分别更新，平均调用开关同时切换
+// 冷启动名额立即按新的启动预热并发放行排队的启动。普通、Ultra 与 Pro 分区的常驻数、峰值数分别更新，平均调用开关同时切换
 func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.warmTarget.Store(int64(cfg.WarmWorkerLimit))
 	manager.maxActive.Store(int64(cfg.MaxActiveWorkers))
 	manager.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
+	manager.setProCapacity(cfg.ProWarmWorkerLimit, cfg.ProMaxActiveWorkers)
 	manager.warmConcurrency.Store(int64(cfg.WarmStartupConcurrency))
 	manager.startupSlots.resized()
 	manager.initTimeout.Store(int64(cfg.InitTimeout))
@@ -201,6 +202,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.UltraExclusive == active.UltraExclusive && saved.UltraIncludePro == active.UltraIncludePro &&
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
+		saved.ProPool == active.ProPool && saved.ProWarmWorkerLimit == active.ProWarmWorkerLimit &&
+		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.RoutingStrategy == active.RoutingStrategy && slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
@@ -227,17 +230,19 @@ func (manager *runtimeManager) applyLiveConfig() {
 		return
 	}
 	manager.requests.log("service", "INFO", fmt.Sprintf(
-		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | 权益规则=%s | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
+		"配置已热更新 | 常驻 Worker=%d | 峰值 Worker=%d | Ultra 常驻 Worker=%d | Ultra 峰值 Worker=%d | Ultra 独占=%t | Pro 并入 Ultra=%t | Pro 独立号池=%t | Pro 常驻 Worker=%d | Pro 峰值 Worker=%d | 权益规则=%s | 预热并发=%d | 单账户并发=%d | 单账户每分钟上限=%s | 策略=%s | 上游通道=%s | 请求超时=%s | 首事件超时=%s | 忽略客户端 seed=%t | 降级判定=%s | 流式优先 Playground=%s | 主用模型=%s | 自动续写=%s | IP 池=%s",
 		saved.WarmWorkerLimit, saved.MaxActiveWorkers, saved.UltraWarmWorkerLimit, saved.UltraMaxActiveWorkers, saved.UltraExclusive,
-		admin.pool.UltraIncludePro(), tierRulesSummary(admin.pool.ModelTierRules()), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
+		admin.pool.UltraIncludePro(), admin.pool.ProPool(), saved.ProWarmWorkerLimit, saved.ProMaxActiveWorkers,
+		tierRulesSummary(admin.pool.ModelTierRules()), saved.WarmStartupConcurrency, saved.PerAccountConcurrency, rpmLimitSummary(saved.AccountRPMLimit),
 		routingStrategySummary(saved.RoutingStrategy), strings.Join(saved.UpstreamChannels, ","), saved.RequestTimeout, saved.FirstEventTimeout,
 		saved.IgnoreClientSeed, downgradeGuardSummary(saved.DowngradeGuard), streamPlaygroundSummary(saved.StreamPlaygroundModels),
 		primaryModelsSummary(saved.PrimaryModels, saved.PrimaryQueueWait, saved.UltraPrimaryModels, saved.UltraPrimaryQueueWait),
 		longOutputSummary(saved.LongOutputEnabled, saved.LongOutputMaxTokens), saved.ProxyPool.Summary(),
 	))
 	// 权益规则变化后立即对照账户目录：目录明确标注可用的写一行 WARN，只是没有标注的按配置项与模型合并写一行 INFO，
-	// 不在任何目录里的名称写一行 WARN；同样的内容不重复写（见 checkTierRules）
+	// 不在任何目录里的名称写一行 WARN；同样的内容不重复写（见 checkTierRules）。PRO_POOL 默认开启的升级提示随设置同步检查（见 pro_pool.go）
 	admin.service.checkTierRules()
+	admin.service.checkProPoolNotice()
 	admin.service.prewarmIfRunning()
 	admin.syncModelCache()
 }
@@ -276,8 +281,17 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	manager.applyOmniIgnoreSystemPrompt(saved.OmniIgnoreSystemPrompt)
 	manager.applyMediaSettings(saved.Media)
 
+	// PRO_POOL 是否写在 .env 或进程环境变量里（默认开启的升级提示，见 pro_pool.go）：手动改 .env 后再保存同样更新，
+	// 不论这次有没有需要热更新的字段
+	proPoolConfigured := config.KeyConfigured(manager.configPath, "PRO_POOL")
+
 	manager.mu.Lock()
 	generation := manager.current
+	if generation != nil {
+		if current, ok := generation.admin.(*runtimeAdmin); ok && current.service != nil {
+			current.service.proPoolConfigured.Store(proPoolConfigured)
+		}
+	}
 	if generation == nil || requiresRebuild(saved, generation.config) || liveFieldsEqual(saved, generation.config) {
 		manager.mu.Unlock()
 		return nil, saved, false
@@ -293,12 +307,18 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	admin.pool.SetRoutingStrategy(saved.RoutingStrategy)
 	// 上游通道：锁顺序 manager.mu 再到账户池锁，与 SetRoutingStrategy 相同；新启用 Build 时解锁后补 Build 目录
 	buildAdded := applyUpstreamChannels(admin.pool, generation.config.UpstreamChannels, saved.UpstreamChannels)
-	// 先更新两个分区的容量再改号池成员：同一次保存调大 ULTRA_* 峰值时，并入的 Pro Worker 按新上限计数
+	// 先更新各分区的容量再改号池成员：同一次保存调大 ULTRA_*（PRO_*）峰值时，换了分区的 Pro Worker 按新上限计数，不会被回收
 	admin.workers.applyLiveSettings(saved)
-	// ULTRA_INCLUDE_PRO 热切换：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同。只在账户池里改成员规则，
-	// 不重启 Worker；Pro Worker 改到新分区计数，候选索引与按号池的缓存在账户池内作废重建
-	membershipChanged := admin.pool.SetUltraIncludePro(saved.UltraIncludePro)
-	// ULTRA_ONLY_MODELS、PAID_ONLY_MODELS 热更新：锁顺序与 SetUltraIncludePro 相同。候选索引与按版本缓存的派生结果在账户池内作废重建，
+	// PRO_POOL、ULTRA_INCLUDE_PRO 热切换：锁顺序 manager.mu 再到账户池锁，与 SetPerAccountConcurrency 相同。只在账户池里一次改成员规则，
+	// Pro 账户整体换号池（不会同时在两个号池或不在任何号池），不重启 Worker；Pro Worker 改到新分区计数，候选索引与按号池的缓存在账户池内作废重建
+	before := poolRuleState{includePro: admin.pool.UltraIncludePro(), proPool: admin.pool.ProPool()}
+	membershipChanged := admin.pool.SetPoolRules(saved.UltraIncludePro, saved.ProPool)
+	change := poolRuleChange{includePro: admin.pool.UltraIncludePro() != before.includePro, proPool: admin.pool.ProPool() != before.proPool}
+	// /pro 的开关与账户池的成员规则在同一段 manager.mu 内切换，只从账户池读取（唯一来源）：公开 API 读到开启时 Pro 账户已在 Pro 号池
+	manager.proPool.Store(admin.pool.ProPool())
+	// ULTRA_INCLUDE_PRO=true 在 PRO_POOL=true 时不生效：只在两项之一这次有变化时提示（启动时另提示一次，见 logPoolRuleNotes）
+	rulesEdited := saved.ProPool != generation.config.ProPool || saved.UltraIncludePro != generation.config.UltraIncludePro
+	// ULTRA_ONLY_MODELS、PAID_ONLY_MODELS 热更新：锁顺序与 SetPoolRules 相同。候选索引与按版本缓存的派生结果在账户池内作废重建，
 	// 进行中的请求不受影响（已取得的租约发送前不看规则）
 	tierRulesChanged := admin.pool.SetModelTierRules(saved.UltraOnlyModels, saved.PaidOnlyModels)
 	admin.service.setRequestTimeout(saved.RequestTimeout)
@@ -332,12 +352,15 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		manager.requests.log("service", "INFO", "权益规则已更新并立即生效 | "+tierRulesSummary(saved.UltraOnlyModels, saved.PaidOnlyModels))
 	}
 
-	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 峰值与启动并发的变化同样要重新判断端口够不够。
+	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 与 Pro 峰值、PRO_POOL 与启动并发的变化同样要重新判断端口够不够。
 	// 运行中的 Worker 不受影响，新启动的 Worker 立即按新设置；没有浏览器的账户立即切到新的默认出口
-	manager.proxyPool.configure(saved.ProxyPool, saved.Proxy, proxyPoolCapacity(saved))
+	manager.proxyPool.configure(saved.ProxyPool, saved.Proxy, proxyPoolCapacity(saved, admin.pool.PartitionMembers().Count(aistudio.PoolScopePro) > 0))
 	if membershipChanged {
 		// 解锁后的步骤都从当前状态重新推导（成员、开关、独占设置），不依赖上面捕获的 saved
-		admin.workers.poolRuleChanged(manager.activeUltraExclusive())
+		admin.workers.poolRuleChanged(manager.activeUltraExclusive(), change)
+	}
+	if rulesEdited {
+		logPoolRuleNotes(manager.requests, saved)
 	}
 	if buildAdded {
 		admin.service.catalogSync.buildChannelEnabled()

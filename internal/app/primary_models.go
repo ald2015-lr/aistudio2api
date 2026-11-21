@@ -181,8 +181,9 @@ func (service *trackedService) syncWorkerPrimaryModels(settings *primaryModelSet
 }
 
 // primaryPolicyFor 返回请求（号池、模型；别名已解析为规范 ID）适用的主用模型规则以及模型是否在对应号池的列表里：
-// Ultra 号池只查 Ultra 列表（额度快速失败），普通号池只查普通列表；不限号池（ULTRA_EXCLUSIVE=false 的普通路径）先查普通列表，
-// 命中按普通规则，没有再查 Ultra 列表，命中按 Ultra 规则
+// Ultra 号池与 Pro 号池（/pro 沿用 ULTRA_PRIMARY_MODELS 与 ULTRA_PRIMARY_QUEUE_WAIT）只查 Ultra 列表（额度快速失败），
+// 普通号池只查普通列表；不限号池（ULTRA_EXCLUSIVE=false 的普通路径）与普通号池与 Ultra 号池（同时 PRO_POOL=true 时的普通路径）
+// 先查普通列表，命中按普通规则，没有再查 Ultra 列表，命中按 Ultra 规则
 func (service *trackedService) primaryPolicyFor(pool aistudio.PoolScope, model string) (primaryPolicy, bool) {
 	settings := service.primaryModels.Load()
 	if settings == nil {
@@ -192,7 +193,7 @@ func (service *trackedService) primaryPolicyFor(pool aistudio.PoolScope, model s
 	normal := primaryPolicy{queueWait: settings.normal.queueWait}
 	ultra := primaryPolicy{queueWait: settings.ultra.queueWait, quotaFailFast: true}
 	switch pool {
-	case aistudio.PoolScopeUltra:
+	case aistudio.PoolScopeUltra, aistudio.PoolScopePro:
 		return ultra, settings.ultra.contains(name)
 	case aistudio.PoolScopeNormal:
 		return normal, settings.normal.contains(name)
@@ -418,9 +419,9 @@ func (budget *leaseWaitBudget) exhausted(reason string) error {
 	}
 }
 
-// primaryModelsSummary 为热更新日志里的一句话概况：普通列表与 Ultra 列表各一段
+// primaryModelsSummary 为热更新日志里的一句话概况：普通列表与 Ultra 列表各一段（Ultra 列表同时作用于 /ultra 与 /pro，写作 Ultra/Pro 主用模型）
 func primaryModelsSummary(models []string, queueWait time.Duration, ultraModels []string, ultraQueueWait time.Duration) string {
-	return primaryListSummary(models, queueWait) + " | Ultra 主用模型=" + primaryListSummary(ultraModels, ultraQueueWait)
+	return primaryListSummary(models, queueWait) + " | Ultra/Pro 主用模型=" + primaryListSummary(ultraModels, ultraQueueWait)
 }
 
 func primaryListSummary(models []string, queueWait time.Duration) string {
