@@ -180,6 +180,12 @@ func newSyncTestEnvWith(t *testing.T, root string, transport *catalogRPCTranspor
 	syncer.tick = 5 * time.Millisecond
 	syncer.interval, syncer.fillInterval = time.Nanosecond, time.Nanosecond
 	syncer.random = func() float64 { return 0.5 }
+	// 缺少模型读目录（missingModelError、noteMissingModel）在后台 goroutine 里读目录并写进 root 下的账户目录，测试不一定等它；
+	// 测试结束删除临时目录之前先停掉并等它结束（晚于 TempDir 注册，先于它执行），否则删除与写入交错会报 directory not empty
+	t.Cleanup(func() {
+		cancel()
+		syncer.waitProbe()
+	})
 	return &syncTestEnv{root: root, ctx: ctx, cancel: cancel, gen: gen, catalog: catalog, service: service, syncer: syncer}
 }
 

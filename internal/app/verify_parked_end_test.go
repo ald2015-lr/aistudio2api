@@ -125,9 +125,10 @@ func TestPrimaryAllCoolingParkedMessage(t *testing.T) {
 	}
 }
 
-// TestQuotaThenVerifyParkedReturns429 本请求先在会自行恢复的账号上遇到每日限额 429（冷却 2 小时、被排除），换号时其余候选全部只被
+// TestQuotaThenVerifyParkedReturns429 本请求先在会自行恢复的账号上遇到每日限额 429（冷却到额度恢复、被排除），换号时其余候选全部只被
 // 需要验证挡住：与其余候选全部冷却一样按额度不足的 429 结束，建议重试为那个额度冷却的恢复时间（同一时刻的新请求候选里有它，同样得到 429
-// 与它的恢复时间）。原先原样上抛 Parked 的错误，这次请求得到 503、不带 Retry-After。对照：其余候选是阶梯 403 冷却时同样 429
+// 与它的恢复时间）。原先原样上抛 Parked 的错误，这次请求得到 503、不带 Retry-After。对照：其余候选是阶梯 403 冷却时同样 429，
+// 建议重试为两者中较早恢复的那个
 func TestQuotaThenVerifyParkedReturns429(t *testing.T) {
 	for _, kind := range []string{"需要验证", "阶梯 403"} {
 		t.Run(kind, func(t *testing.T) {
@@ -161,10 +162,11 @@ func TestQuotaThenVerifyParkedReturns429(t *testing.T) {
 			if !ok {
 				t.Fatal("good 应写入额度冷却")
 			}
-			// 需要验证：只取 good 的额度冷却（不是 30 天、也不是 5 秒）；阶梯 403：bad 6 小时后恢复，早于 good 的次日零点
+			// 需要验证：只取 good 的额度冷却（不是 30 天、也不是 5 秒）；阶梯 403：good 的额度冷却与 bad 的 6 小时取较早的。
+			// 额度冷却到每日额度恢复为止，太平洋时间 18 点以后离恢复不到 6 小时，这时较早的是 good（不能固定期望 6 小时）
 			want := goodUntil
-			if kind != "需要验证" {
-				want = now.Add(6 * time.Hour)
+			if ladder := now.Add(6 * time.Hour); kind != "需要验证" && ladder.Before(want) {
+				want = ladder
 			}
 			if retryAt := quota.RetryAt(); retryAt.Sub(want).Abs() > time.Second {
 				t.Fatalf("建议重试 = %v，期望 %v", retryAt, want)

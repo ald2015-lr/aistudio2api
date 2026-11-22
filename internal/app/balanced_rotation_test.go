@@ -910,9 +910,11 @@ func TestBalancedRotationTakenOver(t *testing.T) {
 		if registered, added := env.manager.registerUnschedulable(w, "测试原因"); !registered || !added {
 			t.Fatal("应改为不可调度登记")
 		}
-		entry, ok := env.entry(w)
-		if !ok || entry.rotation || entry.unschedulable == "" {
-			t.Fatalf("应转成不可调度登记：%+v", entry)
+		// 两次登记都会唤醒淘汰循环，它随时可能按本轮的账户状态核对这条登记：负载高时（CI 上全部包一起跑、-race）循环晚到这里才跑，
+		// 账号其实可调度，原因随即被清空、随后放弃登记。所以这里只要求它不再是轮换登记；转换本身由返回值（added：原先不是
+		// 不可调度登记）与下面“冷却登记接管”的日志证明
+		if entry, ok := env.entry(w); ok && (entry.rotation || entry.rotationSoft) {
+			t.Fatalf("应转成不可调度登记、不再是轮换登记：%+v", entry)
 		}
 		if !logLevelContaining(env.requests, "WARN", "平均调用轮换取消 | 原因=冷却登记接管") {
 			t.Fatalf("应记录接管，日志 = %v", serviceLogMessages(env.requests))
