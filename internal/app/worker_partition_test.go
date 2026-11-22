@@ -546,6 +546,9 @@ func TestRotationStaysInPartition(t *testing.T) {
 	if rotatedUltra != 1 {
 		t.Fatalf("Ultra 分区应替换 1 个长时间冷却的 Worker，实际 %d 个", rotatedUltra)
 	}
+	if countSourceLogs(requests, "", "WAA Worker 已停止 | PID=", "| 起因=冷却轮换") != 1 {
+		t.Fatalf("冷却轮换换下的 Worker 应写起因=冷却轮换：%v", serviceLogMessages(requests))
+	}
 	if hot := manager.hotModelList(); !slices.Equal(hot, []string{testRuntimeModel}) {
 		t.Fatalf("热门冷却模型 = %v", hot)
 	}

@@ -14,11 +14,15 @@ import {
   groupLogs,
   isNoise,
   parseMessage,
+  eventLevel,
   rowCategory,
-  rowSummary,
+  rowHasLevel,
+  rowLevel,
+  rowMatches,
   singleItems,
   type LogCategory,
   type LogItem,
+  type LogLevel,
   type LogRow,
 } from '@/logs'
 import type { AdminLog, RequestLog } from '@/types'
@@ -90,20 +94,22 @@ const sources = computed(() =>
 )
 
 function normalizedLevel(row: LogRow): Level {
-  const value = row.entry.level.toUpperCase()
-  return value === 'WARN' || value === 'ERROR' ? value : 'INFO'
+  return rowLevel(row)
 }
 
-function matches(row: LogRow, query: string): boolean {
-  const entry = row.entry
-  if (rowSummary(row).toLowerCase().includes(query)) return true
-  if (entry.source.toLowerCase().includes(query)) return true
-  if (entry.event.toLowerCase().includes(query)) return true
-  const request = entry.request
-  if (request === undefined) return false
-  return [request.id, request.path ?? '', request.finish_reason ?? ''].some((value) =>
-    value.toLowerCase().includes(query),
-  )
+const levelRank: Record<LogLevel, number> = { INFO: 0, WARN: 1, ERROR: 2 }
+
+// midLevel 返回请求中途写过、比最终级别更高的级别（中途换号、冷却的警告，之后最终成功）；没有时为空。
+// 警告、错误筛选看全部事件，这样的行最终级别仍是信息或警告，在级别徽标旁另标一下，免得看不出它为什么在筛选结果里
+function midLevel(row: LogRow): LogLevel | '' {
+  if (row.events.length < 2) return ''
+  const final = rowLevel(row)
+  let highest: LogLevel = final
+  for (const event of row.events) {
+    const value = eventLevel(event)
+    if (levelRank[value] > levelRank[highest]) highest = value
+  }
+  return highest === final ? '' : highest
 }
 
 const categoryCounts = computed(() => {
@@ -123,24 +129,26 @@ const base = computed(() => {
     if (source.value !== 'ALL' && !row.events.some((event) => event.source === source.value))
       return false
     if (compact.value && isNoise(row)) return false
-    return query === '' || matches(row, query)
+    return query === '' || rowMatches(row, query)
   })
 })
 
+// 等级按钮上的数量与筛选同一口径（见 rowHasLevel）：中途出过警告、最终成功的请求同时算在信息与警告里，各级之和可以大于全部
 const levelCounts = computed(() => {
   const counts: Record<Level, number> = { ALL: 0, INFO: 0, WARN: 0, ERROR: 0 }
   for (const row of base.value) {
     counts.ALL += 1
-    counts[normalizedLevel(row)] += 1
+    for (const value of ['INFO', 'WARN', 'ERROR'] as const) {
+      if (rowHasLevel(row, value)) counts[value] += 1
+    }
   }
   return counts
 })
 
-const filtered = computed(() =>
-  level.value === 'ALL'
-    ? base.value
-    : base.value.filter((row) => normalizedLevel(row) === level.value),
-)
+const filtered = computed(() => {
+  const value = level.value
+  return value === 'ALL' ? base.value : base.value.filter((row) => rowHasLevel(row, value))
+})
 const items = computed(() =>
   compact.value ? aggregateRows(filtered.value) : singleItems(filtered.value),
 )
@@ -428,6 +436,17 @@ onBeforeUnmount(() => {
                       requestStatus(item.row)
                     }}</span>
                     <span
+                      v-if="midLevel(item.row) !== ''"
+                      v-tooltip="
+                        tf('logs.midHelp', { level: levelLabel(midLevel(item.row) as Level) })
+                      "
+                      class="log-mid"
+                      :class="midLevel(item.row) === 'ERROR' ? 'log-mid-error' : 'log-mid-warn'"
+                      >{{
+                        t(midLevel(item.row) === 'ERROR' ? 'logs.midError' : 'logs.midWarn')
+                      }}</span
+                    >
+                    <span
                       v-if="poolTagged(item.row.entry.request.pool)"
                       v-tooltip="t(poolTagHelpKey(item.row.entry.request.pool))"
                       class="tag shrink-0"
@@ -629,6 +648,24 @@ onBeforeUnmount(() => {
   font-family: 'JetBrains Mono', Consolas, monospace;
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
+}
+
+.log-mid {
+  flex-shrink: 0;
+  padding: 0 0.35rem;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  white-space: nowrap;
+}
+
+.log-mid-warn {
+  color: #d29922;
+}
+
+.log-mid-error {
+  color: #f85149;
 }
 
 .log-source {

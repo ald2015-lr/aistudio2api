@@ -91,6 +91,26 @@ func (s *StorageState) SetAuthExtension(extension AuthExtension) error {
 	return nil
 }
 
+// DeviceBoundCookie 为设备绑定会话（DBSC）的 Cookie 名：在开了设备绑定的浏览器里登录的 Google 会话带它，会话要定期用浏览器设备里的
+// 密钥证明自己才能续期，复制出来的认证文件约 2 小时后失效（见 app/device_bound.go）
+const DeviceBoundCookie = "__Secure-1PSIDRTS"
+
+// DeviceBoundSession 判断认证状态是否带设备绑定会话的 Cookie（只看名字，不读值）
+func (s StorageState) DeviceBoundSession() bool {
+	for _, cookie := range s.Cookies {
+		if cookie.Name == DeviceBoundCookie {
+			return true
+		}
+	}
+	return false
+}
+
+// HasChromeRenewal 判断认证扩展里是否保存了 Chrome OAuth 续签材料（只看有没有，不读值）；认证扩展解析不了时按没有
+func (s StorageState) HasChromeRenewal() bool {
+	extension, _, err := s.AuthExtension()
+	return err == nil && extension.OAuth != nil
+}
+
 // AuthExtension 返回 aistudio2api 认证扩展
 func (s StorageState) AuthExtension() (AuthExtension, bool, error) {
 	raw, exists := s.extra[authExtensionKey]

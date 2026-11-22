@@ -19,7 +19,7 @@ import (
 //   - 账号刚被 applyQuotaCooldown 冷却时登记淘汰（retireWorker）：Worker 空闲就立刻关闭，忙碌则等它的请求释放租约后关闭；
 //   - keepWarm 每个周期清扫全局长时间冷却的空闲 Worker（sweepDeadWorkers），不受 5% 阈值限制；
 //   - 请求选号时分区已满而有死槽位（reclaimDeadWorker）：现场回收一个再启动备用账号，不等轮换。
-// 三条路径与 ensureWorker 的替换共用 tryReserveVictim，同一个 Worker 不会被两边同时淘汰；淘汰经 evictIdleWorker 取账号的独占租约，
+// 三条路径与 ensureWorker 的替换共用 tryReserveVictim，同一个 Worker 不会被两边同时淘汰；淘汰经 evictIdleWorkerFor 取账号的独占租约，
 // 正在服务请求的 Worker 永远不会被关闭。只有分区内有可接替的账户时才淘汰：小规模部署全部账号都冷却时保留 Worker，
 // 冷却到期后能立即服务。登记了却一直忙碌的 Worker（饱和时其他模型的请求一直在用它）先排空再淘汰，替补在排空开始时就启动，
 // 见 worker_drain.go；keepWarm 每个周期把驻留 Worker 中的死槽位补登记（registerDeadWorkers），重启后与其他进程写入的冷却同样会被淘汰。
@@ -547,7 +547,7 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 		return
 	}
 	accountID := victim.accountID
-	evicted, err := manager.evictIdleWorker(manager.lifecycle, accountID)
+	evicted, err := manager.evictIdleWorkerFor(manager.lifecycle, accountID, workerStopCoolingRetire)
 	manager.releaseVictim(accountID)
 	switch {
 	case err != nil:
@@ -583,7 +583,7 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 // 出口限流时预热走补位路径，只受补位并发约束
 func (manager *accountWorkerManager) finishRelease(victim retirementCandidate) {
 	accountID := victim.accountID
-	evicted, err := manager.evictIdleWorker(manager.lifecycle, accountID)
+	evicted, err := manager.evictIdleWorkerFor(manager.lifecycle, accountID, workerStopUnschedulable)
 	manager.releaseVictim(accountID)
 	switch {
 	case err != nil:
@@ -917,7 +917,7 @@ func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, part
 		return "", nil
 	}
 	defer manager.releaseVictim(victim)
-	evicted, err := manager.evictIdleWorker(ctx, victim)
+	evicted, err := manager.evictIdleWorkerFor(ctx, victim, workerStopReclaimPlaceholder)
 	if err != nil {
 		manager.requests.log(victim, "WARN", fmt.Sprintf("WAA Worker 回收冷却占位失败 | 错误=%v", err))
 		return "", err

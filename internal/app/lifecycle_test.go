@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -169,4 +170,122 @@ func TestNoStartAfterShutdownBegins(t *testing.T) {
 	if _, err := manager.startService(ctx, false); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// stoppingTestAdmin 的 StopService 等 release 关闭后才返回，模拟停止步骤（cancel_requests 到 flush_writes）进行中
+type stoppingTestAdmin struct {
+	restartTestAdmin
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (admin stoppingTestAdmin) StopService(ctx context.Context) (api.AdminStatus, error) {
+	close(admin.entered)
+	<-admin.release
+	return admin.restartTestAdmin.StopService(ctx)
+}
+
+type startCallResult struct {
+	status api.AdminStatus
+	err    error
+}
+
+// TestStartWaitsForInProgressTransition 启动或停止进行中调用启动（POST /api/control/start）时，接口等进行中的启动或停止结束后再处理，
+// 不返回“正在切换状态”之类的错误（README 的 service_stopped 处理办法）：另一次启动（监督器自动重新启动、保存设置后的重启）进行中时
+// 排在它之后，结束后拿到 RUNNING、不报错，也不再启动一次；停止步骤进行中时先等停止结束，再启动新一代
+func TestStartWaitsForInProgressTransition(t *testing.T) {
+	t.Run("启动进行中", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var launched atomic.Int32
+		current := restartTestGeneration("LAUNCHING")
+		manager := &runtimeManager{
+			lifecycle: ctx, requests: newRequestRegistry(ctx), intent: &serviceIntent{},
+			current: current, configPath: filepath.Join(t.TempDir(), ".env"),
+			factory: func(context.Context, context.Context, config.Config, *requestRegistry) (*runtimeGeneration, error) {
+				launched.Add(1)
+				return nil, errors.New("另一次启动进行中时不应再启动一次")
+			},
+		}
+		manager.intent.running.Store(true)
+		// 另一次启动在整个启动期间持有 startMu
+		manager.startMu.Lock()
+		done := make(chan startCallResult, 1)
+		go func() {
+			status, err := manager.StartService(ctx)
+			done <- startCallResult{status, err}
+		}()
+		select {
+		case result := <-done:
+			manager.startMu.Unlock()
+			t.Fatalf("另一次启动进行中时启动立即返回: state=%q err=%v", result.status.State, result.err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		current.service.(restartTestService).state.Store("RUNNING")
+		manager.startMu.Unlock()
+		select {
+		case result := <-done:
+			if result.err != nil || result.status.State != "RUNNING" || launched.Load() != 0 {
+				t.Fatalf("另一次启动结束后应拿到 RUNNING、不报错、不再启动: state=%q err=%v launched=%d",
+					result.status.State, result.err, launched.Load())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("另一次启动结束后启动没有返回")
+		}
+	})
+	t.Run("停止步骤进行中", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		path := filepath.Join(t.TempDir(), ".env")
+		if err := config.Default().Save(path); err != nil {
+			t.Fatal(err)
+		}
+		state := &atomic.Value{}
+		state.Store("STOPPED")
+		admin := stoppingTestAdmin{
+			restartTestAdmin: restartTestAdmin{state: state}, entered: make(chan struct{}), release: make(chan struct{}),
+		}
+		errLaunched := errors.New("新一代已开始创建")
+		var launched atomic.Int32
+		manager := &runtimeManager{
+			lifecycle: ctx, requests: newRequestRegistry(ctx), intent: &serviceIntent{}, configPath: path,
+			current: &runtimeGeneration{
+				service: restartTestService{state: state}, admin: admin,
+				lifecycleCancel: func() {}, closeRuntime: func() error { return nil },
+			},
+			factory: func(context.Context, context.Context, config.Config, *requestRegistry) (*runtimeGeneration, error) {
+				launched.Add(1)
+				return nil, errLaunched
+			},
+		}
+		done := make(chan startCallResult, 1)
+		go func() {
+			status, err := manager.StartService(ctx)
+			done <- startCallResult{status, err}
+		}()
+		select {
+		case <-admin.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("停止步骤进行中时启动没有先等停止结束")
+		}
+		select {
+		case result := <-done:
+			close(admin.release)
+			t.Fatalf("停止步骤进行中时启动立即返回: state=%q err=%v", result.status.State, result.err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if launched.Load() != 0 {
+			close(admin.release)
+			t.Fatal("停止还没结束就开始创建新一代")
+		}
+		close(admin.release)
+		select {
+		case result := <-done:
+			if !errors.Is(result.err, errLaunched) || launched.Load() != 1 {
+				t.Fatalf("停止结束后应创建新一代: err=%v launched=%d", result.err, launched.Load())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("停止结束后启动没有返回")
+		}
+	})
 }

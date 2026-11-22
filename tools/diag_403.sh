@@ -41,7 +41,13 @@
 #      （登记早于记录请求形态的版本、运行日志已轮转或覆盖这段时间却没有开始行、账本里没有正文、tokens 判断不了）。账本里也没有、只有请求 ID 时按 ID 前缀
 #      补一句接口类型：resp_ 为 Gemini 原生 generateContent 或 OpenAI Responses，chatcmpl_ 为 /v1/chat/completions，msg_ 为
 #      Anthropic /v1/messages，int_ 为 Interactions
-# 只读：只对本机管理接口发 GET 请求，只读 .env、运行日志（logs/aistudio2api.log 与 .1）、登记文件（管理接口连不上时）与进程信息，
+#   8. 所有模型的 403 与号池级 403（不看 MODEL，ACCOUNT 照常；判断有没有上游 529043e 修的那种“长时间运行后全部账户 403”）：运行日志里
+#      “上游返回 4xx … HTTP=403”行按文案分为需要验证账号、The caller does not have permission 与其他（列出最多的 5 种），按天、按小时计数；
+#      号池级 403 判定行与撤销登记的 INFO 行的次数与时间分布；每次 403 时这个账户的 Worker 已运行多久（距最近一次“WAA Worker 就绪”）与
+#      距进程启动多久；Worker 存活时长分布（按停止的“起因=”）；同一分钟 3 个及以上账户出现非 verify 403 的聚类。程序目录与本机其他实例目录
+#      的运行日志分开统计，另读外部轮转出的 .2、.N.gz、-日期 等文件
+# 只读：只对本机管理接口发 GET 请求，只读 .env、运行日志（logs/aistudio2api.log 与 .1，第 8 段另读轮转出的其他文件与本机其他实例的运行日志）、
+#   登记文件（管理接口连不上时）与进程信息，
 # 不改任何配置、记录、冷却或账户；邮箱已打码，不输出管理令牌、API 密钥与提示词（账本里的请求正文只取消息条数、字数、媒体数与参数值，
 # 不输出任何文字内容）。
 #
@@ -114,7 +120,8 @@ for p in $(pgrep -x aistudio2api 2>/dev/null); do
   a="${a:-auth}"; a="${a%%,*}"
   case "$a" in /*) ;; *) a="$d/$a" ;; esac
   a="$(readlink -f "$a" 2>/dev/null || echo "$a")"
-  INSTANCES="$INSTANCES$p|$d|$a
+  started="$(ps -o etimes= -p "$p" 2>/dev/null | tr -cd '0-9')"
+  INSTANCES="$INSTANCES$p|$d|$a|${started:+$(($(date +%s) - started))}
 "
   echo "实例 PID $p | 目录 $d | 账户目录 $a | 启动于 $(ps -o lstart= -p "$p" 2>/dev/null | sed 's/^ *//')"
 done
@@ -136,7 +143,7 @@ fi
 starts="$(grep -a -h '^===== .* start.sh ' logs/aistudio2api.log.1 logs/aistudio2api.log 2>/dev/null | tail -n 5)"
 [ -n "$starts" ] && { echo "最近的启动记录："; printf '%s\n' "$starts" | sed 's/^/  /' | mask; }
 
-export APP MODEL DAYS VERIFY FIX_COUNT PROC_START SHARED APP_AUTH
+export APP MODEL DAYS VERIFY FIX_COUNT PROC_START SHARED APP_AUTH INSTANCES
 "$PYTHON" -I - <<'PY'
 # 只读：只对本机管理接口发 GET、只读日志与登记文件；邮箱打码，不输出令牌与提示词。兼容 Python 3.7（不用 3.8 以后的语法）
 import collections
@@ -2009,4 +2016,422 @@ for entry, text, kind in concluded:
     print("%s · %s（%s）：%s%s → %s" % (mask(entry["label"]), entry["model"], where, text, ("；" + "；".join(notes)) if notes else "", ADVICE[kind]))
 if FIX_COUNT == "0":
     print("⚠ 正在运行的程序早于 93c16fa：带图的 Omni 请求被拒时仍会误登记正常账户，先升级")
+
+# ---------- 8. 所有模型的 403 与号池级 403 ----------
+# 回答“有没有出现上游 Mag1cFall/AIStudio2API 529043e 修的那种‘长时间运行后全部账户 403’”：上游那种 403 是 WAA VM 运行 12 小时后在后台重建、
+# 拿到匿名挑战，之后所有账户的请求都被拒（文案按经验多为 The caller does not have permission），要等下一个 12 小时；本服务没有那个缺陷，
+# 这一段只用运行日志把它变成可以核查的数据（只读，不看 MODEL，ACCOUNT 照常只看邮箱含它的账户；账号打码，上游文案打码后最多 100 字）：
+#   a. 所有模型的“上游返回 4xx … HTTP=403 …”行（请求进度，来源为执行账号，见 internal/app/upstream_error_log.go）按文案分三类：
+#      需要验证账号（verify-account / must be verified）、The caller does not have permission、其他（列出最多的 5 种文案），按天、按小时计数；
+#   b. 号池级 403 判定行（“号池内 N 分钟内至少 M 个账号对模型 X 返回 403 且没有成功，按号池级 403 处理，不冷却账号”，见 runtime.go）与
+#      撤销登记的 INFO 行（“号池级 403 判定成立，撤销 403 无权限账户记录 | 模型= | 账户= | 起点=”，见 permission_denied.go）的次数与时间分布；
+#      判定行按触发的账户过滤；撤销行不带账户，设了 ACCOUNT 时按全号池单独写在 b 段（标明“全号池”），不进按天、按小时表；
+#   c. 每次 403 与号池级判定发生时，这个账户的 Worker 已经活了多久（距同一账户最近一次“WAA Worker 就绪”，同一 PID 的“WAA Worker 停止”、
+#      进程重启或同一账户下一次就绪都算它结束）与距进程启动多久（start.sh 写的“===== … start.sh … =====”分隔行、或“管理监听启动”行，
+#      2 分钟内的算同一次；日志里没有时按正在运行的进程的启动时间）；
+#   d. Worker 存活时长分布（就绪到停止），按停止的“起因=”分开；到日志末尾仍在运行、进程重启时仍在运行的另计；
+#   e. 同一分钟 3 个及以上不同账户出现非 verify 403 的聚类：账户数、文案类别、方法、模型（按同一请求的 request.started）、Worker 年龄、
+#      前后 10 分钟内有没有号池级判定。
+# 读程序目录与本机其他实例目录各自的 logs/aistudio2api.log 与轮转出的 aistudio2api.log.1（以及 .2、.N.gz、-日期 这类外部轮转的文件），
+# 按修改时间从旧到新读、事件再按时间排序；每个实例单独统计（Worker 只在本实例的日志里就绪、停止）
+import gzip
+
+LOG_NAME = re.compile(r"^aistudio2api\.log(?:\.\d+|-\d{8,10})?(?:\.gz)?$")
+START_LINE = re.compile(r"^===== (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) start\.sh ")
+DENY_CLASSES = (("verify", "需要验证账号（verify-account）"), ("caller", "The caller does not have permission"), ("other", "其他文案"))
+CALLER = re.compile(r"caller does not have permission", re.I)
+# 号池级 403 判定的门槛（runtime.go 的 forbiddenWindow 与 forbiddenSystemicAccounts）写在判定行里，这里只取模型
+POOL_LINE = re.compile(r"对模型 (\S+) 返回 403 且没有成功，按号池级 403 处理")
+REVOKE_LINE = re.compile(r"号池级 403 判定成立，撤销 403 无权限账户记录 \| 模型=([^ |]+) \| 账户=(\d+)")
+FIELD = re.compile(r"(?:^| \| )([^=| ]+)=([^|]*?)(?= \| |$)")
+# 年龄分段：11–13 小时单独一段，上游那种 403 集中在 VM 运行约 12 小时之后
+AGE_BUCKETS = ((60, "<1 分钟"), (300, "1–5 分钟"), (1800, "5–30 分钟"), (7200, "30 分钟–2 小时"), (21600, "2–6 小时"),
+               (39600, "6–11 小时"), (46800, "11–13 小时"), (None, "13 小时以上"))
+LONG_RUN = 11 * 3600
+CLUSTER_ACCOUNTS = 3
+HOUR_ROWS = 48
+
+
+def duration_text(seconds):
+    seconds = max(0, int(seconds))
+    if seconds < 120:
+        return "%d 秒" % seconds
+    if seconds < 7200:
+        return "%d 分" % (seconds // 60)
+    if seconds < 172800:
+        return "%.1f 小时" % (seconds / 3600.0)
+    return "%.1f 天" % (seconds / 86400.0)
+
+
+def bucket_text(values):
+    counts = collections.Counter()
+    for value in values:
+        for limit, label in AGE_BUCKETS:
+            if limit is None or value < limit:
+                counts[label] += 1
+                break
+    return "、".join("%s %d" % (label, counts[label]) for _, label in AGE_BUCKETS if counts[label]) or "-"
+
+
+def median(values):
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else 0
+
+
+def spread_text(values):
+    # 个数、中位、最长与分段；没有值时写“没有”
+    if not values:
+        return "没有"
+    return "%d 条，中位 %s，最长 %s；%s" % (len(values), duration_text(median(values)), duration_text(max(values)), bucket_text(values))
+
+
+def log_paths(directory):
+    # 运行日志与轮转出的文件，按修改时间从旧到新，当前的 aistudio2api.log 放最后（start.sh 轮转是复制为 .1 再截断原文件）
+    folder = os.path.join(directory, "logs")
+    try:
+        names = [name for name in os.listdir(folder) if LOG_NAME.match(name)]
+    except OSError:
+        return []
+    def order(name):
+        try:
+            modified = os.path.getmtime(os.path.join(folder, name))
+        except OSError:
+            modified = 0
+        return (name == "aistudio2api.log", modified, name)
+    return [os.path.join(folder, name) for name in sorted(names, key=order)]
+
+
+def open_log(path):
+    if path.endswith(".gz"):
+        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
+    return open(path, encoding="utf-8", errors="replace")
+
+
+def deny_class(message):
+    if ACCOUNT_LEVEL.search(message):
+        return "verify"
+    if CALLER.search(message):
+        return "caller"
+    return "other"
+
+
+def scan_instance(paths):
+    """逐行读一个实例的运行日志，返回 (事件列表, 请求 ID → (模型, 号池), 日志最早与最晚的时间)。事件为 (时间, 序号, 种类, 账户, 数据)，
+    种类：start 进程启动、ready Worker 就绪、stop Worker 停止、deny 上游 403、pool 号池级判定、revoke 撤销登记"""
+    events, requests, first, last = [], {}, None, None
+    order = 0
+    for path in paths:
+        try:
+            handle = open_log(path)
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                order += 1
+                if line.startswith("====="):
+                    match = START_LINE.match(line)
+                    if match:
+                        try:
+                            moment = datetime.datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S").astimezone()
+                        except ValueError:
+                            continue
+                        events.append((moment, order, "start", "", {}))
+                    continue
+                if not line.startswith("{"):
+                    continue
+                interesting = ("WAA Worker 就绪" in line or "WAA Worker 停止 |" in line or "管理监听启动" in line or
+                               ("上游返回 4xx" in line and "HTTP=403" in line) or "按号池级 403 处理" in line or
+                               "号池级 403 判定成立" in line or '"request.started"' in line)
+                if not interesting and first is not None:
+                    # 只为记下日志最晚的时间解析时间字段（不解析整行 JSON）
+                    stamp = line.find('"time":"')
+                    if stamp >= 0:
+                        moment = parse_time(line[stamp + 8:line.find('"', stamp + 8)])
+                        if moment:
+                            last = moment
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                moment = parse_time(item.get("time"))
+                if moment is None:
+                    continue
+                first = first or moment
+                last = moment
+                if not interesting:
+                    continue
+                message = item.get("msg") or ""
+                source = item.get("source") or ""
+                request = item.get("request") or {}
+                if item.get("event") == "request.started":
+                    if request.get("id"):
+                        requests[request["id"]] = (request.get("model") or "", request.get("pool") or "")
+                    continue
+                if message.startswith("管理监听启动"):
+                    events.append((moment, order, "start", "", {}))
+                    continue
+                if message.startswith("号池级 403 判定成立"):
+                    match = REVOKE_LINE.search(message)
+                    if match:
+                        events.append((moment, order, "revoke", "", {"model": match.group(1), "count": int(match.group(2))}))
+                    continue
+                if not wanted_account(source, source):
+                    continue
+                fields = dict((key, value.strip()) for key, value in FIELD.findall(message))
+                if message.startswith("WAA Worker 就绪"):
+                    events.append((moment, order, "ready", source.lower(), {
+                        "pid": fields.get("PID", ""), "source": fields.get("来源", ""), "cause": fields.get("起因", "")}))
+                elif message.startswith("WAA Worker 停止 |"):
+                    events.append((moment, order, "stop", source.lower(), {"pid": fields.get("PID", ""), "cause": fields.get("起因", "")}))
+                elif message.startswith("上游返回 4xx") and fields.get("HTTP") == "403":
+                    wording = re.sub(r"\s+", " ", fields.get("文案", "")).strip()
+                    events.append((moment, order, "deny", source.lower(), {
+                        "class": deny_class(message), "method": fields.get("方法", "") or "?", "wording": wording,
+                        "request": request.get("id") or "", "label": source}))
+                elif "按号池级 403 处理" in message:
+                    match = POOL_LINE.search(message)
+                    events.append((moment, order, "pool", source.lower(), {
+                        "model": match.group(1) if match else "?", "request": request.get("id") or "", "label": source}))
+    events.sort(key=lambda event: (event[0], event[1]))
+    return events, requests, first, last
+
+
+def pool_label(pool):
+    return {"": "默认", "normal": "默认", "free": "默认"}.get(pool, pool)
+
+
+def analyze_instance(directory, started_at):
+    paths = log_paths(directory)
+    print("\n-- 实例目录 %s（运行日志：%s）" % (directory, "、".join(os.path.basename(path) for path in paths) or "没有"))
+    if not paths:
+        print("没有运行日志（logs/aistudio2api.log 与轮转出的 .1 等都不在）")
+        return
+    events, requests, first, last = scan_instance(paths)
+    if first is None:
+        print("运行日志里没有可解析的 JSON 行")
+        return
+    print("日志从 %s 到 %s" % (show(first), show(last)))
+    current = {}  # 账户 → 当前 Worker：{"at": 就绪时间, "pid": PID, "cause": 就绪起因}
+    lifetimes = []  # (秒, 停止起因)
+    cut_by_restart = []  # 进程重启时仍在运行的 Worker 已运行的秒数
+    starts = []
+    last_start = None
+    ages = {kind: [] for kind, _ in DENY_CLASSES}
+    unknown_age = {kind: collections.Counter() for kind, _ in DENY_CLASSES}
+    since_start = {kind: [] for kind, _ in DENY_CLASSES}
+    by_class = {kind: [] for kind, _ in DENY_CLASSES}
+    pools, revokes = [], []
+    daily, hourly = collections.OrderedDict(), collections.OrderedDict()
+    unmatched_stops = 0
+
+    def counted(table, key, column, amount=1):
+        table.setdefault(key, collections.Counter())[column] += amount
+
+    def process_age(moment):
+        if last_start is not None:
+            return (moment - last_start).total_seconds()
+        if started_at is not None and started_at <= moment:
+            return (moment - started_at).total_seconds()
+        return None
+
+    for moment, _, kind, account, data in events:
+        local = moment.astimezone()
+        day, hour = local.strftime("%Y-%m-%d"), local.strftime("%Y-%m-%d %H 时")
+        if kind == "start":
+            if last_start is not None and (moment - last_start).total_seconds() < 120:
+                continue
+            cut_by_restart.extend((moment - worker["at"]).total_seconds() for worker in current.values())
+            current.clear()
+            last_start = moment
+            starts.append(moment)
+        elif kind == "ready":
+            old = current.get(account)
+            if old is not None:
+                # 同一账户新 Worker 就绪：旧的在发布时关掉（原槽位重开不写停止行），停止行随后到来时 PID 对不上、不再重复计
+                lifetimes.append(((moment - old["at"]).total_seconds(), "同账户新 Worker 接替"))
+            current[account] = {"at": moment, "pid": data["pid"], "cause": data["cause"]}
+        elif kind == "stop":
+            worker = current.get(account)
+            if worker is not None and (data["pid"] in ("", "0") or worker["pid"] in ("", "0") or worker["pid"] == data["pid"]):
+                lifetimes.append(((moment - worker["at"]).total_seconds(), data["cause"] or "未写起因（旧版本）"))
+                del current[account]
+            else:
+                unmatched_stops += 1
+        elif kind in ("deny", "pool"):
+            worker = current.get(account)
+            age = (moment - worker["at"]).total_seconds() if worker else None
+            uptime = process_age(moment)
+            data = dict(data, at=moment, age=age, uptime=uptime)
+            if kind == "deny":
+                group = data["class"]
+                by_class[group].append(data)
+                counted(daily, day, group)
+                counted(hourly, hour, group)
+                if age is not None:
+                    ages[group].append(age)
+                else:
+                    unknown_age[group]["就绪早于日志开头" if last_start is None else "这次进程里没有这个账户的就绪行"] += 1
+                if uptime is not None:
+                    since_start[group].append(uptime)
+            else:
+                pools.append(data)
+                counted(daily, day, "pool")
+                counted(hourly, hour, "pool")
+        elif kind == "revoke":
+            revokes.append(dict(data, at=moment))
+            if ACCOUNT:
+                # 撤销行不带账户、不能按 ACCOUNT 过滤：只在 b 段按全号池写，不进按天、按小时表（表里其余各列都只算 ACCOUNT 的账户）
+                continue
+            counted(daily, day, "revoke")
+            counted(daily, day, "revoked", data["count"])
+            counted(hourly, hour, "revoke")
+            counted(hourly, hour, "revoked", data["count"])
+    running = [(last - worker["at"]).total_seconds() for worker in current.values()]
+
+    if starts:
+        print("进程启动（start.sh 分隔行或“管理监听启动”）：%s" % "、".join(show(moment) for moment in starts[-5:]) +
+              ("（共 %d 次，只列最近 5 次）" % len(starts) if len(starts) > 5 else ""))
+    elif started_at is not None:
+        print("日志里没有进程启动行，距进程启动按正在运行的进程算（启动于 %s）" % show(started_at))
+    else:
+        print("日志里没有进程启动行，也没有正在运行的进程：距进程启动算不出")
+
+    total = sum(len(items) for items in by_class.values())
+    print("a. 上游 403（所有模型，“上游返回 4xx … HTTP=403”行）共 %d 行、%d 个账户%s" % (
+        total, len({item["label"].lower() for items in by_class.values() for item in items}),
+        "" if total else "：运行日志覆盖的这段时间没有上游 403"))
+    for kind, label in DENY_CLASSES:
+        items = by_class[kind]
+        if not items:
+            print("  %s：0 行" % label)
+            continue
+        methods = collections.Counter(item["method"] for item in items)
+        print("  %s：%d 行、%d 个账户，%s 至 %s；方法 %s" % (
+            label, len(items), len({item["label"].lower() for item in items}), show(items[0]["at"]), show(items[-1]["at"]),
+            "、".join("%s×%d" % pair for pair in methods.most_common(4))))
+        if kind == "other":
+            wordings = collections.Counter(mask(item["wording"])[:100] or "（没有文案）" for item in items)
+            for wording, count in wordings.most_common(5):
+                print("    %d × %s" % (count, wording))
+    columns = (("verify", "verify"), ("caller", "caller"), ("other", "其他"), ("pool", "号池级判定"), ("revoke", "撤销行"))
+
+    def table_row(key, counts):
+        cells = ["%s %d" % (title, counts[column]) for column, title in columns if counts[column]]
+        if counts["revoked"]:
+            cells.append("撤销账户 %d" % counts["revoked"])
+        return "  %s | %s" % (key, " | ".join(cells))
+
+    if daily:
+        print("  按天（本机时区；verify = 需要验证账号，caller = The caller does not have permission）：")
+        for key, counts in daily.items():
+            print(table_row(key, counts))
+        rows = list(hourly.items())
+        print("  按小时%s：" % ("（只列最近 %d 个有记录的小时，更早的 %d 个略）" % (HOUR_ROWS, len(rows) - HOUR_ROWS) if len(rows) > HOUR_ROWS else ""))
+        for key, counts in rows[-HOUR_ROWS:]:
+            print(table_row(key, counts))
+
+    if ACCOUNT:
+        print("b. 号池级 403 判定（号池内 10 分钟内至少 5 个账号对同一模型 403 且没有成功，不冷却账号）：由邮箱含 ACCOUNT 的账户触发的 %d 次；"
+              "撤销登记的 INFO 行不带账户、不按 ACCOUNT 过滤，按全号池计（不进上面的按天、按小时表）：%d 条、共撤销 %d 个账户记录" % (
+                  len(pools), len(revokes), sum(item["count"] for item in revokes)))
+    else:
+        print("b. 号池级 403 判定（号池内 10 分钟内至少 5 个账号对同一模型 403 且没有成功，不冷却账号）：%d 次；撤销登记的 INFO 行 %d 条、共撤销 %d 个账户记录" % (
+            len(pools), len(revokes), sum(item["count"] for item in revokes)))
+    if pools:
+        models = collections.Counter(item["model"] for item in pools)
+        print("  模型：%s；%s 至 %s" % ("、".join("%s×%d" % pair for pair in models.most_common(5)), show(pools[0]["at"]), show(pools[-1]["at"])))
+        print("  判定时距进程启动：%s" % spread_text([item["uptime"] for item in pools if item["uptime"] is not None]))
+        print("  判定时触发账户的 Worker 年龄：%s" % spread_text([item["age"] for item in pools if item["age"] is not None]))
+        for item in pools[-10:]:
+            model, pool = requests.get(item["request"], ("", ""))
+            print("  %s | 模型 %s | 号池 %s | %s | Worker 年龄 %s | 距进程启动 %s" % (
+                show(item["at"]), item["model"], pool_label(pool) if item["request"] in requests else "?", mask(item["label"]),
+                duration_text(item["age"]) if item["age"] is not None else "?",
+                duration_text(item["uptime"]) if item["uptime"] is not None else "?"))
+    if revokes:
+        models = collections.Counter()
+        for item in revokes:
+            models[item["model"]] += item["count"]
+        print("  撤销%s：%s（账户记录数）；%s 至 %s" % ("（全号池）" if ACCOUNT else "","、".join("%s×%d" % pair for pair in models.most_common(5)), show(revokes[0]["at"]), show(revokes[-1]["at"])))
+
+    print("c. 403 发生时 Worker 已运行多久（距同一账户最近一次“WAA Worker 就绪”）与距进程启动多久：")
+    for kind, label in DENY_CLASSES:
+        if not by_class[kind]:
+            continue
+        missing = unknown_age[kind]
+        print("  %s：" % label)
+        print("    Worker 年龄：%s%s" % (spread_text(ages[kind]), "；算不出 %d 条（%s）" % (
+            sum(missing.values()), "、".join("%s %d" % pair for pair in missing.most_common())) if missing else ""))
+        print("    距进程启动：%s" % spread_text(since_start[kind]))
+
+    ended = [seconds for seconds, _ in lifetimes]
+    print("d. Worker 存活时长（就绪到停止）：已结束 %s" % spread_text(ended))
+    causes = collections.defaultdict(list)
+    for seconds, cause in lifetimes:
+        causes[cause].append(seconds)
+    if causes:
+        print("  按停止起因：%s" % "；".join("%s %d 个（中位 %s）" % (cause, len(values), duration_text(median(values)))
+                                       for cause, values in sorted(causes.items(), key=lambda pair: -len(pair[1]))))
+    if running:
+        print("  到日志末尾仍在运行 %d 个：已运行中位 %s、最长 %s" % (len(running), duration_text(median(running)), duration_text(max(running))))
+    if cut_by_restart:
+        print("  进程重启时仍在运行 %d 个：已运行中位 %s、最长 %s（重启前没有停止行）" % (
+            len(cut_by_restart), duration_text(median(cut_by_restart)), duration_text(max(cut_by_restart))))
+    if unmatched_stops:
+        print("  另有 %d 行停止对不上就绪行（就绪早于日志开头，或已被同账户新 Worker 接替）" % unmatched_stops)
+
+    minutes = collections.OrderedDict()
+    for kind in ("caller", "other"):
+        for item in by_class[kind]:
+            minutes.setdefault(item["at"].astimezone().strftime("%Y-%m-%d %H:%M"), []).append(item)
+    clusters = [(key, items) for key, items in sorted(minutes.items())
+                if len({item["label"].lower() for item in items}) >= CLUSTER_ACCOUNTS]
+    print("e. 同一分钟 %d 个及以上不同账户出现非 verify 403：%s" % (CLUSTER_ACCOUNTS, "%d 个分钟" % len(clusters) if clusters else "没有"))
+    for key, items in clusters[-10:]:
+        accounts = {item["label"].lower() for item in items}
+        groups = collections.Counter(dict(DENY_CLASSES)[item["class"]] for item in items)
+        methods = collections.Counter(item["method"] for item in items)
+        models = collections.Counter(requests.get(item["request"], ("?", ""))[0] or "?" for item in items)
+        known = [item["age"] for item in items if item["age"] is not None]
+        moment = items[0]["at"]
+        nearby = any(abs((pool["at"] - moment).total_seconds()) <= 600 for pool in pools)
+        print("  %s | %d 个账户、%d 行 | %s | 方法 %s | 模型 %s | Worker 年龄中位 %s | 前后 10 分钟%s号池级判定" % (
+            key, len(accounts), len(items), "、".join("%s×%d" % pair for pair in groups.most_common()),
+            "、".join("%s×%d" % pair for pair in methods.most_common(3)), "、".join("%s×%d" % pair for pair in models.most_common(3)),
+            duration_text(median(known)) if known else "?", "有" if nearby else "没有"))
+    if len(clusters) > 10:
+        print("  （只列最近 10 个）")
+
+    systemic = by_class["caller"] + by_class["other"]
+    long_age = [item for item in systemic if item["age"] is not None and item["age"] >= LONG_RUN]
+    long_uptime = [item for item in systemic if item["uptime"] is not None and item["uptime"] >= LONG_RUN]
+    if not by_class["caller"] and not pools:
+        print("→ 没有 The caller does not have permission，也没有号池级 403 判定：这段日志里没有上游那种“长时间运行后全部账户 403”")
+    else:
+        print("→ 非 verify 403 %d 行：Worker 年龄 11 小时以上 %d 行、距进程启动 11 小时以上 %d 行，同一分钟多账户聚类 %d 个，号池级判定 %d 次。"
+              "上游那种 403 的特征是成批出现（同一分钟很多账户、号池级判定）、集中在进程或 Worker 运行约 12 小时之后、文案多为 "
+              "The caller does not have permission；都对得上时把这一段发给开发者，只是零散几行多半是单个账户或模型没有权限" % (
+                  len(systemic), len(long_age), len(long_uptime), len(clusters), len(pools)))
+
+
+print("\n== 8. 所有模型的 403 与号池级 403（不看 MODEL%s；判断有没有上游那种“长时间运行后全部账户 403”；时间为本机时区）" % (
+    "，只看账户含 \"%s\" 的" % ACCOUNT if ACCOUNT else ""))
+instance_dirs = collections.OrderedDict()
+instance_dirs[os.path.realpath(APP)] = PROC_START
+for row in (ENV.get("INSTANCES") or "").splitlines():
+    parts = row.split("|")
+    if len(parts) < 2 or not parts[1]:
+        continue
+    try:
+        started = datetime.datetime.fromtimestamp(int(parts[3]), UTC) if len(parts) > 3 and parts[3] else None
+    except ValueError:
+        started = None
+    directory = os.path.realpath(parts[1])
+    if instance_dirs.get(directory) is None:
+        instance_dirs[directory] = started
+if len(instance_dirs) > 1:
+    print("本机有 %d 个实例目录，各自的运行日志分开统计（Worker 只在本实例的日志里就绪、停止）" % len(instance_dirs))
+for directory, started_at in instance_dirs.items():
+    analyze_instance(directory, started_at)
 PY

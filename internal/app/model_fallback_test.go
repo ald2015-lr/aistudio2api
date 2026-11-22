@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -438,6 +439,8 @@ func TestModelFallbackNonQuotaNotTriggered(t *testing.T) {
 	}{
 		{name: "上游 503", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusServiceUnavailable, Code: 14, Message: "overloaded"}},
 		{name: "参数错误", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusBadRequest, Code: 3, Message: "bad argument"}},
+		// 429 响应头之后读错误体时连接中断（ResponseReadError）：错误体没读到，不算额度失败（状态码只写进日志），换号后照样不改用
+		{name: "读错误响应体中断", err: &aistudio.ResponseReadError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Err: io.ErrUnexpectedEOF}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			upstream := &fallbackUpstream{fail: map[string]func(string) error{fallbackSource: func(string) error { return test.err }}}

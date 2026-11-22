@@ -168,11 +168,16 @@ func newAuthRuntimeRefresher(
 	globalProxy string,
 ) *authRuntimeRefresher {
 	return &authRuntimeRefresher{
-		refresh: chromeauth.Refresh, reset: workers.Reset, prepareHeaders: headers.prepareInvalidate,
+		refresh: chromeauth.Refresh, reset: workers.resetForAuthRefresh, prepareHeaders: headers.prepareInvalidate,
 		globalProxy: globalProxy,
 		requests:    requests,
 		workers:     workers,
 	}
+}
+
+// resetForAuthRefresh 为认证续签（2/2 重置协议运行时）关闭账户的 WAA worker，停止日志写“起因=认证续签”
+func (manager *accountWorkerManager) resetForAuthRefresh(accountID string) error {
+	return manager.ResetFor(accountID, workerStopAuthRefresh)
 }
 
 func (provider *accountHeaderProvider) prepareInvalidate(accountID string) (func(bool), error) {
@@ -456,11 +461,12 @@ func authenticationFailed(response *aistudio.RPCResponse) bool {
 	return response != nil && response.Body != nil && response.StatusCode == http.StatusUnauthorized
 }
 
-// readAuthenticationFailure 读取并关闭认证失败响应，返回原始原因与响应正文
+// readAuthenticationFailure 读取并关闭认证失败响应，返回原始原因与响应正文。读不出响应体时返回 aistudio.ResponseReadError：
+// 不知道上游是什么错误，不按登录失效处理（不续签、不标需要登录），与其他读错误响应体失败一样由调用方按一般失败换号
 func readAuthenticationFailure(method string, response *aistudio.RPCResponse) (*aistudio.RPCError, []byte, error) {
 	body, readErr := io.ReadAll(response.Body)
 	if err := errors.Join(readErr, response.Body.Close()); err != nil {
-		return nil, nil, fmt.Errorf("读取认证失败响应: %w", err)
+		return nil, nil, &aistudio.ResponseReadError{Method: method, StatusCode: response.StatusCode, Err: err}
 	}
 	return aistudio.DecodeRPCError(method, response.StatusCode, body), body, nil
 }

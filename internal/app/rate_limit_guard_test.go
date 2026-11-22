@@ -681,7 +681,7 @@ func TestQuotaCooldownKeepsLaterCooldown(t *testing.T) {
 		t.Fatal("账号在该模型上应仍是死槽位")
 	}
 	if got := countSourceLogs(requests, partitionNormalA, "账号冷却未写入 | 类型=限流 | 范围="+rateLadderModel+" | 恢复="+playground.Format(time.RFC3339),
-		"原因=已有更晚的冷却，保留原冷却"); got != 1 {
+		"原因=已有相同或更晚的冷却，保留原冷却"); got != 1 {
 		t.Fatalf("应如实记一行未写入并写实际生效的恢复时间，日志 = %v", serviceLogMessages(requests))
 	}
 	if got := countSourceLogs(requests, partitionNormalA, "账号冷却 | 类型=限流"); got != 1 {

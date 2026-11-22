@@ -779,6 +779,11 @@ func retryableAccountError(err error) bool {
 	if driveAuthorizationMissing(err) {
 		return false
 	}
+	// 读上游错误响应体时连接中断（见 ResponseReadError）：不知道上游是什么错误，与 5xx 一样换号；读取因请求取消或超时失败时不换号
+	var readError *ResponseReadError
+	if errors.As(err, &readError) {
+		return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+	}
 	var rpcError *RPCError
 	if !errors.As(err, &rpcError) {
 		return false

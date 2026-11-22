@@ -575,6 +575,8 @@ type Account struct {
 	buildModels           []Model
 	// buildPaused 为该账户的 Build 生成暂停（官网对它返回 PROXY_GENERATION_DISABLED，见 build_pause.go），受账户池 mu 保护
 	buildPaused bool
+	// deviceBound 缓存认证扩展里有没有 Chrome 续签材料的判断（见 deviceBoundLocked），受账户池 mu 保护
+	deviceBound deviceBoundMemo
 	// pendingAccess 为推迟写盘的模型资格成功时间（作用域 → 最晚的租约时间，含账号全局 *），pendingAccessGeneration 为记下时的
 	// 目录代际（见 model_access_deferral.go）；受账户池 mu 保护
 	pendingAccess           map[string]time.Time
@@ -674,6 +676,11 @@ type AccountStatus struct {
 	// 收尾等着的 Worker 启动等）不计入：draining 而 ActiveRequests 为 0 表示还在等这些操作结束；没有要等的、正在关闭 Worker 时为 closing
 	Transition     AccountTransition `json:"transition,omitempty"`
 	ActiveRequests int               `json:"active_requests,omitempty"`
+	// DeviceBoundSession 表示认证状态带设备绑定会话的 Cookie（DeviceBoundCookie），ChromeRenewal 表示认证扩展里保存了 Chrome OAuth
+	// 续签材料（见 Account.deviceBoundLocked，按认证扩展缓存在账户上）。复制出来的认证文件是否约 2 小时失效还要看本平台能否原地续签，
+	// 由调用方判断（见 app/device_bound.go）
+	DeviceBoundSession bool `json:"-"`
+	ChromeRenewal      bool `json:"-"`
 }
 
 // AccountSelection 描述账户调度所需的能力或粘性条件
@@ -3309,7 +3316,7 @@ const (
 	CooldownSkippedGeneration
 	// CooldownSkippedStale 表示该作用域已有不早于本次租约的记录（同账号取得租约更晚的请求已写回）
 	CooldownSkippedStale
-	// CooldownKeptLater 表示该作用域已有仍生效且更晚的冷却，保留它（原因也保留），只把检查时间推进到本次租约
+	// CooldownKeptLater 表示该作用域已有仍生效且不早于本次的冷却（更晚，或恢复时间相同），保留它（原因也保留），只把检查时间推进到本次租约
 	// （只由 TryExtendCooldownIfGeneration 返回）
 	CooldownKeptLater
 )
@@ -3324,7 +3331,7 @@ func (w CooldownWrite) String() string {
 	case CooldownSkippedStale:
 		return "同账号取得租约更晚的请求已写回结果"
 	case CooldownKeptLater:
-		return "已有更晚的冷却，保留原冷却"
+		return "已有相同或更晚的冷却，保留原冷却"
 	default:
 		return "未知"
 	}
@@ -3358,7 +3365,9 @@ func (p *AccountPool) TryMarkCooldownIfGeneration(
 }
 
 // TryExtendCooldownIfGeneration 与 TryMarkCooldownIfGeneration 相同，但不缩短已有的冷却：该作用域已有仍生效且晚于 until 的冷却时
-// 保留它（原因也保留），只把该作用域的检查时间推进到本次租约，返回 CooldownKeptLater。另外返回该作用域实际生效的恢复时间
+// 保留它（原因也保留），只把该作用域的检查时间推进到本次租约，返回 CooldownKeptLater。恢复时间与 until 相同时同样保留（参照上游
+// Mag1cFall/AIStudio2API ea74f2f）：同账号并发请求都被每日限额拒绝时恢复时间都是太平洋时间次日零点（分钟限额同一窗口同理），
+// 原先第二次照样重写冷却、调用方再写一行“账号冷却”WARN、再登记一次淘汰、再同步一次另一通道。另外返回该作用域实际生效的恢复时间
 // （写入时为 until，保留时为原冷却的恢复时间，没有写入时为零值）。额度冷却用它：同账号并发请求刚写入的更长冷却
 // （例如连续限流第 3 档的 30 分钟）不会被随后处理、租约稍晚的短冷却（附件上传返回的 30 秒限流等）覆盖成短冷却
 func (p *AccountPool) TryExtendCooldownIfGeneration(
@@ -3410,11 +3419,14 @@ func (p *AccountPool) markCooldownIfGeneration(
 		currentAccess.CheckedAt = checkedAt
 		runtimeState.ModelAccess[modelAccessScope] = currentAccess
 		current, cooling := runtimeState.Cooldowns[modelAccessScope]
-		laterActive := cooling && current.Active(time.Now()) && current.Until.After(until)
+		active := cooling && current.Active(time.Now())
+		laterActive := active && current.Until.After(until)
+		// sameActive：已有仍生效、恢复时间与本次相同的冷却，keepLater 时按保留处理（见 TryExtendCooldownIfGeneration）
+		sameActive := active && current.Until.Equal(until)
 		// 需要验证账号的冷却（整户暂停或单个模型）只能靠人工验证或清除 403 记录解除：不被更短的其他冷却（阶梯 403、每日限额的另一通道同步、
 		// 多模型连续 403 的 30 分钟自动暂停等）替换，否则暂停缩短后账户又被调度、再 403；其他冷却更长时照常写入
 		keepVerify := laterActive && VerifyCooldownKind(current.Reason) != "" && VerifyCooldownKind(reason) == ""
-		if keepLater && laterActive || keepVerify {
+		if keepLater && (laterActive || sameActive) || keepVerify {
 			write, effective = CooldownKeptLater, current.Until
 			return true, nil, nil
 		}
@@ -3824,6 +3836,7 @@ func (p *AccountPool) accountStatusLocked(account *Account, now time.Time) Accou
 		Message:          account.stateMessageLocked(),
 		OrgDisabled:      account.orgDisabled,
 	}
+	status.DeviceBoundSession, status.ChromeRenewal = account.deviceBoundLocked()
 	if account.orgDisabled {
 		status.Restriction = account.orgDisabledKind
 	}

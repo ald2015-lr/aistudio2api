@@ -20,6 +20,7 @@ func (service *trackedService) UploadFile(ctx context.Context, request aistudio.
 		return aistudio.FileRef{}, fmt.Errorf("file service 不可用")
 	}
 	file, requestErr := files.UploadFile(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return file, requestErr
 }
@@ -36,6 +37,7 @@ func (service *trackedService) FileMetadata(ctx context.Context, fileID string) 
 		return aistudio.FileMetadata{}, fmt.Errorf("file service 不可用")
 	}
 	metadata, requestErr := files.FileMetadata(requestCtx, fileID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return metadata, requestErr
 }
@@ -52,6 +54,7 @@ func (service *trackedService) DeleteFile(ctx context.Context, fileID string) er
 		return fmt.Errorf("file service 不可用")
 	}
 	requestErr := files.DeleteFile(requestCtx, fileID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return requestErr
 }

@@ -107,6 +107,9 @@ func (s *server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicInvalid(w, err)
 		return
 	}
+	// 转换之后不再读原始消息与系统提示（搜索历史已在上面解码，之后只用 generateRequest）：放掉它们，内联媒体的 base64 原文
+	// 不再随 request 常驻到生成结束（非流式在生成结束后还要读 request.Model）
+	request.Messages, request.System = nil, nil
 	// 先删除系统提示里 Claude Code 的计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go 的
 	// prepareClientSystem），之后恢复媒体与整理分轮都按整理后的对话进行
 	s.prepareClientSystem(r.Context(), &generateRequest)
@@ -671,7 +674,20 @@ func anthropicServerToolHistoryParts(blockType string, name string, input json.R
 }
 
 func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.Tools, error) {
+	config, err := anthropicToolChoice(choice)
+	if err != nil {
+		return aistudio.Tools{}, err
+	}
 	var mapped aistudio.Tools
+	// chosen 为 tool_choice 指定（{"type":"tool","name":"web_search"} 一类）的 server tool 对应的 Google 工具（与上游
+	// Mag1cFall/AIStudio2API 886e0c0 相同）。server tool 不是函数，原先指定后在选号前按“引用了未声明函数”返回 400
+	chosen := ""
+	server := func(tool anthropicTool, google string) {
+		mapped.Google = appendUnique(mapped.Google, google)
+		if len(config.AllowedFunctionNames) == 1 && config.AllowedFunctionNames[0] == tool.Name {
+			chosen = google
+		}
+	}
 	for _, tool := range tools {
 		typeName := strings.ToLower(tool.Type)
 		// 服务端工具按类型前缀识别，web_search_*、web_fetch_*、code_execution_* 的任何日期版本都接受：
@@ -693,12 +709,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 				}
 				mapped.GoogleSearch = search
 			}
-			mapped.Google = appendUnique(mapped.Google, "google_search")
+			server(tool, "google_search")
 		case typeName == "image_search":
 			if err := validateAnthropicServerTool(tool, "image_search"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			mapped.Google = appendUnique(mapped.Google, "image_search")
+			server(tool, "image_search")
 		case strings.HasPrefix(typeName, "web_fetch_"):
 			if err := validateAnthropicServerTool(tool, "web_fetch"); err != nil {
 				return aistudio.Tools{}, err
@@ -714,12 +730,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 					return aistudio.Tools{}, fmt.Errorf("tool type %q option %q is not supported", tool.Type, field)
 				}
 			}
-			mapped.Google = appendUnique(mapped.Google, "url_context")
+			server(tool, "url_context")
 		case strings.HasPrefix(typeName, "code_execution_"):
 			if err := validateAnthropicServerTool(tool, "code_execution"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			mapped.Google = appendUnique(mapped.Google, "code_execution")
+			server(tool, "code_execution")
 		case strings.HasPrefix(typeName, "tool_search_tool_"), strings.Contains(typeName, "toolset"):
 			// 工具搜索（tool_search_tool_regex_* / _bm25_*）只决定 Anthropic 侧按需加载哪些工具，MCP toolset 由 Anthropic 连接
 			// 远端 MCP 服务器，上游都没有对应能力，忽略；被延迟加载的函数照常全部声明
@@ -727,12 +743,12 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			if err := validateAnthropicServerTool(tool, "url_context"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			mapped.Google = appendUnique(mapped.Google, "url_context")
+			server(tool, "url_context")
 		case typeName == "google_maps":
 			if err := validateAnthropicServerTool(tool, "google_maps"); err != nil {
 				return aistudio.Tools{}, err
 			}
-			mapped.Google = appendUnique(mapped.Google, "google_maps")
+			server(tool, "google_maps")
 		case typeName == "", typeName == "custom":
 			if tool.Name == "" {
 				return aistudio.Tools{}, fmt.Errorf("tool name is required")
@@ -755,9 +771,13 @@ func mapAnthropicTools(tools []anthropicTool, choice json.RawMessage) (aistudio.
 			return aistudio.Tools{}, fmt.Errorf("unsupported tool type %q", tool.Type)
 		}
 	}
-	config, err := anthropicToolChoice(choice)
-	if err != nil {
-		return aistudio.Tools{}, err
+	if chosen != "" {
+		// 指定 server tool：仍为必须调用，本次只开启它对应的 Google 工具，不声明函数（与只带这一个 server tool 的请求相同），
+		// 生成服务按“必须调用加内置工具”核对（用了内置工具即满足）；它的选项（web_search 的搜索偏好）保留，其余工具的去掉
+		config.AllowedFunctionNames, mapped.Functions, mapped.Google = nil, nil, []string{chosen}
+		if chosen != "google_search" {
+			mapped.GoogleSearch = nil
+		}
 	}
 	mapped.ToolConfig = config
 	return mapped, nil

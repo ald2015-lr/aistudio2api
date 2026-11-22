@@ -754,10 +754,16 @@ func interactionStreamError(w http.ResponseWriter, err error) map[string]any {
 	return map[string]any{"error": map[string]any{"code": public.RPC, "message": public.Message}}
 }
 
-// anthropicStreamError 为流式响应中途出错时写出的 Anthropic error 事件
+// anthropicStreamError 为流式响应中途出错时写出的 Anthropic error 事件。5xx 的错误类型一律写 overloaded_error（与上游
+// Mag1cFall/AIStudio2API 529043e 相同）：Claude Code 把流内的 overloaded_error 当作可重试、自动重发这一轮，api_error 则让这一轮
+// 直接失败。只改流内事件的类型，消息仍是同一条官方措辞；HTTP 状态、提交响应头之前与非流式的错误体不变
 func anthropicStreamError(w http.ResponseWriter, err error) map[string]any {
 	public, _ := publicErrorWithRetry(err, accessLogModel(w))
-	return anthropicErrorBody(public, "")
+	body := anthropicErrorBody(public, "")
+	if public.Status >= http.StatusInternalServerError {
+		body["error"].(map[string]string)["type"] = "overloaded_error"
+	}
+	return body
 }
 
 // responsesErrorObject 为 Responses API response.failed 事件中的 error 对象

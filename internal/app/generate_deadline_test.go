@@ -611,10 +611,23 @@ func startGenerated(t *testing.T, service *trackedService, request aistudio.Gene
 // assertCanceledPromptly 断言请求在取消后 1s 内以取消结束（不带本服务期限的文本）
 func assertCanceledPromptly(t *testing.T, results <-chan deadlineResult, canceledAt func() time.Time) deadlineResult {
 	t.Helper()
+	return assertEndedPromptly(t, results, canceledAt, false)
+}
+
+// assertEndedPromptly 断言请求在取消后 1s 内结束：serviceStopped 为真时以 serviceStoppedError 结束（生成服务停止或重启，状态为失败），
+// 否则以取消结束；都不带本服务期限的文本
+func assertEndedPromptly(t *testing.T, results <-chan deadlineResult, canceledAt func() time.Time, serviceStopped bool) deadlineResult {
+	t.Helper()
 	select {
 	case result := <-results:
-		if !errors.Is(result.err, context.Canceled) || finalRequestState(result.err) != "cancelled" || strings.Contains(result.err.Error(), "本服务") {
+		var stopped *serviceStoppedError
+		switch {
+		case serviceStopped && (!errors.As(result.err, &stopped) || errors.Is(result.err, context.Canceled) || finalRequestState(result.err) != "failed"):
+			t.Fatalf("err = %v，期望生成服务停止的 serviceStoppedError（不是取消）", result.err)
+		case !serviceStopped && (!errors.Is(result.err, context.Canceled) || finalRequestState(result.err) != "cancelled"):
 			t.Fatalf("err = %v，期望以取消结束、不带本服务期限的文本", result.err)
+		case result.err != nil && strings.Contains(result.err.Error(), "本服务"):
+			t.Fatalf("err = %v，不应带本服务期限的文本", result.err)
 		}
 		if elapsed := result.endedAt.Sub(canceledAt()); elapsed > time.Second {
 			t.Fatalf("取消后 %s 才结束，期望 1s 内", elapsed)
@@ -626,7 +639,9 @@ func assertCanceledPromptly(t *testing.T, results <-chan deadlineResult, cancele
 	}
 }
 
-// TestGenerateCancelBothPhases I9、I10：管理端取消与生成服务停止在首事件前、首事件后两个阶段都立即结束请求（取消，不是期限）
+// TestGenerateCancelBothPhases I9、I10：管理端取消与生成服务停止在首事件前、首事件后两个阶段都立即结束请求（不是期限）。
+// 管理端取消以取消结束；生成服务停止以 serviceStoppedError 结束（503 service_stopped，请求状态为失败，参照上游 792d67a），
+// 换号循环里照旧按取消处理：不换号、上游收到的仍是取消
 func TestGenerateCancelBothPhases(t *testing.T) {
 	for _, how := range []string{"管理端取消", "生成服务停止"} {
 		for _, streaming := range []bool{false, true} {
@@ -668,9 +683,11 @@ func TestGenerateCancelBothPhases(t *testing.T) {
 					t.Fatal("上游没有收到请求")
 				}
 				cancel()
-				assertCanceledPromptly(t, results, func() time.Time { mu.Lock(); defer mu.Unlock(); return canceledAt })
-				if state := states.await(t, request.ID); state != "cancelled" {
-					t.Fatalf("state = %s，期望 cancelled", state)
+				stopped := how == "生成服务停止"
+				assertEndedPromptly(t, results, func() time.Time { mu.Lock(); defer mu.Unlock(); return canceledAt }, stopped)
+				want := map[bool]string{false: "cancelled", true: "failed"}[stopped]
+				if state := states.await(t, request.ID); state != want {
+					t.Fatalf("state = %s，期望 %s", state, want)
 				}
 				if !waitUntil(time.Second, func() bool { _, _, _, running := upstream.snapshot(); return running == 0 }) {
 					t.Fatal("上游应已被取消并退出")

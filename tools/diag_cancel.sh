@@ -172,7 +172,7 @@ if not cancelled:
     raise SystemExit
 
 initiators = collections.Counter(item["disconnect"].get("initiator") for item in cancelled)
-print(f"谁断开：客户端 {initiators.get('client', 0)}，服务端取消（管理端取消或服务停止、重启） {initiators.get('service', 0)}")
+print(f"谁断开：客户端 {initiators.get('client', 0)}，服务端取消（管理端取消，或服务停止、重启时关闭的 Live 会话） {initiators.get('service', 0)}")
 clients = [item for item in cancelled if item["disconnect"].get("initiator") == "client"]
 right_after_all = [item for item in clients if right_after_headers(item["disconnect"])]
 if right_after_all:

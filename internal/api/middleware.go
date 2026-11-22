@@ -85,7 +85,8 @@ type accessLogMetadata struct {
 // accessDisconnect 为请求被取消那一刻的现场，请求结束时转成 RequestDisconnect 写进请求日志
 type accessDisconnect struct {
 	at time.Time
-	// client 为客户端断开了连接（请求的 context 被取消）；为假时是服务端取消（管理端取消请求、停止或重启服务）
+	// client 为客户端断开了连接（请求的 context 被取消）；为假时是服务端取消（管理端取消请求，或服务停止、重启时关闭的 Live 会话；
+	// 其余进行中的请求在停止、重启时按 503 service_stopped 记为失败，不是取消）
 	client      bool
 	headersSent bool
 	bytes       int64
@@ -837,7 +838,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 		var disconnect *RequestDisconnect
 		if snapshot.canceled || errors.Is(requestErr, context.Canceled) {
 			status = 499
-			// 客户端没有断开却以取消结束：管理端取消了请求，或服务正在停止、重启
+			// 客户端没有断开却以取消结束：管理端取消了请求，或服务停止、重启时关闭了已建立的 Live 会话
 			moment := snapshot.disconnect
 			if moment == nil {
 				service := writer.disconnectSnapshot(false)

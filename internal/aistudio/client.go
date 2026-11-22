@@ -293,6 +293,26 @@ func newRPCRequest(method string, accountID string, requestID string, body []byt
 	}
 }
 
+// ResponseReadError 表示收到上游非 200 响应头之后读取错误响应体失败（连接或代理在读错误体时中断等）。它不是 RPCError：
+// 错误体没有读到，不知道上游具体是什么错误，StatusCode 只写进日志，不据此冷却、识别额度或判断登录失效与 403。
+// 生成路径在请求未结束、原因不是取消或超时时按可换号的一般失败处理（计入连续失败上限并退避，见 app 层 retryableGenerateAccountError），
+// 数据接口同样可换号（见 retryableAccountError）
+type ResponseReadError struct {
+	Method     string
+	StatusCode int
+	Err        error
+}
+
+// Error 返回错误文本：方法、上游状态码与读取失败的原因
+func (e *ResponseReadError) Error() string {
+	return fmt.Sprintf("读取 AI Studio %s 错误响应（HTTP %d）: %v", e.Method, e.StatusCode, e.Err)
+}
+
+// Unwrap 返回读取失败的原因（context.Canceled 等照常可以识别）
+func (e *ResponseReadError) Unwrap() error {
+	return e.Err
+}
+
 func validateRPCResponse(method string, response *RPCResponse) (*RPCResponse, error) {
 	if response == nil || response.Body == nil {
 		return nil, fmt.Errorf("AI Studio %s transport 返回空响应", method)
@@ -301,7 +321,7 @@ func validateRPCResponse(method string, response *RPCResponse) (*RPCResponse, er
 		defer response.Body.Close()
 		raw, readErr := io.ReadAll(response.Body)
 		if readErr != nil {
-			return nil, fmt.Errorf("读取 AI Studio %s 错误响应: %w", method, readErr)
+			return nil, &ResponseReadError{Method: method, StatusCode: response.StatusCode, Err: readErr}
 		}
 		rpcError := DecodeRPCError(method, response.StatusCode, raw)
 		if rpcError.RetryDelay <= 0 {

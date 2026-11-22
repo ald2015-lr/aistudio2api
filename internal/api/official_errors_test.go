@@ -1,9 +1,13 @@
 package api
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 )
@@ -82,5 +86,61 @@ func TestInputTokenLimitAlways400(t *testing.T) {
 	quota := publicErrorFor(&aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusTooManyRequests, Code: 8, Message: "You exceeded your current quota"}, "gemini-3.1-pro-preview")
 	if quota.Status != http.StatusTooManyRequests || quota.Kind != publicKindRateLimit {
 		t.Fatalf("额度 429 得到 %+v，期望仍按 429 限流返回", quota)
+	}
+}
+
+// TestAnthropicStreamServerErrorOverloaded Anthropic 已开始流式响应后，5xx 的流内 error 事件类型为 overloaded_error（Claude Code 会在流内自动重试），
+// 消息仍是官方措辞；4xx 的流内类型、提交响应头之前与非流式的 5xx 错误体（api_error）不变
+func TestAnthropicStreamServerErrorOverloaded(t *testing.T) {
+	header := map[string]string{"Anthropic-Version": "2023-06-01"}
+	const streamBody = `{"model":"gemini-2.5-flash","stream":true,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`
+	errorType := func(t *testing.T, body string) (string, string) {
+		t.Helper()
+		for _, line := range strings.Split(body, "\n") {
+			if payload, ok := strings.CutPrefix(line, "data: "); ok && strings.Contains(payload, `"type":"error"`) {
+				var event struct {
+					Error struct{ Type, Message string } `json:"error"`
+				}
+				if err := json.Unmarshal([]byte(payload), &event); err != nil {
+					t.Fatal(err)
+				}
+				return event.Error.Type, event.Error.Message
+			}
+		}
+		t.Fatalf("流里没有 error 事件: %s", body)
+		return "", ""
+	}
+	for _, test := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "504", err: fmt.Errorf("上游首事件超时: %w", context.DeadlineExceeded), want: "overloaded_error"},
+		{name: "502", err: &aistudio.RPCError{Method: "GenerateContent", StatusCode: http.StatusBadGateway, Message: "upstream response ended before finish frame"}, want: "overloaded_error"},
+		{name: "429", err: &aistudio.AllCoolingError{Until: time.Now().Add(time.Minute)}, want: "rate_limit_error"},
+		{name: "400", err: aistudio.ErrInvalidArgument, want: "invalid_request_error"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := []aistudio.Event{{Kind: aistudio.EventText, Text: "hello"}, {Kind: aistudio.EventError, Err: test.err}}
+			recorder := postJSON(t, NewHandler(&scriptedService{events: events}, Config{APIKey: "sk-test"}), "/v1/messages", streamBody, header)
+			kind, message := errorType(t, recorder.Body.String())
+			// 重试秒数带随机抖动（见 retryAfterJitterStep），只比较之前的官方措辞
+			public, _ := publicErrorWithRetry(test.err, "gemini-2.5-flash")
+			official, _, _ := strings.Cut(public.Message, " Please try again in ")
+			if recorder.Code != http.StatusOK || kind != test.want || !strings.HasPrefix(message, official) {
+				t.Fatalf("status=%d type=%q message=%q，期望流内 %s、官方措辞 %q", recorder.Code, kind, message, test.want, public.Message)
+			}
+		})
+	}
+	// 提交响应头之前（第一个事件就是错误）与非流式：仍按 HTTP 状态返回 api_error
+	failure := []aistudio.Event{{Kind: aistudio.EventError, Err: fmt.Errorf("上游首事件超时: %w", context.DeadlineExceeded)}}
+	for _, body := range []string{streamBody, strings.Replace(streamBody, `"stream":true`, `"stream":false`, 1)} {
+		recorder := postJSON(t, NewHandler(&scriptedService{events: failure}, Config{APIKey: "sk-test"}), "/v1/messages", body, header)
+		var response struct {
+			Error struct{ Type string } `json:"error"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || recorder.Code != http.StatusGatewayTimeout || response.Error.Type != "api_error" {
+			t.Fatalf("响应头之前 / 非流式：%d %s，期望 504 api_error", recorder.Code, recorder.Body.String())
+		}
 	}
 }

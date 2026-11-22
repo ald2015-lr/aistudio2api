@@ -2,9 +2,17 @@ import { reactive, watch } from 'vue'
 import type { UsageDimension, UsageFilters, UsageStats } from '@/types'
 import { readStorage, writeStorage } from '@/storage'
 
-// relativePresets 与 calendarPresets 是相对时间与日历两类快捷范围
+// relativePresets 与 calendarPresets 是相对时间与日历两类快捷范围；quotaDay（配额日）从最近一次太平洋时间零点起算，
+// 与 Google 每日额度重置、平均调用的“今日发送”和额度冷却到次日零点同一个边界（服务端见 internal/aistudio/quota.go）
 export const relativePresets = ['1h', '6h', '24h', '7d', '30d', '90d'] as const
-export const calendarPresets = ['today', 'yesterday', 'week', 'month', 'lastMonth'] as const
+export const calendarPresets = [
+  'today',
+  'yesterday',
+  'week',
+  'month',
+  'lastMonth',
+  'quotaDay',
+] as const
 export type RangePreset =
   (typeof relativePresets)[number] | (typeof calendarPresets)[number] | 'custom'
 
@@ -94,6 +102,49 @@ export function localInput(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
 }
 
+// quotaTimeZone 与服务端额度重置的时区一致（internal/aistudio/quota.go 的 quotaResetTimezone）
+const quotaTimeZone = 'America/Los_Angeles'
+const pacificClock = new Intl.DateTimeFormat('en-US', {
+  timeZone: quotaTimeZone,
+  hourCycle: 'h23',
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: 'numeric',
+  minute: 'numeric',
+  second: 'numeric',
+})
+
+// pacificWall 返回某一时刻在太平洋时间的年月日时分秒
+function pacificWall(date: Date): Record<string, number> {
+  const parts: Record<string, number> = {}
+  for (const part of pacificClock.formatToParts(date)) {
+    if (part.type !== 'literal') parts[part.type] = Number(part.value)
+  }
+  return parts
+}
+
+// quotaDayStart 返回不晚于 now 的最近一次太平洋时间零点。太平洋时间比 UTC 晚 7 小时（夏令时）或 8 小时（标准时间），
+// 零点那一刻不在切换时刻上（切换在凌晨 2 点），按太平洋日期的 UTC 零点加 7 或 8 小时，取换算回来正好是那天零点的一个
+export function quotaDayStart(now: Date): Date {
+  const wall = pacificWall(now)
+  const dayStart = Date.UTC(wall.year ?? 1970, (wall.month ?? 1) - 1, wall.day ?? 1)
+  for (const offset of [7, 8]) {
+    const candidate = new Date(dayStart + offset * 3_600_000)
+    const check = pacificWall(candidate)
+    if (
+      check.year === wall.year &&
+      check.month === wall.month &&
+      check.day === wall.day &&
+      check.hour === 0 &&
+      check.minute === 0 &&
+      candidate.getTime() <= now.getTime()
+    )
+      return candidate
+  }
+  return new Date(dayStart + 8 * 3_600_000)
+}
+
 // resolveRange 把视图状态解析为具体的起止时间，自定义范围无效时返回 null
 export function resolveRange(
   state: Pick<UsageViewState, 'range' | 'from' | 'to'>,
@@ -122,6 +173,8 @@ export function resolveRange(
         from: new Date(now.getFullYear(), now.getMonth() - 1, 1),
         to: new Date(now.getFullYear(), now.getMonth(), 1),
       }
+    case 'quotaDay':
+      return { from: quotaDayStart(now), to: now }
     case 'custom': {
       const from = new Date(state.from)
       const to = new Date(state.to)

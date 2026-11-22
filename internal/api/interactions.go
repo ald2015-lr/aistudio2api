@@ -23,6 +23,9 @@ func (s *server) handleInteraction(w http.ResponseWriter, r *http.Request) {
 		writeGeminiInvalid(w, err)
 		return
 	}
+	// 转换之后不再读原始输入（之后只用 generate）：放掉它，内联媒体的 base64 原文不再随 request 常驻到流结束
+	// （request 按值传给 streamInteraction，结束时还要读其中的 store 与续接 ID）
+	request.Input = nil
 	contents := generate.Contents
 	start := 0
 	if id := request.PreviousID; id != "" {

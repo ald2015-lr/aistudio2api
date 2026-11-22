@@ -386,7 +386,8 @@ type RequestLog struct {
 // RequestDisconnect 为请求取消时的现场：谁取消的、断开在哪个阶段、断开前已经写给客户端多少、多久没有写出、上游多久没有事件。
 // 用来分辨是客户端那一段在等待中被掐断（长时间零字节）、还是数据一直在流时客户端自己走了
 type RequestDisconnect struct {
-	// Initiator 为 client（客户端断开了连接）或 service（客户端没有断开：管理端取消了请求，或服务正在停止、重启）
+	// Initiator 为 client（客户端断开了连接）或 service（客户端没有断开：管理端取消了请求，或服务停止、重启时关闭了已建立的 Live 会话；
+	// 其余进行中的请求在停止、重启时按 503 service_stopped 记为失败，不是取消）
 	Initiator string `json:"initiator"`
 	// Phase 为 before_first_event（上游首个事件之前断开）或 mid_stream（已收到上游首个事件之后断开）
 	Phase string `json:"phase"`
@@ -536,6 +537,10 @@ type AdminAccount struct {
 	// ActiveRequests 为收尾期间账户上进行中的请求数（登录、验证等独占操作不计入）
 	Transition     string `json:"transition,omitempty"`
 	ActiveRequests int    `json:"active_requests,omitempty"`
+	// DeviceBoundSession 表示账户的认证文件是设备绑定会话（带 __Secure-1PSIDRTS），复制出来约 2 小时后失效：本平台不能用 Chrome 续签材料
+	// 原地续签（没有材料，或只有 Windows 能续签），与启动、导入时那行“设备绑定会话”WARN 同一口径；前端在账户行显示徽标，提示改用浏览器登录
+	// （Windows 上也可以 Chrome 导入）。按账户池缓存的判断给出，列表轮询不解析认证扩展
+	DeviceBoundSession bool `json:"device_bound_session,omitempty"`
 }
 
 // AccountInput 表示已有账户配置

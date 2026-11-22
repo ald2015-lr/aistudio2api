@@ -634,6 +634,14 @@ func (admin *runtimeAdmin) updateAccount(
 		headerUpdate.Discard()
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
+	// 准备期间管理请求被取消（页面关闭、客户端断开）：放弃这次更新，不写 account.json，返回取消错误（参照上游 c77dd89；原先照样保存，
+	// 调用方看到的是失败、配置却已改了）。旧 Worker 已在 prepareUpdate 里关闭，Discard 放开启动锁、配置不变，之后的请求与预热按原配置
+	// 按需重建 Worker，与保存失败时相同；停用收尾等被取消的阶段由上面的 defer 按取消前的阶段恢复
+	if err := ctx.Err(); err != nil {
+		workerUpdate.Discard()
+		headerUpdate.Discard()
+		return api.AdminAccount{}, errors.Join(err, lease.Release())
+	}
 	if err := admin.service.changeModels(func() error {
 		return lease.SaveConfig(accountConfig)
 	}); err != nil {
@@ -724,7 +732,7 @@ type accountRemover func(deleteDirectory func(*aistudio.Account) error) (*aistud
 // 移出号池失败时返回的账户为 nil、错误为 remove 的原始错误；移出后清理失败时返回账户与错误，不清除停用原因、不写日志（与原先一致）
 func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Account, error) {
 	removed, err := remove(func(account *aistudio.Account) error {
-		if workerErr := admin.workers.Reset(account.ID); workerErr != nil {
+		if workerErr := admin.workers.ResetFor(account.ID, workerStopDelete); workerErr != nil {
 			return workerErr
 		}
 		return admin.store.Delete(account)
@@ -765,7 +773,7 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 		return api.AdminAccount{}, err
 	}
 	account := lease.Account()
-	if err := admin.workers.Reset(account.ID); err != nil {
+	if err := admin.workers.ResetFor(account.ID, workerStopLogin); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	directory, err := os.MkdirTemp("", "aistudio2api-account-login-*")
@@ -1245,6 +1253,7 @@ func adminAccountDTO(status aistudio.AccountStatus) api.AdminAccount {
 		ProxyPoolSlot: status.ProxySlot, ProxyPoolActive: status.ProxySlotActive,
 		OrgDisabled: status.OrgDisabled, Restriction: restriction,
 		Transition: string(status.Transition), ActiveRequests: status.ActiveRequests,
+		DeviceBoundSession: deviceBoundExpiring(status.DeviceBoundSession, status.ChromeRenewal),
 	}
 }
 
@@ -1360,11 +1369,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	autoStart := saved.AutoStart
 	requestBodyLog := saved.RequestBodyLog
 	adminPassword := saved.AdminPassword
-	// 首事件超时：旧版页面保存时不带该字段，沿用现值
+	// 首事件超时：旧版页面保存时不带该字段，沿用现值。与启动加载同一解析（0、off、整数秒或 Go 时长，见 config.ParseFirstEventTimeout）
 	firstEventTimeout := saved.FirstEventTimeout
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
-		if firstEventTimeout, err = time.ParseDuration(strings.TrimSpace(value.FirstEventTimeout)); err != nil {
-			return api.RuntimeConfig{}, invalidConfigError(fmt.Errorf("FIRST_EVENT_TIMEOUT 无效: %w", err))
+		if firstEventTimeout, err = config.ParseFirstEventTimeout(value.FirstEventTimeout); err != nil {
+			return api.RuntimeConfig{}, invalidConfigError(err)
 		}
 	}
 	downgradeGuard := saved.DowngradeGuard

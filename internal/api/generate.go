@@ -465,6 +465,17 @@ func splitFunctionResultMediaDepth(raw json.RawMessage, depth int) (json.RawMess
 		if err := json.Unmarshal([]byte(trimmed), &object); err != nil {
 			return raw, nil, nil
 		}
+		// 结果本身就是单个媒体内容块（MCP 只返回一张图的 {"type":"image","data":…,"mimeType":…}、{"type":"input_image","image_url":…} 等）
+		// 时按只含它的块数组处理（与上游 Mag1cFall/AIStudio2API 529043e 相同），原位置换成同样的文字说明；原先整个对象连同 base64 按 JSON
+		// 发送。解码失败时与原先一样原样发送（数组里的块解码失败照旧报错）
+		if part, extracted, err := functionResultMediaPart(json.RawMessage(trimmed)); err == nil && extracted {
+			part.FromToolResult = true
+			placeholder, err := functionResultMediaPlaceholder(part, 1)
+			if err != nil {
+				return nil, nil, err
+			}
+			return placeholder, []aistudio.Part{part}, nil
+		}
 		var media []aistudio.Part
 		for _, key := range functionResultMediaWrappers {
 			value, exists := object[key]
@@ -507,10 +518,7 @@ func splitFunctionResultMediaDepth(raw json.RawMessage, depth int) (json.RawMess
 		}
 		part.FromToolResult = true
 		media = append(media, part)
-		kind := mediaKind(part)
-		placeholder, err := json.Marshal(map[string]string{
-			"type": "text", "text": fmt.Sprintf("[%s %d：已作为%s附在随后的消息中]", kind, len(media), kind),
-		})
+		placeholder, err := functionResultMediaPlaceholder(part, len(media))
 		if err != nil {
 			return nil, nil, err
 		}
@@ -524,6 +532,12 @@ func splitFunctionResultMediaDepth(raw json.RawMessage, depth int) (json.RawMess
 		return nil, nil, err
 	}
 	return encoded, media, nil
+}
+
+// functionResultMediaPlaceholder 返回工具结果里取出的第 number 个附件在原位置留下的文字说明块
+func functionResultMediaPlaceholder(part aistudio.Part, number int) (json.RawMessage, error) {
+	kind := mediaKind(part)
+	return json.Marshal(map[string]string{"type": "text", "text": fmt.Sprintf("[%s %d：已作为%s附在随后的消息中]", kind, number, kind)})
 }
 
 // mediaKind 返回附件在说明文字里的称呼：图片或文件

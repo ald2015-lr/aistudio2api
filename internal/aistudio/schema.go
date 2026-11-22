@@ -574,9 +574,17 @@ func schemaInteger(raw json.RawMessage, name string) (int64, error) {
 	return value, nil
 }
 
+// schemaNumber 解析 minimum、maximum。也接受写成字符串的数字（"1"、" 1.5 "，与上游 Mag1cFall/AIStudio2API c77dd89 相同）：
+// @google/genai 等 SDK 把数值序列化为字符串，原先解析失败，降级编码同样带着这个字符串，函数声明编码失败、整个请求失败。
+// 不是数字的字符串与 NaN、Inf 照旧报错
 func schemaNumber(raw json.RawMessage, name string) (float64, error) {
-	value, err := strconv.ParseFloat(string(raw), 64)
-	if err != nil {
+	text := string(raw)
+	var quoted string
+	if json.Unmarshal(raw, &quoted) == nil {
+		text = strings.TrimSpace(quoted)
+	}
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
 		return 0, fmt.Errorf("schema.%s 必须是数字", name)
 	}
 	return value, nil

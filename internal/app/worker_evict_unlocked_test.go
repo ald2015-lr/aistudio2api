@@ -191,10 +191,10 @@ func TestEvictReservedVictimAfterRemove(t *testing.T) {
 	}
 	// 账户池已移出（Worker 已由删除流程关闭），管理器还没移除
 	remove(partitionNormalA)
-	if evicted, err := manager.evictIdleWorker(ctx, partitionNormalA); !errors.Is(err, aistudio.ErrAccountNotFound) || evicted {
-		t.Fatalf("evictIdleWorker 对账户池已移出的账户应照旧报错：evicted=%v err=%v", evicted, err)
+	if evicted, err := manager.evictIdleWorkerFor(ctx, partitionNormalA, ""); !errors.Is(err, aistudio.ErrAccountNotFound) || evicted {
+		t.Fatalf("evictIdleWorkerFor 对账户池已移出的账户应照旧报错：evicted=%v err=%v", evicted, err)
 	}
-	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalA); err != nil || !evicted {
+	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalA, workerStopReplace); err != nil || !evicted {
 		t.Fatalf("账户池已移出的淘汰对象应按已淘汰处理：evicted=%v err=%v", evicted, err)
 	}
 	// 两边都已移除
@@ -202,7 +202,7 @@ func TestEvictReservedVictimAfterRemove(t *testing.T) {
 	if err := manager.Remove(partitionNormalB); err != nil {
 		t.Fatal(err)
 	}
-	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalB); err != nil || !evicted {
+	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalB, workerStopReplace); err != nil || !evicted {
 		t.Fatalf("已删除的淘汰对象应按已淘汰处理：evicted=%v err=%v", evicted, err)
 	}
 	if warm := manager.WarmAccountIDs(); len(warm) != 0 {
@@ -487,7 +487,7 @@ func TestReapStopsOnVictimWithMissingFiles(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalB); err != nil || !evicted {
+	if evicted, err := manager.evictReservedVictim(ctx, partitionNormalB, workerStopReplace); err != nil || !evicted {
 		t.Fatalf("移出账户池后的淘汰对象应按已淘汰处理：evicted=%v err=%v", evicted, err)
 	}
 }

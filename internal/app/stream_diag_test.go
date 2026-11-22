@@ -103,7 +103,7 @@ func TestCancelledRequestLogShowsDisconnect(t *testing.T) {
 		t.Fatalf("载荷缺少 right_after_headers: %s", encoded)
 	}
 	entry.Disconnect = &api.RequestDisconnect{Initiator: "service", Phase: "before_first_event", SinceLastWriteMS: 500, ElapsedMS: 500}
-	if _, _, message := finishedRequestLog(entry); message != "请求已取消 | 服务端取消（管理端取消请求或服务停止、重启） | 阶段=首事件前 | 响应头=未提交 | 已写出=0 块 0 B | 距最近写出=500ms | 距最近数据=无 | 距上游最近事件=无 | 已用时=500ms" {
+	if _, _, message := finishedRequestLog(entry); message != "请求已取消 | 服务端取消（管理端取消请求，或服务停止、重启时关闭的 Live 会话） | 阶段=首事件前 | 响应头=未提交 | 已写出=0 块 0 B | 距最近写出=500ms | 距最近数据=无 | 距上游最近事件=无 | 已用时=500ms" {
 		t.Fatalf("服务端取消的摘要 = %q", message)
 	}
 	if _, _, message := finishedRequestLog(api.AccessLog{Status: http.StatusOK}); message != "请求完成" {

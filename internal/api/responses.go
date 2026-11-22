@@ -59,6 +59,8 @@ type responsesInputItem struct {
 	Arguments        string          `json:"arguments"`
 	Output           json.RawMessage `json:"output"`
 	EncryptedContent string          `json:"encrypted_content"`
+	// Status 为输入项的状态（in_progress、completed、incomplete）；只有 function_call_output 的 incomplete 改变发给上游的内容
+	Status string `json:"status"`
 }
 
 type responseState struct {
@@ -192,8 +194,16 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIInvalid(w, err)
 		return
 	}
-	currentContents := cloneResponseContents(generateRequest.Contents)
-	currentInlineInstructions := append([]string(nil), inlineInstructions...)
+	// 转换之后不再读原始输入（之后只用 generateRequest）：放掉它，内联媒体的 base64 原文不再随 request 常驻到流结束
+	// （流式写出器整份持有 request）
+	request.Input = nil
+	// 本轮输入只在保存续接状态时才复制：不保存（store:false，Codex 的默认写法）时不留副本，副本引用的 Part 与内联媒体不必常驻到流结束
+	var currentContents []aistudio.Content
+	var currentInlineInstructions []string
+	if storesResponse(request.Store) {
+		currentContents = cloneResponseContents(generateRequest.Contents)
+		currentInlineInstructions = append([]string(nil), inlineInstructions...)
+	}
 	if request.PreviousResponseID != "" {
 		previousContents, previousInstructions, ok := s.responseStates.Load(request.PreviousResponseID)
 		if !ok {
@@ -248,10 +258,15 @@ func (s *server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIRequestError(w, err)
 		return
 	}
-	if request.Store == nil || *request.Store {
+	if storesResponse(request.Store) {
 		s.storeResponseState(responseID, request.PreviousResponseID, currentContents, currentInlineInstructions, result)
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+// storesResponse 报告请求是否保存续接状态：store 缺省按 true（与官方相同），只有明确写 false 时不保存
+func storesResponse(store *bool) bool {
+	return store == nil || *store
 }
 
 func (s *server) storeResponseState(id string, parentID string, contents []aistudio.Content, inlineInstructions []string, result generationResult) {
@@ -425,12 +440,27 @@ func responsesContents(raw json.RawMessage) ([]aistudio.Content, []string, error
 			if err != nil {
 				return nil, nil, fmt.Errorf("function_call_output: %w", err)
 			}
+			if item.Status == "incomplete" {
+				// 没有完成的工具输出（Codex 中断的命令等）包成 {"status":"incomplete","output":…} 告诉模型结果不完整（与上游
+				// Mag1cFall/AIStudio2API 529043e 相同）；原先 status 被忽略，模型把截断的输出当作完整结果
+				output, err = json.Marshal(struct {
+					Status string          `json:"status"`
+					Output json.RawMessage `json:"output"`
+				}{Status: item.Status, Output: output})
+				if err != nil {
+					return nil, nil, fmt.Errorf("function_call_output: %w", err)
+				}
+			}
 			parts := []aistudio.Part{{FunctionResult: &aistudio.FunctionResult{
 				ID: item.CallID, Content: output,
 			}}}
 			contents = append(contents, aistudio.Content{Role: aistudio.RoleTool, Parts: append(parts, media...)})
 		case "reasoning":
-			pendingSignature = item.EncryptedContent
+			// 没有 encrypted_content 的 reasoning（只带摘要，或客户端没有要求 reasoning.encrypted_content）不清掉之前待用的签名
+			// （与上游 Mag1cFall/AIStudio2API 529043e 相同）：原先签名被空值覆盖，随后的函数调用丢了思考签名
+			if item.EncryptedContent != "" {
+				pendingSignature = item.EncryptedContent
+			}
 		case "web_search_call", "code_interpreter_call", "image_generation_call", "item_reference":
 			// 本服务自己输出的内置工具调用项（以及引用之前输出项的 item_reference）：无状态客户端会把上一轮的
 			// output 原样放回 input，原先返回 400。这些调用在上游执行，结果已体现在随后的助手消息里，跳过即可
@@ -916,7 +946,7 @@ func (s *server) streamResponses(w http.ResponseWriter, r *http.Request, request
 		_ = writer.failed(err)
 		return
 	}
-	if request.Store == nil || *request.Store {
+	if storesResponse(request.Store) {
 		s.storeResponseState(id, request.PreviousResponseID, contents, inlineInstructions, result)
 	}
 	if err := writer.finish(result, response); err != nil {

@@ -7,6 +7,7 @@ import { useUsageFormat } from './format'
 import {
   calendarPresets,
   localInput,
+  quotaDayStart,
   relativePresets,
   retention,
   validRange,
@@ -19,7 +20,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ apply: [range: RangePreset, from: string, to: string] }>()
 
-const { t } = useI18n()
+const { locale, t, tf } = useI18n()
 const { dateTime } = useUsageFormat()
 const open = ref(false)
 const customFrom = ref('')
@@ -38,6 +39,22 @@ const customError = computed(() => {
 const beforeRetention = computed(
   () => new Date(customFrom.value).getTime() < now.value.getTime() - retention,
 )
+// quotaStart 为配额日起点的本地时间（时:分），选中配额日时取已解析的起点，没选中时按打开浮层的时刻算
+const quotaStart = computed(() => {
+  const start =
+    props.range === 'quotaDay' && props.resolved !== null
+      ? props.resolved.from
+      : quotaDayStart(now.value)
+  return new Intl.DateTimeFormat(locale.value, { hour: '2-digit', minute: '2-digit' }).format(start)
+})
+
+// presetLabel 返回快捷范围的显示文字，配额日带上本地的起始时间
+function presetLabel(preset: RangePreset): string {
+  return preset === 'quotaDay'
+    ? tf('usage.range.quotaDay', { time: quotaStart.value })
+    : t(`usage.range.${preset}`)
+}
+
 const groups = [
   { label: 'usage.rangeRecent' as const, items: relativePresets },
   { label: 'usage.rangeCalendar' as const, items: calendarPresets },
@@ -72,12 +89,12 @@ function applyCustom(): void {
 <template>
   <UiPopover
     v-model:open="open"
-    :label="`${t('usage.range')}: ${t(`usage.range.${range}`)} ${summary}`"
+    :label="`${t('usage.range')}: ${presetLabel(range)} ${summary}`"
     content-class="w-[min(36rem,calc(100vw-24px))] p-3 text-sm"
     trigger-class="flex h-8 min-w-0 items-center gap-2 rounded-md border border-line bg-canvas px-3 text-left text-sm text-gray-200 transition-colors hover:border-line-strong data-[state=open]:border-blue-500"
   >
     <template #trigger>
-      <span class="font-medium whitespace-nowrap">{{ t(`usage.range.${range}`) }}</span>
+      <span class="font-medium whitespace-nowrap">{{ presetLabel(range) }}</span>
       <span class="hidden truncate text-xs text-gray-500 tabular-nums sm:inline">{{
         summary
       }}</span>
@@ -93,6 +110,7 @@ function applyCustom(): void {
             <button
               v-for="item in group.items"
               :key="item"
+              v-tooltip="item === 'quotaDay' ? t('usage.range.quotaDayHelp') : undefined"
               type="button"
               :aria-pressed="range === item"
               class="rounded px-2 py-1.5 text-left text-xs transition-colors"
@@ -103,7 +121,7 @@ function applyCustom(): void {
               "
               @click="choose(item)"
             >
-              {{ t(`usage.range.${item}`) }}
+              {{ presetLabel(item) }}
             </button>
           </div>
         </section>

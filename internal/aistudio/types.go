@@ -147,7 +147,8 @@ type SpeechMetadata struct {
 type Content struct {
 	Role  Role   `json:"role"`
 	Parts []Part `json:"parts"`
-	// FromSystem 标记由客户端 system 角色消息转成的一轮（Anthropic Messages 入口把 messages 里的 system 消息包成 <system-reminder> 的用户消息）：
+	// FromSystem 标记由客户端 system 角色消息转成的一轮（Anthropic Messages 入口把 messages 里的 system 消息、Gemini 原生入口把 contents 里
+	// 对话中途 role 为 system、developer 的消息包成 <system-reminder> 的用户消息）：
 	// 它和请求的系统提示一样来自客户端的系统提示，开启视频模型忽略系统提示（api 层 OMNI_IGNORE_SYSTEM_PROMPT）时随系统提示一起去掉；不参与编码
 	FromSystem bool `json:"-"`
 }

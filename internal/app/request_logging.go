@@ -155,7 +155,9 @@ func finishedRequestLog(entry api.AccessLog) (*api.RequestLog, string, string) {
 func disconnectSummary(disconnect *api.RequestDisconnect) string {
 	who := "客户端断开"
 	if disconnect.Initiator != "client" {
-		who = "服务端取消（管理端取消请求或服务停止、重启）"
+		// 停止或重启生成服务时进行中的请求按 503 service_stopped 记为失败（见 service_stopped.go），不经这里；
+		// 已经建立的 Live 会话被关闭时会话上下文的取消仍可能落到这里
+		who = "服务端取消（管理端取消请求，或服务停止、重启时关闭的 Live 会话）"
 	}
 	phase := "首事件前"
 	if disconnect.Phase == "mid_stream" {

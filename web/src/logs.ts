@@ -143,6 +143,46 @@ export function singleItems(rows: readonly LogRow[]): LogItem[] {
   return rows.map((row) => ({ key: row.key, row, members: [row] }))
 }
 
+export type LogLevel = 'INFO' | 'WARN' | 'ERROR'
+
+// eventLevel 把日志级别归一为信息、警告、错误三类
+export function eventLevel(entry: AdminLog): LogLevel {
+  const value = entry.level.toUpperCase()
+  return value === 'WARN' || value === 'ERROR' ? value : 'INFO'
+}
+
+// rowLevel 为行的最终级别（请求行为合并后最后一条事件的级别），决定行的颜色与级别徽标
+export function rowLevel(row: LogRow): LogLevel {
+  return eventLevel(row.entry)
+}
+
+// rowHasLevel 判断行是否属于某个级别的筛选：警告、错误看请求的全部事件，中途换号、冷却写过警告而最终成功的请求
+// 在警告筛选下也能看到；信息仍按最终级别，免得每个出过警告的请求都同时算进信息
+export function rowHasLevel(row: LogRow, level: LogLevel): boolean {
+  if (level === 'INFO') return rowLevel(row) === 'INFO'
+  return row.events.some((event) => eventLevel(event) === level)
+}
+
+// rowMatches 判断行是否含搜索词（query 已去掉首尾空白并转为小写）：合并后的摘要与请求 ID、路径、结束原因，以及请求全部事件的
+// 消息、来源与事件类型，中途事件里的账户名、换号与冷却原因都搜得到
+export function rowMatches(row: LogRow, query: string): boolean {
+  if (rowSummary(row).toLowerCase().includes(query)) return true
+  const request = row.entry.request
+  if (
+    request !== undefined &&
+    [request.id, request.path ?? '', request.finish_reason ?? ''].some((value) =>
+      value.toLowerCase().includes(query),
+    )
+  )
+    return true
+  return row.events.some(
+    (event) =>
+      event.message.toLowerCase().includes(query) ||
+      event.source.toLowerCase().includes(query) ||
+      event.event.toLowerCase().includes(query),
+  )
+}
+
 // rowSummary 生成单行摘要：请求行显示状态、模型、耗时与用量，其余显示消息原文
 export function rowSummary(row: LogRow): string {
   const request = row.entry.request

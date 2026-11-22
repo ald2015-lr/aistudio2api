@@ -35,6 +35,7 @@ func (service *trackedService) Transcribe(
 	}, cancel)
 	request.CandidateAccountIDs, err = service.transcriptionCandidates(requestCtx, request.Model)
 	if err != nil {
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(requestCtx, err)
 		service.requests.finish(request.ID, finalRequestState(err), err)
 		cancel()
@@ -119,6 +120,7 @@ func (service *trackedService) Transcribe(
 	} else {
 		var result aistudio.TranscriptionResult
 		result, err = transcriptions.Transcribe(observed, request)
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogFirstEvent(requestCtx, result.FirstEvent)
 		api.SetAccessLogGenerationResult(
 			requestCtx, &result.Usage, 0,

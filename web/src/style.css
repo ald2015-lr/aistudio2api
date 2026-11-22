@@ -554,6 +554,14 @@ button[aria-busy='true']::before {
     color: #fde68a;
   }
 
+  /* 设备绑定会话（复制出来约 2 小时失效）的账户标记：琥珀色提醒，比额度改用的黄色深一些 */
+  .tag-device-bound {
+    border-color: rgb(245 158 11 / 55%);
+    background: rgb(245 158 11 / 12%);
+    color: #fcd34d;
+    font-family: inherit;
+  }
+
   /* Ultra 号池的标记：账户权益、请求日志、请求摘要与用量记录共用 */
   .tag-ultra {
     border-color: rgb(217 70 239 / 55%);

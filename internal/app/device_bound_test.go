@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -154,5 +155,73 @@ func TestDeviceBoundCountedOnCredentialUpdate(t *testing.T) {
 	}
 	if strings.Contains(logs[0], "secret") {
 		t.Fatalf("日志不应含 Cookie 的值：%s", logs[0])
+	}
+}
+
+// TestDeviceBoundAccountBadge 管理页账户列表的 device_bound_session（账户行“约 2 小时内失效”徽标）与 WARN 同一口径：带 __Secure-1PSIDRTS、
+// 本平台不能用 Chrome 续签材料原地续签（没有材料，或有材料但平台不支持）时为真；普通账户与可原地续签的账户为假，JSON 里省略。
+// 保存新的认证状态后按新的一份判断
+func TestDeviceBoundAccountBadge(t *testing.T) {
+	previous := deviceBoundRenewSupported
+	t.Cleanup(func() { deviceBoundRenewSupported = previous })
+	deviceBoundRenewSupported = func() bool { return true }
+	admin, _, accounts := enableTestAdmin(t, "plain@example.com", "copied@example.com", "chrome@example.com")
+	save := func(accountID string, state aistudio.StorageState) {
+		t.Helper()
+		lease, err := admin.pool.AcquireAccount(context.Background(), accountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := lease.SaveStorageState(state); err != nil {
+			t.Fatal(err)
+		}
+		if err := lease.Release(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bound := func(state aistudio.StorageState) aistudio.StorageState {
+		state.Cookies = append(state.Cookies, aistudio.StateCookie{Name: deviceBoundCookie, Value: "bound-secret-value", Domain: ".google.com", Path: "/"})
+		return state
+	}
+	save(accounts[1].ID, bound(authTestState(t, "COPIED", false)))
+	save(accounts[2].ID, bound(authTestState(t, "CHROME", true)))
+	badges := func() (map[string]bool, string) {
+		t.Helper()
+		list, err := admin.Accounts(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(list)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := map[string]bool{}
+		for _, account := range list {
+			result[account.ID] = account.DeviceBoundSession
+		}
+		return result, string(encoded)
+	}
+
+	got, encoded := badges()
+	if got[accounts[0].ID] || !got[accounts[1].ID] || got[accounts[2].ID] {
+		t.Fatalf("能原地续签的平台上只有没有续签材料的设备绑定会话显示徽标：%v", got)
+	}
+	if strings.Count(encoded, `"device_bound_session":true`) != 1 || strings.Contains(encoded, `"device_bound_session":false`) {
+		t.Fatalf("JSON 应只为会失效的账户写 device_bound_session，其余省略：%s", encoded)
+	}
+	if strings.Contains(encoded, "secret") || strings.Contains(encoded, "refresh") {
+		t.Fatalf("账户列表不应含 Cookie 或续签材料的值：%s", encoded)
+	}
+
+	// 不能原地续签的平台（非 Windows）：带续签材料的设备绑定会话同样会失效
+	deviceBoundRenewSupported = func() bool { return false }
+	if got, _ = badges(); got[accounts[0].ID] || !got[accounts[1].ID] || !got[accounts[2].ID] {
+		t.Fatalf("不能原地续签的平台上设备绑定会话都显示徽标：%v", got)
+	}
+
+	// 重新登录后不再是设备绑定会话：徽标消失
+	save(accounts[1].ID, authTestState(t, "RELOGIN", false))
+	if got, _ = badges(); got[accounts[1].ID] {
+		t.Fatalf("保存新的认证状态后应按新的一份判断：%v", got)
 	}
 }

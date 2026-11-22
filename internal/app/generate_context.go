@@ -220,6 +220,9 @@ type generateContext struct {
 	heldProgress time.Time
 	heldQuiet    func(now, progress time.Time) time.Duration
 	heldFor      time.Duration
+	// serviceStopped 为结束这个请求的是生成服务停止或重启（见 stopService）：Err() 照旧是 context.Canceled，换号循环、取消诊断不变，
+	// 只在请求的最终出口经 endedRequestError 换成 serviceStoppedError
+	serviceStopped bool
 }
 
 var _ context.Context = (*generateContext)(nil)
@@ -299,9 +302,40 @@ func (c *generateContext) AfterFunc(f func()) func() bool {
 	}
 }
 
-// cancel 以 context.Canceled 结束（管理端取消、生成服务停止、降级判定拒绝、转发结束）
+// cancel 以 context.Canceled 结束（管理端取消、降级判定拒绝、转发结束；生成服务停止用 stopService）
 func (c *generateContext) cancel() {
 	c.finish(context.Canceled, nil)
+}
+
+// stopService 为生成服务停止或重启时结束请求：与 cancel 一样以 context.Canceled 结束，另记下是服务停止结束的（stoppedByService）。
+// 已经因为别的原因结束（客户端先断开、期限先到期、管理端先取消）时什么都不做，那些请求照旧按原来的原因结束。父上下文的结束经
+// context.AfterFunc 在新 goroutine 里才传到这里（见 newGenerateContext）：父上下文已经结束、回调还没执行时按父上下文的原因结束，
+// 不记成服务停止（客户端先断开的请求仍按 499 取消，不按 503 service_stopped）
+func (c *generateContext) stopService() {
+	// 在 mu 外读父上下文（与 newGenerateContext 登记的回调相同），不在持有 mu 时取父上下文的锁
+	if err := c.parent.Err(); err != nil {
+		c.finish(err, nil)
+		return
+	}
+	c.mu.Lock()
+	if c.err != nil {
+		c.mu.Unlock()
+		return
+	}
+	c.serviceStopped = true
+	after := c.finishLocked(context.Canceled, nil)
+	c.mu.Unlock()
+	after()
+}
+
+// stoppedByService 判断请求是不是被生成服务停止或重启结束的（见 stopService）；nil 安全
+func (c *generateContext) stoppedByService() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.serviceStopped
 }
 
 // finish 以 err 结束，cause 为本服务期限到期时是哪一段（其他原因为 nil）；已结束时什么都不做并返回 false

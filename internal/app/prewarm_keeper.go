@@ -383,7 +383,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		drains[index] = workers.drainOf(target.accountID)
 		go func(index int, target victim) {
 			defer closes.Done()
-			evicted, err := workers.evictIdleWorker(ctx, target.accountID)
+			evicted, err := workers.evictIdleWorkerFor(ctx, target.accountID, workerStopCoolingSweep)
 			workers.releaseVictim(target.accountID)
 			if err != nil {
 				if ctx.Err() == nil {
@@ -536,7 +536,7 @@ func (service *trackedService) rotatePartition(
 			continue
 		}
 		drain := workers.drainOf(accountID)
-		evicted, err := workers.evictIdleWorker(ctx, accountID)
+		evicted, err := workers.evictIdleWorkerFor(ctx, accountID, workerStopCoolingRotation)
 		workers.releaseVictim(accountID)
 		if err != nil {
 			service.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 冷却轮换失败 | 错误=%v", err))

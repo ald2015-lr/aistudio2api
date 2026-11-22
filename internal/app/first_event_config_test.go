@@ -12,7 +12,7 @@ import (
 	"github.com/Mag1cFall/AIStudio2API/internal/config"
 )
 
-// TestUpdateRuntimeConfigFirstEventTimeout 管理页面保存首事件超时：正数时长与 0 写入 .env，旧版页面不带该字段时沿用现值，
+// TestUpdateRuntimeConfigFirstEventTimeout 管理页面保存首事件超时：正数时长、整数秒、0 与 off 写入 .env，旧版页面不带该字段时沿用现值，
 // 负数或不小于请求超时返回 400 invalid_config；该字段可热更新
 func TestUpdateRuntimeConfigFirstEventTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -46,7 +46,16 @@ func TestUpdateRuntimeConfigFirstEventTimeout(t *testing.T) {
 	if _, err := admin.UpdateRuntimeConfig(ctx, value); err != nil || load() != 0 {
 		t.Fatalf("保存 0s 应关闭：%s err=%v", load(), err)
 	}
-	for _, invalid := range []string{"-5s", "abc", "5m"} {
+	// 上游 Mag1cFall/AIStudio2API 的写法：整数秒与 off（原先直接报 400）
+	value.FirstEventTimeout = "60"
+	if saved, err := admin.UpdateRuntimeConfig(ctx, value); err != nil || load() != time.Minute || saved.FirstEventTimeout != "1m0s" {
+		t.Fatalf("保存 60 应按 60 秒：返回 %q，.env %s err=%v", saved.FirstEventTimeout, load(), err)
+	}
+	value.FirstEventTimeout = "off"
+	if _, err := admin.UpdateRuntimeConfig(ctx, value); err != nil || load() != 0 {
+		t.Fatalf("保存 off 应关闭：%s err=%v", load(), err)
+	}
+	for _, invalid := range []string{"-5s", "-5", "abc", "5m", "300"} {
 		value.FirstEventTimeout = invalid
 		_, err := admin.UpdateRuntimeConfig(ctx, value)
 		var operation *adminOperationError

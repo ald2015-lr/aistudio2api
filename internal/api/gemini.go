@@ -458,6 +458,8 @@ func (s *server) handleGeminiAction(w http.ResponseWriter, r *http.Request) {
 		writeGeminiInvalid(w, err)
 		return
 	}
+	// 转换之后不再读原始 contents 与系统指令（之后只用 generateRequest）：放掉它们，之后在这里再读 request 时也不会让原文常驻
+	request.Contents, request.SystemInstruction, request.SystemInstructionSnake = nil, nil, nil
 	// 历史函数调用的签名缺失或为占位值（new-api 回程丢掉真签名，下一轮写 context_engineering_is_the_way_to_go）时，
 	// 按调用 ID（new-api 原样带回本服务输出的 call_local_*）补回本进程在同一模型、号池签发过的真实签名，Gemini 3 才能拿到前几步的思考上下文（见 thoughtSignatureStore）
 	if restored := s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents); restored > 0 {
@@ -486,21 +488,35 @@ func (request geminiRequest) toGenerateRequest(id string, model string) (aistudi
 	}
 	var system string
 	if request.SystemInstruction != nil {
-		parts, _, err := mapGeminiParts(nonEmptyGeminiParts(request.SystemInstruction.Parts))
-		if err != nil {
-			return aistudio.GenerateRequest{}, fmt.Errorf("systemInstruction: %w", err)
+		var err error
+		if system, err = geminiSystemText(request.SystemInstruction.Parts, "systemInstruction"); err != nil {
+			return aistudio.GenerateRequest{}, err
 		}
-		var text strings.Builder
-		for _, part := range parts {
-			if part.Text == "" && (part.InlineData != nil || part.File != nil || part.FunctionCall != nil || part.FunctionResult != nil) {
-				return aistudio.GenerateRequest{}, fmt.Errorf("systemInstruction must contain text")
-			}
-			text.WriteString(part.Text)
-		}
-		system = text.String()
 	}
 	contents := make([]aistudio.Content, 0, len(request.Contents))
 	for _, content := range request.Contents {
+		if content.Role == "system" || content.Role == "developer" {
+			// contents 里 role 为 system、developer 的消息（中转与 Agent 框架按 OpenAI 写法转来的系统消息，原先按不支持的角色返回 400）：
+			// 出现在任何对话消息之前的并入系统指令（另起一行接在 systemInstruction 之后）；对话中途的留在原位，与 Anthropic 的 system 角色消息
+			// 一样以 <system-reminder> 包成单独一轮用户消息并标记 FromSystem（视频模型忽略系统提示时整轮去掉，与普通消息不合并），
+			// 不像上游 Mag1cFall/AIStudio2API 529043e 那样并进相邻的用户消息
+			text, err := geminiSystemText(content.Parts, content.Role+" content")
+			if err != nil {
+				return aistudio.GenerateRequest{}, err
+			}
+			switch {
+			case strings.TrimSpace(text) == "":
+			case len(contents) == 0 && system == "":
+				system = text
+			case len(contents) == 0:
+				system += "\n" + text
+			default:
+				contents = append(contents, aistudio.Content{
+					Role: aistudio.RoleUser, Parts: []aistudio.Part{{Text: aistudio.SystemReminderOpen + text + aistudio.SystemReminderClose}}, FromSystem: true,
+				})
+			}
+			continue
+		}
 		parts, hasResult, err := mapGeminiParts(content.Parts)
 		if err != nil {
 			return aistudio.GenerateRequest{}, err
@@ -703,6 +719,23 @@ func mapGeminiSpeechConfig(input *geminiSpeechConfig) (*aistudio.SpeechConfig, e
 	return config, nil
 }
 
+// geminiSystemText 拼接系统指令（systemInstruction，或 contents 里 role 为 system、developer 的消息）的文本：空分段忽略，只接受文本，
+// 各分段按原样首尾相连；field 为出错时说明里的字段名
+func geminiSystemText(input []geminiPart, field string) (string, error) {
+	parts, _, err := mapGeminiParts(nonEmptyGeminiParts(input))
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", field, err)
+	}
+	var text strings.Builder
+	for _, part := range parts {
+		if part.Text == "" && (part.InlineData != nil || part.File != nil || part.FunctionCall != nil || part.FunctionResult != nil) {
+			return "", fmt.Errorf("%s must contain text", field)
+		}
+		text.WriteString(part.Text)
+	}
+	return text.String(), nil
+}
+
 func geminiRole(role string) (aistudio.Role, error) {
 	switch role {
 	case "", "user":
@@ -761,6 +794,8 @@ func mapGeminiParts(input []geminiPart) ([]aistudio.Part, bool, error) {
 			if err != nil {
 				return nil, false, fmt.Errorf("inlineData.data: %w", err)
 			}
+			// 解码后放掉 base64 原文：转换其余分段期间不再同时持有原文与解码结果（之后没有地方再读 inlineData.data）
+			inline.Data = ""
 			parts = append(parts, aistudio.Part{
 				// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）
 				InlineData:       normalizedImageBlob(attachmentMIME(mime, data), data),
@@ -885,6 +920,8 @@ func geminiFunctionResponseMedia(input []geminiPart) ([]aistudio.Part, error) {
 			if err != nil {
 				return nil, fmt.Errorf("functionResponse.parts[%d].inlineData.data: %w", index, err)
 			}
+			// 与 mapGeminiParts 相同，解码后放掉 base64 原文
+			inline.Data = ""
 			media = append(media, aistudio.Part{InlineData: normalizedImageBlob(mime, data), FromToolResult: true})
 		case file != nil && inline == nil:
 			uri := file.URI()

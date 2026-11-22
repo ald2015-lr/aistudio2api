@@ -55,6 +55,9 @@ export interface Account {
   // active_requests 为收尾期间进行中的请求数（登录、验证等独占操作不计入，draining 而它为 0 时在等这些操作结束）
   transition?: AccountTransition
   active_requests?: number
+  // device_bound_session 表示认证文件是设备绑定会话（带 __Secure-1PSIDRTS），复制出来约 2 小时后失效：服务端所在平台不能用 Chrome
+  // 续签材料原地续签（与启动、导入时“设备绑定会话”那行 WARN 同一口径）；不是时没有这个字段
+  device_bound_session?: boolean
 }
 
 // AccountTransition 为账户启停之后的后台收尾阶段

@@ -3,8 +3,10 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
@@ -281,6 +283,9 @@ func (admin *runtimeAdmin) resumeTransition(accountID string, stage aistudio.Acc
 	admin.resumeTransitionLocked(accountID, stage)
 }
 
+// finishDisableReleasedHook 非空时 finishDisable 在释放收尾的独占租约之后、写结束行之前以账户 ID 调用它，只供测试在这一段让别的租约改写账户配置
+var finishDisableReleasedHook atomic.Pointer[func(accountID string)]
+
 // finishDisable 为停用的收尾（阶段 draining）：登记独占等待（账户已停用，不再发出新的生成租约），等进行中的请求都结束、取得独占租约后
 // 关闭 Worker 并重建固定出口（关闭旧出口的空闲连接），与原先保存账户在租约内做的相同。ctx 结束（再次启停、删除、实例关闭）时放弃等待。
 // 取得独占租约时账户可能正由预热这类不持有租约的启动打开 Worker（期间持有 startupMu，最长约 INIT_TIMEOUT）：先可取消地等启动结束
@@ -288,6 +293,7 @@ func (admin *runtimeAdmin) resumeTransition(accountID string, stage aistudio.Acc
 // 就地重新导入都排在后面，刚启动好的浏览器还会被关掉；等启动期间被取消时不关闭 Worker（再启用的账户留着它，删除与实例关闭自己关闭）
 func (admin *runtimeAdmin) finishDisable(ctx context.Context, accountID string, label string) {
 	defer admin.endTransition(accountID)
+	startedAt := time.Now()
 	reservation, err := admin.pool.ReserveAccount(accountID)
 	if err != nil {
 		return
@@ -301,7 +307,10 @@ func (admin *runtimeAdmin) finishDisable(ctx context.Context, accountID string, 
 	}
 	account := lease.Account()
 	var finishErr error
-	if !account.Config.Enabled {
+	// 在租约内读一次停用状态，释放之后的结束行沿用它：释放后别的租约（例如跟随默认代理的批量保存）可以立即取得账户并整份写配置，
+	// 那时再读 account.Config 没有先后关系
+	disabled := !account.Config.Enabled
+	if disabled {
 		if err := admin.workers.waitOpening(ctx, account.ID); err != nil {
 			if releaseErr := lease.Release(); releaseErr != nil {
 				admin.requests.log(label, "WARN", "账户停用收尾失败 | 错误="+strings.TrimSpace(releaseErr.Error()))
@@ -313,7 +322,7 @@ func (admin *runtimeAdmin) finishDisable(ctx context.Context, accountID string, 
 		if admin.service != nil {
 			admin.service.publishModelAccess()
 		}
-		finishErr = admin.workers.Reset(account.ID)
+		finishErr = admin.workers.ResetFor(account.ID, workerStopDisable)
 		if update, err := admin.headers.prepareUpdate(account, account.Config); err != nil {
 			finishErr = errors.Join(finishErr, err)
 		} else {
@@ -322,6 +331,14 @@ func (admin *runtimeAdmin) finishDisable(ctx context.Context, accountID string, 
 	}
 	if err := errors.Join(finishErr, lease.Release()); err != nil {
 		admin.requests.log(label, "WARN", "账户停用收尾失败 | 错误="+strings.TrimSpace(err.Error()))
+		return
+	}
+	if hook := finishDisableReleasedHook.Load(); hook != nil {
+		(*hook)(accountID)
+	}
+	if disabled {
+		// 收尾的结束行（原先只在失败时写）：进行中的请求都已结束、Worker 已关闭；耗时含等请求结束（参照上游 c77dd89）
+		admin.requests.log(label, "INFO", fmt.Sprintf("账户停用完成 | 耗时=%s", time.Since(startedAt).Round(time.Millisecond)))
 	}
 }
 

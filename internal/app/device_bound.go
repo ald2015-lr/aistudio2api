@@ -14,10 +14,12 @@ import (
 // 不读也不写 Cookie 与续签材料的值。
 // 本服务的 Chrome 导入（OAuthMultilogin 加设备绑定 assertion）在强制设备绑定的账户上签发的 Cookie 可能同样带 __Secure-1PSIDRTS，
 // 但认证扩展里保存了 Chrome OAuth 续签材料，在能原地续签的平台上（authRenewPlatformSupported，目前只有 Windows）遇到 401 会原地续签，
-// 不算“复制出来会失效”：这类账户单独计数、不计入 WARN 的数量与名单，提示语也按平台给出
+// 不算“复制出来会失效”：这类账户单独计数、不计入 WARN 的数量与名单，提示语也按平台给出。
+// 管理页账户列表按同一口径（deviceBoundExpiring）在账户行显示“2 小时内失效”的徽标（api.AdminAccount.DeviceBoundSession）：
+// 判断所需的两项在账户池构建状态时算好并缓存在账户上（见 aistudio.Account.deviceBoundLocked），列表轮询不重复解析认证扩展
 const (
 	// deviceBoundCookie 为设备绑定会话的 Cookie 名
-	deviceBoundCookie = "__Secure-1PSIDRTS"
+	deviceBoundCookie = aistudio.DeviceBoundCookie
 	// deviceBoundSampleLimit 为日志里最多列出的账户数
 	deviceBoundSampleLimit = 5
 )
@@ -27,18 +29,18 @@ var deviceBoundRenewSupported = authRenewPlatformSupported
 
 // deviceBoundSession 判断认证状态是否带设备绑定会话的 Cookie（只看名字）
 func deviceBoundSession(state aistudio.StorageState) bool {
-	for _, cookie := range state.Cookies {
-		if cookie.Name == deviceBoundCookie {
-			return true
-		}
-	}
-	return false
+	return state.DeviceBoundSession()
 }
 
 // chromeRenewalMaterial 判断认证状态的认证扩展里是否保存了 Chrome OAuth 续签材料（只看有没有，不读值）
 func chromeRenewalMaterial(state aistudio.StorageState) bool {
-	extension, _, err := state.AuthExtension()
-	return err == nil && extension.OAuth != nil
+	return state.HasChromeRenewal()
+}
+
+// deviceBoundExpiring 判断设备绑定会话复制出来是否会在约 2 小时后失效：带设备绑定 Cookie，且不能在本平台用 Chrome 续签材料原地续签
+// （没有续签材料，或有材料但本平台不能续签）。WARN 的计数与名单、管理页的徽标都按它
+func deviceBoundExpiring(session bool, material bool) bool {
+	return session && !(material && deviceBoundRenewSupported())
 }
 
 // deviceBoundTally 统计一批认证文件里的设备绑定会话，可并发累加（认证文件更新在后台并发载入）
@@ -60,7 +62,7 @@ func (tally *deviceBoundTally) add(label string, state aistudio.StorageState) {
 	material := chromeRenewalMaterial(state)
 	tally.mu.Lock()
 	defer tally.mu.Unlock()
-	if material && deviceBoundRenewSupported() {
+	if !deviceBoundExpiring(true, material) {
 		tally.renewable++
 		return
 	}

@@ -761,7 +761,7 @@ func (manager *accountWorkerManager) advanceRotation(now time.Time, candidate re
 func (manager *accountWorkerManager) finishRotation(victim retirementCandidate) {
 	accountID := victim.accountID
 	book := &manager.balancedState.rotation
-	evicted, err := manager.evictIdleWorker(manager.lifecycle, accountID)
+	evicted, err := manager.evictIdleWorkerFor(manager.lifecycle, accountID, workerStopBalanced)
 	manager.releaseVictim(accountID)
 	switch {
 	case err != nil:

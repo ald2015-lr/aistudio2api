@@ -15,7 +15,8 @@ import (
 //	OpenAI Chat Completions  system、developer 角色消息（不论在第几条）
 //	Responses                instructions、input 里的 system、developer 消息，以及 previous_response_id 续接带上的系统指令
 //	Anthropic Messages       顶层 system，与 messages 里的 system 角色消息（转成的 <system-reminder> 用户消息整轮去掉，见 aistudio.Content.FromSystem）
-//	Gemini 原生接口          systemInstruction（system_instruction）
+//	Gemini 原生接口          systemInstruction（system_instruction），与 contents 里 role 为 system、developer 的消息（开头的已并入系统指令，
+//	                         中途的转成 <system-reminder> 用户消息，与 Anthropic 一样整轮去掉）
 //	Interactions             system_instruction
 //
 // 去掉的字数写进该请求的管理日志（不写提示原文）；其他消息原样保留，去掉 system 角色消息不留下空轮次。除系统提示外没有任何对话消息时：

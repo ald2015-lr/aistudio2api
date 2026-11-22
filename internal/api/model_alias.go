@@ -41,6 +41,20 @@ const (
 	longOutputPrefix = "long-"
 )
 
+// oneMillionContextSuffix 为 Claude Code 1M 上下文模式加在模型名末尾的标记（如 gemini-4-argon[1m]、gemini-4-argon-xhigh[1m]）。
+// AI Studio 没有对应的模型或开关，按去掉它的模型处理（与上游 Mag1cFall/AIStudio2API 529043e 相同）；原先整个名称当作模型名，返回模型不存在
+const oneMillionContextSuffix = "[1m]"
+
+// trimOneMillionContext 去掉模型名末尾的 [1m]（不分大小写，先去掉首尾空白；之前的空白一并去掉），没有时原样返回。
+// 在其他后缀与 long- 前缀之前处理：之后的后缀解析、改用其他模型、权益规则、号池选号与请求日志、用量账本都按去掉后的名称
+func trimOneMillionContext(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if len(trimmed) > len(oneMillionContextSuffix) && strings.EqualFold(trimmed[len(trimmed)-len(oneMillionContextSuffix):], oneMillionContextSuffix) {
+		return strings.TrimSpace(trimmed[:len(trimmed)-len(oneMillionContextSuffix)])
+	}
+	return name
+}
+
 // cutLongPrefix 去掉名称开头的 long-（不分大小写，先去掉首尾空白与 models/），返回去掉后的名称与是否带前缀；只有前缀时不算
 func cutLongPrefix(name string) (string, bool) {
 	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
@@ -71,7 +85,7 @@ func resolveLongRequestModel(models []aistudio.Model, name string) (model aistud
 // 不剥 Omni 视频后缀（那套写法只对能输出视频的 Omni 模型生效，不看目录分不出来）。
 // 供请求号池的目录里没有这个名称时，在其他号池里按同一套写法找模型（见 app 的 otherPoolHint），只在错误路径上调用
 func RequestModelBases(name string) []string {
-	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	name = trimOneMillionContext(strings.TrimPrefix(strings.TrimSpace(name), "models/"))
 	var bases []string
 	collect := func(name string) {
 		alias := modelAlias{base: name}
@@ -218,7 +232,8 @@ func resolveModelAliasWith(models []aistudio.Model, name string, video bool) (ai
 	// 客户端配置里复制粘贴的模型名常带首尾空白：先去掉再解析，改写后的 request.Model 也是干净的目录 ID。
 	// 去掉 models/ 前缀后再解析：Gemini 与 Interactions 入口已经去掉，OpenAI、Anthropic、Responses 原先带着前缀解析不到，
 	// 后缀不生效、响应里的模型名也与其他协议不一致
-	name = strings.TrimPrefix(strings.TrimSpace(name), "models/")
+	// 末尾的 [1m] 先去掉（见 trimOneMillionContext）
+	name = trimOneMillionContext(strings.TrimPrefix(strings.TrimSpace(name), "models/"))
 	alias := modelAlias{base: name}
 	for {
 		if model, ok := byID(alias.base); ok {
@@ -523,6 +538,12 @@ func (s *server) refreshAliasCatalogAsync(cache *aliasCatalogCache, scope aistud
 // 模型目录整理视频设置（见 applyOmniVideoAlias），视频设置不成立时返回参数错误。
 // 返回是否需要隐藏思维链。未知模型保持原样，由上游返回原有错误。
 func (s *server) applyModelAlias(ctx context.Context, request *aistudio.GenerateRequest) (bool, error) {
+	// 末尾的 [1m] 不论目录取不取得到、是不是文本对话模型都先去掉：生成服务的改用其他模型、权益规则、选号与请求日志都按去掉后的名称
+	if trimmed := trimOneMillionContext(request.Model); trimmed != request.Model {
+		request.InfoNotes = append(request.InfoNotes, fmt.Sprintf("模型名 %s 末尾的 [1m]（Claude Code 1M 上下文模式的标记）已去掉，按 %s 处理",
+			strings.TrimSpace(request.Model), trimmed))
+		request.Model = trimmed
+	}
 	models, err := s.aliasCatalogFor(ctx, request.Model)
 	if err != nil {
 		return false, nil
@@ -633,6 +654,8 @@ func responseModel(request aistudio.GenerateRequest) string {
 
 // resolveModelName 把带后缀的名称换成目录模型名，供计数等只需要模型名的接口使用
 func (s *server) resolveModelName(ctx context.Context, name string) string {
+	// 末尾的 [1m] 在目录取不到时也去掉，与生成请求（见 applyModelAlias）按同一个模型
+	name = trimOneMillionContext(name)
 	models, err := s.aliasCatalogFor(ctx, name)
 	if err != nil {
 		return name

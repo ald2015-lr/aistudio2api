@@ -409,6 +409,8 @@ type accountWorkerPreparer struct {
 	pending        bool
 	// source 为冷启动的来源（预热、替补、扩容、按需、补覆盖、重开，见 worker_start_source.go），写进“WAA Worker 就绪”
 	source string
+	// cause 为新 Worker 的槽位从哪来（空槽位、替换、原槽位，见 worker_stop_cause.go），发布前由 ensureWorker 设置，写进“WAA Worker 就绪”的“起因=”
+	cause string
 }
 
 type accountWorkerUpdate struct {
@@ -694,7 +696,7 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 	if victim == "" {
 		return false
 	}
-	evicted, err := manager.evictReservedVictim(manager.lifecycle, victim)
+	evicted, err := manager.evictReservedVictim(manager.lifecycle, victim, workerStopIdleReclaim)
 	manager.releaseVictim(victim)
 	manager.rebalanceMu.Lock()
 	if manager.reaping[partition]--; manager.reaping[partition] <= 0 {
@@ -792,7 +794,7 @@ func (manager *accountWorkerManager) finishOpening(accountID string, opening cha
 }
 
 // waitOpening 等账户正在进行的 Worker 启动结束（启动占位 openings 撤销），没有在启动时立即返回；ctx 结束时返回它的错误。
-// 预热这类不持有账户租约的启动在启动期间一直持有该账户的 startupMu（最长约 INIT_TIMEOUT），Reset 在 startupMu 上等它、不能取消；
+// 预热这类不持有账户租约的启动在启动期间一直持有该账户的 startupMu（最长约 INIT_TIMEOUT），ResetFor 在 startupMu 上等它、不能取消；
 // 停用收尾（finishDisable）先在这里可取消地等，再次启停、删除时立即放弃
 func (manager *accountWorkerManager) waitOpening(ctx context.Context, accountID string) error {
 	for {
@@ -830,8 +832,13 @@ func (manager *accountWorkerManager) Add(account *aistudio.Account) error {
 	return nil
 }
 
-// Reset 关闭账户当前 WAA worker 并保留重建配置
+// Reset 关闭账户当前 WAA worker 并保留重建配置，停止日志不写起因（测试用；运行代码用 ResetFor 写明起因）
 func (manager *accountWorkerManager) Reset(accountID string) error {
+	return manager.ResetFor(accountID, "")
+}
+
+// ResetFor 关闭账户当前 WAA worker 并保留重建配置；cause 为停止日志的“起因=”（见 worker_stop_cause.go），为空时不写
+func (manager *accountWorkerManager) ResetFor(accountID string, cause string) error {
 	manager.mu.RLock()
 	account := manager.accounts[accountID]
 	manager.mu.RUnlock()
@@ -852,18 +859,18 @@ func (manager *accountWorkerManager) Reset(accountID string) error {
 	} else if account.cleanupWorker != nil {
 		pid = account.cleanupWorker.State().PID
 	}
-	manager.requests.log(account.label, "INFO", fmt.Sprintf("WAA Worker 停止 | PID=%d", pid))
+	manager.requests.log(account.label, "INFO", fmt.Sprintf("WAA Worker 停止 | PID=%d%s", pid, workerCauseField(cause)))
 	err := manager.closeAccountWorker(account)
 	if err != nil {
 		manager.requests.log(account.label, "ERROR", fmt.Sprintf(
-			"WAA Worker 停止失败 | PID=%d | 耗时=%s | 错误=%s",
-			pid, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
+			"WAA Worker 停止失败 | PID=%d | 耗时=%s%s | 错误=%s",
+			pid, time.Since(startedAt).Round(time.Millisecond), workerCauseField(cause), strings.TrimSpace(err.Error()),
 		))
 		return err
 	}
 	manager.requests.log(account.label, "INFO", fmt.Sprintf(
-		"WAA Worker 已停止 | PID=%d | 耗时=%s",
-		pid, time.Since(startedAt).Round(time.Millisecond),
+		"WAA Worker 已停止 | PID=%d | 耗时=%s%s",
+		pid, time.Since(startedAt).Round(time.Millisecond), workerCauseField(cause),
 	))
 	return err
 }
@@ -912,17 +919,18 @@ func (manager *accountWorkerManager) ResetIfGeneration(
 	} else if account.cleanupWorker != nil {
 		pid = account.cleanupWorker.State().PID
 	}
-	manager.requests.log(account.label, "INFO", fmt.Sprintf("WAA Worker 停止 | PID=%d", pid))
+	cause := workerCauseField(workerStopRecovery)
+	manager.requests.log(account.label, "INFO", fmt.Sprintf("WAA Worker 停止 | PID=%d%s", pid, cause))
 	if err := manager.closeAccountWorker(account); err != nil {
 		manager.requests.log(account.label, "ERROR", fmt.Sprintf(
-			"WAA Worker 停止失败 | PID=%d | 耗时=%s | 错误=%s",
-			pid, time.Since(startedAt).Round(time.Millisecond), strings.TrimSpace(err.Error()),
+			"WAA Worker 停止失败 | PID=%d | 耗时=%s%s | 错误=%s",
+			pid, time.Since(startedAt).Round(time.Millisecond), cause, strings.TrimSpace(err.Error()),
 		))
 		return false, err
 	}
 	manager.requests.log(account.label, "INFO", fmt.Sprintf(
-		"WAA Worker 已停止 | PID=%d | 耗时=%s",
-		pid, time.Since(startedAt).Round(time.Millisecond),
+		"WAA Worker 已停止 | PID=%d | 耗时=%s%s",
+		pid, time.Since(startedAt).Round(time.Millisecond), cause,
 	))
 	return true, nil
 }
@@ -1000,7 +1008,7 @@ func (manager *accountWorkerManager) ResetAll() error {
 		resets.Add(1)
 		go func(accountID string) {
 			defer resets.Done()
-			resetResults <- manager.Reset(accountID)
+			resetResults <- manager.ResetFor(accountID, workerStopService)
 		}(accountID)
 	}
 	resets.Wait()
@@ -1537,14 +1545,15 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 	label := preparer.account.label
 	preparer.account.mu.Unlock()
 	preparer.manager.notifyScheduling()
-	// 末尾写启动来源，诊断按来源统计冷启动（预热、替补、扩容、按需、补覆盖、重开）
+	// 末尾写启动来源，诊断按来源统计冷启动（预热、替补、扩容、按需、补覆盖、重开）；之后写槽位的起因（空槽位、替换、原槽位）
 	source := ""
 	if preparer.source != "" {
 		source = " | 来源=" + preparer.source
 	}
 	preparer.manager.requests.log(label, "INFO", fmt.Sprintf(
-		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s%s",
+		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s%s%s",
 		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond), source,
+		workerCauseField(preparer.cause),
 	))
 	preparer.pending = false
 	preparer.account.startupMu.Unlock()
@@ -1661,19 +1670,19 @@ func (manager *accountWorkerManager) idleWarmVictimFor(excludeID string, modelID
 	return manager.pickIdleVictim(excludeID, modelID, mode, partition)
 }
 
-// errWorkerAccountMissing 为 Worker 管理器里已经没有这个账户（已删除，见 Reset）
+// errWorkerAccountMissing 为 Worker 管理器里已经没有这个账户（已删除，见 ResetFor）
 var errWorkerAccountMissing = errors.New("WAA worker 账户不存在")
 
 // evictReservedVictim 在 rebalanceMu 外淘汰已预留的 victim（空闲回收与按需替换）。victim 在淘汰期间被删除时按已淘汰处理、不算错误：
-// 删除（单个、批量删除与账户目录移走）先在账户池里取得独占、在回调里关闭它的 Worker（workers.Reset）、移出账户池，最后才从管理器移除，
-// 于是这里取账户租约得到 aistudio.ErrAccountNotFound、账户池里也已没有它（Worker 已由删除流程关闭），或者取得租约后 Reset 得到
+// 删除（单个、批量删除与账户目录移走）先在账户池里取得独占、在回调里关闭它的 Worker（workers.ResetFor，起因为删除）、移出账户池，最后才从管理器移除，
+// 于是这里取账户租约得到 aistudio.ErrAccountNotFound、账户池里也已没有它（Worker 已由删除流程关闭），或者取得租约后 ResetFor 得到
 // errWorkerAccountMissing（管理器已移除）。关闭期间账户锁被占着，仍按 1 个槽位计入占用。原先淘汰持有 rebalanceMu，删除要等淘汰结束，
 // 遇不到这种情况；现在按错误返回会让按需替换关掉已经启动好的新浏览器、请求失败，空闲回收写一条失败日志。
 // 取租约得到 ErrAccountNotFound 而账户还在账户池里时不算已淘汰（errVictimFilesMissing）：账户的 account.json 或认证文件被外部移走、
 // 目录扫描还没把它移出（单个缺失约 20 秒，批量缺失约 1 分钟），它的 Worker 还活着。原先一律按已淘汰处理，空闲回收原地空转、
 // 每轮写一条“空闲回收”，按需替换不关旧浏览器就发布新的，驻留数超过峰值
-func (manager *accountWorkerManager) evictReservedVictim(ctx context.Context, victim string) (bool, error) {
-	evicted, err := manager.evictIdleWorker(ctx, victim)
+func (manager *accountWorkerManager) evictReservedVictim(ctx context.Context, victim string, cause string) (bool, error) {
+	evicted, err := manager.evictIdleWorkerFor(ctx, victim, cause)
 	switch {
 	case evicted && errors.Is(err, errWorkerAccountMissing):
 		return true, nil
@@ -1745,7 +1754,8 @@ func (manager *accountWorkerManager) replacementFitsLocked(partition aistudio.Po
 	return slots <= manager.maxActiveFor(partition)
 }
 
-func (manager *accountWorkerManager) evictIdleWorker(ctx context.Context, accountID string) (bool, error) {
+// evictIdleWorkerFor 取得账户租约后关闭账户的空闲 Worker；cause 为停止日志的“起因=”（见 worker_stop_cause.go）
+func (manager *accountWorkerManager) evictIdleWorkerFor(ctx context.Context, accountID string, cause string) (bool, error) {
 	evictionCtx, cancel := context.WithTimeout(ctx, workerEvictionTimeout)
 	defer cancel()
 	lease, err := manager.pool.AcquireAccount(evictionCtx, accountID)
@@ -1758,7 +1768,7 @@ func (manager *accountWorkerManager) evictIdleWorker(ctx context.Context, accoun
 	if err := ctx.Err(); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
-	resetErr := manager.Reset(accountID)
+	resetErr := manager.ResetFor(accountID, cause)
 	releaseErr := lease.Release()
 	return true, errors.Join(resetErr, releaseErr)
 }
@@ -1872,6 +1882,10 @@ func (manager *accountWorkerManager) ensureWorker(
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					err = errors.Join(ctxErr, discardAccountWorker(preparer))
 				} else {
+					preparer.cause = workerReadyFreeSlot
+					if replacing {
+						preparer.cause = workerReadyOwnSlot
+					}
 					err = activateAccountWorker(preparer)
 				}
 			}
@@ -1963,6 +1977,10 @@ func (manager *accountWorkerManager) ensureWorker(
 		}
 		// publish 在 rebalanceMu 内发布新 Worker 并结束启动占位（调用方已加锁，返回前解锁），kind 为日志里的“按需替换”或“按需扩容”
 		publish := func(kind string) (aistudio.ProtectedPreparer, error) {
+			pending.cause = workerReadyFreeSlot
+			if kind == "按需替换" {
+				pending.cause = workerReadyReplace
+			}
 			activationErr := activateAccountWorker(pending)
 			manager.finishOpening(accountID, opening)
 			warmCount := len(manager.warmAccountIDsIn(partition))
@@ -2010,7 +2028,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			// 锁外淘汰（关一个浏览器要几秒，原先持有 rebalanceMu，期间所有账户的冷启动、扩容、替换与移除都要排队）：
 			// victim 已预留，其他淘汰路径不会再选它；本账户的启动占位一直保留，victim 的 Worker 关完之前也照常计入占用
 			// （occupiedWorkersIn），期间分区不会多放出槽位。发布新 Worker 与结束占位仍在 rebalanceMu 内一起完成
-			evicted, evictionErr := manager.evictReservedVictim(ctx, victim)
+			evicted, evictionErr := manager.evictReservedVictim(ctx, victim, workerStopReplace)
 			if errors.Is(evictionErr, errVictimFilesMissing) && ctx.Err() == nil {
 				// 淘汰对象的账户文件被外部移走、还在账户池里（Worker 还活着）：不算淘汰，换下一个对象，新浏览器照常等。它保持预留到这次
 				// 替换结束：它已不可调度、排在选号最前，解除预留的话下一轮又选回它，在它身上原地空转。目录扫描移出它时由移出流程关闭它的 Worker
@@ -3779,6 +3797,7 @@ func (service *trackedService) CountTokens(ctx context.Context, request aistudio
 	}
 	defer cancel()
 	count, requestErr := service.service.CountTokens(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return count, requestErr
 }
@@ -3833,6 +3852,7 @@ func (service *trackedService) GenerateVideo(ctx context.Context, request aistud
 		request.AllowedAccountIDs = service.videoCandidates(requestCtx, request.Model)
 	}
 	operation, requestErr := video.GenerateVideo(requestCtx, request)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	if requestErr == nil && selectedAccountID != "" {
 		service.markModelAccessVerifiedAsync(
 			selectedAccountID, selectedAccountLabel,
@@ -3912,6 +3932,7 @@ func (service *trackedService) GetGenerateVideoOperation(ctx context.Context, op
 		return aistudio.VideoOperation{}, fmt.Errorf("video service 不可用")
 	}
 	operation, requestErr := video.GetGenerateVideoOperation(requestCtx, operationID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return operation, requestErr
 }
@@ -3928,24 +3949,31 @@ func (service *trackedService) DownloadFile(ctx context.Context, fileID string) 
 		return aistudio.MediaStream{}, fmt.Errorf("video service 不可用")
 	}
 	media, requestErr := video.DownloadFile(requestCtx, fileID)
+	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	if requestErr != nil {
 		cancel()
 		return aistudio.MediaStream{}, requestErr
 	}
-	media.Body = &trackedMediaReadCloser{body: media.Body, cancel: cancel}
+	media.Body = &trackedMediaReadCloser{body: media.Body, ctx: requestCtx, cancel: cancel}
 	return media, requestErr
 }
 
 type trackedMediaReadCloser struct {
-	body   io.ReadCloser
+	body io.ReadCloser
+	// ctx 为下载请求的上下文：读取中途生成服务停止或重启时，读错误按 serviceStoppedError 返回（见 service_stopped.go）
+	ctx    context.Context
 	cancel context.CancelFunc
 	once   sync.Once
 	err    error
 }
 
 func (closer *trackedMediaReadCloser) Read(target []byte) (int, error) {
-	return closer.body.Read(target)
+	read, err := closer.body.Read(target)
+	if err != nil && err != io.EOF {
+		err = endedRequestError(closer.ctx, err)
+	}
+	return read, err
 }
 
 func (closer *trackedMediaReadCloser) Close() error {
@@ -4889,6 +4917,7 @@ func (service *trackedService) startGenerate(
 		if cut, ok := generateContextFrom(requestCtx).startDeadlineError(err, "文件资源刷新"); ok {
 			err = cut
 		}
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(requestCtx, err)
 		cancel()
 		service.requests.finish(request.ID, finalRequestState(err), err)
@@ -6767,7 +6796,8 @@ func (service *trackedService) generateForModel(
 			service.generateForModel(clientCtx, requestCtx, cancel, generationStartedAt, *next, resourceID, destination, diag, run)
 			return
 		}
-		err = finalErr
+		// 最终出口：生成服务停止或重启结束的请求按 serviceStoppedError 返回（换号循环与改用其他模型都已按原来的取消处理完）
+		err = endedRequestError(requestCtx, finalErr)
 		if activity != nil {
 			api.SetAccessLogUpstreamBytes(requestCtx, activity.bytes.Load())
 		}
@@ -7231,6 +7261,13 @@ func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.As(err, &workerInitError) {
 		return ctx.Err() == nil
 	}
+	// 读上游错误响应体时连接中断（收到了非 200 响应头，错误体没读到，见 aistudio.ResponseReadError）：请求未结束、原因不是取消或超时时
+	// 按一般失败换号（计入连续失败上限并退避）。它不是 RPCError，不按状态码冷却、不算额度失败、不触发 MODEL_FALLBACKS；
+	// 首事件超时取消本次尝试读出的取消错误已在发送处换成 firstEventTimeoutError，原因是超时的照下面的期限规则处理
+	var readError *aistudio.ResponseReadError
+	if errors.As(err, &readError) && ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 	if ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
@@ -7266,10 +7303,14 @@ func (service *trackedService) generateRequestContext(ctx context.Context) (cont
 		maxDuration = max(limit, timeout)
 	}
 	requestCtx := newGenerateContext(ctx, time.Now(), timeout, maxDuration)
-	stopData := context.AfterFunc(service.dataContext, requestCtx.cancel)
+	// 生成服务停止或重启时结束请求并记下原因：最终出口按 serviceStoppedError 返回（见 service_stopped.go）
+	detach := watchServiceStop(service.dataContext, requestCtx.stopService)
 	service.lifecycleMu.Unlock()
 	return requestCtx, func() {
-		stopData()
+		// 生成服务正在停止或重启、登记的回调已经触发时按服务停止结束（见 watchServiceStop）
+		if detach() {
+			requestCtx.stopService()
+		}
 		requestCtx.cancel()
 	}, nil
 }
@@ -7280,12 +7321,18 @@ func (service *trackedService) dataRequestContext(ctx context.Context) (context.
 		service.lifecycleMu.Unlock()
 		return nil, nil, &serviceStoppedError{}
 	}
-	requestCtx, cancel := context.WithTimeout(ctx, time.Duration(service.timeout.Load()))
-	stopData := context.AfterFunc(service.dataContext, cancel)
+	timeoutCtx, cancelTimeout := context.WithTimeout(ctx, time.Duration(service.timeout.Load()))
+	// 生成服务停止或重启时以 errServiceStoppedCause 取消（Err() 仍是 context.Canceled），最终出口按 serviceStoppedError 返回（见 service_stopped.go）
+	requestCtx, cancelCause := context.WithCancelCause(timeoutCtx)
+	detach := watchServiceStop(service.dataContext, func() { cancelCause(errServiceStoppedCause) })
 	service.lifecycleMu.Unlock()
 	return requestCtx, func() {
-		stopData()
-		cancel()
+		// 与 generateRequestContext 相同：生成服务正在停止或重启、登记的回调已经触发时按服务停止结束（见 watchServiceStop）
+		if detach() {
+			cancelCause(errServiceStoppedCause)
+		}
+		cancelCause(context.Canceled)
+		cancelTimeout()
 	}, nil
 }
 
@@ -7390,7 +7437,9 @@ func (service *trackedService) forwardEvents(
 		fallbackModel = diag.fallbackModel
 	}
 	replyBytes := 0
-	terminal := false
+	// terminal 为这次请求的结果已经定下（结束事件、错误事件或换成错误的异常结束），terminalDelivered 为终态事件已经交给下游：
+	// 终态定下之后的事件不再转发，只等上游事件流关闭；终态在交给下游时请求上下文先结束的，terminal 为真而 terminalDelivered 为假
+	terminal, terminalDelivered := false, false
 	accountLabel = lease.Account().Config.Label
 	// 降级判定要知道本次的账号与通道（Build 通道的 CountTokens 在同一账号上计数）
 	guard = diag.guard()
@@ -7454,6 +7503,12 @@ func (service *trackedService) forwardEvents(
 		publishFirstOutput()
 	}
 	finishFromContext := func() {
+		if terminalDelivered {
+			// 终态已经交给下游、只在等上游事件流关闭时请求上下文结束（生成服务停止或重启、客户端断开、管理端取消、总时长上限到期）：
+			// 只结束上游与租约，结果仍按终态记录，不把已完整交出的回复记成失败或取消（与下面空闲期限到期时的终态分支一致）。
+			// 原先这里一律按上下文的错误改写：停服时已完整的回复被记成 503 service_stopped（再早是取消）
+			return
+		}
 		if clientCtx.Err() != nil && !terminal {
 			// 下游（客户端或协议层）先结束了：记下断开前上游的状态，配合 request.finished 的断开现场判断是不是长时间零字节后被掐断
 			now := time.Now()
@@ -7468,7 +7523,7 @@ func (service *trackedService) forwardEvents(
 				"下游已断开，结束转发 | 阶段=流中 | 已用时=%s | 距上游最近事件=%s | 最近事件=%s | 推理=%d | 正文=%d | %s",
 				elapsed, upstreamQuiet, lastEventKind, reasoningEvents, contentEvents, activity.logFields(now)))
 		}
-		requestErr = requestCtx.Err()
+		requestErr = endedRequestError(requestCtx, requestCtx.Err())
 		if cause := phase.deadlineCause(); cause != nil {
 			// 本服务的空闲期限或总时长上限：错误写明是哪一段与已输出的事件数，仍满足 context.DeadlineExceeded（对外 504）
 			cut := cause.withOutput(reasoningEvents, contentEvents)
@@ -7621,6 +7676,9 @@ func (service *trackedService) forwardEvents(
 				requestErr = errors.Join(requestErr, stateErr)
 				event.Err = requestErr
 			}
+			// 账号按原错误处理完之后：生成服务停止或重启结束的请求交给客户端的是 serviceStoppedError（见 service_stopped.go）
+			event.Err = endedRequestError(requestCtx, event.Err)
+			requestErr = event.Err
 			state = finalRequestState(event.Err)
 			terminal = true
 		}
@@ -7687,6 +7745,7 @@ func (service *trackedService) forwardEvents(
 		select {
 		case destination <- event:
 			lastProgress = time.Now()
+			terminalDelivered = terminal
 		case <-requestCtx.Done():
 			finishFromContext()
 			return

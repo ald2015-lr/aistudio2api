@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -234,5 +235,48 @@ func TestEncodeJSONSchemaTypeUnspecified(t *testing.T) {
 	property := wire[6].([]any)[0].([]any)[1].([]any)
 	if property[0] != int64(1) {
 		t.Fatalf("属性 type=%#v，期望按未声明推断为 string", property[0])
+	}
+}
+
+// TestEncodeJSONSchemaStringNumbers minimum、maximum 写成字符串的数字（@google/genai 等 SDK 的写法）按数字编码，与数字写法相同，函数参数
+// 不降级（原先降级编码仍带着这个字符串，函数声明编码失败）；不是数字的字符串与 NaN、Inf 照旧报错
+func TestEncodeJSONSchemaStringNumbers(t *testing.T) {
+	wire, err := encodeJSONSchema(json.RawMessage(`{"type":"number","minimum":"1","maximum":" 2.5 "}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire[10] != float64(1) || wire[11] != 2.5 {
+		t.Fatalf("minimum=%#v maximum=%#v，期望 1 与 2.5", wire[10], wire[11])
+	}
+	// 与数字写法编码结果相同
+	plain, err := encodeJSONSchema(json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","minimum":1,"maximum":10}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	quoted, err := encodeJSONSchema(json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","minimum":"1","maximum":"10"}}}`))
+	if err != nil || fmt.Sprint(quoted) != fmt.Sprint(plain) {
+		t.Fatalf("字符串写法编码为 %v（err=%v），期望与数字写法 %v 相同", quoted, err, plain)
+	}
+	for _, raw := range []string{
+		`{"type":"number","minimum":"abc"}`,
+		`{"type":"number","maximum":""}`,
+		`{"type":"number","minimum":"NaN"}`,
+		`{"type":"number","maximum":"Inf"}`,
+		`{"type":"number","maximum":"1e400"}`,
+		`{"type":"number","minimum":true}`,
+	} {
+		if _, err := encodeJSONSchema(json.RawMessage(raw)); err == nil || !strings.Contains(err.Error(), "必须是数字") {
+			t.Fatalf("%s 应返回“必须是数字”，得到 %v", raw, err)
+		}
+	}
+	declaration, err := encodeFunctionDeclaration(FunctionDeclaration{Name: "pick", Parameters: json.RawMessage(
+		`{"type":"object","properties":{"n":{"type":"integer","minimum":"1","maximum":"10"},"tags":{"type":"array","items":{"type":"string"},"maxItems":"5"}}}`)})
+	if err != nil || declaration[1] != nil {
+		t.Fatalf("字符串数值约束不应触发降级: wire=%v err=%v", declaration, err)
+	}
+	// 不是数字的字符串与原先相同：降级编码同样带着这个约束，仍报参数错误
+	if _, err := encodeFunctionDeclaration(FunctionDeclaration{Name: "pick", Parameters: json.RawMessage(`{"type":"object","properties":{"n":{"type":"integer","minimum":"one"}}}`)}); err == nil ||
+		!strings.Contains(err.Error(), "必须是数字") {
+		t.Fatalf("不是数字的 minimum 应照旧报错，得到 %v", err)
 	}
 }

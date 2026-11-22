@@ -877,6 +877,12 @@ function restrictionReason(restriction: AccountRestriction | undefined): string 
   return key ? t(key) : ''
 }
 
+// deviceBoundBadge 判断账户行是否显示“约 2 小时内失效”：认证文件是复制出来会失效的设备绑定会话（服务端按平台判断，见
+// device_bound_session）；已经需要登录时状态一栏已说明，不再重复
+function deviceBoundBadge(account: Account): boolean {
+  return account.device_bound_session === true && account.state !== 'auth_required'
+}
+
 // accountStateLabel 返回账户状态一栏的文字：org_disabled 按原因种类显示（组织已停用、服务受限等），其余按状态
 function accountStateLabel(account: Account): string {
   if (account.state === 'org_disabled') return restrictionLabel(account.restriction)
@@ -3193,6 +3199,13 @@ function closeBulkPanel(): void {
                     class="mt-0.5 block text-[11px] text-yellow-400"
                     tabindex="0"
                     >{{ transitionText(account) }}</span
+                  >
+                  <span
+                    v-if="deviceBoundBadge(account)"
+                    v-tooltip="t('accounts.deviceBoundHelp')"
+                    class="tag tag-device-bound mt-0.5 max-w-full overflow-hidden text-ellipsis"
+                    tabindex="0"
+                    >{{ t('accounts.deviceBound') }}</span
                   >
                 </td>
                 <td>

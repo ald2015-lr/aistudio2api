@@ -27,6 +27,7 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 	if request.AccountID == "" && len(request.AllowedAccountIDs) == 0 {
 		request.AllowedAccountIDs, err = service.bidiCandidates(requestCtx, request.Model, request.ModelAccessScope)
 		if err != nil {
+			err = endedRequestError(requestCtx, err)
 			api.SetAccessLogError(ctx, err)
 			cancel()
 			return nil, err
@@ -107,6 +108,7 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 	}
 	if err := service.awaitLiveReset(setupCtx, request); err != nil {
 		setupDeadline.stop()
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(ctx, err)
 		cancel()
 		return nil, err
@@ -122,6 +124,7 @@ func (service *trackedService) OpenBidi(ctx context.Context, request aistudio.Bi
 		err = liveSetupExpired(ctx, setupWait)
 	}
 	if err != nil {
+		err = endedRequestError(requestCtx, err)
 		api.SetAccessLogError(ctx, err)
 		cancel()
 		return nil, err
@@ -334,14 +337,18 @@ func (service *trackedService) bidiRequestContext(ctx context.Context) (context.
 		service.lifecycleMu.Unlock()
 		return nil, nil, &serviceStoppedError{}
 	}
-	requestCtx, cancel := context.WithCancel(ctx)
-	stopData := context.AfterFunc(service.dataContext, cancel)
+	// 生成服务停止或重启时以 errServiceStoppedCause 取消（Err() 仍是 context.Canceled），建立会话失败时按 serviceStoppedError 返回
+	requestCtx, cancelCause := context.WithCancelCause(ctx)
+	detach := watchServiceStop(service.dataContext, func() { cancelCause(errServiceStoppedCause) })
 	context.AfterFunc(requestCtx, func() {
-		stopData()
+		detach()
 	})
 	service.lifecycleMu.Unlock()
 	return requestCtx, func() {
-		stopData()
-		cancel()
+		// 与 dataRequestContext 相同：生成服务正在停止或重启、登记的回调已经触发时按服务停止结束（见 watchServiceStop）
+		if detach() {
+			cancelCause(errServiceStoppedCause)
+		}
+		cancelCause(context.Canceled)
 	}, nil
 }

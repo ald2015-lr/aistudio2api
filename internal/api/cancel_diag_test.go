@@ -192,7 +192,7 @@ func TestCancelDiagnosticsRightAfterHeaders(t *testing.T) {
 	}
 }
 
-// TestCancelDiagnosticsServiceInitiated 客户端没有断开、请求以取消结束（管理端取消或服务停止）：仍记 499，断开现场标为服务端取消
+// TestCancelDiagnosticsServiceInitiated 客户端没有断开、请求以取消结束（管理端取消）：仍记 499，断开现场标为服务端取消
 func TestCancelDiagnosticsServiceInitiated(t *testing.T) {
 	admin := &capturingAdmin{}
 	service := &scriptedService{events: []aistudio.Event{{Kind: aistudio.EventError, Err: context.Canceled}}}

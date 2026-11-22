@@ -424,9 +424,15 @@ def end_class(row):
     # 旧版本：app/worker_reset.go workerResetWaitEnded "回到原账号等待 X 后请求超时（…）"
     if "回到原账号等待" in error and "后请求超时" in error:
         return "等 Worker 恢复时请求超时（旧版本，没有本服务前缀）", "queue_timeout"
+    # app/service_stopped.go：停止或重启生成服务时进行中的请求 → 503、state=failed、error 为 serviceStoppedError 的文本
+    # （旧版本按取消记为 499，落到下一条）。服务没在运行时（STOPPED、LAUNCHING、停止步骤中）新到的请求一进来就被拒绝，
+    # 记录同样是 503、state=failed 与这段文本（generateRequestContext、dataRequestContext 直接返回 serviceStoppedError），
+    # 账本分不出这两种；一进来就被拒绝的通常耗时接近 0、没有首事件、没有尝试记录
+    if "AIStudio2API 服务已停止" in error:
+        return "生成服务未运行或停止、重启时结束（503 service_stopped）", "service_stopped"
     # api/middleware.go：context.Canceled 或客户端断开 → 499、state=cancelled（app/request_logging.go requestOutcome）
     if state == "cancelled" or status == 499:
-        return "已取消 499（客户端/中转/代理断开；或服务重启、管理端取消）", "cancel"
+        return "已取消 499（客户端/中转/代理断开、管理端取消；旧版本的服务停止、重启）", "cancel"
     # 旧版本：首事件前期限在换号退避中到期、上一次尝试为协议错误码 4 时 error 只留上游原文（没有本服务前缀；新版本为
     # “本服务首事件前期限 … 到期（停在 换号退避）: <上一次错误>”），看起来像 Google 侧期限。状态 504、没有首事件、耗时已到
     # REQUEST_TIMEOUT（见 LEGACY_BACKOFF_SLACK）仍以码 4 结束的，按本服务首事件前期限算：码 4 是在尝试中返回的，返回后还能换号，
@@ -1195,7 +1201,7 @@ print(f"  有输入指纹的请求：{share(len([r for r in window_rows if r['fp
 print("  指纹 = 协议 + 号池 + 模型 + 消息数 + 文字字数 + 附件数/字节 + 文件数 + 生成参数（不含 seed），来自 request.started/finished 日志"
       "（api/middleware.go）；开启 REQUEST_BODY_LOG 时另用请求正文摘要，任一种相同即算相同输入；账本本身没有输入指纹列")
 CUT_FOR_RETRY = SERVICE_CUT_KINDS + ("timeout_backoff_legacy", "upstream_deadline", "stream_closed", "proto_break", "timeout_legacy", "5xx",
-                                     "timeout_other")
+                                     "timeout_other", "service_stopped")
 groups = collections.defaultdict(list)
 for row in fp_rows:
     for fp, _ in row["fps"]:
@@ -1398,7 +1404,7 @@ else:
         print(f"  \"账号冷却 | … | 已输出内容后\"（流内 429，无法换号）：全部 {len(quota_after_output)} 条，其中对得上 {MODEL} 请求的 {len(mine)}")
     else:
         print("  \"账号冷却 | … | 已输出内容后\"：无")
-    # 生命周期：重启、改配置、停止都会打断进行中的长请求（state=cancelled，看起来和客户端断开一样）
+    # 生命周期：重启、改配置、停止都会打断进行中的长请求（503 service_stopped，state=failed；旧版本为 state=cancelled，看起来和客户端断开一样）
     if lifecycle:
         print("  服务生命周期事件：")
         for entry in lifecycle[-10:]:
@@ -1415,7 +1421,7 @@ else:
                         break
         if hit:
             print(f"    ⚠ {len(hit)} 个失败/取消在停止、改配置重启前后结束（应用新配置最多等 30s，收到停止信号最多等 SHUTDOWN_GRACE=60s）")
-            VERDICTS.append(f"{len(hit)} 个 {MODEL} 请求在服务停止/改配置重启时被打断（第 4 段生命周期），这类在账本里也记为 499 取消")
+            VERDICTS.append(f"{len(hit)} 个 {MODEL} 请求在服务停止/改配置重启时被打断（第 4 段生命周期），这类在账本里记为 503 服务已停止（旧版本记为 499 取消）")
     vanished = []
     running_ids = {item.get("id") for item in active}
     for rid, item in log_req.items():

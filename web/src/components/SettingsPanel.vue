@@ -533,6 +533,19 @@ function durationMillis(value: string): number {
   return matched !== '' && matched === value.trim() ? total : Number.NaN
 }
 
+// firstEventTimeoutMillis 与服务端 ParseFirstEventTimeout 一致：off（不分大小写）与 0 表示关闭，整数按秒（60 即 60s，与上游 Mag1cFall/AIStudio2API 相同），
+// 其余按 Go 时长写法；无法解析或为负数时返回 NaN
+function firstEventTimeoutMillis(value: string): number {
+  const text = value.trim()
+  if (text.toLowerCase() === 'off') return 0
+  const seconds = /^([+-]?)(\d+)$/.exec(text)
+  if (seconds !== null) {
+    const amount = Number(seconds[2])
+    return seconds[1] === '-' && amount !== 0 ? Number.NaN : amount * 1000
+  }
+  return durationMillis(text)
+}
+
 // mediaRetentionMillis 与服务端 ParseMediaRetention 一致：Go 时长写法或整数天数加 d（7d），单独的 0 表示不清理；无法解析时返回 NaN
 function mediaRetentionMillis(value: string): number {
   const text = value.trim().toLowerCase()
@@ -620,8 +633,8 @@ function validate(value: ServiceConfig): string {
   for (const [duration, key] of durations) {
     if (!isDuration(duration)) return tf('settings.invalidDuration', { field: label(key) })
   }
-  // 首事件超时可以为 0（关闭），开启时必须小于请求超时
-  const firstEvent = durationMillis(value.first_event_timeout)
+  // 首事件超时可以为 0 或 off（关闭），整数按秒，开启时必须小于请求超时
+  const firstEvent = firstEventTimeoutMillis(value.first_event_timeout)
   if (
     Number.isNaN(firstEvent) ||
     (firstEvent > 0 && firstEvent >= durationMillis(value.request_timeout))
@@ -880,11 +893,19 @@ async function doSave(includeBlurFields: boolean): Promise<ServiceConfig | null>
     }
     // 留空的密钥由服务端换成默认密钥，表单同步显示，避免一直提示未保存
     if (form.proxy_api_key.trim() === '') form.proxy_api_key = saved.proxy_api_key
-    // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s），时长相同时表单同步显示，避免一直提示未保存
-    for (const key of ['init_timeout', 'request_timeout', 'first_event_timeout'] as const) {
+    // 服务端把时长写成规范形式（3m 保存为 3m0s、90s 保存为 1m30s，首事件超时的 off 保存为 0s、60 保存为 1m0s），
+    // 时长相同时表单同步显示，避免一直提示未保存
+    for (const key of ['init_timeout', 'request_timeout'] as const) {
       if (form[key] !== saved[key] && durationMillis(form[key]) === durationMillis(saved[key])) {
         form[key] = saved[key]
       }
+    }
+    if (
+      form.first_event_timeout !== saved.first_event_timeout &&
+      firstEventTimeoutMillis(form.first_event_timeout) ===
+        firstEventTimeoutMillis(saved.first_event_timeout)
+    ) {
+      form.first_event_timeout = saved.first_event_timeout
     }
     // 媒体设置同样由服务端写成规范形式（168h 保存为 7d、20gb 保存为 20GB、地址去掉末尾的 /），含义相同时表单同步显示
     if (

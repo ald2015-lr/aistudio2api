@@ -551,7 +551,7 @@ func (admin *runtimeAdmin) refreshAccountLogin(ctx context.Context, accountID st
 		}
 		return false, err
 	}
-	if err := admin.workers.Reset(accountID); err != nil {
+	if err := admin.workers.ResetFor(accountID, workerStopCredentials); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
 	if err := lease.SaveStorageState(state); err != nil {
@@ -626,7 +626,7 @@ func (admin *runtimeAdmin) syncImportedCatalogs(ctx context.Context, accounts []
 func (admin *runtimeAdmin) detachAccount(accountID string) error {
 	err := admin.service.changeModels(func() error {
 		_, removeErr := admin.pool.Remove(accountID, func(account *aistudio.Account) error {
-			return admin.workers.Reset(account.ID)
+			return admin.workers.ResetFor(account.ID, workerStopDetach)
 		})
 		return removeErr
 	})
@@ -669,7 +669,7 @@ func (admin *runtimeAdmin) reloadAccountCredentials(ctx context.Context, account
 		return false, accountOperationError(err)
 	}
 	account := lease.Account()
-	if err := admin.workers.Reset(account.ID); err != nil {
+	if err := admin.workers.ResetFor(account.ID, workerStopCredentials); err != nil {
 		return false, errors.Join(err, lease.Release())
 	}
 	if err := lease.SaveStorageState(state); err != nil {

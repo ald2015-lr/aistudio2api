@@ -186,7 +186,7 @@ func (admin *runtimeAdmin) updateImportedAccount(
 	}
 	account := lease.Account()
 	label := account.Config.Label
-	if err := admin.workers.Reset(account.ID); err != nil {
+	if err := admin.workers.ResetFor(account.ID, workerStopReimport); err != nil {
 		return api.AdminAccount{}, errors.Join(err, lease.Release())
 	}
 	if _, err := replaceAccountState(lease, state, ""); err != nil {

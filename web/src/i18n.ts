@@ -128,7 +128,7 @@ const zhCN = {
   'logs.clear': '清空日志',
   'logs.autoScroll': '自动滚动',
   'logs.waiting': '等待日志输出...',
-  'logs.search': '搜索模型、请求 ID、状态码',
+  'logs.search': '搜索模型、请求 ID、账户或消息',
   'logs.running': '处理中',
   'logs.tools': '工具调用',
   'logs.loadOlder': '加载更早日志 ({count})',
@@ -223,7 +223,7 @@ const zhCN = {
     '生成请求在首个上游事件之前的总期限：排队、冷启动、WAA proof、附件上传、等首字与首事件前的换号都计入，到时返回 504。开始输出后改为空闲上限：上游连续这么久既没有事件也没有网络字节才以 504 结束，持续出字的长回复不会被切断；整条生成请求最长 1 小时（本项更长时按本项）。计数、视频与转写等其他请求整段受它限制。修改后立即生效，只影响新请求。',
   'settings.firstEventTimeout': '首事件超时',
   'settings.firstEventTimeoutHelp':
-    '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504；客户端还没收到内容时的同账号重新生成每次发送重新起算。0 表示关闭（默认）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
+    '每次尝试从向上游发送起等待第一个上游事件的上限：超时只放弃这一次尝试并换号重试（不额外冷却账号），不能再换号时返回 504；客户端还没收到内容时的同账号重新生成每次发送重新起算。0 或 off 表示关闭（默认）；可以写整数秒（60 即 60 秒，与上游 Mag1cFall/AIStudio2API 的写法相同）或时长（90s、2m）；思考很长的模型可能很久才有第一个事件，开启时要留足余量。',
   'settings.streamDataHeartbeat': '数据型流式心跳',
   'settings.streamDataHeartbeatHelp':
     '每 10 秒没有输出时写一块空数据（Gemini SSE 为空文本或空思考的候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 SSE 注释。new-api 等中转只转发 data 行，开启后中转后面的客户端在等待首字和长思考时也能持续收到字节，不会因长时间零字节被手机系统、VPN 或代理断开。官方 Gemini SDK 直连时仍只写换行（直连不经过中转，不再多写一种 SDK 判为无效的块）；开启后 new-api 的首字时间统计反映的是写出第一块心跳的时刻，且客户端断开或流被截断、没有用量数据时 new-api 按估算的输入 token 计费（原先计 0）。关闭时与原先完全一致。修改后立即生效，只影响新请求。',
@@ -771,7 +771,7 @@ const zhCN = {
   'logs.message': '消息',
   'logs.event': '事件',
   'requests.filterAll': '全部',
-  'cooldowns.search': '搜索模型或账户',
+  'cooldowns.search': '搜索模型',
   'cooldowns.reason': '原因',
   'app.workers': 'Worker {warm} / {target}',
   'app.workersStarting': '启动中 {count}',
@@ -976,7 +976,8 @@ const zhCN = {
   'settings.invalidNumber': '{field}必须是正整数',
   'settings.invalidAccountRpmLimit': '单账号每分钟请求上限应为 0（关闭）到 1000 的整数',
   'settings.invalidDuration': '{field}格式应为 30s、2m、1h30m 这类时长',
-  'settings.invalidFirstEventTimeout': '首事件超时应为 0（关闭）或小于请求超时的时长，例如 90s',
+  'settings.invalidFirstEventTimeout':
+    '首事件超时应为 0 或 off（关闭），或小于请求超时的整数秒或时长，例如 60 或 90s',
   'settings.invalidPrimaryQueueWait': '主用模型排队上限应为 0（不排队）或不超过请求超时的时长，例如 10s',
   'settings.invalidTierRuleModels': '{field}不能写 long- 开头的名称，请写基础模型 ID',
   'settings.invalidUltraPrimaryQueueWait':
@@ -1297,6 +1298,18 @@ const zhCN = {
   'accounts.proxyPoolPinned': '固定为默认代理（不使用 IP 池）',
   'accounts.proxyPoolPinnedHelp':
     '账户代理与默认代理相同，因此不使用 IP 池；可在“服务配置 → IP 池”改为跟随默认代理',
+  'logs.midWarn': '中途有警告',
+  'logs.midError': '中途有错误',
+  'logs.midHelp': '这个请求中途写过{level}（如换号、冷却），左侧是最终级别；点开看事件时间线',
+  'requests.accountFilter': '筛选账户（邮箱或账户 ID）',
+  'requests.noMatch': '没有符合筛选的请求',
+  'cooldowns.noMatch': '没有符合筛选的冷却',
+  'usage.range.quotaDay': '配额日 · {time} 起',
+  'usage.range.quotaDayHelp':
+    '从最近一次太平洋时间零点起算：Google 每日额度在这时重置，平均调用的今日发送数与额度冷却到次日零点也按这个边界',
+  'accounts.deviceBound': '2 小时内失效',
+  'accounts.deviceBoundHelp':
+    '设备绑定会话（带 __Secure-1PSIDRTS）：复制出来的认证文件约 2 小时后失效、变成需要登录。改用本服务的浏览器登录重新登录；Windows 上也可以用 Chrome 导入（带续签材料，失效时原地续签）',
 } as const
 
 export type TranslationKey = keyof typeof zhCN
@@ -1428,7 +1441,7 @@ const en: Record<TranslationKey, string> = {
   'logs.clear': 'Clear logs',
   'logs.autoScroll': 'Auto scroll',
   'logs.waiting': 'Waiting for logs...',
-  'logs.search': 'Search model, request ID, status',
+  'logs.search': 'Search model, request ID, account or message',
   'logs.running': 'Running',
   'logs.tools': 'Tool calls',
   'logs.loadOlder': 'Load older logs ({count})',
@@ -1526,7 +1539,7 @@ const en: Record<TranslationKey, string> = {
     'Deadline before the first upstream event of a generation request: queuing, cold starts, WAA proof, attachment uploads, waiting for the first token and account switches before it all count, and a 504 is returned when it expires. Once output starts it becomes an idle limit: the request ends with 504 only when upstream sends no event and no bytes for this long, so a long reply that keeps streaming is not cut off; a whole generation request is capped at 1 hour (or this value if longer). Token counting, video and transcription requests are limited by it as a whole. Changes apply immediately to new requests only.',
   'settings.firstEventTimeout': 'First event timeout',
   'settings.firstEventTimeoutHelp':
-    'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. It restarts for each same-account regeneration before any output reaches the client. 0 disables it (default); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
+    'How long each attempt waits for its first upstream event after sending upstream. On timeout only that attempt is abandoned and the request retries on another account (no extra cooldown); when no retry is possible a 504 is returned. It restarts for each same-account regeneration before any output reaches the client. 0 or off disables it (default); write whole seconds (60 means 60 seconds, as in upstream Mag1cFall/AIStudio2API) or a duration (90s, 2m); models that think for a long time may take a while to emit their first event, so leave plenty of headroom.',
   'settings.streamDataHeartbeat': 'Data stream heartbeat',
   'settings.streamDataHeartbeatHelp':
     'Write an empty data chunk after every 10 seconds without output (an empty text or empty thought candidate for Gemini SSE, an empty delta chunk for OpenAI Chat), and one more when the streaming response header is sent before the first event, instead of only a newline or an SSE comment. Relays such as new-api forward only data lines, so with this on the clients behind them keep receiving bytes while waiting for the first token or during long thinking and are not dropped by the phone OS, a VPN or a proxy after a long silence. Official Gemini SDKs connecting directly still get newline heartbeats (no relay in between, and no extra chunk the SDK treats as invalid); with this on, new-api reports the first heartbeat as the first-response time, and bills the estimated input tokens when the client disconnects or the stream is cut without usage data (0 before). When off, behavior is exactly as before. Changes apply immediately to new requests only.',
@@ -2099,7 +2112,7 @@ const en: Record<TranslationKey, string> = {
   'logs.message': 'Message',
   'logs.event': 'Event',
   'requests.filterAll': 'All',
-  'cooldowns.search': 'Search model or account',
+  'cooldowns.search': 'Search model',
   'cooldowns.reason': 'Reason',
   'app.workers': 'Workers {warm} / {target}',
   'app.workersStarting': '{count} starting',
@@ -2316,7 +2329,7 @@ const en: Record<TranslationKey, string> = {
     'Requests per minute per account must be an integer from 0 (off) to 1000',
   'settings.invalidDuration': '{field} must be a duration such as 30s, 2m or 1h30m',
   'settings.invalidFirstEventTimeout':
-    'First event timeout must be 0 (disabled) or a duration shorter than the request timeout, such as 90s',
+    'First event timeout must be 0 or off (disabled), or whole seconds or a duration shorter than the request timeout, such as 60 or 90s',
   'settings.invalidPrimaryQueueWait':
     'Primary model queue limit must be 0 (never queue) or a duration not longer than the request timeout, such as 10s',
   'settings.invalidTierRuleModels': '{field} cannot contain names starting with long-; write the base model ID',
@@ -2645,6 +2658,19 @@ const en: Record<TranslationKey, string> = {
   'accounts.proxyPoolPinned': 'Pinned to the default proxy (no IP pool)',
   'accounts.proxyPoolPinnedHelp':
     'The account proxy equals the default proxy, so this account does not use the IP pool; switch it under Service Configuration → IP pool with "Follow the default proxy"',
+  'logs.midWarn': 'warned midway',
+  'logs.midError': 'error midway',
+  'logs.midHelp':
+    'This request logged a {level} midway (such as an account switch or a cooldown); the badge on the left is its final level. Open it to see the timeline',
+  'requests.accountFilter': 'Filter by account (email or account ID)',
+  'requests.noMatch': 'No requests match the filters',
+  'cooldowns.noMatch': 'No cooldowns match the filters',
+  'usage.range.quotaDay': 'Quota day · since {time}',
+  'usage.range.quotaDayHelp':
+    "Starts at the latest midnight Pacific time, when Google's daily quotas reset; balanced routing's daily send counts and quota cooldowns until the next day use the same boundary",
+  'accounts.deviceBound': 'Expires ~2h',
+  'accounts.deviceBoundHelp':
+    "Device-bound session (has __Secure-1PSIDRTS): a copied auth file stops working after about 2 hours and the account then needs a login. Log in again with this service's browser login; on Windows, Chrome import also works (it keeps renewal material and renews in place)",
 }
 
 const legacyKeyMap: Partial<Record<TranslationKey, string>> = {

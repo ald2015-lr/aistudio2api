@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -396,7 +397,7 @@ func Load(path string) (Config, error) {
 	}
 	duration("INIT_TIMEOUT", false, parsePositiveDuration, &cfg.InitTimeout)
 	duration("REQUEST_TIMEOUT", false, parsePositiveDuration, &cfg.RequestTimeout)
-	duration("FIRST_EVENT_TIMEOUT", true, parseOptionalDuration, &cfg.FirstEventTimeout)
+	duration("FIRST_EVENT_TIMEOUT", true, parseFirstEventTimeoutSetting, &cfg.FirstEventTimeout)
 	integer("WARM_WORKER_LIMIT", false, parsePositiveInt, &cfg.WarmWorkerLimit)
 	integer("MAX_ACTIVE_WORKERS", false, parsePositiveInt, &cfg.MaxActiveWorkers)
 	boolean("ULTRA_EXCLUSIVE", true, &cfg.UltraExclusive)
@@ -842,7 +843,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	// 按默认开启处理
 	var firstEventTimeout time.Duration
 	if strings.TrimSpace(value.FirstEventTimeout) != "" {
-		if firstEventTimeout, err = parseOptionalDuration("FIRST_EVENT_TIMEOUT", value.FirstEventTimeout); err != nil {
+		if firstEventTimeout, err = ParseFirstEventTimeout(value.FirstEventTimeout); err != nil {
 			return err
 		}
 	}
@@ -1465,13 +1466,41 @@ func parsePositiveDuration(key string, value string) (time.Duration, error) {
 	return duration, nil
 }
 
-// parseOptionalDuration 解析可以为 0 的时长（0 表示关闭），例如 FIRST_EVENT_TIMEOUT
+// parseOptionalDuration 解析可以为 0 的时长（0 表示关闭或不排队），例如 PRIMARY_QUEUE_WAIT。只认 Go 时长写法：
+// FIRST_EVENT_TIMEOUT 另外接受 off 与整数秒（见 ParseFirstEventTimeout），两个排队上限没有这样的旧写法要兼容，不放宽
 func parseOptionalDuration(key string, value string) (time.Duration, error) {
 	duration, err := time.ParseDuration(strings.TrimSpace(value))
 	if err != nil || duration < 0 {
 		return 0, fmt.Errorf("%s 必须是 0 或正数时长，例如 0、30s 或 2m", key)
 	}
 	return duration, nil
+}
+
+// ParseFirstEventTimeout 解析 FIRST_EVENT_TIMEOUT：0 或 off（不分大小写）表示关闭；整数按秒（60 即 60s，与上游 Mag1cFall/AIStudio2API 相同）；
+// 其余按 Go 时长（60s、2m）。原先只认 Go 时长，照上游写成 off 或 60 时按无效值处理、悄悄退回关闭，管理页保存直接报错。
+// 启动加载与管理页保存共用这一处
+func ParseFirstEventTimeout(value string) (time.Duration, error) {
+	text := strings.TrimSpace(value)
+	if strings.EqualFold(text, "off") {
+		return 0, nil
+	}
+	invalid := fmt.Errorf("FIRST_EVENT_TIMEOUT 必须是 0、off、整数秒或正数时长，例如 0、off、60 或 90s")
+	if seconds, err := strconv.ParseInt(text, 10, 64); err == nil {
+		if seconds < 0 || seconds > int64(math.MaxInt64/int64(time.Second)) {
+			return 0, invalid
+		}
+		return time.Duration(seconds) * time.Second, nil
+	}
+	duration, err := time.ParseDuration(text)
+	if err != nil || duration < 0 {
+		return 0, invalid
+	}
+	return duration, nil
+}
+
+// parseFirstEventTimeoutSetting 为加载 .env 时 FIRST_EVENT_TIMEOUT 的解析函数（与其他时长项同一签名）
+func parseFirstEventTimeoutSetting(_ string, value string) (time.Duration, error) {
+	return ParseFirstEventTimeout(value)
 }
 
 func parsePositiveInt(key string, value string) (int, error) {

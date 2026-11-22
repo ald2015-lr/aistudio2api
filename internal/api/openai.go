@@ -169,6 +169,9 @@ func (s *server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIInvalid(w, err)
 		return
 	}
+	// 转换之后不再读原始消息（之后只用 generateRequest）：放掉它们，内联媒体的 base64 原文不再随 request 常驻到流结束
+	// （request 按值传给 streamChatCompletion、被其中的闭包一直引用）
+	request.Messages = nil
 	s.thoughtSignatures.Restore(s.thoughtSignatureScope(r.Context(), generateRequest.Model), generateRequest.Contents)
 	// 先删除系统提示里 Claude Code 的计费行、按 OMNI_IGNORE_SYSTEM_PROMPT 去掉发给 Omni 视频模型的系统提示（见 omni_system.go 的
 	// prepareClientSystem），之后恢复媒体与整理分轮都按整理后的对话进行
@@ -359,8 +362,9 @@ func assistantImageParts(text string) ([]aistudio.Part, bool) {
 			continue
 		}
 		part.InlineData.MIME = mimeType
+		// 拆出的文本复制出来：子串会让整段原文（含已拆成图片的 base64）随这些 part 一直常驻
 		if match[0] > position {
-			parts = append(parts, aistudio.Part{Text: text[position:match[0]]})
+			parts = append(parts, aistudio.Part{Text: strings.Clone(text[position:match[0]])})
 		}
 		parts = append(parts, part)
 		position = match[1]
@@ -369,7 +373,7 @@ func assistantImageParts(text string) ([]aistudio.Part, bool) {
 		return nil, false
 	}
 	if position < len(text) {
-		parts = append(parts, aistudio.Part{Text: text[position:]})
+		parts = append(parts, aistudio.Part{Text: strings.Clone(text[position:])})
 	}
 	return parts, true
 }
@@ -859,8 +863,9 @@ func fileOrInlinePart(value string, name string) (aistudio.Part, error) {
 	if err != nil {
 		return aistudio.Part{}, fmt.Errorf("data URL: %w", err)
 	}
-	// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）
-	return aistudio.Part{InlineData: normalizedImageBlob(attachmentMIME(strings.TrimSuffix(metadata, ";base64"), data), data)}, nil
+	// 声明的类型不是文本类、内容却是文本时按 text/plain 发送（见 attachmentMIME）。类型要复制出来：它是整个 data URL 的子串，
+	// 直接放进 Blob 会让解码后的附件一直引用整段 base64 原文（附件存进续接状态时也一样）
+	return aistudio.Part{InlineData: normalizedImageBlob(attachmentMIME(strings.Clone(strings.TrimSuffix(metadata, ";base64")), data), data)}, nil
 }
 
 func audioMIME(format string) string {

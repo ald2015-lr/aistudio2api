@@ -255,6 +255,11 @@ func TestSweepDeadWorkersIgnoresThreshold(t *testing.T) {
 	if !hasLogContaining(requests, "冷却清扫", "关闭全局冷却的空闲 Worker=2") {
 		t.Fatalf("应记录冷却清扫日志，日志 = %v", serviceLogMessages(requests))
 	}
+	for _, accountID := range dead {
+		if countSourceLogs(requests, accountID, "WAA Worker 已停止 | PID=", "| 起因=冷却清扫") != 1 {
+			t.Fatalf("冷却清扫关闭的 %s 应写起因=冷却清扫：%v", accountID, serviceLogMessages(requests))
+		}
+	}
 }
 
 // TestSweepDeadWorkersSkipsBusy 清扫不关闭正在服务请求的全局冷却 Worker
