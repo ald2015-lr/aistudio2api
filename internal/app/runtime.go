@@ -170,6 +170,8 @@ func newRuntime(
 	driveStates.attach(pooled)
 	service.driveStates = driveStates
 	admin := newRuntimeAdmin(lifecycle, pool, store, service, requests, login, workers, headers, cfg)
+	// 启动、停止步骤变化时推送状态（见 service_step.go）
+	service.setStatusPublisher(func() { admin.publishStatus(lifecycle) })
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	admin.onboard = newAccountOnboarder(admin, store.PrimaryDirectory())
 	go admin.onboard.run(lifecycle)
@@ -291,6 +293,8 @@ type accountWorkerManager struct {
 	// warmIdleReason 与 warmIdleAt 用于预热等待原因的日志去重
 	warmIdleReason string
 	warmIdleAt     time.Time
+	// firstWarm 为各分区的首轮预热是否还没出结果（见 first_warm.go）
+	firstWarm firstWarmState
 	// fill* 为预热循环的实时状态，供管理页显示
 	fillActive    atomic.Bool
 	fillInflight  atomic.Int32
@@ -2241,18 +2245,35 @@ func (manager *accountWorkerManager) withoutOpening(accountIDs []string) ([]stri
 	return result, pending
 }
 
-// StartPrewarm 启动有界预热并在当前可用账户完成后返回
+// StartPrewarm 启动有界预热，返回的通道在第一个 Worker 就绪或这一轮结束时给出结果（keepWarm、热更新与淘汰后的补齐）
 func (manager *accountWorkerManager) StartPrewarm(ctx context.Context) <-chan error {
+	return manager.startPrewarm(ctx, false)
+}
+
+// startFirstPrewarm 开始生成服务启动时的首轮预热：先把全部分区标为首轮预热还没出结果，由 fillWarm 按分区清除（见 first_warm.go）；
+// 这一轮没能开始（管理器已关闭、已有一轮在进行）时立即全部清除
+func (manager *accountWorkerManager) startFirstPrewarm(ctx context.Context) <-chan error {
+	manager.beginFirstWarm()
+	return manager.startPrewarm(ctx, true)
+}
+
+func (manager *accountWorkerManager) startPrewarm(ctx context.Context, initial bool) <-chan error {
 	first := make(chan error, 1)
 	manager.mu.RLock()
 	closed := manager.closed
 	manager.mu.RUnlock()
 	if closed {
+		if initial {
+			manager.settleAllFirstWarm()
+		}
 		first <- fmt.Errorf("WAA worker manager 已关闭")
 		close(first)
 		return first
 	}
 	if !manager.fillMu.TryLock() {
+		if initial {
+			manager.settleAllFirstWarm()
+		}
 		if len(manager.WarmAccountIDs()) > 0 {
 			first <- nil
 		} else {
@@ -2263,7 +2284,7 @@ func (manager *accountWorkerManager) StartPrewarm(ctx context.Context) <-chan er
 	}
 	fillContext, cancel := context.WithCancel(ctx)
 	stop := context.AfterFunc(manager.lifecycle, cancel)
-	go manager.fillWarm(fillContext, first, func() {
+	go manager.fillWarm(fillContext, first, initial, func() {
 		stop()
 		cancel()
 	})
@@ -2271,12 +2292,22 @@ func (manager *accountWorkerManager) StartPrewarm(ctx context.Context) <-chan er
 }
 
 // fillWarm 以滑动窗口并发预热 Worker：任意一个完成后立刻补上下一个，不再等整批结束，
-// 单个启动慢的账户不会拖住其他并发槽位；常驻数与并发数运行中调整后下一轮即按新值执行
-func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- error, cleanup func()) {
+// 单个启动慢的账户不会拖住其他并发槽位；常驻数与并发数运行中调整后下一轮即按新值执行。
+// initial 为生成服务启动时的首轮：各分区的首轮预热状态按 first_warm.go 的约束清除
+func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- error, initial bool, cleanup func()) {
 	startedAt := time.Now()
 	defer cleanup()
 	defer manager.fillMu.Unlock()
 	defer close(first)
+	// settle 记分区的首轮预热已出结果；首轮结束（含取消）时全部清除
+	settle := func(partition aistudio.PoolScope) {
+		if initial {
+			manager.settleFirstWarm(partition)
+		}
+	}
+	if initial {
+		defer manager.settleAllFirstWarm()
+	}
 	notified := false
 	notify := func(err error) {
 		if notified {
@@ -2317,6 +2348,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		}
 		if result.err == nil {
 			manager.clearWarmFailure(result.accountID)
+			settle(partition)
 			notify(nil)
 			return
 		}
@@ -2388,6 +2420,11 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		for _, partition := range workerPartitions {
 			slots := min(remaining, targets[partition]-warmCounts[partition]-inflightCounts[partition])
 			if capacityFull[partition] || egressPaused[partition] || slots <= 0 {
+				// 首轮：该分区没有进行中的启动、这一轮也不再为它启动（已达常驻数、槽位已满、被出口闸门暂停，
+				// 或冷启动名额被排在前面的分区占满），首轮预热对它已有结果
+				if inflightCounts[partition] == 0 {
+					settle(partition)
+				}
 				continue
 			}
 			classified = true
@@ -2395,6 +2432,9 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			if err != nil {
 				if roundClassifyErr == nil {
 					roundClassifyErr = err
+				}
+				if inflightCounts[partition] == 0 {
+					settle(partition)
 				}
 				continue
 			}
@@ -2446,6 +2486,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 			manager.fillInflight.Store(int32(len(inflight)))
 			if len(started) > 0 {
 				busySince = time.Time{}
+			}
+			// 首轮：该分区没有可启动的账户（候选用完、都在启动失败冷却中或都在忙），也没有进行中的启动：不让请求再等它
+			if inflightCounts[partition]+len(started) == 0 {
+				settle(partition)
 			}
 		}
 		if classified {
@@ -2526,8 +2570,6 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 }
 
 const (
-	// firstWarmRetryInterval 为启动阶段首个 Worker 未就绪时的重试间隔
-	firstWarmRetryInterval = 3 * time.Second
 	// warmRecheckInterval 为滑动窗口预热在等待结果时重新检查空闲槽位的间隔
 	warmRecheckInterval = time.Second
 	// warmResultBuffer 为预热结果通道容量
@@ -2976,6 +3018,10 @@ type trackedService struct {
 	// authRecheck 为登录复核器（疑似登录失效的复核与需要登录账户的定期复核，见 auth_recheck.go）；只在 newRuntime 创建并挂上账户池的 gate，
 	// 测试构造的服务为 nil（401 照常直接标记）
 	authRecheck *authRecheck
+	// step 为生成服务正在进行的启动或停止步骤（见 service_step.go），没有时为 nil
+	step atomic.Pointer[serviceStep]
+	// statusPublisher 在步骤变化时推送状态快照，newRuntime 挂上；为 nil 时不推送（测试直接构造的服务）
+	statusPublisher atomic.Pointer[func()]
 }
 
 type modelCatalogService interface {
@@ -3067,7 +3113,10 @@ func (service *trackedService) State() string {
 	}
 }
 
-// Start 刷新模型并创建本次公开生成服务
+// Start 刷新模型并创建本次公开生成服务。只做必需的步骤（准备模型目录，没有目录缓存时等首个账户读取目录）就进入运行，
+// 首轮预热在后台进行（见 warmAfterLaunch 与 first_warm.go）：预热失败只写 WARN、服务保持运行，不按启动失败处理
+// （原先首个 Worker 就绪前一直停在 LAUNCHING、请求都按服务已停止返回，首批都失败时启动失败、ResetAll 后被监督器按 5–60 秒退避反复重启）。
+// 目录准备失败、没有可用账户等真正的启动失败照旧按启动失败返回
 func (service *trackedService) Start(ctx context.Context, launching func()) ([]aistudio.Model, bool, error) {
 	service.lifecycleMu.Lock()
 	if service.state.Load() == serviceRunning {
@@ -3086,6 +3135,7 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	service.transitionErr = nil
 	service.transitionTimedOut = false
 	service.state.Store(serviceLaunching)
+	service.storeStep(stepPrepareCatalog)
 	service.lifecycleMu.Unlock()
 	service.startDeferredWrites()
 	stopCaller := context.AfterFunc(ctx, dataCancel)
@@ -3096,7 +3146,7 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	models := service.modelSnapshot()
 	// 目录已在 newRuntime 从写盘缓存恢复：启动时只排缺失、不一致、疑似失效与过期的账户，由后台低速刷新，不再全量同步
 	service.requests.log("service", "INFO", service.catalogSync.plan().startLine(len(models)))
-	catalogReady, catalogSynced, catalogDone := service.catalogSync.start(dataContext)
+	catalogReady, _, catalogDone := service.catalogSync.start(dataContext)
 	// 登录复核与目录调度器同时开始：启动期间目录同步遇到的上游 401 同样先记疑似登录失效、复核后才标记（见 auth_recheck.go）
 	go service.authRecheck.run(dataContext)
 	// 过了保留期的本地资源绑定（Live 续接凭证、视频任务与结果文件）定期清理，见 resource_retention.go
@@ -3107,6 +3157,7 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 	}
 	service.lifecycleMu.Unlock()
 	if len(models) == 0 {
+		service.enterLaunchStep(stepWaitCatalog)
 		select {
 		case <-dataContext.Done():
 			stopCaller()
@@ -3123,65 +3174,59 @@ func (service *trackedService) Start(ctx context.Context, launching func()) ([]a
 			return nil, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, aistudio.ErrNoEligibleAccount)
 		}
 	}
+	service.enterLaunchStep(stepStartPrewarm)
 	service.requests.log("service", "INFO", fmt.Sprintf(
-		"生成服务启动 | 2/2 | 预热 WAA Worker | 模型=%d | 目标=%d",
+		"生成服务启动 | 2/2 | 后台预热 WAA Worker | 模型=%d | 目标=%d",
 		len(models), service.workers.PrewarmTarget(),
 	))
-	// 首批账户预热失败时不再等全部账户的模型目录同步完成（账户多时要好几分钟），
-	// 而是每隔几秒用新拿到目录的账户重试，任意一个 Worker 就绪即进入 RUNNING
-	synced, warmErr := service.waitFirstWarm(dataContext, catalogSynced)
-	for warmErr != nil && !synced && dataContext.Err() == nil {
-		timer := time.NewTimer(firstWarmRetryInterval)
-		select {
-		case <-dataContext.Done():
-		case <-catalogSynced:
-		case <-timer.C:
-		}
-		timer.Stop()
-		if dataContext.Err() != nil {
-			break
-		}
-		synced, warmErr = service.waitFirstWarm(dataContext, catalogSynced)
-	}
-	if dataContext.Err() != nil {
-		stopCaller()
-		return nil, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, dataContext.Err())
-	}
-	if warmErr != nil {
-		stopCaller()
-		return nil, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, warmErr)
-	}
 	if !stopCaller() {
 		return nil, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, ctx.Err())
 	}
+	// 首轮预热在进入运行之前开始：各分区的首轮状态先置位，进入运行后到达的请求按分区等它的第一个 Worker（见 first_warm.go）
+	warmStartedAt := time.Now()
+	firstWarm := service.workers.startFirstPrewarm(dataContext)
 	models, err := service.finishModelLaunch(dataContext, transitionDone)
 	if err != nil {
 		return models, false, service.finishLaunch(transitionDone, dataCancel, catalogDone, err)
 	}
-	go service.keepWarm(dataContext)
+	service.publishStatus()
+	// 进入运行后再开始补齐与出口判定：keepWarm 每个周期补齐常驻 Worker（首轮预热失败后的重试也由它进行，已在预热时直接返回）；
 	// 出口判定器用自己的计时器，不放进 keepWarmPass：清扫死槽位会同步等浏览器关闭，会拖慢限速调整与安全阀计时
+	go service.keepWarm(dataContext)
 	go service.egress.run(dataContext)
+	go service.warmAfterLaunch(dataContext, firstWarm, warmStartedAt)
 	return models, true, nil
 }
 
-// waitFirstWarm 启动预热并等待首个就绪 Worker，同时返回结束时首轮目录同步是否已完成
-func (service *trackedService) waitFirstWarm(ctx context.Context, catalogSynced <-chan struct{}) (bool, error) {
-	firstWarm := service.workers.StartPrewarm(ctx)
-	var warmErr error
+// warmAfterLaunch 在生成服务进入运行后等首轮预热 firstWarm 的结果：没有任何 Worker 就绪时写一行 WARN，服务保持运行，
+// 之后由 keepWarm 每个周期补齐（失败的账户在 warmFailureBackoff 内不再自动预热）。上游在首轮目录同步完成前预热失败时
+// 等同步完成再预热一次；这里 keepWarm 每 5 秒按最新目录补齐，不另起一轮。服务停止时直接结束
+func (service *trackedService) warmAfterLaunch(dataContext context.Context, firstWarm <-chan error, startedAt time.Time) {
+	warmErr := waitFirstWarm(dataContext, firstWarm)
+	if warmErr == nil || dataContext.Err() != nil {
+		return
+	}
+	// 错误按账户逐行合并（errors.Join），写成一行并限制长度：首批账户多时整段原因可能很长
+	service.requests.log("service", "WARN", fmt.Sprintf(
+		"WAA Worker 首轮预热失败 | 耗时=%s | 错误=%s | 稍后自动重试",
+		time.Since(startedAt).Round(time.Millisecond), guardShorten(strings.Join(strings.Fields(warmErr.Error()), " "), firstWarmErrorLimit),
+	))
+}
+
+// firstWarmErrorLimit 为“WAA Worker 首轮预热失败”一行里错误原因的字数上限
+const firstWarmErrorLimit = 600
+
+// waitFirstWarm 等一轮预热 firstWarm 给出第一个结果（有 Worker 就绪时为 nil）；ctx 结束时返回它的错误，
+// 通道没有给出结果就关闭时按没有就绪账户处理
+func waitFirstWarm(ctx context.Context, firstWarm <-chan error) error {
 	select {
 	case <-ctx.Done():
-		return true, ctx.Err()
+		return ctx.Err()
 	case err, ok := <-firstWarm:
-		warmErr = err
 		if !ok {
-			warmErr = fmt.Errorf("WAA 预热未返回就绪账户")
+			return fmt.Errorf("WAA 预热未返回就绪账户")
 		}
-	}
-	select {
-	case <-catalogSynced:
-		return true, warmErr
-	default:
-		return false, warmErr
+		return err
 	}
 }
 
@@ -3216,6 +3261,7 @@ func (service *trackedService) finishModelLaunch(
 		}
 		service.modelApplied = modelRevision
 		service.state.Store(serviceRunning)
+		service.storeStep("")
 		service.transitionDone = nil
 		close(transitionDone)
 		service.lifecycleMu.Unlock()
@@ -3231,13 +3277,20 @@ func (service *trackedService) finishLaunch(
 	launchErr error,
 ) error {
 	dataCancel()
-	refreshErr := waitServiceTransition(modelRefreshDone, modelCatalogShutdownTimeout, "模型目录刷新停止")
+	refreshErr := service.waitCatalogStop(modelRefreshDone)
+	service.enterStopStep(stepCloseWorkers)
 	service.workers.waitPrewarm()
 	resetErr := service.workers.ResetAll()
+	service.enterStopStep(stepFlushWrites)
 	service.stopDeferredCookieWrites()
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.state.Store(serviceStopped)
+	}
+	service.lifecycleMu.Unlock()
+	service.finishTransitionStep(transitionDone)
+	service.lifecycleMu.Lock()
+	if service.transitionDone == transitionDone {
 		service.dataContext = nil
 		service.dataCancel = nil
 		service.modelRefreshDone = nil
@@ -3247,6 +3300,41 @@ func (service *trackedService) finishLaunch(
 	}
 	service.lifecycleMu.Unlock()
 	return errors.Join(launchErr, refreshErr, resetErr)
+}
+
+// finishTransitionStep 在清理结束、transitionDone 关闭之前清除步骤并推送最后一份状态：之后才结束切换，
+// 停止或重建后新一代生成服务的状态总在它之后推送，管理页不会被晚到的旧状态盖住
+func (service *trackedService) finishTransitionStep(transitionDone chan struct{}) {
+	service.lifecycleMu.Lock()
+	current := service.transitionDone == transitionDone
+	if current {
+		service.storeStep("")
+	}
+	service.lifecycleMu.Unlock()
+	if current {
+		service.publishStatus()
+	}
+}
+
+// waitCatalogStop 等模型目录同步停止（停止与启动失败的清理共用，最多 modelCatalogShutdownTimeout）：还没停时先进入停止步骤 wait_catalog_stop
+func (service *trackedService) waitCatalogStop(modelRefreshDone <-chan struct{}) error {
+	if unfinished(modelRefreshDone) {
+		service.enterStopStep(stepWaitCatalogStop)
+	}
+	return waitServiceTransition(modelRefreshDone, modelCatalogShutdownTimeout, "模型目录刷新停止")
+}
+
+// unfinished 判断 done 是否属于一个还没结束的后台任务
+func unfinished(done <-chan struct{}) bool {
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 func waitServiceTransition(done <-chan struct{}, timeout time.Duration, operation string) error {
@@ -3328,7 +3416,9 @@ func (service *trackedService) Stop() (bool, error) {
 	if state == serviceLaunching {
 		done := service.transitionDone
 		service.state.Store(serviceStopped)
+		service.storeStep(stepCancelRequests)
 		service.lifecycleMu.Unlock()
+		service.publishStatus()
 		dataCancel()
 		transitionErr := waitServiceTransition(done, serviceTransitionShutdownTimeout, "生成服务启动停止")
 		service.requests.cancelAll()
@@ -3346,8 +3436,10 @@ func (service *trackedService) Stop() (bool, error) {
 	transitionDone := make(chan struct{})
 	service.transitionDone = transitionDone
 	service.state.Store(serviceStopped)
+	service.storeStep(stepCancelRequests)
 	modelRefreshDone := service.modelRefreshDone
 	service.lifecycleMu.Unlock()
+	service.publishStatus()
 	dataCancel()
 	go service.finishStop(transitionDone, modelRefreshDone)
 	transitionErr := waitServiceTransition(transitionDone, serviceTransitionShutdownTimeout, "生成服务停止")
@@ -3385,14 +3477,16 @@ func (service *trackedService) stopDeferredCookieWrites() {
 // finishStop 完成运行态服务的后台清理
 func (service *trackedService) finishStop(transitionDone chan struct{}, modelRefreshDone <-chan struct{}) {
 	service.requests.cancelAll()
-	refreshErr := waitServiceTransition(modelRefreshDone, modelCatalogShutdownTimeout, "模型目录刷新停止")
+	refreshErr := service.waitCatalogStop(modelRefreshDone)
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.transitionErr = refreshErr
 	}
 	service.lifecycleMu.Unlock()
+	service.enterStopStep(stepCloseWorkers)
 	service.workers.waitPrewarm()
 	resetErr := service.workers.ResetAll()
+	service.enterStopStep(stepFlushWrites)
 	service.stopDeferredCookieWrites()
 	// 坏号记忆平时最多每 30 秒写一次：停止服务时立即写出。重建运行时（进程内重启、重建服务的配置保存）先停旧服务、再建新一代
 	// （新一代此时读文件）、最后才关闭旧一代，原先旧一代在关闭时才写，新一代读到的是旧数据，随后又被新一代的第一次写盘整份覆盖
@@ -3407,6 +3501,7 @@ func (service *trackedService) finishStop(transitionDone chan struct{}, modelRef
 	if err := service.workers.saveQuotaUsage(); err != nil && service.requests != nil {
 		service.requests.log("service", "WARN", "今日发送数写入失败 | 错误="+err.Error())
 	}
+	service.finishTransitionStep(transitionDone)
 	service.lifecycleMu.Lock()
 	if service.transitionDone == transitionDone {
 		service.dataContext = nil
@@ -4131,6 +4226,20 @@ func (service *trackedService) acquireLease(
 			coverageID = removedReady[0]
 			groups.StandbyReady = []string{coverageID}
 			snapshot.standby = 1
+		}
+		// 首轮预热（见 first_warm.go）：请求号池里还没有已就绪的 Worker、要冷启动的备用账号有落在首轮预热还没出结果的分区时，
+		// 不固定账户的选号等它的第一个 Worker，不另起冷启动（现场提升、补覆盖、后台扩容）；备用账号都在已出结果的分区时不等
+		// （号池跨分区时，只能由已出结果分区的账户服务的请求不被别的分区的首轮挡住）。该分区有 Worker 就绪或首轮已没有进行中的启动时
+		// 清除并唤醒，之后照常选号；等待受请求期限与排队预算约束（主用模型与等后台扩容一样按现场冷启动抵扣，见 leaseWaitBudget.wait）。
+		// 只用已启动 Worker 的选号不等，也不另发起后台扩容，按额度 429 后没有已启动的 Worker 立即返回
+		if !fixedAccount && len(groups.StandbyReady) > 0 && service.workers.firstWarmBlocks(selection.Pool, warm, groups.StandbyReady) {
+			if warmOnly {
+				return nil, &noImmediateLeaseError{reason: primaryQuotaReasonNoWarm}
+			}
+			if err := wait(schedulingRecheck, waitReasonFirstWarm); err != nil {
+				return nil, err
+			}
+			continue
 		}
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)

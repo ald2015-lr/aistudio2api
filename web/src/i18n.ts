@@ -798,6 +798,31 @@ const zhCN = {
   'app.prewarmActive': '预热中 · 进行 {inflight} · 本轮 {launched}',
   'app.prewarmStalled': '预热循环 {seconds}s 无进展',
   'app.prewarmIdle': '预热空闲',
+  'app.stepPrepareCatalog': '准备模型目录',
+  'app.stepWaitCatalog': '等待首个账户读取模型目录',
+  'app.stepStartPrewarm': '开始后台预热',
+  'app.stepCancelRequests': '停止在途请求',
+  'app.stepWaitCatalogStop': '等待模型目录同步停止',
+  'app.stepCloseWorkers': '关闭 WAA Worker',
+  'app.stepFlushWrites': '写出暂存记录',
+  'app.stepPrepareCatalogDetail':
+    '对照账户池排好模型目录任务，从写盘缓存恢复目录，开始后台目录同步与登录复核',
+  'app.stepWaitCatalogDetail':
+    '没有模型目录缓存（首次启动或缓存损坏）时，要等第一个账户读到模型目录才能进入运行，在此之前还不能处理生成请求；其余账户在后台继续同步',
+  'app.stepStartPrewarmDetail': '首轮预热在后台进行，不等它的结果，服务随即进入运行',
+  'app.stepCancelRequestsDetail': '中止进行中的请求与后台扩容中的 Worker 启动',
+  'app.stepWaitCatalogStopDetail': '模型目录同步退出前把缓存写盘，最多等 2 秒',
+  'app.stepCloseWorkersDetail': '等进行中的预热结束，关闭全部 WAA Worker 的浏览器',
+  'app.stepFlushWritesDetail':
+    '写出暂存的认证 Cookie 与推迟的模型资格时间；停止运行中的服务时另写出坏号记忆、Drive 授权状态与今日发送数',
+  'app.stepClockNote': '（已用时间按服务端时钟计算）',
+  'app.elapsedSeconds': '{seconds} 秒',
+  'app.elapsedMinutes': '{minutes} 分 {seconds} 秒',
+  'app.firstWarm': '首轮预热中',
+  'app.firstWarmPools': '等首个 Worker：{pools}',
+  'app.firstWarmDetail':
+    '生成服务已在运行、接收请求，首轮预热在后台进行。列出的分区还没有就绪的 Worker：期间到达、不指定账户的请求排队等该分区首轮预热的第一个 Worker，不另起冷启动；该分区没有可启动的账户时立即放行，等待受请求期限约束。有账户启动失败时预热换下一个候选继续（日志逐个写“WAA Worker 启动失败”），所有候选都试过仍没有 Worker 时才写一行 WARN“WAA Worker 首轮预热失败”，服务保持运行，之后每 5 秒自动补齐',
+  'app.partitionNormal': '普通',
   'app.ultraWorkers': 'Ultra Worker {occupied} / {max}',
   'app.ultraWorkersDetail':
     'Ultra 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 不可调度 {unschedulable} · 预热目标 {target} · 峰值 {max}',
@@ -2101,6 +2126,35 @@ const en: Record<TranslationKey, string> = {
   'app.prewarmActive': 'Prewarming · {inflight} running · {launched} this round',
   'app.prewarmStalled': 'Prewarm loop stalled {seconds}s',
   'app.prewarmIdle': 'Prewarm idle',
+  'app.stepPrepareCatalog': 'Preparing the model catalog',
+  'app.stepWaitCatalog': 'Waiting for the first account to load models',
+  'app.stepStartPrewarm': 'Starting background prewarm',
+  'app.stepCancelRequests': 'Cancelling in-flight requests',
+  'app.stepWaitCatalogStop': 'Waiting for model sync to stop',
+  'app.stepCloseWorkers': 'Closing WAA Workers',
+  'app.stepFlushWrites': 'Writing pending records',
+  'app.stepPrepareCatalogDetail':
+    'Queues model catalog work against the account pool, restores catalogs from the disk cache, and starts background catalog sync and sign-in rechecks',
+  'app.stepWaitCatalogDetail':
+    'With no cached model catalog (first start or a damaged cache), the service starts running only after the first account loads its models and cannot serve generation requests before that; the other accounts keep syncing in the background',
+  'app.stepStartPrewarmDetail':
+    'The first prewarm runs in the background; the service starts running right away without waiting for its result',
+  'app.stepCancelRequestsDetail':
+    'Aborts in-progress requests and Worker launches for background expansion',
+  'app.stepWaitCatalogStopDetail':
+    'Model sync writes its cache to disk before exiting; waits at most 2 seconds',
+  'app.stepCloseWorkersDetail':
+    'Waits for the running prewarm to finish and closes the browsers of all WAA Workers',
+  'app.stepFlushWritesDetail':
+    "Writes buffered sign-in cookies and deferred model eligibility times; when a running service stops, also writes bad-account memory, Drive authorization state and today's send counts",
+  'app.stepClockNote': ' (elapsed time follows the server clock)',
+  'app.elapsedSeconds': '{seconds}s',
+  'app.elapsedMinutes': '{minutes}m {seconds}s',
+  'app.firstWarm': 'First prewarm in progress',
+  'app.firstWarmPools': 'Waiting for the first Worker: {pools}',
+  'app.firstWarmDetail':
+    'The service is already running and accepting requests; the first prewarm continues in the background. The listed partitions have no ready Worker yet: requests that arrive meanwhile without a pinned account queue for the first Worker of that partition instead of cold-starting another one; a partition with no account left to start is released at once, and the wait is bounded by the request deadline. When an account fails to start, the prewarm moves on to the next candidate (each failure is logged as "WAA Worker 启动失败"); only after every candidate was tried without a Worker is one WARN line "WAA Worker 首轮预热失败" written, the service keeps running, and Workers are topped up automatically every 5 seconds',
+  'app.partitionNormal': 'Normal',
   'app.ultraWorkers': 'Ultra workers {occupied} / {max}',
   'app.ultraWorkersDetail':
     'Ultra partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · {unschedulable} unschedulable · prewarm target {target} · limit {max}',

@@ -76,6 +76,8 @@ WATCHDOG_MODE=0
 STOP_SENT_QUIT=0
 LAUNCH_PID=""
 LAUNCH_OFFSET=0
+# CAMOUFOX_DEPS_CHECKED 为 1 时本次执行已经对安装好的 Camoufox 查过系统库（check_camoufox_deps 置位）
+CAMOUFOX_DEPS_CHECKED=0
 LAUNCH_ENV=()
 LAUNCH_ENV_SRC=""
 LAUNCH_ENV_LANG=""
@@ -269,6 +271,7 @@ check_camoufox_deps() {
     local dir="$APP_DIR/runtime/camoufox" f out missing="" versions=""
     for f in "$dir/camoufox-bin" "$dir/libxul.so"; do
         [[ -f "$f" ]] || continue
+        CAMOUFOX_DEPS_CHECKED=1
         # libmozgtk.so、libmozsandbox.so 等是 Camoufox 自带的库，运行时从安装目录加载；
         # 检查时同样把安装目录加入搜索路径，只报告真正缺失的系统库
         out="$(LD_LIBRARY_PATH="$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$f" 2>&1)"
@@ -425,7 +428,11 @@ wait_ready() {
             fi
             if [[ "$state" == "RUNNING" ]]; then
                 info "API 已就绪：$(api_hint)"
+                info "WAA Worker 首轮预热在后台进行，首个 Worker 就绪前到达的请求排队等它；进度看管理页侧栏或 ./start.sh log"
                 admin_hint
+                # 进入 RUNNING 不再等首个 Worker：拉起前那次检查没看到 Camoufox 时（首次部署时它在进程装配阶段才下载）这里再查一次
+                # 缺的系统库，缺库时每个 Worker 都会启动失败，请求一直排队到超时；拉起前已经查过的不再重复提示
+                ((CAMOUFOX_DEPS_CHECKED)) || check_camoufox_deps
                 return 0
             fi
             if [[ "$state" == "STOPPED" ]]; then

@@ -25,7 +25,9 @@ import type {
   RequestSummary,
   ServiceConfig,
   ServiceStatus,
+  ServiceTransition,
   TabID,
+  WorkerPartition,
 } from '@/types'
 import AccountsPanel from '@/components/AccountsPanel.vue'
 import LogsPanel from '@/components/LogsPanel.vue'
@@ -36,6 +38,7 @@ import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
 import { formatClock } from '@/proxyPool'
+import { elapsedSecondsSince, syncServerClock, useSecondClock } from '@/serverClock'
 import { readStorage, writeStorage } from '@/storage'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
@@ -113,17 +116,113 @@ const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'playground', label: 'nav.playground', icon: 'chat' },
 ]
 
+// stopSteps 为生成服务的停止步骤：停止期间状态已是 STOPPED，启动失败的清理期间仍是 LAUNCHING，有这些步骤时都显示为 STOPPING
+const stopSteps = new Set<ServiceTransition>([
+  'cancel_requests',
+  'wait_catalog_stop',
+  'close_workers',
+  'flush_writes',
+])
 const serviceState = computed(() => {
   if (status.value === null) return 'unavailable'
+  if (status.value.transition !== undefined && stopSteps.has(status.value.transition)) {
+    return 'stopping'
+  }
   if (status.value.state === 'RUNNING') return 'running'
   if (status.value.state === 'LAUNCHING') return 'launching'
   if (startPending.value && !launchCancellationRequested.value) return 'launching'
   return 'stopped'
 })
+// switching 表示生成服务正在启动或停止
+const switching = computed(
+  () => serviceState.value === 'launching' || serviceState.value === 'stopping',
+)
 const statusColor = computed(() => {
   if (serviceState.value === 'running') return 'bg-green-500 shadow-[0_0_10px_rgba(34,197,94,0.5)]'
-  if (serviceState.value === 'launching') return 'bg-cyan-400 animate-pulse'
+  if (switching.value) return 'bg-cyan-400 animate-pulse'
   return 'bg-gray-600'
+})
+// 每份状态都校准一次服务端时钟（见 serverClock.ts）：步骤与首轮预热的已用时间按服务端时钟换算
+watch(status, (value) => syncServerClock(value?.time))
+// transitionLabels 与 transitionDetails 为生成服务各启动、停止步骤的文字与悬停说明
+const transitionLabels: Record<ServiceTransition, TranslationKey> = {
+  prepare_catalog: 'app.stepPrepareCatalog',
+  wait_catalog: 'app.stepWaitCatalog',
+  start_prewarm: 'app.stepStartPrewarm',
+  cancel_requests: 'app.stepCancelRequests',
+  wait_catalog_stop: 'app.stepWaitCatalogStop',
+  close_workers: 'app.stepCloseWorkers',
+  flush_writes: 'app.stepFlushWrites',
+}
+const transitionDetails: Record<ServiceTransition, TranslationKey> = {
+  prepare_catalog: 'app.stepPrepareCatalogDetail',
+  wait_catalog: 'app.stepWaitCatalogDetail',
+  start_prewarm: 'app.stepStartPrewarmDetail',
+  cancel_requests: 'app.stepCancelRequestsDetail',
+  wait_catalog_stop: 'app.stepWaitCatalogStopDetail',
+  close_workers: 'app.stepCloseWorkersDetail',
+  flush_writes: 'app.stepFlushWritesDetail',
+}
+// partitionLabels 为首轮预热还没出结果的分区名
+const partitionLabels: Record<WorkerPartition, TranslationKey> = {
+  normal: 'app.partitionNormal',
+  ultra: 'pool.ultra',
+  pro: 'pool.pro',
+}
+// firstWarmPending 为首轮预热还没出结果的分区（生成服务运行中才显示）；旧版服务端没有这个字段
+const firstWarmPending = computed(() =>
+  serviceState.value === 'running'
+    ? (status.value?.workers?.prewarm?.first_warm_pending ?? [])
+    : [],
+)
+// clockNow 为有启动、停止步骤或首轮预热还没出结果时每秒刷新的本机时刻
+const clockNow = useSecondClock(
+  () => status.value?.transition_since !== undefined || firstWarmPending.value.length > 0,
+)
+
+// elapsedText 把已用秒数写成“N 秒”或“M 分 N 秒”
+function elapsedText(seconds: number): string {
+  if (seconds < 60) return tf('app.elapsedSeconds', { seconds })
+  return tf('app.elapsedMinutes', {
+    minutes: Math.floor(seconds / 60),
+    seconds: String(seconds % 60).padStart(2, '0'),
+  })
+}
+
+// transitionLine 为侧栏状态下方的启动、停止步骤行：步骤文字与进入该步骤以来的已用时间（服务端时钟），没有步骤时为 null
+const transitionLine = computed(() => {
+  const transition = status.value?.transition
+  if (transition === undefined || !(transition in transitionLabels)) return null
+  const since = status.value?.transition_since
+  return {
+    step: t(transitionLabels[transition]),
+    elapsed: since === undefined ? '' : elapsedText(elapsedSecondsSince(since, clockNow.value)),
+    detail: t(transitionDetails[transition]) + t('app.stepClockNote'),
+  }
+})
+
+// firstWarmLine 为生成服务运行中、首轮预热还没出结果时的一行：哪些分区的请求在等首个 Worker，以及首轮预热已进行的时间
+// （服务端给的本轮秒数 round_seconds 按状态的服务端时刻换算成开始时刻，之后每秒走表）
+const firstWarmLine = computed(() => {
+  const pending = firstWarmPending.value
+  if (pending.length === 0) return null
+  const prewarm = status.value?.workers?.prewarm
+  const time = status.value?.time
+  let elapsed = ''
+  if (prewarm?.active && time !== undefined) {
+    const startedAt = new Date(Date.parse(time) - prewarm.round_seconds * 1000).toISOString()
+    elapsed = elapsedText(elapsedSecondsSince(startedAt, clockNow.value))
+  }
+  const separator = locale.value === 'zh-CN' ? '、' : ', '
+  return {
+    pools: tf('app.firstWarmPools', {
+      pools: pending
+        .filter((partition) => partition in partitionLabels)
+        .map((partition) => t(partitionLabels[partition]))
+        .join(separator),
+    }),
+    elapsed,
+  }
 })
 // workerSets 由状态接口的账户列表构造，账户页据此标记每个账户的 Worker 状态
 const workerSets = computed(() => ({
@@ -558,7 +657,7 @@ function navBadge(id: TabID): string {
 
 const statusTextColor = computed(() => {
   if (serviceState.value === 'running') return 'text-green-400'
-  if (serviceState.value === 'launching') return 'text-cyan-300'
+  if (switching.value) return 'text-cyan-300'
   return 'text-gray-500'
 })
 
@@ -918,9 +1017,9 @@ onUnmounted(() => {
 
       <div
         class="relative min-w-0 overflow-hidden border-t border-[#30363d] p-2 md:p-4"
-        :class="serviceState === 'launching' ? 'launching-shell' : ''"
+        :class="switching ? 'launching-shell' : ''"
       >
-        <div v-if="serviceState === 'launching'" class="launching-scan" aria-hidden="true"></div>
+        <div v-if="switching" class="launching-scan" aria-hidden="true"></div>
         <!-- PRO_POOL 默认开启的升级提示：可关闭，点“去设置”打开设置页并滚动到 Pro 号池分组；悬停看完整说明 -->
         <div
           v-if="proPoolNotice"
@@ -956,7 +1055,7 @@ onUnmounted(() => {
         </div>
         <div class="mb-2 text-xs text-gray-500">{{ t('app.status') }}</div>
         <div class="mb-1 flex items-center justify-between">
-          <span class="font-mono font-bold" :class="statusTextColor">
+          <span class="font-mono font-bold" :class="statusTextColor" data-testid="sidebar-state">
             {{ serviceState.toUpperCase() }}
           </span>
           <span
@@ -965,6 +1064,34 @@ onUnmounted(() => {
           >
             {{ status?.version || '—' }}
           </span>
+        </div>
+        <!-- 启动、停止步骤与已用时间（服务端时钟）：步骤名过长时换行，悬停看步骤说明；已用时间不换行，与第一行对齐 -->
+        <div
+          v-if="transitionLine"
+          v-tooltip="`${transitionLine.step} — ${transitionLine.detail}`"
+          class="mb-1 flex min-w-0 items-baseline justify-between gap-2 text-xs"
+          :class="statusTextColor"
+          data-testid="sidebar-transition"
+        >
+          <span class="min-w-0 break-words">{{ transitionLine.step }}</span>
+          <span class="shrink-0 font-mono text-[11px] text-gray-400 tabular-nums">{{
+            transitionLine.elapsed
+          }}</span>
+        </div>
+        <!-- 生成服务已在运行、首轮预热还在后台进行：哪些分区的请求在等首个 Worker 与首轮预热已进行的时间 -->
+        <div
+          v-else-if="firstWarmLine"
+          v-tooltip="t('app.firstWarmDetail')"
+          class="mb-1 text-xs"
+          data-testid="sidebar-first-warm"
+        >
+          <div class="flex min-w-0 items-baseline justify-between gap-2 text-cyan-300">
+            <span class="min-w-0 truncate">{{ t('app.firstWarm') }}</span>
+            <span class="shrink-0 font-mono text-[11px] text-gray-400 tabular-nums">{{
+              firstWarmLine.elapsed
+            }}</span>
+          </div>
+          <div class="break-words text-[11px] text-gray-400">{{ firstWarmLine.pools }}</div>
         </div>
         <div v-if="status" class="mb-3 space-y-0.5 font-mono text-[11px] text-gray-500">
           <div>
@@ -1201,8 +1328,13 @@ onUnmounted(() => {
             >
               {{ tf('app.prewarmStalled', { seconds: status.workers.prewarm.loop_age_seconds }) }}
             </div>
+            <!-- 预热空闲只在运行中显示：停止步骤期间 Worker 正在关闭，不是预热没有进行 -->
             <div
-              v-if="!status.workers.prewarm.active && status.workers.warm < status.workers.target"
+              v-if="
+                serviceState === 'running' &&
+                !status.workers.prewarm.active &&
+                status.workers.warm < status.workers.target
+              "
               v-tooltip="status.workers.prewarm.reason || ''"
               class="cell-truncate"
             >
@@ -1240,14 +1372,18 @@ onUnmounted(() => {
           <UiIcon :name="startPending ? 'spinner' : 'play'" :size="16" />
           {{ t('app.start') }}
         </button>
+        <!-- 停止步骤进行中（其他管理页发起的停止或启动失败的清理）时停止按钮不可点 -->
         <button
-          v-else-if="serviceState === 'launching' || serviceState === 'running'"
+          v-else-if="serviceState !== 'unavailable'"
           class="flex w-full items-center justify-center gap-2 rounded bg-red-600 py-2 font-bold text-white shadow transition hover:bg-red-500 disabled:opacity-50"
           type="button"
-          :disabled="stopPending"
+          :disabled="stopPending || serviceState === 'stopping'"
           @click="stopService"
         >
-          <UiIcon :name="stopPending ? 'spinner' : 'stop'" :size="16" />
+          <UiIcon
+            :name="stopPending || serviceState === 'stopping' ? 'spinner' : 'stop'"
+            :size="16"
+          />
           {{ t('app.stop') }}
         </button>
       </div>

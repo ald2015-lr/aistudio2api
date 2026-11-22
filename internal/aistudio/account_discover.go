@@ -145,7 +145,7 @@ type BootstrapSummary struct {
 	UltraAvailable int
 	// ProAvailable 为 Available 中属于 Pro 号池的账户数（Pro Worker 分区的预热目标上限，PRO_POOL=false 时为 0）
 	ProAvailable int
-	// ModelIDs 为全部账户出现过的初始化模型，去重并按首次出现顺序排列
+	// ModelIDs 为启用账户出现过的初始化模型（含需要登录、冷却中的启用账户），去重并按首次出现顺序排列；停用账户的模型不计入
 	ModelIDs []string
 }
 
@@ -168,14 +168,15 @@ func (p *AccountPool) BootstrapSummary() BootstrapSummary {
 			continue
 		}
 		models := accountBootstrapModelsLocked(account)
+		if len(models) == 0 || !account.Config.Enabled {
+			continue
+		}
+		// 只收集启用账户的模型（上游 c77dd89）：停用账户独有的模型没有可预热的账户，预热按模型分类候选时只是多跑几轮
 		for _, modelID := range models {
 			if _, exists := seen[modelID]; !exists {
 				seen[modelID] = struct{}{}
 				summary.ModelIDs = append(summary.ModelIDs, modelID)
 			}
-		}
-		if len(models) == 0 || !account.Config.Enabled {
-			continue
 		}
 		// 与 Status 共用状态推导（按候选索引的紧凑数组）：需要登录的账户即使还有未结束的租约也不计入可预热
 		if state := index.derivedStateAt(position, nowNanos); state == AccountReady || state == AccountBusy {

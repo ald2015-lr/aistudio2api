@@ -1,7 +1,9 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -45,6 +47,8 @@ type runtimeAdmin struct {
 	// 还没做的合并刷新模型目录（见 syncModelCacheSoon）
 	transitions      accountTransitions
 	modelSyncPending atomic.Bool
+	// statusMu 串行化步骤变化时状态快照的生成与推送（publishStatus）：后生成的快照后到达管理页
+	statusMu sync.Mutex
 }
 
 // requestRegistry 保存活动请求与事件订阅
@@ -209,7 +213,9 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	// 最近 10 分钟新被标为需要登录的账户数，放在全部账户的计数里（持续增长说明运行期 401 在累积）
 	counts.AuthRequired10m = admin.service.authMarks.count(time.Now(), authRecentWindow)
 	normal := aistudio.PoolScopeNormal
-	return api.AdminStatus{
+	prewarm := admin.workers.prewarmState()
+	prewarm.FirstWarmPending = admin.workers.firstWarmPendingNames()
+	status := api.AdminStatus{
 		State:          state,
 		Running:        running,
 		Ready:          running && counts.Ready+counts.Busy > 0,
@@ -221,7 +227,7 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			Warm: len(inPartition(warm, members, normal)), Starting: len(inPartition(starting, members, normal)),
 			Target: admin.workers.prewarmTargetFor(normal), Max: admin.workers.maxActiveFor(normal),
 			Occupied: occupied[normal], Dead: dead[normal], Draining: draining[normal], Retiring: retiring[normal],
-			Prewarm: admin.workers.prewarmState(),
+			Prewarm: prewarm,
 			WarmIDs: warm, StartingIDs: starting,
 			Unschedulable: unschedulable[normal],
 		},
@@ -240,7 +246,24 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Drive:         drive,
 		// 平均调用概况（见 balanced.go）：开启且服务运行时才有，只读 keepWarm 每 30 秒算好的缓存
 		Balanced: admin.workers.balancedStatus(running),
-	}, nil
+		// 服务端时刻与启动、停止步骤（见 service_step.go）：管理页按服务端时钟换算步骤的已用时间
+		Time: time.Now(),
+	}
+	if step, since := admin.service.Step(); step != "" {
+		status.Transition, status.TransitionSince = step, &since
+	}
+	return status, nil
+}
+
+// publishStatus 生成并推送一次生成服务状态快照（启动、停止步骤变化时，见 service_step.go）：只推送 status，不带账户与模型列表
+func (admin *runtimeAdmin) publishStatus(ctx context.Context) {
+	admin.statusMu.Lock()
+	defer admin.statusMu.Unlock()
+	status, err := admin.Status(ctx)
+	if err != nil {
+		return
+	}
+	admin.requests.publish(api.AdminEvent{Type: "status", Data: status})
 }
 
 // adminAccountCounts 投影账户状态计数
@@ -1672,7 +1695,11 @@ func openAdminEvents(
 				refreshTimer.Stop()
 			}
 		}()
+		var statuses statusDedupe
 		send := func(event api.AdminEvent) bool {
+			if !statuses.fresh(event) {
+				return true
+			}
 			select {
 			case events <- event:
 				return true
@@ -1731,6 +1758,30 @@ func openAdminEvents(
 		}
 	}()
 	return events, nil
+}
+
+// statusDedupe 为一个管理页连接的状态快照去重：last 为最近一次发出的状态快照（生成时刻 Time 清零后编码）
+type statusDedupe struct {
+	last []byte
+}
+
+// fresh 判断事件是否要发出：内容与上一次发出的状态快照相同（只是生成时刻 Time 不同不算变化，Time 每次都不同）的不再发出，
+// 其余事件总是发出
+func (dedupe *statusDedupe) fresh(event api.AdminEvent) bool {
+	status, ok := event.Data.(api.AdminStatus)
+	if !ok || event.Type != "status" {
+		return true
+	}
+	status.Time = time.Time{}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		return true
+	}
+	if bytes.Equal(encoded, dedupe.last) {
+		return false
+	}
+	dedupe.last = encoded
+	return true
 }
 
 // adminRequestStateUpdates 合并请求状态引起的管理页快照变化

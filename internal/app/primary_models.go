@@ -82,6 +82,9 @@ const (
 	// waitReasonExpanding 为这次选号发起的后台扩容还没结束时的等待原因（N4）：等它的时间与请求自己的现场冷启动一样延后截止时间
 	// （与现场冷启动共用 INIT_TIMEOUT 的抵扣上限），不再排队 10 秒就 429、而后台扩容 15–25 秒后才就绪
 	waitReasonExpanding = "Worker 正在扩容"
+	// waitReasonFirstWarm 为请求号池里还没有已就绪的 Worker、首轮预热还没出结果时的等待原因（见 first_warm.go）：
+	// 等的是后台预热的第一个 Worker，不另起冷启动；主用模型与等后台扩容一样按现场冷启动抵扣（合计不超过 INIT_TIMEOUT）
+	waitReasonFirstWarm = "等待首个 Worker 预热"
 )
 
 // 额度不足时 PrimaryQuotaError 的原因（Ultra 主用模型与普通号池共用，见 quota_switch.go）
@@ -373,8 +376,9 @@ func (budget *leaseWaitBudget) wait(ctx context.Context, changed <-chan struct{}
 	}
 	// 等这次选号发起的后台扩容（N4）：在还能抵扣的时长内不受截止时间限制，等待的时间计入抵扣（与现场冷启动合计不超过 INIT_TIMEOUT）；
 	// 抵扣用完后按普通容量原因处理。与现场冷启动一样经 beginColdStart/creditColdStart 同步推迟流式请求写出响应头：
-	// 原先只延后了排队截止时间，API 层到“排队上限 + 余量”就先回 200，之后的 429 只能写进流里
-	if credit := budget.expansionCredit - budget.coldStart; reason == waitReasonExpanding && credit > 0 {
+	// 原先只延后了排队截止时间，API 层到“排队上限 + 余量”就先回 200，之后的 429 只能写进流里。
+	// 等首轮预热的第一个 Worker（waitReasonFirstWarm）同样是在等一次后台冷启动，按同样的规则抵扣
+	if credit := budget.expansionCredit - budget.coldStart; (reason == waitReasonExpanding || reason == waitReasonFirstWarm) && credit > 0 {
 		budget.beginColdStart(budget.expansionCredit)
 		startedAt := time.Now()
 		err := waitScheduling(ctx, changed, min(delay, credit))

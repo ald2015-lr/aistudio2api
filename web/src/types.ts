@@ -194,7 +194,12 @@ export interface OnboardingStatus {
   recent: OnboardingEvent[] | null
 }
 
-// PrewarmState 为预热循环的实时状态；loop_age_seconds 持续变大说明循环被卡住
+// WorkerPartition 为 Worker 分区：普通、Ultra 与 Pro
+export type WorkerPartition = 'normal' | 'ultra' | 'pro'
+
+// PrewarmState 为预热循环的实时状态；loop_age_seconds 持续变大说明循环被卡住，round_seconds 为当前这一轮已进行的秒数。
+// first_warm_pending 为首轮预热还没出结果的分区：生成服务已在运行，这些分区还没有就绪的 Worker，期间不指定账户的请求排队等
+// 首轮预热的第一个 Worker、不另起冷启动；都已出结果时省略，旧版服务端不返回
 export interface PrewarmState {
   active: boolean
   inflight: number
@@ -202,6 +207,7 @@ export interface PrewarmState {
   round_seconds: number
   loop_age_seconds: number
   reason?: string
+  first_warm_pending?: WorkerPartition[]
 }
 
 // WorkerCounters 为 WAA Worker 的实时数量；warm_ids、starting_ids 为对应账户；
@@ -344,7 +350,19 @@ export interface EgressSummary {
   rejected: number
 }
 
+// ServiceTransition 为生成服务的启动步骤（prepare_catalog、wait_catalog、start_prewarm）与停止步骤（其余四个，启动失败的清理
+// 同样经过后三个）
+export type ServiceTransition =
+  | 'prepare_catalog'
+  | 'wait_catalog'
+  | 'start_prewarm'
+  | 'cancel_requests'
+  | 'wait_catalog_stop'
+  | 'close_workers'
+  | 'flush_writes'
+
 export interface ServiceStatus {
+  // 停止期间 state 已是 STOPPED，transition 为停止步骤；启动失败的清理期间 state 仍是 LAUNCHING
   state: 'STOPPED' | 'LAUNCHING' | 'RUNNING'
   running: boolean
   ready: boolean
@@ -384,6 +402,11 @@ export interface ServiceStatus {
   drive?: DriveCounters
   // balanced 为平均调用（ROUTING_STRATEGY=balanced）的概况：开启且服务运行时才有；旧版服务端不返回
   balanced?: BalancedStatus
+  // transition 为正在进行的启动或停止步骤，transition_since 为进入它的服务端时刻，没有步骤时都省略；
+  // time 为生成这份状态的服务端时刻，管理页据此换算已用时间（不受浏览器时钟偏差影响）。旧版服务端都不返回
+  transition?: ServiceTransition
+  transition_since?: string
+  time?: string
 }
 
 // ProPoolNotice 为 PRO_POOL 默认开启的升级提示：升级前 Pro 账户服务默认地址（或经 ULTRA_INCLUDE_PRO 并入 /ultra），默认开启后

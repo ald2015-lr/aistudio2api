@@ -81,6 +81,16 @@ type AdminStatus struct {
 	Drive *AdminDriveCounts `json:"drive,omitempty"`
 	// Balanced 为平均调用（ROUTING_STRATEGY=balanced）的概况（见 AdminBalanced）：开启且服务运行时才有
 	Balanced *AdminBalanced `json:"balanced,omitempty"`
+	// Transition 为生成服务正在进行的启动或停止步骤，没有时省略。
+	// 启动：prepare_catalog 准备模型目录，wait_catalog 等待首个账户读取模型目录（没有目录缓存时），start_prewarm 开始后台预热 WAA Worker
+	// （首轮预热不等结果，服务随即进入运行，预热进度见 Workers.Prewarm）；
+	// 停止：cancel_requests 停止在途请求，wait_catalog_stop 等待模型目录同步停止，close_workers 关闭 WAA Worker，
+	// flush_writes 写出暂存的认证 Cookie、推迟的模型资格时间与坏号记忆等记录（启动失败的清理同样经过后三步）
+	Transition string `json:"transition,omitempty"`
+	// TransitionSince 为进入当前步骤的时刻，没有步骤时省略
+	TransitionSince *time.Time `json:"transition_since,omitempty"`
+	// Time 为生成这份状态的服务端时刻，管理页以它换算各步骤的已用时间（不受浏览器时钟偏差影响）；推送去重时不比较它
+	Time time.Time `json:"time"`
 }
 
 // AdminBalanced 表示平均调用的概况：QuotaDay 为当前太平洋时间额度日（每日限额在太平洋时间零点恢复，北京时间 15 点或 16 点），
@@ -297,6 +307,9 @@ type AdminPrewarmState struct {
 	RoundSeconds   int64  `json:"round_seconds"`
 	LoopAgeSeconds int64  `json:"loop_age_seconds"`
 	Reason         string `json:"reason,omitempty"`
+	// FirstWarmPending 为首轮预热还没出结果的 Worker 分区（normal、ultra、pro）：这些分区没有已就绪的 Worker 时，
+	// 不固定账户的请求等首轮预热的第一个 Worker、不另起冷启动；都已出结果时省略
+	FirstWarmPending []string `json:"first_warm_pending,omitempty"`
 }
 
 // AdminWorkerCounts 表示 WAA Worker 的实时数量与对应账户：数量与上限只含普通分区（Ultra 分区见 AdminWorkerPartition），
