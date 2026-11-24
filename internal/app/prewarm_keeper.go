@@ -63,6 +63,9 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	}
 	// 平均调用（见 balanced.go）：自带 30 秒节奏，未开启时什么也不做
 	service.balancedPass(dataContext, time.Now())
+	// 补充池对账（见 extra_pool.go）：成员、归还与释放。放在主分区补齐预热之前，归还先于主分区的预热判断；补充池预热在最后
+	// （主预热先拿冷启动名额）。补充池关闭且没有补充池 Worker 时什么也不做
+	extraPassView := service.extraReconcile(dataContext)
 	workers := service.workers
 	workers.sweepFailedWorkers(dataContext)
 	workers.retryPendingCleanup()
@@ -76,9 +79,12 @@ func (service *trackedService) keepWarmPass(dataContext context.Context, lastRot
 	// IP 池的浏览器上限随 Pro 分区有没有账户变化（见 worker_proxy.go）
 	service.syncProxyPoolCapacity()
 	// 各分区各自按自己的预热目标判断
-	if workers.prewarmNeeded() {
+	mainStarted := workers.prewarmNeeded()
+	if mainStarted {
 		workers.StartPrewarm(dataContext)
 	}
+	// 补充池预热排在主分区补齐预热之后（I8）；补充池关闭且没有补充池 Worker 时 extraPassView 为 nil，什么也不做
+	workers.extraLaunchAfterPrewarm(extraPassView, mainStarted)
 	return lastRotation
 }
 
@@ -319,7 +325,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		return 0
 	}
 	budget := max(workers.warmConcurrencyValue(), 1)
-	members := service.pool.PartitionMembers()
+	members := workers.slotMembers()
 	opening := workers.OpeningAccountIDs()
 	type victim struct {
 		accountID string
@@ -358,6 +364,8 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 		for _, accountID := range inPartition(opening, members, partition) {
 			occupied[accountID] = struct{}{}
 		}
+		// 补充池 Worker 的账户已占着槽位，不算可接替的备用号（见 excludeExtraOwned）
+		workers.excludeExtraOwned(occupied)
 		limit := min(budget-len(victims), len(candidates))
 		limit = min(limit, service.pool.SpareAccounts(partition, occupied, nil, rotationMinRemaining, limit))
 		for _, accountID := range candidates {
@@ -426,7 +434,7 @@ func (service *trackedService) sweepDeadWorkers(ctx context.Context) int {
 // 一轮最多替换的数量两个分区共用启动预热并发。按模型的轮换有阈值；全局冷却的账号见 sweepDeadWorkers
 func (service *trackedService) rotateCooledWorkers(ctx context.Context) {
 	workers := service.workers
-	members := service.pool.PartitionMembers()
+	members := workers.slotMembers()
 	allWarm := workers.WarmAccountIDs()
 	opening := workers.OpeningAccountIDs()
 	var allHot []string
@@ -506,6 +514,8 @@ func (service *trackedService) rotatePartition(
 	for _, accountID := range openingIDs {
 		occupied[accountID] = struct{}{}
 	}
+	// 补充池 Worker 的账户已占着槽位，不算可接替的备用号（见 excludeExtraOwned）
+	workers.excludeExtraOwned(occupied)
 	limit = min(limit, service.pool.SpareAccounts(partition, occupied, hot, rotationMinRemaining, limit))
 	if limit <= 0 {
 		return 0, nil

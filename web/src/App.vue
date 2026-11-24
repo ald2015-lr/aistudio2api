@@ -228,6 +228,8 @@ const firstWarmLine = computed(() => {
 const workerSets = computed(() => ({
   warm: new Set(status.value?.workers?.warm_ids ?? []),
   starting: new Set(status.value?.workers?.starting_ids ?? []),
+  // extra 为其中计入补充池的账户（状态接口的 extra_ids，每 3 秒更新）；补充池关闭且没有补充池 Worker 时为空
+  extra: new Set(status.value?.workers?.extra_ids ?? []),
 }))
 
 // catalogSyncLine 为侧栏的模型目录同步行：暂停中（上游 429 或出口限流）、有缺失或有疑似失效时才显示
@@ -372,6 +374,43 @@ const proWorkers = computed(() => {
   return accounts > 0 || workers.occupied > 0 || workers.warm + workers.starting > 0
     ? workers
     : null
+})
+
+// extraPool 为侧栏的补充池行：状态接口有 extra_pool（开启，或关闭后仍有补充池 Worker 在归还）时显示；
+// detail 为悬停说明（方式、是否含 Ultra、默认地址借付费模型、各计数与借出次数）。关闭后还在归还时只写“已关闭 · 归还中 N”：
+// 关闭时常驻数与峰值按 0 计，写成“N / 0 · 峰值 0”并标黄会像是超限出错
+const extraPool = computed(() => {
+  const extra = status.value?.extra_pool
+  if (extra === undefined) return null
+  const yesNo = (value: boolean): string => t(value ? 'app.extraYes' : 'app.extraNo')
+  const workers = extra.workers
+  return {
+    text: extra.enabled
+      ? tf('app.extraWorkers', {
+          workers: workers.occupied,
+          warm: workers.warm_limit,
+          max: workers.max,
+          lendable: extra.lendable,
+          members: extra.members,
+        })
+      : tf('app.extraWorkersOff', { workers: workers.occupied }),
+    detail: tf('app.extraWorkersDetail', {
+      state: t(extra.enabled ? 'app.extraStateOn' : 'app.extraStateOff'),
+      mode: t(extra.mode === 'overflow' ? 'app.extraModeOverflow' : 'app.extraModeShare'),
+      ultra: yesNo(extra.include_ultra),
+      paid: yesNo(extra.default_paid),
+      running: workers.warm,
+      starting: workers.starting,
+      target: workers.target,
+      cold: extra.cold_members,
+      free: extra.free,
+      pro: extra.pro,
+      ultraMembers: extra.ultra,
+      returning: extra.returning,
+      borrows: extra.borrows,
+    }),
+    full: extra.enabled && workers.occupied >= workers.max,
+  }
 })
 
 // proPoolNotice 为 PRO_POOL 默认开启的升级提示（.env 与环境变量都没有写 PRO_POOL、又有 Pro 号池账户时服务端才返回）：
@@ -1283,6 +1322,15 @@ onUnmounted(() => {
             </span>
           </div>
           <div
+            v-if="extraPool"
+            v-tooltip="extraPool.detail"
+            data-testid="sidebar-extra-workers"
+            class="break-words"
+            :class="extraPool.full ? 'text-yellow-400' : 'text-emerald-300'"
+          >
+            {{ extraPool.text }}
+          </div>
+          <div
             v-if="authRecheckLine"
             v-tooltip="authRecheckLine.detail"
             class="cell-truncate"
@@ -1412,6 +1460,7 @@ onUnmounted(() => {
           :worker-counts="status?.workers ?? null"
           :ultra-worker-counts="status?.ultra_workers ?? null"
           :pro-worker-counts="status?.pro_workers ?? null"
+          :extra-pool="status?.extra_pool ?? null"
           :proxy-pool="status?.proxy_pool ?? null"
           :cooldowns="cooldowns"
           @refresh="loadAccountData"
@@ -1434,7 +1483,10 @@ onUnmounted(() => {
           @refresh="loadRequestData"
           @notice="showNotice"
         />
-        <UsagePanel v-else-if="currentTab === 'usage'" />
+        <UsagePanel
+          v-else-if="currentTab === 'usage'"
+          :extra-pool="status?.extra_pool !== undefined"
+        />
         <SettingsPanel
           v-else-if="currentTab === 'settings'"
           :config="config"

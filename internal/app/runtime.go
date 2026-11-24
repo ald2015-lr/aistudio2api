@@ -80,6 +80,8 @@ func newRuntime(
 	)
 	workers.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
 	workers.setProCapacity(cfg.ProWarmWorkerLimit, cfg.ProMaxActiveWorkers)
+	// 补充池（见 extra_pool.go）：启动流程不经过 applyLiveSettings，这里写一次设置（账户池里的规则由 configurePool 写入）
+	workers.setExtraSettings(extraSettingsOf(cfg))
 	// 平均调用（ROUTING_STRATEGY=balanced，见 balanced.go）：启动流程不经过 applyLiveSettings，这里写一次开关
 	workers.setBalanced(cfg.RoutingStrategy == aistudio.RoutingBalanced)
 	// 按需替换与扩容的启动宽限、每分区每分钟的替换上限（N6，见 replace_rate.go）
@@ -187,6 +189,7 @@ func newRuntime(
 		len(accounts), time.Since(startedAt).Round(time.Millisecond),
 	))
 	logPoolRuleNotes(requests, cfg)
+	logExtraPoolEnabled(requests, cfg)
 	closeRuntime := func() error {
 		// 管理页启停账户的后台收尾（见 account_transition.go）：先取消并等它们退出，之后不会再为账户关闭 Worker
 		admin.transitions.close()
@@ -245,6 +248,9 @@ func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 	pool.SetRoutingStrategy(cfg.RoutingStrategy)
 	pool.SetUpstreamChannels(upstreamChannels(cfg.UpstreamChannels))
 	pool.SetPoolRules(cfg.UltraIncludePro, cfg.ProPool)
+	// 补充池规则（EXTRA_POOL、EXTRA_POOL_INCLUDE_ULTRA、EXTRA_POOL_DEFAULT_PAID，见 extra_pool.go）：关闭时规范化为零值，与初值相同，
+	// 什么也不做（不递增任何版本）；运行中由 applyLiveFields 热更新
+	pool.SetExtraPoolRules(extraRulesOf(cfg))
 	// 权益规则（ULTRA_ONLY_MODELS、PAID_ONLY_MODELS）：第一次建立候选集之前写入；运行中由 applyLiveFields 热更新
 	pool.SetModelTierRules(cfg.UltraOnlyModels, cfg.PaidOnlyModels)
 	// 账户池构造时不限速（0），这里按配置打开；运行中由 applyLiveFields 热更新
@@ -253,6 +259,8 @@ func configurePool(pool *aistudio.AccountPool, cfg config.Config) {
 
 // accountWorkerManager 管理每账户的长驻 WAA worker
 type accountWorkerManager struct {
+	// extraState 为补充池的设置、标记与叠加视图缓存（见 extra_pool.go）
+	extraState
 	// replacements 为各分区最近一分钟的按需替换（每分钟上限，见 replace_rate.go）；replaceGrace 为按需替换与扩容不换刚就绪的 Worker 的宽限
 	// （见 pickReplaceVictim）。两者都只在 newRuntime 打开，测试直接构造的管理器不限
 	replacements replacementRate
@@ -674,14 +682,16 @@ func (manager *accountWorkerManager) reapIdleWorkers() {
 	}
 }
 
-// reapIdleWorker 关闭一个最近使用早于 before 的多余空闲 Worker，并返回是否关闭；各分区按自己的常驻数回收
+// reapIdleWorker 关闭一个最近使用早于 before 的多余空闲 Worker，并返回是否关闭；各分区按自己的常驻数回收。
+// 补充池（见 extra_pool.go）开启或还有补充池 Worker 时在三个分区之后按补充池的常驻数回收：关闭后常驻数为 0，空闲的补充池 Worker
+// 同样被回收，与对账的释放互为兜底；关闭且没有补充池 Worker 时整段跳过
 func (manager *accountWorkerManager) reapIdleWorker(before time.Time) bool {
 	for _, partition := range workerPartitions {
 		if manager.reapIdleWorkerIn(partition, before) {
 			return true
 		}
 	}
-	return false
+	return manager.extraSlotsActive() && manager.reapIdleWorkerIn(aistudio.PoolScopeExtra, before)
 }
 
 // reapIdleWorkerIn 在分区的 Worker 超出该分区常驻数时关闭其中一个空闲超时的 Worker：在热门或主用模型上长时间冷却的死槽位优先，
@@ -710,7 +720,8 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 	}
 	if evicted {
 		manager.requests.log("service", "INFO", fmt.Sprintf(
-			"%s 空闲回收 | Worker=%d/%d", workerLogName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
+			"%s 空闲回收 | Worker=%d/%d%s", workerLogName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
+			manager.handOffSuffix(victim),
 		))
 	}
 	return evicted
@@ -722,7 +733,7 @@ func (manager *accountWorkerManager) reapIdleWorkerIn(partition aistudio.PoolSco
 func (manager *accountWorkerManager) reserveReapVictim(partition aistudio.PoolScope, before time.Time) string {
 	manager.rebalanceMu.Lock()
 	defer manager.rebalanceMu.Unlock()
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	if manager.openingIn(partition, members) || len(inPartition(manager.WarmAccountIDs(), members, partition)) <= manager.warmTargetFor(partition) {
 		return ""
 	}
@@ -1016,6 +1027,8 @@ func (manager *accountWorkerManager) ResetAll() error {
 	// 关闭失败的 Worker 不再排空：生成服务停止后不会有淘汰来清除它们的标记；主用模型供给按 Worker 统计，一并清空
 	manager.clearAllDrains()
 	manager.clearPrimarySupply()
+	// 补充池的成员缓存同样清空（停服期间不对账，见 clearExtraView）；没有补充池时什么也不做
+	manager.clearExtraView()
 	var resetErrors []error
 	for resetErr := range resetResults {
 		resetErrors = append(resetErrors, resetErr)
@@ -1551,9 +1564,9 @@ func activateAccountWorker(preparer *accountWorkerPreparer) error {
 		source = " | 来源=" + preparer.source
 	}
 	preparer.manager.requests.log(label, "INFO", fmt.Sprintf(
-		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s%s%s",
+		"WAA Worker 就绪 | 页面模型=%s | PID=%d | 耗时=%s%s%s%s",
 		preparer.bootstrapModel, preparer.worker.State().PID, time.Since(preparer.startedAt).Round(time.Millisecond), source,
-		workerCauseField(preparer.cause),
+		workerCauseField(preparer.cause), preparer.manager.extraReadySuffix(preparer.account.id),
 	))
 	preparer.pending = false
 	preparer.account.startupMu.Unlock()
@@ -1739,7 +1752,7 @@ func accountFilesPresent(account *aistudio.Account) bool {
 // 同分区每个启动占位计 1 个槽位，含这次替换自己的），合计不超过峰值时新 Worker 可以直接发布。等淘汰对象期间分区可能已空出槽位：
 // 跳过的淘汰对象被目录扫描移出、其他 Worker 被删除或回收。调用方持有 rebalanceMu
 func (manager *accountWorkerManager) replacementFitsLocked(partition aistudio.PoolScope) bool {
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	occupancy := manager.occupiedWorkersIn(partition, members)
 	slots := occupancy.effectiveSlots()
 	for openingAccountID := range manager.openings {
@@ -1767,6 +1780,11 @@ func (manager *accountWorkerManager) evictIdleWorkerFor(ctx context.Context, acc
 	}
 	if err := ctx.Err(); err != nil {
 		return false, errors.Join(err, lease.Release())
+	}
+	// 原地接手（见 extra_pool.go 的 extraAdopt）：起因在白名单里、账户是补充池成员且补充池低于常驻数时，给 Worker 打上补充池标记、
+	// 不关浏览器，按“已空出槽位”返回，调用方照常做后续处理（撤销预留与登记、替补、补预热、发布）。补充池关闭时第一步就返回
+	if manager.extraAdopt(accountID, cause) {
+		return true, lease.Release()
 	}
 	resetErr := manager.ResetFor(accountID, cause)
 	releaseErr := lease.Release()
@@ -1835,32 +1853,45 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return preparer, nil
 		}
-		// 容量只计账户所在分区：Worker 按账户当前所在号池（权益与 PRO_POOL、ULTRA_INCLUDE_PRO 共同决定）计入普通、Ultra 或 Pro 分区
-		members := manager.pool.PartitionMembers()
+		// 容量只计账户所在分区：Worker 按账户当前所在号池（权益与 PRO_POOL、ULTRA_INCLUDE_PRO 共同决定）计入普通、Ultra 或 Pro 分区；
+		// 带补充池标记的计入补充池（叠加视图，见 extra_pool.go）
+		members := manager.slotMembers()
 		partition := partitionOf(accountID, members)
-		occupancy := manager.occupiedWorkersIn(partition, members)
-		occupied := make(map[string]struct{}, len(occupancy.accountIDs)+len(manager.openings))
-		for _, occupiedAccountID := range occupancy.accountIDs {
-			occupied[occupiedAccountID] = struct{}{}
-		}
-		for openingAccountID := range manager.openings {
-			if partitionOf(openingAccountID, members) != partition {
-				continue
-			}
-			occupied[openingAccountID] = struct{}{}
-			// 正在启动的账户锁被占用时（启动流程短暂持有账户锁）上面已按 1 个槽位估计，不再重复计入：
-			// 否则两个账户同时启动时后一个会把前一个算成两个槽位，分区还有空槽却按已满返回
-			if _, estimated := occupancy.lockBusy[openingAccountID]; !estimated {
-				occupancy.slots++
-			}
-		}
+		occupancy, occupied := manager.partitionOccupancyLocked(partition, members)
 		_, replacing := occupied[accountID]
+		// 本进程有过补充池 Worker 时，账户自己的锁被占用不按原槽位绕过容量判断：回到快路径等这把锁，再按叠加视图重新判断（见 extraSelfLockBusy）
+		if manager.extraSelfLockBusy(accountID, occupancy) {
+			manager.rebalanceMu.Unlock()
+			continue
+		}
+		// 补充池的启动（ctx 带 withExtraStart：补充池预热、请求触发的扩容）：账户此刻仍是补充池成员（现查）时改按补充池的容量判断，
+		// 启动占位与补充池标记在同一段 rebalanceMu 内写入；已不是成员时按 fallbackHome 走家分区或返回 errExtraMemberGone。
+		// 账户已占着家分区的槽位（有 Worker、正在关闭或账户锁被占用）时补充池不启动它（预热与扩容只启动冷成员），按正在启动跳过；
+		// 重开与重放（stay）照常在原槽位重开。没有这个 ctx 选项时 tagExtra 恒为假，与没有补充池时完全相同
+		tagExtra := false
+		if extraOptions, ok := extraStartFrom(ctx); ok && partition != aistudio.PoolScopeExtra {
+			switch {
+			case replacing && !extraOptions.stay:
+				manager.rebalanceMu.Unlock()
+				return nil, errAccountWorkerOpening
+			case !replacing:
+				switch manager.extraStartAs(accountID, extraOptions) {
+				case extraAsExtra:
+					partition, tagExtra = aistudio.PoolScopeExtra, true
+					occupancy, _ = manager.partitionOccupancyLocked(partition, members)
+				case extraAsGone:
+					manager.rebalanceMu.Unlock()
+					return nil, errExtraMemberGone
+				}
+			}
+		}
 		// 排空中的 Worker 按已让出槽位计（最多 drainLimit 个）：替补可以在旧 Worker 排空前启动，分区浏览器总数不超过 峰值 + drainLimit
 		if replacing || occupancy.effectiveSlots() < manager.maxActiveFor(partition) {
 			// 冷启动闸门（出口限流期间按路径放行，见 egress_guard.go）：低于常驻数的补位只受并发约束，补覆盖另受每分钟配额，
-			// 已不低于常驻数的扩容暂停；账户自己重开不经闸门
+			// 已不低于常驻数的扩容暂停；账户自己重开不经闸门。补充池的冷启动一律按超出常驻（出口限流期间暂停，不占补位并发）
 			path := coldStartExpand
 			switch {
+			case partition == aistudio.PoolScopeExtra:
 			case workerStartSourceFrom(ctx) == workerStartCoverage:
 				path = coldStartCoverage
 			case occupancy.effectiveSlots() < manager.warmTargetFor(partition):
@@ -1871,9 +1902,19 @@ func (manager *accountWorkerManager) ensureWorker(
 				manager.rebalanceMu.Unlock()
 				return nil, gateErr
 			}
+			// 按补充池计、标记不是这次打上的（原槽位重开、残留标记）：在 extraMu 内核对标记还在再写启动占位（见 storeExtraOpening），
+			// 之后关闭旧 Worker 的路径保留标记，新 Worker 发布时仍计入补充池；标记已被关闭流程去掉时重新判断（没有补充池时不进这里）
+			if partition == aistudio.PoolScopeExtra && !tagExtra && !manager.storeExtraOpening(accountID) {
+				releaseGate(false)
+				manager.rebalanceMu.Unlock()
+				continue
+			}
 			opening := make(chan struct{})
 			manager.openings[accountID] = opening
 			manager.openingSet.Store(accountID, struct{}{})
+			if tagExtra {
+				manager.setExtraOwnedLocked(accountID, true)
+			}
 			manager.rebalanceMu.Unlock()
 			preparer, err := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
 			releaseGate(err == nil)
@@ -1890,6 +1931,11 @@ func (manager *accountWorkerManager) ensureWorker(
 				}
 			}
 			manager.finishOpening(accountID, opening)
+			if partition == aistudio.PoolScopeExtra {
+				// 补充池的启动结束占位之后（同一段 rebalanceMu）：账户已不占任何槽位时去掉标记（启动失败、取消；原槽位重开期间旧 Worker
+				// 被关掉、新的又没发布）。放在结束占位之后：占位还在时关闭流程保留标记（见 clearExtraTagOnClose）
+				manager.dropExtraTagLocked(accountID)
+			}
 			warmCount := len(manager.warmAccountIDsIn(partition))
 			manager.rebalanceMu.Unlock()
 			// 替补由 startReplacement 自己记录，预热由预热循环记录，不算按需扩容；其余无条件写，标明是否超出常驻
@@ -1903,8 +1949,8 @@ func (manager *accountWorkerManager) ensureWorker(
 			return preparer, err
 		}
 		// 不等待的选号（acquireWarmLeaseNow）只在分区有空槽时现场启动：替换空闲 Worker 要等旧 Worker 让出，按容量已满返回；
-		// 替补（startReplacement）同样只用空槽，不替换其他账号的空闲 Worker
-		if immediateStartup(ctx) || replacementStartup(ctx) {
+		// 替补（startReplacement）与补充池预热（extraLaunch）同样只用空槽，不替换其他账号的空闲 Worker
+		if immediateStartup(ctx) || replacementStartup(ctx) || extraPrewarmStartup(ctx) {
 			manager.rebalanceMu.Unlock()
 			return nil, errAccountWorkerCapacity
 		}
@@ -1943,6 +1989,13 @@ func (manager *accountWorkerManager) ensureWorker(
 			manager.rebalanceMu.Unlock()
 			return nil, gateErr
 		}
+		// 补充池残留标记的账户（标记不是这次打上的）同样先核对标记还在（见上面空槽路径与 storeExtraOpening）
+		if partition == aistudio.PoolScopeExtra && !tagExtra && !manager.storeExtraOpening(accountID) {
+			manager.releaseVictim(victim)
+			releaseGate(false)
+			manager.rebalanceMu.Unlock()
+			continue
+		}
 		// 闸门放行后才记一次按需替换（N6）：被闸门拒掉的尝试没有启动浏览器，不占每分钟的替换名额。原先选中淘汰对象就记，
 		// 出口限流期间每个排队请求每次复查都用掉一次，名额很快用完，闸门本来会放行的补覆盖也拿不到可替换的 Worker
 		manager.noteReplacement(ctx, partition)
@@ -1958,12 +2011,22 @@ func (manager *accountWorkerManager) ensureWorker(
 		opening := make(chan struct{})
 		manager.openings[accountID] = opening
 		manager.openingSet.Store(accountID, struct{}{})
+		if tagExtra {
+			manager.setExtraOwnedLocked(accountID, true)
+		}
 		manager.rebalanceMu.Unlock()
+		// endExtraOpening 结束补充池启动的占位之后（调用方持有 rebalanceMu）去掉已不占槽位的账户的标记（见空槽路径）；没有补充池时什么也不做
+		endExtraOpening := func() {
+			if partition == aistudio.PoolScopeExtra {
+				manager.dropExtraTagLocked(accountID)
+			}
+		}
 		pending, startErr := manager.startAuthenticatedWorker(ctx, accountID, bootstrapModel)
 		releaseGate(startErr == nil)
 		if startErr != nil {
 			manager.rebalanceMu.Lock()
 			manager.finishOpening(accountID, opening)
+			endExtraOpening()
 			manager.rebalanceMu.Unlock()
 			return nil, startErr
 		}
@@ -1972,6 +2035,7 @@ func (manager *accountWorkerManager) ensureWorker(
 			discardErr := discardAccountWorker(pending)
 			manager.rebalanceMu.Lock()
 			manager.finishOpening(accountID, opening)
+			endExtraOpening()
 			manager.rebalanceMu.Unlock()
 			return nil, errors.Join(cause, discardErr)
 		}
@@ -1983,15 +2047,22 @@ func (manager *accountWorkerManager) ensureWorker(
 			}
 			activationErr := activateAccountWorker(pending)
 			manager.finishOpening(accountID, opening)
+			endExtraOpening()
 			warmCount := len(manager.warmAccountIDsIn(partition))
 			manager.rebalanceMu.Unlock()
 			if activationErr != nil {
 				return nil, activationErr
 			}
 			if workerStartSourceFrom(ctx) != workerStartPrewarm {
+				// 按需替换的对象被补充池原地接手（见 extraAdopt）时末尾写去向
+				handOff := ""
+				if kind == "按需替换" {
+					handOff = manager.handOffSuffix(victim)
+				}
 				manager.requests.log("service", "INFO", fmt.Sprintf(
-					"%s %s | Worker=%d/%d | 超出常驻=%s",
+					"%s %s | Worker=%d/%d | 超出常驻=%s%s",
 					workerLogName(partition), kind, warmCount, manager.maxActiveFor(partition), aboveResidentText(warmCount > manager.warmTargetFor(partition)),
+					handOff,
 				))
 			}
 			return pending, nil
@@ -2405,7 +2476,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		manager.fillInflight.Store(int32(len(inflight)))
 		warm := manager.WarmAccountIDs()
 		// 每个分区从自己的账户补齐到自己的常驻数（见 worker_partition.go）
-		members := manager.pool.PartitionMembers()
+		members := manager.slotMembers()
 		summary := manager.bootstrapSummary()
 		targets := make(map[aistudio.PoolScope]int, len(workerPartitions))
 		warmCounts := make(map[aistudio.PoolScope]int, len(workerPartitions))
@@ -2421,9 +2492,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		}
 		if filled && len(inflight) == 0 {
 			if launched > 0 {
+				// Worker 数只计三个分区（补充池 Worker 由补充池自己预热，见 extra_pool.go）；没有补充池 Worker 时就是 len(warm)
 				manager.requests.log("service", "INFO", fmt.Sprintf(
 					"WAA Worker 预热完成 | Worker=%d/%d | 耗时=%s",
-					len(warm), manager.PrewarmTarget(), time.Since(startedAt).Round(time.Millisecond),
+					manager.mainWarmCount(warm), manager.PrewarmTarget(), time.Since(startedAt).Round(time.Millisecond),
 				))
 			}
 			notify(nil)
@@ -2536,7 +2608,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				case anyPaused && !anyFull:
 					reason = egressColdStartPausedReason
 				case anyFull:
-					occupancy := manager.occupiedWorkersIn(full, manager.pool.PartitionMembers())
+					occupancy := manager.occupiedWorkersIn(full, manager.slotMembers())
 					reason = fmt.Sprintf("%s 槽位已满（占用 %d / 峰值上限 %d）", workerSlotName(full), occupancy.effectiveSlots(), manager.maxActiveFor(full))
 					level = "WARN"
 				case classifyErr != nil:
@@ -2557,7 +2629,7 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 				if launched > 0 {
 					manager.requests.log("service", "INFO", fmt.Sprintf(
 						"WAA Worker 预热暂停 | Worker=%d/%d | 失败=%d | 耗时=%s | 稍后自动继续",
-						len(warm), manager.PrewarmTarget(), len(failures), time.Since(startedAt).Round(time.Millisecond),
+						manager.mainWarmCount(warm), manager.PrewarmTarget(), len(failures), time.Since(startedAt).Round(time.Millisecond),
 					))
 				}
 				notify(nil)
@@ -2638,6 +2710,8 @@ func (manager *accountWorkerManager) Close() error {
 	// Close 返回后不再有 goroutine 访问账户目录
 	manager.closeWorkerResets()
 	manager.waitPrewarm()
+	// 补充池预热的启动随 lifecycle 取消，等它们退出（见 extra_pool.go 的 extraStart；没有补充池时立即返回）
+	manager.extraLaunches.Wait()
 	closeResults := make(chan error, len(accounts))
 	var closes sync.WaitGroup
 	for _, account := range accounts {
@@ -2704,6 +2778,9 @@ func (manager *accountWorkerManager) closeCleanupLeftovers(account *accountWorke
 		account.warm.Store(false)
 		// Worker 已关闭：排空随之结束（淘汰、清扫、回收、ResetAll、Close 等任何关闭路径），账号以后再启动 Worker 时照常接受请求
 		manager.clearDrain(account.id)
+		// 补充池标记随之去掉（释放、空闲回收、不可调度释放、失败恢复、删除等任何关闭路径）：此时账户已不占任何槽位，计数不变；
+		// 账户正在启动、启动占位记在补充池时保留（见 clearExtraTagOnClose）。锁序 startupMu → 账户锁 → extraMu（叶子锁）。没有标记时什么也不做
+		manager.clearExtraTagOnClose(account.id)
 		manager.notifyScheduling()
 	}
 	return errors.Join(closeErrors...)
@@ -3540,9 +3617,16 @@ func (service *trackedService) PoolRuleVersion() uint64 {
 	return service.pool.PoolRuleVersion()
 }
 
-// Models 返回请求号池内启用账户具有模型资格的公开目录：/ultra 只列 Ultra 号池账户可用的模型
+// Models 返回请求号池内启用账户具有模型资格的公开目录：/ultra 只列 Ultra 号池账户可用的模型。补充池开启且 EXTRA_POOL_DEFAULT_PAID 时，
+// 默认地址另合并补充池的号池能服务的模型（按目录顺序，同 ID 合并可用通道，见 extra_select.go）；/pro、/ultra 与关闭时不变。
+// 列表按权益静态计算，不看冷却与成员资格
 func (service *trackedService) Models(ctx context.Context) ([]aistudio.Model, error) {
-	return service.pool.EligibleModelsIn(aistudio.PoolScopeFromContext(ctx), service.modelSnapshot()), nil
+	snapshot := service.modelSnapshot()
+	models := service.pool.EligibleModelsIn(aistudio.PoolScopeFromContext(ctx), snapshot)
+	if service.extraDefaultPaidFor(ctx) {
+		models = mergeEligibleModels(snapshot, models, service.pool.EligibleModelsIn(aistudio.PoolScopeExtra, snapshot))
+	}
+	return models, nil
 }
 
 // catalogModels 返回管理页使用的完整目录与各模型可用通道；BuildUnary 标出在 Build 通道只能一次性返回整段回复的模型
@@ -3605,6 +3689,7 @@ func (service *trackedService) publishModelAccessNow() {
 		accounts = append(accounts, adminAccountDTO(status))
 	}
 	service.workers.ipPool().markPinned(accounts)
+	service.workers.markExtraAccounts(accounts)
 	service.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
 	service.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": service.catalogModels()}})
 }
@@ -3788,15 +3873,43 @@ func (service *trackedService) observedDataRequestContext(
 	return observed, cancel, nil
 }
 
-// CountTokens 返回上游权威输入 token 数
+// CountTokens 返回上游权威输入 token 数。默认地址上只能由补充池服务的付费模型（见 extraOnlyModel）借用补充池：只在可借出的补充池 Worker（L）
+// 里选号，不为它冷启动，L 为空时按 503 返回；主号池自己能服务的模型不借用（count_tokens 有独立的冷却键，几乎不受主号池繁忙影响）
 func (service *trackedService) CountTokens(ctx context.Context, request aistudio.TokenCountRequest) (aistudio.TokenCount, error) {
-	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
+	request.Model = service.canonicalModelFor(ctx, request.Model)
 	requestCtx, cancel, err := service.observedDataRequestContext(ctx, request.Model)
 	if err != nil {
 		return aistudio.TokenCount{}, err
 	}
 	defer cancel()
+	borrowing := service.extraOnlyModel(ctx, request.Model)
+	// leased 为这次借用取得了租约（选号观察回调，在 L 里选中账户时调用）：没有取得租约就失败时（L 里没有能服务的账户、等不到等）
+	// 访问日志不标补充池，与 L 为空时相同；原先选号之前就标上，没有任何补充池 Worker 服务过的 503 也显示为由补充池服务
+	var leased atomic.Bool
+	if borrowing {
+		lendable := service.workers.extraLendableIDs()
+		if len(lendable) == 0 {
+			err := aistudio.NewExtraUnavailableError(request.Model, time.Now())
+			api.SetAccessLogError(requestCtx, err)
+			return aistudio.TokenCount{}, err
+		}
+		logCtx := requestCtx
+		requestCtx = aistudio.ContextWithAccountSelectionObserver(requestCtx, func(account *aistudio.Account) {
+			leased.Store(true)
+			api.SetAccessLogTarget(logCtx, request.Model, account.Config.Label)
+		})
+		requestCtx = withExtraStart(aistudio.WithSelectionOverride(requestCtx, aistudio.PoolScopeExtra, lendable), extraStartOptions{stay: true})
+		api.SetAccessLogExtra(requestCtx, true)
+	}
 	count, requestErr := service.service.CountTokens(requestCtx, request)
+	if borrowing && requestErr != nil && !leased.Load() {
+		api.SetAccessLogExtra(requestCtx, false)
+	}
+	if borrowing && aistudio.NoCandidateFailure(requestErr) {
+		// 可借出的补充池 Worker 里没有能服务这个模型的账户（例如只有 Free 成员，跑不了付费模型）：模型在默认地址的列表里，
+		// 与 L 为空时一样按 503 返回，不按没有候选的 404
+		requestErr = aistudio.NewExtraUnavailableError(request.Model, time.Now())
+	}
 	requestErr = endedRequestError(requestCtx, requestErr)
 	api.SetAccessLogError(requestCtx, requestErr)
 	return count, requestErr
@@ -4151,17 +4264,25 @@ func (service *trackedService) acquireLease(
 	// 原先每次复查（兜底计时与每次号池变化）都会再扩容一个，一个排队的请求能连着冷启动好几个浏览器，
 	// 偏好靠前的账户都在启动中时还会启动排在后面的、对主用模型已冷却的账户
 	var expanding <-chan struct{}
+	// 补充池（EXTRA_POOL，见 extra_select.go）：这次选号的借用状态；不借用的选号（不等待、固定账户或资源、限定集合、Build 试探等）
+	// 与补充池关闭时为 nil 或这一轮不生效，下面的插入点（I1–I6）都是空操作
+	ext := service.extraRunFor(ctx, selection, immediate, fixedAccount, failedWorkers)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, progress.queueEnded(err)
 		}
 		warm := service.workers.ReadyWarmAccountIDs()
 		active := service.workers.WarmAccountIDs()
+		ext.begin(warm)
 		groups, err := service.pool.ClassifyCandidates(ctx, selection, warm)
 		if err != nil {
-			// 请求的模型不在号池任何账户的目录里：限频地挑高权益的空闲账户在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）；
-			// 普通路径上只有 Pro 或 Ultra 号池能服务的模型带上改用哪个入口的提示，不读目录（见 missingModelError）
-			return nil, service.missingModelError(selection, err)
+			if !ext.onlyFor(err) {
+				// 请求的模型不在号池任何账户的目录里：限频地挑高权益的空闲账户在后台立即读一次目录，本次照旧返回（见 catalog_probe.go）；
+				// 普通路径上只有 Pro 或 Ultra 号池能服务的模型带上改用哪个入口的提示，不读目录（见 missingModelError）
+				return nil, service.missingModelError(selection, err)
+			}
+			// I1：只能由补充池服务的请求（默认地址的付费模型），主号池按空处理，往下只走借用通道
+			groups = aistudio.AccountCandidateGroups{}
 		}
 		groups.WarmReady = excludeAccountIDs(groups.WarmReady, failedWorkers)
 		groups.WarmAvailable = excludeAccountIDs(groups.WarmAvailable, failedWorkers)
@@ -4174,6 +4295,8 @@ func (service *trackedService) acquireLease(
 		runtimeBusyErr := errors.Join(readyBusyErr, standbyBusyErr)
 		candidates := len(groups.WarmReady) + len(groups.WarmAvailable) + len(groups.WarmBusy) +
 			len(groups.StandbyReady) + len(groups.StandbyBusy)
+		// I2：可借出的补充池 Worker 只经借用通道取，从主分组的热 Worker 里剔除；candidates 保持剔除前的值，只剩它们时主路径的结尾是等待
+		ext.strip(&groups)
 		standbyReady, opening := service.workers.withoutOpening(groups.StandbyReady)
 		groups.StandbyReady = standbyReady
 		// 坏号（连续裸限流，见 bad_accounts.go）不做现场提升、扩容与回收后的启动：还有其他备用账号时去掉；固定账户与文件绑定的选号不去
@@ -4203,6 +4326,10 @@ func (service *trackedService) acquireLease(
 			standby: len(groups.StandbyReady), standbyBusy: len(groups.StandbyBusy),
 			opening: opening, earliestCooldown: groups.EarliestCooldown, rateLimited: groups.RateLimited,
 			egressLimited: groups.EgressLimited,
+		}
+		// I3：一起分担时按两边空闲数成比例轮取，轮到补充池时先借
+		if lease := ext.shareFirst(ctx, groups); lease != nil {
+			return lease, nil
 		}
 		if len(warmAvailable) > 0 {
 			// 平均调用（见 balanced.go）：不固定账户的选号先在没有进行中请求的热 Worker（WarmReady）里选，取不到再用全部热 Worker，
@@ -4243,6 +4370,11 @@ func (service *trackedService) acquireLease(
 				return lease, acquireErr
 			}
 		}
+		// I4：主号池热 Worker 段没取到租约：一起分担本轮没试过就借，只在不够时补充满足触发条件才借
+		if lease := ext.afterMainWarm(ctx, len(warmAvailable)); lease != nil {
+			return lease, nil
+		}
+		ext.annotate(&snapshot)
 		warmCandidates := len(warmAvailable) + len(groups.WarmBusy)
 		// 补覆盖：驻留里没有能服务该模型的热 Worker（诊断里 pro 的热空闲为 0，或驻留账号对该模型额度都已用完），不是判定期间 10 秒短冷却
 		// 造成的，又没有未受限出口的备用账户时，把剔除的备用账户里按偏好排第一的放回去，按补覆盖启动（冷启动闸门另有每分钟配额，
@@ -4271,6 +4403,10 @@ func (service *trackedService) acquireLease(
 		}
 		// 备用账户能否启动 Worker 按它所在的 Worker 分区判断：分区未满，或同分区有可淘汰的空闲 Worker
 		capacity := service.workers.standbyCapacity(active, selection.ModelID)
+		if fixedAccount {
+			// 借来的账户在 Worker 重建后重放（见 extra_select.go）：它的启动计入补充池时容量按补充池判断，与 ensureWorker 同一口径
+			capacity.extraAccount = service.workers.extraReplayAccount(ctx, selection)
+		}
 		// 出口限流时备用账户已被剔除：同样不扩容，直接按额度 429 后没有已启动的 Worker 返回（Retry-After 5s）
 		if warmOnly && warmCandidates == 0 && (len(groups.StandbyReady) > 0 || len(groups.StandbyBusy) > 0 || opening || removedStandby) {
 			// 额度 429 之后没有已启动的 Worker，只剩要冷启动的备用账号（或正在启动的）：不现场冷启动（10–30s 以上，冷启动出来的账号
@@ -4430,13 +4566,24 @@ func (service *trackedService) acquireLease(
 			failures.last = promoteErr
 			continue
 		}
+		// I5：主号池既没有空闲热 Worker、也不能现场冷启动：本轮还没借过就借补充池，借不到时最多发起一次补充池后台扩容；
+		// extPending 为补充池有忙碌的可借 Worker 或这次的扩容还没结束（主用模型快速失败时为假）
+		extLease, extPending, extReason := ext.atMainExhausted(ctx, len(warmAvailable), budget.failFastOnQuota())
+		if extLease != nil {
+			return extLease, nil
+		}
+		ext.annotate(&snapshot)
 		// 热候选取租约时被其他请求抢先（分类时还有空位，TryAcquireFor 返回空）同样按账号全部忙碌等待，不落到下面的冷却判断。
 		// 没有空闲的热候选、其中有因出口令牌桶已满按忙碌分组的：按“出口限速”排队
 		busyReason := "账号全部忙碌"
 		if len(warmAvailable) == 0 && groups.EgressLimited > 0 {
 			busyReason = waitReasonEgress
 		}
-		if len(warmAvailable) > 0 || len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening {
+		if len(warmAvailable) > 0 || len(groups.WarmBusy) > 0 || len(groups.StandbyBusy) > 0 || opening || extPending {
+			// 主号池这边没有可等的、只在等补充池时，按补充池的原因排队
+			if extPending && len(warmAvailable)+len(groups.WarmBusy)+len(groups.StandbyBusy) == 0 && !opening {
+				busyReason = extReason
+			}
 			if err := wait(schedulingRecheck, busyReason); err != nil {
 				return nil, err
 			}
@@ -4466,6 +4613,24 @@ func (service *trackedService) acquireLease(
 				return nil, err
 			}
 			continue
+		}
+		// I6：只能由补充池服务的请求（默认地址的付费模型）借不到：补充池的候选全部冷却时与主号池的全部冷却同样等待或按 429 返回
+		// （补充池不是 Ultra 或 Pro 号池，按通用的官方措辞）；有没冷却的候选、只是此刻借不到时按 503 返回（模型在默认地址的列表里，
+		// 不按 404 返回，也不带改用入口的提示）
+		if ext.onlyExtra() {
+			if until := ext.earliest(ctx); !until.IsZero() {
+				if cooled.exceeded(ctx, until, time.Now()) || budget.failFastOnQuota() {
+					return nil, service.pool.AllCoolingErrorFor(ext.borrowSelection(), until)
+				}
+				waitStartedAt := time.Now()
+				err := wait(coolingRecheckDelay(time.Until(until)), waitReasonCooling)
+				cooled.add(time.Since(waitStartedAt))
+				if err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, aistudio.NewExtraUnavailableError(selection.ModelID, time.Now())
 		}
 		if !groups.EarliestCooldown.IsZero() {
 			now := time.Now()
@@ -4829,7 +4994,7 @@ func (service *trackedService) startGenerate(
 	trace.AddParameters("发往上游（seed 与随机后缀处理后）", request)
 	trace.SetPrompt(diag.promptHash, request)
 	api.StartAccessLog(ctx)
-	request.Model = service.pool.CanonicalModelIDIn(aistudio.PoolScopeFromContext(ctx), request.Model)
+	request.Model = service.canonicalModelFor(ctx, request.Model)
 	// Interaction 模型（gemini-omni）的 CreateInteractionStream 不带工具：中转与客户端附带的函数（new-api 的 save_memory、delete_memory 等）
 	// 与 Google 工具在这里去掉并记一行说明，与停止序列一样不发送。原先函数声明发送前按模型目录校验（Omni 没有 function_declarations），
 	// 中文原因被换成通用措辞，经 new-api 的多轮请求对外成了 400 “Request contains an invalid argument.”
@@ -5054,11 +5219,14 @@ func (service *trackedService) generateForModel(
 	modelID := strings.TrimPrefix(strings.TrimSpace(request.Model), "models/")
 	unbound := requestedAccountID == "" && resourceID == ""
 	fileBound := requestedAccountID == "" && resourceID != ""
+	// schedulable 为号池内可调度的账户数（补充池的换号上限用，见下文 borrowPlan）
+	schedulable := 0
 	if unbound || fileBound {
 		_, eligible := service.pool.EnabledAccountsIn(scope)
 		if eligible > 1 {
 			maxAttempts = eligible
 		}
+		schedulable = eligible
 	}
 	var first aistudio.Event
 	var activity *upstreamActivity
@@ -5093,6 +5261,13 @@ func (service *trackedService) generateForModel(
 	// driveMissed 为本请求因账号没有 Drive 授权换掉的账号数
 	driveCount, _ := interactionDriveMediaInput(originalContents)
 	driveRequired := interactionModel && driveCount > 0
+	// borrowPlan 为补充池（EXTRA_POOL）的借用计划（见 extra_select.go）：不固定账户、不引用文件或视频、不需要 Drive、不在降级判定中的请求可以借用，
+	// 选号上下文带上它，acquireLease 据此借用。请求开始时补充池开启时换号上限计入可借出的补充池 Worker（不超过每请求换号硬上限）；
+	// 补充池关闭时只有这一次分配，各处判断都为假
+	borrowPlan := service.newExtraPlan(requestCtx, scope, modelID, unbound && !driveRequired && diag.guard() == nil)
+	if maxAttempts > 0 {
+		maxAttempts = borrowPlan.attemptCeiling(maxAttempts, schedulable)
+	}
 	drive := newDriveSelection(service.service, originalContents, request.Config.VideoConfig)
 	drive.imageHint = imageHint
 	driveMissed := 0
@@ -5249,7 +5424,7 @@ func (service *trackedService) generateForModel(
 		// 非主用模型按“出口限速”的排队整个请求累计不超过 egressQueueWaitMax，换号重试不重新计时（见 egress_wait.go）
 		baseCtx = withEgressWaitBudget(baseCtx)
 	}
-	acquireCtx := withLeaseWaitProgress(withDispatchOrder(baseCtx), progress)
+	acquireCtx := withExtraPlan(withLeaseWaitProgress(withDispatchOrder(baseCtx), progress), borrowPlan)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		budget.beginAttempt()
 		progress.beginAttempt()
@@ -5260,6 +5435,19 @@ func (service *trackedService) generateForModel(
 			selectionAccountID = recoveryAccountID
 			recoveryAccountID = ""
 		}
+		// replay：借来的账户在 Worker 重建后（或回到没等到关闭的原账号）重放。跨号池的选号用 Pool=PoolScopeExtra 固定到原账号，
+		// 启动按留存口径计入补充池；账号已不是补充池成员（补充池已关闭、权益已不在范围、冷却已结束等）时不重放，原账号留在已尝试里、换号。本路由的照旧按原号池固定到原账号，
+		// 启动按留存口径计入补充池，已不是成员时按家分区（见 extraPlan.replayAs）
+		replay := extraReplayHome
+		if recoveringAccount {
+			switch replay = borrowPlan.replayAs(selectionAccountID); replay {
+			case extraReplaySwitch:
+				attempted[selectionAccountID] = struct{}{}
+				trace.Note(extraReplaySwitchMessage)
+				service.requests.logRequestProgress(request.ID, "service", "WARN", extraReplaySwitchMessage)
+				selectionAccountID, recoveringAccount, replay = requestedAccountID, false, extraReplayHome
+			}
+		}
 		selectionResourceID := resourceID
 		if copyFiles {
 			selectionResourceID = ""
@@ -5267,6 +5455,9 @@ func (service *trackedService) generateForModel(
 		selection := aistudio.AccountSelection{
 			ModelID: modelID, Method: "generateContent",
 			AccountID: selectionAccountID, ResourceID: selectionResourceID, Pool: scope,
+		}
+		if replay == extraReplayExtra {
+			selection.Pool = aistudio.PoolScopeExtra
 		}
 		if resourceID != "" || request.Config.SpeechConfig != nil && request.Config.SpeechConfig.Mode != "" {
 			selection.PlaygroundOnly = true
@@ -5370,6 +5561,9 @@ func (service *trackedService) generateForModel(
 		selectCtx := withWorkerResetWake(acquireCtx, deferredReset)
 		if warmOnlyNext {
 			selectCtx = withoutColdStart(selectCtx)
+		}
+		if options, ok := replay.replayStart(); ok {
+			selectCtx = withExtraStart(selectCtx, options)
 		}
 		var nextLease *aistudio.AccountLease
 		var acquireErr error
@@ -5620,7 +5814,7 @@ func (service *trackedService) generateForModel(
 			if keepImageDenied {
 				// 原因先于下面 Worker 重建后重放的换号写入：换号后循环正常结束时补写的结束行同样带原因
 				keepImageDeniedEnd(progressReason(acquireErr))
-			} else if err == nil || !errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
+			} else if selectionErrorReplaces(err, acquireErr, replayUnavailable) {
 				err = acquireErr
 			}
 			if replayUnavailable && requestCtx.Err() == nil {
@@ -5651,6 +5845,7 @@ func (service *trackedService) generateForModel(
 			break
 		}
 		lease = nextLease
+		borrowPlan.adoptReplay(lease, replay)
 		// warmOnlyAttempt：这次选号因上一次额度失败只用已启动的 Worker；sameAccountQuotaAttempt：上一次尝试是同账号换通道的额度失败。
 		// 两个标记都在这里清除，这次尝试在 Build 上被官网停用、只是换通道时据此恢复（见下文 buildDisabled）
 		warmOnlyAttempt, sameAccountQuotaAttempt := warmOnlyNext, sameAccountQuotaNext
@@ -5703,6 +5898,21 @@ func (service *trackedService) generateForModel(
 		// 租约来自 acquireLease，取得租约前已确认或启动了 Worker：发送时 Worker 不在了（失败后被关闭、被淘汰）才要重新启动，
 		// 来源记为重开，冷启动闸门不拦它（见 accountWorkerManager.Worker）
 		attemptCtx = withWorkerStartSource(attemptCtx, workerStartReopen)
+		// 补充池（见 extra_select.go）：borrowed 为这次尝试的租约借自补充池，cross 为跨号池借用（账户的家分区不在路由号池内）。
+		// 请求日志与活动请求以最后一次尝试为准；attemptScope 为这次尝试的号池级判定键（号池级 403、裸限流与成功记账）：跨号池借来的账户记在
+		// PoolScopeExtra 下，不污染路由号池。发送时 Worker 不在了要重开：按留存口径计入补充池，已不是成员时本路由的账户按家分区重开，
+		// 跨号池的返回 errExtraMemberGone（可重试，换号）
+		borrowed := borrowPlan.borrowed(lease)
+		cross := borrowPlan.noteAttempt(request.AccountID, borrowed)
+		api.SetAccessLogExtra(requestCtx, borrowed)
+		service.requests.markExtra(request.ID, borrowed)
+		attemptScope := scope
+		if borrowed {
+			attemptCtx = withExtraStart(attemptCtx, extraStartOptions{stay: true, fallbackHome: !cross})
+			if cross {
+				attemptScope = aistudio.PoolScopeExtra
+			}
+		}
 		firstEvent := newFirstEventDeadline(time.Duration(service.firstEventTimeout.Load()), cancelAttempt)
 		var attemptCopies *aistudio.TemporaryFileCopies
 		copiedFileCount := 0
@@ -6005,8 +6215,8 @@ func (service *trackedService) generateForModel(
 			service.quota.attemptSucceeded(request.AccountID, modelID, lease.Channel(), lease.CheckedAt())
 			service.forbidden.reset(request.AccountID)
 			service.forbidden.resetModel(request.AccountID, lease.CooldownScope(modelID))
-			service.forbidden.modelSucceeded(scope, modelID, now)
-			service.rateLimits.succeeded(scope, modelID, now)
+			service.forbidden.modelSucceeded(attemptScope, modelID, now)
+			service.rateLimits.succeeded(attemptScope, modelID, now)
 			service.egress.observeOutcome(egressObservation{
 				Key: egressKey, AccountID: request.AccountID, Ultra: egressUltra, Outcome: egressSuccess, At: now,
 			})
@@ -6063,7 +6273,7 @@ func (service *trackedService) generateForModel(
 		trace.FinishAttempt(err)
 		failedAttempt := api.RequestAttempt{
 			Account: accountLabel, Channel: string(lease.Channel()), Error: err.Error(),
-			DurationMS: time.Since(attemptStartedAt).Milliseconds(),
+			DurationMS: time.Since(attemptStartedAt).Milliseconds(), Extra: borrowed,
 		}
 		if fallback != nil {
 			// 额度用完改用了其他模型：目标模型的尝试记上模型（改用前源模型的尝试在改用时补记，见 model_fallback.go）
@@ -6282,7 +6492,7 @@ func (service *trackedService) generateForModel(
 		// quotaSameAccount 为额度冷却后不换号、在同账号另一通道再试（进度写“同账号换通道重试”）；
 		// bare 为生成本身返回的裸限流（已由 applyQuotaCooldown 交给出口判定器，见 rate_limit_guard.go）
 		quotaFailure, quotaKind, quotaSameAccount, bare := false, "", false, false
-		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, attemptErr, "", scope, true, generated); ok {
+		if cooldown, ok, stateErr := service.applyQuotaCooldown(lease, accountLabel, modelID, attemptErr, "", attemptScope, true, generated); ok {
 			cooled = true
 			now := time.Now()
 			bare = cooldown.Escalate && generated
@@ -6391,11 +6601,11 @@ func (service *trackedService) generateForModel(
 		// verifyRequired：上游要求先验证账号（Your account must be verified … verify-account）。账户级的问题，与模型和号池一侧都无关：
 		// 不参与号池级 403 判定（大批账号同时要求验证时不能当成号池一侧的问题而不冷却），整个账户暂停调度直到验证通过（见下文）
 		verifyRequired := modelDenied && accountLevelPermissionDenied(attemptErr.Error())
-		if modelDenied && !verifyRequired && service.forbidden.observeModelDenied(scope, request.AccountID, modelID, time.Now()) {
+		if modelDenied && !verifyRequired && service.forbidden.observeModelDenied(attemptScope, request.AccountID, modelID, time.Now()) {
 			modelDenied = false
 			// 判定成立之前号池里的 403 已经登记为无权限账户：撤销号池里该模型自最近一次成功以来登记的全部条目（不只是判定记着的
 			// 几个账号），免得修复后列表里留下一批正常账户
-			service.dropSystemicPermissionDenied(scope, modelID, time.Now())
+			service.dropSystemicPermissionDenied(attemptScope, modelID, time.Now())
 			service.requests.logRequestProgress(request.ID, accountLabel, "WARN", fmt.Sprintf(
 				"号池内 %d 分钟内至少 %d 个账号对模型 %s 返回 403 且没有成功，按号池级 403 处理，不冷却账号",
 				int(forbiddenWindow/time.Minute), forbiddenSystemicAccounts, modelID,
@@ -7244,9 +7454,24 @@ func inputTokenCapError(err error) bool {
 	return aistudio.InputTokenCapError(err)
 }
 
+// selectionErrorReplaces 判断选号失败的 acquireErr 要不要替换请求当前记下的错误 err：没有可用账号一类（ErrNoEligibleAccount）不盖掉
+// 上一次尝试的错误；Worker 重建后在原账号重放时（replayUnavailable）借来的账号已不是补充池成员（errExtraMemberGone，replayAs 判断之后才恢复）
+// 同样只是换号的理由，不盖掉 Worker 失败的原错误：否则之后的选号以没有可用账号一类结束时，请求以这个内部错误结束（对外 502）。
+// 没有补充池时不会出现 errExtraMemberGone，与原来的判断相同
+func selectionErrorReplaces(err error, acquireErr error, replayUnavailable bool) bool {
+	if err != nil && errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) {
+		return false
+	}
+	return !(replayUnavailable && err != nil && errors.Is(acquireErr, errExtraMemberGone))
+}
+
 func retryableGenerateAccountError(ctx context.Context, err error) bool {
 	if errors.Is(err, errStreamClosedBeforeFirstEvent) || errors.Is(err, aistudio.ErrAccountCoolingDown) {
 		return true
+	}
+	// 借来的补充池账号发送时 Worker 不在了、要重开时已不是成员（见 extra_pool.go 的 errExtraMemberGone）：换号再试
+	if errors.Is(err, errExtraMemberGone) {
+		return ctx.Err() == nil
 	}
 	// 原生续写被拒、本账号不能马上重发：换号（指定账号在原账号）再试，下一次补用户消息（不冷却等见 generateWithRetry 的 prefillRetry）
 	var prefillRetry *aistudio.PrefillRetryError

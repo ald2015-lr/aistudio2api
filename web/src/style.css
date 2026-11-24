@@ -578,6 +578,23 @@ button[aria-busy='true']::before {
     font-weight: 600;
   }
 
+  /* 补充池标记：由补充池服务的请求、计入补充池的 Worker 与设置分组共用，翠绿色与号池标记区分 */
+  .tag-extra {
+    border-color: rgb(16 185 129 / 55%);
+    background: rgb(16 185 129 / 14%);
+    color: #a7f3d0;
+    font-weight: 600;
+    font-family: inherit;
+  }
+
+  /* 补充池成员（可补充）：同色的浅色描边，比计入补充池的 Worker 弱一级 */
+  .tag-extra-member {
+    border-color: rgb(16 185 129 / 35%);
+    background: transparent;
+    color: #6ee7b7;
+    font-family: inherit;
+  }
+
   .dot {
     display: inline-block;
     width: 0.5rem;

@@ -39,6 +39,9 @@ const props = defineProps<{
   // proMaxActive 为 Pro 峰值，proCounted 为开启 PRO_POOL 且有 Pro 号池账户（只有这时 Pro 分区才占端口）
   proMaxActive?: number | string
   proCounted?: boolean
+  // extraMaxActive 为补充池峰值，extraCounted 为开启补充池（EXTRA_POOL，只有这时补充池才占端口）
+  extraMaxActive?: number | string
+  extraCounted?: boolean
   warmConcurrency: number | string
   hasDefaultProxy: boolean
   // serverError 为服务端拒绝表单里当前这份设置时的错误（前端组合校验查不出的地址格式问题），显示在地址框旁
@@ -133,8 +136,19 @@ const capacity = computed(() =>
     props.warmConcurrency,
     props.proMaxActive ?? 0,
     props.proCounted ?? false,
+    props.extraMaxActive ?? 0,
+    props.extraCounted ?? false,
   ),
 )
+// capacityKey 为端口需求一行的文案：按计入的分区选（没有 Pro、补充池时与原来同一句）
+const capacityKey = computed<TranslationKey>(() => {
+  if (props.extraCounted) {
+    return props.proCounted
+      ? 'settings.proxyPoolCapacityProExtra'
+      : 'settings.proxyPoolCapacityExtra'
+  }
+  return props.proCounted ? 'settings.proxyPoolCapacityPro' : 'settings.proxyPoolCapacity'
+})
 const spare = computed(() => (capacity.value === null ? 0 : portCount.value - capacity.value.total))
 const capacityShown = computed(
   () => model.value.mode === 'static' && portCount.value > 0 && capacity.value !== null,
@@ -401,7 +415,7 @@ onBeforeUnmount(clearPending)
       <template v-if="capacityShown && capacity !== null">
         <span class="mt-2 block text-xs text-gray-400">
           {{
-            tf(props.proCounted ? 'settings.proxyPoolCapacityPro' : 'settings.proxyPoolCapacity', {
+            tf(capacityKey, {
               ports: portCount,
               need: capacity.total,
               normal: capacity.normal,
@@ -410,6 +424,8 @@ onBeforeUnmount(clearPending)
               ultraDrain: capacity.ultraDrain,
               pro: capacity.pro,
               proDrain: capacity.proDrain,
+              extra: capacity.extra,
+              extraDrain: capacity.extraDrain,
               spare: Math.max(spare, 0),
             })
           }}

@@ -30,6 +30,7 @@
 - **双额度通道**: 每个账户同时拥有 Playground 与 Build 应用代理两份独立额度，`UPSTREAM_CHANNELS` 可单独或同时启用（保存后立即生效）；一个通道触发限额后，同一账户由另一个通道继续；官网停用 Build 通道的生成时自动暂停 Build、改走 Playground，见[官网停用 Build 通道的生成](#官网停用-build-通道的生成)
 - **多账户高并发**: 识别 Free、Pro、Ultra 与 Plus 权益，按实时模型目录在账户间轮询、粘性优先，或平均调用：让高并发的流量尽量平均落在所有账号上（见[平均调用](#平均调用)）
 - **三个号池**: 按权益分号池：Free、Plus 账户服务默认地址；Pro 账户经 `/pro` 前缀单独调用（如 `http://127.0.0.1:2048/pro/v1`，`PRO_POOL` 默认开启）；Ultra 账户经 `/ultra` 前缀单独调用（如 `http://127.0.0.1:2048/ultra/v1`），默认独占。Pro、Ultra 的 Worker 常驻与峰值数各自单独设置；关闭 `PRO_POOL` 时可选让 Pro 账户并入 Ultra 号池（`ULTRA_INCLUDE_PRO`）
+- **补充池（默认关闭）**: 有模型今天用完、别的模型还能用的账户单独开一批浏览器（默认常驻 40、峰值 50），补给默认地址、`/pro` 与 `/ultra`；默认与主号池一起分担，也可改为只在主号池不够时补充，见[补充池](#补充池额外浏览器号池)
 - **两种 WAA 后端**: 默认由 Camoufox 持有官方 WAA 生命周期；设置 `WAA_BACKEND=go` 后由纯 Go 生成官方 proof，运行时不下载、不启动浏览器
 - **四套 API 协议**: OpenAI Chat Completions、OpenAI Responses、Anthropic Messages 与 Gemini GenerateContent，另支持 Gemini Interactions
 - **主流 agent 客户端**: 支持 Claude Code、Codex、OpenCode、pi、omp、OpenClaw、Hermes 的文件读写工具调用，Claude Code、Codex、omp 的原生联网搜索可直接使用
@@ -479,6 +480,8 @@ Gemini 附件与视频图片输入支持 `inlineData` / `inline_data`、`fileDat
 | `false` | `true` | `true` | Free、Plus、未读权益 | 404 | Ultra 与 Pro |
 | `false` | `true` | `false` | 全部账户 | 404 | Ultra 与 Pro |
 
+上表不含补充池：开启 `EXTRA_POOL` 时各入口还会借用补充池里其他号池的成员（只借有模型在冷却、还有别的模型能用的账户，权益规则照常），见[补充池](#补充池额外浏览器号池)。
+
 ```bash
 curl http://127.0.0.1:2048/pro/v1/chat/completions \
   -H "Authorization: Bearer <PROXY_API_KEY>" \
@@ -486,7 +489,7 @@ curl http://127.0.0.1:2048/pro/v1/chat/completions \
   -d '{"model": "gemini-4-argon", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-- **只用 Pro、不借用**：`/pro` 的全部接口（Chat、Responses、Interactions、Messages 与 count_tokens、Gemini 原生、模型列表、文件、图片、语音、转写、视频、Live 与 robotics WebSocket）与默认地址相同，同一个 `PROXY_API_KEY`，只是只用 Pro 号池的账户。没有可用的 Pro 账户时返回 503（`The service is currently unavailable: no account in the Pro pool is ready.`），候选全部冷却、Ultra/Pro 主用模型额度不足或排队超限时返回 429 与 `Retry-After`，不会改用 Ultra 或普通号池的账户。Pro 账户也不服务默认地址与 `/ultra`。
+- **只用 Pro、不借用**：`/pro` 的全部接口（Chat、Responses、Interactions、Messages 与 count_tokens、Gemini 原生、模型列表、文件、图片、语音、转写、视频、Live 与 robotics WebSocket）与默认地址相同，同一个 `PROXY_API_KEY`，只是只用 Pro 号池的账户。没有可用的 Pro 账户时返回 503（`The service is currently unavailable: no account in the Pro pool is ready.`），候选全部冷却、Ultra/Pro 主用模型额度不足或排队超限时返回 429 与 `Retry-After`，不会改用 Ultra 或普通号池的账户。Pro 账户也不服务默认地址与 `/ultra`。开启补充池（`EXTRA_POOL=true`）时例外：`/pro` 也会借用补充池里其他号池的成员，补充池里的 Pro 成员也会借给默认地址与 `/ultra`（权益规则照常），见[补充池](#补充池额外浏览器号池)。
 - **模型**：`/pro/v1/models`、`/pro/v1beta/models` 只列 Pro 号池账户可用的模型。Pro 不能用只限 Ultra 的模型：`gemini-4-carbon` 不在 `/pro` 的模型列表里，请求返回 404 `model_not_found`。这一点只靠 `ULTRA_ONLY_MODELS`（默认 `gemini-4-carbon`，见下文 Ultra 号池的“权益规则”）：从中去掉 carbon 后 Pro 号池也会被选去服务它，服务写一行 WARN“PRO_POOL=true 时 Pro 号池能服务只限 Ultra 的模型”。`gemini-4-argon`、`gemini-3.1-pro-preview` 照常可用。
 - **默认地址上的付费模型**：`ULTRA_EXCLUSIVE=true`（默认）时默认地址既不用 Pro 也不用 Ultra 账户，`gemini-4-argon`、`gemini-3.1-pro-preview` 等只有付费账户能用的模型在默认地址返回 404，说明末尾带一句改用哪个入口，如 `This model is available through the /pro or /ultra endpoints.`（只写能服务它的入口；按请求的方法与能力判断，例如用对话模型发 Live 请求时 `/pro` 同样接不了，就不加；带思考等级、`-nothinking`、`-online` 后缀或 `long-` 前缀的写法，如 `gemini-4-argon-medium`，按去掉后缀的模型名判断；只在出错时判断，也不为它在后台读目录；`PRO_POOL=false` 时不加）。`ULTRA_EXCLUSIVE=false` 时默认地址仍可用 Ultra 账户（不用 Pro 账户），这些模型在默认地址照常可用，并不只有 `/pro`、`/ultra` 才有。
 - **主用模型与改用其他模型**：`/pro` 沿用 Ultra/Pro 主用模型（`ULTRA_PRIMARY_MODELS`、`ULTRA_PRIMARY_QUEUE_WAIT`，默认 `gemini-4-argon` 额度不足立即 429，见[主用模型](#主用模型)），Pro 分区的供给跳过权益规则不让 Pro 用的模型。`MODEL_FALLBACK_SCOPE=ultra`（默认）只管 `/ultra`，要让 `/pro` 也改用其他模型请设为 `all`（默认规则 argon→carbon 在 `/pro` 上不起作用：carbon 不在 Pro 号池的模型目录里）。
@@ -514,7 +517,7 @@ curl http://127.0.0.1:2048/ultra/v1/chat/completions \
   -d '{"model": "<MODEL>", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-- **独占开关**：`ULTRA_EXCLUSIVE=true`（默认）时 Ultra 号池的账户只服务 `/ultra` 请求，普通路径只用其余账户；设为 `false` 时普通路径也可以用 Ultra 号池的账户，`/ultra` 仍只用 Ultra 号池的账户。`PRO_POOL=true` 时普通路径无论如何都不用 Pro 账户。
+- **独占开关**：`ULTRA_EXCLUSIVE=true`（默认）时 Ultra 号池的账户只服务 `/ultra` 请求，普通路径只用其余账户；设为 `false` 时普通路径也可以用 Ultra 号池的账户，`/ultra` 仍只用 Ultra 号池的账户。`PRO_POOL=true` 时普通路径无论如何都不用 Pro 账户。开启补充池（`EXTRA_POOL=true`）时例外：各入口还会借用补充池里其他号池的成员（`EXTRA_POOL_INCLUDE_ULTRA=true` 时也包括 Ultra 成员，权益规则照常），见[补充池](#补充池额外浏览器号池)。
 - **Pro 账户并入（付费号池）**：只在 `PRO_POOL=false` 时生效：`PRO_POOL=true`（默认）时保存原值但不生效，运行日志在启动与两项之一变化时写一行 WARN“ULTRA_INCLUDE_PRO=true 在 PRO_POOL=true 时不生效：Pro 账户只服务 /pro”，管理页置灰并提示。`ULTRA_INCLUDE_PRO=true` 时权益为 Pro 的账户与 Ultra 账户同属 Ultra 号池，按 Ultra 号池的全部设置调度：经 `/ultra` 服务并列入 `/ultra/v1/models`，受 `ULTRA_EXCLUSIVE` 约束，Worker 计入 Ultra 分区与 `ULTRA_WARM_WORKER_LIMIT`、`ULTRA_MAX_ACTIVE_WORKERS` 两个上限，适用 `ULTRA_PRIMARY_MODELS` 的快速失败，也计入侧栏的 Ultra 行、Ultra 主用模型供给与 `/api/status` 的 `ultra_accounts`。默认 `false`，升级后行为不变；在管理页保存后立即生效，不需要重启服务，已运行的 Worker 改按新分区计数，不会重启；旧版管理页面保存时不带这个字段，沿用现值。
   - **普通路径不再用 Pro（`ULTRA_EXCLUSIVE=true` 时）**：这样 Pro 账户只服务 `/ultra`，不再参与普通号池（Free、Plus 等账户）的模型调用。代价有三点：`gemini-4-argon`（只在 Build 通道提供，此前普通路径上的它本来就由 Pro 账户服务）与所有需要订阅权益的模型从普通路径的 `/v1/models` 消失，客户端要改用 `/ultra`；普通号池的容量随之变小；普通路径上 Free、Plus 账户输入超过上限后，不能再换到 Pro 账户重试。`ULTRA_EXCLUSIVE=false` 时普通路径照常可以用 Pro 账户（与 Ultra 账户相同），管理页会提示这个组合没有让 Pro 只服务 `/ultra`。
   - **真实权益不变**：账户页的权益列仍显示 Pro（另带“Ultra 号池”标记，权益筛选仍按权益），权益请求头仍为 `TIER1`，输入上限、模型资格与更高权益重试都按 Pro：目录标成只有 Ultra 订阅能用的模型（访问模式 4）与 `ULTRA_ONLY_MODELS` 里的模型都只由 Ultra 账户服务（目录没有标注或模型只在 Build 通道提供时靠 `ULTRA_ONLY_MODELS`，见下面的“权益规则”），`/ultra` 上 Pro 账户输入超限时可以换 Ultra 账户再试一次；每日额度通道判定也仍按真实权益分组。Plus、Free 与还没读出权益的账户留在普通号池。
@@ -847,16 +850,22 @@ cp .env.example .env
 | `FIRST_EVENT_TIMEOUT` | `0`（关闭） | 每次尝试从向上游发送起等待首个上游事件的上限（客户端还没收到内容时的同账号重新生成每次发送重新起算；强制调用工具时扣住上游事件期间暂停）；超时只放弃这一次尝试并换号重试，不能再换号时返回 504。可写 `0` 或 `off`（关闭）、整数秒（`60` 即 60 秒，与上游 Mag1cFall/AIStudio2API 的写法相同）或时长（`90s`、`2m`），启动加载与管理页保存都认这几种写法（原先只认时长，`off` 与 `60` 按无效值退回关闭）。必须小于 `REQUEST_TIMEOUT`；思考很长的模型可能很久才有第一个事件，开启时要留足余量 |
 | `STREAM_DATA_HEARTBEAT` | `true` | 数据型流式心跳：每 10 秒没有输出时写一块中转会按 data 转发的空数据（Gemini SSE 为空文本或空思考的候选块，OpenAI Chat 为空 delta 块），首个事件还没到就提交响应头时提交时也写一块，代替只写换行或 `: ping`，new-api 等中转后面的客户端在等首字、长思考时也能持续收到字节。官方 SDK 直连时 Gemini SSE 仍只写换行（直连不经过中转，不再多写一种 SDK 判为无效的块）；开启后 new-api 的首字时间与 TTFT 统计反映的是本服务写出第一块心跳的时刻，且 new-api 收到第一块心跳就当作已有上游响应：之后客户端断开或流被截断、没有 `usageMetadata` 时按估算的输入 token 计费（原先只有换行心跳时计 0），介意时关闭它、只依赖 new-api 的 ping。`false` 时与原先完全一致。管理页“服务配置”可改，保存后立即生效，只影响新请求，见[经 new-api 中转时连接被中止](#经-new-api-中转时连接被中止或工具调用后续请求失败) |
 | `WARM_WORKER_LIMIT` | `5` | 普通号池的常驻预热账户数（不含 Pro 号池与 Ultra 号池的账户）。应不小于希望常驻的 Worker 数：超出它的 Worker 空闲 5 分钟后被回收，预热也不会补齐超出部分空出的槽位，只能靠请求现场冷启动 |
-| `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS`、`PRO_MAX_ACTIVE_WORKERS`（开启 `PRO_POOL` 且有 Pro 账户时）之和。淘汰仍在服务请求的冷却占位时替补先启动，排空期间每个分区最多再多 `min(WARM_STARTUP_CONCURRENCY×2, 峰值/4)` 个（至少 1 个） |
-| `ULTRA_EXCLUSIVE` | `true` | `true` 时 Ultra 号池的账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 号池的账户，`/ultra` 仍只用 Ultra 号池的账户 |
+| `MAX_ACTIVE_WORKERS` | `10` | 普通号池高峰期最多同时运行的 Worker 数；浏览器总数最多为它与 `ULTRA_MAX_ACTIVE_WORKERS`、`PRO_MAX_ACTIVE_WORKERS`（开启 `PRO_POOL` 且有 Pro 账户时）、`EXTRA_MAX_ACTIVE_WORKERS`（开启 `EXTRA_POOL` 时）之和。淘汰仍在服务请求的冷却占位时替补先启动，排空期间每个分区最多再多 `min(WARM_STARTUP_CONCURRENCY×2, 峰值/4)` 个（至少 1 个） |
+| `ULTRA_EXCLUSIVE` | `true` | `true` 时 Ultra 号池的账户只服务 `/ultra` 前缀的请求，普通路径只用其余账户；`false` 时普通路径也可以用 Ultra 号池的账户，`/ultra` 仍只用 Ultra 号池的账户；开启补充池（`EXTRA_POOL`）时各入口还会借用补充池里其他号池的成员，见[补充池](#补充池额外浏览器号池) |
 | `ULTRA_INCLUDE_PRO` | `false` | 只在 `PRO_POOL=false` 时生效（`PRO_POOL=true` 时保存原值但不生效，见 [Pro 号池](#pro-号池pro-前缀)）。`true` 时权益为 Pro 的账户并入 Ultra 号池（付费号池），按 Ultra 号池的全部设置调度（`/ultra`、`ULTRA_EXCLUSIVE`、Ultra 分区与两个 `ULTRA_*` Worker 上限、`ULTRA_PRIMARY_MODELS`）；`ULTRA_EXCLUSIVE=true` 时 Pro 账户不再服务普通路径。账户的真实权益不变（权益请求头 `TIER1`、输入上限、模型资格、账户页显示的权益与每日额度通道判定仍按 Pro）。保存后立即生效，影响与注意事项见 [Ultra 号池](#ultra-号池ultra-前缀) |
 | `ULTRA_ONLY_MODELS` | `gemini-4-carbon` | 只有权益为 Ultra 的账户能用的模型，逗号分隔：Pro 号池与并入 Ultra 号池的 Pro 账户都不会被选去服务它们（“Pro 不能用 `gemini-4-carbon`”只靠这一项），也不计入它们的预热、替补与主用模型供给。只收窄、不放宽（账户还要目录按权益允许），按账户真实权益判断，权益尚未读取的账户按 Free 处理；写基础模型 ID，覆盖全部后缀写法与目录别名，大小写不限，不能写 `long-` 开头的名称。号池里没有账户能用的模型不列入该号池的模型列表，请求返回 404。在 `.env` 写空值或在管理页清空即没有规则；进程环境变量的空值不生效。保存后立即生效，见 [Ultra 号池](#ultra-号池ultra-前缀)的“权益规则” |
 | `PAID_ONLY_MODELS` | `gemini-3.1-pro-preview` | 只有权益为 Pro 或 Ultra 的账户能用的模型（Plus、Free 不在内），逗号分隔；规则与 `ULTRA_ONLY_MODELS` 相同，同一模型在两份列表里时只有 Ultra 能用。保存后立即生效 |
 | `ULTRA_WARM_WORKER_LIMIT` | `2` | Ultra 号池的常驻预热 Worker 数，可以为 `0`（只按需启动）；开启 `ULTRA_INCLUDE_PRO` 时由 Ultra 与 Pro 账户共用，为 `1` 时唯一常驻的可能是 Pro 账户 |
 | `ULTRA_MAX_ACTIVE_WORKERS` | `5` | Ultra 号池高峰期最多同时运行的 Worker 数，至少为 1 且不小于 `ULTRA_WARM_WORKER_LIMIT`；开启 `ULTRA_INCLUDE_PRO` 时由 Ultra 与 Pro 账户共用 |
-| `PRO_POOL` | `true` | Pro 独立号池：`true` 时权益为 Pro 的账户只服务 `/pro` 前缀（默认地址与 `/ultra` 不用它们，`ULTRA_INCLUDE_PRO` 不生效），`/pro` 不借用其他号池的账户（没有可用账户 503，冷却或额度不足 429），Pro 不能用 `ULTRA_ONLY_MODELS` 里的模型；`false` 时与没有这项设置之前相同，新的 `/pro` 请求返回 404，切换时仍在进行的 `/pro` 请求返回 503。写法无效时按默认开启并在管理页提示。保存后立即生效，不重启浏览器；升级提醒见 [Pro 号池](#pro-号池pro-前缀) |
+| `PRO_POOL` | `true` | Pro 独立号池：`true` 时权益为 Pro 的账户只服务 `/pro` 前缀（默认地址与 `/ultra` 不用它们，`ULTRA_INCLUDE_PRO` 不生效），`/pro` 不借用其他号池的账户（没有可用账户 503，冷却或额度不足 429；开启补充池时例外：`/pro` 也借补充池里其他号池的成员，Pro 成员也借给默认地址与 `/ultra`，见[补充池](#补充池额外浏览器号池)），Pro 不能用 `ULTRA_ONLY_MODELS` 里的模型；`false` 时与没有这项设置之前相同，新的 `/pro` 请求返回 404，切换时仍在进行的 `/pro` 请求返回 503。写法无效时按默认开启并在管理页提示。保存后立即生效，不重启浏览器；升级提醒见 [Pro 号池](#pro-号池pro-前缀) |
 | `PRO_WARM_WORKER_LIMIT` | `2` | Pro 号池的常驻预热 Worker 数，可以为 `0`（只按需启动）；`PRO_POOL=false` 时 Pro 分区为空 |
 | `PRO_MAX_ACTIVE_WORKERS` | `5` | Pro 号池高峰期最多同时运行的 Worker 数，至少为 1 且不小于 `PRO_WARM_WORKER_LIMIT`；不与普通、Ultra 分区共用 |
+| `EXTRA_POOL` | `false` | 补充池（额外浏览器号池）总开关：有模型冷却（剩余不少于 15 分钟）、别的模型还能用的账户单独开浏览器，补给默认地址、`/pro` 与 `/ultra`；账户所属的号池不变。关闭时与没有这项设置之前完全相同，保存后立即生效，见[补充池](#补充池额外浏览器号池) |
+| `EXTRA_POOL_MODE` | `share` | 补充池的使用方式（不区分大小写，写回 `.env` 为小写）：`share` 与主号池一起分担，补充池已就绪的 Worker 与主号池轮流接请求；`overflow` 只在主号池不够时补充（热 Worker 都忙、候选全部冷却、额度 429 之后只能用已启动的 Worker 时立即借，Worker 正在启动或出口限速时排队满 3 秒再借；主号池还能现场冷启动备用号时先由这个请求冷启动主号池，期间不借）。写错时按 `share` 并在管理页提示 |
+| `EXTRA_POOL_DEFAULT_PAID` | `true` | 默认地址能否借补充池里的 Pro 账户（`EXTRA_POOL_INCLUDE_ULTRA=true` 时还有 Ultra 账户）跑默认地址模型列表之外的模型，如 `gemini-4-argon` 与 `PAID_ONLY_MODELS`；只借得到“别的模型已冷却、这个模型还能用”的成员，没有这样的成员时模型仍在列表里、请求返回 503，要稳定使用请走 `/pro`。权益规则照常，Free 永远跑不了付费模型。`/pro`、`/ultra` 不受影响，始终只补充自己的模型 |
+| `EXTRA_POOL_INCLUDE_ULTRA` | `false` | 权益为 Ultra 的账户能否成为补充池成员；默认只收 Free（含 Plus 与权益尚未读取的，按 Free 计）与 Pro |
+| `EXTRA_WARM_WORKER_LIMIT` | `40` | 补充池的常驻 Worker 数（预热与原地接手补到的数量），可以为 `0`（不预热、不接手，只在请求需要时扩容） |
+| `EXTRA_MAX_ACTIVE_WORKERS` | `50` | 补充池高峰期最多同时运行的 Worker 数，至少为 1 且不小于 `EXTRA_WARM_WORKER_LIMIT`；不与普通、Ultra、Pro 分区共用。每个浏览器约 0.6GB 内存，开满 50 个（加替换时多出的 4 个）约 32GB |
 | `WARM_STARTUP_CONCURRENCY` | `2` | 同时冷启动的 Camoufox Worker 数：预热最多占用该数，请求现场的冷启动另保留 1 个名额并优先；`WAA_BACKEND=go` 不受此限 |
 | `PER_ACCOUNT_CONCURRENCY` | `2` | 单账号同时执行的请求数，是硬上限：同一账号同时进行的请求不超过此数（所有请求类型），调小时进行中的请求照常跑完；受每分钟次数上限（`ACCOUNT_RPM_LIMIT`）约束，不宜调高 |
 | `ACCOUNT_RPM_LIMIT` | `10` | 单账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型与两个通道共用），满了就换号、热 Worker 都满时扩容；只统计本服务，429 冷却仍兜底；`0` 关闭；保存后立即生效 |
@@ -970,6 +979,55 @@ Ultra 主用模型没有额度时立即返回 429：
 
 **看效果**：管理页侧栏多一行“平均调用 · 今日 最少/中位/最多 · 已用 U/A 个号 · 近 1 小时轮换 N 次”（轮换次数为旧号已关闭的次数、两个分区合计；Ultra 分区有可调度账号时另一行，有进行中的轮换或暂停时追加，暂停时标黄），统计的是可调度账号（需要验证账号的整户暂停、需要登录等不算），每 30 秒更新；`/api/status` 的 `balanced`（开启且服务运行时才有）带同样的数与 `p90`、`rotations_today`，`rotating` 为进行中的轮换数（轮换不计入 Worker 的“待淘汰”，先启后停的旧号在接替就绪前也不计入“排空中”）。运行日志每 10 分钟一条“平均调用概况”（不列账户），轮换的登记、接替就绪、关闭、取消与暂停各有一行（见[运行日志](docs/logging.md)）。每个账号的明细用用量页“分项排行”按“账户”排：那边每个请求记一行，这里每次发送都计，两边的数不一样；时间范围选“配额日”（从最近一次太平洋时间零点起算，选项上写本地起始时间，与 Google 每日额度重置、这里的“今日”同一个边界），选“今天”则按浏览器本地零点。
 
+### 补充池（额外浏览器号池）
+
+号池按权益划分之后，Free 号某个模型（例如 `gemini-flash-latest`）当天用完、Pro 号的 `gemini-4-argon` 用完时，这些号的其他模型往往还能用，但它们的 Worker 多半已被冷却淘汰换下，别的入口也用不上它们。`EXTRA_POOL=true`（管理页“服务配置”→“补充池”）把这类账户单独开一批浏览器，补给默认地址、`/pro` 与 `/ultra`。默认关闭，关闭时一切与没有这项设置之前完全相同。
+
+**机制**：账户属于哪个号池（家分区）不变。补充池由两部分组成：一批带“补充池”标记的 Worker，有自己的常驻数（`EXTRA_WARM_WORKER_LIMIT`，默认 40）与峰值（`EXTRA_MAX_ACTIVE_WORKERS`，默认 50），不占普通、Pro、Ultra 分区的名额；以及请求选号时一条不阻塞的借用通道。补充池按常驻数预热，排在主分区之后、共用 `WARM_STARTUP_CONCURRENCY`；主分区因冷却淘汰、冷却轮换、回收冷却占位、空闲回收或按需替换要关掉一个成员的空闲 Worker 时，补充池低于常驻数就原地接手（给它打上标记，不关浏览器）。超出常驻、空闲满 5 分钟的补充池 Worker 逐个回收；请求需要而补充池没有空闲 Worker 时在后台扩容到峰值，峰值满时只在补充池内部替换。
+
+**哪些账户能进**（按与管理页显示冷却相同的口径，每约 5 秒对账一次）：
+
+| 账户 | 是否成员 |
+| --- | --- |
+| 某个模型冷却剩余不少于 15 分钟（每日限额、额度 429、长冷却），还有别的初始化模型能用 | 进入；之后冷却结束才离开 |
+| 只在单个模型上需要验证账号、分钟限额等短冷却 | 不算冷却，不进 |
+| 完全没冷却的账户 | 永远留在原号池 |
+| 需要登录、已停用、组织停用、初始化模型全都在冷却 | 不进；已在补充池的离开 |
+| 整户冷却（全局冷却） | 有生效的全局冷却时不进；已是成员的，全局冷却剩余不少于 15 分钟才离开 |
+| 权益：Free（含 Plus 与权益尚未读取的，按 Free 计）、Pro | 可以进；Ultra 由 `EXTRA_POOL_INCLUDE_ULTRA` 决定，默认不进 |
+
+账户离开时（冷却结束、补充池关闭、权益不在范围），家分区有空位就原地归还 Worker（不关浏览器），否则在空闲时关闭，每轮最多关 `max(WARM_STARTUP_CONCURRENCY, 1)` 个；忙碌的等请求结束。离开但还没归还的补充池 Worker 不再借出（状态接口的 `returning`）。
+
+**两种方式**（`EXTRA_POOL_MODE`）：
+
+- `share`（默认，一起分担）：补充池里已就绪的 Worker 与主号池的 Worker 按两边的空闲数轮流接请求；`fill-first` 时主号池在前，平均调用开启时先比谁手上没有请求。需要冷启动时主号池先现场提升或扩容，补充池排在后面。
+- `overflow`（只在主号池不够时补）：主号池的热 Worker 都在忙、候选全部冷却（或没有能服务的账户）、额度 429 之后只能用已启动的 Worker 时立即借补充池；主号池的 Worker 正在启动、正在扩容或出口限速时，这次选号排队满 3 秒再借；主号池还能现场冷启动备用号（有没冷却的备用号、分区有空槽）时，由这个请求先冷启动主号池的备用号（真实浏览器约 10–30 秒），期间不改借补充池。本路由自己账户的补充池 Worker 同样按补充池对待：主号池能冷启动时也先冷启动，不先用它；它在忙时按主号池的忙碌 Worker 等它空出。
+
+两种方式都只补请求入口本来就有的模型（下面的默认地址借付费模型除外），借到的仍是请求能用的账户：模型目录、权益规则（`ULTRA_ONLY_MODELS`、`PAID_ONLY_MODELS`）与目录访问模式照常检查。
+
+**默认地址借付费模型**（`EXTRA_POOL_DEFAULT_PAID`，默认开）：默认地址可以借补充池里的 Pro 账户（`EXTRA_POOL_INCLUDE_ULTRA=true` 时还有 Ultra 账户）跑默认地址模型列表之外的模型，例如 `gemini-4-argon` 与 `PAID_ONLY_MODELS` 里的模型，前提是那个号这个模型还没用完。补充池只收“有模型冷却、别的模型还能用”的成员，所以这些模型只由“别的模型已冷却、这个付费模型还能用”的 Pro（或 Ultra）成员服务：`gemini-4-argon` 用完的 Pro 号在默认地址上借给 flash 等模型用，不是借给 argon；完全没冷却的健康 Pro 号不是成员，留在 `/pro`。这些模型随之出现在默认地址的 `/v1/models` 里（别名同样能解析，`count_tokens` 同样借用），只能由补充池服务：补充池范围内能跑它的账户全部冷却时返回 429 并带 `Retry-After`；没有这样的成员、或此刻借不到 Worker 时模型仍在列表里，请求返回 503（官方措辞，模型在列表里所以不是 404），例如太平洋时间零点额度恢复、成员成批离开之后，到又有 Pro 号用完别的模型（冷却剩余不少于 15 分钟）之前都可能是 503。要稳定使用 `gemini-4-argon` 请走 `/pro`。默认地址的号池里一个账户都没有（例如只有 Pro 与 Ultra 账户、`PRO_POOL=true`）时，列表里的模型同样借补充池。Free 账户永远跑不了付费模型，Pro 跑不了只限 Ultra 的模型。关闭这项后默认地址去掉这些模型，请求按原来的 404 加改用 `/pro` 的提示返回。
+
+**`/pro` 与 `/ultra` 只补自己的模型**：`/pro` 只借成员跑 `/pro` 列表里有的模型（不会借 Ultra 成员跑只限 Ultra 的模型），`/ultra` 同理；`EXTRA_POOL_DEFAULT_PAID` 不影响这两个入口。补充池借来的跨号池账户，这次尝试的号池级 403 与裸限流判定记在补充池名下，不影响路由号池的判定。
+
+**与改用其他模型、主用模型的关系**：请求先在本路由与补充池里找能用的账户，都没有时才按 `MODEL_FALLBACKS` 改用其他模型（例如 `/ultra` 请求 `gemini-4-argon`、Ultra 号全部冷却、补充池里有能跑它的 Pro 成员时，先由补充池服务，不改用 `gemini-4-carbon`）。主用模型的排队上限（`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT`）包括等补充池的时间；默认地址只能由补充池服务的 `gemini-4-argon` 不在 `PRIMARY_MODELS` 里时按普通模型排队，补充池忙时会排到请求期限，建议把它加进 `PRIMARY_MODELS`。
+
+**资源**：每个浏览器约 0.6GB 内存，常驻 40 个约 24GB，峰值 50 个加替换时先启后停多出的 4 个约 32GB；开启 IP 池时浏览器上限多“峰值 + 排空上限”个（默认 54），见下文 [IP 池](#ip-池每个浏览器一个-ip)的“端口要够”；浏览器多时进程的打开文件数上限建议不低于 65536（`ulimit -n`，见下文 IP 池的“`ulimit -n`”）。开启前请确认机器够用，内存紧张时先调小两个 Worker 数。
+
+**太平洋时间零点**：每日额度在太平洋时间零点（北京时间 15 点或 16 点）恢复，大量成员同时离开：家分区有空位的原地归还，其余按每轮的上限逐步关闭，家分区随后按常驻数补预热。
+
+**借用 Ultra 成员**：打开 `EXTRA_POOL_INCLUDE_ULTRA` 后，借用 Ultra 账户会消耗 Ultra 出口通道的令牌，可能挤占 `/ultra`。
+
+**切换（保存后立即生效，不重启服务）**：打开后下一次对账（约 5 秒内）开始预热，排队中的请求在下一轮复查（约 1 秒或被唤醒）读到开关；关闭后不再启动、不再接手，已有的补充池 Worker 按“离开”处理（归还或空闲时关闭），已借到的请求照常完成，在原账号重放时补充池已关就改为换号（请求进度写一行 WARN）。改方式、默认地址借付费模型、含 Ultra、两个 Worker 数都在下一轮生效；峰值调到低于现有数时不强制关闭，只写一次超峰值 WARN，由空闲回收逐步收敛。运行日志写一行 `补充池设置已更新并立即生效 | 开启=… | 方式=…`，`配置已热更新` 汇总行不变。
+
+**管理页面与状态接口**：“服务配置”的“补充池”分组可修改全部 6 项（关闭时照常保存，开启后显示资源估算）；侧栏显示 `补充池 Worker 13 / 40 · 峰值 50 · 可借出 10 · 成员 357`，悬停看方式、是否含 Ultra、默认地址借付费模型、冷成员、各权益成员数、归还中与借出次数（关闭后还有补充池 Worker 在归还时，侧栏与账户页头部只写 `补充池已关闭 · 归还中 3`）；账户页头部显示补充池 Worker 与成员数，Worker 计入补充池的账户标“补充池”，其余成员在权益旁标“可补充”，号池筛选多一项“补充池”（与这两个标签同一口径）；请求日志、请求摘要与用量记录中由补充池服务的请求（最后一次尝试借用补充池）带“补充池”标签，日志页可只看补充池、请求页与用量记录可只看由补充池服务的请求（补充池关闭后，用量记录里读到过这样的记录时照样显示这个筛选；号池列与汇总仍按入口记录，CSV 的列不变）。`/api/status` 增加 `extra_pool`（`members`、`free`、`pro`、`ultra`、`cold_members`、`lendable`、`returning`、`borrows` 与 `workers`）和 `workers.extra_ids`，账户的 `extra` 为 `worker` 或 `member`；补充池关闭且没有补充池 Worker 时都不输出。诊断：`bash tools/diag_capacity.sh` 与 `bash tools/diag_busy.sh` 会打印补充池的设置与计数，运行日志的说明见 [docs/logging.md](docs/logging.md#补充池)。
+
+**限制**：
+
+- `count_tokens` 只在默认地址的“只能由补充池服务”的模型上借用补充池已就绪的 Worker；其余模型照常只用本路由的账户。
+- Live、转写、视频（Veo）、上传、带文件或视频引用的请求、指定账户的请求、降级判定中的请求不借用补充池：这些请求会在账户上留下资源绑定，必须留在家分区。
+- 补充池成员的单账户并发与每分钟上限与家路由共用。
+- 成员按约 5 秒一次的对账计算，账户恢复后最多 5 秒内仍可能被跨号池借用（账户是健康的）。
+
 ### 端口配置
 
 - **管理页面与 API**: 默认端口 `2048`
@@ -1028,7 +1086,7 @@ PROXY_POOL_URL=http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.
 
 - **优先级**：账户自己的代理（`account.json` 的 `proxy`）> IP 池 > 默认代理 `PROXY`。开启后没有自己代理的账户不再使用 `PROXY`；账户自己的代理或 `PROXY` 指向池里的某个端口时，这个端口记为外部占用，不再分配。
 - **“一个账号一个 IP”指同一时刻**：同一时刻每个浏览器独占一个 IP；账户数多于端口数时，每个 IP 随时间先后服务多个账号。浏览器运行期间，这个账户的后台请求（业务请求、续签等）与浏览器走同一个出口；同一账户的重新登录、验证也跟着正在运行的 Worker 走同一个出口（Worker 是开启 IP 池之前启动的、仍走 `PROXY` 时同样走 `PROXY`）。Chrome 导入只在后台完成授权、不开浏览器，每个账号导入完就归还端口，账户建好后记下这个端口，之后的 Worker 回到它。没有浏览器的账户只有少量后台请求（目录同步、复核、续签），按这个顺序选出口：自己上次的端口（之后没被别人用过）、当时空闲的端口（各账户按自己的顺序挑，分散在不同端口上）、`PROXY`，最后才与别人共用；端口被别人占用或开始冷却时立即改到别处，端口用满时退回 `PROXY` 的账户在有端口空出来 30 秒后改回 IP 池（这段时间里多半有 Worker 来占它）。
-- **端口要够**：可能同时运行的浏览器数为每个分区（普通、Ultra，开启 `PRO_POOL` 且有 Pro 账户时还有 Pro）的“峰值 + 排空上限”之和，排空上限为 `min(2 × WARM_STARTUP_CONCURRENCY, 峰值 / 4)`（至少 1，排空冷却占位时替补先启动、旧 Worker 后关闭）；登录与验证另占端口（新账户自动处理默认验证并发 3）。建议 `端口数 ≥ Σ(峰值 + 排空上限) + 验证并发`。例如 `MAX_ACTIVE_WORKERS=150`、`ULTRA_MAX_ACTIVE_WORKERS=5`、`WARM_STARTUP_CONCURRENCY=16` 时最多 `150+32 + 5+1 = 188` 个浏览器，加验证并发 3 为 191，200 个端口只余 9 个；开启 `PRO_POOL` 且有 Pro 账户时再加 Pro 分区（默认 `PRO_MAX_ACTIVE_WORKERS=5`，即 5+1）；调高峰值或启动并发前先看设置页给出的端口需求。端口不够时超出的浏览器与其他账号共用端口（同一个 IP），日志记 WARN，设置页与侧栏标黄。
+- **端口要够**：可能同时运行的浏览器数为每个分区（普通、Ultra，开启 `PRO_POOL` 且有 Pro 账户时还有 Pro，开启 `EXTRA_POOL` 时还有补充池）的“峰值 + 排空上限”之和（补充池内部替换同样先启后停，默认多 50+4 个），排空上限为 `min(2 × WARM_STARTUP_CONCURRENCY, 峰值 / 4)`（至少 1，排空冷却占位时替补先启动、旧 Worker 后关闭）；登录与验证另占端口（新账户自动处理默认验证并发 3）。建议 `端口数 ≥ Σ(峰值 + 排空上限) + 验证并发`。例如 `MAX_ACTIVE_WORKERS=150`、`ULTRA_MAX_ACTIVE_WORKERS=5`、`WARM_STARTUP_CONCURRENCY=16` 时最多 `150+32 + 5+1 = 188` 个浏览器，加验证并发 3 为 191，200 个端口只余 9 个；开启 `PRO_POOL` 且有 Pro 账户时再加 Pro 分区（默认 `PRO_MAX_ACTIVE_WORKERS=5`，即 5+1）；调高峰值或启动并发前先看设置页给出的端口需求。端口不够时超出的浏览器与其他账号共用端口（同一个 IP），日志记 WARN，设置页与侧栏标黄。
 - **端口段按服务器划分**：每台服务器（每个进程）用不重叠的端口段。同一台机器上的多个进程按端口加文件锁（与账户 runtime 租约同目录：`[用户缓存]/AIStudio2API/runtime-leases/`），不会分到同一端口；`runtime/proxy-pool.json` 按工作目录保存，同一工作目录只运行一个进程。
 - **端口冷却**：端口出问题时冷却（第 1 次 15 分钟，之后翻倍，最长 2 小时；24 小时内没有再冷却则档位清零）。冷却中的端口不分给新的浏览器，已经在用的浏览器不受影响。冷却条件：10 分钟内 2 个不同账号在这个端口上返回裸限流 429（不是额度 429），其间没有生成成功（同一个账号反复 429 多半是它自己的额度问题，由账号冷却处理）；或连续 2 次因代理连不通（连不上、超时、407 等）启动失败，其间没有启动成功（与代理无关的启动失败不计）。大量端口同时出错时按代理商整体问题处理，暂不冷却。
 - **动态 IP 换会话**：同一账户 30 分钟内 2 次因代理连不通启动失败、距上次换会话至少 10 分钟时换一个会话号（没有浏览器的账户立即换，有浏览器的下次启动时换）。裸 429 不换会话：每个会话各自是一个出口、只有一个账号，出口限流判定（要求同一出口上多个账号被拒，见下一条）在会话上不会成立；单看一个会话也分不清是账号额度用完还是这个 IP 被限制，换会话只会让账号频繁换 IP。因此代理能连通、但被上游限制的会话不会自动换。建议在代理商处设置较长的会话时长。
@@ -1164,6 +1222,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 - **“冷却占位”与“排空中”长时间不下降**：在运行日志中搜索“替补跳过”（分区内没有能服务这些模型、没有冷却的备用账号）与“排空超时”（固定账户或文件绑定的请求一直在用该 Worker）。另有两种情况不写日志，属于正常：排空中的 Worker 上有开始输出后的长流时，排空保持到流结束，最长到总时长上限（默认 1 小时），“排空超时”要到总时长上限 + 30 秒后才出现；“排空中”已达 2 × 排空名额（`drainLimit`，为 `max(WARM_STARTUP_CONCURRENCY, 1) × 2`，且不超过分区峰值的 1/4、至少 1）时，其余冷却占位要等其中一个排空结束才排空，期间照常服务其他模型。排空让出的名额已满时，新排空的替补因槽位已满没有启动（日志“替补未启动 | 原因=排空”，错误为槽位已满），旧 Worker 关闭后补上。
 - **Ultra 主用模型的 429**：看 Ultra Worker 下面的“Ultra 主用 <模型>”一行，口径同上，只统计 Ultra 号池。这些模型没有额度时立即返回 429（见[主用模型](#主用模型)），运行日志里对应“Ultra 主用模型候选全部冷却，立即返回 429”或“Ultra 主用模型额度不足，立即返回 429”，后者写明原因与额度失败次数；客户端按 `Retry-After` 稍后重试即可。
 - **冷却很多、热很少**：常驻 Worker 大多对该模型在冷却，多为连续限流或当天额度用完；号池繁忙的 429 看下一节的候选快照与连续限流，或直接运行 `bash tools/diag_busy.sh`。
+- **大量账号只在这个模型上冷却、别的模型还能用**：可以开启[补充池](#补充池额外浏览器号池)，把这些账号单独开浏览器补给各入口（默认地址借 Pro 账户跑 `gemini-4-argon` 等付费模型也靠它）；注意内存与 IP 池端口。
 - **侧栏出现“出口限速”或很多账号同时冷却**：多半是同一出口 IP 被上游整体限流，换号与加账号都无益，见[出口限流、目录缓存与“需要登录”](#出口限流目录缓存与需要登录)；需要登录的账户突然增多时看同一节的登录复核。
 
 ### 号池繁忙 429 与连续限流
@@ -1173,7 +1232,7 @@ netsh int ipv4 add excludedportrange protocol=tcp startport=2048 numberofports=1
 - `热空闲`、`热忙碌`、`备用`、`备用忙碌`：已有 Worker 的账号与备用账号，冷却中的不计；`每分钟已满` 为其中因 `ACCOUNT_RPM_LIMIT` 按忙碌计的；`启动中=是` 为有候选的 Worker 正在启动；`最早恢复` 为候选中最早恢复的冷却还剩多久。
 - `驻留冷却`：对该模型冷却中的常驻 Worker 数，即 `/api/status` 里 `primary_supply` 的 `cooling`（约 30 秒统计一次）。
 
-怎么读：`驻留冷却` 不小于 `热空闲` 加 `热忙碌` 时，常驻 Worker 大多对该模型在冷却（多为下面的连续限流或当天额度用完）；`热忙碌` 大多是 `每分钟已满` 时，每分钟上限是瓶颈；`备用` 与 `备用忙碌` 都为 0 时，号池里已经没有还能服务它的空闲账号；其余多是并发超过了 Worker 数 × 单账户并发（见上一节）。
+怎么读：`驻留冷却` 不小于 `热空闲` 加 `热忙碌` 时，常驻 Worker 大多对该模型在冷却（多为下面的连续限流或当天额度用完）；`热忙碌` 大多是 `每分钟已满` 时，每分钟上限是瓶颈；`备用` 与 `备用忙碌` 都为 0 时，号池里已经没有还能服务它的空闲账号（别的号池里有大量只在其他模型上冷却的账号时，可开启[补充池](#补充池额外浏览器号池)让它们来补）；其余多是并发超过了 Worker 数 × 单账户并发（见上一节）。
 
 **连续限流递增冷却**：上游对额度已用完的账号常只返回裸的 `Quota exceeded`（没有额度周期，也没有重试时间）。这类 429 原先只冷却 30 秒，账号每 30 秒恢复、被选中、再失败一次，它的常驻 Worker 也因为冷却太短既不算冷却中、也成不了冷却占位，换不上新的账号。现在同一账号同一模型在冷却到期后再次遇到这种 429 就升一档：
 

@@ -31,6 +31,9 @@ const (
 	PoolScopePro
 	// PoolScopeNormalUltra 只用普通号池与 Ultra 号池：PRO_POOL=true、ULTRA_EXCLUSIVE=false 时普通路径的范围，只是请求范围，不是 Worker 分区
 	PoolScopeNormalUltra
+	// PoolScopeExtra 为补充池（EXTRA_POOL，见 extra_pool.go）：借用选号与补充池 Worker 槽位用，不是分区（账户的家分区不变），
+	// 不会出现在请求的 context 里；包含的权益按补充池规则（关闭时什么都不包含）
+	PoolScopeExtra
 	// PoolScopeCount 为号池取值的个数，按号池下标的数组用它定长
 	PoolScopeCount
 )
@@ -47,6 +50,8 @@ func (scope PoolScope) String() string {
 		return "pro"
 	case PoolScopeNormalUltra:
 		return "normal_ultra"
+	case PoolScopeExtra:
+		return "extra"
 	default:
 		return ""
 	}
@@ -63,6 +68,8 @@ func (scope PoolScope) Label() string {
 		return "Pro 号池"
 	case PoolScopeNormalUltra:
 		return "普通号池与 Ultra 号池"
+	case PoolScopeExtra:
+		return "补充池"
 	default:
 		return ""
 	}
@@ -86,6 +93,8 @@ var scopePartitions = [PoolScopeCount]uint8{
 	PoolScopeUltra:       partitionBit(PoolScopeUltra),
 	PoolScopePro:         partitionBit(PoolScopePro),
 	PoolScopeNormalUltra: partitionBit(PoolScopeNormal) | partitionBit(PoolScopeUltra),
+	// 补充池不按分区划分：包含的权益由补充池规则单独给出（poolRules.tiers[PoolScopeExtra]，见 extra_pool.go）
+	PoolScopeExtra: 0,
 }
 
 // Contains 判断号池是否包含分区 partition（Worker 分区）；不认识的号池与非分区取值都为否
@@ -129,7 +138,7 @@ type poolRules struct {
 	proPool    bool
 	// partition 为权益格 → 所属分区
 	partition [tierSlotCount]PoolScope
-	// tiers 为号池 → 包含的权益格（按格的位掩码）
+	// tiers 为号池 → 包含的权益格（按格的位掩码）；补充池一格由补充池规则写入（见 setPoolRulesLocked 与 SetExtraPoolRules）
 	tiers [PoolScopeCount]uint8
 }
 
@@ -245,6 +254,8 @@ func (p *AccountPool) SetProPool(on bool) bool {
 // setPoolRulesLocked 为 SetPoolRules 的实现；调用方持有 p.mu
 func (p *AccountPool) setPoolRulesLocked(includePro bool, proPool bool) bool {
 	next := newPoolRules(includePro, proPool)
+	// 补充池的权益掩码不随 PRO_POOL、ULTRA_INCLUDE_PRO 变化，换规则时原样保留（成员不变提前返回时也已写入）
+	next.tiers[PoolScopeExtra] = p.extraRules.tierMask()
 	same := p.rules.sameMembership(&next)
 	p.rules = next
 	if same {

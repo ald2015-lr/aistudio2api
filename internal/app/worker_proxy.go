@@ -13,13 +13,19 @@ import (
 // Pro 分区只在 PRO_POOL=true 且有 Pro 号池账户（proAccounts）时计入：否则 Pro 分区为空、不占端口，默认开启不会让没有 Pro 账户的部署
 // 多需要 PRO_MAX_ACTIVE_WORKERS + 排空上限个端口。IP 池按它判断端口够不够（静态 IP 的端口数应不少于它再加上验证并发），
 // 设置页用同一公式（web/src/proxyPool.ts，Pro 账户按状态接口的 pro_accounts 判断）。装配与保存配置时按配置计算；之后 Pro 分区
-// 有没有账户的变化（读到 Pro 权益、新增或删除 Pro 账户）由后台周期按当前生效的 Worker 设置重算（见 syncProxyPoolCapacity）
+// 有没有账户的变化（读到 Pro 权益、新增或删除 Pro 账户）由后台周期按当前生效的 Worker 设置重算（见 syncProxyPoolCapacity）。
+// 补充池（EXTRA_POOL，见 extra_pool.go）开启时再加补充池的峰值与它的排空上限（默认 50+4）：补充池内部替换先启后停，会短暂多出一个浏览器；
+// 关闭时补充池一项为 0，公式与没有补充池时相同
 func proxyPoolCapacity(cfg config.Config, proAccounts bool) int {
 	pro := 0
 	if cfg.ProPool && proAccounts {
 		pro = cfg.ProMaxActiveWorkers
 	}
-	return browserCapacity(cfg.WarmStartupConcurrency, cfg.MaxActiveWorkers, cfg.UltraMaxActiveWorkers, pro)
+	extra := 0
+	if cfg.ExtraPool {
+		extra = cfg.ExtraMaxActiveWorkers
+	}
+	return browserCapacity(cfg.WarmStartupConcurrency, cfg.MaxActiveWorkers, cfg.UltraMaxActiveWorkers, pro, extra)
 }
 
 // browserCapacity 为 proxyPoolCapacity 的公式：各分区峰值（不大于 0 的不计）加上它的排空上限之和
@@ -34,14 +40,15 @@ func browserCapacity(warmConcurrency int, peaks ...int) int {
 }
 
 // liveProxyPoolCapacity 按当前生效的 Worker 设置（热更新后的各分区峰值与启动预热并发）计算 proxyPoolCapacity；
-// proPartition 为 Pro 分区是否有账户（只在 PRO_POOL=true 时可能为真）
+// proPartition 为 Pro 分区是否有账户（只在 PRO_POOL=true 时可能为真）。补充池的峰值关闭时为 0（不计）
 func (manager *accountWorkerManager) liveProxyPoolCapacity(proPartition bool) int {
 	pro := 0
 	if proPartition {
 		pro = manager.maxActiveFor(aistudio.PoolScopePro)
 	}
 	return browserCapacity(manager.warmConcurrencyValue(),
-		manager.maxActiveFor(aistudio.PoolScopeNormal), manager.maxActiveFor(aistudio.PoolScopeUltra), pro)
+		manager.maxActiveFor(aistudio.PoolScopeNormal), manager.maxActiveFor(aistudio.PoolScopeUltra), pro,
+		manager.maxActiveFor(aistudio.PoolScopeExtra))
 }
 
 // syncProxyPoolCapacity 在后台周期里按 Pro 分区当前有没有账户重算 IP 池的浏览器上限：装配时权益尚未读取的账户按 Free 计，之后才读到

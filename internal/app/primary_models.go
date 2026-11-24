@@ -85,6 +85,10 @@ const (
 	// waitReasonFirstWarm 为请求号池里还没有已就绪的 Worker、首轮预热还没出结果时的等待原因（见 first_warm.go）：
 	// 等的是后台预热的第一个 Worker，不另起冷启动；主用模型与等后台扩容一样按现场冷启动抵扣（合计不超过 INIT_TIMEOUT）
 	waitReasonFirstWarm = "等待首个 Worker 预热"
+	// waitReasonExtraBusy 为主号池没有能立即用的账号、补充池（EXTRA_POOL）里能借的 Worker 都在忙时的等待原因；waitReasonExtraExpanding 为
+	// 这次选号发起的补充池扩容还没结束时的等待原因（见 extra_select.go）。两者都按容量原因计入主用模型的排队预算，与主号池的等待共用一份
+	waitReasonExtraBusy      = "补充池 Worker 全部忙碌"
+	waitReasonExtraExpanding = "补充池 Worker 正在扩容"
 )
 
 // 额度不足时 PrimaryQuotaError 的原因（Ultra 主用模型与普通号池共用，见 quota_switch.go）

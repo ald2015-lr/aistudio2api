@@ -768,6 +768,11 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 	if value.ProMaxActiveWorkers != nil {
 		saved.ProMaxActiveWorkers = *value.ProMaxActiveWorkers
 	}
+	// 补充池设置：提交时省略（旧版页面）按生效值比较
+	extra := extraSettingsFromInput(value, active)
+	saved.ExtraPool, saved.ExtraPoolMode, saved.ExtraPoolDefaultPaid = extra.ExtraPool, extra.ExtraPoolMode, extra.ExtraPoolDefaultPaid
+	saved.ExtraPoolIncludeUltra, saved.ExtraWarmWorkerLimit, saved.ExtraMaxActiveWorkers =
+		extra.ExtraPoolIncludeUltra, extra.ExtraWarmWorkerLimit, extra.ExtraMaxActiveWorkers
 	if value.StreamPlaygroundModels != nil {
 		saved.StreamPlaygroundModels = config.NormalizeModelList(*value.StreamPlaygroundModels)
 	}
@@ -797,7 +802,7 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.ProPool == active.ProPool && saved.ProWarmWorkerLimit == active.ProWarmWorkerLimit &&
-		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers &&
+		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers && extraFieldsEqual(saved, active) &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.TemporaryChat == active.TemporaryChat &&

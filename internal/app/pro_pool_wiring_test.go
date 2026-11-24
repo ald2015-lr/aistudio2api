@@ -39,7 +39,10 @@ func newWiringManager(t *testing.T, cfg config.Config, configured bool) (*runtim
 	isolateDisableNotes(t)
 	useTempCatalogCacheDir(t)
 	clearAppConfigEnv(t)
-	for _, key := range []string{"PRO_POOL", "PRO_WARM_WORKER_LIMIT", "PRO_MAX_ACTIVE_WORKERS"} {
+	for _, key := range []string{
+		"PRO_POOL", "PRO_WARM_WORKER_LIMIT", "PRO_MAX_ACTIVE_WORKERS",
+		"EXTRA_POOL", "EXTRA_POOL_MODE", "EXTRA_POOL_DEFAULT_PAID", "EXTRA_POOL_INCLUDE_ULTRA", "EXTRA_WARM_WORKER_LIMIT", "EXTRA_MAX_ACTIVE_WORKERS",
+	} {
 		t.Setenv(key, "")
 		os.Unsetenv(key)
 	}

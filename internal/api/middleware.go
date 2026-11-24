@@ -61,6 +61,8 @@ type accessLogMetadata struct {
 	requestID       string
 	// fallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时为空
 	fallbackFrom string
+	// extra 为最后一次尝试的租约借自补充池（EXTRA_POOL，见 SetAccessLogExtra）
+	extra bool
 	// startedModel 为写 request.started 时的模型名（客户端请求的名字：协议层已解析名称后缀与 long- 前缀，号池目录里的别名还没换成
 	// 正式 ID）；request.finished 在它与最终模型不同时另记 requested_model，403 无权限账户登记记作最近一次请求的请求名
 	startedModel string
@@ -112,6 +114,7 @@ type accessLogSnapshot struct {
 	replyHash       string
 	servedModel     string
 	fallbackFrom    string
+	extra           bool
 	downgrade       *aistudio.DowngradeDecision
 	requestErr      string
 	trailingError   string
@@ -283,6 +286,7 @@ func (metadata *accessLogMetadata) start(force bool) {
 	admin := metadata.admin
 	entry := AccessLog{
 		Method: metadata.method, Path: metadata.path, Pool: metadata.pool, Model: metadata.model, Account: metadata.account, Channel: metadata.channel,
+		Extra:       metadata.extra,
 		Temperature: metadata.temperature, TopP: metadata.topP, TopK: metadata.topK, Thinking: metadata.thinking,
 		MaxOutputTokens: metadata.maxOutputTokens, Seed: metadata.seed, Generation: metadata.generation, RequestID: metadata.requestID,
 		InputMessages: metadata.inputMessages, InputTextChars: metadata.inputTextChars,
@@ -564,6 +568,7 @@ func (metadata *accessLogMetadata) snapshot() accessLogSnapshot {
 		generation: metadata.generation,
 		model:      metadata.model, startedModel: metadata.startedModel, account: metadata.account, channel: metadata.channel, finishReason: metadata.finishReason, replyHash: metadata.replyHash, servedModel: metadata.servedModel, downgrade: metadata.downgrade,
 		requestErr: metadata.err, trailingError: metadata.trailingError, canceled: metadata.canceled, fallbackFrom: metadata.fallbackFrom,
+		extra:         metadata.extra,
 		failureStatus: metadata.failureStatus,
 		firstEvent:    metadata.firstEvent, firstOutput: metadata.firstOutput,
 		upstreamBytes: metadata.upstreamBytes, usage: metadata.usage, toolCalls: metadata.toolCalls,
@@ -746,6 +751,16 @@ func SetAccessLogTarget(ctx context.Context, model string, account string) {
 	}
 }
 
+// SetAccessLogExtra 写入这次尝试的租约是否借自补充池（EXTRA_POOL）：每次尝试都写，请求日志与 /trace 的结果以最后一次尝试为准
+// （中途借过、最后由主号池服务的请求为 false）。没有借用的请求写 false，与不调用相同（JSON 里 extra 为 omitempty）
+func SetAccessLogExtra(ctx context.Context, extra bool) {
+	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
+		metadata.mu.Lock()
+		metadata.extra = extra
+		metadata.mu.Unlock()
+	}
+}
+
 // SetAccessLogChannel 写入请求实际使用的上游通道
 func SetAccessLogChannel(ctx context.Context, channel string) {
 	if metadata, ok := ctx.Value(accessLogContextKey{}).(*accessLogMetadata); ok {
@@ -869,7 +884,7 @@ func requestLoggingMiddleware(admin AdminService, next http.Handler) http.Handle
 				RequestID: snapshot.requestID, Pool: pool,
 				Method: r.Method, Path: path, Model: snapshot.model, RequestedModel: snapshot.startedModel, Account: snapshot.account, Channel: snapshot.channel,
 				FinishReason: snapshot.finishReason, ReplyHash: snapshot.replyHash, Error: snapshot.requestErr, TrailingError: snapshot.trailingError,
-				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom,
+				ServedModel: snapshot.servedModel, Downgrade: snapshot.downgrade, FallbackFrom: snapshot.fallbackFrom, Extra: snapshot.extra,
 				Canceled: snapshot.canceled, Generation: snapshot.generation, Attempts: snapshot.attempts,
 				Authorized: snapshot.authorized, Warmup: snapshot.warmup, Disconnect: disconnect,
 			})

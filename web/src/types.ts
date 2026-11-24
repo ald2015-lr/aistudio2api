@@ -58,7 +58,13 @@ export interface Account {
   // device_bound_session 表示认证文件是设备绑定会话（带 __Secure-1PSIDRTS），复制出来约 2 小时后失效：服务端所在平台不能用 Chrome
   // 续签材料原地续签（与启动、导入时“设备绑定会话”那行 WARN 同一口径）；不是时没有这个字段
   device_bound_session?: boolean
+  // extra 为账户与补充池（EXTRA_POOL）的关系：worker 为 Worker 计入补充池（含启动中），member 为补充池成员（有模型冷却、其他模型可用；
+  // Worker 驻留在主分区或没有 Worker）。按最近一次对账的成员缓存，账户列表不随成员变化推送；补充池关闭且没有补充池 Worker 时没有
+  extra?: AccountExtra
 }
+
+// AccountExtra 为账户与补充池的关系
+export type AccountExtra = 'worker' | 'member'
 
 // AccountTransition 为账户启停之后的后台收尾阶段
 export type AccountTransition = 'draining' | 'closing' | 'syncing'
@@ -230,6 +236,8 @@ export interface WorkerCounters {
   prewarm?: PrewarmState
   warm_ids?: string[]
   starting_ids?: string[]
+  // extra_ids 为 warm_ids、starting_ids 中计入补充池的账户（带补充池标记）；没有时省略，旧版服务端不返回
+  extra_ids?: string[]
 }
 
 // PartitionWorkerCounters 为 Ultra 分区或 Pro 分区的 Worker 数量与上限；occupied 为占用的槽位（含正在关闭的），
@@ -383,6 +391,8 @@ export interface ServiceStatus {
   pro_workers?: PartitionWorkerCounters
   // pro_pool_notice 为 PRO_POOL 默认开启的升级提示：.env 与环境变量都没有写 PRO_POOL、又有 Pro 号池账户时才有
   pro_pool_notice?: ProPoolNotice
+  // extra_pool 为补充池（EXTRA_POOL）的概况：开启，或关闭后仍有补充池 Worker 在归还或释放时才有；旧版服务端不返回
+  extra_pool?: ExtraPoolStatus
   // primary_supply 为每个主用模型（PRIMARY_MODELS 与 ULTRA_PRIMARY_MODELS）的可用供给，没有主用模型或服务未运行时没有；
   // 同一个模型同时在两份列表里时有两个条目，用 pool 区分
   primary_supply?: PrimarySupply[]
@@ -410,6 +420,29 @@ export interface ServiceStatus {
   transition?: ServiceTransition
   transition_since?: string
   time?: string
+}
+
+// ExtraPoolMode 为补充池的使用方式：share 与主号池一起分担（默认），overflow 只在主号池不够时补充
+export type ExtraPoolMode = 'share' | 'overflow'
+
+// ExtraPoolStatus 为补充池（额外浏览器号池）的概况。members 为最近一次对账（约每 5 秒）按进入口径的成员数（含已有 Worker 的），
+// free（含 Plus 与权益尚未识别的）、pro、ultra 为其中各权益的个数，cold_members 为其中没有 Worker、也不在启动中的；
+// lendable 为补充池 Worker 中仍是成员、可以借出的个数，returning 为已不是成员、等待归还或释放的个数，borrows 为本进程借出次数；
+// workers 为补充池 Worker 的计数（target 为常驻数与成员数取小，warm_limit、max 为常驻与峰值设置；dead、draining、retiring 恒为 0）
+export interface ExtraPoolStatus {
+  enabled: boolean
+  mode: ExtraPoolMode
+  default_paid: boolean
+  include_ultra: boolean
+  members: number
+  free: number
+  pro: number
+  ultra: number
+  cold_members: number
+  lendable: number
+  returning: number
+  borrows: number
+  workers: PartitionWorkerCounters
 }
 
 // ProPoolNotice 为 PRO_POOL 默认开启的升级提示：升级前 Pro 账户服务默认地址（或经 ULTRA_INCLUDE_PRO 并入 /ultra），默认开启后
@@ -640,6 +673,8 @@ export interface RequestLog {
   downgrade?: DowngradeDecision
   // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后实际使用的模型；没有改用时不出现
   fallback_from?: string
+  // extra 为请求由补充池服务（最后一次尝试的租约借自补充池）；与 pool（入口）相互独立，其余请求不出现
+  extra?: boolean
 }
 
 // RequestDisconnect 对应请求日志里取消请求的断开现场
@@ -756,6 +791,8 @@ export interface RequestSummary {
   pool?: RequestPool
   // fallback_from 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，model 为改用后的模型；没有改用时不出现
   fallback_from?: string
+  // extra 为这次尝试的租约借自补充池（正在由补充池服务）；其余请求不出现
+  extra?: boolean
 }
 
 // DowngradeGuardConfig 为"拒绝被上游降级的回复"的设置（服务配置页，修改后立即生效）
@@ -838,6 +875,16 @@ export interface ServiceConfig {
   pro_pool: boolean
   pro_warm_worker_limit: number
   pro_max_active_workers: number
+  // extra_pool 为补充池（EXTRA_POOL，默认关闭，保存后立即生效）：有模型冷却、其他模型还能用的账户单独开浏览器，补给默认地址、/pro 与 /ultra；
+  // extra_pool_mode 为 share（一起分担）或 overflow（不够时才补）；extra_pool_default_paid 为默认地址能否借补充池里的 Pro（含 Ultra 时还有 Ultra）
+  // 账户跑本路由列表之外的模型；extra_pool_include_ultra 为 Ultra 账户能否进补充池；extra_warm_worker_limit 可以为 0，
+  // extra_max_active_workers 至少为 1 且不小于常驻数。服务端总是返回这六个字段，因此这里不是可选字段
+  extra_pool: boolean
+  extra_pool_mode: ExtraPoolMode
+  extra_pool_default_paid: boolean
+  extra_pool_include_ultra: boolean
+  extra_warm_worker_limit: number
+  extra_max_active_workers: number
   // ultra_only_models 为只有 Ultra 权益的账户能用的模型（ULTRA_ONLY_MODELS），paid_only_models 为只有 Pro 与 Ultra 能用的模型
   // （PAID_ONLY_MODELS）；空数组表示没有规则，保存后立即生效。旧版服务端不返回这两个字段
   ultra_only_models?: string[]
@@ -1088,6 +1135,8 @@ export interface RequestAttempt {
   duration_ms: number
   // 这次尝试所用的模型：只在额度用完改用了其他模型（MODEL_FALLBACKS）的请求里有，源模型与目标模型的尝试各记各的
   model?: string
+  // extra 为这次尝试的租约借自补充池；其余尝试不出现
+  extra?: boolean
 }
 
 export interface UsageRecord {
@@ -1117,6 +1166,8 @@ export interface UsageRecord {
   has_body: boolean
   // pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为 normal
   pool: AccountPool
+  // extra 为由补充池服务（与 pool 相互独立，pool 仍按入口）；其余记录不出现
+  extra?: boolean
 }
 
 export interface UsageRecordPage {

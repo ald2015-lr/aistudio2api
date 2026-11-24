@@ -16,6 +16,7 @@ import {
   parseMessage,
   eventLevel,
   rowCategory,
+  rowExtra,
   rowHasLevel,
   rowLevel,
   rowMatches,
@@ -75,6 +76,8 @@ const level = ref<Level>('ALL')
 const category = ref<Category>('all')
 const source = ref('ALL')
 const search = ref('')
+// extraOnly 为“只看补充池”：只在日志里有补充池相关的行（或已经勾选）时显示这个开关，补充池从没开过时日志页与原来一致
+const extraOnly = ref(false)
 const autoScroll = ref(true)
 const compact = ref(readStorage(COMPACT_KEY) !== 'false')
 const selectedKey = ref('')
@@ -89,6 +92,7 @@ watch(compact, (value) => {
 })
 
 const rows = computed(() => groupLogs(props.logs))
+const extraShown = computed(() => extraOnly.value || rows.value.some(rowExtra))
 const sources = computed(() =>
   Array.from(new Set(props.logs.map((entry) => entry.source).filter(Boolean))).sort(),
 )
@@ -129,6 +133,7 @@ const base = computed(() => {
     if (source.value !== 'ALL' && !row.events.some((event) => event.source === source.value))
       return false
     if (compact.value && isNoise(row)) return false
+    if (extraOnly.value && !rowExtra(row)) return false
     return query === '' || rowMatches(row, query)
   })
 })
@@ -393,6 +398,15 @@ onBeforeUnmount(() => {
           <option value="ALL">{{ t('logs.source') }}: {{ t('logs.allSources') }}</option>
           <option v-for="item in sources" :key="item" :value="item">{{ item }}</option>
         </select>
+        <label
+          v-if="extraShown"
+          v-tooltip="t('logs.extraFilterHelp')"
+          class="flex cursor-pointer items-center gap-1.5 text-xs text-emerald-300"
+          data-testid="logs-extra-filter"
+        >
+          <input v-model="extraOnly" type="checkbox" />
+          {{ t('logs.extraFilter') }}
+        </label>
         <span class="flex-1"></span>
         <span class="font-mono text-[11px] text-gray-500">
           {{ tf('logs.shown', { shown: filtered.length, total: rows.length }) }}
@@ -452,6 +466,12 @@ onBeforeUnmount(() => {
                       class="tag shrink-0"
                       :class="poolTagClass(item.row.entry.request.pool)"
                       >{{ t(poolTagLabelKey(item.row.entry.request.pool)) }}</span
+                    >
+                    <span
+                      v-if="item.row.entry.request.extra"
+                      v-tooltip="t('pool.extraHelp')"
+                      class="tag tag-extra shrink-0"
+                      >{{ t('pool.extra') }}</span
                     >
                     <strong class="log-title">{{ requestTitle(item.row) }}</strong>
                     <span

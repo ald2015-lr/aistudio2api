@@ -159,6 +159,51 @@ WARN  account@example.com    平均调用轮换取消 | 原因=排空超时，30
 INFO  service                平均调用暂停 | 分区=Ultra | 原因=分区内没有可接替的备用号
 ```
 
+### 补充池
+
+`EXTRA_POOL=true`（补充池，见 [README](../README.md#补充池额外浏览器号池)）时写下面这些行；`EXTRA_POOL=false` 且本进程没有补充池 Worker 时，除保存补充池设置时的“补充池设置已更新并立即生效”外一行都不写，原有各行的文本也与没有补充池时逐字相同。账号一律写账户标签，不写密码、代理凭据与 API Key。
+
+| 日志 | 级别 | 来源 | 何时写 |
+| --- | --- | --- | --- |
+| `补充池已开启 \| 开启=是 \| 方式=<分担\|补充> \| 默认地址借付费模型=<是\|否> \| 含 Ultra=<是\|否> \| 常驻 Worker=<N> \| 峰值 Worker=<N>` | INFO | `service` | 装配生成服务时 `EXTRA_POOL=true`，只写一次 |
+| `补充池设置已更新并立即生效 \| （同上字段）` | INFO | `service` | 保存服务配置时 6 个 `EXTRA_*` 与生效配置不同；`配置已热更新 \| …` 汇总行不带补充池字段、一个字也不改 |
+| `补充池成员变化 \| 加入=<n> \| 退出=<n> \| 成员=<n>（Free <n> · Pro <n> · Ultra <n>） \| 补充池 Worker=<n>/<峰值>` | INFO | `service` | 对账（约每 5 秒）与上次相比有进出时，最多每 30 秒一行，间隔内的变化合并到下一行；成员按进入口径（含已有 Worker 的） |
+| `WAA Worker 就绪 \| … \| 来源=<预热\|扩容\|重开…> \| 起因=… \| 分区=补充池` | INFO | 账户 | 补充池 Worker 就绪：只在末尾追加 `分区=补充池`，其余字段与主分区相同 |
+| `补充池 WAA Worker 预热等待 \| Worker=<n>/<目标> \| 原因=<首轮预热未完成\|出口限流中，冷启动按配额进行\|主预热占满启动名额\|暂无可启动的成员>` | INFO | `service` | 低于目标（常驻数与“仍是成员的补充池 Worker + 冷成员”取小）却发不出启动；去重同 `WAA Worker 预热等待`，与主预热各记各的 |
+| `补充池 WAA Worker 预热失败 \| 错误=<…>` | WARN | `service` | 补充池预热的启动失败；去重同上 |
+| `补充池 WAA Worker 后台扩容失败 \| 错误=<…>` | WARN | 账户 | 请求触发的后台扩容启动失败（请求照常换号或等待） |
+| `补充池 WAA Worker 按需扩容 \| Worker=<n>/<峰值> \| 超出常驻=<是\|否>`、`补充池 WAA Worker 按需替换 \| …`、`补充池 WAA Worker 空闲回收 \| Worker=<n>/<峰值>` | INFO | `service` | 与主分区同一格式，只换前缀 |
+| `补充池接手 Worker \| 原分区=<普通分区\|Ultra 分区\|Pro 分区> \| 起因=<冷却淘汰\|冷却轮换\|回收冷却占位\|空闲回收\|替换> \| 补充池 Worker=<n>/<常驻>` | INFO | 账户 | 主分区要关闭成员的空闲 Worker 时原地接手（不关浏览器、PID 不变；按需替换换下的写 `起因=替换`）；原来那一行（如 `WAA Worker 冷却淘汰`、`WAA Worker 空闲回收`）末尾追加 ` \| 去向=补充池接手`，不再有对应的停止行 |
+| `补充池 Worker 归还 \| 分区=<普通分区\|Ultra 分区\|Pro 分区> \| 原因=<冷却已结束\|补充池已关闭\|权益不在补充池范围> \| <分区 Worker>=<n>/<峰值>` | INFO | 账户 | 已不是成员、家分区有空位：原地去掉标记（不关浏览器） |
+| `WAA Worker 停止 \| PID=… \| 起因=补充池释放`，随后 `补充池 Worker 释放 \| 原因=<家分区已满\|补充池已关闭，家分区已满\|全局冷却\|没有能用的模型> \| 补充池 Worker=<n>/<峰值>` | INFO | 账户 | 已不是成员、家分区没有空位（或全局冷却、没有能用的模型）：空闲时关闭，每轮最多 `max(WARM_STARTUP_CONCURRENCY,1)` 个；关闭补充池导致离开时原因写 `补充池已关闭，家分区已满`，此时补充池的峰值按 0 计；关闭出错时为 WARN `补充池 Worker 释放失败 \| 错误=<…>` |
+| `WAA Worker 释放 \| 原因=<…> \| 登记后=<…> \| 补充池 Worker=<n>/<峰值>` | INFO | 账户 | 补充池 Worker 的账号变为不可调度（需要登录、停用等），由现有的不可调度释放关闭；与主分区同一行，只是槽位名写 `补充池 Worker`（没有单独的“补充池 WAA Worker 不可调度释放”行） |
+| `补充池 Worker 超过峰值 \| 当前=<N> \| 峰值=<N> \| 空闲 Worker 将逐步回收，可调大 EXTRA_MAX_ACTIVE_WORKERS` | WARN | `service` | 调小峰值后越过峰值时写一次，回落到峰值以内之后才会再写；补充池满到峰值后的按需替换先启后停，新 Worker 启动期间已选为淘汰对象的旧 Worker 不计入，不算越过峰值 |
+
+请求时间线（同时写进 `/trace` 的排查记录）：
+
+| 日志 | 级别 | 何时写 |
+| --- | --- | --- |
+| `由补充池服务 \| 方式=<分担\|补充> \| 账号所在号池=<普通号池\|Pro 号池\|Ultra 号池>` | INFO | 这次尝试的租约借自补充池；来源为被借的账户 |
+| `主号池没有可用账号，改用补充池 \| 原因=<全部冷却\|账号全部忙碌\|额度 429 后只能用已启动的 Worker\|排队 3 秒（最后原因=…）>` | INFO | `overflow` 方式第一次借用时写，每个请求最多一行 |
+| `补充池已关闭或账号已不是补充池成员，不在原账号重放，换号` | WARN | 跨号池借来的 Worker 失效、要在原账号重放时账号已不是补充池成员（补充池已关闭、权益已不在范围、冷却已结束、全局冷却、没有能用的模型或整户不可调度）：放弃重放，换号重试 |
+
+排队等待（见[排队等待](#排队等待)）的 `原因` 多出 `补充池 Worker 全部忙碌` 与 `补充池 Worker 正在扩容`（只能由补充池服务、或要借补充池的请求在等补充池）；借用生效时快照末尾追加 ` | 补充池空闲=<n> | 补充池忙碌=<n>`，不生效时不追加。
+
+请求日志、活动请求与每次尝试的记录加 `extra`（只在为真时输出）：请求日志与活动请求的 `extra` 表示最后一次尝试的租约借自补充池（由补充池服务），中途借过、最后由主号池服务的请求为假，失败的那次借用尝试在 `attempts` 里带 `extra:true`。号池字段（`pool`）仍按请求入口记录。
+
+```text
+INFO  service              补充池设置已更新并立即生效 | 开启=是 | 方式=分担 | 默认地址借付费模型=是 | 含 Ultra=否 | 常驻 Worker=40 | 峰值 Worker=50
+INFO  service              补充池成员变化 | 加入=12 | 退出=0 | 成员=357（Free 300 · Pro 57 · Ultra 0） | 补充池 Worker=0/50
+INFO  member@example.com   WAA Worker 就绪 | 页面模型=gemini-flash-latest | PID=18240 | 耗时=10.842s | 来源=预热 | 起因=空槽位 | 分区=补充池
+INFO  member@example.com   WAA Worker 冷却淘汰 | 范围=gemini-4-argon | 登记后=2m3s | Pro Worker=2/5 | 去向=补充池接手
+INFO  member@example.com   补充池接手 Worker | 原分区=Pro 分区 | 起因=冷却淘汰 | 补充池 Worker=13/40
+INFO  member@example.com   由补充池服务 | 方式=分担 | 账号所在号池=Pro 号池
+INFO  member@example.com   补充池 Worker 归还 | 分区=Pro 分区 | 原因=冷却已结束 | Pro Worker=3/5
+INFO  member@example.com   WAA Worker 停止 | PID=18240 | 起因=补充池释放
+INFO  member@example.com   补充池 Worker 释放 | 原因=家分区已满 | 补充池 Worker=12/50
+WARN  service              补充池 Worker 超过峰值 | 当前=45 | 峰值=40 | 空闲 Worker 将逐步回收，可调大 EXTRA_MAX_ACTIVE_WORKERS
+```
+
 ### 组织停用 AI Studio 的账户
 
 Google Workspace 账号所属组织（或 Google）关闭了 AI Studio 时，载入 AI Studio 被跳到 `access.workspace.google.com/ServiceNotAllowed`，RPC 返回 `HTTP 403、协议错误码 7: AI Studio app is disabled.`。启动、验证、登录与请求遇到时都进入同一个账户级状态（`org_disabled`，不参与任何调度，见[开发文档](development.md#组织停用-ai-studio-的账户)），不再干等、不再每分钟重试：
@@ -237,7 +282,7 @@ WARN   service              暂停启动失败后的浏览器缓存清理 | 原�
 
 不固定账户的生成请求没等到失败 Worker 的后台关闭完成就换号时，请求进度写 `WAA Worker 恢复等待 <DURATION> 未完成（同账号仍有进行中的请求），后台继续关闭失败的 Worker，换号重试 | 原因=...`（关闭出错时为 `WAA Worker 恢复时关闭失败的 Worker 出错（<ERROR>），换号重试`，后台放弃时为 `WAA Worker 恢复的后台关闭已放弃，换号重试`），随后照常记录 `账号切换`；换号没有其他可用账户时写 `换号没有可用账号，回到原账号等待 Worker 恢复后重放`，换号次数用完或到连续失败上限时还有没等到关闭就换走的原账户，同样回去等待，写 `换号次数已用完，回到原账号等待 Worker 恢复后重放` 或 `已连续 5 次失败，回到原账号等待 Worker 恢复后重放`。这次失败计入连续失败上限后就到上限的请求不再换号，直接等原账户关闭完成。换号后的选号在排队（其他账户都忙）时原账户关闭完成，写 `换号排队中原账号的 WAA Worker 已关闭完成，原账号重新参与选号`：不再排除原账户，按原来的排队位置重新选号，不固定到原账户（关闭后它没有 Worker，要冷启动并占一个 Worker 槽位），原账户与其他账户哪个先能用就用哪个。回到原账户等待时请求超时或被取消，错误为 `回到原账号等待 <DURATION> 后请求超时（最后原因=WAA Worker 恢复，上次失败=...）: context deadline exceeded`（取消时为 `请求已取消`），对外仍是 504 或取消的官方措辞；经生成服务以首事件前期限结束时，`request.error` 前面另加 `本服务首事件前期限 <DURATION> 到期: `（见[流式等待](#流式等待)）。
 
-按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`PRO_POOL=false`、`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`；Pro 分区（`PRO_POOL=true` 时权益为 Pro 的账户）的同类事件以 `Pro WAA Worker` 开头，`M` 为 `PRO_MAX_ACTIVE_WORKERS`，常驻数为 `PRO_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满`、`Pro Worker 槽位已满` 表示该分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`（Pro 分区为 `Pro WAA Worker 预热等待`），`N/M` 为该分区驻留的 Worker 数与预热目标；冷却轮换、平均调用轮换与分区相关的日志同样按 `普通`、`Ultra`、`Pro` 写明分区。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）；`OMNI_IGNORE_SYSTEM_PROMPT` 发生变化时记录 `视频模型忽略系统提示设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后进入的请求按新设置整理，Omni 请求去掉系统提示时的说明见 [API 请求](#api-请求)）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`（`PRO_POOL=true` 时为 `false`），之后为 `Pro 独立号池=<BOOL> | Pro 常驻 Worker=<N> | Pro 峰值 Worker=<N>`（`PRO_POOL=false` 时同样写出）；主用模型一段写作 `主用模型=… | Ultra/Pro 主用模型=…`（Ultra 列表同时作用于 `/ultra` 与 `/pro`）；`策略=<ROUTING_STRATEGY>`（平均调用写成 `策略=balanced（平均调用）`，其余取值原样）之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；`IP 池` 之前带 `自动续写=<关闭 / 开启（默认总上限 N）>`，为保存并随这次热更新生效的 `LONG_OUTPUT_ENABLED` 与 `LONG_OUTPUT_MAX_TOKENS`（之后开始的请求立即按新设置）；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
+按需扩容、按需替换与空闲回收按 Worker 分区计数：上表的 `N/M` 为普通分区的 Worker 数与 `MAX_ACTIVE_WORKERS`；Ultra 分区（Ultra 号池的账户：权益为 Ultra，`PRO_POOL=false`、`ULTRA_INCLUDE_PRO=true` 时也含权益为 Pro 的账户）的同类事件以 `Ultra WAA Worker` 开头，`M` 为 `ULTRA_MAX_ACTIVE_WORKERS`，常驻数为 `ULTRA_WARM_WORKER_LIMIT`；Pro 分区（`PRO_POOL=true` 时权益为 Pro 的账户）的同类事件以 `Pro WAA Worker` 开头，`M` 为 `PRO_MAX_ACTIVE_WORKERS`，常驻数为 `PRO_WARM_WORKER_LIMIT`；补充池（`EXTRA_POOL=true`，见下文[补充池](#补充池)）的同类事件以 `补充池 WAA Worker` 开头，`M` 为 `EXTRA_MAX_ACTIVE_WORKERS`，常驻数为 `EXTRA_WARM_WORKER_LIMIT`。预热暂停原因中的 `Ultra Worker 槽位已满`、`Pro Worker 槽位已满` 表示该分区已满；预热不足按分区判断，Ultra 分区不足时记录 `Ultra WAA Worker 预热等待 | Worker=N/M`（Pro 分区为 `Pro WAA Worker 预热等待`），`N/M` 为该分区驻留的 Worker 数与预热目标；冷却轮换、平均调用轮换与分区相关的日志同样按 `普通`、`Ultra`、`Pro` 写明分区。保存服务配置或启动生成服务后生效的 `ULTRA_EXCLUSIVE` 发生变化时记录 `Ultra 独占设置已更新并立即生效 | 独占=<BOOL>`；`STREAM_DATA_HEARTBEAT` 发生变化时同样记录 `数据型心跳设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后开始的流式请求按新设置写心跳）；`OMNI_IGNORE_SYSTEM_PROMPT` 发生变化时记录 `视频模型忽略系统提示设置已更新并立即生效 | 开启=<BOOL>`（进程级设置，之后进入的请求按新设置整理，Omni 请求去掉系统提示时的说明见 [API 请求](#api-请求)）。服务配置热更新的汇总行 `配置已热更新 | ...` 带 `Pro 并入 Ultra=<BOOL>`，为账户池当前生效的 `ULTRA_INCLUDE_PRO`（`PRO_POOL=true` 时为 `false`），之后为 `Pro 独立号池=<BOOL> | Pro 常驻 Worker=<N> | Pro 峰值 Worker=<N>`（`PRO_POOL=false` 时同样写出）；主用模型一段写作 `主用模型=… | Ultra/Pro 主用模型=…`（Ultra 列表同时作用于 `/ultra` 与 `/pro`）；`策略=<ROUTING_STRATEGY>`（平均调用写成 `策略=balanced（平均调用）`，其余取值原样）之后带 `上游通道=<UPSTREAM_CHANNELS>`（如 `playground,build`），上游通道保存后随这次热更新立即生效，运行中新启用 Build 时另写一行 `已启用 Build 通道，后台补齐 Build 模型目录 | 账户=<N>`（没有 Build 目录的账户由后台目录同步按“不一致”优先级补齐）；`单账户并发=<N>` 之后带 `单账户每分钟上限=<N> 次`，为保存的 `ACCOUNT_RPM_LIMIT`，`0` 时写 `单账户每分钟上限=关闭`；`IP 池` 之前带 `自动续写=<关闭 / 开启（默认总上限 N）>`，为保存并随这次热更新生效的 `LONG_OUTPUT_ENABLED` 与 `LONG_OUTPUT_MAX_TOKENS`（之后开始的请求立即按新设置）；末尾带 `IP 池=<关闭 / 静态 scheme://host 端口 a-b（n 个）/ 动态 scheme://host>`，为保存并随这次热更新生效的 IP 池设置（只写 `scheme://host` 与端口段，不写地址全文、用户名和密码，见 [IP 池](#ip-池)）。
 
 空闲回收与按需替换只在 `rebalanceMu` 内选中并预留被关闭的 Worker（`tryReserveVictim`），关闭浏览器在锁外进行：关一个浏览器要几秒，原先这期间所有账户的冷启动、扩容、替换与删除都排队等它，日志里表现为一批 `WAA Worker 启动 | 1/7` 在某个 `WAA Worker 已停止` 之后才集中出现。被关闭的 Worker 关完之前照常占着它的槽位（按需替换时新 Worker 的启动占位也一直保留），容量判断不会多放出槽位；预留期间其他淘汰路径（替换、冷却轮换、死槽位回收）不会再选它；空闲回收关闭期间同分区的按需启动不走按需替换（不会为它再关掉另一个空闲 Worker），等回收关完后按空槽写 `按需扩容`。淘汰对象在关闭期间被删除时按已淘汰处理，不写 `WAA Worker 空闲回收失败`，按需替换的请求也不失败。淘汰对象的 `account.json` 或认证文件被外部移走、目录扫描还没把它移出账户池时（它的 Worker 还活着），空闲回收照旧写 `WAA Worker 空闲回收失败 | 错误=淘汰对象的账户文件已不在…` 并结束本轮；按需替换写 `WAA Worker 按需替换跳过淘汰对象 | 错误=…`（来源为该账户）并换下一个淘汰对象，请求不失败，驻留数不超过峰值；等下一个淘汰对象期间分区空出了槽位（跳过的账户被目录扫描移出、其他 Worker 被删除或回收）时直接发布新 Worker、写 `按需扩容`，跳过的账户文件放回后重新参与选号；一直没有空出槽位、也没有别的淘汰对象（例如只删了 `account.json`、目录还在，目录扫描不会移出它）时最多等约 70 秒，随后关掉没发布的新浏览器，后台扩容写 `WAA Worker 后台扩容失败 | 错误=淘汰对象的账户文件已不在…：等了 1m10s 仍没有空出槽位或其他可淘汰的 Worker`。按需替换的 `WAA Worker 停止`、`WAA Worker 已停止` 两行与新 Worker 的 `就绪`、`按需替换` 之间因此可能夹着其他账户的启动日志。
 
@@ -882,7 +927,7 @@ WARN  account@example.com  下游已断开，结束转发 | 阶段=流中 | 已�
 
 | 字段 | 含义 |
 | --- | --- |
-| `原因` | 当前在等什么：`账号全部忙碌`、`没有空闲的 Worker 槽位`、`Worker 正在启动`、`Worker 正在扩容`、`Worker 容量已满`、`账号忙碌`、`账号冷却中`；生成服务刚启动、请求号池里还没有已就绪的 Worker、要冷启动的备用账号所在的分区首轮预热还没出结果时为 `等待首个 Worker 预热`（等后台预热的第一个 Worker，不另起冷启动；该分区有 Worker 就绪或已没有可启动的账户时结束等待；备用账号都在首轮已出结果的分区时不等）；出口限流判定成立期间另有 `出口限速`（候选所在出口的令牌桶已满）与 `驻留账号该模型额度已用完`（受限出口上的备用账户已剔除、驻留里没有能服务该模型的热 Worker，补覆盖配额已满或正在启动），非主用模型按这两个原因累计排队最多 30 秒（见[出口限流](#出口限流)） |
+| `原因` | 当前在等什么：`账号全部忙碌`、`没有空闲的 Worker 槽位`、`Worker 正在启动`、`Worker 正在扩容`、`Worker 容量已满`、`账号忙碌`、`账号冷却中`，开启补充池时另有 `补充池 Worker 全部忙碌`、`补充池 Worker 正在扩容`（见[补充池](#补充池)）；生成服务刚启动、请求号池里还没有已就绪的 Worker、要冷启动的备用账号所在的分区首轮预热还没出结果时为 `等待首个 Worker 预热`（等后台预热的第一个 Worker，不另起冷启动；该分区有 Worker 就绪或已没有可启动的账户时结束等待；备用账号都在首轮已出结果的分区时不等）；出口限流判定成立期间另有 `出口限速`（候选所在出口的令牌桶已满）与 `驻留账号该模型额度已用完`（受限出口上的备用账户已剔除、驻留里没有能服务该模型的热 Worker，补覆盖配额已满或正在启动），非主用模型按这两个原因累计排队最多 30 秒（见[出口限流](#出口限流)） |
 | `已等待` | 排队的时间：每次选号从第一次等待到取得账号或选号结束按墙钟计，换号重试接着累加；两次选号之间上游处理、退避与 Worker 恢复的时间不算 |
 | `尝试` | 第几次选号（换号重试递增） |
 | `同条件队列` | 在选择条件相同的请求（模型、通道限定、号池等）中排第几、共几个 |
@@ -1313,6 +1358,8 @@ WARN  service  请求账本写入队列已满 | 丢弃=<COUNT>
 ERROR service  请求账本写入失败 | 记录=<COUNT> | 错误=<ERROR>
 ERROR service  请求账本清理失败 | 错误=<ERROR>
 ```
+
+由补充池服务的请求（最后一次尝试借自补充池，见[补充池](#补充池)）另写一行附表 `extra_served(id, time)`：附表在第一次写入这样的记录时才在同一个写事务里建立，从没用过补充池的账本没有这张表，数据库文件与查询都和以前一样；旧版本打开同一个数据库时不认识它，原样留着。`requests` 表与汇总表的列、号池（仍按入口）与 CSV 的列都不变；记录查询在附表存在时 `LEFT JOIN` 它，给记录加 `extra`（只在为真时输出），`GET /api/usage/records` 与 `records.csv` 带 `extra=1` 时只返回由补充池服务的请求（附表还不存在时为空）；清理过期记录时一并删除附表里过期的行。
 
 同一个数据库的 `response_states` 表保存 Responses 与 Interactions 的续接状态（`previous_response_id`、`previous_interaction_id` 指向的最多 256 个节点，规则见 [protocol.md](protocol.md)）：节点的改动经同一个写入协程排队写入，服务启动时读回，重启后仍可续接。
 

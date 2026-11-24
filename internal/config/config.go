@@ -34,6 +34,11 @@ const (
 	// defaultProWarmWorkerLimit 与 defaultProMaxActiveWorkers 为 Pro 分区（PRO_POOL=true）的常驻与峰值 Worker 数
 	defaultProWarmWorkerLimit  = 2
 	defaultProMaxActiveWorkers = 5
+	// defaultExtraWarmWorkerLimit 与 defaultExtraMaxActiveWorkers 为补充池（EXTRA_POOL=true）的常驻与峰值 Worker 数，
+	// defaultExtraPoolMode 为补充池的使用方式（与主号池一起分担）
+	defaultExtraWarmWorkerLimit  = 40
+	defaultExtraMaxActiveWorkers = 50
+	defaultExtraPoolMode         = ExtraPoolModeShare
 	// defaultAccountRPMLimit 为单账号每分钟生成请求上限的默认值：上游每账号每分钟 12 次（所有模型、两个通道共用），留出余量；
 	// maxAccountRPMLimit 为允许配置的最大值
 	defaultAccountRPMLimit = 10
@@ -79,6 +84,12 @@ var configKeys = [...]string{
 	"ULTRA_MAX_ACTIVE_WORKERS",
 	"PRO_WARM_WORKER_LIMIT",
 	"PRO_MAX_ACTIVE_WORKERS",
+	"EXTRA_POOL",
+	"EXTRA_POOL_MODE",
+	"EXTRA_POOL_DEFAULT_PAID",
+	"EXTRA_POOL_INCLUDE_ULTRA",
+	"EXTRA_WARM_WORKER_LIMIT",
+	"EXTRA_MAX_ACTIVE_WORKERS",
 	"WARM_STARTUP_CONCURRENCY",
 	"PER_ACCOUNT_CONCURRENCY",
 	"ACCOUNT_RPM_LIMIT",
@@ -121,6 +132,17 @@ var configKeys = [...]string{
 	"AUTO_START",
 	"REQUEST_BODY_LOG",
 	"ADMIN_PASSWORD",
+}
+
+// 补充池的使用方式（EXTRA_POOL_MODE）：share 为与主号池一起分担，overflow 为只在主号池不够时补充
+const (
+	ExtraPoolModeShare    = "share"
+	ExtraPoolModeOverflow = "overflow"
+)
+
+// NormalizeExtraPoolMode 规范补充池使用方式的写法：去掉首尾空白、改为小写（不认识的值原样返回，由校验报错）
+func NormalizeExtraPoolMode(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
 }
 
 // upstreamChannels 表示生成请求可启用的上游通道
@@ -246,6 +268,21 @@ type Config struct {
 	// 与普通分区、Ultra 分区分开计算，浏览器总数最多为三个分区峰值之和（PRO_POOL=false 时 Pro 分区为空）；常驻数可以为 0（只按需启动）
 	ProWarmWorkerLimit  int `json:"pro_warm_worker_limit"`
 	ProMaxActiveWorkers int `json:"pro_max_active_workers"`
+	// ExtraPool 为补充池（额外浏览器号池，EXTRA_POOL，默认关闭，保存后立即生效）：有模型在冷却、还有别的模型能用的账户另开 Worker，
+	// 补给默认地址、/pro 与 /ultra；账户所属的号池不变。关闭时与没有这项设置时完全相同
+	ExtraPool bool `json:"extra_pool"`
+	// ExtraPoolMode 为补充池的使用方式（EXTRA_POOL_MODE）：share（默认，与主号池一起分担）或 overflow（只在主号池不够时补充）；
+	// 读取时不区分大小写，写回小写
+	ExtraPoolMode string `json:"extra_pool_mode"`
+	// ExtraPoolDefaultPaid 为默认地址能否借补充池里的 Pro（ExtraPoolIncludeUltra 时还有 Ultra）账户服务本路由列表之外的模型
+	// （EXTRA_POOL_DEFAULT_PAID，默认开启）；/pro、/ultra 不受影响，始终只补充自己的模型。权益规则照常按账户真实权益
+	ExtraPoolDefaultPaid bool `json:"extra_pool_default_paid"`
+	// ExtraPoolIncludeUltra 为权益为 Ultra 的账户能否进入补充池（EXTRA_POOL_INCLUDE_ULTRA，默认关闭）
+	ExtraPoolIncludeUltra bool `json:"extra_pool_include_ultra"`
+	// ExtraWarmWorkerLimit 与 ExtraMaxActiveWorkers 为补充池的常驻与峰值 Worker 数（EXTRA_WARM_WORKER_LIMIT 默认 40、可以为 0；
+	// EXTRA_MAX_ACTIVE_WORKERS 默认 50），与三个分区分开计算；开启补充池时浏览器总数最多再加补充池峰值
+	ExtraWarmWorkerLimit  int `json:"extra_warm_worker_limit"`
+	ExtraMaxActiveWorkers int `json:"extra_max_active_workers"`
 	// DowngradeGuard 为降级判定（拒绝被上游降级的回复）的设置，见 DowngradeGuard
 	DowngradeGuard DowngradeGuard `json:"downgrade_guard"`
 	WAABackend     string         `json:"waa_backend"`
@@ -292,6 +329,12 @@ func Default() Config {
 		UltraMaxActiveWorkers:  defaultUltraMaxActiveWorkers,
 		ProWarmWorkerLimit:     defaultProWarmWorkerLimit,
 		ProMaxActiveWorkers:    defaultProMaxActiveWorkers,
+		ExtraPool:              false,
+		ExtraPoolMode:          defaultExtraPoolMode,
+		ExtraPoolDefaultPaid:   true,
+		ExtraPoolIncludeUltra:  false,
+		ExtraWarmWorkerLimit:   defaultExtraWarmWorkerLimit,
+		ExtraMaxActiveWorkers:  defaultExtraMaxActiveWorkers,
 		WarmStartupConcurrency: defaultWarmConcurrency,
 		PerAccountConcurrency:  defaultAccountConcurrency,
 		AccountRPMLimit:        defaultAccountRPMLimit,
@@ -412,6 +455,16 @@ func Load(path string) (Config, error) {
 	integer("ULTRA_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.UltraMaxActiveWorkers)
 	integer("PRO_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.ProWarmWorkerLimit)
 	integer("PRO_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.ProMaxActiveWorkers)
+	// 补充池：空值保持默认；开关写法无效时记入无效项、按默认值（不阻止启动）。使用方式不区分大小写，不认识的值由联动校验改回 share
+	boolean("EXTRA_POOL", true, &cfg.ExtraPool)
+	_ = loader.field("EXTRA_POOL_MODE", true, func(value string) error {
+		cfg.ExtraPoolMode = NormalizeExtraPoolMode(value)
+		return nil
+	})
+	boolean("EXTRA_POOL_DEFAULT_PAID", true, &cfg.ExtraPoolDefaultPaid)
+	boolean("EXTRA_POOL_INCLUDE_ULTRA", true, &cfg.ExtraPoolIncludeUltra)
+	integer("EXTRA_WARM_WORKER_LIMIT", true, parseNonNegativeInt, &cfg.ExtraWarmWorkerLimit)
+	integer("EXTRA_MAX_ACTIVE_WORKERS", true, parsePositiveInt, &cfg.ExtraMaxActiveWorkers)
 	integer("WARM_STARTUP_CONCURRENCY", false, parsePositiveInt, &cfg.WarmStartupConcurrency)
 	integer("PER_ACCOUNT_CONCURRENCY", false, parsePositiveInt, &cfg.PerAccountConcurrency)
 	// 空值沿用默认值，关闭必须写 0
@@ -561,6 +614,12 @@ func (c Config) save(path string, kept map[string]string, omitted map[string]str
 		"ULTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.UltraMaxActiveWorkers),
 		"PRO_WARM_WORKER_LIMIT":    strconv.Itoa(c.ProWarmWorkerLimit),
 		"PRO_MAX_ACTIVE_WORKERS":   strconv.Itoa(c.ProMaxActiveWorkers),
+		"EXTRA_POOL":               strconv.FormatBool(c.ExtraPool),
+		"EXTRA_POOL_MODE":          NormalizeExtraPoolMode(c.ExtraPoolMode),
+		"EXTRA_POOL_DEFAULT_PAID":  strconv.FormatBool(c.ExtraPoolDefaultPaid),
+		"EXTRA_POOL_INCLUDE_ULTRA": strconv.FormatBool(c.ExtraPoolIncludeUltra),
+		"EXTRA_WARM_WORKER_LIMIT":  strconv.Itoa(c.ExtraWarmWorkerLimit),
+		"EXTRA_MAX_ACTIVE_WORKERS": strconv.Itoa(c.ExtraMaxActiveWorkers),
 		"WARM_STARTUP_CONCURRENCY": strconv.Itoa(c.WarmStartupConcurrency),
 		"PER_ACCOUNT_CONCURRENCY":  strconv.Itoa(c.PerAccountConcurrency),
 		"ACCOUNT_RPM_LIMIT":        strconv.Itoa(c.AccountRPMLimit),
@@ -702,6 +761,12 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		UltraMaxActiveWorkers  int               `json:"ultra_max_active_workers"`
 		ProWarmWorkerLimit     int               `json:"pro_warm_worker_limit"`
 		ProMaxActiveWorkers    int               `json:"pro_max_active_workers"`
+		ExtraPool              bool              `json:"extra_pool"`
+		ExtraPoolMode          string            `json:"extra_pool_mode"`
+		ExtraPoolDefaultPaid   bool              `json:"extra_pool_default_paid"`
+		ExtraPoolIncludeUltra  bool              `json:"extra_pool_include_ultra"`
+		ExtraWarmWorkerLimit   int               `json:"extra_warm_worker_limit"`
+		ExtraMaxActiveWorkers  int               `json:"extra_max_active_workers"`
 		WarmStartupConcurrency int               `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int               `json:"per_account_concurrency"`
 		AccountRPMLimit        int               `json:"account_rpm_limit"`
@@ -749,6 +814,12 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		UltraMaxActiveWorkers:  c.UltraMaxActiveWorkers,
 		ProWarmWorkerLimit:     c.ProWarmWorkerLimit,
 		ProMaxActiveWorkers:    c.ProMaxActiveWorkers,
+		ExtraPool:              c.ExtraPool,
+		ExtraPoolMode:          NormalizeExtraPoolMode(c.ExtraPoolMode),
+		ExtraPoolDefaultPaid:   c.ExtraPoolDefaultPaid,
+		ExtraPoolIncludeUltra:  c.ExtraPoolIncludeUltra,
+		ExtraWarmWorkerLimit:   c.ExtraWarmWorkerLimit,
+		ExtraMaxActiveWorkers:  c.ExtraMaxActiveWorkers,
 		WarmStartupConcurrency: c.WarmStartupConcurrency,
 		PerAccountConcurrency:  c.PerAccountConcurrency,
 		AccountRPMLimit:        c.AccountRPMLimit,
@@ -800,6 +871,12 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		UltraMaxActiveWorkers  *int               `json:"ultra_max_active_workers"`
 		ProWarmWorkerLimit     *int               `json:"pro_warm_worker_limit"`
 		ProMaxActiveWorkers    *int               `json:"pro_max_active_workers"`
+		ExtraPool              *bool              `json:"extra_pool"`
+		ExtraPoolMode          string             `json:"extra_pool_mode"`
+		ExtraPoolDefaultPaid   *bool              `json:"extra_pool_default_paid"`
+		ExtraPoolIncludeUltra  *bool              `json:"extra_pool_include_ultra"`
+		ExtraWarmWorkerLimit   *int               `json:"extra_warm_worker_limit"`
+		ExtraMaxActiveWorkers  *int               `json:"extra_max_active_workers"`
 		WarmStartupConcurrency int                `json:"warm_startup_concurrency"`
 		PerAccountConcurrency  int                `json:"per_account_concurrency"`
 		AccountRPMLimit        *int               `json:"account_rpm_limit"`
@@ -881,6 +958,11 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	if modelFallbackScope == "" {
 		modelFallbackScope = ModelFallbackScopeUltra
 	}
+	// 补充池：旧版数据没有这些字段时按默认值处理（关闭、share、默认地址可借付费模型、不含 Ultra、40、50）
+	extraPoolMode := NormalizeExtraPoolMode(value.ExtraPoolMode)
+	if extraPoolMode == "" {
+		extraPoolMode = defaultExtraPoolMode
+	}
 	// 媒体设置：旧版数据没有该字段时按默认值处理
 	media, err := mediaSettingsOrDefault(value.Media)
 	if err != nil {
@@ -907,6 +989,12 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		UltraMaxActiveWorkers:  intOrDefault(value.UltraMaxActiveWorkers, defaultUltraMaxActiveWorkers),
 		ProWarmWorkerLimit:     intOrDefault(value.ProWarmWorkerLimit, defaultProWarmWorkerLimit),
 		ProMaxActiveWorkers:    intOrDefault(value.ProMaxActiveWorkers, defaultProMaxActiveWorkers),
+		ExtraPool:              value.ExtraPool != nil && *value.ExtraPool,
+		ExtraPoolMode:          extraPoolMode,
+		ExtraPoolDefaultPaid:   value.ExtraPoolDefaultPaid == nil || *value.ExtraPoolDefaultPaid,
+		ExtraPoolIncludeUltra:  value.ExtraPoolIncludeUltra != nil && *value.ExtraPoolIncludeUltra,
+		ExtraWarmWorkerLimit:   intOrDefault(value.ExtraWarmWorkerLimit, defaultExtraWarmWorkerLimit),
+		ExtraMaxActiveWorkers:  intOrDefault(value.ExtraMaxActiveWorkers, defaultExtraMaxActiveWorkers),
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
 		AccountRPMLimit:        intOrDefault(value.AccountRPMLimit, defaultAccountRPMLimit),

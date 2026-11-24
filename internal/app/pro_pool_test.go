@@ -76,7 +76,8 @@ func TestProPartitionLimits(t *testing.T) {
 	if manager.warmTargetFor(aistudio.PoolScopePro) != 1 || manager.maxActiveFor(aistudio.PoolScopePro) != 1 {
 		t.Fatal("Pro 分区的容量应取 PRO_* 设置")
 	}
-	for _, scope := range []aistudio.PoolScope{aistudio.PoolScopeAll, aistudio.PoolScopeNormalUltra, aistudio.PoolScopeCount} {
+	// 补充池没有开启时容量同样为 0（失败时关闭）
+	for _, scope := range []aistudio.PoolScope{aistudio.PoolScopeAll, aistudio.PoolScopeNormalUltra, aistudio.PoolScopeExtra, aistudio.PoolScopeCount} {
 		if manager.warmTargetFor(scope) != 0 || manager.maxActiveFor(scope) != 0 {
 			t.Fatalf("号池 %v 不是分区，容量应为 0", scope)
 		}
@@ -244,6 +245,8 @@ func TestModelFallbackScopeWithPro(t *testing.T) {
 		{config.ModelFallbackScopeUltra, map[aistudio.PoolScope]bool{aistudio.PoolScopeUltra: true}},
 		{config.ModelFallbackScopeAll, map[aistudio.PoolScope]bool{
 			aistudio.PoolScopeAll: true, aistudio.PoolScopeNormal: true, aistudio.PoolScopeUltra: true, aistudio.PoolScopePro: true, aistudio.PoolScopeNormalUltra: true,
+			// 补充池不会出现在请求的号池里（借用不改写请求号池），all 时按全部号池处理
+			aistudio.PoolScopeExtra: true,
 		}},
 		{config.ModelFallbackScopeOff, map[aistudio.PoolScope]bool{}},
 	} {

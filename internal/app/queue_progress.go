@@ -229,6 +229,10 @@ type queueSnapshot struct {
 	egressLimited                            int
 	egressLimit                              int
 	egressNext                               time.Time
+	// extra 为这一轮复查做过补充池（EXTRA_POOL）的借用分类，extraIdle、extraBusy 为其中可借出的空闲与忙碌 Worker 数（见 extra_select.go）；
+	// 没有借用时为假，进度不写补充池计数
+	extra                bool
+	extraIdle, extraBusy int
 }
 
 func (snapshot queueSnapshot) text(now time.Time) string {
@@ -257,6 +261,9 @@ func (snapshot queueSnapshot) text(now time.Time) string {
 			remaining = remaining.Round(time.Millisecond)
 		}
 		text += " | 最早恢复=" + remaining.String()
+	}
+	if snapshot.extra {
+		text += fmt.Sprintf(" | 补充池空闲=%d | 补充池忙碌=%d", snapshot.extraIdle, snapshot.extraBusy)
 	}
 	return text
 }

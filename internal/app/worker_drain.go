@@ -138,7 +138,7 @@ func (manager *accountWorkerManager) startDrain(accountID string, partition aist
 	manager.drainMu.Lock()
 	defer manager.drainMu.Unlock()
 	// 锁顺序 drainMu 再到账户池锁，与下面的 SetDraining 相同；成员快照写时复制，这里只是一次加锁
-	if partitionOf(accountID, manager.pool.PartitionMembers()) != partition {
+	if partitionOf(accountID, manager.slotMembers()) != partition {
 		return nil
 	}
 	slotLimit, totalLimit := manager.drainLimit(partition), manager.drainTotalLimit(partition)
@@ -378,8 +378,12 @@ func (manager *accountWorkerManager) primaryModelLists() (normal []string, ultra
 // 主用模型冷却会把稀缺的 Ultra Worker 当成死槽位淘汰，而它们还能服务 Ultra 列表的模型
 func (manager *accountWorkerManager) primaryModelListFor(partition aistudio.PoolScope) []string {
 	normal, ultra := manager.primaryModelLists()
-	if partition == aistudio.PoolScopeUltra || partition == aistudio.PoolScopePro {
+	switch partition {
+	case aistudio.PoolScopeUltra, aistudio.PoolScopePro:
 		return ultra
+	case aistudio.PoolScopeExtra:
+		// 补充池 Worker 服务所有路由：回收时的死槽位与冷成员排序用两份列表的并集
+		return mergeModelLists(normal, ultra)
 	}
 	return normal
 }
@@ -457,7 +461,7 @@ func (manager *accountWorkerManager) replacementsFor(evicted []evictedWorker) []
 	if len(pending) == 0 {
 		return nil
 	}
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	resident := make(map[aistudio.PoolScope]map[string]struct{}, len(workerPartitions))
 	for _, ids := range [][]string{manager.WarmAccountIDs(), manager.OpeningAccountIDs()} {
 		for _, accountID := range ids {

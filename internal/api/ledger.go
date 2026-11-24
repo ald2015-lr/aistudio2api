@@ -165,6 +165,8 @@ type RequestAttempt struct {
 	// Model 为这次尝试所用的模型：只在额度用完改用了其他模型（MODEL_FALLBACKS，见 app/model_fallback.go）的请求里写，
 	// 源模型与各个目标模型的尝试各记各的模型（请求本身的模型只有一个）；其他请求为空，与没有这项设置时相同
 	Model string `json:"model,omitempty"`
+	// Extra 为这次尝试的租约借自补充池（EXTRA_POOL）；其余尝试不出现（attempts 列按 JSON 存，不需要迁移）
+	Extra bool `json:"extra,omitempty"`
 }
 
 // UsageRecordQuery 选择请求记录的时间范围、筛选、状态码、关键字与分页位置
@@ -176,6 +178,8 @@ type UsageRecordQuery struct {
 	Search  string
 	Before  *UsageCursor
 	Limit   int
+	// Extra 为只看由补充池服务的请求（查询参数 extra=1）
+	Extra bool
 }
 
 // UsageCursor 是请求记录分页位置，下一页从该记录之后的更早记录开始
@@ -234,6 +238,8 @@ type UsageRecord struct {
 	HasBody   bool   `json:"has_body"`
 	// Pool 为请求的号池：ultra、pro 或 normal
 	Pool string `json:"pool"`
+	// Extra 为由补充池服务（最后一次尝试的租约借自补充池，见 requestdb 的 extra_served 附表）；其余记录不出现
+	Extra bool `json:"extra,omitempty"`
 }
 
 // UsageRecordPage 是按完成时间倒序的一页请求记录，NextCursor 为空表示没有更早的记录
@@ -428,6 +434,8 @@ func parseUsageRecordQuery(r *http.Request) (UsageRecordQuery, error) {
 			return UsageRecordQuery{}, fmt.Errorf("limit 必须是 1 到 200")
 		}
 	}
+	// 只认 extra=1：其他取值与不带这个参数相同（加入补充池之前的请求带什么都不报错，这里也不报错）
+	query.Extra = values.Get("extra") == "1"
 	return query, nil
 }
 

@@ -36,6 +36,8 @@ const refreshing = ref(false)
 const accountQuery = ref('')
 const cooldownQuery = ref('')
 const requestFilter = ref<'all' | RequestState>('all')
+// extraOnly 为只看正在由补充池服务的请求：只在列表里有这样的请求（或已经打开）时显示这个开关
+const extraOnly = ref(false)
 
 const requestStateKeys: Record<RequestState, TranslationKey> = {
   queued: 'state.queued',
@@ -101,10 +103,13 @@ const filteredCooldowns = computed(() => {
   return list.sort((left, right) => left.until.localeCompare(right.until))
 })
 
+const extraCount = computed(() => searchedRequests.value.filter((request) => request.extra).length)
 const filteredRequests = computed(() =>
-  requestFilter.value === 'all'
-    ? searchedRequests.value
-    : searchedRequests.value.filter((request) => request.state === requestFilter.value),
+  searchedRequests.value.filter(
+    (request) =>
+      (requestFilter.value === 'all' || request.state === requestFilter.value) &&
+      (!extraOnly.value || request.extra === true),
+  ),
 )
 
 // accountFiltered 为账户筛选已填写：列表标题旁写出筛选后与全部的条数，列表为空时说明是筛选的结果
@@ -286,6 +291,19 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
               >{{ searchedRequests.length }} / {{ requests.length }}</span
             >
             <span class="flex-1"></span>
+            <button
+              v-if="extraOnly || extraCount > 0"
+              v-tooltip="t('requests.filterExtraHelp')"
+              class="btn btn-sm"
+              :class="extraOnly ? 'border-emerald-500/50 text-emerald-300' : ''"
+              type="button"
+              :aria-pressed="extraOnly"
+              data-testid="requests-extra-filter"
+              @click="extraOnly = !extraOnly"
+            >
+              {{ t('requests.filterExtra') }}
+              <span class="seg-count">{{ extraCount }}</span>
+            </button>
             <div class="seg">
               <button
                 class="seg-item"
@@ -345,6 +363,12 @@ async function cancelRequest(request: RequestSummary): Promise<void> {
                           class="tag shrink-0"
                           :class="poolTagClass(request.pool)"
                           >{{ t(poolTagLabelKey(request.pool)) }}</span
+                        >
+                        <span
+                          v-if="request.extra"
+                          v-tooltip="t('pool.extraHelp')"
+                          class="tag tag-extra shrink-0"
+                          >{{ t('pool.extra') }}</span
                         >
                         <span class="cell-truncate text-gray-200">{{ request.model || '—' }}</span>
                         <span

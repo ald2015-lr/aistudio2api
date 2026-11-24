@@ -167,7 +167,8 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 	sort.Strings(warm)
 	starting := admin.workers.OpeningAccountIDs()
 	// Worker 计数按分区：workers 的数量与上限只含普通分区，ultra_workers、pro_workers 为 Ultra 与 Pro 分区；Worker 列表包含全部分区
-	members := admin.pool.PartitionMembers()
+	// 叠加视图（见 slotMembers）：补充池 Worker 不计入三个分区
+	members := admin.workers.slotMembers()
 	occupied := admin.workers.occupiedSlotsApprox(members)
 	// 死槽位：驻留 Worker 的账号长时间冷却（见 worker_retire.go），占着名额却服务不了请求，等待淘汰
 	dead := admin.workers.deadWarmCounts(warm, members)
@@ -230,6 +231,8 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 			Prewarm: prewarm,
 			WarmIDs: warm, StartingIDs: starting,
 			Unschedulable: unschedulable[normal],
+			// 计入补充池的 Worker（带补充池标记，见 extra_pool.go）；没有时省略
+			ExtraIDs: admin.workers.extraOwnedIDs(),
 		},
 		UltraWorkers:  paidWorkers(aistudio.PoolScopeUltra),
 		ProAccounts:   adminAccountCounts(partitionStates[aistudio.PoolScopePro]),
@@ -246,6 +249,8 @@ func (admin *runtimeAdmin) Status(context.Context) (api.AdminStatus, error) {
 		Drive:         drive,
 		// 平均调用概况（见 balanced.go）：开启且服务运行时才有，只读 keepWarm 每 30 秒算好的缓存
 		Balanced: admin.workers.balancedStatus(running),
+		// 补充池概况（见 extra_pool.go）：关闭且没有补充池 Worker 时为空，只读对账算好的成员缓存
+		ExtraPool: admin.workers.extraStatus(members, warm, starting, occupied, unschedulable),
 		// 服务端时刻与启动、停止步骤（见 service_step.go）：管理页按服务端时钟换算步骤的已用时间
 		Time: time.Now(),
 	}
@@ -281,6 +286,7 @@ func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error)
 		accounts = append(accounts, adminAccountDTO(status))
 	}
 	admin.ipPool().markPinned(accounts)
+	admin.workers.markExtraAccounts(accounts)
 	return accounts, nil
 }
 
@@ -1201,6 +1207,7 @@ func (admin *runtimeAdmin) account(accountID string) (api.AdminAccount, error) {
 	if status, ok := admin.pool.StatusOf(accountID); ok {
 		accounts := []api.AdminAccount{adminAccountDTO(status)}
 		admin.ipPool().markPinned(accounts)
+		admin.workers.markExtraAccounts(accounts)
 		return accounts[0], nil
 	}
 	return api.AdminAccount{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, accountID))
@@ -1407,6 +1414,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.UltraMaxActiveWorkers != nil {
 		ultraMax = *value.UltraMaxActiveWorkers
 	}
+	// 补充池设置：旧版页面保存时不带这些字段，沿用现值（漏掉时峰值为 0，过不了校验，以后每次保存都失败）
+	extra := extraSettingsFromInput(value, saved)
 	// 权益规则：旧版页面保存时不带这些字段，沿用现值；空数组表示没有规则，写法无效（long- 开头等）时由下面的 Validate 拒绝
 	ultraOnlyModels, paidOnlyModels := saved.UltraOnlyModels, saved.PaidOnlyModels
 	if value.UltraOnlyModels != nil {
@@ -1516,7 +1525,9 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		WarmWorkerLimit: value.WarmWorkerLimit, MaxActiveWorkers: value.MaxActiveWorkers,
 		UltraExclusive: ultraExclusive, UltraIncludePro: ultraIncludePro, UltraWarmWorkerLimit: ultraWarm, UltraMaxActiveWorkers: ultraMax,
 		ProPool: proPool, ProWarmWorkerLimit: proWarm, ProMaxActiveWorkers: proMax,
-		UltraOnlyModels: ultraOnlyModels, PaidOnlyModels: paidOnlyModels,
+		ExtraPool: extra.ExtraPool, ExtraPoolMode: extra.ExtraPoolMode, ExtraPoolDefaultPaid: extra.ExtraPoolDefaultPaid,
+		ExtraPoolIncludeUltra: extra.ExtraPoolIncludeUltra, ExtraWarmWorkerLimit: extra.ExtraWarmWorkerLimit,
+		ExtraMaxActiveWorkers: extra.ExtraMaxActiveWorkers, UltraOnlyModels: ultraOnlyModels, PaidOnlyModels: paidOnlyModels,
 		StreamDataHeartbeat:    streamDataHeartbeat,
 		WarmStartupConcurrency: value.WarmStartupConcurrency,
 		PerAccountConcurrency:  value.PerAccountConcurrency,
@@ -1844,6 +1855,17 @@ func (registry *requestRegistry) markRunning(id string, accountID string, accoun
 		tracked.request.AccountID = accountID
 		tracked.request.AccountLabel = accountLabel
 		tracked.request.State = "running"
+		registry.active[id] = tracked
+		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
+	}
+	registry.mu.Unlock()
+}
+
+// markExtra 记录请求本次尝试的租约是否借自补充池（EXTRA_POOL）：只在变化时更新并推送，没有借用过的请求什么也不做（与没有补充池时相同）
+func (registry *requestRegistry) markExtra(id string, extra bool) {
+	registry.mu.Lock()
+	if tracked, exists := registry.active[id]; exists && tracked.request.Extra != extra {
+		tracked.request.Extra = extra
 		registry.active[id] = tracked
 		registry.publishLocked(api.AdminEvent{Type: "request", Data: tracked.request})
 	}
@@ -2275,6 +2297,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	ultraOnlyModels := append([]string{}, cfg.UltraOnlyModels...)
 	paidOnlyModels := append([]string{}, cfg.PaidOnlyModels...)
 	modelFallbacks := cfg.ModelFallbacks
+	extraPoolMode := config.NormalizeExtraPoolMode(cfg.ExtraPoolMode)
 	return api.RuntimeConfig{
 		AuthStates: cfg.AuthStates, ListenAddr: cfg.ListenAddr, APIKey: cfg.ProxyAPIKey,
 		ActiveListenAddr: cfg.ListenAddr, ActiveAPIKey: cfg.ProxyAPIKey,
@@ -2297,6 +2320,12 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		ProPool:                &cfg.ProPool,
 		ProWarmWorkerLimit:     &cfg.ProWarmWorkerLimit,
 		ProMaxActiveWorkers:    &cfg.ProMaxActiveWorkers,
+		ExtraPool:              &cfg.ExtraPool,
+		ExtraPoolMode:          &extraPoolMode,
+		ExtraPoolDefaultPaid:   &cfg.ExtraPoolDefaultPaid,
+		ExtraPoolIncludeUltra:  &cfg.ExtraPoolIncludeUltra,
+		ExtraWarmWorkerLimit:   &cfg.ExtraWarmWorkerLimit,
+		ExtraMaxActiveWorkers:  &cfg.ExtraMaxActiveWorkers,
 		UltraOnlyModels:        &ultraOnlyModels,
 		PaidOnlyModels:         &paidOnlyModels,
 		StreamDataHeartbeat:    &cfg.StreamDataHeartbeat,

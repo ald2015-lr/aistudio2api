@@ -82,6 +82,7 @@ const summary = computed(() => {
     { label: t('usage.reply'), value: integer(record.reply_tokens) },
     { label: t('usage.tokens'), value: integer(record.total_tokens) },
   ]
+  if (record.extra) items.push({ label: t('pool.extra'), value: t('pool.extraHelp') })
   if (record.served_model) items.push({ label: t('usage.servedModel'), value: record.served_model })
   if (record.downgrade)
     items.push({ label: t('usage.downgrade'), value: downgradeLabel(record.downgrade) })
@@ -216,6 +217,7 @@ async function copy(kind: string, text: string): Promise<void> {
                   attempt.model
                 }}</span>
                 <span class="text-gray-500">{{ dimensionLabel('channel', attempt.channel) }}</span>
+                <span v-if="attempt.extra" class="tag tag-extra">{{ t('pool.extra') }}</span>
                 <span class="text-gray-500 tabular-nums">{{ duration(attempt.duration_ms) }}</span>
               </div>
               <p class="mt-0.5 font-mono break-words text-red-300/90">{{ attempt.error }}</p>

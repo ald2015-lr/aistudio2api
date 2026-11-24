@@ -38,6 +38,8 @@ var partitionNameTable = [aistudio.PoolScopeCount]partitionNames{
 	aistudio.PoolScopeNormal: {label: "普通分区", worker: "WAA Worker", slot: "Worker", balanced: "普通"},
 	aistudio.PoolScopeUltra:  {label: "Ultra 分区", worker: "Ultra WAA Worker", slot: "Ultra Worker", balanced: "Ultra"},
 	aistudio.PoolScopePro:    {label: "Pro 分区", worker: "Pro WAA Worker", slot: "Pro Worker", balanced: "Pro"},
+	// 补充池不是分区（账户的家分区不变），但带补充池标记的 Worker 在叠加视图里按它计数，日志与状态用自己的名称（见 extra_pool.go）
+	aistudio.PoolScopeExtra: {label: "补充池", worker: "补充池 WAA Worker", slot: "补充池 Worker", balanced: "补充池"},
 }
 
 // namesOf 返回分区的名称；不是分区的取值按普通分区（与原先 if Ultra 否则普通的写法相同）
@@ -45,9 +47,9 @@ func namesOf(partition aistudio.PoolScope) partitionNames {
 	return partitionNameTable[namesPartition(partition)]
 }
 
-// namesPartition 把不是分区的取值归到普通分区（计数与名称沿用原先 if Ultra 否则普通的口径）
+// namesPartition 把不是分区的取值归到普通分区（计数与名称沿用原先 if Ultra 否则普通的口径）；补充池按自己的名称
 func namesPartition(partition aistudio.PoolScope) aistudio.PoolScope {
-	if partition.IsPartition() {
+	if partition.IsPartition() || partition == aistudio.PoolScopeExtra {
 		return partition
 	}
 	return aistudio.PoolScopeNormal
@@ -86,6 +88,10 @@ func (manager *accountWorkerManager) warmTargetFor(partition aistudio.PoolScope)
 		return int(manager.ultraWarmTarget.Load())
 	case aistudio.PoolScopePro:
 		return int(manager.proWarmTarget.Load())
+	case aistudio.PoolScopeExtra:
+		// 补充池关闭时为 0（失败时关闭）
+		warm, _ := manager.extraCapacity()
+		return warm
 	default:
 		return 0
 	}
@@ -100,6 +106,9 @@ func (manager *accountWorkerManager) maxActiveFor(partition aistudio.PoolScope) 
 		return int(manager.ultraMaxActive.Load())
 	case aistudio.PoolScopePro:
 		return int(manager.proMaxActive.Load())
+	case aistudio.PoolScopeExtra:
+		_, maxActive := manager.extraCapacity()
+		return maxActive
 	default:
 		return 0
 	}
@@ -143,7 +152,7 @@ func (manager *accountWorkerManager) openingIn(partition aistudio.PoolScope, mem
 
 // warmAccountIDsIn 返回分区内驻留的 Worker
 func (manager *accountWorkerManager) warmAccountIDsIn(partition aistudio.PoolScope) []string {
-	return inPartition(manager.WarmAccountIDs(), manager.pool.PartitionMembers(), partition)
+	return inPartition(manager.WarmAccountIDs(), manager.slotMembers(), partition)
 }
 
 // prewarmTargetFor 返回分区需要预热的账户数：分区常驻数与分区内可预热的账户数取小
@@ -164,7 +173,7 @@ func (manager *accountWorkerManager) prewarmNeeded() bool {
 // shortPartition 返回第一个驻留与启动中 Worker 少于预热目标的分区。按分区判断：
 // 一个分区按需扩容超出常驻数时，不能掩盖另一个分区预热不足
 func (manager *accountWorkerManager) shortPartition() (aistudio.PoolScope, bool) {
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	warm, opening := countByPartition(manager.WarmAccountIDs(), members), countByPartition(manager.OpeningAccountIDs(), members)
 	summary := manager.bootstrapSummary()
 	for _, partition := range workerPartitions {
@@ -207,8 +216,10 @@ func (manager *accountWorkerManager) poolRuleChanged(exclusive bool, change pool
 	manager.drainMu.Unlock()
 	manager.notifyScheduling()
 
+	// 号池账户数按账户池的成员（家分区），Worker 数按叠加视图（补充池 Worker 不计入三个分区）
 	members = manager.pool.PartitionMembers()
-	warm, opening := countByPartition(manager.WarmAccountIDs(), members), countByPartition(manager.OpeningAccountIDs(), members)
+	slots := manager.slotMembers()
+	warm, opening := countByPartition(manager.WarmAccountIDs(), slots), countByPartition(manager.OpeningAccountIDs(), slots)
 	var current partitionCounts
 	for _, partition := range workerPartitions {
 		current[partition] = warm[partition] + opening[partition]
@@ -311,6 +322,9 @@ type standbyCapacity struct {
 	// rankModels 为各分区排序用的主用与热门模型列表（见 coldRankModelsFor），一次调度内第一次需要时取一次
 	ranks      map[string]coldRank
 	rankModels map[aistudio.PoolScope]coldRankModels
+	// extraAccount 为按补充池启动的固定账户（跨号池借来的账户在 Worker 重建后按 Pool=Extra 重放，见 extra_select.go）：它按补充池判断容量，
+	// 与 ensureWorker 把它计入补充池同一口径；其余选号为空
+	extraAccount string
 }
 
 // standbyCapacity 按当前驻留的 Worker 创建分区容量判断
@@ -321,7 +335,7 @@ func (manager *accountWorkerManager) standbyCapacity(active []string, modelID st
 // partition 返回账户所在的分区；第一次调用时读取分区成员并按分区统计占用的 Worker（驻留与正在启动，减去排空让出的）
 func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope {
 	if capacity.members == nil {
-		capacity.members = capacity.manager.pool.PartitionMembers()
+		capacity.members = capacity.manager.slotMembers()
 		capacity.active = make(map[aistudio.PoolScope]int, len(workerPartitions))
 		capacity.cooling = make(map[aistudio.PoolScope]bool, len(workerPartitions))
 		capacity.idle = make(map[aistudio.PoolScope]bool, len(workerPartitions))
@@ -338,6 +352,9 @@ func (capacity *standbyCapacity) partition(accountID string) aistudio.PoolScope 
 		for _, partition := range workerPartitions {
 			capacity.active[partition] -= capacity.manager.drainCredit(partition, occupied)
 		}
+	}
+	if accountID != "" && accountID == capacity.extraAccount {
+		return aistudio.PoolScopeExtra
 	}
 	return partitionOf(accountID, capacity.members)
 }

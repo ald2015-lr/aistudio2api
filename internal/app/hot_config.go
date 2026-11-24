@@ -163,6 +163,8 @@ func (manager *accountWorkerManager) applyLiveSettings(cfg config.Config) {
 	manager.maxActive.Store(int64(cfg.MaxActiveWorkers))
 	manager.setUltraCapacity(cfg.UltraWarmWorkerLimit, cfg.UltraMaxActiveWorkers)
 	manager.setProCapacity(cfg.ProWarmWorkerLimit, cfg.ProMaxActiveWorkers)
+	// 补充池（见 extra_pool.go）的常驻数、峰值与开关同样先于号池规则更新
+	manager.setExtraSettings(extraSettingsOf(cfg))
 	manager.warmConcurrency.Store(int64(cfg.WarmStartupConcurrency))
 	manager.startupSlots.resized()
 	manager.initTimeout.Store(int64(cfg.InitTimeout))
@@ -203,7 +205,7 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		saved.UltraWarmWorkerLimit == active.UltraWarmWorkerLimit &&
 		saved.UltraMaxActiveWorkers == active.UltraMaxActiveWorkers &&
 		saved.ProPool == active.ProPool && saved.ProWarmWorkerLimit == active.ProWarmWorkerLimit &&
-		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers &&
+		saved.ProMaxActiveWorkers == active.ProMaxActiveWorkers && extraFieldsEqual(saved, active) &&
 		saved.WarmStartupConcurrency == active.WarmStartupConcurrency &&
 		saved.PerAccountConcurrency == active.PerAccountConcurrency && saved.AccountRPMLimit == active.AccountRPMLimit &&
 		saved.RoutingStrategy == active.RoutingStrategy && slices.Equal(saved.UpstreamChannels, active.UpstreamChannels) &&
@@ -313,6 +315,9 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	// Pro 账户整体换号池（不会同时在两个号池或不在任何号池），不重启 Worker；Pro Worker 改到新分区计数，候选索引与按号池的缓存在账户池内作废重建
 	before := poolRuleState{includePro: admin.pool.UltraIncludePro(), proPool: admin.pool.ProPool()}
 	membershipChanged := admin.pool.SetPoolRules(saved.UltraIncludePro, saved.ProPool)
+	// 补充池规则（权益掩码与默认地址借付费模型）紧跟号池成员规则，锁顺序相同；容量已由上面的 applyLiveSettings 更新
+	admin.pool.SetExtraPoolRules(extraRulesOf(saved))
+	extraChanged := !extraFieldsEqual(saved, generation.config)
 	change := poolRuleChange{includePro: admin.pool.UltraIncludePro() != before.includePro, proPool: admin.pool.ProPool() != before.proPool}
 	// /pro 的开关与账户池的成员规则在同一段 manager.mu 内切换，只从账户池读取（唯一来源）：公开 API 读到开启时 Pro 账户已在 Pro 号池
 	manager.proPool.Store(admin.pool.ProPool())
@@ -350,6 +355,11 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 	}
 	if tierRulesChanged {
 		manager.requests.log("service", "INFO", "权益规则已更新并立即生效 | "+tierRulesSummary(saved.UltraOnlyModels, saved.PaidOnlyModels))
+	}
+	if extraChanged {
+		// 补充池设置单独写一行（配置已热更新的汇总行不变），并唤醒排队的请求按新设置复查
+		manager.requests.log("service", "INFO", "补充池设置已更新并立即生效 | "+extraSettingsSummary(extraSettingsOf(saved)))
+		admin.workers.notifyScheduling()
 	}
 
 	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 与 Pro 峰值、PRO_POOL 与启动并发的变化同样要重新判断端口够不够。

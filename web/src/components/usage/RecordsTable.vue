@@ -20,6 +20,8 @@ const props = defineProps<{
   total: number
   statusOptions: string[]
   refreshKey: number
+  // extraPool 为补充池开启（或仍有补充池 Worker）：这时才显示“只看由补充池服务”
+  extraPool?: boolean
 }>()
 const emit = defineEmits<{ 'update:status': [value: string]; 'update:search': [value: string] }>()
 
@@ -71,10 +73,15 @@ const state = ref<'loading' | 'ready' | 'error'>('loading')
 const error = ref('')
 const selected = ref<UsageRecord | null>(null)
 const searchText = ref(props.search)
+// extraOnly 为只看由补充池服务的请求（查询参数 extra=1，导出 CSV 同样只含这些行）；补充池关闭后已勾选的仍显示，方便取消。
+// extraSeen 为本页面读到过由补充池服务的记录：补充池已关闭、没有补充池 Worker 时仍显示筛选，历史记录照样能筛出与导出
+const extraOnly = ref(false)
+const extraSeen = ref(false)
+const extraShown = computed(() => props.extraPool === true || extraOnly.value || extraSeen.value)
 let controller: AbortController | undefined
 let searchTimer: number | undefined
 
-const filtered = computed(() => props.status !== '' || props.search !== '')
+const filtered = computed(() => props.status !== '' || props.search !== '' || extraOnly.value)
 
 // parameters 在调用时解析时间范围并组合筛选、状态码、关键字与分页参数，范围无效时返回 null
 function parameters(cursor?: string): URLSearchParams | null {
@@ -82,6 +89,7 @@ function parameters(cursor?: string): URLSearchParams | null {
   if (query === null) return null
   if (props.status !== '') query.set('status', props.status)
   if (props.search !== '') query.set('q', props.search)
+  if (extraOnly.value) query.set('extra', '1')
   if (cursor !== undefined) query.set('cursor', cursor)
   return query
 }
@@ -104,6 +112,7 @@ async function load(): Promise<void> {
   try {
     const result = await api.usageRecords(query, current.signal)
     items.value = result.items
+    if (result.items.some((record) => record.extra === true)) extraSeen.value = true
     nextCursor.value = result.next_cursor
     state.value = 'ready'
   } catch (reason) {
@@ -130,7 +139,9 @@ function move(step: 1 | -1): void {
   void load()
 }
 
-watch(() => [props.scope, props.status, props.search, pageSize.value], restart, { immediate: true })
+watch(() => [props.scope, props.status, props.search, pageSize.value, extraOnly.value], restart, {
+  immediate: true,
+})
 watch(
   () => props.refreshKey,
   () => void load(),
@@ -207,6 +218,15 @@ function latencyWidth(milliseconds: number): number {
         <option value="">{{ t('usage.recordsAllStatus') }}</option>
         <option v-for="code in statusOptions" :key="code" :value="code">{{ code }}</option>
       </UiSelect>
+      <label
+        v-if="extraShown"
+        v-tooltip="t('usage.extraFilterHelp')"
+        class="flex h-8 cursor-pointer items-center gap-1.5 text-xs text-emerald-300"
+        data-testid="usage-extra-filter"
+      >
+        <input v-model="extraOnly" type="checkbox" />
+        {{ t('usage.extraFilter') }}
+      </label>
       <UiPopover align="end" content-class="w-48 p-2" trigger-class="btn btn-sm h-8">
         <template #trigger>{{ t('usage.columns') }}</template>
         <fieldset>
@@ -297,6 +317,12 @@ function latencyWidth(milliseconds: number): number {
                   >{{ t(poolTagLabelKey(record.pool)) }}</span
                 >
                 <span
+                  v-if="record.extra"
+                  v-tooltip="t('pool.extraHelp')"
+                  class="tag tag-extra ml-1.5"
+                  >{{ t('pool.extra') }}</span
+                >
+                <span
                   v-if="record.downgrade === 'rejected'"
                   v-tooltip="t('usage.downgrade.rejected')"
                   class="tag ml-1.5 text-red-300"
@@ -381,6 +407,7 @@ function latencyWidth(milliseconds: number): number {
               <span v-if="poolTagged(record.pool)" class="tag" :class="poolTagClass(record.pool)">{{
                 t(poolTagLabelKey(record.pool))
               }}</span>
+              <span v-if="record.extra" class="tag tag-extra">{{ t('pool.extra') }}</span>
               <span class="ml-auto text-gray-400 tabular-nums">{{
                 dateTime(record.time, true)
               }}</span>

@@ -26,6 +26,9 @@ import {
   type RangePreset,
 } from './usage/model'
 
+// extraPool 为状态接口有补充池（开启，或仍有补充池 Worker）：请求记录据此显示“只看由补充池服务”
+const props = defineProps<{ extraPool?: boolean }>()
+
 const { t, tf, errorText } = useI18n()
 const { compact, integer, percent, duration, dateTime, clock, ago, dimensionLabel } =
   useUsageFormat()
@@ -614,6 +617,7 @@ const statusOptions = computed(() =>
               :total="report.totals.requests"
               :status-options="statusOptions"
               :refresh-key="recordsRefresh"
+              :extra-pool="props.extraPool ?? false"
               @update:status="state.status = $event"
               @update:search="state.search = $event"
             />

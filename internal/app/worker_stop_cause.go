@@ -39,6 +39,8 @@ const (
 	workerStopAuthRefresh = "认证续签"
 	// workerStopDetach 为账户目录已不在、移出账户池
 	workerStopDetach = "账户移出"
+	// workerStopExtraRelease 为补充池 Worker 的账号已不是补充池成员、家分区又没有空位时空闲关闭（见 extra_pool.go 的 extraPass）
+	workerStopExtraRelease = "补充池释放"
 )
 
 // 就绪的起因写进“WAA Worker 就绪”的“起因=”（追加在“来源=”之后）：新 Worker 的槽位是怎么来的。来源说明是谁要启动（预热、按需等），

@@ -236,13 +236,40 @@ const zhCN = {
     '权益为 Pro 的账户组成 Pro 号池（开启下方“Pro 独立号池”时）。客户端把 Base URL 换成 /pro 前缀（OpenAI 用 http://主机:端口/pro/v1，Anthropic 与 Gemini 用 http://主机:端口/pro）即只用 Pro 号池的账户处理请求；/pro 的全部接口与默认地址相同，排查路由为 /trace/pro。修改后立即生效，不需要重启服务。',
   'settings.proPool': 'Pro 独立号池',
   'settings.proPoolHelp':
-    '开启（默认）时权益为 Pro 的账户只服务 /pro 前缀：默认地址与 /ultra 都不再使用它们（下方 Ultra 号池的“Pro 账户并入 Ultra 号池”不生效），/pro 也不借用 Ultra 或普通号池的账户——Pro 号池没有可用账户时返回 503，候选全部冷却、额度用完或排队超限时返回 429 并带 Retry-After。Pro 不能用只限 Ultra 的模型（gemini-4-carbon 不在 /pro 的模型列表里，请求返回 404），这一点靠下方的“仅 Ultra 可用的模型”（ULTRA_ONLY_MODELS），清空它会让 Pro 号池也能选到 carbon；gemini-4-argon、gemini-3.1-pro-preview 照常可用。/pro 沿用 Ultra/Pro 主用模型列表与排队上限。资源不迁移：Pro 账户上已有的文件与视频任务要改从 /pro 引用（否则返回 400 并说明改用哪个入口）。关闭后与没有这项设置之前相同（Pro 账户留在默认地址，开启“Pro 账户并入 Ultra 号池”时并入 /ultra），新的 /pro 请求返回 404，切换时仍在进行的 /pro 请求返回 503。修改后立即生效，已运行的 Worker 改按新的分区计数，不会重启；建议在同一次保存里调好下方两个 Worker 数，避免多出的 Pro Worker 被逐步回收。',
+    '开启（默认）时权益为 Pro 的账户只服务 /pro 前缀：默认地址与 /ultra 都不再使用它们（下方 Ultra 号池的“Pro 账户并入 Ultra 号池”不生效），/pro 也不借用 Ultra 或普通号池的账户——Pro 号池没有可用账户时返回 503，候选全部冷却、额度用完或排队超限时返回 429 并带 Retry-After；开启补充池时例外：/pro 也借用补充池里其他号池的成员，补充池里的 Pro 成员也借给默认地址与 /ultra（权益规则照常）。Pro 不能用只限 Ultra 的模型（gemini-4-carbon 不在 /pro 的模型列表里，请求返回 404），这一点靠下方的“仅 Ultra 可用的模型”（ULTRA_ONLY_MODELS），清空它会让 Pro 号池也能选到 carbon；gemini-4-argon、gemini-3.1-pro-preview 照常可用。/pro 沿用 Ultra/Pro 主用模型列表与排队上限。资源不迁移：Pro 账户上已有的文件与视频任务要改从 /pro 引用（否则返回 400 并说明改用哪个入口）。关闭后与没有这项设置之前相同（Pro 账户留在默认地址，开启“Pro 账户并入 Ultra 号池”时并入 /ultra），新的 /pro 请求返回 404，切换时仍在进行的 /pro 请求返回 503。修改后立即生效，已运行的 Worker 改按新的分区计数，不会重启；建议在同一次保存里调好下方两个 Worker 数，避免多出的 Pro Worker 被逐步回收。',
   'settings.proWarmWorkerLimit': 'Pro 常驻 Worker 数',
   'settings.proMaxActiveWorkers': 'Pro 峰值 Worker 上限',
   'settings.proWorkersHelp':
     'Pro 号池账户的 Worker 单独计数：预热、空闲回收与淘汰都只在 Pro 分区内进行，不会挤占普通号池或 Ultra 号池的 Worker，反之亦然。默认 2 与 5 偏小，原来由普通分区或 Ultra 分区承担 Pro 流量时，建议把那边的 Worker 数挪一部分过来，浏览器总数保持不变。常驻数可以为 0（只在有请求时启动），峰值至少为 1 且不小于常驻数。',
   'settings.workerPartitionHelp':
-    '常驻 Worker 数与峰值 Worker 上限只约束普通号池（不含 Pro 与 Ultra）；Pro 号池与 Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为三个分区的峰值之和（关闭 Pro 独立号池或没有 Pro 账户时 Pro 分区为空）。启动预热并发与单账户请求并发各号池共用，冷启动按普通、Ultra、Pro 的顺序分配启动预热并发。单账户请求并发是硬上限：同一账号同时进行的请求不超过此数（所有请求类型，含流式与非流式、Playground 与 Build、countTokens 与文件操作）；修改后立即生效，调小时已在进行的请求照常跑完。',
+    '常驻 Worker 数与峰值 Worker 上限只约束普通号池（不含 Pro 与 Ultra）；Pro 号池与 Ultra 号池的 Worker 在下方单独设置，浏览器总数最多为三个分区的峰值之和，开启补充池时再加补充池峰值（关闭 Pro 独立号池或没有 Pro 账户时 Pro 分区为空）。启动预热并发与单账户请求并发各号池共用，冷启动按普通、Ultra、Pro 的顺序分配启动预热并发。单账户请求并发是硬上限：同一账号同时进行的请求不超过此数（所有请求类型，含流式与非流式、Playground 与 Build、countTokens 与文件操作）；修改后立即生效，调小时已在进行的请求照常跑完。',
+  'settings.extraTitle': '补充池（额外浏览器号池）',
+  'settings.extraHelp':
+    '有模型今天用完、其他模型还能用的账户（例如 gemini-4-argon 的每日额度用完、flash 还能用）单独开一批浏览器，补给默认地址、/pro 与 /ultra。账户所属的号池不变：完全没冷却的账户留在原号池，需要登录、已停用、整户冷却或初始化模型全都在冷却的账户不会进来。默认关闭，关闭时一切与没有这项设置之前相同。修改后立即生效，不需要重启服务。',
+  'settings.extraPool': '开启补充池',
+  'settings.extraPoolHelp':
+    '有模型冷却、剩余不少于 15 分钟，而且还有别的模型能用的账户成为成员；冷却结束（太平洋时间零点额度恢复时会成批结束）、整户不可用或权益不在范围时离开：原分区有空位就原地归还 Worker，否则在空闲时关闭。分钟限额等短冷却、只在单个模型上需要验证账号的不算。Free（含 Plus 与权益尚未读取的，按 Free 计）与 Pro 账户可以进入，Ultra 看下方开关。开启后补充池按常驻数预热，主分区换下成员的空闲 Worker 时原地接手，不关浏览器。',
+  'settings.extraPoolMode': '使用方式',
+  'settings.extraModeShare': '一起分担（默认）',
+  'settings.extraModeOverflow': '主号池不够时才补',
+  'settings.extraModeHelp':
+    '一起分担：补充池里已就绪的 Worker 与主号池的 Worker 轮流接请求。主号池不够时才补：主号池的热 Worker 都忙、候选全部冷却、额度 429 之后只能用已启动的 Worker 时立即借补充池；主号池的 Worker 正在启动或出口限速时排队满 3 秒再借；主号池还能现场冷启动备用号时，由这个请求先冷启动主号池（约 10–30 秒），期间不借。两种方式都只补请求入口本来就有的模型（下方默认地址的付费模型除外）。',
+  'settings.extraDefaultPaid': '默认地址可借补充池的付费账户',
+  'settings.extraDefaultPaidHelp':
+    '开启（默认）时，默认地址能借补充池里的 Pro 账户（开启下方 Ultra 开关时还有 Ultra 账户）跑默认地址模型列表之外的模型，例如 gemini-4-argon 与 PAID_ONLY_MODELS 里的模型，前提是那个号这个模型还没用完：只有“别的模型已冷却、这个付费模型还能用”的 Pro（或 Ultra）成员借得到，gemini-4-argon 用完的 Pro 号在默认地址上借给 flash 等模型用，不是借给 argon；完全没冷却的健康 Pro 号留在 /pro。这些模型随之出现在默认地址的 /v1/models 里，只能由补充池服务：补充池范围内能跑它的账户全部冷却时返回 429 并带 Retry-After；没有这样的成员或此刻借不到 Worker 时模型仍在列表里，请求返回 503。要稳定使用 gemini-4-argon 请走 /pro。权益规则照常，Free 永远跑不了付费模型，Pro 跑不了只限 Ultra 的模型。关闭时各入口只补充自己原本就有的模型；/pro 与 /ultra 不受这项影响。',
+  'settings.extraIncludeUltra': 'Ultra 账户也进补充池',
+  'settings.extraIncludeUltraHelp':
+    '默认关闭：权益为 Ultra 的账户不会成为成员。打开后有模型冷却的 Ultra 账户也补给默认地址与 /pro（只跑这些入口允许的模型；开启上方付费开关时默认地址还能借它跑只限 Ultra 的模型）。借用 Ultra 账户会消耗 Ultra 出口通道的令牌，可能挤占 /ultra。',
+  'settings.extraWarmWorkerLimit': '补充池常驻 Worker 数',
+  'settings.extraMaxActiveWorkers': '补充池峰值 Worker 上限',
+  'settings.extraWorkersHelp':
+    '补充池的 Worker 单独计数，不占普通、Pro、Ultra 分区的名额。常驻数（默认 40）是预热与接手补到的数量，可以为 0（只在请求需要时扩容）；峰值（默认 50）至少为 1 且不小于常驻数，超出常驻、空闲满 5 分钟的逐个回收。补充池预热排在主分区之后，共用启动预热并发。每个浏览器约 0.6GB 内存：常驻 40 个约 24GB，峰值 50 个加替换时多出的 4 个约 32GB；开启 IP 池时端口要多“峰值 + 替换余量”个（默认 54）；浏览器多时进程的打开文件数上限建议不低于 65536（ulimit -n）。',
+  'settings.extraResourceHint':
+    '按当前峰值，补充池最多同时 {browsers} 个浏览器（峰值 {max} + 替换 {drain}），约多占 {memory}GB 内存，开启 IP 池时多需要 {browsers} 个端口。',
+  'settings.extraOffNote': '补充池关闭：下面的设置照常保存，开启后才生效。',
+  'settings.invalidExtraWarmWorkers': '补充池常驻 Worker 数必须是 0 或正整数',
+  'settings.invalidExtraMaxWorkers':
+    '补充池峰值 Worker 上限必须是正整数，且不能小于补充池常驻 Worker 数',
   'settings.accountRpmLimit': '单账号每分钟请求上限',
   'settings.accountRpmLimitHelp':
     '每个账号最近 60 秒最多发出的生成请求数（上游每账号每分钟 12 次，所有模型、两个通道共用）；满了就算忙碌，请求换到其他账号，热 Worker 都满时启动新的 Worker；只统计本服务，上游的 429 冷却仍然兜底；默认 10，比 12 留出余量；0 表示关闭；修改后立即生效。',
@@ -251,7 +278,7 @@ const zhCN = {
     '权益为 Ultra 的账户组成 Ultra 号池（付费号池）；关闭上方“Pro 独立号池”、开启下方“Pro 账户并入 Ultra 号池”时，权益为 Pro 的账户也属于它。客户端把 Base URL 换成 /ultra 前缀（OpenAI 用 http://主机:端口/ultra/v1，Anthropic 与 Gemini 用 http://主机:端口/ultra）即只用 Ultra 号池的账户处理请求。修改后立即生效，不需要重启服务。',
   'settings.ultraExclusive': 'Ultra 号池的账户只服务 /ultra 请求',
   'settings.ultraExclusiveHelp':
-    '开启（默认）时普通路径只用其余账户，Ultra 号池的账户留给 /ultra；关闭时普通路径也可以用 Ultra 号池的账户，/ultra 仍只用 Ultra 号池的账户；开启 Pro 独立号池时普通路径仍不使用 Pro 账户，所以 gemini-4-argon 等付费模型在默认地址仍可经 Ultra 账户使用，不是只有 /pro 与 /ultra 才有。',
+    '开启（默认）时普通路径只用其余账户，Ultra 号池的账户留给 /ultra；关闭时普通路径也可以用 Ultra 号池的账户，/ultra 仍只用 Ultra 号池的账户；开启 Pro 独立号池时普通路径仍不使用 Pro 账户，所以 gemini-4-argon 等付费模型在默认地址仍可经 Ultra 账户使用，不是只有 /pro 与 /ultra 才有。开启补充池时各入口还会借用补充池里其他号池的成员（权益规则照常）。',
   'settings.ultraIncludePro': 'Pro 账户并入 Ultra 号池（付费号池）',
   'settings.ultraIncludeProHelp':
     '只在关闭上方“Pro 独立号池”（PRO_POOL=false）时生效。开启后权益为 Pro 的账户与 Ultra 账户同属 Ultra 号池，按 Ultra 号池的全部设置调度：经 /ultra 前缀服务并列入 /ultra 的模型列表，受上方“Ultra 号池的账户只服务 /ultra 请求”约束，Worker 计入下方 Ultra 常驻数与峰值上限，适用 Ultra 主用模型列表，也计入侧栏与账户页的 Ultra 号池计数。账户的真实权益不变：账户页仍显示 Pro（另加 Ultra 号池标记），模型资格、输入上限与额度共享仍按 Pro 计。上方设置开启时普通路径不再使用 Pro 账户，普通号池容量随之变小，gemini-4-argon 与需要订阅权益的模型会从普通路径的模型列表（/v1/models）消失，客户端要改用 /ultra 前缀。Pro 与 Ultra 共用下方两个 Worker 上限，默认值偏小，建议调大；Ultra 常驻 Worker 数为 1（ULTRA_WARM_WORKER_LIMIT=1）时常驻的可能是 Pro 账户而不是 Ultra 账户，建议不小于 2。资源不迁移，Pro 账户上已有的文件与视频任务切换后可能要换入口引用：开启本项后，上方设置开启时经普通路径引用会返回 400，要改用 /ultra 前缀（上方设置关闭时不受影响）；关闭本项后经 /ultra 引用会返回 400，要改用普通路径。建议在没有进行中的视频任务时切换。默认关闭；修改后立即生效，不需要重启服务，已运行的 Worker 改按新的分区计数，不会重启。',
@@ -335,6 +362,8 @@ const zhCN = {
   'pool.ultraHelp': '经 /ultra 前缀进入，只用 Ultra 号池的账户',
   'pool.pro': 'Pro',
   'pool.proHelp': '经 /pro 前缀进入，只用 Pro 号池的账户',
+  'pool.extra': '补充池',
+  'pool.extraHelp': '由补充池服务：最后一次尝试借用了补充池的 Worker（号池标记仍按入口）',
   'models.channels': '通道',
   'settings.mediaTitle': '生成媒体输出',
   'settings.mediaHelp':
@@ -411,7 +440,7 @@ const zhCN = {
   'playground.poolPro': 'Pro',
   'playground.poolUltra': 'Ultra',
   'playground.poolNormalHelp':
-    '请求经默认地址发送，只由普通号池（Free、Plus）的账户处理；列表只显示它们能用的模型，Pro、Ultra 才能用的模型请选 Pro 或 Ultra',
+    '请求经默认地址发送，只由普通号池（Free、Plus）的账户处理（开启补充池时还可能借用补充池里其他号池的成员）；列表只显示它们能用的模型，Pro、Ultra 才能用的模型请选 Pro 或 Ultra',
   'playground.poolNormalSharedHelp':
     '请求经默认地址发送，由普通号池与 Ultra 号池的账户处理（不含 Pro 账户，ULTRA_EXCLUSIVE=false）',
   'playground.poolNormalProOffHelp': '请求经默认地址发送；Pro 独立号池已关闭，Pro 不可选',
@@ -764,6 +793,9 @@ const zhCN = {
   'models.options': '能力选项',
   'logs.compact': '精简',
   'logs.compactHint': '隐藏 Worker 启动等过程日志，并把一分钟内连续出现的同类信息合并为一行',
+  'logs.extraFilter': '只看补充池',
+  'logs.extraFilterHelp':
+    '只看由补充池服务的请求与补充池的运行日志（成员变化、预热、接手、归还、释放）',
   'logs.shown': '显示 {shown} / {total}',
   'logs.jumpLatest': '跳到最新',
   'logs.detailTitle': '日志详情',
@@ -771,6 +803,8 @@ const zhCN = {
   'logs.message': '消息',
   'logs.event': '事件',
   'requests.filterAll': '全部',
+  'requests.filterExtra': '补充池',
+  'requests.filterExtraHelp': '只看由补充池服务的请求（这次或最后一次尝试借用了补充池的 Worker）',
   'cooldowns.search': '搜索模型',
   'cooldowns.reason': '原因',
   'app.workers': 'Worker {warm} / {target}',
@@ -829,6 +863,17 @@ const zhCN = {
   'app.proWorkers': 'Pro Worker {occupied} / {max}',
   'app.proWorkersDetail':
     'Pro 分区：运行中 {warm} · 启动中 {starting} · 冷却占位 {dead} · 排空中 {draining} · 不可调度 {unschedulable} · 预热目标 {target} · 峰值 {max}',
+  'app.extraWorkers':
+    '补充池 Worker {workers} / {warm} · 峰值 {max} · 可借出 {lendable} · 成员 {members}',
+  'app.extraWorkersOff': '补充池已关闭 · 归还中 {workers}',
+  'app.extraWorkersDetail':
+    '补充池（{state}）：方式 {mode} · 含 Ultra {ultra} · 默认地址借付费模型 {paid} · 运行中 {running} · 启动中 {starting} · 预热目标 {target} · 冷成员 {cold} · 成员 Free {free} / Pro {pro} / Ultra {ultraMembers} · 归还中 {returning} · 本进程借出 {borrows} 次',
+  'app.extraStateOn': '已开启',
+  'app.extraStateOff': '已关闭，等待归还',
+  'app.extraModeShare': '一起分担',
+  'app.extraModeOverflow': '不够时才补',
+  'app.extraYes': '是',
+  'app.extraNo': '否',
   'app.proPoolNoticeTitle': 'Pro 独立号池已默认开启',
   'app.proPoolNotice': '{count} 个 Pro 账户只服务 /pro。建议 Worker：Pro {proWarm}/{proMax}，普通 {warm}/{max}。',
   'app.proPoolNoticeUltra': '{count} 个 Pro 账户只服务 /pro。建议 Worker：Pro {proWarm}/{proMax}，Ultra {warm}/{max}。',
@@ -939,6 +984,17 @@ const zhCN = {
   'accounts.poolFilterNormal': '号池：普通',
   'accounts.poolFilterPro': '号池：Pro',
   'accounts.poolFilterUltra': '号池：Ultra',
+  'accounts.extraWorker': '补充池',
+  'accounts.extraWorkerHelp':
+    '这个 Worker 计入补充池：账户有模型冷却、其他模型可用，补充池借它补给各入口',
+  'accounts.extraMember': '可补充',
+  'accounts.extraMemberHelp':
+    '补充池成员：有模型冷却、其他模型可用（冷却的模型与结束时刻见请求页的冷却列表）。账户列表按最近一次对账，不随成员变化推送',
+  'accounts.extraCount': '补充池 Worker {workers} / {warm} · 成员 {members}',
+  'accounts.extraCountOff': '补充池已关闭 · 归还中 {workers}',
+  'accounts.extraCountHelp':
+    '补充池（EXTRA_POOL）：Worker 为计入补充池的 Worker 数与常驻数，成员为有模型冷却、其他模型可用的账户（含 Worker 驻留在主分区的）',
+  'accounts.poolFilterExtra': '号池：补充池',
   'accounts.tierFilterPro': '权益：Pro',
   'accounts.tierFilterPlus': '权益：Plus',
   'accounts.tierFilterFree': '权益：Free',
@@ -1130,6 +1186,9 @@ const zhCN = {
   'usage.recordsCount': '共 {count} 条，按完成时间倒序',
   'usage.recordsSearch': '搜索请求 ID、错误或回复指纹',
   'usage.recordsAllStatus': '全部状态码',
+  'usage.extraFilter': '只看由补充池服务',
+  'usage.extraFilterHelp':
+    '只列出最后一次尝试借用了补充池的请求（号池列仍按入口）；导出 CSV 同样只含这些行，列不变',
   'usage.export': '导出 CSV',
   'usage.columns': '显示列',
   'usage.pageSize': '每页 {count} 条',
@@ -1213,6 +1272,10 @@ const zhCN = {
     '共 {ports} 个端口；最多同时 {need} 个浏览器（普通 {normal}+{normalDrain}、Ultra {ultra}+{ultraDrain}，加号后为排空时先启动的替补），余量 {spare} 个，登录与验证另占（默认验证并发 3）。',
   'settings.proxyPoolCapacityPro':
     '共 {ports} 个端口；最多同时 {need} 个浏览器（普通 {normal}+{normalDrain}、Ultra {ultra}+{ultraDrain}、Pro {pro}+{proDrain}，加号后为排空时先启动的替补），余量 {spare} 个，登录与验证另占（默认验证并发 3）。',
+  'settings.proxyPoolCapacityExtra':
+    '共 {ports} 个端口；最多同时 {need} 个浏览器（普通 {normal}+{normalDrain}、Ultra {ultra}+{ultraDrain}、补充池 {extra}+{extraDrain}，加号后为排空或替换时先启动的浏览器），余量 {spare} 个，登录与验证另占（默认验证并发 3）。',
+  'settings.proxyPoolCapacityProExtra':
+    '共 {ports} 个端口；最多同时 {need} 个浏览器（普通 {normal}+{normalDrain}、Ultra {ultra}+{ultraDrain}、Pro {pro}+{proDrain}、补充池 {extra}+{extraDrain}，加号后为排空或替换时先启动的浏览器），余量 {spare} 个，登录与验证另占（默认验证并发 3）。',
   'settings.proxyPoolShortage':
     '端口少于可能同时运行的浏览器数（需要 {need} 个）：超出的浏览器会与其他账号共用端口（同一个 IP）。请扩大端口段，或调低峰值 Worker 上限、启动预热并发。',
   'settings.proxyPoolTight':
@@ -1552,13 +1615,41 @@ const en: Record<TranslationKey, string> = {
     'Accounts with the Pro tier form the Pro pool (while "Separate Pro pool" below is on). Point a client at the /pro prefix (OpenAI: http://host:port/pro/v1; Anthropic and Gemini: http://host:port/pro) to have its requests served only by Pro-pool accounts; /pro offers every endpoint of the default URL, and its trace route is /trace/pro. Changes apply immediately without a service restart.',
   'settings.proPool': 'Separate Pro pool',
   'settings.proPoolHelp':
-    'When on (default), accounts with the Pro tier only serve the /pro prefix: neither the default URL nor /ultra uses them any more ("Put Pro accounts in the Ultra pool" in the Ultra pool below has no effect), and /pro never borrows Ultra or normal-pool accounts: it returns 503 when no Pro-pool account is ready, and 429 with Retry-After when every candidate is cooling down, out of quota or the queue is full. Pro cannot use Ultra-only models (gemini-4-carbon is not in the /pro model list and requests for it return 404); this relies on "Ultra-only models" (ULTRA_ONLY_MODELS) below, and clearing that list lets the Pro pool pick carbon too. gemini-4-argon and gemini-3.1-pro-preview work as usual. /pro follows the Ultra/Pro primary model list and queue limit. Resources do not move: files and video jobs that already live on Pro accounts must be referenced through /pro (otherwise the request returns 400 naming the right entry point). When off, behaviour is exactly as before this setting existed (Pro accounts stay on the default URL, or join /ultra when "Put Pro accounts in the Ultra pool" is on), new /pro requests return 404, and /pro requests still in flight during the switch return 503. Changes apply immediately; running workers are recounted in their new partition instead of being restarted. Set the two worker counts below in the same save, otherwise surplus Pro workers are reaped gradually.',
+    'When on (default), accounts with the Pro tier only serve the /pro prefix: neither the default URL nor /ultra uses them any more ("Put Pro accounts in the Ultra pool" in the Ultra pool below has no effect), and /pro never borrows Ultra or normal-pool accounts: it returns 503 when no Pro-pool account is ready, and 429 with Retry-After when every candidate is cooling down, out of quota or the queue is full. The exception is the extra pool: /pro also borrows extra-pool members of other pools, and Pro members in the extra pool are lent to the default URL and /ultra too (tier rules still apply). Pro cannot use Ultra-only models (gemini-4-carbon is not in the /pro model list and requests for it return 404); this relies on "Ultra-only models" (ULTRA_ONLY_MODELS) below, and clearing that list lets the Pro pool pick carbon too. gemini-4-argon and gemini-3.1-pro-preview work as usual. /pro follows the Ultra/Pro primary model list and queue limit. Resources do not move: files and video jobs that already live on Pro accounts must be referenced through /pro (otherwise the request returns 400 naming the right entry point). When off, behaviour is exactly as before this setting existed (Pro accounts stay on the default URL, or join /ultra when "Put Pro accounts in the Ultra pool" is on), new /pro requests return 404, and /pro requests still in flight during the switch return 503. Changes apply immediately; running workers are recounted in their new partition instead of being restarted. Set the two worker counts below in the same save, otherwise surplus Pro workers are reaped gradually.',
   'settings.proWarmWorkerLimit': 'Pro resident workers',
   'settings.proMaxActiveWorkers': 'Pro active worker limit',
   'settings.proWorkersHelp':
     'Workers of Pro-pool accounts are counted on their own: prewarming, idle reaping and eviction stay inside the Pro partition and never take workers from the normal or Ultra pool, nor the other way round. The defaults of 2 and 5 are small; if the normal or Ultra partition carried the Pro traffic before, move part of its workers here and keep the total number of browsers unchanged. The resident count may be 0 (start on demand only); the limit must be at least 1 and not lower than the resident count.',
   'settings.workerPartitionHelp':
-    'Resident workers and the active worker limit apply to the normal pool only (Pro and Ultra excluded). Pro-pool and Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of the three partition limits (the Pro partition is empty while the separate Pro pool is off or there are no Pro accounts). Startup prewarm concurrency and per-account concurrency are shared by all pools, and cold starts get prewarm slots in the order normal, Ultra, Pro. Per-account concurrency is a hard cap: an account never has more requests in flight than this (every request type, streaming or not, Playground or Build, countTokens and file operations included). Changes apply immediately; lowering it lets requests already in flight finish.',
+    'Resident workers and the active worker limit apply to the normal pool only (Pro and Ultra excluded). Pro-pool and Ultra-pool workers are configured separately below, so the total number of browsers can reach the sum of the three partition limits, plus the extra pool limit while the extra pool is on (the Pro partition is empty while the separate Pro pool is off or there are no Pro accounts). Startup prewarm concurrency and per-account concurrency are shared by all pools, and cold starts get prewarm slots in the order normal, Ultra, Pro. Per-account concurrency is a hard cap: an account never has more requests in flight than this (every request type, streaming or not, Playground or Build, countTokens and file operations included). Changes apply immediately; lowering it lets requests already in flight finish.',
+  'settings.extraTitle': 'Extra pool (additional browser pool)',
+  'settings.extraHelp':
+    'Accounts that used up one model today while other models still work (for example gemini-4-argon is out of daily quota but flash is fine) get browsers of their own that help the default URL, /pro and /ultra. The pool an account belongs to does not change: accounts with nothing cooling down stay in their own pool, and accounts that need a login, are disabled, are cooling down as a whole or have every bootstrap model cooling down never join. Off by default; while off everything behaves exactly as before this setting existed. Changes apply immediately without a service restart.',
+  'settings.extraPool': 'Enable the extra pool',
+  'settings.extraPoolHelp':
+    'An account becomes a member when a model has at least 15 minutes of cooldown left and some other model still works; it leaves when the cooldown ends (many end together when quotas reset at midnight Pacific time), when the whole account becomes unusable or when its tier is out of scope: its worker is handed back in place if its home partition has room, or closed once idle. Short cooldowns such as per-minute limits and a verification required on a single model do not count. Free (including Plus and tiers not read yet, counted as Free) and Pro accounts may join; Ultra depends on the switch below. While on, the extra pool prewarms up to its resident count and takes over idle member workers in place (without closing the browser) when a main partition lets them go.',
+  'settings.extraPoolMode': 'Mode',
+  'settings.extraModeShare': 'Share the load (default)',
+  'settings.extraModeOverflow': 'Only when the main pool runs short',
+  'settings.extraModeHelp':
+    'Share the load: ready extra-pool workers take turns with the main pool workers. Only when the main pool runs short: the extra pool is borrowed at once when every running main-pool worker is busy, every candidate is cooling down or only started workers may be used after a quota 429; after 3 seconds of queueing while a main-pool worker is starting or egress is rate limited; while the main pool can still cold-start a spare account, the request cold-starts it first (about 10–30 seconds) and does not borrow meanwhile. Either way the extra pool only serves models the entry point already offers (except the paid models of the default URL below).',
+  'settings.extraDefaultPaid': 'Default URL may borrow paid accounts',
+  'settings.extraDefaultPaidHelp':
+    'When on (default), the default URL may borrow Pro accounts of the extra pool (and Ultra accounts while the Ultra switch below is on) for models outside the default URL model list, such as gemini-4-argon and the models in PAID_ONLY_MODELS, as long as that account still has quota for the model: only Pro (or Ultra) members whose other models are cooling down while this paid model still works can be borrowed, so a Pro account that used up gemini-4-argon is lent to the default URL for flash and similar models, not for argon, and healthy Pro accounts with nothing cooling down stay on /pro. These models then appear in the default URL /v1/models and can only be served by the extra pool: when every account within the scope of the extra pool that can run one is cooling down the request returns 429 with Retry-After; without such a member, or when no worker can be borrowed right now, the model stays listed and the request returns 503. Use /pro for steady access to gemini-4-argon. Tier rules still apply: Free never runs paid models and Pro never runs Ultra-only models. When off, each entry point is only helped with the models it already offers; /pro and /ultra are not affected by this switch.',
+  'settings.extraIncludeUltra': 'Include Ultra accounts',
+  'settings.extraIncludeUltraHelp':
+    'Off by default: accounts with the Ultra tier never become members. When on, Ultra accounts with a cooling model also help the default URL and /pro (only with models those entry points allow; with the paid switch above on, the default URL may also borrow them for Ultra-only models). Borrowing Ultra accounts spends tokens of the Ultra egress lane and may squeeze /ultra.',
+  'settings.extraWarmWorkerLimit': 'Extra pool resident workers',
+  'settings.extraMaxActiveWorkers': 'Extra pool active worker limit',
+  'settings.extraWorkersHelp':
+    'Extra-pool workers are counted on their own and never take slots of the normal, Pro or Ultra partitions. The resident count (default 40) is what prewarming and takeovers fill up to and may be 0 (expand on demand only); the limit (default 50) must be at least 1 and not lower than the resident count, and workers above the resident count are reaped one by one after 5 idle minutes. Extra-pool prewarming comes after the main partitions and shares the startup prewarm concurrency. Each browser takes about 0.6 GB of memory: 40 resident take about 24 GB, and 50 plus the 4 started during replacements about 32 GB; with the IP pool on you need "limit + replacement headroom" more ports (54 by default); with many browsers keep the open-file limit of the process at 65536 or more (ulimit -n).',
+  'settings.extraResourceHint':
+    'With the current limit the extra pool runs at most {browsers} browsers at once ({max} + {drain} replacements), about {memory} GB more memory, and {browsers} more ports while the IP pool is on.',
+  'settings.extraOffNote':
+    'The extra pool is off: the settings below are saved and take effect once it is on.',
+  'settings.invalidExtraWarmWorkers': 'Extra pool resident workers must be 0 or a positive integer',
+  'settings.invalidExtraMaxWorkers':
+    'The extra pool active worker limit must be a positive integer and not lower than its resident workers',
   'settings.accountRpmLimit': 'Requests per minute per account',
   'settings.accountRpmLimitHelp':
     'The most generation requests each account sends in the last 60 seconds (upstream allows 12 per account per minute, shared by all models and both channels). An account that reaches it counts as busy and requests go to other accounts; when every running worker is full a new worker starts. Only requests from this service are counted, and upstream 429 cooldowns still act as the fallback. Defaults to 10, which leaves headroom below 12; 0 turns it off. Changes apply immediately.',
@@ -1567,7 +1658,7 @@ const en: Record<TranslationKey, string> = {
     'Accounts with the Ultra tier form the Ultra pool (the paid pool); with "Separate Pro pool" above off and "Put Pro accounts in the Ultra pool" below on, accounts with the Pro tier belong to it too. Point a client at the /ultra prefix (OpenAI: http://host:port/ultra/v1; Anthropic and Gemini: http://host:port/ultra) to have its requests served only by Ultra-pool accounts. Changes apply immediately without a service restart.',
   'settings.ultraExclusive': 'Ultra-pool accounts only serve /ultra requests',
   'settings.ultraExclusiveHelp':
-    'When on (default), normal paths only use the other accounts and Ultra-pool accounts are kept for /ultra. When off, normal paths may also use Ultra-pool accounts; /ultra still uses Ultra-pool accounts only. With the separate Pro pool on, normal paths still never use Pro accounts, so paid models such as gemini-4-argon stay available on the default URL through Ultra accounts instead of only on /pro and /ultra.',
+    'When on (default), normal paths only use the other accounts and Ultra-pool accounts are kept for /ultra. When off, normal paths may also use Ultra-pool accounts; /ultra still uses Ultra-pool accounts only. With the separate Pro pool on, normal paths still never use Pro accounts, so paid models such as gemini-4-argon stay available on the default URL through Ultra accounts instead of only on /pro and /ultra. With the extra pool on, every entry point also borrows extra-pool members of other pools (tier rules still apply).',
   'settings.ultraIncludePro': 'Put Pro accounts in the Ultra pool (paid pool)',
   'settings.ultraIncludeProHelp':
     'Only takes effect while "Separate Pro pool" above is off (PRO_POOL=false). When on, accounts with the Pro tier join Ultra accounts in the Ultra pool and are scheduled by every Ultra-pool setting: they serve the /ultra prefix and appear in its model list, follow "Ultra-pool accounts only serve /ultra requests" above, count toward the Ultra resident and active worker limits below, follow the Ultra primary model list, and count toward the Ultra-pool figures in the sidebar and on the accounts page. Their real tier does not change: the accounts page still shows Pro (with an Ultra pool tag), and model eligibility, input limits and quota sharing still follow Pro. While the setting above is on, normal paths no longer use Pro accounts, the normal pool shrinks accordingly, and gemini-4-argon and the models that need a subscription disappear from the normal-path model list (/v1/models), so clients have to switch to the /ultra prefix. Pro and Ultra share the two worker limits below, whose defaults are small, so raise them; with 1 Ultra resident worker (ULTRA_WARM_WORKER_LIMIT=1) the resident one may be a Pro account rather than an Ultra account, so keep it at 2 or more. Resources do not move, so files and video jobs that already live on a Pro account may need a different entry point after a switch: after turning this on, referencing them through normal paths returns 400 while the setting above is on, so use the /ultra prefix instead (nothing changes while it is off); after turning this off, referencing them through /ultra returns 400, so use normal paths instead. Switch while no video job is in progress. Off by default; changes apply immediately without a service restart, and running workers are recounted in their new partition instead of being restarted.',
@@ -1653,6 +1744,9 @@ const en: Record<TranslationKey, string> = {
   'pool.ultraHelp': 'Sent through the /ultra prefix and served only by Ultra-pool accounts',
   'pool.pro': 'Pro',
   'pool.proHelp': 'Sent through the /pro prefix and served only by Pro-pool accounts',
+  'pool.extra': 'Extra',
+  'pool.extraHelp':
+    'Served by the extra pool: the last attempt borrowed an extra-pool worker (the pool tag still follows the entry point)',
   'models.channels': 'Channels',
   'settings.mediaTitle': 'Generated media output',
   'settings.mediaHelp':
@@ -1738,7 +1832,7 @@ const en: Record<TranslationKey, string> = {
   'playground.poolPro': 'Pro',
   'playground.poolUltra': 'Ultra',
   'playground.poolNormalHelp':
-    'Requests go through the default URL and are served only by normal-pool accounts (Free, Plus); the list only shows models they can use, choose Pro or Ultra for models that need those tiers',
+    'Requests go through the default URL and are served only by normal-pool accounts (Free, Plus; with the extra pool on, extra-pool members of other pools may be borrowed too); the list only shows models they can use, choose Pro or Ultra for models that need those tiers',
   'playground.poolNormalSharedHelp':
     'Requests go through the default URL and are served by normal-pool and Ultra-pool accounts (no Pro accounts, ULTRA_EXCLUSIVE=false)',
   'playground.poolNormalProOffHelp':
@@ -2105,6 +2199,9 @@ const en: Record<TranslationKey, string> = {
   'models.options': 'Options',
   'logs.compact': 'Compact',
   'logs.compactHint': 'Hide worker startup steps and merge repeated messages within a minute into one row',
+  'logs.extraFilter': 'Extra pool only',
+  'logs.extraFilterHelp':
+    'Show only requests served by the extra pool and extra-pool runtime logs (membership, prewarming, takeovers, hand-backs, releases)',
   'logs.shown': 'Showing {shown} / {total}',
   'logs.jumpLatest': 'Jump to latest',
   'logs.detailTitle': 'Log detail',
@@ -2112,6 +2209,9 @@ const en: Record<TranslationKey, string> = {
   'logs.message': 'Message',
   'logs.event': 'Event',
   'requests.filterAll': 'All',
+  'requests.filterExtra': 'Extra pool',
+  'requests.filterExtraHelp':
+    'Show only requests served by the extra pool (the current or last attempt borrowed an extra-pool worker)',
   'cooldowns.search': 'Search model',
   'cooldowns.reason': 'Reason',
   'app.workers': 'Workers {warm} / {target}',
@@ -2174,6 +2274,17 @@ const en: Record<TranslationKey, string> = {
   'app.proWorkers': 'Pro workers {occupied} / {max}',
   'app.proWorkersDetail':
     'Pro partition: {warm} running · {starting} starting · {dead} dead slots · {draining} draining · {unschedulable} unschedulable · prewarm target {target} · limit {max}',
+  'app.extraWorkers':
+    'Extra workers {workers} / {warm} · limit {max} · lendable {lendable} · members {members}',
+  'app.extraWorkersOff': 'Extra pool off · handing back {workers}',
+  'app.extraWorkersDetail':
+    'Extra pool ({state}): mode {mode} · Ultra included {ultra} · paid models on the default URL {paid} · running {running} · starting {starting} · prewarm target {target} · cold members {cold} · members Free {free} / Pro {pro} / Ultra {ultraMembers} · handing back {returning} · borrowed {borrows} times by this process',
+  'app.extraStateOn': 'on',
+  'app.extraStateOff': 'off, handing back',
+  'app.extraModeShare': 'share',
+  'app.extraModeOverflow': 'overflow',
+  'app.extraYes': 'yes',
+  'app.extraNo': 'no',
   'app.proPoolNoticeTitle': 'Separate Pro pool is on by default',
   'app.proPoolNotice':
     '{count} Pro accounts only serve /pro. Suggested workers: Pro {proWarm}/{proMax}, normal {warm}/{max}.',
@@ -2289,6 +2400,17 @@ const en: Record<TranslationKey, string> = {
   'accounts.poolFilterNormal': 'Pool: normal',
   'accounts.poolFilterPro': 'Pool: Pro',
   'accounts.poolFilterUltra': 'Pool: Ultra',
+  'accounts.extraWorker': 'Extra',
+  'accounts.extraWorkerHelp':
+    'This worker counts toward the extra pool: the account has a cooling model while other models work, and the extra pool lends it to every entry point',
+  'accounts.extraMember': 'Member',
+  'accounts.extraMemberHelp':
+    'Extra pool member: a model is cooling down while other models work (the cooling models and their end times are in the cooldown list on the Requests page). The account list follows the latest reconciliation and is not pushed on membership changes',
+  'accounts.extraCount': 'Extra workers {workers} / {warm} · members {members}',
+  'accounts.extraCountOff': 'Extra pool off · handing back {workers}',
+  'accounts.extraCountHelp':
+    'Extra pool (EXTRA_POOL): workers counted in the extra pool against its resident count, and members, the accounts with a cooling model while other models work (including those whose worker stays in a main partition)',
+  'accounts.poolFilterExtra': 'Pool: Extra',
   'accounts.tierFilterPro': 'Tier: Pro',
   'accounts.tierFilterPlus': 'Tier: Plus',
   'accounts.tierFilterFree': 'Tier: Free',
@@ -2484,6 +2606,9 @@ const en: Record<TranslationKey, string> = {
   'usage.recordsCount': '{count} records, newest first',
   'usage.recordsSearch': 'Search request ID, error or reply fingerprint',
   'usage.recordsAllStatus': 'All status codes',
+  'usage.extraFilter': 'Served by the extra pool',
+  'usage.extraFilterHelp':
+    'List only requests whose last attempt borrowed the extra pool (the pool column still follows the entry point); the CSV export keeps the same columns and only these rows',
   'usage.export': 'Export CSV',
   'usage.columns': 'Columns',
   'usage.pageSize': '{count} per page',
@@ -2568,6 +2693,10 @@ const en: Record<TranslationKey, string> = {
     '{ports} ports; at most {need} browsers at once (normal {normal}+{normalDrain}, Ultra {ultra}+{ultraDrain}; the second number is replacements started before draining workers close), {spare} spare, and logins and verifications take ports too (default verification concurrency 3).',
   'settings.proxyPoolCapacityPro':
     '{ports} ports; at most {need} browsers at once (normal {normal}+{normalDrain}, Ultra {ultra}+{ultraDrain}, Pro {pro}+{proDrain}; the second number is replacements started before draining workers close), {spare} spare, and logins and verifications take ports too (default verification concurrency 3).',
+  'settings.proxyPoolCapacityExtra':
+    '{ports} ports; at most {need} browsers at once (normal {normal}+{normalDrain}, Ultra {ultra}+{ultraDrain}, extra pool {extra}+{extraDrain}; the second number is browsers started before draining or replaced workers close), {spare} spare, and logins and verifications take ports too (default verification concurrency 3).',
+  'settings.proxyPoolCapacityProExtra':
+    '{ports} ports; at most {need} browsers at once (normal {normal}+{normalDrain}, Ultra {ultra}+{ultraDrain}, Pro {pro}+{proDrain}, extra pool {extra}+{extraDrain}; the second number is browsers started before draining or replaced workers close), {spare} spare, and logins and verifications take ports too (default verification concurrency 3).',
   'settings.proxyPoolShortage':
     'Fewer ports than browsers that may run at once ({need} needed): the extra browsers share ports (the same IP) with other accounts. Widen the range or lower the peak worker limit or startup concurrency.',
   'settings.proxyPoolTight':

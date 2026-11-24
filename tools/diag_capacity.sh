@@ -17,7 +17,7 @@ AUTH="${AUTH:-auth}"
 case "$AUTH" in /*) ;; *) AUTH="$APP_DIR/$AUTH" ;; esac
 
 echo "==================== 0. 相关设置（.env 里没写的按默认值） ===================="
-grep -E '^(ROUTING_STRATEGY|REQUEST_TIMEOUT|FIRST_EVENT_TIMEOUT|INIT_TIMEOUT|WARM_STARTUP_CONCURRENCY|WARM_WORKER_LIMIT|MAX_ACTIVE_WORKERS|ULTRA_WARM_WORKER_LIMIT|ULTRA_MAX_ACTIVE_WORKERS|PER_ACCOUNT_CONCURRENCY|ACCOUNT_RPM_LIMIT|PRIMARY_MODELS|PRIMARY_QUEUE_WAIT|ULTRA_PRIMARY_MODELS|ULTRA_PRIMARY_QUEUE_WAIT|ULTRA_INCLUDE_PRO|ULTRA_EXCLUSIVE|PRO_POOL|PRO_WARM_WORKER_LIMIT|PRO_MAX_ACTIVE_WORKERS)=' .env 2>/dev/null | sed 's/^/  /'
+grep -E '^(ROUTING_STRATEGY|REQUEST_TIMEOUT|FIRST_EVENT_TIMEOUT|INIT_TIMEOUT|WARM_STARTUP_CONCURRENCY|WARM_WORKER_LIMIT|MAX_ACTIVE_WORKERS|ULTRA_WARM_WORKER_LIMIT|ULTRA_MAX_ACTIVE_WORKERS|PER_ACCOUNT_CONCURRENCY|ACCOUNT_RPM_LIMIT|PRIMARY_MODELS|PRIMARY_QUEUE_WAIT|ULTRA_PRIMARY_MODELS|ULTRA_PRIMARY_QUEUE_WAIT|ULTRA_INCLUDE_PRO|ULTRA_EXCLUSIVE|PRO_POOL|PRO_WARM_WORKER_LIMIT|PRO_MAX_ACTIVE_WORKERS|EXTRA_POOL|EXTRA_POOL_MODE|EXTRA_POOL_DEFAULT_PAID|EXTRA_POOL_INCLUDE_ULTRA|EXTRA_WARM_WORKER_LIMIT|EXTRA_MAX_ACTIVE_WORKERS)=' .env 2>/dev/null | sed 's/^/  /'
 git log --oneline -1 2>/dev/null | cut -c1-7 | sed 's/^/  版本：/'
 
 for path in status accounts cooldowns accounts/permission-denied; do
@@ -282,6 +282,18 @@ for key, name in (("workers", "普通"), ("ultra_workers", "Ultra"), ("pro_worke
     part = status.get(key) or {}
     if part.get("max"):
         print(f"  {name} 分区 Worker：就绪 {part.get('warm')} / 预热目标 {part.get('target')} / 峰值 {part.get('max')}")
+# 补充池（EXTRA_POOL）：开启，或关闭后仍有补充池 Worker 在归还时状态接口才有 extra_pool；上面各分区的计数不含补充池 Worker
+extra = status.get("extra_pool")
+if extra:
+    part = extra.get("workers") or {}
+    mode = "一起分担" if extra.get("mode") != "overflow" else "不够时才补"
+    print(f"  补充池（{'开启' if extra.get('enabled') else '已关闭，等待归还'}，{mode}）Worker：就绪 {part.get('warm')} / 启动中 {part.get('starting')}"
+          f" / 预热目标 {part.get('target')} / 常驻 {part.get('warm_limit')} / 峰值 {part.get('max')}")
+    print(f"    成员 {extra.get('members')}（Free {extra.get('free')} · Pro {extra.get('pro')} · Ultra {extra.get('ultra')}，冷成员 {extra.get('cold_members')}）"
+          f"，可借出 {extra.get('lendable')}，归还中 {extra.get('returning')}，本进程借出 {extra.get('borrows')} 次")
+    extra_ids = set((status.get("workers") or {}).get("extra_ids") or [])
+    if extra_ids:
+        print("    补充池 Worker 按权益：" + str(dict(collections.Counter(tier(a) for a in extra_ids))))
 for model in ("gemini-3.1-pro-preview", "gemini-4-carbon"):
     usable = collections.Counter((tier(a.get("id")), a.get("state")) for a in accounts if model in (a.get("models") or []))
     print(f"  目录里有 {model} 的账号（权益, 状态）：" + (", ".join(f"{t}/{s} {n}" for (t, s), n in usable.most_common(12)) or "无"))

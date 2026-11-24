@@ -7,6 +7,7 @@ import {
   DEFAULT_PROXY_POOL_PORT_END,
   DEFAULT_PROXY_POOL_PORT_START,
   cloneProxyPool,
+  drainLimitFor,
   formatClock,
   proxyPoolProblem,
   proxyPoolProblemKey,
@@ -64,6 +65,12 @@ type EditableKey =
   | 'pro_pool'
   | 'pro_warm_worker_limit'
   | 'pro_max_active_workers'
+  | 'extra_pool'
+  | 'extra_pool_mode'
+  | 'extra_pool_default_paid'
+  | 'extra_pool_include_ultra'
+  | 'extra_warm_worker_limit'
+  | 'extra_max_active_workers'
   | 'ultra_only_models'
   | 'paid_only_models'
   | 'ultra_warm_worker_limit'
@@ -114,6 +121,12 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'pro_pool',
   'pro_warm_worker_limit',
   'pro_max_active_workers',
+  'extra_pool',
+  'extra_pool_mode',
+  'extra_pool_default_paid',
+  'extra_pool_include_ultra',
+  'extra_warm_worker_limit',
+  'extra_max_active_workers',
   'ultra_only_models',
   'paid_only_models',
   'ultra_warm_worker_limit',
@@ -264,6 +277,12 @@ const form = reactive<ServiceConfig>({
   pro_pool: true,
   pro_warm_worker_limit: 2,
   pro_max_active_workers: 5,
+  extra_pool: false,
+  extra_pool_mode: 'share',
+  extra_pool_default_paid: true,
+  extra_pool_include_ultra: false,
+  extra_warm_worker_limit: 40,
+  extra_max_active_workers: 50,
   ultra_only_models: [...DEFAULT_ULTRA_ONLY_MODELS],
   paid_only_models: [...DEFAULT_PAID_ONLY_MODELS],
   ultra_warm_worker_limit: 2,
@@ -743,6 +762,17 @@ function validate(value: ServiceConfig): string {
   if (!isPositiveInteger(value.pro_max_active_workers) || value.pro_max_active_workers < proWarm) {
     return t('settings.invalidProMaxWorkers')
   }
+  // 补充池常驻数与峰值的规则同上（关闭补充池时照样校验，与服务端一致）
+  const extraWarm = value.extra_warm_worker_limit
+  if (typeof extraWarm !== 'number' || !Number.isInteger(extraWarm) || extraWarm < 0) {
+    return t('settings.invalidExtraWarmWorkers')
+  }
+  if (
+    !isPositiveInteger(value.extra_max_active_workers) ||
+    value.extra_max_active_workers < extraWarm
+  ) {
+    return t('settings.invalidExtraMaxWorkers')
+  }
   if (!isMediaBaseURL(value.media_base_url)) return t('settings.invalidMediaBaseURL')
   const retention = mediaRetentionMillis(value.media_retention)
   if (Number.isNaN(retention) || (retention > 0 && retention < MIN_MEDIA_RETENTION_MS)) {
@@ -811,6 +841,32 @@ const ultraMaxFloor = computed(() =>
 const proMaxFloor = computed(() =>
   typeof form.pro_warm_worker_limit === 'number' ? Math.max(1, form.pro_warm_worker_limit) : 1,
 )
+// extraMaxFloor 为补充池峰值输入框的下限：至少为 1，且不小于补充池常驻数
+const extraMaxFloor = computed(() =>
+  typeof form.extra_warm_worker_limit === 'number' ? Math.max(1, form.extra_warm_worker_limit) : 1,
+)
+// extraWorkersError 为补充池两个 Worker 数的错误（显示在分组里，与保存时的校验同一口径）
+const extraWorkersError = computed(() => {
+  const warm = form.extra_warm_worker_limit
+  if (typeof warm !== 'number' || !Number.isInteger(warm) || warm < 0) {
+    return t('settings.invalidExtraWarmWorkers')
+  }
+  if (!isPositiveInteger(form.extra_max_active_workers) || form.extra_max_active_workers < warm) {
+    return t('settings.invalidExtraMaxWorkers')
+  }
+  return ''
+})
+// extraResource 为开启补充池时的资源估算：峰值加替换余量（与 IP 池容量同一公式）个浏览器，每个约 0.6GB 内存
+const extraResource = computed(() => {
+  const max = form.extra_max_active_workers
+  if (!form.extra_pool || !isPositiveInteger(max)) return null
+  const concurrency = isPositiveInteger(form.warm_startup_concurrency)
+    ? form.warm_startup_concurrency
+    : 1
+  const drain = drainLimitFor(max, concurrency)
+  const browsers = max + drain
+  return { max, drain, browsers, memory: Math.round(browsers * 0.6) }
+})
 
 // payload 构造保存内容；自动保存时所有失焦字段沿用已保存的值，避免把输入到一半的内容写进去
 function payload(includeBlurFields: boolean): ServiceConfig {
@@ -1292,6 +1348,8 @@ onBeforeUnmount(() => {
         :ultra-max-active="form.ultra_max_active_workers"
         :pro-max-active="form.pro_max_active_workers"
         :pro-counted="form.pro_pool && (proAccounts ?? 0) > 0"
+        :extra-max-active="form.extra_max_active_workers"
+        :extra-counted="form.extra_pool"
         :warm-concurrency="form.warm_startup_concurrency"
         :has-default-proxy="form.proxy.trim() !== ''"
         :server-error="proxyPoolServerError"
@@ -1685,6 +1743,157 @@ onBeforeUnmount(() => {
           </label>
         </div>
         <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.ultraWorkersHelp')" />
+      </fieldset>
+
+      <fieldset
+        class="block rounded-lg border border-emerald-500/30 bg-[#161b22] p-4"
+        data-testid="settings-extra-pool"
+      >
+        <legend class="sr-only">{{ t('settings.extraTitle') }}</legend>
+        <div class="mb-1 flex flex-wrap items-center gap-2">
+          <span class="tag tag-extra">{{ t('pool.extra') }}</span>
+          <span class="text-sm font-medium text-gray-300">{{ t('settings.extraTitle') }}</span>
+        </div>
+        <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.extraHelp')" />
+        <HelpField>
+          <label class="flex items-start gap-3">
+            <input
+              v-model="form.extra_pool"
+              class="mt-0.5 h-4 w-4 accent-blue-500"
+              type="checkbox"
+              data-testid="extra-pool-toggle"
+            />
+            <span>
+              <span class="block text-sm font-medium text-gray-300">{{
+                t('settings.extraPool')
+              }}</span>
+              <HelpText
+                class="mt-1 block text-xs text-gray-500"
+                :text="t('settings.extraPoolHelp')"
+              />
+            </span>
+          </label>
+        </HelpField>
+        <p
+          v-if="!form.extra_pool"
+          class="mt-3 rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-xs leading-5 text-gray-400"
+          role="note"
+          data-testid="extra-pool-off-note"
+        >
+          {{ t('settings.extraOffNote') }}
+        </p>
+        <p
+          v-else-if="extraResource !== null"
+          class="mt-3 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs leading-5 text-amber-200"
+          role="note"
+          data-testid="extra-pool-resource"
+        >
+          {{ tf('settings.extraResourceHint', extraResource) }}
+        </p>
+        <div
+          class="mt-4 space-y-4 border-t border-[#30363d] pt-4"
+          :class="form.extra_pool ? '' : 'opacity-70'"
+        >
+          <HelpField>
+            <div role="radiogroup" :aria-label="t('settings.extraPoolMode')">
+              <span class="mb-2 block text-sm font-medium text-gray-400">{{
+                t('settings.extraPoolMode')
+              }}</span>
+              <div class="flex flex-wrap gap-x-6 gap-y-2">
+                <label class="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    v-model="form.extra_pool_mode"
+                    class="h-4 w-4 accent-blue-500"
+                    type="radio"
+                    value="share"
+                    name="extra-pool-mode"
+                  />
+                  {{ t('settings.extraModeShare') }}
+                </label>
+                <label class="flex items-center gap-2 text-sm text-gray-300">
+                  <input
+                    v-model="form.extra_pool_mode"
+                    class="h-4 w-4 accent-blue-500"
+                    type="radio"
+                    value="overflow"
+                    name="extra-pool-mode"
+                  />
+                  {{ t('settings.extraModeOverflow') }}
+                </label>
+              </div>
+              <HelpText
+                class="mt-2 block text-xs text-gray-500"
+                :text="t('settings.extraModeHelp')"
+              />
+            </div>
+          </HelpField>
+          <HelpField>
+            <label class="flex items-start gap-3">
+              <input
+                v-model="form.extra_pool_default_paid"
+                class="mt-0.5 h-4 w-4 accent-blue-500"
+                type="checkbox"
+              />
+              <span>
+                <span class="block text-sm font-medium text-gray-300">{{
+                  t('settings.extraDefaultPaid')
+                }}</span>
+                <HelpText
+                  class="mt-1 block text-xs text-gray-500"
+                  :text="t('settings.extraDefaultPaidHelp')"
+                />
+              </span>
+            </label>
+          </HelpField>
+          <HelpField>
+            <label class="flex items-start gap-3">
+              <input
+                v-model="form.extra_pool_include_ultra"
+                class="mt-0.5 h-4 w-4 accent-blue-500"
+                type="checkbox"
+              />
+              <span>
+                <span class="block text-sm font-medium text-gray-300">{{
+                  t('settings.extraIncludeUltra')
+                }}</span>
+                <HelpText
+                  class="mt-1 block text-xs text-gray-500"
+                  :text="t('settings.extraIncludeUltraHelp')"
+                />
+              </span>
+            </label>
+          </HelpField>
+          <div class="grid grid-cols-1 gap-4 md:grid-cols-2">
+            <label class="block">
+              <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                t('settings.extraWarmWorkerLimit')
+              }}</span>
+              <input
+                v-model.number="form.extra_warm_worker_limit"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="number"
+                min="0"
+                required
+              />
+            </label>
+            <label class="block">
+              <span class="mb-1 block text-sm font-medium text-gray-400">{{
+                t('settings.extraMaxActiveWorkers')
+              }}</span>
+              <input
+                v-model.number="form.extra_max_active_workers"
+                class="w-full rounded border border-[#30363d] bg-[#0d1117] px-3 py-2 text-white transition focus:border-blue-500 focus:outline-none"
+                type="number"
+                :min="extraMaxFloor"
+                required
+              />
+            </label>
+          </div>
+          <p v-if="extraWorkersError !== ''" class="text-xs text-red-400" role="alert">
+            {{ extraWorkersError }}
+          </p>
+          <HelpText class="block text-xs text-gray-500" :text="t('settings.extraWorkersHelp')" />
+        </div>
       </fieldset>
 
       <HelpField class="rounded-lg border border-[#30363d] bg-[#161b22] p-4">

@@ -341,7 +341,7 @@ func (manager *accountWorkerManager) retirePass() int {
 	sort.Slice(candidates, func(left int, right int) bool {
 		return candidates[left].entry.since.Before(candidates[right].entry.since)
 	})
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	warm := manager.WarmAccountIDs()
 	opening := manager.OpeningAccountIDs()
 	// 各登记账号是否忙碌一次加锁取得（keepWarm 补登记后登记可能有上百条，逐条查询要对账户池加锁上百次）；
@@ -374,6 +374,8 @@ func (manager *accountWorkerManager) retirePass() int {
 		for _, id := range inPartition(opening, members, partition) {
 			held[id] = struct{}{}
 		}
+		// 补充池 Worker 的账户（家分区可能就是这个分区）已占着槽位，不算可接替的备用号（见 excludeExtraOwned）
+		manager.excludeExtraOwned(held)
 		occupied[partition] = held
 		return held
 	}
@@ -411,6 +413,12 @@ func (manager *accountWorkerManager) retirePass() int {
 			release.rotation, release.rotationSoft = false, false
 		}
 		candidate.entry = release
+		// 补充池 Worker（叠加视图里计在补充池，见 extra_pool.go）不走冷却淘汰与平均调用轮换：它们本来就是部分冷却的账号，由补充池对账归还或释放。
+		// 先登记、后被补充池接手的登记直接放弃；不可调度的照常释放
+		if !unschedulable && candidate.partition == aistudio.PoolScopeExtra {
+			manager.dropRetirement(accountID)
+			continue
+		}
 		if unschedulable {
 			if manager.workerStarting(account, accountID) || states[accountID].Busy || !manager.tryReserveVictim(accountID) {
 				continue
@@ -567,9 +575,10 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 			drained = fmt.Sprintf(" | 排空=%s", victim.drain.age(time.Now()).Round(time.Millisecond))
 		}
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
-			"WAA Worker 冷却淘汰 | 范围=%s | 登记后=%s%s | %s=%d/%d",
+			"WAA Worker 冷却淘汰 | 范围=%s | 登记后=%s%s | %s=%d/%d%s",
 			victim.entry.scopeLabel(), time.Since(victim.entry.since).Round(time.Millisecond), drained,
 			workerSlotName(victim.partition), len(manager.warmAccountIDsIn(victim.partition)), manager.maxActiveFor(victim.partition),
+			manager.handOffSuffix(accountID),
 		))
 		if refill := manager.afterRetire.Load(); refill != nil {
 			(*refill)()
@@ -583,6 +592,8 @@ func (manager *accountWorkerManager) finishRetirement(victim retirementCandidate
 // 出口限流时预热走补位路径，只受补位并发约束
 func (manager *accountWorkerManager) finishRelease(victim retirementCandidate) {
 	accountID := victim.accountID
+	// 补充池 Worker 关闭后标记随之去掉：日志的槽位名按关闭前的叠加视图写（补充池 Worker=n/峰值）
+	extra := manager.extraOwnedHas(accountID)
 	evicted, err := manager.evictIdleWorkerFor(manager.lifecycle, accountID, workerStopUnschedulable)
 	manager.releaseVictim(accountID)
 	switch {
@@ -595,6 +606,9 @@ func (manager *accountWorkerManager) finishRelease(victim retirementCandidate) {
 	default:
 		manager.dropRetirement(accountID)
 		partition := partitionOf(accountID, manager.pool.PartitionMembers())
+		if extra {
+			partition = aistudio.PoolScopeExtra
+		}
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"WAA Worker 释放 | 原因=%s | 登记后=%s | %s=%d/%d",
 			victim.entry.unschedulable, time.Since(victim.entry.since).Round(time.Millisecond),
@@ -625,6 +639,10 @@ func (service *trackedService) retireCooledWorker(accountID string, modelID stri
 	if service.workers == nil || time.Until(cooldown.Until) < rotationMinRemaining {
 		return
 	}
+	// 补充池 Worker 不登记冷却淘汰：它的去留由补充池对账决定（见 extra_pool.go 的 extraPass）
+	if service.workers.extraOwnedHas(accountID) {
+		return
+	}
 	scope := modelID
 	if cooldown.Global {
 		scope = ""
@@ -646,7 +664,7 @@ func (service *trackedService) registerDeadWorkers() int {
 		return 0
 	}
 	allWarm := workers.WarmAccountIDs()
-	members := service.pool.PartitionMembers()
+	members := service.workers.slotMembers()
 	added, deadTotal := 0, 0
 	var logged []string
 	for _, partition := range workerPartitions {
@@ -776,7 +794,7 @@ func (manager *accountWorkerManager) replaceVictimFor(excludeID string, modelID 
 
 // openingInSet 返回分区内是否有 Worker 正在启动（读无锁镜像 openingSet）
 func (manager *accountWorkerManager) openingInSet(partition aistudio.PoolScope) bool {
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	opening := false
 	manager.openingSet.Range(func(key, _ any) bool {
 		if accountID, ok := key.(string); ok && partitionOf(accountID, members) == partition {
@@ -850,8 +868,10 @@ func (manager *accountWorkerManager) pickIdleVictimWith(
 			continue
 		}
 		cleanupPending := accountWorkerCleanupPending(account)
+		// 补充池 Worker 在选号快照之后关闭、已改记家分区的不作为候选（见 extraSlotMoved；没有补充池时恒为假）
+		moved := manager.extraSlotMoved(account, partition)
 		account.mu.Unlock()
-		if cleanupPending {
+		if cleanupPending || moved {
 			continue
 		}
 		candidates = append(candidates, accountID)
@@ -927,8 +947,9 @@ func (manager *accountWorkerManager) reclaimDeadWorker(ctx context.Context, part
 	}
 	manager.dropRetirement(victim)
 	manager.requests.log(victim, "INFO", fmt.Sprintf(
-		"WAA Worker 回收冷却占位 | 模型=%s | %s=%d/%d",
+		"WAA Worker 回收冷却占位 | 模型=%s | %s=%d/%d%s",
 		modelID, workerSlotName(partition), len(manager.warmAccountIDsIn(partition)), manager.maxActiveFor(partition),
+		manager.handOffSuffix(victim),
 	))
 	return victim, nil
 }

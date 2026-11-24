@@ -214,6 +214,21 @@ func TestUsageRecordQueryParsing(t *testing.T) {
 	}
 }
 
+// TestUsageRecordQueryExtra 记录查询只认 extra=1 为“只看由补充池服务”；不带、extra=0 与其他取值都与不带相同（不报 400）
+func TestUsageRecordQueryExtra(t *testing.T) {
+	for suffix, want := range map[string]bool{"": false, "&extra=1": true, "&extra=0": false, "&extra=yes": false} {
+		ledger := &fakeLedger{}
+		recorder := adminGet(ledgerTestHandler(ledger), "/api/usage/records?"+usageRange()+suffix)
+		if recorder.Code != http.StatusOK || len(ledger.records) != 1 || ledger.records[0].Extra != want {
+			t.Fatalf("%q：status=%d、查询 %+v，期望 extra=%t", suffix, recorder.Code, ledger.records, want)
+		}
+	}
+	data, err := json.Marshal(UsageRecord{ID: "r"})
+	if err != nil || strings.Contains(string(data), `"extra"`) {
+		t.Fatalf("没有由补充池服务的记录不应输出 extra：%s", data)
+	}
+}
+
 // TestUsageExportErrors 导出在写出之前失败时返回 JSON 错误；写出之后失败只能中断下载
 func TestUsageExportErrors(t *testing.T) {
 	failing := ledgerTestHandler(&fakeLedger{exportErr: errors.New("磁盘错误")})

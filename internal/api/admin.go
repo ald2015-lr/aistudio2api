@@ -81,6 +81,8 @@ type AdminStatus struct {
 	Drive *AdminDriveCounts `json:"drive,omitempty"`
 	// Balanced 为平均调用（ROUTING_STRATEGY=balanced）的概况（见 AdminBalanced）：开启且服务运行时才有
 	Balanced *AdminBalanced `json:"balanced,omitempty"`
+	// ExtraPool 为补充池（EXTRA_POOL，见 AdminExtraPool）；EXTRA_POOL=false 且没有补充池 Worker 时为空（不输出）
+	ExtraPool *AdminExtraPool `json:"extra_pool,omitempty"`
 	// Transition 为生成服务正在进行的启动或停止步骤，没有时省略。
 	// 启动：prepare_catalog 准备模型目录，wait_catalog 等待首个账户读取模型目录（没有目录缓存时），start_prewarm 开始后台预热 WAA Worker
 	// （首轮预热不等结果，服务随即进入运行，预热进度见 Workers.Prewarm）；
@@ -108,6 +110,27 @@ type AdminBalanced struct {
 	Pro            *AdminBalancedPartition `json:"pro,omitempty"`
 	Rotations1h    int                     `json:"rotations_1h"`
 	RotationsToday int                     `json:"rotations_today"`
+}
+
+// AdminExtraPool 为补充池（额外浏览器号池）的概况。Mode 为 share（与主号池一起分担）或 overflow（主号池不够时才补）；
+// Members 为最近一次对账（约每 5 秒）按进入口径的成员数（含已有 Worker 的），Free（含 Plus 与权益尚未识别的）、Pro、Ultra 为其中各权益的个数，
+// ColdMembers 为其中没有 Worker、也不在启动中的；Lendable 为补充池 Worker 中仍是成员、可以借出的个数，Returning 为已不是成员、
+// 等待归还或释放的个数；Borrows 为本进程借出次数。Workers 为补充池 Worker 的计数（Target 为常驻数与成员数取小），
+// Dead、Draining、Retiring 恒为 0（补充池 Worker 不登记淘汰、不排空）
+type AdminExtraPool struct {
+	Enabled      bool                 `json:"enabled"`
+	Mode         string               `json:"mode"`
+	DefaultPaid  bool                 `json:"default_paid"`
+	IncludeUltra bool                 `json:"include_ultra"`
+	Members      int                  `json:"members"`
+	Free         int                  `json:"free"`
+	Pro          int                  `json:"pro"`
+	Ultra        int                  `json:"ultra"`
+	ColdMembers  int                  `json:"cold_members"`
+	Lendable     int                  `json:"lendable"`
+	Returning    int                  `json:"returning"`
+	Borrows      int64                `json:"borrows"`
+	Workers      AdminWorkerPartition `json:"workers"`
 }
 
 // AdminProPoolNotice 为 PRO_POOL 默认开启的升级提示：升级前 Pro 账户留在默认地址（或经 ULTRA_INCLUDE_PRO 并入 /ultra），
@@ -331,6 +354,8 @@ type AdminWorkerCounts struct {
 	// Unschedulable 为驻留 Worker 中账号已不能服务任何模型的（需要登录、已停用、不可用、组织停用、需要验证账号的整户暂停中、没有可初始化模型），等待释放；
 	// 单个模型需要验证账号的暂停不算（账号其他模型照常调度，Worker 不释放）
 	Unschedulable int `json:"unschedulable"`
+	// ExtraIDs 为 WarmIDs、StartingIDs 中计入补充池的账户（带补充池标记，见 AdminExtraPool）；没有时省略
+	ExtraIDs []string `json:"extra_ids,omitempty"`
 }
 
 // AdminLog 表示管理页面展示的一条运行日志
@@ -361,6 +386,8 @@ type RequestLog struct {
 	ServedModel string `json:"served_model,omitempty"`
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时不出现
 	FallbackFrom string `json:"fallback_from,omitempty"`
+	// Extra 为请求由补充池服务（EXTRA_POOL：最后一次尝试的租约借自补充池）；其余请求不出现
+	Extra bool `json:"extra,omitempty"`
 	// RequestedModel 只在 request.finished 里、客户端请求的模型名与最终的 Model 不同时出现（请求了目录别名、经 MODEL_FALLBACKS 改用等），
 	// 与同一请求 request.started 的 model 含义相同
 	RequestedModel string `json:"requested_model,omitempty"`
@@ -463,7 +490,9 @@ type AccessLog struct {
 	Downgrade       *aistudio.DowngradeDecision
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后实际使用的模型；没有改用时为空
 	FallbackFrom string
-	Error        string
+	// Extra 为请求由补充池服务（最后一次尝试的租约借自补充池，见 SetAccessLogExtra）
+	Extra bool
+	Error string
 	// TrailingError 为上游在已交给客户端的函数调用之后结束生成的原因（流尾错误、流中断、拦截请求、内容策略类结束原因）：请求按正常完成
 	// 记录（Error 为空、状态不变），原因写进请求日志与用量账本的错误详情
 	TrailingError string
@@ -514,6 +543,9 @@ type AdminAccount struct {
 	// Pool 为账户当前所属的号池（成员关系）：ultra（权益为 Ultra，PRO_POOL=false、ULTRA_INCLUDE_PRO=true 时也含 Pro）、
 	// pro（PRO_POOL=true 时权益为 Pro）或 normal；benefit_tier 始终是账户的真实权益，并入 Ultra 号池的 Pro 账户仍显示 Pro
 	Pool string `json:"pool"`
+	// Extra 为账户与补充池（EXTRA_POOL）的关系：worker 为 Worker 计入补充池（含启动中），member 为补充池成员（有模型冷却、
+	// 其他模型可用；Worker 驻留在主分区或没有 Worker）；其余账户不出现。按最近一次对账的成员缓存，账户列表不随成员变化推送
+	Extra string `json:"extra,omitempty"`
 	// Authenticated 与 VerifyReason 只在验证接口的返回里填写：验证结论（浏览器已登录且接口复核通过才为 true）与它的原因。
 	// 停用账户的状态始终是 disabled，前端按 Authenticated 计“有效 / 登录失效”，不能看状态或 HTTP 200
 	Authenticated *bool  `json:"authenticated,omitempty"`
@@ -637,6 +669,15 @@ type RuntimeConfig struct {
 	ProPool             *bool `json:"pro_pool,omitempty"`
 	ProWarmWorkerLimit  *int  `json:"pro_warm_worker_limit,omitempty"`
 	ProMaxActiveWorkers *int  `json:"pro_max_active_workers,omitempty"`
+	// ExtraPool、ExtraPoolMode、ExtraPoolDefaultPaid、ExtraPoolIncludeUltra、ExtraWarmWorkerLimit、ExtraMaxActiveWorkers 为补充池设置
+	// （EXTRA_POOL、EXTRA_POOL_MODE、EXTRA_POOL_DEFAULT_PAID、EXTRA_POOL_INCLUDE_ULTRA、EXTRA_WARM_WORKER_LIMIT、EXTRA_MAX_ACTIVE_WORKERS），
+	// 保存后立即生效；读取时总是返回，保存时没有这些字段（旧版页面）则沿用现值（false 与 0 都是有效值，用指针区分缺省）
+	ExtraPool             *bool   `json:"extra_pool,omitempty"`
+	ExtraPoolMode         *string `json:"extra_pool_mode,omitempty"`
+	ExtraPoolDefaultPaid  *bool   `json:"extra_pool_default_paid,omitempty"`
+	ExtraPoolIncludeUltra *bool   `json:"extra_pool_include_ultra,omitempty"`
+	ExtraWarmWorkerLimit  *int    `json:"extra_warm_worker_limit,omitempty"`
+	ExtraMaxActiveWorkers *int    `json:"extra_max_active_workers,omitempty"`
 	// UltraOnlyModels、PaidOnlyModels 为权益规则（ULTRA_ONLY_MODELS：只有 Ultra 能用的模型；PAID_ONLY_MODELS：只有 Pro 与 Ultra 能用的模型），
 	// 保存后立即生效；读取时总是返回（可以为空数组），保存时没有这些字段（旧版页面）则沿用现值
 	UltraOnlyModels *[]string `json:"ultra_only_models,omitempty"`
@@ -824,6 +865,8 @@ type AdminRequest struct {
 	Pool string `json:"pool,omitempty"`
 	// FallbackFrom 为额度用完改用其他模型（MODEL_FALLBACKS）前的模型，Model 为改用后的模型；没有改用时为空
 	FallbackFrom string `json:"fallback_from,omitempty"`
+	// Extra 为这次尝试的租约借自补充池（EXTRA_POOL）；其余请求不出现
+	Extra bool `json:"extra,omitempty"`
 }
 
 // AdminEvent 表示管理端增量事件

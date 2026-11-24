@@ -20,8 +20,21 @@ const recordColumns = `r.id, r.time, r.protocol, r.path, r.model, r.account, r.c
  r.tool_calls, r.error, r.attempts, r.served_model, r.downgrade, r.reply_hash, r.duplicate, r.pool,
  EXISTS(SELECT 1 FROM bodies b WHERE b.id = r.id)`
 
-// recordFilter 返回请求记录的范围、维度筛选、状态码与关键字条件；关键字匹配请求 ID 与错误，或等于回复指纹（列出同一回复的全部请求）
-func recordFilter(query api.UsageRecordQuery) (string, []any) {
+// extraJoin 是附表 extra_served 存在时记录查询的来源：LEFT JOIN 后多读一列“由补充池服务”（放在 recordColumns 之后）
+const extraJoin = ` FROM requests r LEFT JOIN extra_served e ON e.id = r.id`
+
+// recordSource 返回记录查询读取的列与来源，joined 表示 JOIN 了附表（scanRecord 要多读一列）；
+// empty 表示按“由补充池服务”筛选、而附表还不存在，结果必为空，调用方不必查询
+func (store *Store) recordSource(query api.UsageRecordQuery) (columns string, joined bool, empty bool) {
+	if !store.extraTable.Load() {
+		return recordColumns + ` FROM requests r`, false, query.Extra
+	}
+	return recordColumns + `, e.id IS NOT NULL` + extraJoin, true, false
+}
+
+// recordFilter 返回请求记录的范围、维度筛选、状态码与关键字条件；关键字匹配请求 ID 与错误，或等于回复指纹（列出同一回复的全部请求）。
+// joined 为真且按“由补充池服务”筛选时，只留附表里有的记录
+func recordFilter(query api.UsageRecordQuery, joined bool) (string, []any) {
 	clause, args := filterSQL(query.Filters)
 	clause = ` WHERE r.time >= ? AND r.time < ?` + strings.ReplaceAll(clause, " AND ", " AND r.")
 	args = append([]any{query.From.UnixMilli(), query.To.UnixMilli()}, args...)
@@ -34,18 +47,25 @@ func recordFilter(query api.UsageRecordQuery) (string, []any) {
 		clause += ` AND (r.id LIKE ? ESCAPE '\' OR r.error LIKE ? ESCAPE '\' OR r.reply_hash = ?)`
 		args = append(args, pattern, pattern, query.Search)
 	}
+	if joined && query.Extra {
+		clause += ` AND e.id IS NOT NULL`
+	}
 	return clause, args
 }
 
-// scanRecord 读取一条请求记录
-func scanRecord(rows *sql.Rows) (api.UsageRecord, error) {
+// scanRecord 读取一条请求记录；joined 为真时最后多一列“由补充池服务”
+func scanRecord(rows *sql.Rows, joined bool) (api.UsageRecord, error) {
 	var record api.UsageRecord
 	var at int64
 	var attempts, pool string
-	err := rows.Scan(&record.ID, &at, &record.Protocol, &record.Path, &record.Model, &record.Account, &record.Channel,
+	targets := []any{&record.ID, &at, &record.Protocol, &record.Path, &record.Model, &record.Account, &record.Channel,
 		&record.Status, &record.State, &record.DurationMS, &record.FirstEventMS, &record.QueueMS, &record.InputTokens,
 		&record.ReasoningTokens, &record.ReplyTokens, &record.TotalTokens, &record.ToolCalls, &record.Error, &attempts,
-		&record.ServedModel, &record.Downgrade, &record.ReplyHash, &record.Duplicate, &pool, &record.HasBody)
+		&record.ServedModel, &record.Downgrade, &record.ReplyHash, &record.Duplicate, &pool, &record.HasBody}
+	if joined {
+		targets = append(targets, &record.Extra)
+	}
+	err := rows.Scan(targets...)
 	if err != nil {
 		return record, err
 	}
@@ -62,19 +82,23 @@ func (store *Store) Records(ctx context.Context, query api.UsageRecordQuery) (ap
 	if query.Limit <= 0 {
 		query.Limit = 50
 	}
-	clause, args := recordFilter(query)
+	source, joined, empty := store.recordSource(query)
+	page := api.UsageRecordPage{Items: []api.UsageRecord{}}
+	if empty {
+		return page, nil
+	}
+	clause, args := recordFilter(query, joined)
 	if before := query.Before; before != nil {
 		clause += ` AND (r.time < ? OR r.time = ? AND r.id < ?)`
 		args = append(args, before.Time.UnixMilli(), before.Time.UnixMilli(), before.ID)
 	}
-	rows, err := store.db.QueryContext(ctx, `SELECT `+recordColumns+` FROM requests r`+clause+
+	rows, err := store.db.QueryContext(ctx, `SELECT `+source+clause+
 		` ORDER BY r.time DESC, r.id DESC LIMIT ?`, append(args, query.Limit+1)...)
 	if err != nil {
 		return api.UsageRecordPage{}, err
 	}
-	page := api.UsageRecordPage{Items: []api.UsageRecord{}}
 	for rows.Next() {
-		record, err := scanRecord(rows)
+		record, err := scanRecord(rows, joined)
 		if err != nil {
 			return api.UsageRecordPage{}, errors.Join(err, rows.Close())
 		}
@@ -106,10 +130,23 @@ func csvText(value string) string {
 	return value
 }
 
-// ExportRecords 以带 BOM 的 UTF-8 CSV 按完成时间倒序写出范围内全部符合条件的请求记录
+// ExportRecords 以带 BOM 的 UTF-8 CSV 按完成时间倒序写出范围内全部符合条件的请求记录。CSV 的列不含“由补充池服务”，
+// 按它筛选时只影响导出哪些行（附表还不存在时只有表头）
 func (store *Store) ExportRecords(ctx context.Context, query api.UsageRecordQuery, output io.Writer) error {
-	clause, args := recordFilter(query)
-	rows, err := store.db.QueryContext(ctx, `SELECT `+recordColumns+` FROM requests r`+clause+` ORDER BY r.time DESC, r.id DESC`, args...)
+	source, joined, empty := store.recordSource(query)
+	if empty {
+		if _, err := io.WriteString(output, "\xef\xbb\xbf"); err != nil {
+			return err
+		}
+		writer := csv.NewWriter(output)
+		if err := writer.Write(csvHeader); err != nil {
+			return err
+		}
+		writer.Flush()
+		return writer.Error()
+	}
+	clause, args := recordFilter(query, joined)
+	rows, err := store.db.QueryContext(ctx, `SELECT `+source+clause+` ORDER BY r.time DESC, r.id DESC`, args...)
 	if err != nil {
 		return err
 	}
@@ -121,7 +158,7 @@ func (store *Store) ExportRecords(ctx context.Context, query api.UsageRecordQuer
 		return errors.Join(err, rows.Close())
 	}
 	for rows.Next() {
-		record, err := scanRecord(rows)
+		record, err := scanRecord(rows, joined)
 		if err != nil {
 			return errors.Join(err, rows.Close())
 		}

@@ -571,7 +571,7 @@ func (service *trackedService) balancedRotate(ctx context.Context, now time.Time
 	running := workers.serviceRunning()
 	limited := service.egress.anyLimited()
 	snapshot := service.pool.QuotaDayUsage()
-	members := service.pool.PartitionMembers()
+	members := workers.slotMembers()
 	ready := workers.ReadyWarmAccountIDs()
 	allWarm := workers.WarmAccountIDs()
 	view := workers.rotationRegistrationsIn(members)

@@ -29,7 +29,7 @@ func requestLogData(entry api.AccessLog) *api.RequestLog {
 		InputMedia: entry.InputMedia, InputMediaBytes: entry.InputMediaBytes, InputFiles: entry.InputFiles,
 		FirstEventMS: float64(entry.FirstEvent) / float64(time.Millisecond), UpstreamBytes: entry.UpstreamBytes,
 		QueueMS: float64(entry.QueueWait) / float64(time.Millisecond), ProofMS: float64(entry.Proof) / float64(time.Millisecond),
-		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect, FallbackFrom: entry.FallbackFrom,
+		Channel: entry.Channel, Pool: entry.Pool, Disconnect: entry.Disconnect, FallbackFrom: entry.FallbackFrom, Extra: entry.Extra,
 	}
 	if data.Error == "" && entry.TrailingError != "" {
 		// 函数调用之后上游结束生成：请求按正常完成记录（状态照常为工具调用完成等），原因作为错误详情写进请求日志与用量账本
@@ -223,7 +223,7 @@ func requestRow(entry api.AccessLog, finished time.Time) requestdb.Row {
 		ID: entry.RequestID, Time: finished, Protocol: requestProtocol(entry.Path), Path: entry.Path,
 		Model: entry.Model, Account: entry.Account, Channel: entry.Channel, Status: entry.Status, State: data.State,
 		Duration: entry.Latency, FirstEvent: entry.FirstEvent, Queue: entry.QueueWait, ToolCalls: entry.ToolCalls, Error: data.Error,
-		Attempts: entry.Attempts, ServedModel: entry.ServedModel, ReplyHash: entry.ReplyHash, Pool: entry.Pool,
+		Attempts: entry.Attempts, ServedModel: entry.ServedModel, ReplyHash: entry.ReplyHash, Pool: entry.Pool, Extra: entry.Extra,
 	}
 	if entry.Downgrade != nil {
 		row.Downgrade = entry.Downgrade.Verdict

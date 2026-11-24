@@ -1,0 +1,254 @@
+{
+  "calls": [
+    "default golden-normal-a@example.com test-model/playground",
+    "default golden-normal-b@example.com test-model/playground",
+    "default golden-normal-b@example.com test-model/playground",
+    "default golden-normal-b@example.com test-model/playground",
+    "default golden-normal-b@example.com test-model/playground",
+    "default golden-normal-b@example.com test-model/playground",
+    "pro golden-pro-a@example.com test-model/playground",
+    "pro golden-pro-b@example.com gemini-4-argon/build",
+    "pro golden-pro-b@example.com test-model/playground",
+    "pro golden-pro-b@example.com gemini-4-argon/build",
+    "pro golden-pro-a@example.com test-model/playground",
+    "pro golden-pro-b@example.com test-model/playground",
+    "ultra golden-ultra-a@example.com test-model/playground",
+    "ultra golden-ultra-a@example.com gemini-4-argon/build",
+    "ultra golden-ultra-a@example.com test-model/playground",
+    "ultra golden-ultra-a@example.com gemini-4-argon/build",
+    "ultra golden-ultra-a@example.com test-model/playground",
+    "ultra golden-ultra-a@example.com test-model/playground"
+  ],
+  "results": [
+    "default #1 test-model: 正文=\"hello\"",
+    "default #2 test-model: 正文=\"hello\"",
+    "default #3 test-model: 正文=\"hello\"",
+    "default #4 test-model: 正文=\"hello\"",
+    "default #5 test-model: 正文=\"hello\"",
+    "default #6 gemini-4-argon: 正文=\"\" 错误=AI Studio 实时目录中没有请求模型: gemini-4-argon（Pro 号池、Ultra 号池有账户能服务模型 gemini-4-argon，改用 /pro 或 /ultra 前缀）",
+    "pro #1 test-model: 正文=\"hello\"",
+    "pro #2 gemini-4-argon: 正文=\"hello\"",
+    "pro #3 test-model: 正文=\"hello\"",
+    "pro #4 gemini-4-argon: 正文=\"hello\"",
+    "pro #5 test-model: 正文=\"hello\"",
+    "pro #6 test-model: 正文=\"hello\"",
+    "ultra #1 test-model: 正文=\"hello\"",
+    "ultra #2 gemini-4-argon: 正文=\"hello\"",
+    "ultra #3 test-model: 正文=\"hello\"",
+    "ultra #4 gemini-4-argon: 正文=\"hello\"",
+    "ultra #5 test-model: 正文=\"hello\"",
+    "ultra #6 test-model: 正文=\"hello\""
+  ],
+  "phases": [
+    {
+      "name": "预热",
+      "logs": [
+        "INFO golden-normal-a@example.com WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型=test-model [runtime.message]",
+        "INFO golden-normal-a@example.com WAA Worker 就绪 | 页面模型=test-model | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 来源=预热 | 起因=空槽位 [runtime.message]",
+        "INFO golden-normal-b@example.com WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型=test-model [runtime.message]",
+        "INFO golden-normal-b@example.com WAA Worker 就绪 | 页面模型=test-model | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 来源=预热 | 起因=空槽位 [runtime.message]",
+        "INFO golden-ultra-a@example.com WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型=test-model [runtime.message]",
+        "INFO golden-ultra-a@example.com WAA Worker 就绪 | 页面模型=test-model | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 来源=预热 | 起因=空槽位 [runtime.message]",
+        "INFO golden-pro-a@example.com WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型=test-model [runtime.message]",
+        "INFO golden-pro-a@example.com WAA Worker 就绪 | 页面模型=test-model | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 来源=预热 | 起因=空槽位 [runtime.message]",
+        "INFO service WAA Worker 预热完成 | Worker=4/4 | 耗时=\u003c时长\u003e [runtime.message]"
+      ]
+    },
+    {
+      "name": "keepWarm",
+      "logs": [
+        "WARN service PRO_POOL 默认开启：2 个 Pro 账户只服务 /pro 前缀，默认地址与 /ultra 不再使用它们 | Pro 常驻/峰值 Worker=1/2 | 建议 PRO_WARM_WORKER_LIMIT=2、PRO_MAX_ACTIVE_WORKERS=5（Pro 可用账户 1，普通可用账户 2），普通分区可相应减为 WARM_WORKER_LIMIT=2、MAX_ACTIVE_WORKERS=3 | 要保持升级前的行为请设置 PRO_POOL=false，写明 PRO_POOL 后不再提示 [runtime.message]"
+      ]
+    },
+    {
+      "name": "请求 default",
+      "logs": [
+        "INFO golden-normal-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-1\",\"state\":\"running\"}",
+        "WARN golden-normal-a@example.com 上游返回 4xx | 方法= | HTTP=429 | 文案=Resource has been exhausted [request.progress] {\"id\":\"golden-default-1\",\"state\":\"running\"}",
+        "WARN golden-normal-a@example.com 账号冷却 | 类型=分钟限额 | 范围=test-model | 恢复=\u003c时刻\u003e [runtime.message]",
+        "WARN golden-normal-a@example.com 账号切换 | 模型=test-model\n原因: AI Studio  返回 HTTP 429: Resource has been exhausted [runtime.message]",
+        "INFO golden-normal-a@example.com 限流 429，换号重试（只用已启动的 Worker）| 限流失败=1/2 | 类型=分钟限额 | 额度失败=0/4 | 原因=AI Studio 返回 HTTP 429: Resource has been exhausted [request.progress] {\"id\":\"golden-default-1\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-1\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-default-1\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 请求完成 [request.finished] {\"id\":\"golden-default-1\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-normal-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-2\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-default-2\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 请求完成 [request.finished] {\"id\":\"golden-default-2\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-normal-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-3\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-default-3\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 请求完成 [request.finished] {\"id\":\"golden-default-3\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-normal-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-4\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-default-4\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 请求完成 [request.finished] {\"id\":\"golden-default-4\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-normal-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-default-5\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-default-5\",\"state\":\"running\"}",
+        "INFO golden-normal-b@example.com 请求完成 [request.finished] {\"id\":\"golden-default-5\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "ERROR golden-normal-b@example.com 请求失败 [request.finished] {\"id\":\"golden-default-6\",\"state\":\"failed\",\"model\":\"gemini-4-argon\",\"method\":\"POST\",\"path\":\"/v1/chat/completions\",\"status\":404,\"error\":\"AI Studio 实时目录中没有请求模型: gemini-4-argon（Pro 号池、Ultra 号池有账户能服务模型 gemini-4-argon，改用 /pro 或 /ultra 前缀）\",\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}"
+      ]
+    },
+    {
+      "name": "请求 pro",
+      "logs": [
+        "INFO golden-pro-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-1\",\"state\":\"running\"}",
+        "INFO golden-pro-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-1\",\"state\":\"running\"}",
+        "INFO golden-pro-a@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-1\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-pro-b@example.com WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型=test-model [runtime.message]",
+        "INFO golden-pro-b@example.com WAA Worker 就绪 | 页面模型=test-model | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 来源=按需 | 起因=空槽位 [runtime.message]",
+        "INFO service Pro WAA Worker 按需扩容 | Worker=2/2 | 超出常驻=是 [runtime.message]",
+        "INFO golden-pro-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-2\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-2\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-2\",\"state\":\"completed\",\"model\":\"gemini-4-argon\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-pro-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-3\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-3\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-3\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-pro-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-4\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-4\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-4\",\"state\":\"completed\",\"model\":\"gemini-4-argon\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-pro-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-5\",\"state\":\"running\"}",
+        "INFO golden-pro-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-5\",\"state\":\"running\"}",
+        "INFO golden-pro-a@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-5\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-pro-b@example.com 等待上游响应 [request.progress] {\"id\":\"golden-pro-6\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-pro-6\",\"state\":\"running\"}",
+        "INFO golden-pro-b@example.com 请求完成 [request.finished] {\"id\":\"golden-pro-6\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/pro/v1/chat/completions\",\"pool\":\"pro\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}"
+      ]
+    },
+    {
+      "name": "请求 ultra",
+      "logs": [
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-1\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-1\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-1\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-2\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-2\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-2\",\"state\":\"completed\",\"model\":\"gemini-4-argon\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-3\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-3\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-3\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-4\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-4\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-4\",\"state\":\"completed\",\"model\":\"gemini-4-argon\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-5\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-5\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-5\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}",
+        "INFO golden-ultra-a@example.com 等待上游响应 [request.progress] {\"id\":\"golden-ultra-6\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 收到上游首个事件 [request.progress] {\"id\":\"golden-ultra-6\",\"state\":\"running\"}",
+        "INFO golden-ultra-a@example.com 请求完成 [request.finished] {\"id\":\"golden-ultra-6\",\"state\":\"completed\",\"model\":\"test-model\",\"method\":\"POST\",\"path\":\"/ultra/v1/chat/completions\",\"pool\":\"ultra\",\"status\":200,\"parameters\":{\"max_output_tokens\":\"\",\"seed\":\"\",\"temperature\":\"\",\"thinking\":\"\",\"top_k\":\"\",\"top_p\":\"\"}}"
+      ]
+    },
+    {
+      "name": "空闲回收",
+      "logs": [
+        "INFO golden-pro-a@example.com WAA Worker 停止 | PID=\u003cpid\u003e | 起因=空闲回收 [runtime.message]",
+        "INFO golden-pro-a@example.com WAA Worker 已停止 | PID=\u003cpid\u003e | 耗时=\u003c时长\u003e | 起因=空闲回收 [runtime.message]",
+        "INFO service Pro WAA Worker 空闲回收 | Worker=1/2 [runtime.message]"
+      ]
+    },
+    {
+      "name": "保存设置",
+      "logs": [
+        "INFO service 服务配置已保存 [runtime.message]",
+        "INFO service 数据型心跳设置已更新并立即生效 | 开启=true [runtime.message]",
+        "INFO service 视频模型忽略系统提示设置已更新并立即生效 | 开启=true [runtime.message]",
+        "INFO service 额度用完改用其他模型的设置已更新并立即生效 | MODEL_FALLBACKS=gemini-4-argon=gemini-4-carbon,gemini-4-carbon=gemini-4-argon | MODEL_FALLBACK_SCOPE=ultra [runtime.message]",
+        "INFO service 权益规则已更新并立即生效 | 仅 Ultra gemini-4-carbon；仅付费 gemini-3.1-pro-preview [runtime.message]",
+        "INFO service 配置已热更新 | 常驻 Worker=2 | 峰值 Worker=3 | Ultra 常驻 Worker=1 | Ultra 峰值 Worker=1 | Ultra 独占=true | Pro 并入 Ultra=false | Pro 独立号池=true | Pro 常驻 Worker=1 | Pro 峰值 Worker=2 | 权益规则=仅 Ultra gemini-4-carbon；仅付费 gemini-3.1-pro-preview | 预热并发=1 | 单账户并发=2 | 单账户每分钟上限=10 次 | 策略=round-robin | 上游通道=playground,build | 请求超时=\u003c时长\u003e | 首事件超时=\u003c时长\u003e | 忽略客户端 seed=false | 降级判定=gemini-3.1-pro-preview（严格模式，内容延后不限时，190 tok/s，拒绝返回 400） | 流式优先 Playground=关闭 | 主用模型=关闭 | Ultra/Pro 主用模型=关闭 | 自动续写=开启（默认总上限 262144） | IP 池=关闭 [runtime.message]",
+        "WARN service 规则模型目前不在任何账户目录里（带后缀的名称要写成基础模型 ID） | 配置项=ULTRA_ONLY_MODELS | 模型=gemini-4-carbon [runtime.message]",
+        "WARN service 规则模型目前不在任何账户目录里（带后缀的名称要写成基础模型 ID） | 配置项=PAID_ONLY_MODELS | 模型=gemini-3.1-pro-preview [runtime.message]"
+      ]
+    }
+  ],
+  "status": {
+    "accounts": {
+      "auth_required": 0,
+      "busy": 0,
+      "cooldown": 3,
+      "org_disabled": 0,
+      "ready": 3,
+      "total": 6
+    },
+    "active_requests": 0,
+    "pro_accounts": {
+      "auth_required": 0,
+      "busy": 0,
+      "cooldown": 1,
+      "org_disabled": 0,
+      "ready": 1,
+      "total": 2
+    },
+    "pro_workers": {
+      "dead": 0,
+      "draining": 0,
+      "max": 2,
+      "occupied": 1,
+      "retiring": 0,
+      "starting": 0,
+      "target": 1,
+      "unschedulable": 0,
+      "warm": 1,
+      "warm_limit": 1
+    },
+    "ready": false,
+    "running": false,
+    "state": "STOPPED",
+    "ultra_accounts": {
+      "auth_required": 0,
+      "busy": 0,
+      "cooldown": 0,
+      "org_disabled": 0,
+      "ready": 1,
+      "total": 1
+    },
+    "ultra_workers": {
+      "dead": 0,
+      "draining": 0,
+      "max": 1,
+      "occupied": 1,
+      "retiring": 0,
+      "starting": 0,
+      "target": 1,
+      "unschedulable": 0,
+      "warm": 1,
+      "warm_limit": 1
+    },
+    "workers": {
+      "dead": 0,
+      "draining": 0,
+      "max": 3,
+      "occupied": 2,
+      "prewarm": {
+        "active": false,
+        "inflight": 0,
+        "launched": 0,
+        "loop_age_seconds": 0,
+        "round_seconds": 0
+      },
+      "retiring": 0,
+      "starting": 0,
+      "target": 1,
+      "unschedulable": 0,
+      "warm": 2,
+      "warm_ids": [
+        "golden-normal-a@example.com",
+        "golden-normal-b@example.com",
+        "golden-pro-b@example.com",
+        "golden-ultra-a@example.com"
+      ]
+    }
+  },
+  "models": {
+    "default": [
+      "test-model playground"
+    ],
+    "pro": [
+      "test-model playground",
+      "gemini-4-argon build"
+    ],
+    "ultra": [
+      "test-model playground",
+      "gemini-4-argon build"
+    ]
+  },
+  "proxy_capacity": 9,
+  "live_capacity": 9,
+  "pool_rule_version": 2
+}

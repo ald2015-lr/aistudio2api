@@ -773,6 +773,8 @@ ultra_workers = status.get("ultra_workers") or {}
 # pro_workers、pro_accounts 为 Pro 分区与 Pro 号池（PRO_POOL=true 时权益为 Pro 的账户）；旧版状态接口没有，PRO_POOL=false 时为空
 pro_workers = status.get("pro_workers") or {}
 pro_accounts = status.get("pro_accounts") or {}
+# extra_pool 为补充池（EXTRA_POOL）：开启，或关闭后仍有补充池 Worker 在归还时才有；各分区的计数不含补充池 Worker
+extra_pool = status.get("extra_pool") or {}
 account_counts = status.get("accounts") or {}
 
 
@@ -819,6 +821,14 @@ if status:
         print(f"  Pro 分区 Worker：就绪 {pro_workers.get('warm')} / 预热目标 {pro_workers.get('target')} / 峰值 {pro_workers.get('max')}，"
               f"启动中 {pro_workers.get('starting')}，死槽位 {pro_workers.get('dead') or 0}，排空中 {pro_workers.get('draining') or 0}；"
               f"Pro 号池账户 {pro_accounts.get('total') or 0}，就绪 {pro_accounts.get('ready') or 0}")
+    if extra_pool:
+        extra_workers = extra_pool.get("workers") or {}
+        print(f"  补充池 Worker（{'开启' if extra_pool.get('enabled') else '已关闭，等待归还'}，"
+              f"{'不够时才补' if extra_pool.get('mode') == 'overflow' else '一起分担'}）：就绪 {extra_workers.get('warm')} / 预热目标 {extra_workers.get('target')} / "
+              f"常驻 {extra_workers.get('warm_limit')} / 峰值 {extra_workers.get('max')}，启动中 {extra_workers.get('starting')}，"
+              f"不可调度 {extra_workers.get('unschedulable') or 0}；成员 {extra_pool.get('members')}（Free {extra_pool.get('free')} · Pro {extra_pool.get('pro')} · "
+              f"Ultra {extra_pool.get('ultra')}，冷成员 {extra_pool.get('cold_members')}），可借出 {extra_pool.get('lendable')}，归还中 {extra_pool.get('returning')}，"
+              f"本进程借出 {extra_pool.get('borrows')} 次")
     # 不可调度（app/worker_unschedulable.go）：驻留 Worker 的账号需要登录、已停用、不可用、没有模型目录或需要验证账号（整户暂停中），不是任何模型的候选，等待释放
     if "unschedulable" in workers:
         print(f"  驻留 Worker 不可调度={(workers.get('unschedulable') or 0) + (ultra_workers.get('unschedulable') or 0) + (pro_workers.get('unschedulable') or 0)}"
@@ -890,6 +900,11 @@ if config:
         print(f"  Pro 独立号池 PRO_POOL={str(config.get('pro_pool')).lower()}  Pro 常驻 PRO_WARM_WORKER_LIMIT={config.get('pro_warm_worker_limit')}  "
               f"Pro 峰值 PRO_MAX_ACTIVE_WORKERS={config.get('pro_max_active_workers')}"
               + ("（ULTRA_INCLUDE_PRO 在 PRO_POOL=true 时不生效）" if config.get("pro_pool") and config.get("ultra_include_pro") else ""))
+    if "extra_pool" in config:
+        print(f"  补充池 EXTRA_POOL={str(config.get('extra_pool')).lower()}  方式 EXTRA_POOL_MODE={config.get('extra_pool_mode')}  "
+              f"默认地址借付费模型 EXTRA_POOL_DEFAULT_PAID={str(config.get('extra_pool_default_paid')).lower()}  "
+              f"含 Ultra EXTRA_POOL_INCLUDE_ULTRA={str(config.get('extra_pool_include_ultra')).lower()}  "
+              f"常驻 EXTRA_WARM_WORKER_LIMIT={config.get('extra_warm_worker_limit')}  峰值 EXTRA_MAX_ACTIVE_WORKERS={config.get('extra_max_active_workers')}")
 elif API_STATE not in ("down", "denied", "offline"):
     print("  无法读取 /api/config")
 primary_listed = MODEL and MODEL in [model_key(m) for m in (config.get("primary_models") or []) + (config.get("ultra_primary_models") or [])]

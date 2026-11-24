@@ -90,6 +90,13 @@ const responseStatesSchema = `
 CREATE TABLE IF NOT EXISTS response_states (
  seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, data BLOB NOT NULL);`
 
+// extraServedSchema 是“由补充池服务”的请求附表（EXTRA_POOL，见 app/extra_pool.go）：id 为请求 ID，time 为完成时间（清理用）。
+// 只在第一次写入由补充池服务的记录时、在同一个写事务里建立，不放进 schema：从没用过补充池的账本不多出这张表，
+// 数据库文件与记录查询都和加入补充池之前一样；旧版本打开同一个数据库时不认识这张表，原样留着，不报错也不丢数据
+const extraServedSchema = `
+CREATE TABLE IF NOT EXISTS extra_served (id TEXT PRIMARY KEY, time INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS extra_served_time ON extra_served(time);`
+
 // 本地相对上游新增 served_model（上游标明的实际模型）、downgrade（降级判定结论）、reply_hash（回复正文指纹）
 // 与 duplicate（窗口内出现过相同回复），用于统计降级拦截率与重复回复率；指纹只用于比对，不保存回复内容。
 // pool 为请求的号池（经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空），旧账本打开时由 migrate 补上（见 migrate）
@@ -142,6 +149,8 @@ type Row struct {
 	ReplyHash string
 	// Pool 为请求的号池：经 /ultra 进入的请求为 ultra，经 /pro 进入的为 pro，其余为空
 	Pool string
+	// Extra 为最后一次尝试的租约借自补充池（由补充池服务）：为真时另写一行附表 extra_served，requests 表的列不变
+	Extra bool
 }
 
 // countedReply 判断记录是否参与重复回复统计
@@ -181,6 +190,9 @@ type Store struct {
 	stateBytes   atomic.Int64
 	stateDropped atomic.Int64
 	stateLimit   int64
+	// extraTable 表示附表 extra_served 已存在：Open 时按 sqlite_master 读出，写入协程第一次提交补充池记录后置位；
+	// 为假时记录查询不 JOIN 附表，按“由补充池服务”筛选直接返回空
+	extraTable atomic.Bool
 }
 
 // Open 打开或创建账本数据库并启动写入协程
@@ -213,6 +225,11 @@ func Open(path string, log Logger) (*Store, error) {
 		return nil, errors.Join(fmt.Errorf("升级请求账本: %w", err), db.Close())
 	}
 	store := &Store{db: db, writes: make(chan write, queueLimit), done: make(chan struct{}), log: log, stateLimit: responseStateQueueBytes}
+	var extraTables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'extra_served'`).Scan(&extraTables); err != nil {
+		return nil, errors.Join(fmt.Errorf("读取请求账本附表: %w", err), db.Close())
+	}
+	store.extraTable.Store(extraTables > 0)
 	if err := store.alignDays(); err != nil {
 		return nil, errors.Join(fmt.Errorf("重建本地日汇总: %w", err), db.Close())
 	}
@@ -445,7 +462,7 @@ func (store *Store) write(batch []write) (err error) {
 		}
 	}()
 	hours, days := map[rollupKey]*entry{}, map[rollupKey]*entry{}
-	bodies := false
+	bodies, extraCreated := false, false
 	for _, item := range batch {
 		if row := item.row; row != nil {
 			attempts := row.Attempts
@@ -479,6 +496,17 @@ func (store *Store) write(batch []write) (err error) {
 				day, _ := localDay(value.time)
 				collect(hours, keyOf(floorDiv(value.time, hourMS)*hourMS, value), value)
 				collect(days, keyOf(day, value), value)
+				if row.Extra {
+					if !extraCreated && !store.extraTable.Load() {
+						if _, err := tx.Exec(extraServedSchema); err != nil {
+							return err
+						}
+						extraCreated = true
+					}
+					if _, err := tx.Exec(`INSERT OR IGNORE INTO extra_served (id, time) VALUES (?, ?)`, row.ID, row.Time.UnixMilli()); err != nil {
+						return err
+					}
+				}
 			}
 		}
 		if states := item.states; states != nil {
@@ -517,7 +545,13 @@ func (store *Store) write(batch []write) (err error) {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if extraCreated {
+		store.extraTable.Store(true)
+	}
+	return nil
 }
 
 // mergeRollup 把本批记录累加到汇总表中已有的同键汇总
@@ -566,7 +600,11 @@ func (store *Store) pruneBefore(cutoff time.Time) {
 	_, requestsErr := store.db.Exec(`DELETE FROM requests WHERE time < ?`, hour)
 	_, hoursErr := store.db.Exec(`DELETE FROM hours WHERE start < ?`, hour)
 	_, daysErr := store.db.Exec(`DELETE FROM days WHERE start < ?`, day)
-	if err := errors.Join(requestsErr, hoursErr, daysErr); err != nil {
+	var extraErr error
+	if store.extraTable.Load() {
+		_, extraErr = store.db.Exec(`DELETE FROM extra_served WHERE time < ?`, hour)
+	}
+	if err := errors.Join(requestsErr, hoursErr, daysErr, extraErr); err != nil {
 		store.log("ERROR", fmt.Sprintf("请求账本清理失败 | 错误=%v", err))
 	}
 }

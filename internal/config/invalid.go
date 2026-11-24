@@ -148,6 +148,18 @@ func (c *Config) resetKey(key string) {
 		c.ProWarmWorkerLimit = defaults.ProWarmWorkerLimit
 	case "PRO_MAX_ACTIVE_WORKERS":
 		c.ProMaxActiveWorkers = defaults.ProMaxActiveWorkers
+	case "EXTRA_POOL":
+		c.ExtraPool = defaults.ExtraPool
+	case "EXTRA_POOL_MODE":
+		c.ExtraPoolMode = defaults.ExtraPoolMode
+	case "EXTRA_POOL_DEFAULT_PAID":
+		c.ExtraPoolDefaultPaid = defaults.ExtraPoolDefaultPaid
+	case "EXTRA_POOL_INCLUDE_ULTRA":
+		c.ExtraPoolIncludeUltra = defaults.ExtraPoolIncludeUltra
+	case "EXTRA_WARM_WORKER_LIMIT":
+		c.ExtraWarmWorkerLimit = defaults.ExtraWarmWorkerLimit
+	case "EXTRA_MAX_ACTIVE_WORKERS":
+		c.ExtraMaxActiveWorkers = defaults.ExtraMaxActiveWorkers
 	case "WARM_STARTUP_CONCURRENCY":
 		// 不超过当前的 WARM_WORKER_LIMIT：只设了 WARM_WORKER_LIMIT=1 时不必连它一起改回默认值
 		c.WarmStartupConcurrency = defaults.WarmStartupConcurrency
@@ -313,6 +325,31 @@ var configChecks = []configCheck{
 	{keys: []string{"PRO_MAX_ACTIVE_WORKERS", "PRO_WARM_WORKER_LIMIT"}, check: func(c Config) error {
 		if c.ProMaxActiveWorkers < c.ProWarmWorkerLimit {
 			return fmt.Errorf("PRO_MAX_ACTIVE_WORKERS 必须大于或等于 PRO_WARM_WORKER_LIMIT")
+		}
+		return nil
+	}},
+	// 补充池：EXTRA_POOL=false 时数值照样校验（与 PRO_* 相同），不成立时改回默认值、记入无效项，不阻止启动
+	{keys: []string{"EXTRA_POOL_MODE"}, check: func(c Config) error {
+		if mode := NormalizeExtraPoolMode(c.ExtraPoolMode); mode != ExtraPoolModeShare && mode != ExtraPoolModeOverflow {
+			return fmt.Errorf("EXTRA_POOL_MODE 必须是 share 或 overflow")
+		}
+		return nil
+	}},
+	{keys: []string{"EXTRA_WARM_WORKER_LIMIT"}, check: func(c Config) error {
+		if c.ExtraWarmWorkerLimit < 0 {
+			return fmt.Errorf("EXTRA_WARM_WORKER_LIMIT 必须是 0 或正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"EXTRA_MAX_ACTIVE_WORKERS"}, check: func(c Config) error {
+		if c.ExtraMaxActiveWorkers <= 0 {
+			return fmt.Errorf("EXTRA_MAX_ACTIVE_WORKERS 必须是正整数")
+		}
+		return nil
+	}},
+	{keys: []string{"EXTRA_MAX_ACTIVE_WORKERS", "EXTRA_WARM_WORKER_LIMIT"}, check: func(c Config) error {
+		if c.ExtraMaxActiveWorkers < c.ExtraWarmWorkerLimit {
+			return fmt.Errorf("EXTRA_MAX_ACTIVE_WORKERS 必须大于或等于 EXTRA_WARM_WORKER_LIMIT")
 		}
 		return nil
 	}},

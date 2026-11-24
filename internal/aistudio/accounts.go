@@ -804,6 +804,9 @@ type AccountPool struct {
 	rules poolRules
 	// proPoolLive 为 rules.proPool 的无锁副本（见 ProPool），只在 setPoolRulesLocked 内与成员一同写
 	proPoolLive atomic.Bool
+	// extraRules 为补充池规则（见 extra_pool.go），受 mu 保护；extraLive 为它的无锁副本（见 ExtraPoolLive），与 extraRules 一同写
+	extraRules ExtraPoolRules
+	extraLive  atomic.Pointer[ExtraPoolRules]
 	// membersSnapshot 为 PartitionMembers 返回的只读副本，nil 表示成员变化后尚未重建；受 mu 保护
 	membersSnapshot PartitionSet
 	// tierRules 为 ULTRA_ONLY_MODELS 与 PAID_ONLY_MODELS 的权益规则（见 tier_rules.go），tierReport 为按 eligibilityVersion 缓存的
@@ -1811,6 +1814,10 @@ func (p *AccountPool) AcquireFor(ctx context.Context, selection AccountSelection
 		return nil, PoolNotReady(poolMissingReason, nil)
 	}
 	selection = ScopedSelection(ctx, selection)
+	// 补充池的选择覆盖（见 WithSelectionOverride，只有 countTokens 借用补充池时设置）：不固定账户与资源的选择改在补充池的可借出账户里选
+	if override, ok := selectionOverrideFrom(ctx); ok && selection.AccountID == "" && selection.ResourceID == "" {
+		selection.Pool, selection.AllowedAccountIDs = override.pool, override.allowed
+	}
 	if selection.ResourceID != "" {
 		if err := p.refreshResource(ctx, selection.ResourceID); err != nil {
 			return nil, err

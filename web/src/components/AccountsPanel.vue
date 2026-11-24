@@ -31,6 +31,7 @@ import type {
   ProxyPoolAssignment,
   ProxyPoolStatus,
   PartitionWorkerCounters,
+  ExtraPoolStatus,
   WorkerCounters,
   WorkerState,
 } from '@/types'
@@ -46,11 +47,14 @@ const props = defineProps<{
   accounts: Account[]
   loading: boolean
   error: string
-  workerSets: { warm: Set<string>; starting: Set<string> }
+  // extra 为计入补充池的 Worker 的账户（状态接口的 extra_ids；旧版服务端或补充池没有 Worker 时为空）
+  workerSets: { warm: Set<string>; starting: Set<string>; extra?: Set<string> }
   workerCounts: WorkerCounters | null
   ultraWorkerCounts: PartitionWorkerCounters | null
   // proWorkerCounts 为 Pro 分区的 Worker 计数（旧版服务端不返回时为 null）
   proWorkerCounts?: PartitionWorkerCounters | null
+  // extraPool 为状态接口的补充池概况（补充池关闭且没有补充池 Worker、或旧版服务端时为 null）
+  extraPool?: ExtraPoolStatus | null
   // proxyPool 为状态接口的 IP 池实时状态（每 3 秒更新）：assignments 给出每个账户当前用的端口或会话；没有开启时为 null
   proxyPool: ProxyPoolStatus | null
   cooldowns: Cooldown[]
@@ -1228,9 +1232,10 @@ const workerFilterOptions: { value: WorkerFilter; label: TranslationKey }[] = [
   { value: 'none', label: 'accounts.workerFilterNone' },
 ]
 // PoolFilter 按号池成员关系（account.pool）筛选，与按真实权益的 TierFilter 不同：关闭 PRO_POOL、开启 ULTRA_INCLUDE_PRO 时
-// Pro 账户属于 Ultra 号池，开启 PRO_POOL 时属于 Pro 号池
-type PoolFilter = 'all' | AccountPool
-const poolFilterOptions: { value: PoolFilter; label: TranslationKey }[] = [
+// Pro 账户属于 Ultra 号池，开启 PRO_POOL 时属于 Pro 号池。extra 为补充池（Worker 计入补充池的账户与补充池成员），
+// 账户的号池不变，所以只在补充池开启或有补充池账户时列出
+type PoolFilter = 'all' | AccountPool | 'extra'
+const basePoolFilterOptions: { value: PoolFilter; label: TranslationKey }[] = [
   { value: 'all', label: 'accounts.poolFilterAll' },
   { value: 'normal', label: 'accounts.poolFilterNormal' },
   { value: 'pro', label: 'accounts.poolFilterPro' },
@@ -1287,6 +1292,24 @@ function workerState(account: Account): WorkerState {
   if (props.workerSets.warm.has(account.id)) return 'warm'
   if (props.workerSets.starting.has(account.id)) return 'starting'
   return 'none'
+}
+
+// extraWorker 判断账户的 Worker 计入补充池：按状态接口的 extra_ids（实时），旧版服务端时按账户列表的 extra
+function extraWorker(account: Account): boolean {
+  const live = props.workerSets.extra
+  if (live !== undefined && props.workerCounts !== null) return live.has(account.id)
+  return account.extra === 'worker'
+}
+
+// extraMember 判断账户是补充池成员、Worker 没有计入补充池（显示“可补充”）
+function extraMember(account: Account): boolean {
+  return account.extra === 'member' && !extraWorker(account)
+}
+
+// inExtraPool 判断账户与补充池有关（号池筛选“补充池”）：Worker 计入补充池或是成员，与“补充池”“可补充”标签同一口径
+// （有实时的 extra_ids 时不认账户列表里过时的 worker：账户列表不随 Worker 归还推送）
+function inExtraPool(account: Account): boolean {
+  return extraWorker(account) || extraMember(account)
 }
 
 // ---------- 代理列与 IP 池 ----------
@@ -1424,19 +1447,44 @@ const poolCounts = computed(() => {
     normal: 0,
     pro: 0,
     ultra: 0,
+    extra: 0,
   }
-  for (const account of props.accounts)
+  for (const account of props.accounts) {
     counts[account.pool === 'ultra' || account.pool === 'pro' ? account.pool : 'normal'] += 1
+    if (inExtraPool(account)) counts.extra += 1
+  }
   return counts
 })
 const proPoolCount = computed(() => poolCounts.value.pro)
+// extraShown 表示账户页显示补充池（筛选项、头部计数与标签）：状态接口有 extra_pool，或有账户与补充池有关
+const extraShown = computed(
+  () => (props.extraPool ?? null) !== null || props.accounts.some(inExtraPool),
+)
+const poolFilterOptions = computed(() =>
+  extraShown.value || poolFilter.value === 'extra'
+    ? [
+        ...basePoolFilterOptions,
+        { value: 'extra' as PoolFilter, label: 'accounts.poolFilterExtra' as TranslationKey },
+      ]
+    : basePoolFilterOptions,
+)
+// extraWorkerShown、extraMemberShown 表示有账户要显示“补充池”“可补充”标签：只在这时加宽 Worker 列与权益列
+const extraWorkerShown = computed(() => props.accounts.some(extraWorker))
+const extraMemberShown = computed(() => props.accounts.some(extraMember))
+// tableMinWidth 为表格最小宽度：权益列加宽（w-20 → w-32）多 48px，Worker 列加宽（w-24 → w-40）多 64px；都不加宽时与原来一致
+const tableMinWidth = computed(() => {
+  if (extraWorkerShown.value) return poolTagShown.value ? 'min-w-[1172px]' : 'min-w-[1124px]'
+  return poolTagShown.value ? 'min-w-[1108px]' : 'min-w-[1060px]'
+})
 const proReady = computed(
   () => props.accounts.filter((account) => inProPool(account) && account.state === 'ready').length,
 )
 // poolTagShown 表示有账户要在权益旁另加 Ultra 号池标记（权益不是 Ultra 却属于 Ultra 号池）。原来的权益列放不下
 // “权益 + 标记”，只在这时加宽权益列并同样加大表格最小宽度，账户列不被挤窄；开关关闭时表格布局与原来一致
-const poolTagShown = computed(() =>
-  props.accounts.some((account) => inUltraPool(account) && accountTier(account) !== 'Ultra'),
+const poolTagShown = computed(
+  () =>
+    props.accounts.some((account) => inUltraPool(account) && accountTier(account) !== 'Ultra') ||
+    extraMemberShown.value,
 )
 const ultraReady = computed(
   () =>
@@ -1731,7 +1779,10 @@ const filtered = computed(() => {
     } else if (stateFilter.value !== 'all' && account.state !== stateFilter.value) return false
     if (workerFilter.value !== 'all' && workerState(account) !== workerFilter.value) return false
     if (tierFilter.value !== 'all' && accountTier(account) !== tierFilter.value) return false
-    if (poolFilter.value !== 'all' && (account.pool ?? 'normal') !== poolFilter.value) return false
+    if (poolFilter.value === 'extra') {
+      if (!inExtraPool(account)) return false
+    } else if (poolFilter.value !== 'all' && (account.pool ?? 'normal') !== poolFilter.value)
+      return false
     if (term === '') return true
     // 代理按掩码后的显示值匹配，搜不到账号密码；IP 池的端口号或会话号也能搜
     return [
@@ -2277,6 +2328,24 @@ function closeBulkPanel(): void {
                 warm: proWorkerCounts.warm,
                 target: proWorkerCounts.target,
               })
+            }}
+          </span>
+          <!-- 补充池：状态接口有 extra_pool 时显示（Worker 计入补充池的数量与常驻数、成员数；关闭后还在归还时只写归还中的数量） -->
+          <span
+            v-if="extraPool"
+            v-tooltip="t('accounts.extraCountHelp')"
+            class="tag tag-extra"
+            tabindex="0"
+            data-testid="accounts-extra-count"
+          >
+            {{
+              extraPool.enabled
+                ? tf('accounts.extraCount', {
+                    workers: extraPool.workers.occupied,
+                    warm: extraPool.workers.warm_limit,
+                    members: extraPool.members,
+                  })
+                : tf('accounts.extraCountOff', { workers: extraPool.workers.occupied })
             }}
           </span>
         </div>
@@ -3139,11 +3208,11 @@ function closeBulkPanel(): void {
       </div>
       <div v-else class="panel">
         <div class="overflow-x-auto">
-          <table class="data-table" :class="poolTagShown ? 'min-w-[1108px]' : 'min-w-[1060px]'">
+          <table class="data-table" :class="tableMinWidth">
             <colgroup>
               <col class="w-10" />
               <col class="w-28" />
-              <col class="w-24" />
+              <col :class="extraWorkerShown ? 'w-40' : 'w-24'" />
               <col />
               <col :class="poolTagShown ? 'w-32' : 'w-20'" />
               <col class="w-16" />
@@ -3214,7 +3283,17 @@ function closeBulkPanel(): void {
                     :class="workerTextClass[workerState(account)]"
                   >
                     <span class="dot" :class="workerDotClass[workerState(account)]"></span>
-                    {{ t(workerLabelKeys[workerState(account)]) }}
+                    <span class="whitespace-nowrap">{{
+                      t(workerLabelKeys[workerState(account)])
+                    }}</span>
+                    <span
+                      v-if="extraWorker(account)"
+                      v-tooltip="t('accounts.extraWorkerHelp')"
+                      class="tag tag-extra shrink-0"
+                      tabindex="0"
+                      data-testid="account-extra-worker"
+                      >{{ t('accounts.extraWorker') }}</span
+                    >
                   </span>
                 </td>
                 <td>
@@ -3260,6 +3339,15 @@ function closeBulkPanel(): void {
                       >{{ t('accounts.poolUltraTag') }}</span
                     >
                   </template>
+                  <!-- 补充池成员（Worker 没有计入补充池的）：权益旁加浅色的“可补充” -->
+                  <span
+                    v-if="extraMember(account)"
+                    v-tooltip="t('accounts.extraMemberHelp')"
+                    class="tag tag-extra-member ml-1"
+                    tabindex="0"
+                    data-testid="account-extra-member"
+                    >{{ t('accounts.extraMember') }}</span
+                  >
                 </td>
                 <td class="font-mono text-xs text-gray-300">
                   {{ account.models.length === 0 ? '—' : account.models.length }}

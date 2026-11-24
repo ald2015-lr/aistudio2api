@@ -106,7 +106,8 @@ export function drainLimitFor(maxActive: number, warmConcurrency: number): numbe
 }
 
 // ProxyPoolCapacity 为可能同时运行的浏览器数：每个分区为 峰值 + 排空上限（排空时替补先启动、旧 Worker 后关闭），不含登录与验证。
-// pro、proDrain 只在开启 PRO_POOL 且有 Pro 号池账户时计入（否则 Pro 分区为空、不占端口，为 0），与服务端 proxyPoolCapacity 一致
+// pro、proDrain 只在开启 PRO_POOL 且有 Pro 号池账户时计入（否则 Pro 分区为空、不占端口，为 0）；extra、extraDrain 只在开启补充池
+// （EXTRA_POOL）时计入（补充池内部替换先启后停，同样按峰值 + 排空上限计，默认 50+4），关闭时为 0。与服务端 proxyPoolCapacity 一致
 export interface ProxyPoolCapacity {
   normal: number
   normalDrain: number
@@ -114,19 +115,29 @@ export interface ProxyPoolCapacity {
   ultraDrain: number
   pro: number
   proDrain: number
+  extra: number
+  extraDrain: number
   total: number
 }
 
 // proxyPoolCapacity 按设置页当前的峰值与启动并发估算端口需求：Σ各分区（峰值 + 排空上限）；proCounted 为开启 PRO_POOL 且状态接口的
-// pro_accounts 有账户，为假时不计 Pro 分区。数值不合法时返回 null
+// pro_accounts 有账户，为假时不计 Pro 分区；extraCounted 为开启补充池，为假时不计补充池。数值不合法时返回 null
 export function proxyPoolCapacity(
   maxActive: unknown,
   ultraMaxActive: unknown,
   warmConcurrency: unknown,
   proMaxActive: unknown = 0,
   proCounted = false,
+  extraMaxActive: unknown = 0,
+  extraCounted = false,
 ): ProxyPoolCapacity | null {
-  const values = [maxActive, ultraMaxActive, warmConcurrency, ...(proCounted ? [proMaxActive] : [])]
+  const values = [
+    maxActive,
+    ultraMaxActive,
+    warmConcurrency,
+    ...(proCounted ? [proMaxActive] : []),
+    ...(extraCounted ? [extraMaxActive] : []),
+  ]
   if (
     !values.every((value) => typeof value === 'number' && Number.isInteger(value) && value >= 0)
   ) {
@@ -135,10 +146,12 @@ export function proxyPoolCapacity(
   const normal = maxActive as number
   const ultra = ultraMaxActive as number
   const pro = proCounted ? (proMaxActive as number) : 0
+  const extra = extraCounted ? (extraMaxActive as number) : 0
   const warm = warmConcurrency as number
   const normalDrain = drainLimitFor(normal, warm)
   const ultraDrain = drainLimitFor(ultra, warm)
   const proDrain = drainLimitFor(pro, warm)
+  const extraDrain = drainLimitFor(extra, warm)
   return {
     normal,
     normalDrain,
@@ -146,7 +159,9 @@ export function proxyPoolCapacity(
     ultraDrain,
     pro,
     proDrain,
-    total: normal + normalDrain + ultra + ultraDrain + pro + proDrain,
+    extra,
+    extraDrain,
+    total: normal + normalDrain + ultra + ultraDrain + pro + proDrain + extra + extraDrain,
   }
 }
 

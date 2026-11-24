@@ -767,7 +767,13 @@ func accountAttemptLimit(ctx context.Context, pool *AccountPool, pinned bool) in
 		return 1
 	}
 	attemptLimitScans.Add(1)
-	eligible := max(pool.attemptCandidatesIn(PoolScopeFromContext(ctx)), 1)
+	var eligible int
+	if override, ok := selectionOverrideFrom(ctx); ok {
+		// 补充池的选择覆盖（见 WithSelectionOverride）：只在可借出的账户里换号
+		eligible = max(len(override.allowed), 1)
+	} else {
+		eligible = max(pool.attemptCandidatesIn(PoolScopeFromContext(ctx)), 1)
+	}
 	if ceiling := attemptCeilingFrom(ctx); ceiling > 0 && eligible > ceiling {
 		return ceiling
 	}

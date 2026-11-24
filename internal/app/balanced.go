@@ -206,7 +206,7 @@ type balancedRotationStats struct {
 // balancedRotationStats 返回轮换的计数（见 balancedRotationStats 类型的说明）：登记数在 retireMu 内数，其余读轮换记录
 func (manager *accountWorkerManager) balancedRotationStats(now time.Time) balancedRotationStats {
 	stats := balancedRotationStats{rotating: make(map[aistudio.PoolScope]int, len(workerPartitions))}
-	members := manager.pool.PartitionMembers()
+	members := manager.slotMembers()
 	manager.retireMu.Lock()
 	for accountID, entry := range manager.retirements {
 		if entry.rotation {

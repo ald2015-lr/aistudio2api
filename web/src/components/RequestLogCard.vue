@@ -44,6 +44,9 @@ function number(value: number, digits = 0): string {
         :class="poolTagClass(request.pool)"
         >{{ t(poolTagLabelKey(request.pool)) }}</span
       >
+      <span v-if="request.extra" v-tooltip="t('pool.extraHelp')" class="tag tag-extra">{{
+        t('pool.extra')
+      }}</span>
       <strong>{{ request.model || `${request.method} ${request.path}` }}</strong>
       <span
         v-if="request.fallback_from"
@@ -95,6 +98,10 @@ function number(value: number, digits = 0): string {
         <template v-if="poolTagged(request.pool)">
           <dt>{{ t('logs.pool') }}</dt>
           <dd>{{ t(poolTagLabelKey(request.pool)) }}</dd>
+        </template>
+        <template v-if="request.extra">
+          <dt>{{ t('pool.extra') }}</dt>
+          <dd>{{ t('pool.extraHelp') }}</dd>
         </template>
         <template v-if="request.channel">
           <dt>{{ t('logs.channel') }}</dt>

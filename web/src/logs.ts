@@ -163,6 +163,14 @@ export function rowHasLevel(row: LogRow, level: LogLevel): boolean {
   return row.events.some((event) => eventLevel(event) === level)
 }
 
+// rowExtra 判断行与补充池有关（日志页的“只看补充池”）：请求行为由补充池服务（最后一次尝试借用补充池），其余为补充池的运行日志
+// （服务端写的“补充池 …”行，以及就绪行的“分区=补充池”、原行追加的“去向=补充池接手”）
+export function rowExtra(row: LogRow): boolean {
+  const request = row.entry.request
+  if (request !== undefined) return request.extra === true
+  return row.entry.message.includes('补充池')
+}
+
 // rowMatches 判断行是否含搜索词（query 已去掉首尾空白并转为小写）：合并后的摘要与请求 ID、路径、结束原因，以及请求全部事件的
 // 消息、来源与事件类型，中途事件里的账户名、换号与冷却原因都搜得到
 export function rowMatches(row: LogRow, query: string): boolean {
