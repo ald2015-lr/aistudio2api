@@ -109,10 +109,17 @@ type adminOperationError struct {
 	status  int
 	code    string
 	message string
+	// cause 为转换前的错误（只用于 errors.Is / errors.As，例如固定分配的端口暂停），不进入对外文案；多数为 nil
+	cause error
 }
 
 func (err *adminOperationError) Error() string {
 	return err.message
+}
+
+// Unwrap 返回转换前的错误（没有时为 nil）
+func (err *adminOperationError) Unwrap() error {
+	return err.cause
 }
 
 func (err *adminOperationError) HTTPStatus() int {
@@ -285,7 +292,7 @@ func (admin *runtimeAdmin) Accounts(context.Context) ([]api.AdminAccount, error)
 	for _, status := range statuses {
 		accounts = append(accounts, adminAccountDTO(status))
 	}
-	admin.ipPool().markPinned(accounts)
+	admin.ipPool().markAccounts(accounts)
 	admin.workers.markExtraAccounts(accounts)
 	return accounts, nil
 }
@@ -325,7 +332,11 @@ func (admin *runtimeAdmin) CreateAccount(ctx context.Context, input api.AccountC
 	startedAt := time.Now()
 	admin.requests.log("auth", "INFO", "账户添加 | 1/2 | 等待隔离登录")
 	// 登录浏览器同样占一个 IP 池出口：新账户还没有 ID，用临时键；登录成功后记到账户名下（adopt），之后的 Worker 回到这个 IP
-	loginProxy, poolLease := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindLogin, "auth", accountConfig.Proxy)
+	loginProxy, poolLease, err := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindLogin, "auth", accountConfig.Proxy)
+	if err != nil {
+		admin.requests.log("auth", "WARN", "账户添加失败 | 错误="+strings.TrimSpace(err.Error()))
+		return api.AdminAccount{}, err
+	}
 	defer poolLease.release()
 	result, err := admin.login.Login(ctx, aistudio.IsolatedLoginRequest{
 		AccountID: "new", Directory: directory, Proxy: loginProxy,
@@ -443,6 +454,12 @@ func (admin *runtimeAdmin) ImportChromeAccounts(ctx context.Context, input api.C
 		if err != nil {
 			return api.ChromeImportResult{}, err
 		}
+		// 没有 adopt 的出口记录（后面任何一步失败、整批返回）撤销固定分配里的预留；adopt 过的为空操作
+		defer func() {
+			for _, claim := range poolClaims {
+				claim.discard()
+			}
+		}()
 	}
 	configs := make([]aistudio.AccountConfig, len(results))
 	seen := make(map[string]struct{}, len(results))
@@ -532,22 +549,27 @@ func (admin *runtimeAdmin) addAccount(
 			resultErr = errors.Join(resultErr, publishLease.Release())
 		}
 	}()
+	// 新建之后的步骤失败、账户目录删除时，onCreated 记到它名下的固定位置一起释放（账户已进账户池之后的失败不释放）
+	rollback := func() error {
+		admin.ipPool().releaseFixed(account.ID, "新增失败")
+		return admin.store.Delete(account)
+	}
 	if fingerprintDirectory != "" {
 		if err := camoufoxnative.PersistAccountFingerprint(fingerprintDirectory, account.Directory); err != nil {
-			return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
+			return api.AdminAccount{}, errors.Join(err, rollback())
 		}
 	}
 	if err := admin.headers.Add(account); err != nil {
-		return api.AdminAccount{}, errors.Join(err, admin.store.Delete(account))
+		return api.AdminAccount{}, errors.Join(err, rollback())
 	}
 	if err := admin.workers.Add(account); err != nil {
-		return api.AdminAccount{}, errors.Join(err, admin.headers.Remove(account.ID), admin.store.Delete(account))
+		return api.AdminAccount{}, errors.Join(err, admin.headers.Remove(account.ID), rollback())
 	}
 	if err := admin.service.changeModels(func() error {
 		return admin.pool.Add(account)
 	}); err != nil {
 		return api.AdminAccount{}, errors.Join(
-			err, admin.workers.Remove(account.ID), admin.headers.Remove(account.ID), admin.store.Delete(account),
+			err, admin.workers.Remove(account.ID), admin.headers.Remove(account.ID), rollback(),
 		)
 	}
 	// 账户已进入账户池：IP 池记下它的固定代理（外部占用、固定了默认代理）并推送默认出口
@@ -747,6 +769,8 @@ func (admin *runtimeAdmin) removeAccount(remove accountRemover) (*aistudio.Accou
 		return nil, err
 	}
 	accountID := removed.ID
+	// 固定分配：释放这个账户的固定位置（只删这一条，不重排其他账户；休眠的表同样释放）
+	admin.ipPool().releaseFixed(accountID, "账户已删除")
 	admin.service.removeAccountModelRetry(accountID)
 	admin.service.permissionDenied.clearAccount(accountID)
 	admin.service.orgDisabled.clearAccount(accountID)
@@ -792,7 +816,11 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	startedAt := time.Now()
 	admin.requests.log(account.Config.Label, "INFO", "账户登录 | 1/2 | 等待隔离登录")
-	loginProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindLogin, account.Config.Label, account.Config.Proxy)
+	loginProxy, poolLease, err := admin.browserProxy(account.ID, account.ID, proxyPoolKindLogin, account.Config.Label, account.Config.Proxy)
+	if err != nil {
+		admin.requests.log(account.Config.Label, "WARN", "账户登录失败 | 错误="+strings.TrimSpace(err.Error()))
+		return api.AdminAccount{}, errors.Join(err, lease.Release())
+	}
 	defer poolLease.release()
 	request := admin.loginRequest(account, directory, loginProxy)
 	request.OnboardingCompleted = admin.onboardingLogger(account.Config.Label, "账户登录")
@@ -954,7 +982,11 @@ func (admin *runtimeAdmin) verifyLogin(ctx context.Context, accountID string) (a
 	startedAt := time.Now()
 	admin.requests.log(account.Config.Label, "INFO", "账户验证 | 访问 AI Studio")
 	// 验证是完整的浏览器会话：同样占一个 IP 池出口（账户已有 Worker 时共用它的端口），返回时归还
-	verifyProxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
+	verifyProxy, poolLease, err := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
+	if err != nil {
+		admin.requests.log(account.Config.Label, "WARN", "账户验证失败 | 错误="+strings.TrimSpace(err.Error()))
+		return aistudio.LoginVerification{}, errors.Join(err, lease.Release())
+	}
 	defer poolLease.release()
 	request := admin.loginRequest(account, account.Directory, verifyProxy)
 	request.OnboardingCompleted = admin.onboardingLogger(account.Config.Label, "账户验证")
@@ -1206,7 +1238,7 @@ func (admin *runtimeAdmin) publishRuntimeSnapshot(ctx context.Context, status ap
 func (admin *runtimeAdmin) account(accountID string) (api.AdminAccount, error) {
 	if status, ok := admin.pool.StatusOf(accountID); ok {
 		accounts := []api.AdminAccount{adminAccountDTO(status)}
-		admin.ipPool().markPinned(accounts)
+		admin.ipPool().markAccounts(accounts)
 		admin.workers.markExtraAccounts(accounts)
 		return accounts[0], nil
 	}
@@ -1518,6 +1550,12 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		if poolSettings, err = proxyPoolFromInput(*value.ProxyPool); err != nil {
 			return api.RuntimeConfig{}, invalidConfigError(err)
 		}
+		// proxy_pool 不带固定分配的开关（见 api.RuntimeConfig.ProxyPoolFixed）：沿用现值
+		poolSettings.Fixed = saved.ProxyPool.Fixed
+	}
+	// 固定分配：旧版页面保存时不带该字段，沿用现值
+	if value.ProxyPoolFixed != nil {
+		poolSettings.Fixed = *value.ProxyPoolFixed
 	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
@@ -1567,6 +1605,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if !config.KeyConfigured(admin.configPath, "PRO_POOL") &&
 		proPool == saved.ProPool && proWarm == saved.ProWarmWorkerLimit && proMax == saved.ProMaxActiveWorkers {
 		unset = []string{"PRO_POOL"}
+	}
+	// 固定分配从没开过（.env 与进程环境变量都没有写 PROXY_POOL_FIXED）时保存 false 不写这一行：.env 与加入固定分配之前逐字节相同；
+	// 文件里有这一行后照常写真实值
+	if !poolSettings.Fixed && !config.KeyConfigured(admin.configPath, "PROXY_POOL_FIXED") {
+		unset = append(unset, "PROXY_POOL_FIXED")
 	}
 	if err := cfg.SaveKeepingUnset(admin.configPath, uneditedInvalidConfigKeys(saved.Invalid), unset); err != nil {
 		return api.RuntimeConfig{}, err
@@ -2291,6 +2334,7 @@ func buildVersion() string {
 
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	media := cfg.Media.Normalized()
+	proxyPoolFixed := cfg.ProxyPool.Fixed
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
@@ -2344,6 +2388,7 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		ModelFallbacks:         &modelFallbacks,
 		ModelFallbackScope:     cfg.ModelFallbackScope,
 		ProxyPool:              proxyPoolToAPI(cfg.ProxyPool),
+		ProxyPoolFixed:         &proxyPoolFixed,
 		MediaOutput:            media.Output,
 		MediaBaseURL:           &media.BaseURL,
 		MediaRetention:         config.FormatMediaRetention(media.Retention),

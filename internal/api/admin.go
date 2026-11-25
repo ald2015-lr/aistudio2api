@@ -557,6 +557,9 @@ type AdminAccount struct {
 	// ProxyPoolPinned 表示 IP 池开启、账户代理与当前生效的默认代理（PROXY）规范值相同，因此不使用 IP 池；与状态接口的
 	// proxy_pool.pinned_default、“改为跟随默认代理”同一份判断
 	ProxyPoolPinned bool `json:"proxy_pool_pinned,omitempty"`
+	// ProxyPoolFixedPort 为 IP 池固定分配（静态 IP、PROXY_POOL_FIXED=true）下账户的固定端口（只有端口号）；没有自己代理、分到端口的账户才有。
+	// 端口暂停使用时账户的 state 为 proxy_paused、message 为原因
+	ProxyPoolFixedPort int `json:"proxy_pool_fixed_port,omitempty"`
 	// OrgDisabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户的 state 仍为 disabled、
 	// message 接上这个原因；验证接口的返回在验证遇到组织停用时同样为 true，前端据此提示组织停用而不是登录失效
 	OrgDisabled bool `json:"org_disabled,omitempty"`
@@ -716,6 +719,9 @@ type RuntimeConfig struct {
 	ModelFallbackScope string  `json:"model_fallback_scope,omitempty"`
 	// ProxyPool 为 IP 池设置（PROXY_POOL_*，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
 	ProxyPool *ProxyPoolConfig `json:"proxy_pool,omitempty"`
+	// ProxyPoolFixed 为 IP 池固定分配（PROXY_POOL_FIXED，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值。
+	// 不放进 ProxyPoolConfig：旧版页面带着不含它的 proxy_pool 保存时不能把开关关掉
+	ProxyPoolFixed *bool `json:"proxy_pool_fixed,omitempty"`
 	// MediaOutput、MediaBaseURL、MediaRetention、MediaMaxSize 为生成媒体的输出与保存设置（MEDIA_OUTPUT、MEDIA_BASE_URL、
 	// MEDIA_RETENTION、MEDIA_MAX_SIZE，保存后立即生效），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值。
 	// 期限与大小为文本（7d、72h、20GB，0 表示不清理或不限）；服务地址可以清空，所以用指针区分缺省
@@ -905,6 +911,9 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/proxy/test", s.handleTestProxy)
 	mux.HandleFunc("POST /api/proxy/pool/check", s.handleCheckProxyPool)
 	mux.HandleFunc("POST /api/accounts/proxy/follow-default", s.handleFollowDefaultProxy)
+	mux.HandleFunc("POST /api/proxy/pool/fixed/rebalance", s.handleRebalanceProxyPool)
+	mux.HandleFunc("POST /api/proxy/pool/fixed/ports/{port}/reassign", s.handleReassignProxyPoolPort)
+	mux.HandleFunc("POST /api/proxy/pool/fixed/ports/{port}/restore", s.handleRestoreProxyPoolPort)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
 	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)

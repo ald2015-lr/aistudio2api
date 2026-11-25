@@ -1208,7 +1208,7 @@ func (manager *accountWorkerManager) extraLaunchDone(ctx context.Context, accoun
 		manager.extraPausedUntil.Store(time.Now().Add(extraEgressBackoff).UnixNano())
 		return false
 	case errors.Is(err, errAccountWorkerCapacity), errors.Is(err, errAccountWorkerOpening), errors.Is(err, errExtraMemberGone),
-		errors.Is(err, errAccountRuntimeBusy):
+		errors.Is(err, errAccountRuntimeBusy), errors.Is(err, errProxyPoolPortPaused):
 		manager.extraMu.Lock()
 		if manager.extraSkip == nil {
 			manager.extraSkip = make(map[string]struct{})
@@ -1231,8 +1231,9 @@ func (manager *accountWorkerManager) extraExpandInBackground(accountID string, m
 	go func() {
 		defer close(done)
 		_, err := manager.ensureWorker(ctx, accountID, modelID, false)
+		// 固定端口暂停使用按跳过处理（见 expandInBackground）
 		if err == nil || ctx.Err() != nil || errors.Is(err, errAccountWorkerOpening) || errors.Is(err, errAccountWorkerCapacity) ||
-			errors.Is(err, errAccountRuntimeBusy) || errors.Is(err, errExtraMemberGone) {
+			errors.Is(err, errAccountRuntimeBusy) || errors.Is(err, errExtraMemberGone) || errors.Is(err, errProxyPoolPortPaused) {
 			return
 		}
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("补充池 WAA Worker 后台扩容失败 | 错误=%v", err))

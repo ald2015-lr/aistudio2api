@@ -89,6 +89,7 @@ const zhCN = {
   'accounts.verifyResult': '验证完成：有效 {ok}，失效 {invalid}，出错 {failed}',
   'accounts.verifyResultOrgDisabled':
     '验证完成：有效 {ok}，失效 {invalid}，组织停用或受限 {org}，出错 {failed}',
+  'accounts.verifyResultSkippedPaused': '；跳过 {count} 个 IP 暂停的账户（固定端口恢复后再验证）',
   'accounts.verifyRestricted':
     '验证未通过：{reason}（不是登录失效，重新登录也没用；已停止调度）',
   'accounts.verifyRestrictedReason': '{reason}（不是登录失效，重新登录也没用）',
@@ -489,6 +490,7 @@ const zhCN = {
   'state.unavailable': '不可用',
   'state.disabled': '已停用',
   'state.org_disabled': '组织停用或受限',
+  'state.proxy_paused': 'IP 暂停',
   'restriction.org_disabled': '组织已停用',
   'restriction.service_restricted': '服务受限',
   'restriction.age_requirement': '年龄或资格不符',
@@ -561,6 +563,8 @@ const zhCN = {
   'accounts.progressErrored': '出错 {count}',
   'accounts.progressInvalidList': '登录失效明细（{count}）',
   'accounts.progressOrgDisabled': '组织停用或受限 {count}',
+  'accounts.progressSkippedPaused': '跳过 {count}（IP 暂停）',
+  'accounts.progressSkippedPausedList': '跳过明细：IP 暂停（{count}）',
   'accounts.progressNotPassedList': '未通过明细（{count}）',
   'accounts.progressActive': '处理中：{names}',
   'accounts.progressStop': '停止',
@@ -1249,11 +1253,15 @@ const zhCN = {
     '清空账户代理后由 IP 池分配，例如：{slot}（之后启动的 Worker 可能分到别的端口）',
   'proxy.testPoolSlot': 'IP 池此刻会分给登录的出口：{slot}（实际以登录时分到的为准）',
   'settings.proxyPoolTitle': 'IP 池（每个浏览器一个 IP）',
+  'settings.proxyPoolTitleFixed': 'IP 池（每个账户固定一个 IP）',
   'settings.proxyPoolHelp':
     '没有自己代理的账户改用 IP 池出网。静态 IP：端口段里每个端口是一个固定 IP，每个运行中的浏览器（Worker、登录、验证）独占一个端口，账号尽量回到上次用过的端口；动态 IP：地址里的 {session} 按账户换成固定会话号，一个会话号一个粘性 IP。优先级：账户自己的代理 > IP 池 > 默认代理。“一个账号一个 IP”指同一时刻：账号多于端口时，一个 IP 会先后服务多个账号。',
+  'settings.proxyPoolHelpFixed':
+    '没有自己代理的账户改用 IP 池出网。已开启固定分配：静态 IP 下每个账户固定一个端口（端口段里每个端口是一个固定 IP），同一端口的几个账户共用这个 IP、可以同时开浏览器，不再每个浏览器独占一个端口；动态 IP 下地址里的 {session} 按账户换成固定会话号，一直用这个会话号、不自动换会话。优先级：账户自己的代理 > IP 池 > 默认代理。',
   'settings.proxyPoolMode': '模式',
   'settings.proxyPoolModeOff': '关闭（使用默认代理）',
   'settings.proxyPoolModeStatic': '静态 IP（端口段，每个浏览器独占一个端口）',
+  'settings.proxyPoolModeStaticFixed': '静态 IP（端口段，每个账户固定一个端口）',
   'settings.proxyPoolModeDynamic': '动态 IP（会话号，每个账户一个固定会话）',
   'settings.proxyPoolURL': '代理地址',
   'settings.proxyPoolURLHelpOff': '关闭时保留地址，方便再次开启。',
@@ -1261,6 +1269,8 @@ const zhCN = {
     '填代理商给的任意一个端口的地址，例如 http://用户名:密码@isp.decodo.com:10000；端口会自动换成下面端口段里的端口（一个端口一个 IP）。写法同默认代理，保存时统一改写成 URL 形式。',
   'settings.proxyPoolURLHelpDynamic':
     '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。只在代理连不通时换会话号；裸 429 不换（每个会话只有一个账号，分不清是账号还是 IP 的问题），代理能连通、但被上游限制的会话不会自动换。建议在代理商处设置较长的会话时长。',
+  'settings.proxyPoolURLHelpDynamicFixed':
+    '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。已开启固定会话：每个账户一直用它的会话号，代理连不通时也不换。建议在代理商处设置较长的会话时长。',
   'settings.proxyPoolURLPlaceholderStatic': 'http://用户名:密码@isp.decodo.com:10000',
   'settings.proxyPoolURLPlaceholderDynamic':
     'http://customer-账号-sessid-{session}:密码@gate.ipfoxy.io:58688',
@@ -1361,6 +1371,86 @@ const zhCN = {
   'accounts.proxyPoolPinned': '固定为默认代理（不使用 IP 池）',
   'accounts.proxyPoolPinnedHelp':
     '账户代理与默认代理相同，因此不使用 IP 池；可在“服务配置 → IP 池”改为跟随默认代理',
+  'settings.proxyPoolFixed': '固定分配（每个账户固定一个端口，不自动换 IP）',
+  'settings.proxyPoolFixedHelpStatic':
+    '开启后，每个走 IP 池的账户（没有自己代理的）固定一个端口，按账户数平均分到端口段的端口上，例如 2000 个账户、500 个端口 → 每个端口 4 个账户（除不尽时各端口相差不超过 1）。同一端口的几个账户共用这个 IP、可以同时开浏览器；账户的 Worker、登录、验证、Chrome 导入与后台请求都只用它的固定端口。之后重启、更新、停止再启动、改其他设置都不变；端口冷却或被其他进程占用时，这个端口上的账户暂停使用、等它恢复（不换端口、不走默认代理、不直连）。分配记在 runtime/proxy-pool-fixed.json：首次开启时尽量保留账户上次用的端口，之后新增的账户分到账户最少的端口，删除账户只释放它自己的位置。',
+  'settings.proxyPoolFixedDynamic': '固定会话（不自动换会话）',
+  'settings.proxyPoolFixedHelpDynamic':
+    '开启后，每个账户一直用它的会话号（同一个 IP），连续出口连不通时也不再自动换会话；会话号记在 runtime/proxy-pool.json，重启、更新都不变。代理商那边这个会话不通时，这个账户的 Worker 启动会失败，直到会话恢复：可以给这个账户填自己的代理，或临时关闭固定会话。',
+  'settings.proxyPoolFixedEnableConfirm':
+    '开启固定分配：{accounts} 个账户分到 {ports} 个端口，每个端口约 {perPort} 个账户（同一端口的账户共用这个 IP，可以同时开浏览器；以前开启过时沿用原来的分配表、不重新平均，需要均匀时开启后点“重新平均分配”）。之后重启、更新都不变；端口冷却或被其他进程占用时，这个端口上的账户暂停使用、等它恢复，不换端口。运行中的浏览器关闭后改用固定端口（要立即切换，停止服务后再启动）。',
+  'settings.proxyPoolFixedEnableConfirmDynamic':
+    '开启固定会话：每个账户一直用它的会话号，连续出口连不通时也不再自动换会话；代理商那边会话不通时，这个账户的 Worker 启动会失败，直到会话恢复。',
+  'settings.proxyPoolFixedEnableAction': '开启',
+  'settings.proxyPoolFixedDisableConfirm':
+    '关闭固定分配：分配表保留，再次开启时沿用；之后启动的浏览器按原方式分配端口（每个浏览器独占一个端口，账户可能换 IP），运行中的浏览器关闭后改用原方式。',
+  'settings.proxyPoolFixedDisableConfirmDynamic': '关闭固定会话：连续出口连不通时恢复自动换会话。',
+  'settings.proxyPoolFixedDisableAction': '关闭',
+  'settings.proxyPoolFixedShrinkConfirm':
+    '固定分配已开启：端口 {ports} 不在新的端口段内，这些端口上约 {accounts} 个账户会立即挪到其他账户最少的端口、换 IP；之后改回端口段也不会回到原端口。确定要改端口段吗？',
+  'settings.proxyPoolFixedShrinkAction': '改端口段',
+  'settings.proxyPoolFixedCapacity':
+    '共 {ports} 个端口、{accounts} 个账户，每端口 {perPort} 个（同一端口的账户共用这个 IP，可以同时开浏览器；固定分配下不要求浏览器数不超过端口数）。',
+  'settings.proxyPoolFixedDefaultProxyHint':
+    '开启后，没有自己代理的账户不再使用默认代理；固定分配下也不会退回默认代理或直连：端口暂停使用时，这个端口上的账户暂停、等它恢复。',
+  'settings.proxyPoolFixedStatus': '固定分配：{ports} 个端口 · {accounts} 个账户 · 每端口 {perPort} 个',
+  'settings.proxyPoolFixedEmpty': '没有账户的端口 {count} 个',
+  'settings.proxyPoolFixedReserved': '登录、导入中预留 {count} 个',
+  'settings.proxyPoolFixedStray':
+    '{count} 个记录的账户已不在账户池（例如目录暂时移走或载入失败）：位置保留，账户回来时回到原端口；“重新平均分配”会清理它们。',
+  'settings.proxyPoolFixedUnassigned': '{count} 个走 IP 池的账户还没有分到端口（下次用到时分到账户最少的端口）。',
+  'settings.proxyPoolFixedTransitional':
+    '{count} 个运行中的 Worker 还不在固定端口上（开启固定分配或挪动之前就在运行），关闭后改用固定端口；要立即切换，停止服务后再启动。',
+  'settings.proxyPoolFixedExternal':
+    '{count} 个有固定账户的端口同时被账户自己的代理或默认代理指向：照常使用（与它们共用 IP），需要时可以给这些端口换 IP。',
+  'settings.proxyPoolFixedPaused':
+    '暂停使用的端口 {ports} 个（账户 {accounts} 个）：端口恢复后这些账户自动恢复，不换端口；IP 被限流或一直不通时可以给端口换 IP。',
+  'settings.proxyPoolFixedPausedUntil': '至 {time}',
+  'settings.proxyPoolFixedPausedRecheck': '下次检查 {time}',
+  'settings.proxyPoolFixedPausedAccounts': '{count} 个账户',
+  'settings.proxyPoolFixedListMore': '另有 {count} 个未列出',
+  'settings.proxyPoolFixedExcluded': '已停用的端口 {count} 个（换 IP 后不再分配；恢复后新增账户与重新平均分配会用到它）：',
+  'settings.proxyPoolFixedRestore': '恢复',
+  'settings.proxyPoolFixedRestoreDone': '端口 {port} 已恢复分配（不挪动任何账户）',
+  'settings.proxyPoolFixedRestoreNoop': '端口 {port} 本来就没有停用',
+  'settings.proxyPoolFixedReassign': '换 IP',
+  'settings.proxyPoolFixedReassignHelp': '把这个端口上的固定账户挪到其他账户最少的端口，这个端口停用（可以恢复）',
+  'settings.proxyPoolFixedReassignConfirm':
+    '给端口 {port} 换 IP：这个端口上的 {moved} 个账户挪到其他账户最少的端口（{targets}），端口 {port} 停用、之后不再分配（可以恢复）。',
+  'settings.proxyPoolFixedReassignClosing':
+    '此刻用这个端口的 {closing} 个浏览器在进行中的请求结束后关闭，下次启动用各自的固定端口。',
+  'settings.proxyPoolFixedReassignEmpty': '端口 {port} 上没有固定账户：停用这个端口，之后不再分配（可以恢复）。',
+  'settings.proxyPoolFixedReassignDone':
+    '已给端口 {port} 换 IP：挪动 {moved} 个账户，后台关闭 {restarted} 个 Worker，端口 {port} 已停用',
+  'settings.proxyPoolFixedRebalance': '重新平均分配',
+  'settings.proxyPoolFixedRebalanceHint':
+    '加了端口（IP）或删了很多账户之后，用“重新平均分配”让每个端口的账户数重新均匀：尽量少挪，先显示挪动数再确认；被挪的账户会换 IP。',
+  'settings.proxyPoolFixedRebalanceConfirm':
+    '重新平均分配：将挪动 {moved} 个账户（其中 {running} 个有运行中的浏览器，关闭后改用新端口），清理 {pruned} 个已不在账户池的记录；之后 {accounts} 个账户分到 {ports} 个端口，每端口 {perPort} 个。被挪的账户会换 IP。',
+  'settings.proxyPoolFixedRebalanceNone': '已经是平均分配，不需要挪动（每端口 {perPort} 个）',
+  'settings.proxyPoolFixedRebalanceDone': '已重新平均分配：挪动 {moved} 个账户，清理 {pruned} 个记录，每端口 {perPort} 个',
+  'settings.proxyPoolFixedDynamicStatus': '固定会话：{accounts} 个账户一直用各自的会话号，不自动换会话',
+  'settings.proxyPoolFixedNotFixed': '固定分配没有开启（需要静态 IP 且开启固定分配）',
+  'settings.proxyPoolFixedNoTarget': '没有其他可分配的端口',
+  'settings.proxyPoolFixedOutOfRange': '端口不在当前端口段内',
+  'proxyPoolPause.cooling_upstream': '冷却中（连续出口连不通）',
+  'proxyPoolPause.cooling_rate_limited': '冷却中（不同账号返回限流）',
+  'proxyPoolPause.cooling': '冷却中',
+  'proxyPoolPause.locked_elsewhere': '被其他进程占用',
+  'app.proxyPoolFixed': 'IP 池 · 固定 · 每端口 {perPort} · 暂停 {paused}',
+  'app.proxyPoolFixedDynamic': 'IP 池（动态）· 会话 {inUse} · 固定会话',
+  'app.proxyPoolDetailFixed':
+    '固定分配：{ports} 个端口 · {accounts} 个账户 · 每端口 {perPort} 个（同一端口的账户共用这个 IP）· 有浏览器的端口 {inUse}/{total}',
+  'app.proxyPoolDetailFixedPaused': '暂停使用：{ports}',
+  'app.proxyPoolDetailFixedPausedPort': '{port}（{reason}，{accounts} 个账户）',
+  'app.proxyPoolDetailFixedTransitional': '还不在固定端口上的 Worker {count} 个（关闭后改用固定端口）',
+  'app.proxyPoolDetailFixedDynamic': '固定会话：{accounts} 个账户不自动换会话',
+  'accounts.proxyPoolFixedSlot': 'IP 池 · 端口 {port}（固定）',
+  'accounts.proxyPoolFixedHelp': '固定分配：这个账户的 Worker、登录、验证与后台请求一直用这个端口（同一端口的几个账户共用这个 IP），重启、更新都不变',
+  'accounts.proxyPoolFixedPaused': '暂停使用',
+  'accounts.proxyPoolFixedTransitionalHelp': '这个浏览器在开启固定分配或挪动之前就在这个出口上运行，关闭后改用固定端口 {port}',
+  'proxy.testAccountClearedFixedSlot': '清空账户代理后分到的固定端口，例如：{slot}（账户最少的端口；之后一直用它）',
+  'proxy.testPoolFixedSlot': '固定分配下新账户登录此刻会分到：{slot}（账户最少、没有暂停的端口；登录用的端口就是之后的固定端口）',
   'logs.midWarn': '中途有警告',
   'logs.midError': '中途有错误',
   'logs.midHelp': '这个请求中途写过{level}（如换号、冷却），左侧是最终级别；点开看事件时间线',
@@ -1463,6 +1553,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.verifyResult': 'Verification finished: {ok} valid, {invalid} invalid, {failed} failed',
   'accounts.verifyResultOrgDisabled':
     'Verification finished: {ok} valid, {invalid} invalid, {org} disabled or restricted, {failed} failed',
+  'accounts.verifyResultSkippedPaused':
+    '; skipped {count} accounts whose IP is paused (verify them once their fixed port recovers)',
   'accounts.verifyRestricted':
     'Verification failed: {reason} (not an expired login, signing in again does not help; scheduling has stopped)',
   'accounts.verifyRestrictedReason': '{reason} (not an expired login, signing in again does not help)',
@@ -1883,6 +1975,7 @@ const en: Record<TranslationKey, string> = {
   'state.unavailable': 'Unavailable',
   'state.disabled': 'Disabled',
   'state.org_disabled': 'Disabled or restricted',
+  'state.proxy_paused': 'Proxy paused',
   'restriction.org_disabled': 'Disabled by org',
   'restriction.service_restricted': 'Service restricted',
   'restriction.age_requirement': 'Age or eligibility',
@@ -1958,6 +2051,8 @@ const en: Record<TranslationKey, string> = {
   'accounts.progressErrored': '{count} failed',
   'accounts.progressInvalidList': 'Expired logins ({count})',
   'accounts.progressOrgDisabled': '{count} disabled or restricted',
+  'accounts.progressSkippedPaused': '{count} skipped (proxy paused)',
+  'accounts.progressSkippedPausedList': 'Skipped: proxy paused ({count})',
   'accounts.progressNotPassedList': 'Not passed ({count})',
   'accounts.progressActive': 'Working on: {names}',
   'accounts.progressStop': 'Stop',
@@ -2670,11 +2765,15 @@ const en: Record<TranslationKey, string> = {
   'proxy.testPoolSlot':
     'IP pool exit a login would get right now: {slot} (the login itself may get another)',
   'settings.proxyPoolTitle': 'IP pool (one IP per browser)',
+  'settings.proxyPoolTitleFixed': 'IP pool (one fixed IP per account)',
   'settings.proxyPoolHelp':
     'Accounts without their own proxy go out through the IP pool. Static IPs: each port in the range is one fixed IP, every running browser (worker, login, verification) gets a port of its own, and an account returns to the port it used last when possible. Rotating IPs: {session} in the address is replaced with a fixed session ID per account, one sticky IP per session. Priority: the account proxy > the IP pool > the default proxy. "One IP per account" holds at any one moment: with more accounts than ports, one IP serves several accounts over time.',
+  'settings.proxyPoolHelpFixed':
+    'Accounts without their own proxy go out through the IP pool. Fixed assignment is on: with static IPs every account has one fixed port (each port in the range is one fixed IP), and the accounts on one port share its IP and can run browsers at the same time instead of one port per browser; with rotating IPs, {session} in the address is replaced with a fixed session ID per account, which is kept and never changed automatically. Priority: the account proxy > the IP pool > the default proxy.',
   'settings.proxyPoolMode': 'Mode',
   'settings.proxyPoolModeOff': 'Off (use the default proxy)',
   'settings.proxyPoolModeStatic': 'Static IPs (port range, one port per browser)',
+  'settings.proxyPoolModeStaticFixed': 'Static IPs (port range, one fixed port per account)',
   'settings.proxyPoolModeDynamic': 'Rotating IPs (session IDs, one fixed session per account)',
   'settings.proxyPoolURL': 'Proxy address',
   'settings.proxyPoolURLHelpOff': 'The address is kept while off so the pool can be turned on again.',
@@ -2682,6 +2781,8 @@ const en: Record<TranslationKey, string> = {
     'Enter the address of any port from your provider, for example http://user:pass@isp.decodo.com:10000; the port is replaced with each port of the range below (one IP per port). Same formats as the default proxy; saved in URL form.',
   'settings.proxyPoolURLHelpDynamic':
     'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters), which changes only when the proxy cannot be reached; bare 429s never change it (each session has a single account, so they cannot tell the account from the IP), and a session that the upstream limits while the proxy still works is not changed automatically. Set a long session duration at your provider.',
+  'settings.proxyPoolURLHelpDynamicFixed':
+    'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters). Fixed sessions are on: every account keeps its session ID, even when the proxy cannot be reached. Set a long session duration at your provider.',
   'settings.proxyPoolURLPlaceholderStatic': 'http://user:pass@isp.decodo.com:10000',
   'settings.proxyPoolURLPlaceholderDynamic':
     'http://customer-account-sessid-{session}:pass@gate.ipfoxy.io:58688',
@@ -2787,6 +2888,102 @@ const en: Record<TranslationKey, string> = {
   'accounts.proxyPoolPinned': 'Pinned to the default proxy (no IP pool)',
   'accounts.proxyPoolPinnedHelp':
     'The account proxy equals the default proxy, so this account does not use the IP pool; switch it under Service Configuration → IP pool with "Follow the default proxy"',
+  'settings.proxyPoolFixed':
+    'Fixed assignment (one fixed port per account, no automatic IP changes)',
+  'settings.proxyPoolFixedHelpStatic':
+    "Once on, every account that goes through the IP pool (no proxy of its own) gets one fixed port, spread evenly over the ports of the range by account count, for example 2000 accounts on 500 ports → 4 accounts per port (when it does not divide evenly, ports differ by at most 1). The accounts on one port share its IP and can run browsers at the same time; an account's worker, logins, verifications, Chrome imports and background requests all use only its fixed port. It then stays the same across restarts, updates, stopping and starting the service and changes to other settings; while a port is cooling down or held by another process, the accounts on it pause until it recovers (no other port, no default proxy, no direct connection). The assignment is kept in runtime/proxy-pool-fixed.json: the first time it is turned on, accounts keep the port they used last where possible, accounts added later go to the port with the fewest accounts, and deleting an account frees only its own place.",
+  'settings.proxyPoolFixedDynamic': 'Fixed sessions (no automatic session changes)',
+  'settings.proxyPoolFixedHelpDynamic':
+    "Once on, every account keeps its session ID (the same IP) and the session is no longer changed automatically when the exit keeps failing; session IDs are kept in runtime/proxy-pool.json and survive restarts and updates. If the provider cannot serve that session, the account's worker fails to start until the session recovers: give the account a proxy of its own, or turn fixed sessions off for a while.",
+  'settings.proxyPoolFixedEnableConfirm':
+    'Turn on fixed assignment: {accounts} accounts on {ports} ports, about {perPort} accounts per port (accounts on one port share its IP and can run browsers at the same time; if it was on before, the earlier assignment is kept rather than rebalanced, so use Rebalance after turning it on to even it out). It then stays the same across restarts and updates; while a port is cooling down or held by another process, the accounts on it pause until it recovers instead of moving to another port. Running browsers switch to their fixed port after they close (to switch now, stop the service and start it again).',
+  'settings.proxyPoolFixedEnableConfirmDynamic':
+    "Turn on fixed sessions: every account keeps its session ID and the session is no longer changed when the exit keeps failing; if the provider cannot serve a session, that account's worker fails to start until the session recovers.",
+  'settings.proxyPoolFixedEnableAction': 'Turn on',
+  'settings.proxyPoolFixedDisableConfirm':
+    'Turn off fixed assignment: the assignment is kept and used again when it is turned back on; browsers started from now on get ports the usual way (one port per browser, so accounts may change IP), and running browsers switch after they close.',
+  'settings.proxyPoolFixedDisableConfirmDynamic':
+    'Turn off fixed sessions: sessions are changed automatically again when the exit keeps failing.',
+  'settings.proxyPoolFixedDisableAction': 'Turn off',
+  'settings.proxyPoolFixedShrinkConfirm':
+    'Fixed assignment is on: ports {ports} are not in the new range, so about {accounts} accounts on them move to the ports with the fewest accounts right away and change IP; changing the range back later does not return them to their old ports. Change the port range?',
+  'settings.proxyPoolFixedShrinkAction': 'Change range',
+  'settings.proxyPoolFixedCapacity':
+    '{ports} ports, {accounts} accounts, {perPort} per port (accounts on one port share its IP and can run browsers at the same time; with fixed assignment, browsers may outnumber ports).',
+  'settings.proxyPoolFixedDefaultProxyHint':
+    'Once on, accounts without their own proxy stop using the default proxy; with fixed assignment they never fall back to the default proxy or a direct connection either: while a port is paused, the accounts on it pause until it recovers.',
+  'settings.proxyPoolFixedStatus':
+    'Fixed assignment: {ports} ports · {accounts} accounts · {perPort} per port',
+  'settings.proxyPoolFixedEmpty': '{count} ports without accounts',
+  'settings.proxyPoolFixedReserved': '{count} reserved for logins and imports',
+  'settings.proxyPoolFixedStray':
+    '{count} recorded accounts are no longer in the account pool (for example, their directory was moved away for a while or failed to load): their places are kept and they return to their port when they come back; "Rebalance" clears them.',
+  'settings.proxyPoolFixedUnassigned':
+    '{count} accounts that use the IP pool have no port yet (they get the port with the fewest accounts when next used).',
+  'settings.proxyPoolFixedTransitional':
+    '{count} running workers are not on their fixed port yet (they were running before fixed assignment was turned on or before a move) and switch after they close; to switch now, stop the service and start it again.',
+  'settings.proxyPoolFixedExternal':
+    '{count} ports with fixed accounts are also used by account proxies or the default proxy: they are used as usual (sharing the IP with those), and you can change the IP of those ports if needed.',
+  'settings.proxyPoolFixedPaused':
+    '{ports} ports paused ({accounts} accounts): the accounts resume when the port recovers, without moving to another port; if the IP is rate limited or keeps failing, change the IP of that port.',
+  'settings.proxyPoolFixedPausedUntil': 'until {time}',
+  'settings.proxyPoolFixedPausedRecheck': 'next check {time}',
+  'settings.proxyPoolFixedPausedAccounts': '{count} accounts',
+  'settings.proxyPoolFixedListMore': '{count} more not listed',
+  'settings.proxyPoolFixedExcluded':
+    '{count} ports disabled (not assigned after an IP change; once restored, new accounts and rebalancing use them again):',
+  'settings.proxyPoolFixedRestore': 'Restore',
+  'settings.proxyPoolFixedRestoreDone':
+    'Port {port} can be assigned again (no accounts were moved)',
+  'settings.proxyPoolFixedRestoreNoop': 'Port {port} was not disabled',
+  'settings.proxyPoolFixedReassign': 'Change IP',
+  'settings.proxyPoolFixedReassignHelp':
+    'Move the fixed accounts of this port to the ports with the fewest accounts and disable this port (it can be restored)',
+  'settings.proxyPoolFixedReassignConfirm':
+    'Change the IP of port {port}: its {moved} accounts move to the ports with the fewest accounts ({targets}), and port {port} is disabled and no longer assigned (it can be restored).',
+  'settings.proxyPoolFixedReassignClosing':
+    ' The {closing} browsers using this port now close once their requests finish and start on their own fixed ports next time.',
+  'settings.proxyPoolFixedReassignEmpty':
+    'Port {port} has no fixed accounts: disable it so it is no longer assigned (it can be restored).',
+  'settings.proxyPoolFixedReassignDone':
+    'Changed the IP of port {port}: moved {moved} accounts, closing {restarted} workers in the background; port {port} is disabled',
+  'settings.proxyPoolFixedRebalance': 'Rebalance',
+  'settings.proxyPoolFixedRebalanceHint':
+    'After adding ports (IPs) or deleting many accounts, "Rebalance" evens out the accounts per port again with as few moves as possible, showing the number of moves before you confirm; moved accounts change IP.',
+  'settings.proxyPoolFixedRebalanceConfirm':
+    'Rebalance: {moved} accounts will move ({running} of them have a running browser and switch after it closes), and {pruned} records of accounts no longer in the account pool will be cleared; afterwards {accounts} accounts are on {ports} ports, {perPort} per port. Moved accounts change IP.',
+  'settings.proxyPoolFixedRebalanceNone': 'Already balanced, nothing to move ({perPort} per port)',
+  'settings.proxyPoolFixedRebalanceDone':
+    'Rebalanced: moved {moved} accounts, cleared {pruned} records, {perPort} per port',
+  'settings.proxyPoolFixedDynamicStatus':
+    'Fixed sessions: {accounts} accounts keep their session IDs; sessions are not changed automatically',
+  'settings.proxyPoolFixedNotFixed':
+    'Fixed assignment is not on (it needs static IPs with fixed assignment turned on)',
+  'settings.proxyPoolFixedNoTarget': 'No other port to assign to',
+  'settings.proxyPoolFixedOutOfRange': 'The port is not in the current port range',
+  'proxyPoolPause.cooling_upstream': 'cooling down (exit kept failing)',
+  'proxyPoolPause.cooling_rate_limited': 'cooling down (rate limited across accounts)',
+  'proxyPoolPause.cooling': 'cooling down',
+  'proxyPoolPause.locked_elsewhere': 'held by another process',
+  'app.proxyPoolFixed': 'IP pool · fixed · {perPort} per port · {paused} paused',
+  'app.proxyPoolFixedDynamic': 'IP pool (rotating) · {inUse} sessions · fixed',
+  'app.proxyPoolDetailFixed':
+    'Fixed assignment: {ports} ports · {accounts} accounts · {perPort} per port (accounts on one port share its IP) · ports with browsers {inUse}/{total}',
+  'app.proxyPoolDetailFixedPaused': 'Paused: {ports}',
+  'app.proxyPoolDetailFixedPausedPort': '{port} ({reason}, {accounts} accounts)',
+  'app.proxyPoolDetailFixedTransitional':
+    '{count} workers not on their fixed port yet (they switch after closing)',
+  'app.proxyPoolDetailFixedDynamic': 'Fixed sessions: {accounts} accounts keep their sessions',
+  'accounts.proxyPoolFixedSlot': 'IP pool · port {port} (fixed)',
+  'accounts.proxyPoolFixedHelp':
+    'Fixed assignment: the worker, logins, verifications and background requests of this account always use this port (the accounts on one port share its IP), across restarts and updates',
+  'accounts.proxyPoolFixedPaused': 'paused',
+  'accounts.proxyPoolFixedTransitionalHelp':
+    'This browser was already running on this exit before fixed assignment was turned on or before a move; it switches to fixed port {port} after it closes',
+  'proxy.testAccountClearedFixedSlot':
+    'Fixed port after clearing the account proxy, for example: {slot} (the port with the fewest accounts; kept from then on)',
+  'proxy.testPoolFixedSlot':
+    'With fixed assignment a new login would get: {slot} (the port with the fewest accounts that is not paused; the login port becomes its fixed port)',
   'logs.midWarn': 'warned midway',
   'logs.midError': 'error midway',
   'logs.midHelp':

@@ -47,6 +47,43 @@ type AdminProxyPool struct {
 	Assignments    []AdminProxyPoolAssignment `json:"assignments,omitempty"`   // 活动的池租约
 	Check          *AdminProxyPoolCheck       `json:"check,omitempty"`         // 最近一次“检查全部端口”
 	RelayLimit     int                        `json:"relay_limit,omitempty"`   // 本机代理中转的进程连接上限
+	Fixed          *AdminProxyPoolFixed       `json:"fixed,omitempty"`         // 固定分配开启（且模式不为 off）时才有；不含地址
+}
+
+// AdminProxyPoolFixed 为 IP 池固定分配（PROXY_POOL_FIXED=true）的状态：Mode 为 static 或 dynamic。静态：Ports 为参与分配的端口数
+// （端口段内、没有停用的），Accounts 为分配表里的账户数，MinPerPort / MaxPerPort 为参与分配的端口上的最少 / 最多账户数，Empty 为没有账户的
+// 端口，Stray 为分配表里已不在账户池的账户（保留位置，服务停止时不算），Unassigned 为走 IP 池却没有分到端口的账户（正常为 0），Reserved 为
+// 登录、导入中预留的位置，Transitional 为运行中、还不在固定端口上的 Worker（关闭后改用固定端口），ExternalPorts 为有固定账户、同时被账户
+// 固定代理或 PROXY 指向的端口，Excluded 为“换 IP”后停用的端口（最多 50 个，ExcludedTotal 为总数），PausedPorts / PausedAccounts 为暂停使用的
+// 端口与其上的账户数，Paused 为暂停的端口（最多 50 个，按恢复时间、端口）。动态：Accounts 为走 IP 池的账户数，其余为 0
+type AdminProxyPoolFixed struct {
+	Mode           string                     `json:"mode"`
+	Since          time.Time                  `json:"since,omitzero"`
+	Ports          int                        `json:"ports,omitempty"`
+	Accounts       int                        `json:"accounts"`
+	MinPerPort     int                        `json:"min_per_port"`
+	MaxPerPort     int                        `json:"max_per_port"`
+	Empty          int                        `json:"empty,omitempty"`
+	Stray          int                        `json:"stray,omitempty"`
+	Unassigned     int                        `json:"unassigned,omitempty"`
+	Reserved       int                        `json:"reserved,omitempty"`
+	Transitional   int                        `json:"transitional,omitempty"`
+	ExternalPorts  int                        `json:"external_ports,omitempty"`
+	Excluded       []int                      `json:"excluded,omitempty"`
+	ExcludedTotal  int                        `json:"excluded_total,omitempty"`
+	PausedPorts    int                        `json:"paused_ports"`
+	PausedAccounts int                        `json:"paused_accounts"`
+	Paused         []AdminProxyPoolPausedPort `json:"paused,omitempty"`
+}
+
+// AdminProxyPoolPausedPort 为固定分配下暂停使用的端口：Reason 为 cooling_upstream（连续出口连不通的冷却）、cooling_rate_limited
+// （不同账号返回限流的冷却）、cooling（冷却中、规则未知，如重启后读回）或 locked_elsewhere（被其他进程占用）；Until 为冷却恢复时间或
+// 下次检查时间，Accounts 为这个端口上的固定账户数
+type AdminProxyPoolPausedPort struct {
+	Port     int       `json:"port"`
+	Reason   string    `json:"reason"`
+	Until    time.Time `json:"until,omitzero"`
+	Accounts int       `json:"accounts"`
 }
 
 // AdminProxyPoolPort 为冷却中的端口：Level 为冷却档位（第 n 档 15 分钟 × 2^(n-1)，最长 2 小时）

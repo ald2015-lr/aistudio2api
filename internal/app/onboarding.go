@@ -57,6 +57,8 @@ const (
 	onboardVerified     = "verified"
 	onboardVerifyFailed = "verify_failed"
 	onboardError        = "error"
+	// onboardDeferred 为暂缓（IP 池固定分配下账户的固定端口暂停使用）：不是结果，不记录、不计重试次数，放回队列等端口恢复
+	onboardDeferred = "deferred"
 )
 
 type onboardRecord struct {
@@ -452,6 +454,15 @@ func (onboarder *accountOnboarder) processBatch(ctx context.Context, batch []str
 	))
 }
 
+// deferUntil 让处理中的账户放回队列后不早于 at 再处理（暂缓，见 onboardDeferred）
+func (onboarder *accountOnboarder) deferUntil(accountID string, at time.Time) {
+	onboarder.mu.Lock()
+	defer onboarder.mu.Unlock()
+	if item := onboarder.processing[accountID]; item != nil {
+		item.notBefore = at
+	}
+}
+
 // explicitAt 返回处理中的账户由“处理现有停用账户”加入的时间；普通新账户为零
 func (onboarder *accountOnboarder) explicitAt(accountID string) time.Time {
 	onboarder.mu.Lock()
@@ -491,6 +502,20 @@ func (onboarder *accountOnboarder) process(
 	verified := false
 	if policy.AutoVerify {
 		verification, err := onboarder.admin.verifyLogin(ctx, accountID)
+		var paused *proxyPoolPausedError
+		if errors.As(err, &paused) {
+			// IP 池固定分配下账户的固定端口暂停使用（冷却中或被其他进程占用，固定分配不换端口）：不是验证出错，不计重试次数、
+			// 不写停用原因，等端口恢复后再处理
+			notBefore := time.Now().Add(onboardingRetryDelay)
+			if paused.Until.After(notBefore) {
+				notBefore = paused.Until
+			}
+			onboarder.deferUntil(accountID, notBefore)
+			onboarder.admin.requests.log(label, "INFO", fmt.Sprintf(
+				"新账户自动处理暂缓 | 原因=IP 池固定端口暂停使用 | 端口=%d | 下次=%s | 不计重试次数，端口恢复后再处理",
+				paused.Port, notBefore.UTC().Format(time.RFC3339)))
+			return onboardDeferred, strings.TrimSpace(err.Error()), false
+		}
 		if err != nil {
 			return onboardError, strings.TrimSpace(err.Error()), true
 		}
@@ -556,19 +581,19 @@ func onboardVerifyFailure(verification aistudio.LoginVerification, status aistud
 	return true, reason
 }
 
-// finish 记录处理结果；出错且未超过重试次数时稍后重试。返回最终结果（仍在重试时为空）
+// finish 记录处理结果；出错且未超过重试次数时稍后重试。返回最终结果（仍在重试或暂缓时为空）
 func (onboarder *accountOnboarder) finish(accountID string, result string, detail string, retry bool) string {
 	// 先在锁外查询账户是否仍存在，避免持有本锁时再去拿账户池锁
 	exists := true
-	if result == "" {
+	if result == "" || result == onboardDeferred {
 		_, exists = onboarder.accountStatus(accountID)
 	}
 	onboarder.mu.Lock()
 	defer onboarder.mu.Unlock()
 	item := onboarder.processing[accountID]
 	delete(onboarder.processing, accountID)
-	if result == "" {
-		// 服务停止时放回队列；账户已被删除时直接丢弃
+	if result == "" || result == onboardDeferred {
+		// 服务停止时放回队列，暂缓的按 deferUntil 记下的时间再处理（不计重试次数）；账户已被删除时直接丢弃
 		if item != nil && exists {
 			onboarder.pending[accountID] = item
 		}

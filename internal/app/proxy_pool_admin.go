@@ -21,6 +21,9 @@ import (
 var _ interface {
 	CheckProxyPool(context.Context, api.ProxyPoolCheckInput) error
 	FollowDefaultProxy(context.Context) (api.FollowDefaultProxyResult, error)
+	RebalanceProxyPool(context.Context, api.ProxyPoolFixedInput) (api.ProxyPoolFixedRebalanceResult, error)
+	ReassignProxyPoolPort(context.Context, int, api.ProxyPoolFixedInput) (api.ProxyPoolFixedReassignResult, error)
+	RestoreProxyPoolPort(context.Context, int) (api.ProxyPoolFixedRestoreResult, error)
 } = (*runtimeManager)(nil)
 
 // ipPool 返回生成服务使用的 IP 池；测试构造的管理端没有 Worker 管理器时为 nil（IP 池的方法对 nil 安全）
@@ -33,18 +36,23 @@ func (admin *runtimeAdmin) ipPool() *proxyPool {
 
 // browserProxy 为登录、验证、导入申请出口：账户代理非空时直接用它（租约为 nil）；IP 池开启时申请独占租约（已有账户跟随它正在用的
 // 出口：共用 Worker 的端口或会话号，Worker 仍走默认代理时用同一个上游），返回分到的上游；IP 池关闭时为直通租约，返回 PROXY。
-// key 为租约键（已有账户为账户 ID，新账户登录为 "login:" + 随机串），调用方在浏览器类操作结束后 release（方法对 nil 安全）
-func (admin *runtimeAdmin) browserProxy(key, accountID, kind, label, accountProxy string) (string, *proxyPoolLease) {
+// key 为租约键（已有账户为账户 ID，新账户登录为 "login:" + 随机串），调用方在浏览器类操作结束后 release（方法对 nil 安全）。
+// 固定分配下账户的固定端口暂停使用时返回 409 proxy_pool_port_paused（新账户全部端口暂停为 503 proxy_pool_no_port），不启动浏览器、
+// 不换端口、不用默认代理
+func (admin *runtimeAdmin) browserProxy(key, accountID, kind, label, accountProxy string) (string, *proxyPoolLease, error) {
 	if proxy := strings.TrimSpace(accountProxy); proxy != "" {
-		return proxy, nil
+		return proxy, nil, nil
 	}
 	fallback := admin.effectiveProxy("")
 	lease := admin.ipPool().acquire(key, accountID, kind, label, fallback)
 	if lease == nil {
-		return fallback, nil
+		return fallback, nil, nil
+	}
+	if err := lease.Refused(); err != nil {
+		return "", nil, fixedPausedAdminError(err)
 	}
 	// 直通租约的 URL 为 fallback，或跟随的 Worker 实际使用的上游
-	return lease.URL(), lease
+	return lease.URL(), lease, nil
 }
 
 // newLoginLeaseKey 返回新账户登录的租约键：登录成功、拿到邮箱之前没有账户 ID
@@ -66,7 +74,10 @@ func (admin *runtimeAdmin) importChrome(
 	ctx context.Context, root string, accountProxy string, accountIDs []string,
 ) ([]chromeauth.ImportResult, []*proxyPoolClaim, error) {
 	if strings.TrimSpace(accountProxy) != "" || !admin.ipPool().enabled() {
-		proxy, lease := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindImport, "auth", accountProxy)
+		proxy, lease, err := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindImport, "auth", accountProxy)
+		if err != nil {
+			return nil, nil, err
+		}
 		defer lease.release()
 		results, err := chromeImport(ctx, chromeauth.ImportOptions{ChromeRoot: root, Proxy: proxy, AccountIDs: accountIDs})
 		if err != nil {
@@ -79,6 +90,10 @@ func (admin *runtimeAdmin) importChrome(
 	for _, accountID := range accountIDs {
 		imported, claim, err := admin.importChromeOne(ctx, root, accountID)
 		if err != nil {
+			// 整批失败：已经拿到的出口记录没有人 adopt，撤销它们在固定分配里的预留
+			for _, claim := range claims {
+				claim.discard()
+			}
 			return nil, nil, err
 		}
 		results = append(results, imported...)
@@ -98,7 +113,10 @@ func (admin *runtimeAdmin) importChrome(
 func (admin *runtimeAdmin) importChromeOne(
 	ctx context.Context, root string, accountID string,
 ) ([]chromeauth.ImportResult, *proxyPoolClaim, error) {
-	proxy, lease := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindImport, "auth", "")
+	proxy, lease, err := admin.browserProxy(newLoginLeaseKey(), "", proxyPoolKindImport, "auth", "")
+	if err != nil {
+		return nil, nil, err
+	}
 	imported, err := chromeImport(ctx, chromeauth.ImportOptions{ChromeRoot: root, Proxy: proxy, AccountIDs: []string{accountID}})
 	if err != nil || len(imported) == 0 {
 		lease.release()
@@ -256,4 +274,102 @@ func (pool *proxyPool) enabled() bool {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 	return pool.settings.cfg.Enabled()
+}
+
+// fixedRunningAdmin 返回当前生成服务的管理端与它是否在运行（固定分配的管理操作据此决定清理不在账户池的记录、登记关闭 Worker）
+func (manager *runtimeManager) fixedRunningAdmin() (*runtimeAdmin, bool) {
+	generation := manager.generation()
+	if generation == nil {
+		return nil, false
+	}
+	admin, ok := generation.admin.(*runtimeAdmin)
+	if !ok || admin == nil {
+		return nil, false
+	}
+	return admin, generation.service != nil && generation.service.State() == "RUNNING"
+}
+
+// fixedKnownAccounts 返回服务运行中时账户池里的账户（服务停止时为 nil：不清理不在账户池的记录，重启时某个目录读失败也不换 IP）
+func (admin *runtimeAdmin) fixedKnownAccounts(running bool) map[string]struct{} {
+	if !running || admin == nil || admin.pool == nil {
+		return nil
+	}
+	ids := admin.pool.AccountIDs()
+	known := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		known[id] = struct{}{}
+	}
+	return known
+}
+
+// publishFixedChange 固定分配改了账户的端口后推一次账户列表（账户页的固定端口）
+func (admin *runtimeAdmin) publishFixedChange(ctx context.Context) {
+	if admin == nil {
+		return
+	}
+	if status, err := admin.Status(ctx); err == nil {
+		admin.publishRuntimeSnapshot(ctx, status)
+	}
+}
+
+// RebalanceProxyPool 重新平均分配固定端口（最少挪动，见 fixedPlanRebalance）：服务运行中时先清理已不在账户池的记录；dry_run 时只计算。
+// 被挪账户运行中的 Worker 不强制重启，关闭后改用新端口（服务停止时也能用）
+func (manager *runtimeManager) RebalanceProxyPool(ctx context.Context, input api.ProxyPoolFixedInput) (api.ProxyPoolFixedRebalanceResult, error) {
+	if manager.proxyPool == nil {
+		return api.ProxyPoolFixedRebalanceResult{}, &adminOperationError{status: http.StatusServiceUnavailable, code: "proxy_pool_unavailable", message: "IP 池尚未就绪"}
+	}
+	admin, running := manager.fixedRunningAdmin()
+	result, err := manager.proxyPool.fixedRebalance(admin.fixedKnownAccounts(running), input.DryRun)
+	if err == nil && !input.DryRun && (result.Moved > 0 || result.Pruned > 0) {
+		admin.publishFixedChange(ctx)
+	}
+	return result, err
+}
+
+// ReassignProxyPoolPort 给端口换 IP：这个端口上的账户挪到其他账户最少的端口，这个端口停用；服务运行中时给仍在旧端口上服务的 Worker 登记
+// 后台关闭（等进行中的请求结束，不切断输出中的流，下次启动用新端口）。dry_run 时只计算
+func (manager *runtimeManager) ReassignProxyPoolPort(ctx context.Context, port int, input api.ProxyPoolFixedInput) (api.ProxyPoolFixedReassignResult, error) {
+	if manager.proxyPool == nil {
+		return api.ProxyPoolFixedReassignResult{}, &adminOperationError{status: http.StatusServiceUnavailable, code: "proxy_pool_unavailable", message: "IP 池尚未就绪"}
+	}
+	result, serving, err := manager.proxyPool.fixedReassign(port, input.DryRun)
+	if err != nil || input.DryRun {
+		return result, err
+	}
+	admin, running := manager.fixedRunningAdmin()
+	if running && admin != nil {
+		result.Restarted = admin.workers.resetFixedWorkers(serving, port)
+	}
+	manager.requests.logDurable("service", "INFO", fixedReassignLog(result))
+	admin.publishFixedChange(ctx)
+	return result, nil
+}
+
+// RestoreProxyPoolPort 恢复“换 IP”后停用的端口（不挪任何账户）
+func (manager *runtimeManager) RestoreProxyPoolPort(ctx context.Context, port int) (api.ProxyPoolFixedRestoreResult, error) {
+	if manager.proxyPool == nil {
+		return api.ProxyPoolFixedRestoreResult{}, &adminOperationError{status: http.StatusServiceUnavailable, code: "proxy_pool_unavailable", message: "IP 池尚未就绪"}
+	}
+	return manager.proxyPool.fixedRestore(port)
+}
+
+// resetFixedWorkers 给仍在 port 上服务的这些账户的 Worker 登记后台关闭（workerResetProxyFixed）：先取版本再核对端口（照端口冷却的写法），
+// 核对之后才换掉的 Worker 按版本登记的关闭不会关掉新的。返回真正登记的个数
+func (manager *accountWorkerManager) resetFixedWorkers(accountIDs []string, port int) int {
+	if manager == nil {
+		return 0
+	}
+	ipPool := manager.ipPool()
+	restarted := 0
+	for _, accountID := range accountIDs {
+		generation := manager.WorkerGeneration(accountID)
+		if !manager.hasWorker(accountID) || !ipPool.servesOnPort(accountID, port) {
+			continue
+		}
+		pending, _ := manager.scheduleWorkerReset(accountID, generation, nil, workerResetProxyFixed)
+		if workerResetRegistered(pending) {
+			restarted++
+		}
+	}
+	return restarted
 }

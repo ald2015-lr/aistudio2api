@@ -26,6 +26,10 @@ import (
 // AccountOrgDisabled 表示账号所属组织停用了 AI Studio：不参与调度，认证文件更新、管理员清除或长间隔复查通过后恢复
 const AccountOrgDisabled AccountState = "org_disabled"
 
+// AccountProxyPaused 表示 IP 池固定分配（PROXY_POOL_FIXED）下账户的固定端口暂停使用（冷却中或被其他进程占用，见 ProxyBinding.Hold）：
+// 不参与调度，端口恢复后 IP 池清除 Hold、自动恢复；不换端口、不走默认代理、不直连
+const AccountProxyPaused AccountState = "proxy_paused"
+
 // ErrOrgDisabled 为账号所属组织停用了 AI Studio 的哨兵（与 camoufoxnative.ErrServiceNotAllowed 是同一个）：
 // 启动、验证、登录时的组织停用页（camoufoxnative.ServiceNotAllowedError）与上游 RPC 的“AI Studio app is disabled”（*RPCError）
 // 都满足 errors.Is(err, ErrOrgDisabled)
@@ -290,13 +294,20 @@ func (account *Account) schedulingState() AccountState {
 	if account.orgDisabled && account.State != AccountDisabled {
 		return AccountOrgDisabled
 	}
+	// IP 池固定分配下固定端口暂停使用（见 ProxyBinding.Hold）：只盖住就绪状态，需要登录、不可用、停用与组织停用照旧优先
+	if account.State == AccountReady && account.ProxyHold() != "" {
+		return AccountProxyPaused
+	}
 	return account.State
 }
 
-// stateMessageLocked 返回账户状态的说明：组织停用时为标记的说明，其余为底层状态的说明；调用方持有 p.mu
+// stateMessageLocked 返回账户状态的说明：组织停用时为标记的说明，固定端口暂停使用时为暂停原因，其余为底层状态的说明；调用方持有 p.mu
 func (account *Account) stateMessageLocked() string {
-	if account.schedulingState() == AccountOrgDisabled && account.Config.Enabled {
+	switch state := account.schedulingState(); {
+	case state == AccountOrgDisabled && account.Config.Enabled:
 		return account.orgDisabledReason
+	case state == AccountProxyPaused && account.Config.Enabled:
+		return account.ProxyHold()
 	}
 	return account.stateMessage
 }

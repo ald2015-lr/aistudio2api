@@ -36,7 +36,7 @@ import type {
   WorkerState,
 } from '@/types'
 import { maskProxy, proxyHasAuth } from '@/proxy'
-import { proxyPoolActive, slotLabel } from '@/proxyPool'
+import { proxyPoolActive, proxyPoolFixedStatic, slotLabel } from '@/proxyPool'
 import OnboardingPanel from './OnboardingPanel.vue'
 import StudioKeysPanel from './StudioKeysPanel.vue'
 import ProxyInput from './ProxyInput.vue'
@@ -853,6 +853,7 @@ const stateKeys: Record<AccountState, TranslationKey> = {
   unavailable: 'state.unavailable',
   disabled: 'state.disabled',
   org_disabled: 'state.org_disabled',
+  proxy_paused: 'state.proxy_paused',
 }
 
 // restrictionKeys 为 org_disabled 状态各原因种类的显示（组织停用、服务受限、年龄或资格、Workspace 未开放）
@@ -901,6 +902,7 @@ const stateDotClass: Record<AccountState, string> = {
   unavailable: 'bg-red-500',
   disabled: 'bg-gray-600',
   org_disabled: 'bg-orange-500',
+  proxy_paused: 'bg-purple-500',
 }
 
 const stateTextClass: Record<AccountState, string> = {
@@ -911,6 +913,7 @@ const stateTextClass: Record<AccountState, string> = {
   unavailable: 'text-red-400',
   disabled: 'text-gray-500',
   org_disabled: 'text-orange-400',
+  proxy_paused: 'text-purple-300',
 }
 
 function messageOf(error: unknown): string {
@@ -1200,6 +1203,7 @@ type AccountTier = 'Ultra' | 'Pro' | 'Plus' | 'Free' | 'unknown'
 type TierFilter = 'all' | AccountTier
 type SortKey = 'default' | 'state' | 'label' | 'models' | 'worker'
 
+// proxy_paused（IP 池固定分配下固定端口暂停使用）只在有这样的账户或正在按它筛选时显示，见 visibleFilterStates
 const filterStates: AccountState[] = [
   'ready',
   'busy',
@@ -1207,16 +1211,18 @@ const filterStates: AccountState[] = [
   'auth_required',
   'org_disabled',
   'unavailable',
+  'proxy_paused',
   'disabled',
 ]
 const stateOrder: Record<AccountState, number> = {
   auth_required: 0,
   org_disabled: 1,
   unavailable: 2,
-  cooldown: 3,
-  busy: 4,
-  ready: 5,
-  disabled: 6,
+  proxy_paused: 3,
+  cooldown: 4,
+  busy: 5,
+  ready: 6,
+  disabled: 7,
 }
 const sortOptions: { value: SortKey; label: TranslationKey }[] = [
   { value: 'default', label: 'accounts.sortDefault' },
@@ -1315,6 +1321,8 @@ function inExtraPool(account: Account): boolean {
 // ---------- 代理列与 IP 池 ----------
 
 const poolOn = computed(() => proxyPoolActive(props.proxyPool))
+// poolFixed 为静态 IP 的固定分配生效：账户列表带固定端口（proxy_pool_fixed_port），代理列显示“端口 X（固定）”
+const poolFixed = computed(() => proxyPoolFixedStatic(props.proxyPool))
 // poolAssignments 按账户 ID 合并状态接口的活动租约（同一账户的 Worker 与登录、验证同时在用时以 Worker 为准）；
 // 账户列表事件不随 Worker 启停推送，实时端口以这里为准
 const poolAssignments = computed(() => {
@@ -1337,8 +1345,15 @@ interface ProxyCell {
   className: string
 }
 
+// fixedPortOf 返回账户的固定端口（静态 IP 的固定分配生效、账户没有自己的代理时）；没有时为 0
+function fixedPortOf(account: Account): number {
+  if (!poolFixed.value || account.proxy !== '') return 0
+  return account.proxy_pool_fixed_port ?? 0
+}
+
 // proxyCell 返回代理列的显示：账户代理（服务端按当前生效的默认代理标出不用 IP 池的，proxy_pool_pinned）> IP 池的实时租约 >
-// 仍走默认代理的 Worker（开启 IP 池或改为跟随默认代理之前就在运行）> 没有浏览器时后台请求暂用的出口 > 默认代理
+// 仍走默认代理的 Worker（开启 IP 池或改为跟随默认代理之前就在运行）> 固定分配的固定端口（暂停时标出）> 没有浏览器时后台请求暂用的出口 >
+// 默认代理。固定分配下实时租约在固定端口上时同样标“固定”，不在固定端口上的是过渡中的浏览器（关闭后改用固定端口）
 function proxyCell(account: Account): ProxyCell {
   const own = account.proxy
   if (own !== '') {
@@ -1352,14 +1367,26 @@ function proxyCell(account: Account): ProxyCell {
       className: 'text-gray-400',
     }
   }
+  const fixedPort = fixedPortOf(account)
   const assignment = poolAssignments.value.get(account.id)
   if (assignment !== undefined) {
     const login = assignment.kind === 'login'
+    const usage = t(login ? 'accounts.proxyPoolLogin' : 'accounts.proxyPoolActive')
+    if (fixedPort > 0 && assignment.slot === String(fixedPort)) {
+      return {
+        text: `${tf('accounts.proxyPoolFixedSlot', { port: fixedPort })} · ${usage}`,
+        tooltip: t('accounts.proxyPoolFixedHelp'),
+        auth: false,
+        pinned: false,
+        className: 'text-sky-300',
+      }
+    }
     return {
-      text: `${tf('accounts.proxyPoolSlot', { slot: slotLabel(assignment.slot, tf) })} · ${t(
-        login ? 'accounts.proxyPoolLogin' : 'accounts.proxyPoolActive',
-      )}`,
-      tooltip: t(login ? 'accounts.proxyPoolLoginHelp' : 'accounts.proxyPoolActiveHelp'),
+      text: `${tf('accounts.proxyPoolSlot', { slot: slotLabel(assignment.slot, tf) })} · ${usage}`,
+      tooltip:
+        fixedPort > 0
+          ? tf('accounts.proxyPoolFixedTransitionalHelp', { port: fixedPort })
+          : t(login ? 'accounts.proxyPoolLoginHelp' : 'accounts.proxyPoolActiveHelp'),
       auth: false,
       pinned: false,
       className: 'text-sky-300',
@@ -1372,6 +1399,18 @@ function proxyCell(account: Account): ProxyCell {
       auth: false,
       pinned: false,
       className: 'text-blue-300',
+    }
+  }
+  if (fixedPort > 0) {
+    const paused = account.state === 'proxy_paused'
+    return {
+      text: paused
+        ? `${tf('accounts.proxyPoolFixedSlot', { port: fixedPort })} · ${t('accounts.proxyPoolFixedPaused')}`
+        : tf('accounts.proxyPoolFixedSlot', { port: fixedPort }),
+      tooltip: paused && account.message !== '' ? account.message : t('accounts.proxyPoolFixedHelp'),
+      auth: false,
+      pinned: false,
+      className: paused ? 'text-purple-300' : 'text-gray-400',
     }
   }
   const slot = account.proxy_pool_slot ?? ''
@@ -1396,10 +1435,11 @@ function proxyCell(account: Account): ProxyCell {
   return { text: t('accounts.direct'), tooltip: '', auth: false, pinned: false, className: 'text-gray-400' }
 }
 
-// proxySearchText 为搜索用的代理文本：账户代理按掩码后的显示值（搜不到账号密码），另加 IP 池的端口号或会话号
+// proxySearchText 为搜索用的代理文本：账户代理按掩码后的显示值（搜不到账号密码），另加 IP 池的端口号或会话号与固定端口
 function proxySearchText(account: Account): string {
   const slot = poolAssignments.value.get(account.id)?.slot ?? account.proxy_pool_slot ?? ''
-  return `${maskProxy(account.proxy)} ${slot}`
+  const fixedPort = fixedPortOf(account)
+  return `${maskProxy(account.proxy)} ${slot}${fixedPort > 0 ? ` ${fixedPort}` : ''}`
 }
 
 const query = ref('')
@@ -1420,10 +1460,22 @@ const stateCounts = computed(() => {
     unavailable: 0,
     disabled: 0,
     org_disabled: 0,
+    proxy_paused: 0,
   }
-  for (const account of props.accounts) counts[account.state] += 1
+  for (const account of props.accounts) {
+    // 旧数据或更新的服务端可能带来不认识的状态：不计入，避免 NaN
+    if (account.state in counts) counts[account.state] += 1
+  }
   return counts
 })
+
+// visibleFilterStates 为状态筛选里显示的状态：IP 暂停只在有这样的账户、或正在按它筛选时显示（大多数部署没有固定分配）
+const visibleFilterStates = computed(() =>
+  filterStates.filter(
+    (state) =>
+      state !== 'proxy_paused' || stateCounts.value.proxy_paused > 0 || stateFilter.value === state,
+  ),
+)
 
 // tierCounts 按真实权益统计账户数，供权益筛选显示数量；ultraPoolCount 与 ultraReady 按号池成员关系统计
 // Ultra 号池的账户数与其中就绪的账户数，开启 ULTRA_INCLUDE_PRO 时含 Pro 账户
@@ -1953,17 +2005,22 @@ async function startBulk(
   finishBulk(action)
 }
 
-// finishBulk 批量任务结束后刷新数据并给出汇总通知：批量验证按“有效 / 登录失效 / 出错”三项汇总，有组织停用的账户时另列一项
+// finishBulk 批量任务结束后刷新数据并给出汇总通知：批量验证按“有效 / 登录失效 / 出错”三项汇总，有组织停用的账户时另列一项，
+// 有固定端口暂停而跳过的账户时再接一句（跳过不算出错，只有跳过时仍用成功色）
 function finishBulk(action: BulkAction): void {
   emit('refresh')
   if (action === 'verify') {
     const org = bulkOrgDisabled.value
     const counts = { ok: bulk.succeeded, invalid: bulkExpired.value, failed: bulk.failures.length }
-    emit(
-      'notice',
+    const summary =
       org > 0
         ? tf('accounts.verifyResultOrgDisabled', { ...counts, org })
-        : tf('accounts.verifyResult', counts),
+        : tf('accounts.verifyResult', counts)
+    emit(
+      'notice',
+      bulk.skipped.length > 0
+        ? summary + tf('accounts.verifyResultSkippedPaused', { count: bulk.skipped.length })
+        : summary,
       bulk.failures.length === 0 && bulk.invalid.length === 0 ? 'success' : 'error',
     )
     return
@@ -2206,7 +2263,17 @@ async function startVerify(): Promise<void> {
     return
   }
   await startBulk('verify', targets, verifyConcurrency.value, async (account) => {
-    const verified = await api.verifyAccount(account.id)
+    let verified: Awaited<ReturnType<typeof api.verifyAccount>>
+    try {
+      verified = await api.verifyAccount(account.id)
+    } catch (error) {
+      // 固定分配下账户的固定端口暂停使用（409 proxy_pool_port_paused）：这次不验证，计为跳过（与新账户自动处理的“暂缓”同一口径），
+      // 不计出错；端口恢复后再验证
+      if (error instanceof ApiError && error.code === 'proxy_pool_port_paused') {
+        return { skipped: true, message: error.message }
+      }
+      throw error
+    }
     if (verifiedOrgDisabled(verified)) {
       const reason = restrictionReason(verified.restriction)
       return {
@@ -2949,6 +3016,9 @@ function closeBulkPanel(): void {
               <span v-if="bulkOrgDisabled > 0" class="text-xs text-yellow-400">
                 {{ tf('accounts.progressOrgDisabled', { count: bulkOrgDisabled }) }}
               </span>
+              <span v-if="bulk.skipped.length > 0" class="text-xs text-gray-400">
+                {{ tf('accounts.progressSkippedPaused', { count: bulk.skipped.length }) }}
+              </span>
               <span class="text-xs" :class="bulk.failures.length > 0 ? 'text-red-400' : 'text-gray-500'">
                 {{ tf('accounts.progressErrored', { count: bulk.failures.length }) }}
               </span>
@@ -3015,6 +3085,24 @@ function closeBulkPanel(): void {
             </li>
           </ul>
         </details>
+        <details v-if="bulk.skipped.length > 0" class="mt-2 text-xs">
+          <summary class="cursor-pointer text-gray-400">
+            {{ tf('accounts.progressSkippedPausedList', { count: bulk.skipped.length }) }}
+            <button
+              class="btn btn-sm ml-2"
+              type="button"
+              @click.prevent="copyEmails(bulk.skipped.map((entry) => entry.label))"
+            >
+              {{ t('accounts.copyEmails') }}
+            </button>
+          </summary>
+          <ul class="mt-2 max-h-48 space-y-1 overflow-auto">
+            <li v-for="entry in bulk.skipped" :key="entry.id" class="flex gap-2">
+              <span class="shrink-0 font-mono text-gray-300">{{ entry.label }}</span>
+              <span class="min-w-0 break-words text-gray-400">{{ entry.message }}</span>
+            </li>
+          </ul>
+        </details>
         <details v-if="bulk.failures.length > 0" class="mt-2 text-xs">
           <summary class="cursor-pointer text-red-400">
             {{ tf('accounts.progressFailures', { count: bulk.failures.length }) }}
@@ -3048,7 +3136,7 @@ function closeBulkPanel(): void {
             <span class="seg-count">{{ accounts.length }}</span>
           </button>
           <button
-            v-for="state in filterStates"
+            v-for="state in visibleFilterStates"
             :key="state"
             class="seg-item"
             :class="{ active: stateFilter === state }"
@@ -3310,7 +3398,8 @@ function closeBulkPanel(): void {
                   <div
                     v-else-if="account.message"
                     v-tooltip="account.message"
-                    class="cell-truncate text-[11px] text-red-400"
+                    class="cell-truncate text-[11px]"
+                    :class="account.state === 'proxy_paused' ? 'text-purple-300' : 'text-red-400'"
                   >
                     {{ account.message }}
                   </div>
@@ -3537,6 +3626,7 @@ function closeBulkPanel(): void {
                 allow-empty-test
                 :account-id="editingTestAccountID"
                 :account-cleared="editingTestCleared"
+                :pool-fixed="poolFixed"
                 :label="t('accounts.proxy')"
               />
             </div>
@@ -3599,6 +3689,7 @@ function closeBulkPanel(): void {
                 input-class="input w-full"
                 :help="t('accounts.proxyHelp')"
                 allow-empty-test
+                :pool-fixed="poolFixed"
                 :label="t('accounts.proxy')"
               />
             </div>
@@ -3666,6 +3757,7 @@ function closeBulkPanel(): void {
                 input-class="input w-full"
                 :help="t('accounts.proxyHelp')"
                 allow-empty-test
+                :pool-fixed="poolFixed"
                 :label="t('accounts.proxy')"
               />
             </div>

@@ -36,6 +36,7 @@ A="http://127.0.0.1:$PORT"
 T=$(tr -cd '0-9a-fA-F' < .admin-token 2>/dev/null)
 POOL_MODE=$(env_value PROXY_POOL_MODE); POOL_URL=$(env_value PROXY_POOL_URL)
 POOL_START=$(env_value PROXY_POOL_PORT_START); POOL_END=$(env_value PROXY_POOL_PORT_END)
+POOL_FIXED=$(env_value PROXY_POOL_FIXED)
 SECRETS=$(echo "$POOL_URL" | sed -n 's#^[a-zA-Z0-9]*://\([^@/]*\)@.*#\1#p')
 export SECRETS
 
@@ -104,6 +105,23 @@ if pool:
     check = pool.get("check")
     if check:
         print("  最近一次检查全部端口：" + json.dumps(check, ensure_ascii=False)[:300])
+    # fixed 为 IP 池固定分配（PROXY_POOL_FIXED=true）的状态：开启且模式不为关闭时才有，只有端口号与计数
+    fixed = pool.get("fixed")
+    if isinstance(fixed, dict) and fixed.get("mode") == "static":
+        reasons = {"cooling_upstream": "冷却中（连续出口连不通）", "cooling_rate_limited": "冷却中（不同账号返回限流）",
+                   "cooling": "冷却中", "locked_elsewhere": "被其他进程占用"}
+        print(f"  IP 池固定分配：端口 {fixed.get('ports')}，账户 {fixed.get('accounts')}，每端口 {fixed.get('min_per_port')}–{fixed.get('max_per_port')}，"
+              f"暂停端口 {fixed.get('paused_ports')}（账户 {fixed.get('paused_accounts')}），过渡 Worker {fixed.get('transitional') or 0}，"
+              f"停用端口 {fixed.get('excluded_total') or 0}，已不在账户池 {fixed.get('stray') or 0}，未分配 {fixed.get('unassigned') or 0}")
+        for port in (fixed.get("paused") or [])[:10]:
+            # 冷却的 until 为恢复时间；被其他进程占用的 until 只是下次检查锁的时间，对方释放后才恢复
+            when = "下次检查" if port.get("reason") == "locked_elsewhere" else "恢复"
+            print(f"    暂停端口 {port.get('port')}：{reasons.get(port.get('reason'), port.get('reason'))}，"
+                  f"{when} {port.get('until') or '-'}，账户 {port.get('accounts')}")
+        if fixed.get("paused_ports"):
+            print("    → 暂停的端口恢复前，固定在它上面的账户不启动 Worker、不参与调度（不换端口）；IP 被限流或一直不通时在管理页给这个端口“换 IP”")
+    elif isinstance(fixed, dict):
+        print(f"  IP 池固定会话：账户 {fixed.get('accounts')}（连不通时也不自动换会话）")
 s = d.get("egress_summary")
 if s:
     print(f"出口：共 {s.get('total')}，正常 {s.get('normal')}，判定限流 {s.get('limited')}，已撤销 {s.get('rejected')}")
@@ -128,7 +146,7 @@ PY
 
   echo
   echo "==================== 直连测 IP 池端口（不经程序，看 Decodo 本身）===================="
-  echo "模式 ${POOL_MODE:-off}，端口 ${POOL_START:-?}–${POOL_END:-?}"
+  echo "模式 ${POOL_MODE:-off}，端口 ${POOL_START:-?}–${POOL_END:-?}，固定分配 ${POOL_FIXED:-false}"
   if [ "${POOL_MODE:-off}" = static ] && [ -n "$POOL_URL" ] && [ -n "$POOL_START" ] && [ -n "$POOL_END" ]; then
     hostpart=$(echo "$POOL_URL" | sed -E 's#^([a-zA-Z0-9]+)://([^@/]*@)?([^:/]+).*#\1://\3#')
     auth=$(echo "$POOL_URL" | python3 -I -c 'import sys, urllib.parse as u

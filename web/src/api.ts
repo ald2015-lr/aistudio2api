@@ -20,6 +20,9 @@ import type {
   OrgDisabledAccount,
   PermissionDeniedAccount,
   ProxyPoolConfig,
+  ProxyPoolFixedRebalanceResult,
+  ProxyPoolFixedReassignResult,
+  ProxyPoolFixedRestoreResult,
   ProxyTestResult,
   RequestBody,
   RequestSummary,
@@ -193,7 +196,8 @@ async function playgroundResponseError(response: Response): Promise<ApiError> {
 }
 
 // adminResponseError 把管理端的非 2xx 响应转为 ApiError。withCode 为真时带上错误外壳里的错误码（管理端为 {error:{code,message}}），
-// 只给按错误码显示本地化文案的账户写操作用（添加账户、修改账户、Chrome 导入：account_exists、invalid_timezone）；
+// 只给按错误码显示本地化文案或分类的账户写操作用（添加账户、修改账户、Chrome 导入：account_exists、invalid_timezone；
+// 验证：proxy_pool_port_paused）；
 // 其他管理请求的错误照旧只带消息与状态码
 async function adminResponseError(response: Response, withCode: boolean): Promise<ApiError> {
   if (!withCode) return new ApiError(await responseErrorMessage(response), response.status)
@@ -325,8 +329,15 @@ export const api = {
     requestCommand(`/api/accounts/${encodeURIComponent(id)}/login`, { method: 'POST' }),
   // verifyAccount 返回带验证结论的账户（authenticated 与 verify_reason）：HTTP 200 只表示验证做完了，不表示登录有效。
   // 服务端返回 {"account": …}，取出里面的账户（原先把外壳当成账户，authenticated 永远读不到）
+  // 带错误码：批量验证把固定端口暂停使用（409 proxy_pool_port_paused）计为跳过
   verifyAccount: async (id: string) =>
-    (await requestJSON<AccountResponse>(`/api/accounts/${encodeURIComponent(id)}/verify`, { method: 'POST' })).account,
+    (
+      await requestJSON<AccountResponse>(
+        `/api/accounts/${encodeURIComponent(id)}/verify`,
+        { method: 'POST' },
+        true,
+      )
+    ).account,
   // AI Studio API Key：列表只有末四位；revealStudioKey 只给复制按钮用（服务端 Cache-Control: no-store）
   studioKeys: () => requestJSON<StudioKeyStatus>('/api/studio-keys', { cache: 'no-store' }),
   fetchStudioKeys: (ids: string[]) =>
@@ -413,6 +424,25 @@ export const api = {
     requestJSON<FollowDefaultProxyResult>('/api/accounts/proxy/follow-default', {
       method: 'POST',
     }),
+  // rebalanceProxyPool 重新平均分配 IP 池固定分配（最少挪动）；dryRun 为真时只计算挪动数、不改分配（确认前先显示）
+  rebalanceProxyPool: (dryRun: boolean) =>
+    requestJSON<ProxyPoolFixedRebalanceResult>('/api/proxy/pool/fixed/rebalance', {
+      method: 'POST',
+      body: JSON.stringify({ dry_run: dryRun }),
+    }),
+  // reassignProxyPoolPort 给固定分配的端口换 IP：这个端口上的账户挪到其他账户最少的端口，这个端口停用（之后不再分配，可恢复）；
+  // dryRun 为真时只计算
+  reassignProxyPoolPort: (port: number, dryRun: boolean) =>
+    requestJSON<ProxyPoolFixedReassignResult>(
+      `/api/proxy/pool/fixed/ports/${encodeURIComponent(String(port))}/reassign`,
+      { method: 'POST', body: JSON.stringify({ dry_run: dryRun }) },
+    ),
+  // restoreProxyPoolPort 恢复“换 IP”后停用的端口（之后新增账户与重新平均分配会用到它，不挪任何账户）
+  restoreProxyPoolPort: (port: number) =>
+    requestJSON<ProxyPoolFixedRestoreResult>(
+      `/api/proxy/pool/fixed/ports/${encodeURIComponent(String(port))}/restore`,
+      { method: 'POST' },
+    ),
   cancelRequest: (id: string) =>
     requestCommand(`/api/requests/${encodeURIComponent(id)}/cancel`, {
       method: 'POST',

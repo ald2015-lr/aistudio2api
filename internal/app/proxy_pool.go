@@ -174,6 +174,11 @@ type proxyPool struct {
 	check           *api.AdminProxyPoolCheck
 	checkRunning    bool
 	onPortCooled    func(proxyPoolCooling) // 端口开始冷却时的回调（生成服务接到 429 治理，见 proxy_pool_egress.go），nil 时不调用；在锁外调用
+
+	// onAccountsChanged 为固定分配改了账户页可见的状态（端口暂停与恢复、开启与关闭、对齐改了分配表）后的回调（生成服务接到账户列表的
+	// 合并推送），nil 时不调用；随固定分配日志在锁外调用（见 takeFixedLogsLocked）
+	onAccountsChanged func()
+
 	shortage        proxyPoolShortageLog
 	coolingShortage proxyPoolShortageLog
 	capacityShort   bool
@@ -187,6 +192,8 @@ type proxyPool struct {
 	dirty           bool
 	saveTimer       *time.Timer
 	saveMu          sync.Mutex
+	// fixed 为固定分配（PROXY_POOL_FIXED）的分配表、预留与暂停记录（见 proxy_pool_fixed.go）；关闭时只有删除账户会改它
+	fixed proxyPoolFixed
 }
 
 // proxyPoolSettings 为生效配置与预先算好的值
@@ -219,6 +226,8 @@ type proxyPoolPort struct {
 	coolUntil      time.Time
 	coolLevel      int
 	cooledAt       time.Time
+	// coolRule 为最近一次冷却的规则（固定分配下暂停原因的说明用）；只在内存、不写盘，重启后读回的冷却规则未知
+	coolRule string
 }
 
 // proxyPoolFailure 为端口上一个账号最近一次计入规则 A 的裸 429：proven 为当时账号 proxyPoolProvenWithin 内在别的出口上成功过
@@ -297,12 +306,15 @@ type proxyPoolCooling struct {
 	RateLimitedAccounts []string
 	Holders             []string
 	Workers             []string
+	// Fixed 为固定分配下的冷却：Workers 只含固定端口不是这个端口的过渡 Worker（关掉后回到自己的固定端口），固定端口就是它的账户暂停使用
+	Fixed bool
 }
 
-// proxyPoolLog 为锁内收集、锁外写出的一行日志
+// proxyPoolLog 为锁内收集、锁外写出的一行日志；notify 不为 nil 时不是日志，emit 到这里时调用它（固定分配推送账户列表，见 takeFixedLogsLocked）
 type proxyPoolLog struct {
 	source, level, message string
 	durable                bool
+	notify                 func()
 }
 
 // proxyPoolLease 为一个浏览器的出口租约：url 为实际使用的上游，pooled 为 IP 池分配（否则是直通租约，url 为当时的 PROXY）
@@ -324,6 +336,10 @@ type proxyPoolLease struct {
 	// attached 为 Worker 浏览器已启动成功（attach）或补登记的运行中 Worker（passthrough）：账户绑定优先取最新的这种租约，
 	// 新浏览器起来之前 Go 侧仍走正在服务的旧浏览器的出口（pool.mu 保护）
 	attached bool
+	// fixedToken 为固定分配下新账户登录、导入预留的位置（adopt 转正、归还时撤销）；refused 为固定分配下被拒的原因（端口暂停使用，
+	// 见 Refused）：被拒的租约不登记、不分配，归还等全部方法为空操作
+	fixedToken string
+	refused    *proxyPoolPausedError
 }
 
 type proxyPoolOptions struct {
@@ -367,7 +383,10 @@ func newProxyPool(options proxyPoolOptions) *proxyPool {
 	if pool.relayLimit == nil {
 		pool.relayLimit = proxyrelay.TotalConnectionLimit
 	}
-	if logs := pool.load(); len(logs) > 0 {
+	pool.fixed.init(options.path)
+	logs := pool.load()
+	logs = append(logs, pool.loadFixed()...)
+	if len(logs) > 0 {
 		pool.emit(logs)
 	}
 	return pool
@@ -402,6 +421,7 @@ func (pool *proxyPool) configure(cfg config.ProxyPool, globalProxy string, capac
 		return false
 	}
 	wasEnabled := old.initialized && old.cfg.Enabled()
+	fixedChanged := false
 	if cfgChanged || globalChanged {
 		if cfgChanged {
 			pool.version++
@@ -431,20 +451,35 @@ func (pool *proxyPool) configure(cfg config.ProxyPool, globalProxy string, capac
 			if pool.portsKey != "" && pool.portsKey != key {
 				// 换了代理商或子账号：同一端口号已经不是同一个 IP，清掉冷却、归属与健康记录（不动 holders，同一端口号仍视为同一占用）
 				pool.resetPortRecordsLocked()
+				if pool.fixedStaticLocked() {
+					// 固定表按端口号保留；暂停记录随冷却与锁的记录清掉，全量重推后按新的记录重算（暂停说明随之去掉，推送账户列表）
+					clear(pool.fixed.held)
+					pool.fixed.nextCheck, pool.fixed.rescan = time.Time{}, true
+					pool.fixed.notify = true
+					logs = append(logs, proxyPoolLog{source: "service", level: "INFO", message: "IP 池换了代理商或子账号，固定分配按端口号保留（同一端口号的 IP 可能已变）"})
+				}
 			}
 			pool.portsKey = key
 		}
 		pool.recomputeAccountsLocked()
 		logs = append(logs, pool.externalLogLocked()...)
+		// 固定分配：全量重推之前对齐固定表（重推时没有活动租约的账户立即切到固定端口）
+		fixedLogs, changed := pool.fixedConfigureLocked(old, pool.now())
+		fixedChanged = changed
 		pool.syncOwnerLocked(true, "")
 		logs = append(logs, pool.configureLogsLocked(old, wasEnabled)...)
+		logs = append(logs, fixedLogs...)
 	} else {
 		pool.settings.capacity = capacity
 	}
 	logs = append(logs, pool.capacityLogsLocked(cfgChanged)...)
 	pool.wakeDefaultsLocked(pool.now())
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
+	if fixedChanged {
+		pool.fixedFlush()
+	}
 	return cfgChanged || globalChanged
 }
 
@@ -478,6 +513,13 @@ func (pool *proxyPool) configureLogsLocked(old proxyPoolSettings, wasEnabled boo
 			start, end := cfg.Ports()
 			message = fmt.Sprintf("IP 池已更新 | 模式=静态 | 出口=%s | 端口=%d-%d（%d 个） | 需要=%d",
 				pool.settings.endpoint, start, end, cfg.Size(), pool.settings.capacity)
+		}
+		if cfg.Fixed {
+			if cfg.Mode == config.ProxyPoolStatic {
+				message += " | 固定分配=开启"
+			} else {
+				message += " | 固定会话=开启"
+			}
 		}
 		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", message: message})
 	case !cfg.Enabled() && wasEnabled:
@@ -517,12 +559,14 @@ func (pool *proxyPool) capacityLogsLocked(cfgChanged bool) []proxyPoolLog {
 	cfg := pool.settings.cfg
 	capacity := pool.settings.capacity
 	var logs []proxyPoolLog
-	short := cfg.Mode == config.ProxyPoolStatic && capacity > 0 && cfg.Size() < capacity
+	// 固定分配下端口本来就共用（每个端口固定几个账户、可以同时开浏览器），不要求浏览器数不超过端口数：不写端口不足，
+	// 从不足切到固定分配时只复位状态（不写误导的“已足够”）；切回非固定时按配置变化重新判断
+	short := cfg.Mode == config.ProxyPoolStatic && !cfg.Fixed && capacity > 0 && cfg.Size() < capacity
 	switch {
 	case short && (!pool.capacityShort || cfgChanged):
 		logs = append(logs, proxyPoolLog{source: "service", level: "WARN", message: fmt.Sprintf(
 			"IP 池端口少于可能同时运行的浏览器数，超出的会与其他账号共用端口 | 端口=%d | 需要=%d", cfg.Size(), capacity)})
-	case !short && pool.capacityShort && cfg.Mode == config.ProxyPoolStatic:
+	case !short && pool.capacityShort && cfg.Mode == config.ProxyPoolStatic && !cfg.Fixed:
 		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", message: fmt.Sprintf(
 			"IP 池端口已足够 | 端口=%d | 需要=%d", cfg.Size(), capacity)})
 	}
@@ -538,6 +582,16 @@ func (pool *proxyPool) capacityLogsLocked(cfgChanged bool) []proxyPoolLog {
 	}
 	pool.relayLow = low
 	return logs
+}
+
+// setAccountsChangedHook 登记固定分配改了账户页可见状态后的回调（生成服务装配成功后接到账户列表的合并推送）：在锁外调用，不能同步回到 IP 池
+func (pool *proxyPool) setAccountsChangedHook(hook func()) {
+	if pool == nil {
+		return
+	}
+	pool.mu.Lock()
+	pool.onAccountsChanged = hook
+	pool.mu.Unlock()
 }
 
 // setPortCooledHook 登记端口开始冷却时的回调（生成服务装配成功后接到 429 治理，见 proxy_pool_egress.go）：在锁外调用，
@@ -558,6 +612,8 @@ func (pool *proxyPool) prime(account *aistudio.Account) {
 		return
 	}
 	pool.mu.Lock()
+	// 账户对象还没进账户池：记下“正在新增”（固定分配的重新平均分配不清理它；账户池同步看到它时去掉）
+	pool.fixed.adding[account.ID] = pool.now()
 	state := pool.accountLocked(account.ID)
 	externalChanged := pool.observeAccountProxyLocked(account.ID, state, account.Config.Proxy)
 	binding := pool.bindingLocked(account.ID, state, &proxyPoolBatch{now: pool.now()})
@@ -575,6 +631,7 @@ func (pool *proxyPool) prime(account *aistudio.Account) {
 		pool.syncOwnerLocked(true, "")
 	}
 	pool.wakeDefaultsLocked(pool.now())
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 }
@@ -593,6 +650,7 @@ func (pool *proxyPool) attach(owner proxyPoolOwner) {
 	pool.syncOwnerLocked(true, "")
 	logs := append(pool.externalLogLocked(), pool.pinnedLogLocked()...)
 	pool.wakeDefaultsLocked(pool.now())
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 }
@@ -613,6 +671,7 @@ func (pool *proxyPool) refresh(owner proxyPoolOwner, accountID string) {
 	pool.syncOwnerLocked(false, accountID)
 	logs := append(pool.externalLogLocked(), pool.pinnedLogLocked()...)
 	pool.wakeDefaultsLocked(pool.now())
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 }
@@ -625,6 +684,7 @@ func (pool *proxyPool) acquire(key, accountID, kind, label, fallback string) *pr
 	}
 	pool.mu.Lock()
 	lease, logs := pool.acquireLocked(key, accountID, kind, label, fallback)
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 	return lease
@@ -646,7 +706,9 @@ func (pool *proxyPool) passthrough(key, accountID, kind, label, url string) *pro
 	if accountID != "" {
 		pool.pushLocked(accountID)
 	}
+	logs := pool.takeFixedLogsLocked()
 	pool.mu.Unlock()
+	pool.emit(logs)
 	return lease
 }
 
@@ -656,6 +718,22 @@ func (pool *proxyPool) acquireLocked(key, accountID, kind, label, fallback strin
 		key = accountID
 	}
 	lease := &proxyPoolLease{pool: pool, key: key, accountID: accountID, kind: kind, label: label, version: pool.version}
+	if pool.fixedStaticLocked() && !pool.ownProxyLocked(accountID) {
+		// 固定分配：只用固定端口（或新账户的最少端口），不经独占分配；暂停时拒绝，不登记、不填默认代理、不推送
+		logs := pool.acquireFixedLocked(lease, now)
+		if lease.refused != nil {
+			lease.released = true
+			pool.wakeDefaultsLocked(now)
+			return lease, logs
+		}
+		pool.registerLeaseLocked(lease)
+		if accountID != "" {
+			pool.pushLocked(accountID)
+		}
+		logs = append(logs, pool.overAllocationLogLocked(now)...)
+		pool.wakeDefaultsLocked(now)
+		return lease, logs
+	}
 	var logs []proxyPoolLog
 	var displaced []string
 	followed := false
@@ -985,10 +1063,18 @@ func (pool *proxyPool) lockPortLocked(port int, now time.Time, logs *[]proxyPool
 		pool.lockedElsewhere[port] = now.Add(proxyPoolLockedRetry)
 		// 默认出口落在这个端口上的账户换到别处：另一个进程的浏览器正在用它
 		pool.pushLocked(pool.defaultUsersOfLocked(port, "")...)
+		if pool.fixedStaticLocked() {
+			// 固定分配：这个端口上的账户暂停使用，不换端口
+			pool.fixedPortChangedLocked(port, now)
+		}
 		return false
 	}
 	state.lock = lock
+	_, wasLocked := pool.lockedElsewhere[port]
 	delete(pool.lockedElsewhere, port)
+	if wasLocked && pool.fixedStaticLocked() {
+		pool.fixedPortChangedLocked(port, now)
+	}
 	return true
 }
 
@@ -1068,6 +1154,7 @@ func (lease *proxyPoolLease) release() {
 	pool := lease.pool
 	pool.mu.Lock()
 	logs := pool.releaseLocked(lease)
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 }
@@ -1077,6 +1164,11 @@ func (pool *proxyPool) releaseLocked(lease *proxyPoolLease) []proxyPoolLog {
 		return nil
 	}
 	lease.released = true
+	if lease.fixedToken != "" {
+		// 新账户登录、导入没有 adopt 就归还：撤销预留的位置
+		pool.fixedRevokeLocked(lease.fixedToken)
+		lease.fixedToken = ""
+	}
 	now := pool.now()
 	pool.byKey[lease.key] = removeProxyPoolLease(pool.byKey[lease.key], lease)
 	if len(pool.byKey[lease.key]) == 0 {
@@ -1170,7 +1262,9 @@ func (lease *proxyPoolLease) attach(worker proxyPoolCloser) {
 			pool.pushLocked(lease.accountID)
 		}
 	}
+	logs := pool.takeFixedLogsLocked()
 	pool.mu.Unlock()
+	pool.emit(logs)
 	if native, ok := worker.(*aistudio.NativeWorker); ok && native == nil || worker == nil {
 		return
 	}
@@ -1202,6 +1296,7 @@ func (lease *proxyPoolLease) launchFailed(cause error, canceled bool) {
 	if rotated != "" {
 		logs = append(logs, pool.rotationLogLocked(lease.accountID, lease.logSource(), rotated, "连续 2 次出口连不通"))
 	}
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	hook := pool.onPortCooled
 	pool.mu.Unlock()
 	pool.emit(logs)
@@ -1219,6 +1314,9 @@ type proxyPoolClaim struct {
 	key     string // 静态：端口记录所属的 EndpointKey，换了代理商或子账号时不再登记
 	port    int    // 静态：独占过的端口
 	session string // 动态：导入用的临时会话号
+	// fixed 为固定分配下的导入记录：fixedToken 为预留的位置（adopt 时转正、discard 时撤销，pool.mu 保护）
+	fixed      bool
+	fixedToken string
 }
 
 // releaseClaim 归还新账户的登录类租约，返回它的出口记录；不是 IP 池分配、与别人共用端口或已记到账户名下时为 nil（可重复调用，方法对 nil 安全）
@@ -1231,6 +1329,11 @@ func (lease *proxyPoolLease) releaseClaim() *proxyPoolClaim {
 	var claim *proxyPoolClaim
 	if !lease.released && lease.pooled && lease.accountID == "" {
 		switch {
+		case lease.fixedToken != "" && pool.fixedStaticLocked() && lease.port != 0 && pool.currentStaticLocked(lease):
+			// 固定分配：预留随记录转移（1 小时后过期兜底），adopt 时转正、discard 时撤销；归还时不再撤销
+			claim = &proxyPoolClaim{pool: pool, key: pool.portsKey, port: lease.port, fixed: true, fixedToken: lease.fixedToken}
+			pool.fixed.reserved[lease.fixedToken] = proxyPoolFixedReservation{port: lease.port, expires: pool.now().Add(proxyPoolFixedReserveTTL)}
+			lease.fixedToken = ""
 		case lease.port != 0 && !lease.shared && pool.currentStaticLocked(lease):
 			claim = &proxyPoolClaim{pool: pool, key: pool.portsKey, port: lease.port}
 		case lease.port == 0 && lease.tempSession != "":
@@ -1238,6 +1341,7 @@ func (lease *proxyPoolLease) releaseClaim() *proxyPoolClaim {
 		}
 	}
 	logs := pool.releaseLocked(lease)
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 	return claim
@@ -1251,8 +1355,25 @@ func (claim *proxyPoolClaim) adopt(accountID string) {
 	}
 	pool := claim.pool
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
+	defer func() {
+		logs := pool.takeFixedLogsLocked()
+		pool.mu.Unlock()
+		pool.emit(logs)
+	}()
 	now := pool.now()
+	if claim.fixed {
+		switch {
+		case claim.fixedToken == "":
+			// 已 adopt 或 discard 过
+			return
+		case pool.fixedStaticLocked():
+			pool.fixedClaimAdoptLocked(claim, accountID, now)
+			return
+		}
+		// 固定分配已关闭：撤销预留，按原方式记亲和
+		pool.fixedRevokeLocked(claim.fixedToken)
+		claim.fixedToken = ""
+	}
 	switch {
 	case claim.port != 0:
 		if claim.key == "" || claim.key != pool.portsKey || !pool.inRangeLocked(claim.port) {
@@ -1282,13 +1403,20 @@ func (lease *proxyPoolLease) adopt(accountID string) {
 	}
 	pool := lease.pool
 	pool.mu.Lock()
-	defer pool.mu.Unlock()
+	defer func() {
+		logs := pool.takeFixedLogsLocked()
+		pool.mu.Unlock()
+		pool.emit(logs)
+	}()
 	if lease.released || lease.accountID != "" {
 		return
 	}
 	now := pool.now()
 	lease.accountID = accountID
 	pool.byAccount[accountID] = append(pool.byAccount[accountID], lease)
+	if pool.fixedAdoptLocked(lease, accountID, now) {
+		return
+	}
 	if lease.pooled {
 		if lease.port != 0 && !lease.shared {
 			// 端口不足时共用的端口归别人，不记成这个账户的
@@ -1347,6 +1475,7 @@ func (pool *proxyPool) rateLimited(accountID string, wasBad bool) {
 		logs, cooled = pool.coolLocked(port, proxyPoolRuleRateLimited, reason, now)
 	}
 	pool.wakeDefaultsLocked(now)
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	hook := pool.onPortCooled
 	pool.mu.Unlock()
 	pool.emit(logs)
@@ -1461,6 +1590,7 @@ func (pool *proxyPool) coolLocked(port int, rule, reason string, now time.Time) 
 	duration = min(duration, proxyPoolCoolMax)
 	state.coolUntil = now.Add(duration)
 	state.cooledAt = now
+	state.coolRule = rule
 	cooling := proxyPoolCooling{Port: port, Until: state.coolUntil, Level: state.coolLevel, Rule: rule}
 	if rule == proxyPoolRuleRateLimited {
 		for _, failure := range state.failures {
@@ -1469,10 +1599,23 @@ func (pool *proxyPool) coolLocked(port int, rule, reason string, now time.Time) 
 	}
 	cooling.Holders = pool.portHolderAccountsLocked(port)
 	cooling.Workers = pool.portWorkerAccountsLocked(cooling.Holders, port)
+	fixed := pool.fixedStaticLocked()
+	if fixed {
+		// 固定分配：固定端口就是这个端口的账户不重启（暂停使用、等端口恢复，驻留 Worker 按不可调度释放）；只关掉开启前就在这个端口上的过渡
+		// Worker，它们下次启动回到自己的固定端口（回到固定端口，不是挪端口）
+		cooling.Fixed = true
+		cooling.Workers = slices.DeleteFunc(cooling.Workers, func(accountID string) bool {
+			entry, ok := pool.fixed.entries[accountID]
+			return ok && entry.port == port
+		})
+	}
 	state.failures = nil
 	state.upstreamFails = 0
 	pool.markDirtyLocked()
 	pool.pushLocked(pool.defaultUsersOfLocked(port, "")...)
+	if fixed {
+		pool.fixedPortChangedLocked(port, now)
+	}
 	logs := []proxyPoolLog{{source: "service", level: "WARN", durable: true, message: fmt.Sprintf(
 		"IP 池端口冷却 | 端口=%d | 第 %d 档 | 时长=%s | 恢复=%s | 原因=%s",
 		port, state.coolLevel, duration, state.coolUntil.UTC().Format(time.RFC3339), reason)}}
@@ -1516,6 +1659,10 @@ func (pool *proxyPool) sessionStrikeLocked(lease *proxyPoolLease, now time.Time)
 	if session.strikes < proxyPoolUpstreamFails || !session.rotatedAt.IsZero() && now.Sub(session.rotatedAt) < proxyPoolRotateInterval {
 		return "", logs
 	}
+	if keepLogs, kept := pool.fixedSessionKeepLocked(lease, session.strikes, now); kept {
+		// 固定会话：不换会话，账户一直用它的会话号
+		return "", append(logs, keepLogs...)
+	}
 	previous := pool.sessionLocked(lease.accountID)
 	pool.rotateLocked(lease.accountID, now)
 	return previous, logs
@@ -1556,6 +1703,11 @@ func (pool *proxyPool) rotateSession(accountID, key, reason string) bool {
 	}
 	pool.mu.Lock()
 	now := pool.now()
+	if pool.fixedDynamicLocked() {
+		// 固定会话：出口判定也不换会话
+		pool.mu.Unlock()
+		return false
+	}
 	if current, ok := pool.sessionEgressKeyLocked(accountID); !ok || current != key {
 		pool.mu.Unlock()
 		return false
@@ -1667,7 +1819,8 @@ func (pool *proxyPool) poolsAccount(accountID string) bool {
 	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	return pool.poolingLocked() && pool.poolsAccountLocked(accountID)
+	// 静态固定分配下默认出口就是账户真正的出口（启动时不另分端口），出口限流的判断照常适用
+	return pool.poolingLocked() && !pool.fixedStaticLocked() && pool.poolsAccountLocked(accountID)
 }
 
 // pooledAccounts 返回 ids 里 poolsAccount 为真的账户（一次加锁）；IP 池关闭或一个都没有时为 nil。
@@ -1678,7 +1831,7 @@ func (pool *proxyPool) pooledAccounts(ids []string) map[string]struct{} {
 	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	if !pool.poolingLocked() {
+	if !pool.poolingLocked() || pool.fixedStaticLocked() {
 		return nil
 	}
 	var pooled map[string]struct{}
@@ -1748,9 +1901,15 @@ func (pool *proxyPool) loginPreview() (proxyPoolPreview, bool) {
 	switch pool.settings.cfg.Mode {
 	case config.ProxyPoolStatic:
 		now := pool.now()
-		port := pool.pickFreeLocked(now)
-		if port == 0 {
-			port, _ = pool.pickSharedLocked(now)
+		var port int
+		if pool.fixedStaticLocked() {
+			// 固定分配：与新账户登录同样的规则（负载最少、不暂停的端口；只读，不加锁、不预留）
+			port = pool.fixedLoginPreviewLocked(now)
+		} else {
+			port = pool.pickFreeLocked(now)
+			if port == 0 {
+				port, _ = pool.pickSharedLocked(now)
+			}
 		}
 		if port == 0 {
 			return proxyPoolPreview{}, false
@@ -1777,7 +1936,13 @@ func (pool *proxyPool) accountPreview(accountID string) (proxyPoolPreview, bool)
 	case config.ProxyPoolStatic:
 		// 只读：探测序列缓存在临时对象上，不改账户记录、默认出口与 defaultWaiting
 		state := proxyPoolAccount{}
-		port, _ := pool.defaultPortLocked(accountID, &state, &proxyPoolBatch{now: pool.now()})
+		var port int
+		if pool.fixedStaticLocked() {
+			// 固定分配：账户的固定端口；还没有时为此刻会分到的端口（只读）
+			port = pool.fixedPortLocked(accountID, pool.now(), false)
+		} else {
+			port, _ = pool.defaultPortLocked(accountID, &state, &proxyPoolBatch{now: pool.now()})
+		}
 		if port == 0 {
 			return proxyPoolPreview{}, false
 		}
@@ -1789,14 +1954,16 @@ func (pool *proxyPool) accountPreview(accountID string) (proxyPoolPreview, bool)
 	return preview, preview.url != ""
 }
 
-// markPinned 给自己的代理与 PROXY 规范值相同（因此不使用 IP 池）的账户标上 ProxyPoolPinned（IP 池开启时）：与状态接口的
-// pinned_default、“改为跟随默认代理”用同一份判断（当前生效的 PROXY），账户列表不再自己比较字符串
-func (pool *proxyPool) markPinned(accounts []api.AdminAccount) {
+// markAccounts 给账户列表标上 IP 池的信息：静态固定分配下的固定端口（ProxyPoolFixedPort，只有端口号），以及自己的代理与 PROXY 规范值相同
+// （因此不使用 IP 池）的账户的 ProxyPoolPinned（IP 池开启时）：与状态接口的 pinned_default、“改为跟随默认代理”用同一份判断（当前生效的
+// PROXY），账户列表不再自己比较字符串
+func (pool *proxyPool) markAccounts(accounts []api.AdminAccount) {
 	if pool == nil || len(accounts) == 0 {
 		return
 	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
+	pool.markFixedLocked(accounts)
 	if pool.pinned == 0 || !pool.settings.cfg.Enabled() {
 		return
 	}
@@ -1823,7 +1990,8 @@ func (pool *proxyPool) status() *api.AdminProxyPool {
 	}
 	pool.mu.Lock()
 	owner := pool.owner
-	needIDs := owner != nil && len(pool.byAccount) > 0
+	// 静态固定分配的 stray（固定表里已不在账户池的账户）同样要账户池的 ID
+	needIDs := owner != nil && (len(pool.byAccount) > 0 || pool.fixedStaticLocked() && len(pool.fixed.entries) > 0)
 	pool.mu.Unlock()
 	var known map[string]struct{}
 	if needIDs {
@@ -1839,7 +2007,9 @@ func (pool *proxyPool) status() *api.AdminProxyPool {
 	pool.wakeDefaultsLocked(now)
 	cfg := pool.settings.cfg
 	if !cfg.Enabled() && pool.pooledLeases == 0 {
+		logs := pool.takeFixedLogsLocked()
 		pool.mu.Unlock()
+		pool.emit(logs)
 		return nil
 	}
 	status := &api.AdminProxyPool{
@@ -1905,6 +2075,7 @@ func (pool *proxyPool) status() *api.AdminProxyPool {
 		check.Failed = slices.Clone(pool.check.Failed)
 		status.Check = &check
 	}
+	status.Fixed = pool.fixedStatusLocked(now, known)
 	var logs []proxyPoolLog
 	if orphaned > pool.orphanedLogged {
 		logs = append(logs, proxyPoolLog{source: "service", level: "WARN", message: fmt.Sprintf("IP 池租约泄漏 | 已删除账户仍占用=%d", orphaned)})
@@ -1913,6 +2084,7 @@ func (pool *proxyPool) status() *api.AdminProxyPool {
 		pool.orphanedLogged = orphaned
 	}
 	logs = append(logs, pool.overAllocationLogLocked(now)...)
+	logs = append(logs, pool.takeFixedLogsLocked()...)
 	pool.mu.Unlock()
 	pool.emit(logs)
 	return status
@@ -2000,6 +2172,10 @@ func (pool *proxyPool) syncOwnerLocked(full bool, focus string) {
 		batch := &proxyPoolBatch{now: pool.now(), snapshot: full}
 		pool.owner.UpdateProxyBindings(func(accountID, accountProxy string) *aistudio.ProxyBinding {
 			seen[accountID] = struct{}{}
+			if len(pool.fixed.adding) > 0 {
+				// 已进账户池：不再是“正在新增”
+				delete(pool.fixed.adding, accountID)
+			}
 			state := pool.accountLocked(accountID)
 			changed := !state.known || state.proxyRaw != accountProxy
 			if changed && pool.observeAccountProxyLocked(accountID, state, accountProxy) {
@@ -2106,6 +2282,18 @@ func (pool *proxyPool) bindingLocked(accountID string, state *proxyPoolAccount, 
 	if state.proxy != "" {
 		pool.setDefaultPortLocked(accountID, state, 0, false)
 		return nil
+	}
+	if pool.fixedStaticLocked() {
+		// 固定分配：Go 侧出口永远是段内端口（暂停时也是，Hold 写原因），不进 defaultUsers/defaultWaiting；过渡期跟随已启动的 Worker。
+		// 运行在账户池的 UpdateProxyBindings 回调里：只改 IP 池状态与待写日志，不推送、不写日志、不登记暂停的转换
+		pool.setDefaultPortLocked(accountID, state, 0, false)
+		// 只给登记过的账户惰性分配（删除或新增回滚之后的推送不把它写回固定表，见 releaseFixed）
+		port := pool.fixedPortLocked(accountID, batch.now, state.known)
+		hold := pool.fixedHoldTextLocked(port, batch.now)
+		if lease := pool.bindingLeaseLocked(accountID); lease != nil {
+			return &aistudio.ProxyBinding{URL: lease.url, Slot: lease.slot, Active: true, EgressTag: lease.egressTag, Hold: hold}
+		}
+		return &aistudio.ProxyBinding{URL: pool.staticURLLocked(port), Slot: strconv.Itoa(port), Hold: hold}
 	}
 	if lease := pool.bindingLeaseLocked(accountID); lease != nil {
 		pool.setDefaultPortLocked(accountID, state, 0, false)
@@ -2234,6 +2422,9 @@ func (pool *proxyPool) defaultUsersOfLocked(port int, except string) []string {
 // 再重推 defaultWaiting 里的账户（默认出口退回了 PROXY、或与别人共用哈希端口）；之后按仍在等的账户重新安排下一次检查。
 // 只做 map 操作、非阻塞的端口文件锁检测与一次批量推送
 func (pool *proxyPool) wakeDefaultsLocked(now time.Time) {
+	// 固定分配：先登记暂停（rescan：账户刚被分到正在暂停的端口上等）、清除冷却到期的暂停，再检测其他进程锁：检测确认释放时这个端口
+	// 已有暂停记录，恢复时重推它的账户（静态固定之外什么也不做）
+	pool.fixedRefreshHoldsLocked(now)
 	if !pool.recheckAt.IsZero() && !now.Before(pool.recheckAt) {
 		pool.probeLockedElsewhereLocked(now)
 		pool.wakeAt = time.Time{}
@@ -2273,9 +2464,13 @@ func (pool *proxyPool) probeLockedElsewhereLocked(now time.Time) {
 		}
 	}
 	sort.Ints(ports)
+	fixed := pool.fixedStaticLocked()
 	for _, port := range ports {
 		if state := pool.ports[port]; state != nil && state.lock != nil {
 			delete(pool.lockedElsewhere, port)
+			if fixed {
+				pool.fixedPortChangedLocked(port, now)
+			}
 			continue
 		}
 		if !pool.inRangeLocked(port) {
@@ -2285,9 +2480,17 @@ func (pool *proxyPool) probeLockedElsewhereLocked(now time.Time) {
 		lock, locked, err := pool.tryLock(pool.lockDir, pool.settings.key, port)
 		if err != nil || !locked {
 			pool.lockedElsewhere[port] = now.Add(proxyPoolLockedRetry)
+			if fixed {
+				// 固定分配：仍被占用，暂停记录的下次检查时间随之顺延
+				pool.fixedPortChangedLocked(port, now)
+			}
 			continue
 		}
 		delete(pool.lockedElsewhere, port)
+		if fixed {
+			// 固定分配：其他进程已释放，这个端口上的账户恢复使用
+			pool.fixedPortChangedLocked(port, now)
+		}
 		if state := pool.ports[port]; state != nil && len(state.holders) > 0 {
 			// 本进程在共用这个端口（当初没锁到）：其他进程已经释放，补上锁
 			state.lock = lock
@@ -2306,9 +2509,14 @@ func (pool *proxyPool) scheduleRecheckLocked(now time.Time) {
 			next = at
 		}
 	}
-	if len(pool.defaultWaiting) == 0 || pool.settings.cfg.Mode != config.ProxyPoolStatic {
+	waiting := len(pool.defaultWaiting) > 0 && pool.settings.cfg.Mode == config.ProxyPoolStatic
+	// 固定分配下有暂停使用的端口，或有“被其他进程占用”的记录（没有固定账户的空端口被锁过时也不登记暂停，但选端口时避开它，
+	// 要按重试时间检测才能再用）时，同样按冷却到期与其他进程锁的重试时间检查（恢复时清除暂停）
+	held := pool.fixedStaticLocked() && (len(pool.fixed.held) > 0 || len(pool.lockedElsewhere) > 0)
+	if !waiting {
 		pool.wakeAt = time.Time{}
-	} else {
+	}
+	if waiting || held {
 		if !pool.wakeAt.IsZero() {
 			consider(pool.wakeAt)
 		}
@@ -2357,7 +2565,9 @@ func (pool *proxyPool) recheckFired() {
 	pool.mu.Lock()
 	pool.recheckArmed = false
 	pool.wakeDefaultsLocked(pool.now())
+	logs := pool.takeFixedLogsLocked()
 	pool.mu.Unlock()
+	pool.emit(logs)
 }
 
 // observeAccountProxyLocked 记下账户自己的代理，增量更新外部占用与 pinned；返回外部占用的端口集合是否变化
@@ -2368,6 +2578,7 @@ func (pool *proxyPool) observeAccountProxyLocked(accountID string, state *proxyP
 	if strings.TrimSpace(raw) != "" {
 		state.proxy = config.CanonicalProxy(raw)
 	}
+	pool.fixedObserveOwnProxyLocked(accountID, state)
 	return pool.updateAccountExternalLocked(state)
 }
 
@@ -2441,6 +2652,19 @@ func (pool *proxyPool) externalLogLocked() []proxyPoolLog {
 		}
 	}
 	summary := fmt.Sprint(ports, accounts)
+	if pool.fixedStaticLocked() {
+		// 固定分配：外部占用的端口照常参与分配（与它们共用 IP），只提示一次
+		if summary == pool.fixed.externalWarned {
+			return nil
+		}
+		pool.fixed.externalWarned = summary
+		if len(ports) == 0 {
+			return nil
+		}
+		return []proxyPoolLog{{source: "service", level: "WARN", message: fmt.Sprintf(
+			"IP 池端口段与账户固定代理或 PROXY 重叠，固定分配照常使用这些端口（与它们共用 IP） | 端口数=%d | 账户数=%d | 可用“换 IP”挪走这些端口上的固定账户",
+			len(ports), accounts)}}
+	}
 	if summary == pool.externalSummary {
 		return nil
 	}
@@ -2479,6 +2703,7 @@ func (pool *proxyPool) resetPortRecordsLocked() {
 		state.upstreamFails = 0
 		state.coolUntil, state.cooledAt = time.Time{}, time.Time{}
 		state.coolLevel = 0
+		state.coolRule = ""
 	}
 	pool.lockedElsewhere = make(map[int]time.Time)
 	pool.markDirtyLocked()
@@ -2720,6 +2945,10 @@ func (pool *proxyPool) emit(logs []proxyPoolLog) {
 		return
 	}
 	for _, entry := range logs {
+		if entry.notify != nil {
+			entry.notify()
+			continue
+		}
 		if entry.durable {
 			pool.requests.logDurable(entry.source, entry.level, entry.message)
 		} else {

@@ -427,6 +427,9 @@ const (
 	// UnschedulableVerifyRequired 为需要验证账号的整户暂停生效中（见 verifyRequiredPausedLocked）：暂停最长 30 天、只能靠管理页验证通过、
 	// 认证文件更新、任一模型成功或清除 403 记录解除，驻留 Worker 留着等冷却到期没有意义，按不可调度释放
 	UnschedulableVerifyRequired = "需要验证账号"
+	// UnschedulableProxyPaused 为 IP 池固定分配下账户的固定端口暂停使用（见 ProxyBinding.Hold）：端口恢复后自动可调度，
+	// 驻留 Worker 留着也不会被选，按不可调度释放
+	UnschedulableProxyPaused = "IP 池端口暂停"
 )
 
 // VerifyRequiredPauseReason 为需要验证账号（403 Your account must be verified … verify-account）时整个账户暂停调度写入的
@@ -469,6 +472,8 @@ func unschedulableReasonLocked(account *Account, now time.Time) string {
 		return UnschedulableUnavailable
 	case account.State != AccountReady:
 		return UnschedulableNotReady
+	case account.ProxyHold() != "":
+		return UnschedulableProxyPaused
 	case verifyRequiredPausedLocked(account, now):
 		return UnschedulableVerifyRequired
 	case !account.initializedAt.IsZero() && len(accountBootstrapModelsLocked(account)) == 0:

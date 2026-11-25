@@ -1,0 +1,1958 @@
+[
+  {
+    "name": "configure static",
+    "logs": [
+      "INFO service IP 池已更新 | 模式=静态 | 出口=http://isp.example.com | 端口=10001-10006（6 个） | 需要=6",
+      "INFO service IP 池开启后，没有自己代理的账户不再使用默认代理 PROXY"
+    ],
+    "bindings": null,
+    "leases": null,
+    "extra": [
+      "held=[]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 0,
+      "leases": 0,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 0,
+      "affinity_hits": 0,
+      "affinity_misses": 0,
+      "relay_limit": 1048576
+    },
+    "record": "",
+    "fixed_file": false
+  },
+  {
+    "name": "attach",
+    "logs": [
+      "WARN service 有账户固定了与默认代理相同的地址，不会使用 IP 池 | 账户=1 | 可在“服务配置 → IP 池”改为跟随默认代理"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10006 slot=10006 active=false tag= effective=http://isp.example.com:10006",
+      "b@example.com url=http://isp.example.com:10001 slot=10001 active=false tag= effective=http://isp.example.com:10001",
+      "c@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": null,
+    "extra": [
+      "primed=http://isp.example.com:10006 slot=10006",
+      "poolsAccount a=true own=false pinned=false",
+      "pooledAccounts=[a@example.com b@example.com c@example.com d@example.com e@example.com]",
+      "held=[]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 0,
+      "leases": 0,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 0,
+      "affinity_misses": 0,
+      "relay_limit": 1048576
+    },
+    "record": "",
+    "fixed_file": false
+  },
+  {
+    "name": "workers and same key",
+    "logs": [
+      "INFO a@example.com IP 池分配 | 端口=10005 | 来源=空闲 | 用途=Worker | 使用中=1/6",
+      "INFO b@example.com IP 池分配 | 端口=10006 | 来源=空闲 | 用途=Worker | 使用中=2/6",
+      "INFO c@example.com IP 池分配 | 端口=10001 | 来源=空闲 | 用途=Worker | 使用中=3/6",
+      "INFO a@example.com IP 池分配 | 端口=10005 | 来源=同账号 | 用途=验证 | 使用中=3/6",
+      "INFO b@example.com IP 池分配 | 端口=10006 | 来源=同账号 | 用途=登录 | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "login:b login=false account=b@example.com kind=login port=10006 slot=10006 pooled=true shared=false attached=false released=false url=http://isp.example.com:10006",
+      "verify:a login=false account=a@example.com kind=verify port=10005 slot=10005 pooled=true shared=false attached=false released=false url=http://isp.example.com:10005",
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "slot a=端口=10005 b=端口=10006 d=端口=10003",
+      "servesOnPort a=true",
+      "logField a=端口=10005",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 5,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 0,
+      "affinity_misses": 0,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "login"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "login"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "release a",
+    "logs": [
+      "INFO a@example.com IP 池归还 | 端口=10005 | 使用中=3/6",
+      "INFO b@example.com IP 池归还 | 端口=10006 | 使用中=3/6",
+      "INFO a@example.com IP 池归还 | 端口=10005 | 使用中=2/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=false tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 2,
+      "leases": 2,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 0,
+      "affinity_misses": 0,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "affinity a",
+    "logs": [
+      "INFO a@example.com IP 池分配 | 端口=10005 | 来源=亲和 | 用途=Worker | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 3,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 1,
+      "affinity_misses": 0,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "shortage",
+    "logs": [
+      "INFO d@example.com IP 池分配 | 端口=10004 | 来源=空闲 | 用途=Worker | 使用中=4/6",
+      "INFO e@example.com IP 池分配 | 端口=10003 | 来源=空闲 | 用途=Worker | 使用中=5/6",
+      "INFO service IP 池分配 | 端口=10002 | 来源=空闲 | 用途=登录 | 使用中=6/6",
+      "WARN service IP 池端口不足，与其他账号共用 | 端口=10001 | 共用账号=2 | 使用中=6/6 | 冷却=0",
+      "INFO service IP 池分配 | 端口=10001 | 来源=共用 | 用途=登录 | 使用中=6/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10004 slot=10004 active=true tag= effective=http://isp.example.com:10004",
+      "e@example.com url=http://isp.example.com:10003 slot=10003 active=true tag= effective=http://isp.example.com:10003",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "login:new1 login=true account= kind=login port=10002 slot=10002 pooled=true shared=false attached=false released=false url=http://isp.example.com:10002",
+      "login:new2 login=true account= kind=login port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001",
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10004 slot=10004 pooled=true shared=false attached=false released=false url=http://isp.example.com:10004",
+      "worker:e@example.com login=false account=e@example.com kind=worker port=10003 slot=10003 pooled=true shared=false attached=false released=false url=http://isp.example.com:10003"
+    ],
+    "extra": [
+      "held=[10001 10002 10003 10004 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 6,
+      "leases": 7,
+      "capacity": 6,
+      "shared": 1,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 1,
+      "affinity_misses": 0,
+      "assignments": [
+        {
+          "account_id": "",
+          "slot": "10001",
+          "kind": "login"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "",
+          "slot": "10002",
+          "kind": "login"
+        },
+        {
+          "account_id": "e@example.com",
+          "slot": "10003",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10004",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10004,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"e@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10004\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "login adopt and import claims",
+    "logs": [
+      "INFO new1@example.com IP 池归还 | 端口=10002 | 使用中=5/6",
+      "INFO service IP 池归还 | 端口=10001 | 使用中=5/6",
+      "INFO e@example.com IP 池归还 | 端口=10003 | 使用中=4/6",
+      "INFO d@example.com IP 池归还 | 端口=10004 | 使用中=3/6",
+      "INFO service IP 池分配 | 端口=10002 | 来源=空闲 | 用途=导入 | 使用中=4/6",
+      "INFO service IP 池归还 | 端口=10002 | 使用中=3/6",
+      "INFO service IP 池分配 | 端口=10002 | 来源=空闲 | 用途=导入 | 使用中=4/6",
+      "INFO service IP 池归还 | 端口=10002 | 使用中=3/6",
+      "INFO service IP 池分配 | 端口=10002 | 来源=空闲 | 用途=导入 | 使用中=4/6",
+      "INFO service IP 池归还 | 端口=10002 | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "e@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "claims=3",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 3,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 1,
+      "affinity_misses": 0,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10004,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"e@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10004\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "rule A",
+    "logs": [
+      "INFO c@example.com IP 池分配 | 端口=10001 | 来源=同账号 | 用途=Worker | 使用中=3/6",
+      "WARN service IP 池端口冷却 | 端口=10006 | 第 1 档 | 时长=15m0s | 恢复=2026-10-23T08:16:00Z | 原因=10 分钟内 2 个账号返回限流且没有成功"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "e@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "portB=10006",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 4,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 1,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 1,
+      "affinity_misses": 0,
+      "cooling_ports": [
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10004,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"e@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10004\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "rule B",
+    "logs": [
+      "INFO d@example.com IP 池分配 | 端口=10004 | 来源=亲和 | 用途=Worker | 使用中=4/6",
+      "WARN d@example.com IP 池出口连不通 | 端口=10004 | 连续=1/2",
+      "INFO d@example.com IP 池归还 | 端口=10004 | 使用中=3/6",
+      "INFO d@example.com IP 池分配 | 端口=10004 | 来源=亲和 | 用途=Worker | 使用中=4/6",
+      "WARN d@example.com IP 池出口连不通 | 端口=10004 | 连续=2/2",
+      "WARN service IP 池端口冷却 | 端口=10004 | 第 1 档 | 时长=15m0s | 恢复=2026-10-23T08:16:00Z | 原因=连续 2 次出口连不通",
+      "INFO d@example.com IP 池归还 | 端口=10004 | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "failPort=10004 secondPort=10004",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 4,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 2,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 0,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"e@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "systemic protection",
+    "logs": [
+      "INFO d@example.com IP 池分配 | 端口=10003 | 来源=空闲 | 用途=Worker | 使用中=4/6",
+      "WARN d@example.com IP 池出口连不通 | 端口=10003 | 连续=2/2",
+      "WARN service IP 池多数端口同时出错，按上游或代理商整体问题处理，暂不冷却端口 | 出错端口=6/4",
+      "INFO d@example.com IP 池归还 | 端口=10003 | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10003 slot=10003 active=false tag= effective=http://isp.example.com:10003",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 4,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 2,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 0,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "locked elsewhere",
+    "logs": [
+      "WARN d@example.com IP 池端口不足，与其他账号共用 | 端口=10001 | 共用账号=2 | 使用中=3/6 | 冷却=2",
+      "INFO d@example.com IP 池分配 | 端口=10001 | 来源=共用 | 用途=Worker | 使用中=3/6",
+      "INFO e@example.com IP 池分配 | 端口=10005 | 来源=共用 | 用途=Worker | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "imp0@example.com nil",
+      "imp1@example.com nil",
+      "imp2@example.com nil",
+      "new1@example.com nil",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001",
+      "worker:e@example.com login=false account=e@example.com kind=worker port=10005 slot=10005 pooled=true shared=true attached=false released=false url=http://isp.example.com:10005"
+    ],
+    "extra": [
+      "lockedOut=[10002 10003 10004]",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 6,
+      "capacity": 6,
+      "shared": 2,
+      "cooling": 2,
+      "external": 2,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "e@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "probe released",
+    "logs": [],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001",
+      "worker:e@example.com login=false account=e@example.com kind=worker port=10005 slot=10005 pooled=true shared=true attached=false released=false url=http://isp.example.com:10005"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 6,
+      "capacity": 6,
+      "shared": 2,
+      "cooling": 2,
+      "external": 1,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "e@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "probe released 2",
+    "logs": [
+      "INFO e@example.com IP 池归还 | 端口=10005 | 使用中=3/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 5,
+      "capacity": 6,
+      "shared": 1,
+      "cooling": 2,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "external PROXY",
+    "logs": [
+      "WARN service IP 池端口段与账户固定代理或 PROXY 重叠，这些端口不再分配 | 端口数=1 | 账户数=0",
+      "INFO service IP 池开启后，没有自己代理的账户不再使用默认代理 PROXY"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 5,
+      "capacity": 6,
+      "shared": 1,
+      "cooling": 2,
+      "external": 1,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 0,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "PROXY restored",
+    "logs": [
+      "INFO service IP 池开启后，没有自己代理的账户不再使用默认代理 PROXY"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp0@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "imp2@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "new1@example.com url=http://isp.example.com:10002 slot=10002 active=false tag= effective=http://isp.example.com:10002",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10001,
+      "port_end": 10006,
+      "total": 6,
+      "in_use": 3,
+      "leases": 5,
+      "capacity": 6,
+      "shared": 1,
+      "cooling": 2,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "range moved",
+    "logs": [
+      "INFO service IP 池已更新 | 模式=静态 | 出口=http://isp.example.com | 端口=10003-10008（6 个） | 需要=6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp0@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "imp1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp2@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "new1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 2,
+      "leases": 5,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 2,
+      "external": 0,
+      "stale": 3,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "capacity up",
+    "logs": [
+      "WARN service IP 池端口少于可能同时运行的浏览器数，超出的会与其他账号共用端口 | 端口=6 | 需要=12"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp0@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "imp1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp2@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "new1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 2,
+      "leases": 5,
+      "capacity": 12,
+      "shared": 0,
+      "cooling": 2,
+      "external": 0,
+      "stale": 3,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "capacity down",
+    "logs": [
+      "INFO service IP 池端口已足够 | 端口=6 | 需要=4"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp0@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "imp1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp2@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "new1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 2,
+      "leases": 5,
+      "capacity": 4,
+      "shared": 0,
+      "cooling": 2,
+      "external": 0,
+      "stale": 3,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "cooling_ports": [
+        {
+          "port": 10004,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        },
+        {
+          "port": 10006,
+          "until": "2026-10-23T08:16:00Z",
+          "level": 1
+        }
+      ],
+      "hot_ports": [
+        {
+          "port": 10006,
+          "rate_limited": 2,
+          "accounts": 1
+        }
+      ],
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "previews",
+    "logs": [],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp0@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "imp1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "imp2@example.com url=http://isp.example.com:10007 slot=10007 active=false tag= effective=http://isp.example.com:10007",
+      "new1@example.com url=http://isp.example.com:10008 slot=10008 active=false tag= effective=http://isp.example.com:10008",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "passthrough:pinned login=false account=pinned@example.com kind=worker port=0 slot= pooled=false shared=false attached=true released=false url=http://203.0.113.9:3128",
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "login=true slot=10007 url=http://isp.example.com:10007",
+      "account=true slot=10004 url=http://isp.example.com:10004",
+      "own=true slot=10007",
+      "pinnedDefault=[pinned@example.com]",
+      "accounts=[{\"id\":\"a@example.com\",\"label\":\"\",\"enabled\":false,\"state\":\"\",\"proxy\":\"\",\"locale\":\"\",\"timezone\":\"\",\"models\":null,\"benefit_tier\":\"\",\"message\":\"\",\"benefit_tier_known\":false,\"pool\":\"\"},{\"id\":\"own@example.com\",\"label\":\"\",\"enabled\":false,\"state\":\"\",\"proxy\":\"\",\"locale\":\"\",\"timezone\":\"\",\"models\":null,\"benefit_tier\":\"\",\"message\":\"\",\"benefit_tier_known\":false,\"pool\":\"\"},{\"id\":\"pinned@example.com\",\"label\":\"\",\"enabled\":false,\"state\":\"\",\"proxy\":\"\",\"locale\":\"\",\"timezone\":\"\",\"models\":null,\"benefit_tier\":\"\",\"message\":\"\",\"benefit_tier_known\":false,\"pool\":\"\",\"proxy_pool_pinned\":true},{\"id\":\"d@example.com\",\"label\":\"\",\"enabled\":false,\"state\":\"\",\"proxy\":\"\",\"locale\":\"\",\"timezone\":\"\",\"models\":null,\"benefit_tier\":\"\",\"message\":\"\",\"benefit_tier_known\":false,\"pool\":\"\"}]",
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 2,
+      "leases": 5,
+      "capacity": 4,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 3,
+      "unpooled": 1,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "own proxy and removed",
+    "logs": [],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=true tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=true tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "d@example.com url=http://isp.example.com:10001 slot=10001 active=true tag= effective=http://isp.example.com:10001",
+      "e@example.com nil",
+      "imp0@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "imp1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "new1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=10005 slot=10005 pooled=true shared=false attached=true released=false url=http://isp.example.com:10005",
+      "worker:b@example.com login=false account=b@example.com kind=worker port=10006 slot=10006 pooled=true shared=false attached=true released=false url=http://isp.example.com:10006",
+      "worker:c@example.com login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=true released=false url=http://isp.example.com:10001",
+      "worker:c@example.com:2 login=false account=c@example.com kind=worker port=10001 slot=10001 pooled=true shared=false attached=false released=false url=http://isp.example.com:10001",
+      "worker:d@example.com login=false account=d@example.com kind=worker port=10001 slot=10001 pooled=true shared=true attached=false released=false url=http://isp.example.com:10001"
+    ],
+    "extra": [
+      "held=[10001 10005 10006]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 2,
+      "leases": 5,
+      "capacity": 4,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 3,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "assignments": [
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "c@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "d@example.com",
+          "slot": "10001",
+          "kind": "worker"
+        },
+        {
+          "account_id": "a@example.com",
+          "slot": "10005",
+          "kind": "worker"
+        },
+        {
+          "account_id": "b@example.com",
+          "slot": "10006",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "all released",
+    "logs": [
+      "INFO a@example.com IP 池归还 | 端口=10005 | 使用中=1/6",
+      "INFO b@example.com IP 池归还 | 端口=10006 | 使用中=0/6",
+      "INFO c@example.com IP 池归还 | 端口=10001 | 使用中=0/6",
+      "INFO c@example.com IP 池归还 | 端口=10001 | 使用中=0/6",
+      "INFO d@example.com IP 池归还 | 端口=10001 | 使用中=0/6"
+    ],
+    "bindings": [
+      "a@example.com url=http://isp.example.com:10005 slot=10005 active=false tag= effective=http://isp.example.com:10005",
+      "b@example.com url=http://isp.example.com:10006 slot=10006 active=false tag= effective=http://isp.example.com:10006",
+      "c@example.com url=http://isp.example.com:10006 slot=10006 active=false tag= effective=http://isp.example.com:10006",
+      "d@example.com url=http://isp.example.com:10005 slot=10005 active=false tag= effective=http://isp.example.com:10005",
+      "e@example.com nil",
+      "imp0@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "imp1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "new1@example.com url=http://isp.example.com:10004 slot=10004 active=false tag= effective=http://isp.example.com:10004",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": null,
+    "extra": [
+      "held=[]"
+    ],
+    "status": {
+      "mode": "static",
+      "endpoint": "http://isp.example.com",
+      "port_start": 10003,
+      "port_end": 10008,
+      "total": 6,
+      "in_use": 0,
+      "leases": 0,
+      "capacity": 4,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "dynamic",
+    "logs": [
+      "INFO service IP 池已更新 | 模式=动态 | 出口=http://gate.example.com"
+    ],
+    "bindings": [
+      "a@example.com url=http://gate.example.com:58688 slot=9719652d7547 active=false tag= effective=http://gate.example.com:58688",
+      "b@example.com url=http://gate.example.com:58688 slot=73dd59d7ce90 active=false tag= effective=http://gate.example.com:58688",
+      "c@example.com url=http://gate.example.com:58688 slot=d45e2f5c4761 active=false tag= effective=http://gate.example.com:58688",
+      "d@example.com url=http://gate.example.com:58688 slot=ae085cc5ec7a active=false tag= effective=http://gate.example.com:58688",
+      "e@example.com nil",
+      "imp0@example.com url=http://gate.example.com:58688 slot=1a97bd0027f0 active=false tag= effective=http://gate.example.com:58688",
+      "imp1@example.com url=http://gate.example.com:58688 slot=2fdfc8e527ce active=false tag= effective=http://gate.example.com:58688",
+      "new1@example.com url=http://gate.example.com:58688 slot=359795cfeff0 active=false tag= effective=http://gate.example.com:58688",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": null,
+    "extra": [
+      "held=[]"
+    ],
+    "status": {
+      "mode": "dynamic",
+      "endpoint": "http://gate.example.com",
+      "total": 0,
+      "in_use": 0,
+      "leases": 0,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T08:00:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {}\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "dynamic leases",
+    "logs": [
+      "INFO a@example.com IP 池分配 | 会话=9719652d7547 | 用途=Worker | 使用中=1",
+      "INFO service IP 池分配 | 会话=n07e027c047a | 用途=登录 | 使用中=2",
+      "INFO dyn@example.com IP 池归还 | 会话=n07e027c047a"
+    ],
+    "bindings": [
+      "a@example.com url=http://gate.example.com:58688 slot=9719652d7547 active=true tag= effective=http://gate.example.com:58688",
+      "b@example.com url=http://gate.example.com:58688 slot=73dd59d7ce90 active=false tag= effective=http://gate.example.com:58688",
+      "c@example.com url=http://gate.example.com:58688 slot=d45e2f5c4761 active=false tag= effective=http://gate.example.com:58688",
+      "d@example.com url=http://gate.example.com:58688 slot=ae085cc5ec7a active=false tag= effective=http://gate.example.com:58688",
+      "dyn@example.com url=http://gate.example.com:58688 slot=n07e027c047a active=false tag= effective=http://gate.example.com:58688",
+      "e@example.com nil",
+      "imp0@example.com url=http://gate.example.com:58688 slot=1a97bd0027f0 active=false tag= effective=http://gate.example.com:58688",
+      "imp1@example.com url=http://gate.example.com:58688 slot=2fdfc8e527ce active=false tag= effective=http://gate.example.com:58688",
+      "new1@example.com url=http://gate.example.com:58688 slot=359795cfeff0 active=false tag= effective=http://gate.example.com:58688",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=0 slot=9719652d7547 pooled=true shared=false attached=true released=false url=http://gate.example.com:58688"
+    ],
+    "extra": [
+      "held=[]"
+    ],
+    "status": {
+      "mode": "dynamic",
+      "endpoint": "http://gate.example.com",
+      "total": 0,
+      "in_use": 1,
+      "leases": 1,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "assignments": [
+        {
+          "account_id": "a@example.com",
+          "slot": "9719652d7547",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {\n    \"accounts\": {\n      \"dyn@example.com\": {\n        \"base\": \"n07e027c047a\",\n        \"used_at\": \"2026-10-23T11:04:33Z\"\n      }\n    }\n  }\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "dynamic upstream rotation",
+    "logs": [
+      "INFO b@example.com IP 池分配 | 会话=73dd59d7ce90 | 用途=Worker | 使用中=2",
+      "WARN b@example.com IP 池出口连不通 | 会话=73dd59d7ce90 | 连续=1/2",
+      "INFO b@example.com IP 池归还 | 会话=73dd59d7ce90",
+      "INFO b@example.com IP 池分配 | 会话=73dd59d7ce90 | 用途=Worker | 使用中=2",
+      "WARN b@example.com IP 池出口连不通 | 会话=73dd59d7ce90 | 连续=2/2",
+      "INFO b@example.com IP 池归还 | 会话=73dd59d7ce90",
+      "WARN b@example.com IP 池换会话 | 会话=73dd59d7ce90 → 73dd59d7ce90r1 | 原因=连续 2 次出口连不通 | 生效=立即（没有 Worker）"
+    ],
+    "bindings": [
+      "a@example.com url=http://gate.example.com:58688 slot=9719652d7547 active=true tag= effective=http://gate.example.com:58688",
+      "b@example.com url=http://gate.example.com:58688 slot=73dd59d7ce90r1 active=false tag= effective=http://gate.example.com:58688",
+      "c@example.com url=http://gate.example.com:58688 slot=d45e2f5c4761 active=false tag= effective=http://gate.example.com:58688",
+      "d@example.com url=http://gate.example.com:58688 slot=ae085cc5ec7a active=false tag= effective=http://gate.example.com:58688",
+      "dyn@example.com url=http://gate.example.com:58688 slot=n07e027c047a active=false tag= effective=http://gate.example.com:58688",
+      "e@example.com nil",
+      "imp0@example.com url=http://gate.example.com:58688 slot=1a97bd0027f0 active=false tag= effective=http://gate.example.com:58688",
+      "imp1@example.com url=http://gate.example.com:58688 slot=2fdfc8e527ce active=false tag= effective=http://gate.example.com:58688",
+      "new1@example.com url=http://gate.example.com:58688 slot=359795cfeff0 active=false tag= effective=http://gate.example.com:58688",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=0 slot=9719652d7547 pooled=true shared=false attached=true released=false url=http://gate.example.com:58688"
+    ],
+    "extra": [
+      "held=[]"
+    ],
+    "status": {
+      "mode": "dynamic",
+      "endpoint": "http://gate.example.com",
+      "total": 0,
+      "in_use": 1,
+      "leases": 1,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "rotations": 1,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "assignments": [
+        {
+          "account_id": "a@example.com",
+          "slot": "9719652d7547",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {\n    \"accounts\": {\n      \"b@example.com\": {\n        \"generation\": 1,\n        \"rotated_at\": \"2026-10-23T11:05:33Z\",\n        \"used_at\": \"2026-10-23T11:05:33Z\"\n      },\n      \"dyn@example.com\": {\n        \"base\": \"n07e027c047a\",\n        \"used_at\": \"2026-10-23T11:04:33Z\"\n      }\n    }\n  }\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "dynamic egress rotation",
+    "logs": [
+      "WARN c@example.com IP 池换会话 | 会话=d45e2f5c4761 → d45e2f5c4761r1 | 原因=出口受限 | 生效=立即（没有 Worker）"
+    ],
+    "bindings": [
+      "a@example.com url=http://gate.example.com:58688 slot=9719652d7547 active=true tag= effective=http://gate.example.com:58688",
+      "b@example.com url=http://gate.example.com:58688 slot=73dd59d7ce90r1 active=false tag= effective=http://gate.example.com:58688",
+      "c@example.com url=http://gate.example.com:58688 slot=d45e2f5c4761r1 active=false tag= effective=http://gate.example.com:58688",
+      "d@example.com url=http://gate.example.com:58688 slot=ae085cc5ec7a active=false tag= effective=http://gate.example.com:58688",
+      "dyn@example.com url=http://gate.example.com:58688 slot=n07e027c047a active=false tag= effective=http://gate.example.com:58688",
+      "e@example.com nil",
+      "imp0@example.com url=http://gate.example.com:58688 slot=1a97bd0027f0 active=false tag= effective=http://gate.example.com:58688",
+      "imp1@example.com url=http://gate.example.com:58688 slot=2fdfc8e527ce active=false tag= effective=http://gate.example.com:58688",
+      "new1@example.com url=http://gate.example.com:58688 slot=359795cfeff0 active=false tag= effective=http://gate.example.com:58688",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": [
+      "worker:a@example.com login=false account=a@example.com kind=worker port=0 slot=9719652d7547 pooled=true shared=false attached=true released=false url=http://gate.example.com:58688"
+    ],
+    "extra": [
+      "rotated=true",
+      "held=[]"
+    ],
+    "status": {
+      "mode": "dynamic",
+      "endpoint": "http://gate.example.com",
+      "total": 0,
+      "in_use": 1,
+      "leases": 1,
+      "capacity": 6,
+      "shared": 0,
+      "cooling": 0,
+      "external": 0,
+      "stale": 0,
+      "unpooled": 0,
+      "orphaned": 0,
+      "pinned_default": 1,
+      "rotations": 2,
+      "affinity_hits": 3,
+      "affinity_misses": 2,
+      "assignments": [
+        {
+          "account_id": "a@example.com",
+          "slot": "9719652d7547",
+          "kind": "worker"
+        }
+      ],
+      "relay_limit": 1048576
+    },
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {\n    \"accounts\": {\n      \"b@example.com\": {\n        \"generation\": 1,\n        \"rotated_at\": \"2026-10-23T11:05:33Z\",\n        \"used_at\": \"2026-10-23T11:05:33Z\"\n      },\n      \"c@example.com\": {\n        \"generation\": 1,\n        \"rotated_at\": \"2026-10-23T11:16:33Z\"\n      },\n      \"dyn@example.com\": {\n        \"base\": \"n07e027c047a\",\n        \"used_at\": \"2026-10-23T11:04:33Z\"\n      }\n    }\n  }\n}\n",
+    "fixed_file": false
+  },
+  {
+    "name": "off",
+    "logs": [
+      "INFO a@example.com IP 池归还 | 会话=9719652d7547",
+      "INFO service IP 池已关闭 | 仍在使用旧出口的浏览器=0（关闭后归还）"
+    ],
+    "bindings": [
+      "a@example.com nil",
+      "b@example.com nil",
+      "c@example.com nil",
+      "d@example.com nil",
+      "dyn@example.com nil",
+      "e@example.com nil",
+      "imp0@example.com nil",
+      "imp1@example.com nil",
+      "new1@example.com nil",
+      "own@example.com nil",
+      "pinned@example.com nil"
+    ],
+    "leases": null,
+    "extra": [
+      "held=[]"
+    ],
+    "status": null,
+    "record": "{\n  \"version\": 1,\n  \"static\": {\n    \"endpoint_key\": \"e56d32141d590bc6\",\n    \"accounts\": {\n      \"a@example.com\": {\n        \"port\": 10005,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"b@example.com\": {\n        \"port\": 10006,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"c@example.com\": {\n        \"port\": 10001,\n        \"at\": \"2026-10-23T08:00:00Z\"\n      },\n      \"d@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:02:00Z\"\n      },\n      \"e@example.com\": {\n        \"port\": 10003,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp0@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"imp2@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"new1@example.com\": {\n        \"port\": 10002,\n        \"at\": \"2026-10-23T08:01:00Z\"\n      }\n    },\n    \"ports\": {\n      \"10001\": {\n        \"last_account\": \"c@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10002\": {\n        \"last_account\": \"imp2@example.com\",\n        \"last_used\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10003\": {\n        \"last_account\": \"d@example.com\",\n        \"last_used\": \"2026-10-23T08:02:00Z\"\n      },\n      \"10004\": {\n        \"last_used\": \"2026-10-23T08:01:00Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      },\n      \"10005\": {\n        \"last_account\": \"a@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\"\n      },\n      \"10006\": {\n        \"last_account\": \"b@example.com\",\n        \"last_used\": \"2026-10-23T11:04:02Z\",\n        \"cooling_until\": \"2026-10-23T08:16:00Z\",\n        \"cooling_level\": 1,\n        \"cooled_at\": \"2026-10-23T08:01:00Z\"\n      }\n    }\n  },\n  \"dynamic\": {\n    \"accounts\": {\n      \"b@example.com\": {\n        \"generation\": 1,\n        \"rotated_at\": \"2026-10-23T11:05:33Z\",\n        \"used_at\": \"2026-10-23T11:05:33Z\"\n      },\n      \"c@example.com\": {\n        \"generation\": 1,\n        \"rotated_at\": \"2026-10-23T11:16:33Z\"\n      },\n      \"dyn@example.com\": {\n        \"base\": \"n07e027c047a\",\n        \"used_at\": \"2026-10-23T11:04:33Z\"\n      }\n    }\n  }\n}\n",
+    "fixed_file": false
+  }
+]

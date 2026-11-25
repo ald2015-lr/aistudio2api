@@ -560,7 +560,7 @@ func (manager *accountWorkerManager) runReplacement(
 			"%s 替补未启动 | 原因=%s | %s", workerLogName(partition), reason, egressColdStartPausedReason,
 		))
 		return replacementFailed, false
-	case errors.Is(err, errAccountWorkerCapacity), errors.Is(err, errAccountRuntimeBusy):
+	case errors.Is(err, errAccountWorkerCapacity), errors.Is(err, errAccountRuntimeBusy), errors.Is(err, errProxyPoolPortPaused):
 		manager.requests.log(accountID, "INFO", fmt.Sprintf(
 			"%s 替补未启动 | 原因=%s | %s", workerLogName(partition), reason, strings.TrimSpace(err.Error()),
 		))

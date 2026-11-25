@@ -2403,7 +2403,7 @@ func TestProxyPoolImportClaims(t *testing.T) {
 	checkProxyPoolInvariants(t, pool, owner)
 }
 
-// TestProxyPoolPinnedAndPreview 复查 2-2、2-3：markPinned 按当前生效的 PROXY 标出固定了默认代理的账户（IP 池关闭时不标）；
+// TestProxyPoolPinnedAndPreview 复查 2-2、2-3：markAccounts 按当前生效的 PROXY 标出固定了默认代理的账户（IP 池关闭时不标）；
 // accountPreview 给出账户清空自己的代理后的默认出口（不改账户记录）
 func TestProxyPoolPinnedAndPreview(t *testing.T) {
 	pool, _ := newTestProxyPool(t, newProxyPoolTestClock(), "", "")
@@ -2414,7 +2414,7 @@ func TestProxyPoolPinnedAndPreview(t *testing.T) {
 	pool.configure(staticProxyPool(10001, 10003), proxyPoolTestGlobal, 2)
 	pool.attach(owner)
 	accounts := []api.AdminAccount{{ID: "pinned@example.com"}, {ID: "own@example.com"}, {ID: "free@example.com"}}
-	pool.markPinned(accounts)
+	pool.markAccounts(accounts)
 	if !accounts[0].ProxyPoolPinned || accounts[1].ProxyPoolPinned || accounts[2].ProxyPoolPinned {
 		t.Fatalf("固定标记 = %+v", accounts)
 	}
@@ -2445,7 +2445,7 @@ func TestProxyPoolPinnedAndPreview(t *testing.T) {
 
 	pool.configure(config.ProxyPool{Mode: config.ProxyPoolOff}, proxyPoolTestGlobal, 2)
 	accounts[0].ProxyPoolPinned = false
-	pool.markPinned(accounts)
+	pool.markAccounts(accounts)
 	if accounts[0].ProxyPoolPinned {
 		t.Fatal("IP 池关闭时不应标出")
 	}
@@ -2453,7 +2453,7 @@ func TestProxyPoolPinnedAndPreview(t *testing.T) {
 		t.Fatal("IP 池关闭时没有池出口")
 	}
 	var nilPool *proxyPool
-	nilPool.markPinned(accounts)
+	nilPool.markAccounts(accounts)
 	if _, ok := nilPool.accountPreview("own@example.com"); ok {
 		t.Fatal("nil IP 池没有出口")
 	}

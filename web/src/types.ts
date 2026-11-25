@@ -9,9 +9,17 @@ export type TabID =
   | 'settings'
   | 'playground'
 
-// org_disabled 为账号所属组织停用了 AI Studio（不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复）
+// org_disabled 为账号所属组织停用了 AI Studio（不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复）；
+// proxy_paused 为 IP 池固定分配下账户的固定端口暂停使用（端口冷却中或被其他进程占用；不参与调度，端口恢复后自动恢复，message 为原因）
 export type AccountState =
-  'ready' | 'busy' | 'cooldown' | 'auth_required' | 'unavailable' | 'disabled' | 'org_disabled'
+  | 'ready'
+  | 'busy'
+  | 'cooldown'
+  | 'auth_required'
+  | 'unavailable'
+  | 'disabled'
+  | 'org_disabled'
+  | 'proxy_paused'
 
 // AccountRestriction 为 org_disabled 状态的原因种类：org_disabled（组织停用）、service_restricted（Google 限制了该账号使用 AI Studio）、
 // age_requirement（年龄或使用资格）、workspace_disabled（所属 Workspace 没有开放 AI Studio）；旧版服务没有这个字段，按组织停用显示
@@ -45,6 +53,9 @@ export interface Account {
   proxy_pool_active?: boolean
   // proxy_pool_pinned 表示 IP 池开启、账户代理与当前生效的默认代理相同，因此不使用 IP 池（服务端判断，与 pinned_default 一致）
   proxy_pool_pinned?: boolean
+  // proxy_pool_fixed_port 为 IP 池固定分配（静态 IP、PROXY_POOL_FIXED=true）下账户的固定端口（只有端口号）；没有自己代理、分到端口的
+  // 账户才有。端口暂停使用时 state 为 proxy_paused、message 为原因
+  proxy_pool_fixed_port?: number
   // org_disabled 表示账户所属组织停用了 AI Studio（不区分是否启用）：启用账户的 state 为 org_disabled，停用账户仍为 disabled、
   // message 接上原因；验证接口的返回在验证遇到组织停用时同样为 true
   org_disabled?: boolean
@@ -583,6 +594,48 @@ export interface ProxyPoolCheck {
   failed?: ProxyPoolFailure[]
 }
 
+// ProxyPoolPauseReason 为固定分配下端口暂停使用的原因：cooling_upstream（连续出口连不通的冷却）、cooling_rate_limited（不同账号返回
+// 限流的冷却）、cooling（冷却中、规则未知，例如重启后读回）、locked_elsewhere（被其他进程占用）
+export type ProxyPoolPauseReason =
+  | 'cooling_upstream'
+  | 'cooling_rate_limited'
+  | 'cooling'
+  | 'locked_elsewhere'
+
+// ProxyPoolPausedPort 为固定分配下暂停使用的端口：until 为冷却恢复时间或下次检查时间，accounts 为这个端口上的固定账户数
+export interface ProxyPoolPausedPort {
+  port: number
+  reason: ProxyPoolPauseReason | string
+  until?: string
+  accounts: number
+}
+
+// ProxyPoolFixedStatus 为 IP 池固定分配（PROXY_POOL_FIXED=true）的状态，模式为 static 或 dynamic（不含地址）。静态：ports 为参与分配的端口数
+// （端口段内、没有停用的），accounts 为分配表里的账户数，min_per_port / max_per_port 为参与分配的端口上的最少 / 最多账户数，empty 为没有
+// 账户的端口，stray 为分配表里已不在账户池的账户（保留位置），unassigned 为走 IP 池却没有分到端口的账户（正常为 0），reserved 为登录、
+// 导入中预留的位置，transitional 为运行中、还不在固定端口上的 Worker，external_ports 为有固定账户、同时被账户固定代理或 PROXY 指向的端口，
+// excluded 为“换 IP”后停用的端口（最多 50 个，excluded_total 为总数），paused_ports / paused_accounts 为暂停使用的端口与其上的账户数，
+// paused 为暂停的端口（最多 50 个，按恢复时间）。动态：accounts 为走 IP 池的账户数，其余为 0
+export interface ProxyPoolFixedStatus {
+  mode: 'static' | 'dynamic'
+  since?: string
+  ports?: number
+  accounts: number
+  min_per_port: number
+  max_per_port: number
+  empty?: number
+  stray?: number
+  unassigned?: number
+  reserved?: number
+  transitional?: number
+  external_ports?: number
+  excluded?: number[]
+  excluded_total?: number
+  paused_ports: number
+  paused_accounts: number
+  paused?: ProxyPoolPausedPort[]
+}
+
 // ProxyPoolStatus 为 IP 池的实时状态（不含账号密码）：
 // total 为静态 IP 的端口数（动态为 0），in_use 为有浏览器占用的端口（动态为有浏览器在用的会话），leases 为 IP 池分配的活动租约
 // （Worker 与登录、验证），capacity 为可能同时运行的浏览器数 Σ(峰值 + 排空上限)（不含登录与验证）；shared 为被两个及以上账号
@@ -613,6 +666,43 @@ export interface ProxyPoolStatus {
   assignments?: ProxyPoolAssignment[]
   check?: ProxyPoolCheck
   relay_limit?: number
+  // fixed 为固定分配的状态：开启 PROXY_POOL_FIXED 且模式不为关闭时才有；旧版服务端不返回
+  fixed?: ProxyPoolFixedStatus
+}
+
+// ProxyPoolFixedRebalanceResult 为“重新平均分配”的结果：dry_run 为只计算、没有改分配；accounts 为分配表里的账户数（清理之后），ports 为参与
+// 分配的端口数，moved 为换了端口的账户数，pruned 为清理掉的已不在账户池的记录（服务停止时不清理），running 为被挪账户里有运行中 Worker 的
+// （关闭后改用新端口），min_per_port / max_per_port 为之后每个端口的最少 / 最多账户数
+export interface ProxyPoolFixedRebalanceResult {
+  dry_run: boolean
+  accounts: number
+  ports: number
+  moved: number
+  pruned: number
+  running: number
+  min_per_port: number
+  max_per_port: number
+}
+
+// ProxyPoolFixedReassignResult 为“给端口换 IP”的结果：moved 为挪走的账户数，targets 为挪到的端口（去重升序，最多 20 个），running 为被挪
+// 账户里有运行中 Worker 的（不论在哪个端口），closing 为此刻用这个端口服务、服务运行中时登记后台关闭的 Worker 数（含固定端口已在别处的
+// 过渡 Worker，预演与执行同一口径；旧版服务没有），restarted 为执行时真正登记了后台关闭的 Worker（等进行中的请求结束，下次启动用各自的
+// 固定端口），excluded 为这个端口已停用
+export interface ProxyPoolFixedReassignResult {
+  dry_run: boolean
+  port: number
+  moved: number
+  targets?: number[]
+  running: number
+  closing?: number
+  restarted: number
+  excluded: boolean
+}
+
+// ProxyPoolFixedRestoreResult 为恢复停用端口的结果：restored 为假时这个端口本来就没有停用
+export interface ProxyPoolFixedRestoreResult {
+  port: number
+  restored: boolean
 }
 
 // FollowDefaultProxyResult 为“改为跟随默认代理”的结果：changed 为清空了账户代理的账户数，running 为其中仍有运行中 Worker
@@ -933,6 +1023,9 @@ export interface ServiceConfig {
   downgrade_guard: DowngradeGuardConfig
   // proxy_pool 为 IP 池设置；旧版服务端不返回，此时设置页不显示 IP 池分组，保存时也不提交（服务端沿用现值）
   proxy_pool?: ProxyPoolConfig
+  // proxy_pool_fixed 为 IP 池固定分配（PROXY_POOL_FIXED，默认关闭，保存后立即生效）：静态 IP 时每个走 IP 池的账户固定一个端口、按账户数
+  // 平均分到端口段的端口上，之后不自动改变；动态 IP 时不再自动换会话。旧版服务端不返回，此时不显示开关、保存时也不提交（服务端沿用现值）
+  proxy_pool_fixed?: boolean
   // media_output 为生成媒体的输出方式：inline 内联 data URI（Gemini 原生接口为 inlineData），url 保存到 runtime/media/ 并以本服务
   // /media/<文件名> 链接引用；media_base_url 为链接使用的服务地址（为空时按请求地址）；media_retention 为保存期限（7d、72h，0 不清理），
   // media_max_size 为媒体目录总量上限（20GB、500MB，0 不限）。服务端总是返回这几个字段，保存后立即生效

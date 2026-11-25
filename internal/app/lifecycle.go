@@ -720,7 +720,12 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		if err != nil {
 			return false
 		}
+		// proxy_pool 不带固定分配的开关：按生效值比较
+		poolSettings.Fixed = saved.ProxyPool.Fixed
 		saved.ProxyPool = poolSettings
+	}
+	if value.ProxyPoolFixed != nil {
+		saved.ProxyPool.Fixed = *value.ProxyPoolFixed
 	}
 	if value.UltraExclusive != nil {
 		saved.UltraExclusive = *value.UltraExclusive

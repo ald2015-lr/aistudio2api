@@ -37,7 +37,7 @@ import RequestsPanel from '@/components/RequestsPanel.vue'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
-import { formatClock } from '@/proxyPool'
+import { formatClock, proxyPoolFixedActive, proxyPoolPauseReasonKey } from '@/proxyPool'
 import { elapsedSecondsSince, syncServerClock, useSecondClock } from '@/serverClock'
 import { readStorage, writeStorage } from '@/storage'
 
@@ -495,8 +495,14 @@ const proTierAccounts = computed(
     ).length,
 )
 
+// poolAccountCount 为没有自己代理的账户数（按账户列表），设置页开启 IP 池固定分配前估算每个端口的账户数
+const poolAccountCount = computed(
+  () => accounts.value.filter((account) => account.proxy.trim() === '').length,
+)
+
 // proxyPoolLine 为侧栏 Worker 区下方的 IP 池一行：静态显示端口占用、冷却与共用，动态显示会话数与换会话次数，
-// 有旧出口、仍走默认代理的 Worker、外部占用、已删账户占用时追加；悬停列出冷却端口与裸 429 最多的端口
+// 有旧出口、仍走默认代理的 Worker、外部占用、已删账户占用时追加；悬停列出冷却端口与裸 429 最多的端口。
+// 静态 IP 的固定分配下改为每端口账户数与暂停的端口（共用端口是常态，不因共用标黄；有暂停的端口或已删账户占用时标黄）
 const PROXY_POOL_TOOLTIP_PORTS = 5
 
 // listPorts 列出提示里的端口，最多 PROXY_POOL_TOOLTIP_PORTS 个，超出时以省略号结尾
@@ -511,8 +517,43 @@ const proxyPoolLine = computed(() => {
   if (pool === undefined) return null
   const parts: string[] = []
   const details: string[] = []
-  const shortage = pool.mode === 'static' && pool.total < pool.capacity
-  if (pool.mode === 'static') {
+  const fixed = proxyPoolFixedActive(pool)
+  const fixedStatic = fixed?.mode === 'static'
+  const shortage = pool.mode === 'static' && !fixedStatic && pool.total < pool.capacity
+  if (fixed !== null && fixedStatic) {
+    const perPort =
+      fixed.min_per_port === fixed.max_per_port
+        ? String(fixed.min_per_port)
+        : `${fixed.min_per_port}–${fixed.max_per_port}`
+    parts.push(tf('app.proxyPoolFixed', { perPort, paused: fixed.paused_ports }))
+    details.push(
+      tf('app.proxyPoolDetailFixed', {
+        ports: fixed.ports ?? 0,
+        accounts: fixed.accounts,
+        perPort,
+        inUse: pool.in_use,
+        total: pool.total,
+      }),
+    )
+    if ((fixed.paused ?? []).length > 0) {
+      details.push(
+        tf('app.proxyPoolDetailFixedPaused', {
+          ports: listPorts(fixed.paused, (port) =>
+            tf('app.proxyPoolDetailFixedPausedPort', {
+              port: port.port,
+              reason: proxyPoolPauseReasonText(port.reason),
+              accounts: port.accounts,
+            }),
+          ),
+        }),
+      )
+    }
+    if ((fixed.transitional ?? 0) > 0) {
+      details.push(
+        tf('app.proxyPoolDetailFixedTransitional', { count: fixed.transitional ?? 0 }),
+      )
+    }
+  } else if (pool.mode === 'static') {
     parts.push(
       tf('app.proxyPoolStatic', {
         inUse: pool.in_use,
@@ -534,7 +575,11 @@ const proxyPoolLine = computed(() => {
     )
     if (shortage) details.push(tf('app.proxyPoolDetailShortage', { capacity: pool.capacity }))
   } else if (pool.mode === 'dynamic') {
-    parts.push(tf('app.proxyPoolDynamic', { inUse: pool.in_use, rotations: pool.rotations ?? 0 }))
+    parts.push(
+      fixed !== null
+        ? tf('app.proxyPoolFixedDynamic', { inUse: pool.in_use })
+        : tf('app.proxyPoolDynamic', { inUse: pool.in_use, rotations: pool.rotations ?? 0 }),
+    )
     details.push(
       tf('app.proxyPoolDetailDynamic', {
         endpoint: pool.endpoint ?? '',
@@ -542,12 +587,18 @@ const proxyPoolLine = computed(() => {
         rotations: pool.rotations ?? 0,
       }),
     )
+    if (fixed !== null) {
+      details.push(tf('app.proxyPoolDetailFixedDynamic', { accounts: fixed.accounts }))
+    }
   } else {
     parts.push(t('app.proxyPoolOff'))
   }
   if (pool.stale > 0) parts.push(tf('app.proxyPoolStale', { count: pool.stale }))
   if (pool.unpooled > 0) parts.push(tf('app.proxyPoolUnpooled', { count: pool.unpooled }))
-  if (pool.external > 0) parts.push(tf('app.proxyPoolExternal', { count: pool.external }))
+  // 固定分配下外部占用的端口照常使用、被其他进程占用的端口算作暂停，不另列“外部占用”
+  if (pool.external > 0 && !fixedStatic) {
+    parts.push(tf('app.proxyPoolExternal', { count: pool.external }))
+  }
   if (pool.orphaned > 0) parts.push(tf('app.proxyPoolOrphaned', { count: pool.orphaned }))
   if ((pool.cooling_ports ?? []).length > 0) {
     details.push(
@@ -589,9 +640,17 @@ const proxyPoolLine = computed(() => {
   return {
     text: parts.join(' · '),
     detail: details.join('；'),
-    warn: shortage || pool.shared > 0 || pool.orphaned > 0,
+    warn: fixedStatic
+      ? (fixed?.paused_ports ?? 0) > 0 || pool.orphaned > 0
+      : shortage || pool.shared > 0 || pool.orphaned > 0,
   }
 })
+
+// proxyPoolPauseReasonText 返回固定分配下端口暂停原因的说明；不认识的原因码原样显示
+function proxyPoolPauseReasonText(reason: string): string {
+  const key = proxyPoolPauseReasonKey(reason)
+  return key === null ? reason : t(key)
+}
 
 // primarySupplyRows 为侧栏显示的主用模型供给；备用达到统计上限时显示为 1000+。
 // 普通条目与 Ultra、Pro 条目（pool 为 ultra、pro）分开：同一个模型可能同时在几份列表里，Ultra、Pro 条目显示在各自的 Worker 行下面
@@ -1497,6 +1556,7 @@ onUnmounted(() => {
           :proxy-pool-status="status?.proxy_pool ?? null"
           :build-channel-status="status?.build_channel ?? null"
           :pro-accounts="proTierAccounts"
+          :pool-accounts="poolAccountCount"
           @saved="config = $event"
           @notice="showNotice"
         />

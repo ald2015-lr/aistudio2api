@@ -1213,7 +1213,10 @@ func (admin *runtimeAdmin) fetchStudioKeyWithLease(
 	}
 	defer func() { _ = lease.Release() }()
 	account := lease.Account()
-	proxy, poolLease := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
+	proxy, poolLease, err := admin.browserProxy(account.ID, account.ID, proxyPoolKindVerify, account.Config.Label, account.Config.Proxy)
+	if err != nil {
+		return camoufoxnative.StudioKeyResult{}, err
+	}
 	defer poolLease.release()
 	request := admin.loginRequest(account, account.Directory, proxy)
 	request.OnboardingCompleted = admin.onboardingLogger(account.Config.Label, "获取 API Key")

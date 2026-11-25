@@ -23,6 +23,8 @@ const props = withDefaults(
     // accountCleared 为这个账户原来有自己的代理（对话框里清空了）：服务端改测清空后 IP 池会给它的出口
     accountId?: string
     accountCleared?: boolean
+    // poolFixed 为 IP 池固定分配生效（静态 IP）：清空代理后、新账户登录分到的端口就是之后一直用的固定端口
+    poolFixed?: boolean
     // collapsibleHelp 为 true 时长说明折叠成两行、可展开（设置页）；账户对话框照常完整显示
     collapsibleHelp?: boolean
   }>(),
@@ -32,6 +34,7 @@ const props = withDefaults(
     placeholder: '',
     accountId: '',
     accountCleared: false,
+    poolFixed: false,
     collapsibleHelp: false,
   },
 )
@@ -65,9 +68,11 @@ const testDisabled = computed(
 )
 // slotKey 为结果里端口号或会话号的说明：编辑已有账户时为它当前的出口，清空了它原来的代理时为清空后的出口（之后的 Worker 可能另分），
 // 添加新账户时为此刻会分给登录的出口
+// （固定分配下清空代理后、新账户登录分到的就是之后一直用的固定端口）
 const slotKey = computed<TranslationKey>(() => {
-  if (props.accountId === '') return 'proxy.testPoolSlot'
-  return props.accountCleared ? 'proxy.testAccountClearedSlot' : 'proxy.testAccountSlot'
+  if (props.accountId === '') return props.poolFixed ? 'proxy.testPoolFixedSlot' : 'proxy.testPoolSlot'
+  if (!props.accountCleared) return 'proxy.testAccountSlot'
+  return props.poolFixed ? 'proxy.testAccountClearedFixedSlot' : 'proxy.testAccountClearedSlot'
 })
 const warnings = computed(() =>
   (result.value?.warnings ?? []).filter((warning) => warning in warningKeys),

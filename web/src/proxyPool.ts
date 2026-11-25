@@ -1,6 +1,6 @@
 // IP 池的界面辅助：组合校验与容量估算只用于设置页提示与提交前的检查，最终以服务端 ProxyPool.Validate 为准
 import type { TranslationKey } from '@/i18n'
-import type { ProxyPoolConfig, ProxyPoolStatus } from '@/types'
+import type { ProxyPoolConfig, ProxyPoolFixedStatus, ProxyPoolStatus } from '@/types'
 
 // 与服务端 config.DefaultProxyPoolPortStart、DefaultProxyPoolPortEnd、MaxProxyPoolPorts 一致
 export const DEFAULT_PROXY_POOL_PORT_START = 10001
@@ -189,4 +189,41 @@ export function formatClock(value: string | undefined, locale: string): string {
 // proxyPoolActive 判断 IP 池是否开启（关闭后仍有旧出口时状态接口照样返回，mode 为 off）
 export function proxyPoolActive(status: ProxyPoolStatus | null | undefined): boolean {
   return status !== null && status !== undefined && status.mode !== 'off'
+}
+
+// proxyPoolFixedActive 返回生效中的固定分配状态（静态为固定端口、动态为固定会话）；没有开启或旧版服务端时为 null
+export function proxyPoolFixedActive(
+  status: ProxyPoolStatus | null | undefined,
+): ProxyPoolFixedStatus | null {
+  if (!proxyPoolActive(status)) return null
+  return status?.fixed ?? null
+}
+
+// proxyPoolFixedStatic 判断静态 IP 的固定分配生效（账户各有固定端口、同端口的账户共用这个 IP）
+export function proxyPoolFixedStatic(status: ProxyPoolStatus | null | undefined): boolean {
+  return proxyPoolFixedActive(status)?.mode === 'static'
+}
+
+const pauseReasonKeys: Record<string, TranslationKey> = {
+  cooling_upstream: 'proxyPoolPause.cooling_upstream',
+  cooling_rate_limited: 'proxyPoolPause.cooling_rate_limited',
+  cooling: 'proxyPoolPause.cooling',
+  locked_elsewhere: 'proxyPoolPause.locked_elsewhere',
+}
+
+// proxyPoolPauseReasonKey 返回固定分配下端口暂停原因的翻译键；不认识的原因码（更新的服务端）返回 null，调用处原样显示
+export function proxyPoolPauseReasonKey(reason: string): TranslationKey | null {
+  return pauseReasonKeys[reason] ?? null
+}
+
+// fixedPerPort 按账户数与端口数估算平均分配后每个端口的账户数（与服务端一样：除不尽时各端口相差不超过 1）；端口数不是正整数时返回 null
+export function fixedPerPort(
+  accounts: number,
+  ports: number,
+): { min: number; max: number } | null {
+  if (!Number.isInteger(ports) || ports <= 0 || !Number.isInteger(accounts) || accounts < 0) {
+    return null
+  }
+  const base = Math.floor(accounts / ports)
+  return { min: base, max: accounts % ports === 0 ? base : base + 1 }
 }

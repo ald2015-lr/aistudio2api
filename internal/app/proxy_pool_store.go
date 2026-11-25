@@ -113,7 +113,7 @@ func (pool *proxyPool) markDirtyLocked() {
 	})
 }
 
-// flush 立即写出未保存的记录（生成服务关闭与 runtimeManager.Close 时调用）
+// flush 立即写出未保存的记录与固定分配表（生成服务关闭与 runtimeManager.Close 时调用）
 func (pool *proxyPool) flush() {
 	if pool == nil {
 		return
@@ -125,6 +125,7 @@ func (pool *proxyPool) flush() {
 	}
 	pool.mu.Unlock()
 	pool.save()
+	pool.fixedFlush()
 }
 
 // save 锁内复制快照、锁外编码与原子写入；saveMu 保证较旧的快照不会最后落盘。写入失败时 WARN，下一次变化再写
@@ -164,7 +165,7 @@ func (pool *proxyPool) save() {
 	}
 }
 
-// snapshotLocked 复制要写盘的记录，并修剪已不在账户池里、且 30 天没有用过的账户记录（known 为空时不按账户池修剪）。
+// snapshotLocked 复制要写盘的记录，并修剪已不在账户池里、且 30 天没有用过的账户记录（known 为空时不按账户池修剪；动态固定会话不修剪会话记录）。
 // 端口只写有归属或冷却档位的
 func (pool *proxyPool) snapshotLocked(known map[string]struct{}, now time.Time) proxyPoolRecord {
 	stale := func(accountID string, at time.Time) bool {
@@ -201,6 +202,9 @@ func (pool *proxyPool) snapshotLocked(known map[string]struct{}, now time.Time) 
 			CoolingUntil: proxyPoolUTC(state.coolUntil), CoolingLevel: state.coolLevel, CooledAt: proxyPoolUTC(state.cooledAt),
 		}
 	}
+	// 动态固定会话：会话号同样持久，暂时不在账户池的账户（目录移走、载入失败）不按 30 天修剪，回来时仍是原会话号；删除账户时由
+	// releaseFixed 释放
+	keepSessions := pool.fixedDynamicLocked()
 	for accountID, session := range pool.sessions {
 		if session.base == "" && session.generation == 0 {
 			// 只有连通失败计数的会话不写盘
@@ -210,7 +214,7 @@ func (pool *proxyPool) snapshotLocked(known map[string]struct{}, now time.Time) 
 		if session.rotatedAt.After(at) {
 			at = session.rotatedAt
 		}
-		if stale(accountID, at) {
+		if !keepSessions && stale(accountID, at) {
 			delete(pool.sessions, accountID)
 			continue
 		}

@@ -17,6 +17,7 @@ import type {
   DowngradeGuardConfig,
   Model,
   ProxyPoolConfig,
+  ProxyPoolMode,
   ProxyPoolStatus,
   ServiceConfig,
   TierRuleHint,
@@ -42,6 +43,8 @@ const props = defineProps<{
   buildChannelStatus?: BuildChannelStatus | null
   // proAccounts 为权益为 Pro 的账户数（按账户列表）：开启 Pro 独立号池且有 Pro 账户时 IP 池的端口需求才计入 Pro 分区
   proAccounts?: number
+  // poolAccounts 为没有自己代理的账户数（按账户列表）：开启 IP 池固定分配前估算每个端口的账户数
+  poolAccounts?: number
 }>()
 
 const emit = defineEmits<{
@@ -98,6 +101,7 @@ type EditableKey =
   | 'long_output_max_tokens'
   | 'downgrade_guard'
   | 'proxy_pool'
+  | 'proxy_pool_fixed'
   | 'media_output'
   | 'media_base_url'
   | 'media_retention'
@@ -154,6 +158,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'long_output_max_tokens',
   'downgrade_guard',
   'proxy_pool',
+  'proxy_pool_fixed',
   'media_output',
   'media_base_url',
   'media_retention',
@@ -812,6 +817,14 @@ function proxyPoolInvalid(value: ServiceConfig): string {
   return rejected !== null && rejected.pool === poolSnapshot(value.proxy_pool) ? rejected.message : ''
 }
 
+// savedFixedMode 为已保存的设置里开启了固定分配的模式（静态为固定分配、动态为固定会话；没有开启或 IP 池关闭时为空）：IP 池分组
+// 切换模式会让固定分配换一种方式生效时据此先确认
+const savedFixedMode = computed<ProxyPoolMode | ''>(() => {
+  const saved = savedConfig.value
+  if (saved?.proxy_pool_fixed !== true || saved.proxy_pool === undefined) return ''
+  return saved.proxy_pool.mode === 'off' ? '' : saved.proxy_pool.mode
+})
+
 // proxyPoolServerError 为表单里当前的 IP 池设置被服务端拒绝时的错误（显示在 IP 池地址框旁）
 const proxyPoolServerError = computed(() => {
   const rejected = proxyPoolRejected.value
@@ -1145,6 +1158,8 @@ watch(
       // 旧版服务端不返回 IP 池设置：表单里也去掉，保存时不提交，服务端沿用现值
       if (config.proxy_pool !== undefined) form.proxy_pool = cloneProxyPool(config.proxy_pool)
       else delete form.proxy_pool
+      // 固定分配开关同样：旧版服务端不返回时不显示开关、保存时不提交
+      if (config.proxy_pool_fixed === undefined) delete form.proxy_pool_fixed
     }
     savedConfig.value = config
   },
@@ -1343,7 +1358,10 @@ onBeforeUnmount(() => {
       <ProxyPoolSettings
         v-if="form.proxy_pool !== undefined"
         v-model="proxyPoolForm"
+        v-model:fixed="form.proxy_pool_fixed"
         :status="proxyPoolStatus"
+        :pool-accounts="poolAccounts ?? 0"
+        :saved-fixed-mode="savedFixedMode"
         :max-active="form.max_active_workers"
         :ultra-max-active="form.ultra_max_active_workers"
         :pro-max-active="form.pro_max_active_workers"

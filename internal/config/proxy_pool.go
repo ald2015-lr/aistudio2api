@@ -43,6 +43,7 @@ var (
 	errProxyPoolDynamicEmpty = errors.New("dynamic 模式的 PROXY_POOL_URL 不能为空：写成 http://customer-账号-sessid-{session}:密码@gate.example.com:端口 这样的地址，程序按账户替换 {session}")
 	errProxyPoolDynamicToken = errors.New("dynamic 模式的 PROXY_POOL_URL 必须包含 {session}：写在用户名里会话号的位置，例如 customer-账号-sessid-{session}，程序按账户替换成固定会话号")
 	errProxyPoolTokenHost    = errors.New("PROXY_POOL_URL 的 {session} 只能写在用户名或密码里")
+	errProxyPoolFixed        = errors.New("PROXY_POOL_FIXED 必须是 true 或 false")
 )
 
 // ProxyPool 为 IP 池设置（PROXY_POOL_*）：static 时每个浏览器独占端口段里的一个端口（代理商一个端口一个固定 IP），
@@ -56,6 +57,11 @@ type ProxyPool struct {
 	// PortStart、PortEnd 为 static 的端口段（PROXY_POOL_PORT_START / PROXY_POOL_PORT_END，含两端，默认 10001-10200）
 	PortStart int `json:"port_start"`
 	PortEnd   int `json:"port_end"`
+	// Fixed 为固定分配（PROXY_POOL_FIXED，默认 false）：static 时每个走 IP 池的账户固定一个端口，按账户数平均分到端口段的端口上
+	// （同一端口的账户共用这个 IP、可以同时开浏览器），之后重启、更新与热更新其他设置都不变；端口冷却或被其他进程占用时这个端口上的
+	// 账户暂停使用、等它恢复，不换端口、不走默认代理、不直连。dynamic 时每个账户一直用它的会话号，不再自动换会话。off 时不生效
+	// （分配表保留，再开启时沿用）。普通 bool：测试按值比较整个结构；omitempty 让关闭时 JSON 与原来逐字节一致
+	Fixed bool `json:"fixed,omitempty"`
 }
 
 // DefaultProxyPool 返回默认设置：关闭，端口段 10001-10200
@@ -90,7 +96,7 @@ func (p ProxyPool) Enabled() bool {
 func (p ProxyPool) Equal(other ProxyPool) bool {
 	left, right := p.withDefaults(), other.withDefaults()
 	return left.Mode == right.Mode && CanonicalProxyPoolURL(left.URL) == CanonicalProxyPoolURL(right.URL) &&
-		left.PortStart == right.PortStart && left.PortEnd == right.PortEnd
+		left.PortStart == right.PortStart && left.PortEnd == right.PortEnd && left.Fixed == right.Fixed
 }
 
 // Validate 校验设置：端口段在任何模式下都校验；static 要求地址非空且不含 {session}；dynamic 要求地址非空、含 {session}
@@ -231,14 +237,23 @@ func (p ProxyPool) EndpointKey() string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// Summary 返回热更新日志里的一段（脱敏）：关闭 / 静态 http://isp.example.com 端口 10001-10200（200 个）/ 动态 http://gate.example.com
+// Summary 返回热更新日志里的一段（脱敏）：关闭 / 静态 http://isp.example.com 端口 10001-10200（200 个）/ 动态 http://gate.example.com；
+// 固定分配开启时静态追加“，固定分配”、动态追加“，固定会话”（关闭时文案不变）
 func (p ProxyPool) Summary() string {
 	p = p.withDefaults()
 	switch p.Mode {
 	case ProxyPoolStatic:
-		return fmt.Sprintf("静态 %s 端口 %d-%d（%d 个）", p.Endpoint(), p.PortStart, p.PortEnd, p.Size())
+		summary := fmt.Sprintf("静态 %s 端口 %d-%d（%d 个）", p.Endpoint(), p.PortStart, p.PortEnd, p.Size())
+		if p.Fixed {
+			summary += "，固定分配"
+		}
+		return summary
 	case ProxyPoolDynamic:
-		return "动态 " + p.Endpoint()
+		summary := "动态 " + p.Endpoint()
+		if p.Fixed {
+			summary += "，固定会话"
+		}
+		return summary
 	default:
 		return "关闭"
 	}
@@ -349,6 +364,14 @@ func loadProxyPool(values map[string]string, pool *ProxyPool) error {
 		}
 		*field.target = port
 	}
+	// 固定分配写错时启动即报错（与端口键相同）：按 false 启动会让固定了端口的账户重新按原方式换 IP
+	if value, ok := values["PROXY_POOL_FIXED"]; ok && strings.TrimSpace(value) != "" {
+		fixed, err := strconv.ParseBool(strings.TrimSpace(value))
+		if err != nil {
+			return errProxyPoolFixed
+		}
+		pool.Fixed = fixed
+	}
 	return nil
 }
 
@@ -360,6 +383,7 @@ func (p ProxyPool) envValues() map[string]string {
 		"PROXY_POOL_URL":        CanonicalProxyPoolURL(p.URL),
 		"PROXY_POOL_PORT_START": strconv.Itoa(p.PortStart),
 		"PROXY_POOL_PORT_END":   strconv.Itoa(p.PortEnd),
+		"PROXY_POOL_FIXED":      strconv.FormatBool(p.Fixed),
 	}
 }
 

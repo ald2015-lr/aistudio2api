@@ -58,6 +58,8 @@ func newRuntime(
 	// IP 池（进程级）先按本次配置生效，再给还没进入账户池的账户对象写默认出口：账户池、公共头与 Go 侧请求第一次就按带绑定的
 	// EffectiveProxy 取出口（见 proxy_pool.go）
 	proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg, hasProAccounts(accounts)))
+	// 固定分配：账户进账户池、第一次 prime 之前按载入的账户一次对齐完（之后 prime 不再惰性分配）
+	proxyPool.prepareFixed(accounts)
 	for _, account := range accounts {
 		proxyPool.prime(account)
 	}
@@ -183,6 +185,8 @@ func newRuntime(
 	// 旧实例浏览器的归还按账户 ID 推给新账户池。端口冷却的回调同时换成新生成服务的（撤回误伤的逐级冷却、换端口重启 Worker，
 	// 见 proxy_pool_egress.go）
 	proxyPool.setPortCooledHook(service.proxyPortCooled)
+	// 固定分配的端口暂停与恢复、开启与关闭改了账户页的状态与固定端口：合并推送账户列表（请求少时不必等下一次请求结束）
+	proxyPool.setAccountsChangedHook(service.publishModelAccess)
 	proxyPool.attach(pool)
 	requests.log("service", "INFO", fmt.Sprintf(
 		"协议运行时就绪 | 账户=%d | 耗时=%s",
@@ -574,8 +578,10 @@ func (manager *accountWorkerManager) expandInBackground(accountID string, modelI
 	go func() {
 		defer close(done)
 		_, err := manager.ensureWorker(ctx, accountID, modelID, false)
+		// 固定分配下固定端口暂停使用是预期中的拒绝（不换端口、等恢复），与预热、替补同样按跳过处理：暂停已写在端口那一行，
+		// 名额到手后才被拒的另写过“WAA Worker 不启动”
 		if err == nil || ctx.Err() != nil || errors.Is(err, errAccountWorkerOpening) ||
-			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) {
+			errors.Is(err, errAccountWorkerCapacity) || errors.Is(err, errAccountRuntimeBusy) || errors.Is(err, errProxyPoolPortPaused) {
 			return
 		}
 		manager.requests.log(accountID, "WARN", fmt.Sprintf("WAA Worker 后台扩容失败 | 错误=%v", err))
@@ -1441,7 +1447,17 @@ func (manager *accountWorkerManager) startReservedWorker(
 		return nil, &accountWorkerInitError{err: errWorkerOrgDisabled}
 	}
 	// 名额到手后才申请 IP 池出口：排队等名额的启动不占端口。只改这次启动的局部参数，accountWorker.config 不变
-	poolLease := manager.workerProxyLease(account.id, label, ownProxy, &options)
+	poolLease, leaseErr := manager.workerProxyLease(account.id, label, ownProxy, &options)
+	if leaseErr != nil {
+		// 固定分配下固定端口在排队期间暂停使用了（预检之后的竞态）：名额立即让出，不启动浏览器、不换端口；不算容量已满
+		releaseSlot()
+		if ownsLease {
+			_ = runtimeLease.Release()
+		}
+		account.startupMu.Unlock()
+		manager.requests.log(label, "INFO", fixedWorkerRefusedText(leaseErr))
+		return nil, &accountWorkerInitError{err: leaseErr}
+	}
 	manager.requests.log(label, "INFO", "WAA Worker 启动 | 1/7 | 初始化页面 | 页面模型="+bootstrapModel)
 	initTimeout := time.Duration(manager.initTimeout.Load())
 	initCtx, cancel := context.WithTimeout(ctx, initTimeout)
@@ -2175,6 +2191,10 @@ func (manager *accountWorkerManager) startAuthenticatedWorker(ctx context.Contex
 		// 所属组织停用了 AI Studio 的账户不再启动浏览器（调度本来就不会挑它，这里兜底：不占启动名额、不等页面）
 		return nil, &accountWorkerInitError{err: errWorkerOrgDisabled}
 	}
+	if err := manager.ipPool().fixedPausedError(accountID); err != nil {
+		// 固定分配下账户的固定端口暂停使用（冷却中或被其他进程占用）：不占启动名额、不换端口，等端口恢复（名额到手后申请时再判一次）
+		return nil, &accountWorkerInitError{err: err}
+	}
 	generation := manager.pool.AuthGeneration(accountID)
 	worker, err := manager.startOrgCheckedWorker(ctx, accountID, model)
 	if err == nil {
@@ -2456,6 +2476,10 @@ func (manager *accountWorkerManager) fillWarm(ctx context.Context, first chan<- 
 		}
 		if errors.Is(result.err, errAccountWorkerOpening) {
 			openingElsewhere[result.accountID] = struct{}{}
+			return
+		}
+		// 固定分配下固定端口暂停使用：不算失败（端口恢复后不被预热失败的退避耽误）
+		if errors.Is(result.err, errProxyPoolPortPaused) {
 			return
 		}
 		failures = append(failures, fmt.Errorf("预热账户 %s: %w", result.accountID, result.err))
@@ -3688,7 +3712,7 @@ func (service *trackedService) publishModelAccessNow() {
 	for _, status := range statuses {
 		accounts = append(accounts, adminAccountDTO(status))
 	}
-	service.workers.ipPool().markPinned(accounts)
+	service.workers.ipPool().markAccounts(accounts)
 	service.workers.markExtraAccounts(accounts)
 	service.requests.publish(api.AdminEvent{Type: "accounts", Data: map[string]any{"accounts": accounts}})
 	service.requests.publish(api.AdminEvent{Type: "models", Data: map[string]any{"models": service.catalogModels()}})

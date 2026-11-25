@@ -2,12 +2,32 @@ package aistudio
 
 // ProxyBinding 为 IP 池分给账户的出口（见 app/proxy_pool.go）：URL 为上游代理（可能带账号密码，只交给网络层，
 // 不能写进日志、错误与接口；为空表示沿用默认代理），Slot 为管理页显示的端口号或会话号（为空不显示），
-// Active 表示有浏览器正在用它（静态 IP 时该端口归它独占），EgressTag 在会话号写在密码里时为会话号（出口统计据此区分）
+// Active 表示有浏览器正在用它（静态 IP 时该端口归它独占），EgressTag 在会话号写在密码里时为会话号（出口统计据此区分）。
+// Hold 为 IP 池固定分配（PROXY_POOL_FIXED）下账户的固定端口暂停使用的原因（只含端口号与固定文案）：非空时就绪账户的对外与调度状态为
+// AccountProxyPaused，不参与任何调度（选号、预热、替补、扩容、补充池、上传候选），URL 仍是固定端口（不改默认代理、不直连）；
+// 只由 IP 池在静态固定分配下推送，关闭时恒为空
 type ProxyBinding struct {
 	URL       string
 	Slot      string
 	Active    bool
 	EgressTag string
+	Hold      string
+}
+
+// holdOf 返回绑定的暂停原因（nil 为空）
+func holdOf(binding *ProxyBinding) string {
+	if binding == nil {
+		return ""
+	}
+	return binding.Hold
+}
+
+// ProxyHold 返回账户当前绑定的暂停原因（见 ProxyBinding.Hold）；没有绑定或没有暂停时为空。方法对 nil 账户安全
+func (a *Account) ProxyHold() string {
+	if a == nil {
+		return ""
+	}
+	return holdOf(a.proxyBinding.Load())
 }
 
 // EgressKey 返回绑定作为出口时的出口键：EgressKey(URL)，带 EgressTag 时追加 "#" + EgressTag（与账户池挂通道用的键相同，
@@ -70,7 +90,8 @@ func (a *Account) CurrentProxyBinding() (ProxyBinding, bool) {
 
 // SetProxyBindings 在 p.mu 内按账户 ID 写绑定（不在号池中的 ID 忽略：重建期间旧实例浏览器的归还推给新号池时，
 // 新号池可能已经没有这个账户），返回实际写入（内容有变化）的个数。出口通道在同一次加锁内随绑定重挂，有账户换了通道时唤醒等待方
-// （见 proxyBindingChangedLocked）。调用方持有 app 层 proxyPool.mu（锁序 proxyPool.mu → p.mu），本方法不回调任何外部代码
+// （见 proxyBindingChangedLocked）；暂停原因（Hold）变化时同步候选索引与状态，暂停解除时唤醒等待方。
+// 调用方持有 app 层 proxyPool.mu（锁序 proxyPool.mu → p.mu），本方法不回调任何外部代码
 func (p *AccountPool) SetProxyBindings(updates []ProxyBindingUpdate) int {
 	if p == nil || len(updates) == 0 {
 		return 0
@@ -83,9 +104,13 @@ func (p *AccountPool) SetProxyBindings(updates []ProxyBindingUpdate) int {
 		if account == nil {
 			continue
 		}
+		previous := holdOf(account.proxyBinding.Load())
 		if account.storeProxyBinding(update.Binding) {
 			written++
 			if p.proxyBindingChangedLocked(account, true) {
+				moved = true
+			}
+			if p.proxyHoldChangedLocked(account, previous) {
 				moved = true
 			}
 		}
@@ -94,6 +119,18 @@ func (p *AccountPool) SetProxyBindings(updates []ProxyBindingUpdate) int {
 		p.notifyLocked()
 	}
 	return written
+}
+
+// proxyHoldChangedLocked 在写绑定之后核对暂停原因是否变化：变化时同步候选索引、分区成员与状态缓存（accountChangedLocked；
+// 调度状态 AccountProxyPaused 由 Hold 推导），返回暂停是否解除（调用方据此唤醒在等的请求）。Hold 不变时什么也不做，
+// 固定分配关闭时 Hold 恒空，与没有这个字段时完全相同。调用方持有 p.mu
+func (p *AccountPool) proxyHoldChangedLocked(account *Account, previous string) bool {
+	current := holdOf(account.proxyBinding.Load())
+	if current == previous {
+		return false
+	}
+	p.accountChangedLocked(account)
+	return previous != "" && current == ""
 }
 
 // UpdateProxyBindings 在 p.mu 内对号池全部账户调用 compute（账户 ID 与它自己的代理原文），按返回值写绑定（nil 为清除）；
@@ -109,9 +146,13 @@ func (p *AccountPool) UpdateProxyBindings(compute func(accountID, accountProxy s
 		if account == nil {
 			continue
 		}
+		previous := holdOf(account.proxyBinding.Load())
 		if account.storeProxyBinding(compute(account.ID, account.Config.Proxy)) {
 			changed++
 			if p.proxyBindingChangedLocked(account, false) {
+				moved = true
+			}
+			if p.proxyHoldChangedLocked(account, previous) {
 				moved = true
 			}
 		}

@@ -489,6 +489,7 @@ var accountStateLabels = map[AccountState]string{
 	AccountUnavailable:  "不可用",
 	AccountDisabled:     "已停用",
 	AccountOrgDisabled:  "所属组织已停用 AI Studio",
+	AccountProxyPaused:  "IP 池端口暂停使用",
 }
 
 // AccountConfig 表示账户目录中的固定最小配置

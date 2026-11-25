@@ -82,18 +82,22 @@ func (manager *accountWorkerManager) ipPool() *proxyPool {
 
 // workerProxyLease 为一次 Worker 启动申请出口：账户有自己的代理（ownProxy）或没有 IP 池时返回 nil，不改 options；
 // IP 池分配时把 options.Proxy 改成分到的上游（只改这次启动的局部参数，accountWorker.config 不变）；IP 池关闭时为直通租约，
-// options.Proxy 仍是 PROXY。返回的租约在启动失败时 launchFailed、启动成功后 attach 到浏览器（方法对 nil 安全）
+// options.Proxy 仍是 PROXY。返回的租约在启动失败时 launchFailed、启动成功后 attach 到浏览器（方法对 nil 安全）。
+// 固定分配下账户的固定端口暂停使用时返回错误（errors.Is errProxyPoolPortPaused），options 不改，不启动浏览器
 func (manager *accountWorkerManager) workerProxyLease(
 	accountID string, label string, ownProxy bool, options *camoufoxnative.Options,
-) *proxyPoolLease {
+) (*proxyPoolLease, error) {
 	if manager == nil || manager.proxyPool == nil || ownProxy || options == nil {
-		return nil
+		return nil, nil
 	}
 	lease := manager.proxyPool.acquire(accountID, accountID, proxyPoolKindWorker, label, options.Proxy)
+	if err := lease.Refused(); err != nil {
+		return nil, err
+	}
 	if lease.Pooled() {
 		options.Proxy = lease.URL()
 	}
-	return lease
+	return lease, nil
 }
 
 // errFollowDefaultBusy 表示账户的 Worker 正在启动或关闭，这次不改为跟随默认代理

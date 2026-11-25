@@ -11,15 +11,14 @@ export interface BulkFailure {
 }
 
 // BulkTaskResult 为单个账户操作的结论：invalid 为操作做完了、但结论是否定的（批量验证的“登录失效”），message 为原因，
-// orgDisabled 为否定的原因是账号所属组织停用了 AI Studio；不返回（undefined）表示成功。操作本身出错仍以抛出错误表示（计为出错）
-export interface BulkTaskResult {
-  invalid: true
-  message: string
-  orgDisabled?: boolean
-}
+// orgDisabled 为否定的原因是账号所属组织停用了 AI Studio；skipped 为这次没有做（批量验证时账户的 IP 池固定端口暂停使用，
+// 端口恢复后再验证），不计成功也不计出错；不返回（undefined）表示成功。操作本身出错仍以抛出错误表示（计为出错）
+export type BulkTaskResult =
+  | { invalid: true; skipped?: undefined; message: string; orgDisabled?: boolean }
+  | { skipped: true; invalid?: undefined; message: string }
 
 // BulkState 描述一次批量账户操作的进度：succeeded 为成功（验证时为“有效”），invalid 为结论否定（验证时为“登录失效”），
-// failures 为操作出错
+// skipped 为跳过（验证时为固定端口暂停使用的账户），failures 为操作出错
 export interface BulkState {
   action: BulkAction | ''
   running: boolean
@@ -28,6 +27,7 @@ export interface BulkState {
   done: number
   succeeded: number
   invalid: BulkFailure[]
+  skipped: BulkFailure[]
   failures: BulkFailure[]
   active: string[]
 }
@@ -42,6 +42,7 @@ export function emptyBulkState(): BulkState {
     done: 0,
     succeeded: 0,
     invalid: [],
+    skipped: [],
     failures: [],
     active: [],
   }
@@ -67,7 +68,12 @@ export async function runBulk(
       state.active = [...state.active, account.label]
       try {
         const result = await task(account)
-        if (result?.invalid) {
+        if (result?.skipped) {
+          state.skipped = [
+            ...state.skipped,
+            { id: account.id, label: account.label, message: result.message },
+          ]
+        } else if (result?.invalid) {
           state.invalid = [
             ...state.invalid,
             {

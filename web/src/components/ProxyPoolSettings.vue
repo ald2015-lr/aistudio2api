@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// ProxyPoolSettings 设置页的 IP 池分组：模式、地址（带账号密码时掩码显示）、静态 IP 的端口段与容量提示、抽测出口、
-// 检查全部端口、实时状态与“改为跟随默认代理”。改动经 commit 通知设置页保存（与失焦保存的字段相同）：模式与地址的组合
-// 不合法时设置页不提交，错误显示在对应输入框旁
+// ProxyPoolSettings 设置页的 IP 池分组：模式、固定分配开关、地址（带账号密码时掩码显示）、静态 IP 的端口段与容量提示、抽测出口、
+// 检查全部端口、实时状态、固定分配的状态与操作（重新平均分配、给端口换 IP、恢复停用的端口）与“改为跟随默认代理”。
+// 改动经 commit 通知设置页保存（与失焦保存的字段相同）：模式与地址的组合不合法时设置页不提交，错误显示在对应输入框旁；
+// 固定分配开关（v-model:fixed）确认后改表单，由设置页自动保存
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { ApiError, api } from '@/api'
 import { trackPendingWrite } from '@/assetRecovery'
@@ -11,8 +12,11 @@ import { proxyParts } from '@/proxy'
 import {
   DEFAULT_VERIFY_CONCURRENCY,
   cloneProxyPool,
+  fixedPerPort,
   formatClock,
   proxyPoolCapacity,
+  proxyPoolFixedActive,
+  proxyPoolPauseReasonKey,
   proxyPoolPortCount,
   proxyPoolProblem,
   proxyPoolProblemKey,
@@ -21,16 +25,20 @@ import {
 import type {
   ProxyPoolConfig,
   ProxyPoolMode,
+  ProxyPoolPausedPort,
   ProxyPoolStatus,
   ProxyTestProbe,
   ProxyTestResult,
 } from '@/types'
+import HelpField from './HelpField.vue'
 import HelpText from './HelpText.vue'
 import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiSelect from './UiSelect.vue'
 
 const model = defineModel<ProxyPoolConfig>({ required: true })
+// fixed 为固定分配开关（PROXY_POOL_FIXED）；旧版服务端不返回时为 undefined，不显示开关
+const fixed = defineModel<boolean | undefined>('fixed')
 const props = defineProps<{
   status: ProxyPoolStatus | null // 状态接口的 proxy_pool：已保存并生效的设置的实时情况
   // 设置页表单里的峰值与启动并发（可能是输入到一半的值），用于估算端口需求
@@ -44,6 +52,11 @@ const props = defineProps<{
   extraCounted?: boolean
   warmConcurrency: number | string
   hasDefaultProxy: boolean
+  // poolAccounts 为走 IP 池的账户数（账户列表里没有自己代理的账户），开启固定分配前估算每个端口的账户数
+  poolAccounts?: number
+  // savedFixedMode 为已保存的设置里开启了固定分配的模式（static 为固定分配、dynamic 为固定会话；没有开启或 IP 池关闭时为空）：
+  // 切换模式会让固定分配换一种生效方式时先确认
+  savedFixedMode?: ProxyPoolMode | ''
   // serverError 为服务端拒绝表单里当前这份设置时的错误（前端组合校验查不出的地址格式问题），显示在地址框旁
   serverError?: string
 }>()
@@ -79,10 +92,25 @@ function update(patch: Partial<ProxyPoolConfig>): void {
   model.value = { ...model.value, ...patch }
 }
 
-function setMode(value: unknown): void {
+async function setMode(value: unknown): Promise<void> {
   if (value !== 'off' && value !== 'static' && value !== 'dynamic') return
   const mode: ProxyPoolMode = value
-  if (mode === model.value.mode) return
+  if (mode === model.value.mode || modeConfirming.value) return
+  // 开着固定分配切到另一种模式（动态切静态、关闭切静态等）：固定分配随之按新模式生效（静态为首次分配端口、同端口共用 IP、端口
+  // 暂停时整端口暂停），先给出与勾选开关相同的确认；取消时不切模式
+  if (fixedModeNeedsAck(mode)) {
+    modeConfirming.value = true
+    try {
+      const confirmed = await confirmAction(
+        fixedEnableMessage(mode),
+        t('settings.proxyPoolFixedEnableAction'),
+      )
+      if (!confirmed) return
+      fixedAcked.value = mode
+    } finally {
+      modeConfirming.value = false
+    }
+  }
   update({ mode })
   // 下拉框没有失焦时机：选完立即提交，组合不合法时设置页不保存，错误显示在下面
   emit('commit')
@@ -117,9 +145,22 @@ const invalid = computed(() => problem.value !== '' || (props.serverError ?? '')
 
 const urlHelp = computed(() => {
   if (model.value.mode === 'static') return t('settings.proxyPoolURLHelpStatic')
-  if (model.value.mode === 'dynamic') return t('settings.proxyPoolURLHelpDynamic')
+  if (model.value.mode === 'dynamic') {
+    // 开启固定会话时不再“连不通时换会话号”
+    return t(
+      fixed.value === true
+        ? 'settings.proxyPoolURLHelpDynamicFixed'
+        : 'settings.proxyPoolURLHelpDynamic',
+    )
+  }
   return t('settings.proxyPoolURLHelpOff')
 })
+// fixedForm 为表单里开启了固定分配（静态为固定分配、动态为固定会话）：分组标题与说明改用固定分配的口径
+const fixedForm = computed(() => fixed.value === true && model.value.mode !== 'off')
+// staticModeLabel 为模式下拉里静态 IP 的选项：开关开着时是每个账户固定一个端口，不再是每个浏览器独占
+const staticModeLabel = computed(() =>
+  t(fixed.value === true ? 'settings.proxyPoolModeStaticFixed' : 'settings.proxyPoolModeStatic'),
+)
 const urlPlaceholder = computed(() =>
   model.value.mode === 'dynamic'
     ? t('settings.proxyPoolURLPlaceholderDynamic')
@@ -166,6 +207,337 @@ const relayLow = computed(() => {
 const pinned = computed(() =>
   props.status !== null && props.status.mode !== 'off' ? props.status.pinned_default : 0,
 )
+
+// ---------- 固定分配 ----------
+
+// fixedShown 为显示固定分配开关：服务端返回了开关、IP 池没有关闭（关闭时开关保留、不生效）
+const fixedShown = computed(() => fixed.value !== undefined && model.value.mode !== 'off')
+// fixedStaticForm 为表单里是静态 IP 且开启固定分配：端口需求一行改为每端口账户数，不再提示端口少于浏览器数
+const fixedStaticForm = computed(() => fixed.value === true && model.value.mode === 'static')
+// fixedLive 为状态接口里生效中的固定分配（已保存的设置）
+const fixedLive = computed(() => proxyPoolFixedActive(props.status))
+const fixedStaticLive = computed(() => fixedLive.value?.mode === 'static')
+
+// perPortText 把每端口的最少、最多账户数显示为“4”或“4–5”
+function perPortText(min: number, max: number): string {
+  return min === max ? String(min) : `${min}–${max}`
+}
+
+// fixedCapacity 为静态固定分配下的端口与每端口账户数：表单端口段与生效的端口段相同时用状态接口的实际值，否则按账户数估算
+const fixedCapacity = computed(() => {
+  if (!fixedStaticForm.value || portCount.value <= 0) return null
+  const live = fixedLive.value
+  const status = props.status
+  if (
+    live?.mode === 'static' &&
+    status?.port_start === model.value.port_start &&
+    status?.port_end === model.value.port_end
+  ) {
+    return {
+      ports: live.ports ?? portCount.value,
+      accounts: live.accounts,
+      perPort: perPortText(live.min_per_port, live.max_per_port),
+    }
+  }
+  const accounts = props.poolAccounts ?? 0
+  const spread = fixedPerPort(accounts, portCount.value)
+  if (spread === null) return null
+  return { ports: portCount.value, accounts, perPort: perPortText(spread.min, spread.max) }
+})
+
+// fixedEnableMessage 返回在 mode 下开启固定分配的确认文案：静态按账户数与表单端口数估算每端口约几个账户（再次开启时沿用原分配表、
+// 不重新平均，文案里写明），动态为固定会话
+function fixedEnableMessage(mode: ProxyPoolMode): string {
+  if (mode === 'dynamic') return t('settings.proxyPoolFixedEnableConfirmDynamic')
+  const accounts = props.poolAccounts ?? 0
+  const spread = fixedPerPort(accounts, portCount.value) ?? { min: 0, max: 0 }
+  return tf('settings.proxyPoolFixedEnableConfirm', {
+    accounts,
+    ports: portCount.value,
+    perPort: perPortText(spread.min, spread.max),
+  })
+}
+
+// fixedAcked 为这次编辑里已经确认过开启固定分配的模式（勾选开关、切换模式时的确认）：同一模式不再重复确认
+const fixedAcked = ref<ProxyPoolMode | ''>('')
+const modeConfirming = ref(false)
+
+// fixedModeNeedsAck 判断切到 mode 时固定分配会换一种方式生效、需要先确认：开关开着、mode 不是关闭、已保存的设置里不是这种模式的
+// 固定分配，且这次编辑里还没确认过
+function fixedModeNeedsAck(mode: ProxyPoolMode): boolean {
+  return (
+    fixed.value === true &&
+    mode !== 'off' &&
+    (props.savedFixedMode ?? '') !== mode &&
+    fixedAcked.value !== mode
+  )
+}
+
+// onFixedChange 切换固定分配：先确认（开启时说明每端口约几个账户、之后不再自动换 IP），确认后才改表单（设置页随即自动保存）
+const fixedConfirming = ref(false)
+async function onFixedChange(event: Event): Promise<void> {
+  const input = event.target as HTMLInputElement
+  const next = input.checked
+  // 确认之前勾选框保持原样
+  input.checked = fixed.value === true
+  if (fixedConfirming.value || next === (fixed.value === true)) return
+  const mode = model.value.mode
+  const dynamic = mode === 'dynamic'
+  let message: string
+  if (next) {
+    message = fixedEnableMessage(mode)
+  } else {
+    message = t(
+      dynamic
+        ? 'settings.proxyPoolFixedDisableConfirmDynamic'
+        : 'settings.proxyPoolFixedDisableConfirm',
+    )
+  }
+  fixedConfirming.value = true
+  try {
+    const confirmed = await confirmAction(
+      message,
+      t(next ? 'settings.proxyPoolFixedEnableAction' : 'settings.proxyPoolFixedDisableAction'),
+    )
+    if (confirmed) {
+      fixed.value = next
+      fixedAcked.value = next ? mode : ''
+    }
+  } finally {
+    fixedConfirming.value = false
+  }
+}
+
+// droppedPortRanges 返回生效端口段 [liveStart, liveEnd] 里不在新端口段 [start, end] 内的端口（最多两段，按升序）与个数
+function droppedPortRanges(
+  liveStart: number,
+  liveEnd: number,
+  start: number,
+  end: number,
+): { ranges: [number, number][]; count: number } {
+  const ranges: [number, number][] = []
+  if (end < liveStart || start > liveEnd) {
+    ranges.push([liveStart, liveEnd])
+  } else {
+    if (start > liveStart) ranges.push([liveStart, start - 1])
+    if (end < liveEnd) ranges.push([end + 1, liveEnd])
+  }
+  return { ranges, count: ranges.reduce((sum, [from, to]) => sum + to - from + 1, 0) }
+}
+
+// commitPorts 端口段失焦时提交：静态固定分配生效中、新端口段（合法时）丢掉了生效段里的端口时先确认——这些端口上的账户会立即挪到其他
+// 端口、换 IP，改回端口段也不会回到原端口；取消时把表单恢复成生效的端口段，不提交
+const portsConfirming = ref(false)
+async function commitPorts(): Promise<void> {
+  const status = props.status
+  const live = fixedLive.value
+  if (
+    portsConfirming.value ||
+    !fixedStaticForm.value ||
+    live?.mode !== 'static' ||
+    status?.port_start === undefined ||
+    status.port_end === undefined ||
+    problem.value !== ''
+  ) {
+    if (!portsConfirming.value) emit('commit')
+    return
+  }
+  const liveStart = status.port_start
+  const liveEnd = status.port_end
+  const dropped = droppedPortRanges(liveStart, liveEnd, model.value.port_start, model.value.port_end)
+  if (dropped.count === 0) {
+    emit('commit')
+    return
+  }
+  const total = liveEnd - liveStart + 1
+  const accounts =
+    dropped.count >= total ? live.accounts : Math.round((live.accounts * dropped.count) / total)
+  const separator = locale.value.startsWith('zh') ? '、' : ', '
+  const ports = dropped.ranges
+    .map(([from, to]) => (from === to ? String(from) : `${from}–${to}`))
+    .join(separator)
+  portsConfirming.value = true
+  try {
+    const confirmed = await confirmAction(
+      tf('settings.proxyPoolFixedShrinkConfirm', { ports, accounts }),
+      t('settings.proxyPoolFixedShrinkAction'),
+    )
+    if (confirmed) {
+      emit('commit')
+    } else {
+      update({ port_start: liveStart, port_end: liveEnd })
+    }
+  } finally {
+    portsConfirming.value = false
+  }
+}
+
+// pauseReasonText 返回暂停原因的说明；不认识的原因码原样显示
+function pauseReasonText(reason: string): string {
+  const key = proxyPoolPauseReasonKey(reason)
+  return key === null ? reason : t(key)
+}
+
+// pausedUntilText 返回暂停端口的恢复时间（冷却）或下次检查时间（被其他进程占用）
+function pausedUntilText(item: ProxyPoolPausedPort): string {
+  const time = formatClock(item.until, locale.value)
+  if (time === '') return ''
+  return tf(
+    item.reason === 'locked_elsewhere'
+      ? 'settings.proxyPoolFixedPausedRecheck'
+      : 'settings.proxyPoolFixedPausedUntil',
+    { time },
+  )
+}
+
+const fixedPaused = computed(() => fixedLive.value?.paused ?? [])
+const fixedPausedMore = computed(() =>
+  Math.max(0, (fixedLive.value?.paused_ports ?? 0) - fixedPaused.value.length),
+)
+const fixedExcluded = computed(() => fixedLive.value?.excluded ?? [])
+const fixedExcludedMore = computed(() =>
+  Math.max(0, (fixedLive.value?.excluded_total ?? 0) - fixedExcluded.value.length),
+)
+// fixedInRange 判断端口在生效的端口段内（“检查全部端口”的失败端口旁显示“换 IP”）
+function fixedInRange(port: number): boolean {
+  const status = props.status
+  return (
+    status !== null &&
+    status.port_start !== undefined &&
+    status.port_end !== undefined &&
+    port >= status.port_start &&
+    port <= status.port_end
+  )
+}
+
+const fixedErrorKeys: Record<string, TranslationKey> = {
+  proxy_pool_not_fixed: 'settings.proxyPoolFixedNotFixed',
+  proxy_pool_no_target: 'settings.proxyPoolFixedNoTarget',
+  proxy_pool_port_out_of_range: 'settings.proxyPoolFixedOutOfRange',
+}
+
+// fixedErrorText 返回固定分配操作的错误：已知错误码按界面语言显示，其余显示服务端的说明
+function fixedErrorText(error: unknown): string {
+  if (error instanceof ApiError) {
+    const key = fixedErrorKeys[error.code]
+    if (key !== undefined) return t(key)
+  }
+  return errorText(error)
+}
+
+// listTargets 把挪到的端口列成一行，超过 10 个时以省略号结尾
+function listTargets(ports: number[] | undefined): string {
+  const values = (ports ?? []).slice(0, 10).map(String)
+  if ((ports?.length ?? 0) > 10) values.push('…')
+  return values.join(locale.value.startsWith('zh') ? '、' : ', ')
+}
+
+// fixedBusy 为进行中的固定分配操作（rebalance、reassign:端口、restore:端口）；同一时间只做一个
+const fixedBusy = ref('')
+
+// rebalanceFixed 重新平均分配：先只计算挪动数，确认后执行（登记为在途写操作）
+async function rebalanceFixed(): Promise<void> {
+  if (fixedBusy.value !== '') return
+  fixedBusy.value = 'rebalance'
+  try {
+    const preview = await api.rebalanceProxyPool(true)
+    if (preview.moved === 0 && preview.pruned === 0) {
+      emit(
+        'notice',
+        tf('settings.proxyPoolFixedRebalanceNone', {
+          perPort: perPortText(preview.min_per_port, preview.max_per_port),
+        }),
+        'success',
+      )
+      return
+    }
+    const confirmed = await confirmAction(
+      tf('settings.proxyPoolFixedRebalanceConfirm', {
+        moved: preview.moved,
+        running: preview.running,
+        pruned: preview.pruned,
+        accounts: preview.accounts,
+        ports: preview.ports,
+        perPort: perPortText(preview.min_per_port, preview.max_per_port),
+      }),
+      t('settings.proxyPoolFixedRebalance'),
+    )
+    if (!confirmed) return
+    const result = await trackPendingWrite(api.rebalanceProxyPool(false))
+    emit(
+      'notice',
+      tf('settings.proxyPoolFixedRebalanceDone', {
+        moved: result.moved,
+        pruned: result.pruned,
+        perPort: perPortText(result.min_per_port, result.max_per_port),
+      }),
+      'success',
+    )
+  } catch (error) {
+    emit('notice', fixedErrorText(error), 'error')
+  } finally {
+    fixedBusy.value = ''
+  }
+}
+
+// reassignFixed 给端口换 IP：先只计算挪动数与目标端口，确认后执行
+async function reassignFixed(port: number): Promise<void> {
+  if (fixedBusy.value !== '') return
+  fixedBusy.value = `reassign:${port}`
+  try {
+    const preview = await api.reassignProxyPoolPort(port, true)
+    // closing 为此刻用这个端口、执行后登记后台关闭的浏览器（含固定端口已在别处的过渡浏览器），与执行结果的 restarted 同一口径；
+    // 旧版服务没有这个字段时不写这一句
+    const closing = preview.closing ?? 0
+    const message =
+      (preview.moved === 0
+        ? tf('settings.proxyPoolFixedReassignEmpty', { port })
+        : tf('settings.proxyPoolFixedReassignConfirm', {
+            port,
+            moved: preview.moved,
+            targets: listTargets(preview.targets),
+          })) + (closing > 0 ? tf('settings.proxyPoolFixedReassignClosing', { closing }) : '')
+    const confirmed = await confirmAction(message, t('settings.proxyPoolFixedReassign'))
+    if (!confirmed) return
+    const result = await trackPendingWrite(api.reassignProxyPoolPort(port, false))
+    emit(
+      'notice',
+      tf('settings.proxyPoolFixedReassignDone', {
+        port,
+        moved: result.moved,
+        restarted: result.restarted,
+      }),
+      'success',
+    )
+  } catch (error) {
+    emit('notice', fixedErrorText(error), 'error')
+  } finally {
+    fixedBusy.value = ''
+  }
+}
+
+// restoreFixed 恢复“换 IP”后停用的端口（不挪任何账户）
+async function restoreFixed(port: number): Promise<void> {
+  if (fixedBusy.value !== '') return
+  fixedBusy.value = `restore:${port}`
+  try {
+    const result = await trackPendingWrite(api.restoreProxyPoolPort(port))
+    emit(
+      'notice',
+      tf(
+        result.restored
+          ? 'settings.proxyPoolFixedRestoreDone'
+          : 'settings.proxyPoolFixedRestoreNoop',
+        { port },
+      ),
+      'success',
+    )
+  } catch (error) {
+    emit('notice', fixedErrorText(error), 'error')
+  } finally {
+    fixedBusy.value = ''
+  }
+}
 
 // ---------- 抽测出口 ----------
 
@@ -344,22 +716,60 @@ onBeforeUnmount(clearPending)
 <template>
   <!-- 地址输入里有掩码按钮，标题不用 label 包裹，避免点说明文字时触发掩码按钮 -->
   <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
-    <legend class="sr-only">{{ t('settings.proxyPoolTitle') }}</legend>
+    <legend class="sr-only">
+      {{ fixedForm ? t('settings.proxyPoolTitleFixed') : t('settings.proxyPoolTitle') }}
+    </legend>
     <span class="mb-1 block text-sm font-medium text-gray-300">{{
-      t('settings.proxyPoolTitle')
+      fixedForm ? t('settings.proxyPoolTitleFixed') : t('settings.proxyPoolTitle')
     }}</span>
-    <HelpText class="mb-4 text-xs leading-5 text-gray-500" :text="t('settings.proxyPoolHelp')" />
+    <HelpText
+      class="mb-4 text-xs leading-5 text-gray-500"
+      :text="fixedForm ? t('settings.proxyPoolHelpFixed') : t('settings.proxyPoolHelp')"
+    />
 
     <label class="block">
       <span class="mb-1 block text-sm font-medium text-gray-400">{{
         t('settings.proxyPoolMode')
       }}</span>
-      <UiSelect :model-value="model.mode" :class="INPUT_CLASS" @update:model-value="setMode">
+      <UiSelect
+        :model-value="model.mode"
+        :class="INPUT_CLASS"
+        :disabled="modeConfirming"
+        @update:model-value="setMode"
+      >
         <option value="off">{{ t('settings.proxyPoolModeOff') }}</option>
-        <option value="static">{{ t('settings.proxyPoolModeStatic') }}</option>
+        <option value="static">{{ staticModeLabel }}</option>
         <option value="dynamic">{{ t('settings.proxyPoolModeDynamic') }}</option>
       </UiSelect>
     </label>
+
+    <HelpField v-if="fixedShown" class="mt-4">
+      <label class="flex items-start gap-3">
+        <input
+          :checked="fixed === true"
+          class="mt-0.5 h-4 w-4 shrink-0 accent-blue-500"
+          type="checkbox"
+          :disabled="fixedConfirming"
+          data-testid="proxy-pool-fixed-toggle"
+          @change="onFixedChange"
+        />
+        <span class="min-w-0">
+          <span class="block text-sm font-medium text-gray-300">{{
+            model.mode === 'dynamic'
+              ? t('settings.proxyPoolFixedDynamic')
+              : t('settings.proxyPoolFixed')
+          }}</span>
+          <HelpText
+            class="mt-1 block text-xs text-gray-500"
+            :text="
+              model.mode === 'dynamic'
+                ? t('settings.proxyPoolFixedHelpDynamic')
+                : t('settings.proxyPoolFixedHelpStatic')
+            "
+          />
+        </span>
+      </label>
+    </HelpField>
 
     <div class="mt-4">
       <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -393,7 +803,8 @@ onBeforeUnmount(clearPending)
             min="1"
             max="65535"
             required
-            @change="emit('commit')"
+            data-testid="proxy-pool-port-start"
+            @change="commitPorts"
           />
         </label>
         <label class="block">
@@ -407,12 +818,20 @@ onBeforeUnmount(clearPending)
             min="1"
             max="65535"
             required
-            @change="emit('commit')"
+            data-testid="proxy-pool-port-end"
+            @change="commitPorts"
           />
         </label>
       </div>
       <HelpText class="mt-2 block text-xs text-gray-500" :text="t('settings.proxyPoolPortsHelp')" />
-      <template v-if="capacityShown && capacity !== null">
+      <span
+        v-if="fixedCapacity !== null"
+        class="mt-2 block text-xs text-gray-400"
+        data-testid="proxy-pool-fixed-capacity"
+      >
+        {{ tf('settings.proxyPoolFixedCapacity', fixedCapacity) }}
+      </span>
+      <template v-else-if="capacityShown && capacity !== null">
         <span class="mt-2 block text-xs text-gray-400">
           {{
             tf(capacityKey, {
@@ -447,7 +866,11 @@ onBeforeUnmount(clearPending)
     <HelpText
       v-if="model.mode !== 'off' && hasDefaultProxy"
       class="mt-3 text-xs leading-5 text-gray-500"
-      :text="t('settings.proxyPoolDefaultProxyHint')"
+      :text="
+        fixedStaticForm
+          ? t('settings.proxyPoolFixedDefaultProxyHint')
+          : t('settings.proxyPoolDefaultProxyHint')
+      "
     />
     <HelpText
       class="mt-3 text-xs leading-5 text-gray-500"
@@ -565,6 +988,17 @@ onBeforeUnmount(clearPending)
               <li v-for="failure in check.failed" :key="failure.port" class="break-words">
                 <span class="font-mono">{{ failure.port }}</span
                 >：{{ failure.error }}
+                <button
+                  v-if="fixedStaticLive && fixedInRange(failure.port)"
+                  v-tooltip="t('settings.proxyPoolFixedReassignHelp')"
+                  class="btn btn-sm ml-2"
+                  type="button"
+                  :disabled="fixedBusy !== ''"
+                  :aria-busy="fixedBusy === `reassign:${failure.port}`"
+                  @click="reassignFixed(failure.port)"
+                >
+                  {{ t('settings.proxyPoolFixedReassign') }}
+                </button>
               </li>
             </ul>
           </div>
@@ -596,7 +1030,7 @@ onBeforeUnmount(clearPending)
           })
         }}
       </div>
-      <div v-if="status.mode === 'static'" class="text-gray-500">
+      <div v-if="status.mode === 'static' && !fixedStaticLive" class="text-gray-500">
         {{
           tf('settings.proxyPoolAffinity', {
             hits: status.affinity_hits,
@@ -610,7 +1044,7 @@ onBeforeUnmount(clearPending)
       <div v-if="status.stale > 0">
         {{ tf('settings.proxyPoolStale', { count: status.stale }) }}
       </div>
-      <div v-if="status.external > 0" class="text-yellow-400">
+      <div v-if="status.external > 0 && !fixedStaticLive" class="text-yellow-400">
         {{ tf('settings.proxyPoolExternal', { count: status.external }) }}
       </div>
       <div v-if="status.orphaned > 0" class="text-yellow-400">
@@ -618,6 +1052,140 @@ onBeforeUnmount(clearPending)
       </div>
       <div v-if="relayLow" class="text-yellow-400">
         {{ tf('settings.proxyPoolRelayLimit', { limit: status.relay_limit ?? 0 }) }}
+      </div>
+
+      <!-- 固定分配（已保存并生效的设置）：统计、暂停与停用的端口、重新平均分配 -->
+      <div
+        v-if="fixedLive !== null && fixedLive.mode === 'static'"
+        class="mt-3 space-y-1 border-t border-[#30363d] pt-3"
+        data-testid="proxy-pool-fixed-status"
+      >
+        <div class="text-gray-300">
+          {{
+            tf('settings.proxyPoolFixedStatus', {
+              ports: fixedLive.ports ?? 0,
+              accounts: fixedLive.accounts,
+              perPort: perPortText(fixedLive.min_per_port, fixedLive.max_per_port),
+            })
+          }}<template v-if="(fixedLive.empty ?? 0) > 0">
+            · {{ tf('settings.proxyPoolFixedEmpty', { count: fixedLive.empty ?? 0 }) }}</template
+          ><template v-if="(fixedLive.reserved ?? 0) > 0">
+            · {{ tf('settings.proxyPoolFixedReserved', { count: fixedLive.reserved ?? 0 }) }}</template
+          >
+        </div>
+        <div v-if="(fixedLive.transitional ?? 0) > 0" class="text-blue-300">
+          {{ tf('settings.proxyPoolFixedTransitional', { count: fixedLive.transitional ?? 0 }) }}
+        </div>
+        <div v-if="(fixedLive.unassigned ?? 0) > 0" class="text-yellow-400">
+          {{ tf('settings.proxyPoolFixedUnassigned', { count: fixedLive.unassigned ?? 0 }) }}
+        </div>
+        <div v-if="(fixedLive.stray ?? 0) > 0" class="text-yellow-400">
+          {{ tf('settings.proxyPoolFixedStray', { count: fixedLive.stray ?? 0 }) }}
+        </div>
+        <div v-if="(fixedLive.external_ports ?? 0) > 0" class="text-yellow-400">
+          {{ tf('settings.proxyPoolFixedExternal', { count: fixedLive.external_ports ?? 0 }) }}
+        </div>
+
+        <div
+          v-if="fixedLive.paused_ports > 0"
+          class="mt-2 rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-amber-200"
+          role="note"
+          data-testid="proxy-pool-fixed-paused"
+        >
+          <div class="leading-5">
+            {{
+              tf('settings.proxyPoolFixedPaused', {
+                ports: fixedLive.paused_ports,
+                accounts: fixedLive.paused_accounts,
+              })
+            }}
+          </div>
+          <ul class="mt-1 max-h-48 space-y-1 overflow-auto">
+            <li
+              v-for="item in fixedPaused"
+              :key="item.port"
+              class="flex flex-wrap items-center gap-x-2 gap-y-1"
+            >
+              <span class="font-mono text-gray-100">{{ item.port }}</span>
+              <span class="min-w-0 break-words">{{ pauseReasonText(item.reason) }}</span>
+              <span v-if="pausedUntilText(item) !== ''" class="text-amber-300/80">{{
+                pausedUntilText(item)
+              }}</span>
+              <span class="text-amber-300/80">{{
+                tf('settings.proxyPoolFixedPausedAccounts', { count: item.accounts })
+              }}</span>
+              <button
+                v-tooltip="t('settings.proxyPoolFixedReassignHelp')"
+                class="btn btn-sm"
+                type="button"
+                :disabled="fixedBusy !== ''"
+                :aria-busy="fixedBusy === `reassign:${item.port}`"
+                @click="reassignFixed(item.port)"
+              >
+                {{ t('settings.proxyPoolFixedReassign') }}
+              </button>
+            </li>
+          </ul>
+          <div v-if="fixedPausedMore > 0" class="mt-1 text-amber-300/80">
+            {{ tf('settings.proxyPoolFixedListMore', { count: fixedPausedMore }) }}
+          </div>
+        </div>
+
+        <div v-if="fixedExcluded.length > 0" class="mt-2" data-testid="proxy-pool-fixed-excluded">
+          <div>
+            {{
+              tf('settings.proxyPoolFixedExcluded', {
+                count: fixedLive.excluded_total ?? fixedExcluded.length,
+              })
+            }}
+          </div>
+          <ul class="mt-1 flex max-h-32 flex-wrap gap-2 overflow-auto">
+            <li
+              v-for="port in fixedExcluded"
+              :key="port"
+              class="flex items-center gap-1 rounded border border-[#30363d] px-2 py-0.5"
+            >
+              <span class="font-mono text-gray-300">{{ port }}</span>
+              <button
+                class="btn btn-sm"
+                type="button"
+                :disabled="fixedBusy !== ''"
+                :aria-busy="fixedBusy === `restore:${port}`"
+                @click="restoreFixed(port)"
+              >
+                {{ t('settings.proxyPoolFixedRestore') }}
+              </button>
+            </li>
+          </ul>
+          <div v-if="fixedExcludedMore > 0" class="mt-1 text-gray-500">
+            {{ tf('settings.proxyPoolFixedListMore', { count: fixedExcludedMore }) }}
+          </div>
+        </div>
+
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            class="btn btn-sm"
+            type="button"
+            :disabled="fixedBusy !== ''"
+            :aria-busy="fixedBusy === 'rebalance'"
+            data-testid="proxy-pool-fixed-rebalance"
+            @click="rebalanceFixed"
+          >
+            <UiIcon v-if="fixedBusy === 'rebalance'" name="spinner" :size="12" />
+            {{ t('settings.proxyPoolFixedRebalance') }}
+          </button>
+        </div>
+        <HelpText
+          class="block text-xs text-gray-500"
+          :text="t('settings.proxyPoolFixedRebalanceHint')"
+        />
+      </div>
+      <div
+        v-else-if="fixedLive !== null && fixedLive.mode === 'dynamic'"
+        class="text-gray-300"
+        data-testid="proxy-pool-fixed-status"
+      >
+        {{ tf('settings.proxyPoolFixedDynamicStatus', { accounts: fixedLive.accounts }) }}
       </div>
     </div>
 

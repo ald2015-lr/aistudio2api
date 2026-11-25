@@ -79,6 +79,11 @@ func (service *trackedService) relaxProxyPort(cooling proxyPoolCooling) {
 		}
 	}
 	restarted, unregistered := 0, 0
+	source := workerResetProxyPort
+	if cooling.Fixed {
+		// 固定分配：cooling.Workers 只有不在固定端口上的过渡 Worker，关掉后下次启动回到它们自己的固定端口
+		source = workerResetProxyFixed
+	}
 	if service.workers != nil {
 		ipPool := service.workers.ipPool()
 		for _, accountID := range cooling.Workers {
@@ -89,7 +94,7 @@ func (service *trackedService) relaxProxyPort(cooling proxyPoolCooling) {
 			if !service.workers.hasWorker(accountID) || !ipPool.servesOnPort(accountID, cooling.Port) {
 				continue
 			}
-			pending, _ := service.workers.scheduleWorkerReset(accountID, generation, nil, workerResetProxyPort)
+			pending, _ := service.workers.scheduleWorkerReset(accountID, generation, nil, source)
 			if workerResetRegistered(pending) {
 				restarted++
 			} else {
@@ -107,6 +112,13 @@ func (service *trackedService) relaxProxyPort(cooling proxyPoolCooling) {
 	skipped := ""
 	if unregistered > 0 {
 		skipped = fmt.Sprintf(" | 未登记=%d", unregistered)
+	}
+	if cooling.Fixed {
+		service.requests.logDurable("service", "INFO", fmt.Sprintf(
+			"IP 池端口冷却：固定分配不换端口，这个端口上的账户暂停使用到恢复 | 端口=%d | 规则=%s | 撤回账号=%d | 撤回坏号=%d | 失败=%d | 关闭过渡 Worker=%d%s | 耗时=%s",
+			cooling.Port, rule, relaxed, pardoned, failed, restarted, skipped, time.Since(startedAt).Round(time.Millisecond),
+		))
+		return
 	}
 	service.requests.logDurable("service", "INFO", fmt.Sprintf(
 		"IP 池端口冷却：撤回逐级冷却并换端口重启 Worker | 端口=%d | 规则=%s | 撤回账号=%d | 撤回坏号=%d | 失败=%d | 重启 Worker=%d%s | 耗时=%s",

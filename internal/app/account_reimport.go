@@ -153,7 +153,10 @@ func (admin *runtimeAdmin) reimportChromeAccount(ctx context.Context, root strin
 	if !ok {
 		return api.AdminAccount{}, accountOperationError(fmt.Errorf("%w: %s", aistudio.ErrAccountNotFound, target.accountID))
 	}
-	proxy, lease := admin.browserProxy(status.ID, status.ID, proxyPoolKindImport, status.Label, status.Proxy)
+	proxy, lease, err := admin.browserProxy(status.ID, status.ID, proxyPoolKindImport, status.Label, status.Proxy)
+	if err != nil {
+		return api.AdminAccount{}, err
+	}
 	imported, err := chromeImport(ctx, chromeauth.ImportOptions{ChromeRoot: root, Proxy: proxy, AccountIDs: []string{target.chromeID}})
 	lease.release()
 	if err != nil {
