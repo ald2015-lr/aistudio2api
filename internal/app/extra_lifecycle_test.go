@@ -1062,7 +1062,14 @@ func TestExtraUnschedulableReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	env.service.keepWarmPass(env.ctx, time.Now())
-	if !waitUntil(5*time.Second, func() bool { return env.workerOf(partitionNormalA) == nil }) {
+	// 淘汰循环在后台关闭 Worker，“WAA Worker 释放”在关闭之后才写（带关闭后的补充池计数，见 finishRelease）：
+	// 等到释放行出现再核对，只等 Worker 被移除时释放行可能还没写
+	if !waitUntil(5*time.Second, func() bool {
+		return countFrom(env.requests, partitionNormalA, "WAA Worker 释放 | 原因=需要登录") > 0
+	}) {
+		t.Fatalf("需要登录的补充池 Worker 应经不可调度释放关闭：%q", logsFrom(env.requests, partitionNormalA))
+	}
+	if env.workerOf(partitionNormalA) != nil {
 		t.Fatal("需要登录的补充池 Worker 应被释放")
 	}
 	if countFrom(env.requests, partitionNormalA, "WAA Worker 停止", "起因=不可调度释放") != 1 ||

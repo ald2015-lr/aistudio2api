@@ -4295,6 +4295,8 @@ func (service *trackedService) acquireLease(
 		if err := ctx.Err(); err != nil {
 			return nil, progress.queueEnded(err)
 		}
+		// 首轮预热状态在已就绪 Worker 的快照之前读（见 firstWarmSnapshotNow），下面判断要不要等首轮预热时用它
+		firstWarmPending := service.workers.firstWarmSnapshotNow()
 		warm := service.workers.ReadyWarmAccountIDs()
 		active := service.workers.WarmAccountIDs()
 		ext.begin(warm)
@@ -4416,7 +4418,7 @@ func (service *trackedService) acquireLease(
 		// （号池跨分区时，只能由已出结果分区的账户服务的请求不被别的分区的首轮挡住）。该分区有 Worker 就绪或首轮已没有进行中的启动时
 		// 清除并唤醒，之后照常选号；等待受请求期限与排队预算约束（主用模型与等后台扩容一样按现场冷启动抵扣，见 leaseWaitBudget.wait）。
 		// 只用已启动 Worker 的选号不等，也不另发起后台扩容，按额度 429 后没有已启动的 Worker 立即返回
-		if !fixedAccount && len(groups.StandbyReady) > 0 && service.workers.firstWarmBlocks(selection.Pool, warm, groups.StandbyReady) {
+		if !fixedAccount && len(groups.StandbyReady) > 0 && service.workers.firstWarmBlocks(selection.Pool, firstWarmPending, warm, groups.StandbyReady) {
 			if warmOnly {
 				return nil, &noImmediateLeaseError{reason: primaryQuotaReasonNoWarm}
 			}

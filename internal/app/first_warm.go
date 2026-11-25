@@ -14,7 +14,8 @@ import (
 //     分类失败、槽位已满、冷启动被出口闸门暂停、冷启动名额被排在前面的分区占满）时同样清除；首轮结束时全部清除。
 //     清除时唤醒排队的请求（notifyScheduling）；
 //   - 不固定账户的选号在请求号池里没有已就绪的 Worker、要冷启动的备用账号有落在首轮预热还没出结果的分区时，
-//     等它的第一个 Worker（acquireLease 的 waitReasonFirstWarm），不另起冷启动；备用账号都在已出结果的分区时不等（firstWarmBlocks）；
+//     等它的第一个 Worker（acquireLease 的 waitReasonFirstWarm），不另起冷启动；备用账号都在已出结果的分区时不等（firstWarmBlocks）。
+//     每一轮选号先读首轮状态、再取已就绪 Worker 的快照（firstWarmSnapshotNow），不会看到两者从未同时成立的组合；
 //     只有首轮置位，keepWarm 之后的补齐不置位
 
 // firstWarmState 为各分区的首轮预热状态，按号池下标；非分区下标不用
@@ -55,12 +56,40 @@ func (manager *accountWorkerManager) firstWarmPendingIn(scope aistudio.PoolScope
 	return pending
 }
 
+// firstWarmSnapshot 为某一时刻各分区的首轮预热状态，按号池下标，为真表示还没出结果；非分区下标恒为假
+type firstWarmSnapshot [aistudio.PoolScopeCount]bool
+
+// firstWarmSnapshotNow 读各分区此刻的首轮预热状态。选号每一轮先读它、再取已就绪 Worker 的快照（见 acquireLease）：
+// 分区因第一个 Worker 就绪而清除首轮状态，发生在这个 Worker 发布（activateAccountWorker）之后，所以先读到“已出结果”时，
+// 随后取的快照里有这个 Worker，除非它在这之间已被关闭或不再处于 Ready/Busy（那时它本就用不上，照常选号、现场冷启动是对的）。顺序反过来时，两次读取之间 Worker 就绪并清除首轮状态，这一轮看到的是“号池里没有就绪的 Worker、
+// 首轮也已出结果”，两者从未同时成立：请求不再等，现场冷启动另一个备用账号（刚就绪的账户已是热 Worker，提升时排在冷账户之后），
+// 例如首轮里刚启动失败过的账户，而不是用刚就绪的 Worker。读到“还没出结果”而 Worker 其实已就绪时只是多一次等待复查
+// （Worker 就绪与清除首轮状态都发调度信号，排队的请求随即复查）
+func (manager *accountWorkerManager) firstWarmSnapshotNow() firstWarmSnapshot {
+	var snapshot firstWarmSnapshot
+	for _, partition := range workerPartitions {
+		snapshot[partition] = manager.firstWarm.pending[partition].Load()
+	}
+	return snapshot
+}
+
+// anyIn 判断号池 scope 包含的分区里有首轮预热还没出结果的
+func (snapshot firstWarmSnapshot) anyIn(scope aistudio.PoolScope) bool {
+	for _, partition := range workerPartitions {
+		if scope.Contains(partition) && snapshot[partition] {
+			return true
+		}
+	}
+	return false
+}
+
 // firstWarmBlocks 判断号池 scope 的选号是否要等首轮预热：standby（这次要冷启动的备用账号，已去掉坏号、受限出口上与正在启动的账户）
 // 里有账户落在首轮预热还没出结果的分区，且 warm（已就绪的 Worker）里没有属于 scope 的。号池跨分区（ULTRA_EXCLUSIVE=false 的普通路径）
 // 时只看备用账号所在的分区：备用账号都在已出结果的分区（例如只有 Ultra 账户能服务的模型、Ultra 分区已出结果，普通分区还在首轮）时不等，
-// 照常现场冷启动；有备用账号落在待定分区时仍等，不在那个分区另起冷启动。只在号池里有分区待定时才读分区成员
-func (manager *accountWorkerManager) firstWarmBlocks(scope aistudio.PoolScope, warm, standby []string) bool {
-	if len(manager.firstWarmPendingIn(scope)) == 0 {
+// 照常现场冷启动；有备用账号落在待定分区时仍等，不在那个分区另起冷启动。只在号池里有分区待定时才读分区成员。
+// pending 为取 warm 之前读的首轮状态（firstWarmSnapshotNow），不在这里现读：现读的状态可能比 warm 新（见 firstWarmSnapshotNow）
+func (manager *accountWorkerManager) firstWarmBlocks(scope aistudio.PoolScope, pending firstWarmSnapshot, warm, standby []string) bool {
+	if !pending.anyIn(scope) {
 		return false
 	}
 	members := manager.pool.PartitionMembers()
@@ -70,7 +99,7 @@ func (manager *accountWorkerManager) firstWarmBlocks(scope aistudio.PoolScope, w
 		}
 	}
 	for _, accountID := range standby {
-		if partition := partitionOf(accountID, members); scope.Contains(partition) && manager.firstWarm.pending[partition].Load() {
+		if partition := partitionOf(accountID, members); scope.Contains(partition) && pending[partition] {
 			return true
 		}
 	}
