@@ -9,6 +9,7 @@ import {
   cloneProxyPool,
   drainLimitFor,
   formatClock,
+  isAutoReplaceLimit,
   proxyPoolProblem,
   proxyPoolProblemKey,
 } from '@/proxyPool'
@@ -102,6 +103,7 @@ type EditableKey =
   | 'downgrade_guard'
   | 'proxy_pool'
   | 'proxy_pool_fixed'
+  | 'proxy_pool_fixed_auto_replace'
   | 'media_output'
   | 'media_base_url'
   | 'media_retention'
@@ -159,6 +161,7 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
   'downgrade_guard',
   'proxy_pool',
   'proxy_pool_fixed',
+  'proxy_pool_fixed_auto_replace',
   'media_output',
   'media_base_url',
   'media_retention',
@@ -170,7 +173,8 @@ const EDITABLE_KEYS: readonly EditableKey[] = [
 // IP 池的模式、地址与端口段要组合合法才能保存（例如先选静态 IP、再填地址），同样只在失焦或选完模式时提交；
 // 媒体链接地址、保存期限与总量上限输入到一半时不合法（例如期限只写了 7、地址只写了 https://），同样失焦时保存；
 // 额度用完改用其他模型的规则输入到一半时也不合法（例如只写了 gemini-4-argon=），同样失焦时保存；
-// 权益规则的模型输入到一半（例如 gemini-4-car）会让规则暂时不匹配原来的模型、放开它，同样失焦时保存
+// 权益规则的模型输入到一半（例如 gemini-4-car）会让规则暂时不匹配原来的模型、放开它，同样失焦时保存；
+// 坏 IP 自动换的上限（IP 池分组里）输入到一半可能越界，同样失焦或回车时提交
 const BLUR_KEYS: readonly EditableKey[] = [
   'auth_states',
   'listen_addr',
@@ -183,6 +187,7 @@ const BLUR_KEYS: readonly EditableKey[] = [
   'model_fallbacks',
   'ultra_only_models',
   'paid_only_models',
+  'proxy_pool_fixed_auto_replace',
 ]
 const AUTO_KEYS: readonly EditableKey[] = EDITABLE_KEYS.filter((key) => !BLUR_KEYS.includes(key))
 
@@ -694,6 +699,13 @@ function validate(value: ServiceConfig): string {
   for (const [number, key] of numbers) {
     if (!isPositiveInteger(number)) return tf('settings.invalidNumber', { field: label(key) })
   }
+  // 坏 IP 自动换的上限：0 到 5000 的整数（旧版服务端不返回时没有这一项）
+  if (
+    value.proxy_pool_fixed_auto_replace !== undefined &&
+    !isAutoReplaceLimit(value.proxy_pool_fixed_auto_replace)
+  ) {
+    return t('settings.invalidProxyPoolAutoReplace')
+  }
   // 单账号每分钟上限可以为 0（关闭），最大 1000
   const rpm = value.account_rpm_limit
   if (typeof rpm !== 'number' || !Number.isInteger(rpm) || rpm < 0 || rpm > 1000) {
@@ -888,11 +900,20 @@ function payload(includeBlurFields: boolean): ServiceConfig {
   if (!includeBlurFields) {
     return { ...form, ...Object.fromEntries(BLUR_KEYS.map((key) => [key, base[key]])) }
   }
+  const value: ServiceConfig = { ...form }
   // IP 池组合还不合法（例如选了静态 IP、地址还空着）时沿用已保存的值，其余失焦字段照常保存；错误只显示在 IP 池输入框旁
   if (proxyPoolInvalid(form) !== '' && base.proxy_pool !== undefined) {
-    return { ...form, proxy_pool: base.proxy_pool }
+    value.proxy_pool = base.proxy_pool
   }
-  return { ...form }
+  // 坏 IP 自动换的上限不合法时同样沿用已保存的值（错误显示在输入框旁）
+  if (
+    value.proxy_pool_fixed_auto_replace !== undefined &&
+    !isAutoReplaceLimit(value.proxy_pool_fixed_auto_replace)
+  ) {
+    if (base.proxy_pool_fixed_auto_replace === undefined) delete value.proxy_pool_fixed_auto_replace
+    else value.proxy_pool_fixed_auto_replace = base.proxy_pool_fixed_auto_replace
+  }
+  return value
 }
 
 function cancelCountdown(): void {
@@ -1160,6 +1181,8 @@ watch(
       else delete form.proxy_pool
       // 固定分配开关同样：旧版服务端不返回时不显示开关、保存时不提交
       if (config.proxy_pool_fixed === undefined) delete form.proxy_pool_fixed
+      // 坏 IP 自动换的上限同样：旧版服务端不返回时不显示输入框、保存时不提交（服务端沿用现值）
+      if (config.proxy_pool_fixed_auto_replace === undefined) delete form.proxy_pool_fixed_auto_replace
     }
     savedConfig.value = config
   },
@@ -1359,6 +1382,7 @@ onBeforeUnmount(() => {
         v-if="form.proxy_pool !== undefined"
         v-model="proxyPoolForm"
         v-model:fixed="form.proxy_pool_fixed"
+        v-model:auto-replace="form.proxy_pool_fixed_auto_replace"
         :status="proxyPoolStatus"
         :pool-accounts="poolAccounts ?? 0"
         :saved-fixed-mode="savedFixedMode"

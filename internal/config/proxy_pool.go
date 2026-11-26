@@ -58,8 +58,9 @@ type ProxyPool struct {
 	PortStart int `json:"port_start"`
 	PortEnd   int `json:"port_end"`
 	// Fixed 为固定分配（PROXY_POOL_FIXED，默认 false）：static 时每个走 IP 池的账户固定一个端口，按账户数平均分到端口段的端口上
-	// （同一端口的账户共用这个 IP、可以同时开浏览器），之后重启、更新与热更新其他设置都不变；端口冷却或被其他进程占用时这个端口上的
-	// 账户暂停使用、等它恢复，不换端口、不走默认代理、不直连。dynamic 时每个账户一直用它的会话号，不再自动换会话。off 时不生效
+	// （同一端口的账户共用这个 IP、可以同时开浏览器），之后重启、更新与热更新其他设置都不变；端口冷却时少数自动换 IP（见
+	// Config.ProxyPoolFixedAutoReplace，为 0 时同原来），被其他进程占用、或冷却却没有自动换时这个端口上的账户暂停使用、等它恢复，不走
+	// 默认代理、不直连。dynamic 时每个账户一直用它的会话号，会话连不通时少数自动换会话（同一设置，为 0 时不再自动换会话）。off 时不生效
 	// （分配表保留，再开启时沿用）。普通 bool：测试按值比较整个结构；omitempty 让关闭时 JSON 与原来逐字节一致
 	Fixed bool `json:"fixed,omitempty"`
 }
@@ -385,6 +386,26 @@ func (p ProxyPool) envValues() map[string]string {
 		"PROXY_POOL_PORT_END":   strconv.Itoa(p.PortEnd),
 		"PROXY_POOL_FIXED":      strconv.FormatBool(p.Fixed),
 	}
+}
+
+// errProxyPoolFixedAutoReplace 为 PROXY_POOL_FIXED_AUTO_REPLACE 写错的固定文案（不回显输入）
+var errProxyPoolFixedAutoReplace = fmt.Errorf("PROXY_POOL_FIXED_AUTO_REPLACE 必须是 0 到 %d 的整数", MaxProxyPoolFixedAutoReplace)
+
+// parseProxyPoolFixedAutoReplace 解析坏 IP 自动换的上限：0 到 MaxProxyPoolFixedAutoReplace 的整数
+func parseProxyPoolFixedAutoReplace(value string) (int, error) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || parsed < 0 || parsed > MaxProxyPoolFixedAutoReplace {
+		return 0, errProxyPoolFixedAutoReplace
+	}
+	return parsed, nil
+}
+
+// validateProxyPoolFixedAutoReplace 校验坏 IP 自动换的上限（管理页保存经 Validate 拦下）
+func validateProxyPoolFixedAutoReplace(limit int) error {
+	if limit < 0 || limit > MaxProxyPoolFixedAutoReplace {
+		return errProxyPoolFixedAutoReplace
+	}
+	return nil
 }
 
 // parsePortValue 解析 1 到 65535 的端口号

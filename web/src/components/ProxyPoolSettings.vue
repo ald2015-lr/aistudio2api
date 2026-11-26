@@ -1,6 +1,7 @@
 <script setup lang="ts">
-// ProxyPoolSettings 设置页的 IP 池分组：模式、固定分配开关、地址（带账号密码时掩码显示）、静态 IP 的端口段与容量提示、抽测出口、
-// 检查全部端口、实时状态、固定分配的状态与操作（重新平均分配、给端口换 IP、恢复停用的端口）与“改为跟随默认代理”。
+// ProxyPoolSettings 设置页的 IP 池分组：模式、固定分配开关与坏 IP 自动换的上限、地址（带账号密码时掩码显示）、静态 IP 的端口段与容量提示、
+// 抽测出口、检查全部端口、实时状态、固定分配的状态与操作（重新平均分配、给端口换 IP、恢复停用的端口、自动换过的端口、坏 IP 过多停止自动换时
+// 的醒目提示与“恢复自动换”、固定会话下会话连不通的账户与“换会话”）与“改为跟随默认代理”。
 // 改动经 commit 通知设置页保存（与失焦保存的字段相同）：模式与地址的组合不合法时设置页不提交，错误显示在对应输入框旁；
 // 固定分配开关（v-model:fixed）确认后改表单，由设置页自动保存
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
@@ -14,6 +15,8 @@ import {
   cloneProxyPool,
   fixedPerPort,
   formatClock,
+  isAutoReplaceLimit,
+  proxyPoolAutoTagKey,
   proxyPoolCapacity,
   proxyPoolFixedActive,
   proxyPoolPauseReasonKey,
@@ -23,6 +26,7 @@ import {
   slotLabel,
 } from '@/proxyPool'
 import type {
+  ProxyPoolAutoReplaced,
   ProxyPoolConfig,
   ProxyPoolMode,
   ProxyPoolPausedPort,
@@ -39,6 +43,8 @@ import UiSelect from './UiSelect.vue'
 const model = defineModel<ProxyPoolConfig>({ required: true })
 // fixed 为固定分配开关（PROXY_POOL_FIXED）；旧版服务端不返回时为 undefined，不显示开关
 const fixed = defineModel<boolean | undefined>('fixed')
+// autoReplace 为坏 IP 自动换的上限（PROXY_POOL_FIXED_AUTO_REPLACE，0 为不自动换）；旧版服务端不返回时为 undefined，不显示输入框
+const autoReplace = defineModel<number | undefined>('autoReplace')
 const props = defineProps<{
   status: ProxyPoolStatus | null // 状态接口的 proxy_pool：已保存并生效的设置的实时情况
   // 设置页表单里的峰值与启动并发（可能是输入到一半的值），用于估算端口需求
@@ -394,10 +400,97 @@ const fixedPaused = computed(() => fixedLive.value?.paused ?? [])
 const fixedPausedMore = computed(() =>
   Math.max(0, (fixedLive.value?.paused_ports ?? 0) - fixedPaused.value.length),
 )
+// 自动换过的端口单独列出（带时间、原因与挪走的账户数）；有 auto 时服务端的 excluded 已不含它们（自动换过的超过 50 个时也不会把手动停用的
+// 挤出列表），excluded_total 仍为全部停用端口数，“停用的端口”的计数为两者之差
+const fixedAuto = computed(() => fixedLive.value?.auto ?? null)
+const autoReplacedList = computed<ProxyPoolAutoReplaced[]>(() => fixedAuto.value?.replaced ?? [])
+const autoReplacedTotal = computed(() => fixedAuto.value?.replaced_total ?? autoReplacedList.value.length)
+const autoReplacedMore = computed(() => Math.max(0, autoReplacedTotal.value - autoReplacedList.value.length))
 const fixedExcluded = computed(() => fixedLive.value?.excluded ?? [])
-const fixedExcludedMore = computed(() =>
-  Math.max(0, (fixedLive.value?.excluded_total ?? 0) - fixedExcluded.value.length),
+const fixedExcludedTotal = computed(() =>
+  Math.max(0, (fixedLive.value?.excluded_total ?? 0) - autoReplacedTotal.value),
 )
+const fixedExcludedMore = computed(() =>
+  Math.max(0, fixedExcludedTotal.value - fixedExcluded.value.length),
+)
+const autoStuck = computed(() => fixedAuto.value?.stuck ?? [])
+const autoStuckMore = computed(() =>
+  Math.max(0, (fixedAuto.value?.stuck_total ?? autoStuck.value.length) - autoStuck.value.length),
+)
+
+// autoTagText 返回暂停端口没有自动换的原因标签（已停止自动换 / 没有可挪的端口），没有时为空
+function autoTagText(item: ProxyPoolPausedPort): string {
+  const key = proxyPoolAutoTagKey(item.auto)
+  return key === null ? '' : t(key)
+}
+
+// autoRuleText 返回自动换过的端口的冷却原因
+function autoRuleText(rule: string): string {
+  if (rule === 'rate_limited') return t('settings.proxyPoolAutoRuleRateLimited')
+  if (rule === 'upstream') return t('settings.proxyPoolAutoRuleUpstream')
+  return rule
+}
+
+// autoHaltedDetail 返回停止自动换的说明：停止时间、停止时的计数、上限或原因（静态下能用的端口会不到一半；换过的新 IP、新会话又坏了；坏掉的账户
+// 超过一半），停止之后又坏的个数大于 0 时附在后面（skipped 不含触发停止的那一个）
+const autoHaltedDetail = computed(() => {
+  const auto = fixedAuto.value
+  if (auto === null || !auto.halted) return ''
+  const dynamic = fixedLive.value?.mode === 'dynamic'
+  let key: TranslationKey = 'settings.proxyPoolAutoHaltedDetail'
+  if (dynamic) {
+    key = 'settings.proxyPoolAutoHaltedDetailDynamic'
+    if (auto.halted_reason === 'chain') key = 'settings.proxyPoolAutoHaltedDetailDynamicChain'
+    else if (auto.halted_reason === 'accounts') key = 'settings.proxyPoolAutoHaltedDetailDynamicAccounts'
+  } else if (auto.halted_reason === 'half') key = 'settings.proxyPoolAutoHaltedDetailHalf'
+  else if (auto.halted_reason === 'chain') key = 'settings.proxyPoolAutoHaltedDetailChain'
+  else if (auto.halted_reason === 'accounts') key = 'settings.proxyPoolAutoHaltedDetailAccounts'
+  let detail = tf(key, {
+    time: formatClock(auto.halted_at, locale.value),
+    count: auto.halted_count ?? 0,
+    limit: auto.limit,
+  })
+  const skipped = auto.skipped ?? 0
+  if (skipped > 0) {
+    detail +=
+      (locale.value.startsWith('zh') ? '' : ' ') +
+      tf(
+        dynamic ? 'settings.proxyPoolAutoHaltedSkippedDynamic' : 'settings.proxyPoolAutoHaltedSkipped',
+        { skipped },
+      )
+  }
+  return detail
+})
+
+// ---------- 坏 IP 自动换的上限 ----------
+
+// autoReplaceShown 为显示上限输入框：服务端返回了这一项、固定分配（或固定会话）开关开着
+const autoReplaceShown = computed(
+  () => fixedShown.value && fixed.value === true && autoReplace.value !== undefined,
+)
+// autoReplaceText 为输入框里的文字（输入到一半时可能不合法）；表单值变化（保存后同步、旧值回填）时跟着变
+const autoReplaceText = ref('')
+watch(
+  autoReplace,
+  (value) => {
+    autoReplaceText.value = value === undefined ? '' : String(value)
+  },
+  { immediate: true },
+)
+const autoReplaceError = computed(() => {
+  const text = autoReplaceText.value.trim()
+  return text !== '' && /^\d+$/.test(text) && isAutoReplaceLimit(Number(text))
+    ? ''
+    : t('settings.invalidProxyPoolAutoReplace')
+})
+
+// commitAutoReplace 输入框失焦或回车时提交：不合法时只显示红字、不改表单（设置页不保存）
+function commitAutoReplace(): void {
+  if (autoReplaceError.value !== '') return
+  const value = Number(autoReplaceText.value.trim())
+  if (value !== autoReplace.value) autoReplace.value = value
+  emit('commit')
+}
 // fixedInRange 判断端口在生效的端口段内（“检查全部端口”的失败端口旁显示“换 IP”）
 function fixedInRange(port: number): boolean {
   const status = props.status
@@ -414,6 +507,8 @@ const fixedErrorKeys: Record<string, TranslationKey> = {
   proxy_pool_not_fixed: 'settings.proxyPoolFixedNotFixed',
   proxy_pool_no_target: 'settings.proxyPoolFixedNoTarget',
   proxy_pool_port_out_of_range: 'settings.proxyPoolFixedOutOfRange',
+  proxy_pool_not_fixed_dynamic: 'settings.proxyPoolAutoNotDynamic',
+  proxy_pool_account_not_pooled: 'settings.proxyPoolAutoNotPooled',
 }
 
 // fixedErrorText 返回固定分配操作的错误：已知错误码按界面语言显示，其余显示服务端的说明
@@ -432,7 +527,7 @@ function listTargets(ports: number[] | undefined): string {
   return values.join(locale.value.startsWith('zh') ? '、' : ', ')
 }
 
-// fixedBusy 为进行中的固定分配操作（rebalance、reassign:端口、restore:端口）；同一时间只做一个
+// fixedBusy 为进行中的固定分配操作（rebalance、reassign:端口、restore:端口、resume、rotate:账户）；同一时间只做一个
 const fixedBusy = ref('')
 
 // rebalanceFixed 重新平均分配：先只计算挪动数，确认后执行（登记为在途写操作）
@@ -532,6 +627,51 @@ async function restoreFixed(port: number): Promise<void> {
       ),
       'success',
     )
+  } catch (error) {
+    emit('notice', fixedErrorText(error), 'error')
+  } finally {
+    fixedBusy.value = ''
+  }
+}
+
+// resumeAuto 恢复自动换（坏 IP 或坏会话过多停止之后）：确认后执行，30 分钟计数从 0 开始
+async function resumeAuto(): Promise<void> {
+  if (fixedBusy.value !== '') return
+  const dynamic = fixedLive.value?.mode === 'dynamic'
+  const confirmed = await confirmAction(
+    t(dynamic ? 'settings.proxyPoolAutoResumeConfirmDynamic' : 'settings.proxyPoolAutoResumeConfirm'),
+    t(dynamic ? 'settings.proxyPoolAutoResumeDynamic' : 'settings.proxyPoolAutoResume'),
+  )
+  if (!confirmed) return
+  fixedBusy.value = 'resume'
+  try {
+    const result = await trackPendingWrite(api.resumeProxyPoolAuto())
+    emit(
+      'notice',
+      result.resumed
+        ? t('settings.proxyPoolAutoResumeDone')
+        : t('settings.proxyPoolAutoResumeNoop'),
+      'success',
+    )
+  } catch (error) {
+    emit('notice', fixedErrorText(error), 'error')
+  } finally {
+    fixedBusy.value = ''
+  }
+}
+
+// rotateSession 固定会话下给会话连不通的账户换会话：确认后执行，用旧会话的浏览器在进行中的请求结束后关闭
+async function rotateSession(accountId: string): Promise<void> {
+  if (fixedBusy.value !== '') return
+  const confirmed = await confirmAction(
+    tf('settings.proxyPoolAutoRotateConfirm', { account: accountId }),
+    t('settings.proxyPoolAutoRotate'),
+  )
+  if (!confirmed) return
+  fixedBusy.value = `rotate:${accountId}`
+  try {
+    const result = await trackPendingWrite(api.rotateProxyPoolSession(accountId))
+    emit('notice', tf('settings.proxyPoolAutoRotateDone', { from: result.from, to: result.to }), 'success')
   } catch (error) {
     emit('notice', fixedErrorText(error), 'error')
   } finally {
@@ -714,8 +854,12 @@ onBeforeUnmount(clearPending)
 </script>
 
 <template>
-  <!-- 地址输入里有掩码按钮，标题不用 label 包裹，避免点说明文字时触发掩码按钮 -->
-  <fieldset class="block rounded-lg border border-[#30363d] bg-[#161b22] p-4">
+  <!-- 地址输入里有掩码按钮，标题不用 label 包裹，避免点说明文字时触发掩码按钮；min-w-0：fieldset 默认最小宽度为内容宽度，
+       窄屏上模式下拉框的长文字会把整个分组撑出屏幕（坏 IP 过多的醒目提示也被截掉） -->
+  <fieldset
+    class="block min-w-0 rounded-lg border border-[#30363d] bg-[#161b22] p-4"
+    data-testid="settings-proxy-pool"
+  >
     <legend class="sr-only">
       {{ fixedForm ? t('settings.proxyPoolTitleFixed') : t('settings.proxyPoolTitle') }}
     </legend>
@@ -770,6 +914,36 @@ onBeforeUnmount(clearPending)
         </span>
       </label>
     </HelpField>
+
+    <label v-if="autoReplaceShown" class="mt-4 block" data-testid="proxy-pool-auto-replace">
+      <span class="mb-1 block text-sm font-medium text-gray-400">{{
+        model.mode === 'dynamic'
+          ? t('settings.proxyPoolAutoReplaceDynamic')
+          : t('settings.proxyPoolAutoReplace')
+      }}</span>
+      <input
+        v-model="autoReplaceText"
+        :class="INPUT_CLASS"
+        class="max-w-[12rem]"
+        type="text"
+        inputmode="numeric"
+        :aria-invalid="autoReplaceError !== ''"
+        data-testid="proxy-pool-auto-replace-input"
+        @change="commitAutoReplace"
+        @keydown.enter.prevent="commitAutoReplace"
+      />
+      <p v-if="autoReplaceError !== ''" class="mt-1 text-xs text-red-400" role="alert">
+        {{ autoReplaceError }}
+      </p>
+      <HelpText
+        class="mt-1 block text-xs text-gray-500"
+        :text="
+          model.mode === 'dynamic'
+            ? t('settings.proxyPoolAutoReplaceHelpDynamic')
+            : t('settings.proxyPoolAutoReplaceHelp')
+        "
+      />
+    </label>
 
     <div class="mt-4">
       <span class="mb-1 block text-sm font-medium text-gray-400">{{
@@ -1085,6 +1259,31 @@ onBeforeUnmount(clearPending)
         <div v-if="(fixedLive.external_ports ?? 0) > 0" class="text-yellow-400">
           {{ tf('settings.proxyPoolFixedExternal', { count: fixedLive.external_ports ?? 0 }) }}
         </div>
+        <div v-if="fixedAuto !== null" class="text-gray-300" data-testid="proxy-pool-fixed-auto">
+          {{
+            tf('settings.proxyPoolAutoStatus', { limit: fixedAuto.limit, recent: fixedAuto.recent })
+          }}
+        </div>
+        <div
+          v-if="fixedAuto !== null && fixedAuto.halted"
+          class="mt-2 rounded border border-red-500/50 bg-red-500/10 px-3 py-2 text-red-200"
+          role="alert"
+          data-testid="proxy-pool-fixed-auto-halted"
+        >
+          <div class="font-bold">{{ t('settings.proxyPoolAutoHaltedTitle') }}</div>
+          <div class="mt-1 leading-5">{{ autoHaltedDetail }}</div>
+          <button
+            class="btn btn-sm mt-2"
+            type="button"
+            :disabled="fixedBusy !== ''"
+            :aria-busy="fixedBusy === 'resume'"
+            data-testid="proxy-pool-fixed-auto-resume"
+            @click="resumeAuto"
+          >
+            <UiIcon v-if="fixedBusy === 'resume'" name="spinner" :size="12" />
+            {{ t('settings.proxyPoolAutoResume') }}
+          </button>
+        </div>
 
         <div
           v-if="fixedLive.paused_ports > 0"
@@ -1114,6 +1313,11 @@ onBeforeUnmount(clearPending)
               <span class="text-amber-300/80">{{
                 tf('settings.proxyPoolFixedPausedAccounts', { count: item.accounts })
               }}</span>
+              <span
+                v-if="autoTagText(item) !== ''"
+                class="rounded border border-red-400/40 px-1.5 text-[11px] text-red-200"
+                >{{ autoTagText(item) }}</span
+              >
               <button
                 v-tooltip="t('settings.proxyPoolFixedReassignHelp')"
                 class="btn btn-sm"
@@ -1131,15 +1335,55 @@ onBeforeUnmount(clearPending)
           </div>
         </div>
 
-        <div v-if="fixedExcluded.length > 0" class="mt-2" data-testid="proxy-pool-fixed-excluded">
+        <div
+          v-if="autoReplacedList.length > 0"
+          class="mt-2"
+          data-testid="proxy-pool-fixed-auto-replaced"
+        >
+          <div>{{ tf('settings.proxyPoolAutoReplaced', { count: autoReplacedTotal }) }}</div>
+          <ul class="mt-1 max-h-40 space-y-1 overflow-auto">
+            <li
+              v-for="item in autoReplacedList"
+              :key="item.port"
+              class="flex flex-wrap items-center gap-x-2 gap-y-1"
+            >
+              <span class="font-mono text-gray-300">{{ item.port }}</span>
+              <span class="min-w-0 break-words text-gray-400">{{
+                tf('settings.proxyPoolAutoReplacedItem', {
+                  time: formatClock(item.at, locale),
+                  rule: autoRuleText(item.rule),
+                  moved: item.moved,
+                })
+              }}</span>
+              <button
+                class="btn btn-sm"
+                type="button"
+                :disabled="fixedBusy !== ''"
+                :aria-busy="fixedBusy === `restore:${item.port}`"
+                @click="restoreFixed(item.port)"
+              >
+                {{ t('settings.proxyPoolFixedRestore') }}
+              </button>
+            </li>
+          </ul>
+          <div v-if="autoReplacedMore > 0" class="mt-1 text-gray-500">
+            {{ tf('settings.proxyPoolFixedListMore', { count: autoReplacedMore }) }}
+          </div>
+        </div>
+
+        <div
+          v-if="fixedExcludedTotal > 0 || fixedExcluded.length > 0"
+          class="mt-2"
+          data-testid="proxy-pool-fixed-excluded"
+        >
           <div>
             {{
               tf('settings.proxyPoolFixedExcluded', {
-                count: fixedLive.excluded_total ?? fixedExcluded.length,
+                count: fixedExcludedTotal || fixedExcluded.length,
               })
             }}
           </div>
-          <ul class="mt-1 flex max-h-32 flex-wrap gap-2 overflow-auto">
+          <ul v-if="fixedExcluded.length > 0" class="mt-1 flex max-h-32 flex-wrap gap-2 overflow-auto">
             <li
               v-for="port in fixedExcluded"
               :key="port"
@@ -1182,10 +1426,72 @@ onBeforeUnmount(clearPending)
       </div>
       <div
         v-else-if="fixedLive !== null && fixedLive.mode === 'dynamic'"
-        class="text-gray-300"
+        class="space-y-1"
         data-testid="proxy-pool-fixed-status"
       >
-        {{ tf('settings.proxyPoolFixedDynamicStatus', { accounts: fixedLive.accounts }) }}
+        <div class="text-gray-300">
+          {{ tf('settings.proxyPoolFixedDynamicStatus', { accounts: fixedLive.accounts }) }}
+        </div>
+        <div v-if="fixedAuto !== null" class="text-gray-300" data-testid="proxy-pool-fixed-auto">
+          {{
+            tf('settings.proxyPoolAutoStatusDynamic', {
+              limit: fixedAuto.limit,
+              recent: fixedAuto.recent,
+            })
+          }}
+        </div>
+        <div
+          v-if="fixedAuto !== null && fixedAuto.halted"
+          class="mt-2 rounded border border-red-500/50 bg-red-500/10 px-3 py-2 text-red-200"
+          role="alert"
+          data-testid="proxy-pool-fixed-auto-halted"
+        >
+          <div class="font-bold">{{ t('settings.proxyPoolAutoHaltedTitleDynamic') }}</div>
+          <div class="mt-1 leading-5">{{ autoHaltedDetail }}</div>
+          <button
+            class="btn btn-sm mt-2"
+            type="button"
+            :disabled="fixedBusy !== ''"
+            :aria-busy="fixedBusy === 'resume'"
+            data-testid="proxy-pool-fixed-auto-resume"
+            @click="resumeAuto"
+          >
+            <UiIcon v-if="fixedBusy === 'resume'" name="spinner" :size="12" />
+            {{ t('settings.proxyPoolAutoResumeDynamic') }}
+          </button>
+        </div>
+        <div v-if="autoStuck.length > 0" class="mt-2" data-testid="proxy-pool-fixed-auto-stuck">
+          <div>
+            {{ tf('settings.proxyPoolAutoStuck', { count: fixedAuto?.stuck_total ?? autoStuck.length }) }}
+          </div>
+          <ul class="mt-1 max-h-48 space-y-1 overflow-auto">
+            <li
+              v-for="item in autoStuck"
+              :key="item.account_id"
+              class="flex flex-wrap items-center gap-x-2 gap-y-1"
+            >
+              <span class="min-w-0 break-all text-gray-200">{{ item.account_id }}</span>
+              <span class="font-mono text-gray-400">{{
+                tf('settings.proxyPoolAutoStuckSince', {
+                  session: item.session,
+                  time: formatClock(item.since, locale),
+                })
+              }}</span>
+              <button
+                class="btn btn-sm"
+                type="button"
+                :disabled="fixedBusy !== ''"
+                :aria-busy="fixedBusy === `rotate:${item.account_id}`"
+                @click="rotateSession(item.account_id)"
+              >
+                {{ t('settings.proxyPoolAutoRotate') }}
+              </button>
+            </li>
+          </ul>
+          <div v-if="autoStuckMore > 0" class="mt-1 text-gray-500">
+            {{ tf('settings.proxyPoolFixedListMore', { count: autoStuckMore }) }}
+          </div>
+        </div>
       </div>
     </div>
 

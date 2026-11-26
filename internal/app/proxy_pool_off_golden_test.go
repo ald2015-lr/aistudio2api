@@ -218,11 +218,20 @@ func runProxyPoolOffScenario(t *testing.T) []byte {
 // runProxyPoolOffScenarioIn 与 runProxyPoolOffScenario 相同，seed 不为 nil 时在建 IP 池之前往 runtime 目录里放文件（休眠的固定表）
 func runProxyPoolOffScenarioIn(t *testing.T, seed func(dir string)) []byte {
 	t.Helper()
+	return runProxyPoolOffScenarioWith(t, seed, nil)
+}
+
+// runProxyPoolOffScenarioWith 与 runProxyPoolOffScenarioIn 相同，setup 不为 nil 时在建好 IP 池、第一次 configure 之前调用（如设置坏 IP 自动换的上限）
+func runProxyPoolOffScenarioWith(t *testing.T, seed func(dir string), setup func(pool *proxyPool)) []byte {
+	t.Helper()
 	dir := t.TempDir()
 	if seed != nil {
 		seed(dir)
 	}
 	env := newProxyPoolGoldenEnv(t, dir)
+	if setup != nil {
+		setup(env.pool)
+	}
 	pool, clock, locks := env.pool, env.clock, env.locks
 	const own = "http://203.0.113.50:3128"
 	ids := []string{"a@example.com", "b@example.com", "c@example.com", "d@example.com", "e@example.com"}
@@ -482,5 +491,9 @@ func TestProxyPoolOffGolden(t *testing.T) {
 	}
 	if string(want) != string(got) {
 		t.Fatalf("与金样不同：%s", goldenDiff(want, got))
+	}
+	// 坏 IP 自动换的上限为 10 时关闭固定分配的场景不变（只在固定分配开启时有意义）
+	if auto := runProxyPoolOffScenarioWith(t, nil, func(pool *proxyPool) { pool.setFixedAutoReplace(10) }); string(auto) != string(want) {
+		t.Fatalf("上限 10 时与金样不同：%s", goldenDiff(want, auto))
 	}
 }

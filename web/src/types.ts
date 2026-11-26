@@ -637,13 +637,67 @@ export interface ProxyPoolPausedPort {
   reason: ProxyPoolPauseReason | string
   until?: string
   accounts: number
+  // auto 为这个端口为什么没有自动换 IP（PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时才有）：halted 为坏 IP 过多、已停止自动换，
+  // no_target 为当时没有可挪的端口；旧版服务端不返回
+  auto?: 'halted' | 'no_target' | string
+}
+
+// ProxyPoolAutoReplaced 为自动换过 IP、仍停用的端口：rule 为 upstream（连续出口连不通）或 rate_limited（不同账号返回限流），moved 为挪走的账户数
+export interface ProxyPoolAutoReplaced {
+  port: number
+  at: string
+  rule: 'upstream' | 'rate_limited' | string
+  moved: number
+}
+
+// ProxyPoolStuckSession 为动态固定会话下会话连不通、没有自动换的账户（只有账户 ID 与会话号）
+export interface ProxyPoolStuckSession {
+  account_id: string
+  session: string
+  since: string
+}
+
+// ProxyPoolFixedAuto 为坏 IP 自动换（静态）或坏会话自动换（动态）的状态：limit 为设置值，window_minutes 为计数窗口，recent 为窗口内坏掉的端口
+// 或会话数，halted 为坏得太多已停止自动换（halted_at 为停止时刻，halted_count 为停止时窗口内的个数，halted_reason 为 limit（超过上限）、half
+// （静态：再自动换的话端口段里能用的端口会不到一半）、chain（换过的新 IP 或新会话 30 分钟内又坏了）或 accounts（30 分钟内 IP 或会话坏掉的账户
+// 超过一半），skipped 为停止之后又坏、按暂停处理的个数，不含触发停止的那一个），replaced 为自动换过、
+// 仍停用的端口（最多 50 个，replaced_total 为总数），stuck 为动态下会话连不通、没有自动换的账户（最多 50 个，stuck_total 为总数）
+export interface ProxyPoolFixedAuto {
+  limit: number
+  window_minutes: number
+  recent: number
+  halted: boolean
+  halted_at?: string
+  halted_count?: number
+  halted_reason?: 'limit' | 'half' | 'chain' | 'accounts'
+  skipped?: number
+  replaced?: ProxyPoolAutoReplaced[]
+  replaced_total?: number
+  stuck?: ProxyPoolStuckSession[]
+  stuck_total?: number
+}
+
+// ProxyPoolFixedAutoResumeResult 为“恢复自动换”的结果：resumed 为假时本来就没有停止，skipped 为停止之后又坏、仍暂停的个数（不含触发停止的那一个）
+export interface ProxyPoolFixedAutoResumeResult {
+  resumed: boolean
+  halted_at?: string
+  skipped: number
+}
+
+// ProxyPoolFixedRotateResult 为动态固定会话下手动换会话的结果：from、to 为换前与换后的会话号，restarted 为登记了后台关闭的 Worker 数
+export interface ProxyPoolFixedRotateResult {
+  account_id: string
+  from: string
+  to: string
+  restarted: number
 }
 
 // ProxyPoolFixedStatus 为 IP 池固定分配（PROXY_POOL_FIXED=true）的状态，模式为 static 或 dynamic（不含地址）。静态：ports 为参与分配的端口数
 // （端口段内、没有停用的），accounts 为分配表里的账户数，min_per_port / max_per_port 为参与分配的端口上的最少 / 最多账户数，empty 为没有
 // 账户的端口，stray 为分配表里已不在账户池的账户（保留位置），unassigned 为走 IP 池却没有分到端口的账户（正常为 0），reserved 为登录、
 // 导入中预留的位置，transitional 为运行中、还不在固定端口上的 Worker，external_ports 为有固定账户、同时被账户固定代理或 PROXY 指向的端口，
-// excluded 为“换 IP”后停用的端口（最多 50 个，excluded_total 为总数），paused_ports / paused_accounts 为暂停使用的端口与其上的账户数，
+// excluded 为“换 IP”后停用的端口（最多 50 个；有 auto 时不含自动换过的端口，它们在 auto.replaced 里），excluded_total 为停用端口总数（含自动换
+// 过的），paused_ports / paused_accounts 为暂停使用的端口与其上的账户数，
 // paused 为暂停的端口（最多 50 个，按恢复时间）。动态：accounts 为走 IP 池的账户数，其余为 0
 export interface ProxyPoolFixedStatus {
   mode: 'static' | 'dynamic'
@@ -663,6 +717,8 @@ export interface ProxyPoolFixedStatus {
   paused_ports: number
   paused_accounts: number
   paused?: ProxyPoolPausedPort[]
+  // auto 为坏 IP 自动换的状态：PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时才有；旧版服务端不返回
+  auto?: ProxyPoolFixedAuto
 }
 
 // ProxyPoolStatus 为 IP 池的实时状态（不含账号密码）：
@@ -1053,8 +1109,13 @@ export interface ServiceConfig {
   // proxy_pool 为 IP 池设置；旧版服务端不返回，此时设置页不显示 IP 池分组，保存时也不提交（服务端沿用现值）
   proxy_pool?: ProxyPoolConfig
   // proxy_pool_fixed 为 IP 池固定分配（PROXY_POOL_FIXED，默认关闭，保存后立即生效）：静态 IP 时每个走 IP 池的账户固定一个端口、按账户数
-  // 平均分到端口段的端口上，之后不自动改变；动态 IP 时不再自动换会话。旧版服务端不返回，此时不显示开关、保存时也不提交（服务端沿用现值）
+  // 平均分到端口段的端口上，之后不自动改变（端口冷却时少数自动换 IP，见 proxy_pool_fixed_auto_replace，为 0 时同原来）；动态 IP 时每个账户
+  // 一直用它的会话号（会话连不通时少数自动换会话，同一设置，为 0 时不再自动换会话）。旧版服务端不返回，此时不显示开关、保存时也不提交
+  // （服务端沿用现值）
   proxy_pool_fixed?: boolean
+  // proxy_pool_fixed_auto_replace 为固定分配下 30 分钟内最多自动换几个坏 IP（动态固定会话下为坏会话）（PROXY_POOL_FIXED_AUTO_REPLACE，默认 10，
+  // 0 到 5000，0 为不自动换，保存后立即生效）。旧版服务端不返回，此时不显示输入框、保存时也不提交（服务端沿用现值）
+  proxy_pool_fixed_auto_replace?: number
   // media_output 为生成媒体的输出方式：inline 内联 data URI（Gemini 原生接口为 inlineData），url 保存到 runtime/media/ 并以本服务
   // /media/<文件名> 链接引用；media_base_url 为链接使用的服务地址（为空时按请求地址）；media_retention 为保存期限（7d、72h，0 不清理），
   // media_max_size 为媒体目录总量上限（20GB、500MB，0 不限）。服务端总是返回这几个字段，保存后立即生效

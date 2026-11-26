@@ -55,10 +55,11 @@ type poolLaunchRecorder struct {
 	proxies       map[string][]string
 	closeFailures map[string]int
 	fail          func(ctx context.Context, accountID string) error
+	closed        map[string][]func() int // 每个启动成功的 stub Worker 报告成功关闭次数的函数
 }
 
 func newPoolLaunchRecorder() *poolLaunchRecorder {
-	return &poolLaunchRecorder{proxies: make(map[string][]string), closeFailures: make(map[string]int)}
+	return &poolLaunchRecorder{proxies: make(map[string][]string), closeFailures: make(map[string]int), closed: make(map[string][]func() int)}
 }
 
 func (recorder *poolLaunchRecorder) launch(ctx context.Context, accountID string, options camoufoxnative.Options) (*aistudio.NativeWorker, error) {
@@ -72,8 +73,23 @@ func (recorder *poolLaunchRecorder) launch(ctx context.Context, accountID string
 			return nil, err
 		}
 	}
-	worker, _ := aistudio.NewStubWorker(accountID, failures)
+	worker, closed := aistudio.NewStubWorker(accountID, failures)
+	recorder.mu.Lock()
+	recorder.closed[accountID] = append(recorder.closed[accountID], closed)
+	recorder.mu.Unlock()
 	return worker, nil
+}
+
+// closes 返回账户全部 stub Worker 成功关闭的次数之和
+func (recorder *poolLaunchRecorder) closes(accountID string) int {
+	recorder.mu.Lock()
+	counters := slices.Clone(recorder.closed[accountID])
+	recorder.mu.Unlock()
+	total := 0
+	for _, closed := range counters {
+		total += closed()
+	}
+	return total
 }
 
 func (recorder *poolLaunchRecorder) last(accountID string) string {

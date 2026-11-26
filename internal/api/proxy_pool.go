@@ -54,8 +54,9 @@ type AdminProxyPool struct {
 // （端口段内、没有停用的），Accounts 为分配表里的账户数，MinPerPort / MaxPerPort 为参与分配的端口上的最少 / 最多账户数，Empty 为没有账户的
 // 端口，Stray 为分配表里已不在账户池的账户（保留位置，服务停止时不算），Unassigned 为走 IP 池却没有分到端口的账户（正常为 0），Reserved 为
 // 登录、导入中预留的位置，Transitional 为运行中、还不在固定端口上的 Worker（关闭后改用固定端口），ExternalPorts 为有固定账户、同时被账户
-// 固定代理或 PROXY 指向的端口，Excluded 为“换 IP”后停用的端口（最多 50 个，ExcludedTotal 为总数），PausedPorts / PausedAccounts 为暂停使用的
-// 端口与其上的账户数，Paused 为暂停的端口（最多 50 个，按恢复时间、端口）。动态：Accounts 为走 IP 池的账户数，其余为 0
+// 固定代理或 PROXY 指向的端口，Excluded 为“换 IP”后停用的端口（升序，最多 50 个；有 Auto 时不含自动换过的端口，它们列在 Auto.Replaced 里），
+// ExcludedTotal 为停用端口总数（含自动换过的），PausedPorts / PausedAccounts 为暂停使用的端口与其上的账户数，Paused 为暂停的端口（最多 50 个，按
+// 恢复时间、端口）。动态：Accounts 为走 IP 池的账户数，其余为 0
 type AdminProxyPoolFixed struct {
 	Mode           string                     `json:"mode"`
 	Since          time.Time                  `json:"since,omitzero"`
@@ -74,6 +75,45 @@ type AdminProxyPoolFixed struct {
 	PausedPorts    int                        `json:"paused_ports"`
 	PausedAccounts int                        `json:"paused_accounts"`
 	Paused         []AdminProxyPoolPausedPort `json:"paused,omitempty"`
+	// Auto 为坏 IP 自动换的状态：PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时才有（为 0 时状态与没有这项设置时相同）
+	Auto *AdminProxyPoolFixedAuto `json:"auto,omitempty"`
+}
+
+// AdminProxyPoolFixedAuto 为固定分配下自动换坏 IP（静态）或坏会话（动态）的状态：Limit 为设置值，WindowMinutes 为计数窗口，Recent 为窗口内坏掉的
+// 端口或会话数（含没有换的；同一端口、同一会话只算一个，账户换了会话后新会话再坏另算一个），Halted 为坏得太多已停止自动换（HaltedAt 为停止时刻，
+// HaltedCount 为停止时窗口内的个数，HaltedReason 为 limit（窗口内超过上限）、half（静态：再自动换的话端口段里能用的端口会不到一半）、chain（换过的
+// 新 IP 或新会话 30 分钟内又坏了）或 accounts（30 分钟内 IP 或会话坏掉的账户超过走 IP 池的账户的一半），Skipped 为停止之后又坏、按暂停处理的个数，
+// 不含触发停止的那一个），Replaced 为自动换过、仍停用的端口（最多 50 个，新到旧；ReplacedTotal 为总数），Stuck 为
+// 动态下会话连不通、没有自动换的账户（最多 50 个，按开始时间；StuckTotal 为总数）。只有端口号、会话号、账户 ID、计数与时间
+type AdminProxyPoolFixedAuto struct {
+	Limit         int                          `json:"limit"`
+	WindowMinutes int                          `json:"window_minutes"`
+	Recent        int                          `json:"recent"`
+	Halted        bool                         `json:"halted"`
+	HaltedAt      time.Time                    `json:"halted_at,omitzero"`
+	HaltedCount   int                          `json:"halted_count,omitempty"`
+	HaltedReason  string                       `json:"halted_reason,omitempty"`
+	Skipped       int                          `json:"skipped,omitempty"`
+	Replaced      []AdminProxyPoolAutoReplaced `json:"replaced,omitempty"`
+	ReplacedTotal int                          `json:"replaced_total,omitempty"`
+	Stuck         []AdminProxyPoolStuckSession `json:"stuck,omitempty"`
+	StuckTotal    int                          `json:"stuck_total,omitempty"`
+}
+
+// AdminProxyPoolAutoReplaced 为自动换过 IP、仍停用的端口：Rule 为 upstream（连续出口连不通）或 rate_limited（不同账号返回限流），Moved 为挪走的
+// 账户数
+type AdminProxyPoolAutoReplaced struct {
+	Port  int       `json:"port"`
+	At    time.Time `json:"at"`
+	Rule  string    `json:"rule"`
+	Moved int       `json:"moved"`
+}
+
+// AdminProxyPoolStuckSession 为动态固定会话下会话连不通、没有自动换的账户（只有账户 ID 与会话号）
+type AdminProxyPoolStuckSession struct {
+	AccountID string    `json:"account_id"`
+	Session   string    `json:"session"`
+	Since     time.Time `json:"since"`
 }
 
 // AdminProxyPoolPausedPort 为固定分配下暂停使用的端口：Reason 为 cooling_upstream（连续出口连不通的冷却）、cooling_rate_limited
@@ -84,6 +124,9 @@ type AdminProxyPoolPausedPort struct {
 	Reason   string    `json:"reason"`
 	Until    time.Time `json:"until,omitzero"`
 	Accounts int       `json:"accounts"`
+	// Auto 为这个端口为什么没有自动换 IP（只在 PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时有）：halted 为坏 IP 过多、已停止自动换，
+	// no_target 为当时没有可挪的端口（其余端口都暂停或停用）
+	Auto string `json:"auto,omitempty"`
 }
 
 // AdminProxyPoolPort 为冷却中的端口：Level 为冷却档位（第 n 档 15 分钟 × 2^(n-1)，最长 2 小时）

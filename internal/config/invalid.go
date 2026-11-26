@@ -41,7 +41,7 @@ var secretConfigKeys = map[string]bool{
 // 请求、页面交互或是否对外发请求）
 var fatalConfigKeys = map[string]bool{
 	"PROXY": true, "PROXY_POOL_MODE": true, "PROXY_POOL_URL": true, "PROXY_POOL_PORT_START": true, "PROXY_POOL_PORT_END": true,
-	"PROXY_POOL_FIXED": true, "WAA_BACKEND": true, "UPSTREAM_CHANNELS": true, "TEMPORARY_CHAT": true, "AUTO_START": true,
+	"PROXY_POOL_FIXED": true, "PROXY_POOL_FIXED_AUTO_REPLACE": true, "WAA_BACKEND": true, "UPSTREAM_CHANNELS": true, "TEMPORARY_CHAT": true, "AUTO_START": true,
 }
 
 // maxInvalidValueRunes 为记录的原值长度上限
@@ -452,6 +452,8 @@ var configChecks = []configCheck{
 	{keys: []string{"DOWNGRADE_MAX_HOLD_MS"}, check: func(c Config) error { return c.DowngradeGuard.validateMaxHold() }},
 	{keys: []string{"PROXY_POOL_MODE", "PROXY_POOL_URL", "PROXY_POOL_PORT_START", "PROXY_POOL_PORT_END", "PROXY_POOL_FIXED"}, fatal: true,
 		check: func(c Config) error { return c.ProxyPool.Validate() }},
+	{keys: []string{"PROXY_POOL_FIXED_AUTO_REPLACE"}, fatal: true,
+		check: func(c Config) error { return validateProxyPoolFixedAutoReplace(c.ProxyPoolFixedAutoReplace) }},
 	{keys: []string{"MEDIA_OUTPUT"}, check: func(c Config) error { return c.Media.validateOutput() }},
 	{keys: []string{"MEDIA_BASE_URL"}, check: func(c Config) error { return c.Media.validateBaseURL() }},
 	{keys: []string{"MEDIA_RETENTION"}, check: func(c Config) error { return c.Media.validateRetention() }},

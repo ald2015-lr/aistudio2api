@@ -222,7 +222,8 @@ func liveFieldsEqual(saved config.Config, active config.Config) bool {
 		slices.Equal(saved.UltraOnlyModels, active.UltraOnlyModels) && slices.Equal(saved.PaidOnlyModels, active.PaidOnlyModels) &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
-		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
+		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media) &&
+		saved.ProxyPoolFixedAutoReplace == active.ProxyPoolFixedAutoReplace
 }
 
 // applyLiveConfig 读取已保存配置，把可热更新的字段直接应用到当前生成服务，不中断任何请求
@@ -362,6 +363,11 @@ func (manager *runtimeManager) applyLiveFields() (admin *runtimeAdmin, saved con
 		admin.workers.notifyScheduling()
 	}
 
+	// 坏 IP 自动换的上限（PROXY_POOL_FIXED_AUTO_REPLACE）先于 configure 设置；改小不回溯（已自动换过的不撤回），熔断不随设置改变
+	if manager.proxyPool.setFixedAutoReplace(saved.ProxyPoolFixedAutoReplace) {
+		manager.requests.log("service", "INFO", fmt.Sprintf(
+			"IP 池自动换坏 IP 设置已更新并立即生效 | 30 分钟内最多自动换=%d 个（PROXY_POOL_FIXED_AUTO_REPLACE，0 为不自动换）", saved.ProxyPoolFixedAutoReplace))
+	}
 	// IP 池（进程级）在 manager.mu 外、liveConfigMu 内应用：每次热更新都调用，峰值、Ultra 与 Pro 峰值、PRO_POOL 与启动并发的变化同样要重新判断端口够不够。
 	// 运行中的 Worker 不受影响，新启动的 Worker 立即按新设置；没有浏览器的账户立即切到新的默认出口
 	manager.proxyPool.configure(saved.ProxyPool, saved.Proxy, proxyPoolCapacity(saved, admin.pool.PartitionMembers().Count(aistudio.PoolScopePro) > 0))

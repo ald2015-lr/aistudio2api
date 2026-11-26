@@ -1285,7 +1285,7 @@ const zhCN = {
   'settings.proxyPoolHelp':
     '没有自己代理的账户改用 IP 池出网。静态 IP：端口段里每个端口是一个固定 IP，每个运行中的浏览器（Worker、登录、验证）独占一个端口，账号尽量回到上次用过的端口；动态 IP：地址里的 {session} 按账户换成固定会话号，一个会话号一个粘性 IP。优先级：账户自己的代理 > IP 池 > 默认代理。“一个账号一个 IP”指同一时刻：账号多于端口时，一个 IP 会先后服务多个账号。',
   'settings.proxyPoolHelpFixed':
-    '没有自己代理的账户改用 IP 池出网。已开启固定分配：静态 IP 下每个账户固定一个端口（端口段里每个端口是一个固定 IP），同一端口的几个账户共用这个 IP、可以同时开浏览器，不再每个浏览器独占一个端口；动态 IP 下地址里的 {session} 按账户换成固定会话号，一直用这个会话号、不自动换会话。优先级：账户自己的代理 > IP 池 > 默认代理。',
+    '没有自己代理的账户改用 IP 池出网。已开启固定分配：静态 IP 下每个账户固定一个端口（端口段里每个端口是一个固定 IP），同一端口的几个账户共用这个 IP、可以同时开浏览器，不再每个浏览器独占一个端口；动态 IP 下地址里的 {session} 按账户换成固定会话号，一直用这个会话号。少数 IP（会话）坏了时自动换，30 分钟内坏得超过设置值就停止自动换、暂停等你手动处理（设置为 0 时不自动换）。优先级：账户自己的代理 > IP 池 > 默认代理。',
   'settings.proxyPoolMode': '模式',
   'settings.proxyPoolModeOff': '关闭（使用默认代理）',
   'settings.proxyPoolModeStatic': '静态 IP（端口段，每个浏览器独占一个端口）',
@@ -1298,7 +1298,7 @@ const zhCN = {
   'settings.proxyPoolURLHelpDynamic':
     '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。只在代理连不通时换会话号；裸 429 不换（每个会话只有一个账号，分不清是账号还是 IP 的问题），代理能连通、但被上游限制的会话不会自动换。建议在代理商处设置较长的会话时长。',
   'settings.proxyPoolURLHelpDynamicFixed':
-    '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。已开启固定会话：每个账户一直用它的会话号，代理连不通时也不换。建议在代理商处设置较长的会话时长。',
+    '在用户名或密码里会话号的位置写 {session}（不区分大小写），例如 http://customer-账号-cc-US-sessid-{session}:密码@gate.ipfoxy.io:58688；程序按账户换成固定会话号（只含小写字母和数字，最长 15 个字符）。已开启固定会话：每个账户一直用它的会话号；少数会话连续出口连不通时自动换会话号，30 分钟内超过设置值就停止自动换、等你手动换会话（设置为 0 时不换）。建议在代理商处设置较长的会话时长。',
   'settings.proxyPoolURLPlaceholderStatic': 'http://用户名:密码@isp.decodo.com:10000',
   'settings.proxyPoolURLPlaceholderDynamic':
     'http://customer-账号-sessid-{session}:密码@gate.ipfoxy.io:58688',
@@ -1399,16 +1399,16 @@ const zhCN = {
   'accounts.proxyPoolPinned': '固定为默认代理（不使用 IP 池）',
   'accounts.proxyPoolPinnedHelp':
     '账户代理与默认代理相同，因此不使用 IP 池；可在“服务配置 → IP 池”改为跟随默认代理',
-  'settings.proxyPoolFixed': '固定分配（每个账户固定一个端口，不自动换 IP）',
+  'settings.proxyPoolFixed': '固定分配（每个账户固定一个端口）',
   'settings.proxyPoolFixedHelpStatic':
-    '开启后，每个走 IP 池的账户（没有自己代理的）固定一个端口，按账户数平均分到端口段的端口上，例如 2000 个账户、500 个端口 → 每个端口 4 个账户（除不尽时各端口相差不超过 1）。同一端口的几个账户共用这个 IP、可以同时开浏览器；账户的 Worker、登录、验证、Chrome 导入与后台请求都只用它的固定端口。之后重启、更新、停止再启动、改其他设置都不变；端口冷却或被其他进程占用时，这个端口上的账户暂停使用、等它恢复（不换端口、不走默认代理、不直连）。分配记在 runtime/proxy-pool-fixed.json：首次开启时尽量保留账户上次用的端口，之后新增的账户分到账户最少的端口，删除账户只释放它自己的位置。',
-  'settings.proxyPoolFixedDynamic': '固定会话（不自动换会话）',
+    '开启后，每个走 IP 池的账户（没有自己代理的）固定一个端口，按账户数平均分到端口段的端口上，例如 2000 个账户、500 个端口 → 每个端口 4 个账户（除不尽时各端口相差不超过 1）。同一端口的几个账户共用这个 IP、可以同时开浏览器；账户的 Worker、登录、验证、Chrome 导入与后台请求都只用它的固定端口。之后重启、更新、停止再启动、改其他设置都不变。端口冷却（IP 坏了：连续出口连不通、不同账号返回限流）时少数自动换 IP：这个端口上的账户挪到其他账户最少、没有暂停的端口，坏端口停用；30 分钟内坏得超过下面的设置值就停止自动换，之后坏掉的端口上的账户暂停使用、等你手动换 IP；被其他进程占用时只暂停、等它释放（都不走默认代理、不直连）。分配记在 runtime/proxy-pool-fixed.json：首次开启时尽量保留账户上次用的端口，之后新增的账户分到账户最少的端口，删除账户只释放它自己的位置。',
+  'settings.proxyPoolFixedDynamic': '固定会话（每个账户一个固定会话号）',
   'settings.proxyPoolFixedHelpDynamic':
-    '开启后，每个账户一直用它的会话号（同一个 IP），连续出口连不通时也不再自动换会话；会话号记在 runtime/proxy-pool.json，重启、更新都不变。代理商那边这个会话不通时，这个账户的 Worker 启动会失败，直到会话恢复：可以给这个账户填自己的代理，或临时关闭固定会话。',
+    '开启后，每个账户一直用它的会话号（同一个 IP），会话号记在 runtime/proxy-pool.json，重启、更新都不变。少数会话连续出口连不通时自动换这个账户的会话号；30 分钟内超过下面的设置值就停止自动换，这些账户一直用原会话（Worker 启动会失败）、等你在 IP 池状态里手动换会话。设置为 0 时不自动换会话。',
   'settings.proxyPoolFixedEnableConfirm':
-    '开启固定分配：{accounts} 个账户分到 {ports} 个端口，每个端口约 {perPort} 个账户（同一端口的账户共用这个 IP，可以同时开浏览器；以前开启过时沿用原来的分配表、不重新平均，需要均匀时开启后点“重新平均分配”）。之后重启、更新都不变；端口冷却或被其他进程占用时，这个端口上的账户暂停使用、等它恢复，不换端口。运行中的浏览器关闭后改用固定端口（要立即切换，停止服务后再启动）。',
+    '开启固定分配：{accounts} 个账户分到 {ports} 个端口，每个端口约 {perPort} 个账户（同一端口的账户共用这个 IP，可以同时开浏览器；以前开启过时沿用原来的分配表、不重新平均，需要均匀时开启后点“重新平均分配”）。之后重启、更新都不变；端口冷却（IP 坏了）时少数自动换 IP，30 分钟内坏得超过设置值就停止自动换、暂停等你手动换（设置为 0 时只暂停）；被其他进程占用时只暂停。运行中的浏览器关闭后改用固定端口（要立即切换，停止服务后再启动）。',
   'settings.proxyPoolFixedEnableConfirmDynamic':
-    '开启固定会话：每个账户一直用它的会话号，连续出口连不通时也不再自动换会话；代理商那边会话不通时，这个账户的 Worker 启动会失败，直到会话恢复。',
+    '开启固定会话：每个账户一直用它的会话号；少数会话连续出口连不通时自动换会话，30 分钟内超过设置值就停止自动换、等你手动换会话（设置为 0 时不换，这个账户的 Worker 启动会失败直到会话恢复）。',
   'settings.proxyPoolFixedEnableAction': '开启',
   'settings.proxyPoolFixedDisableConfirm':
     '关闭固定分配：分配表保留，再次开启时沿用；之后启动的浏览器按原方式分配端口（每个浏览器独占一个端口，账户可能换 IP），运行中的浏览器关闭后改用原方式。',
@@ -1432,7 +1432,7 @@ const zhCN = {
   'settings.proxyPoolFixedExternal':
     '{count} 个有固定账户的端口同时被账户自己的代理或默认代理指向：照常使用（与它们共用 IP），需要时可以给这些端口换 IP。',
   'settings.proxyPoolFixedPaused':
-    '暂停使用的端口 {ports} 个（账户 {accounts} 个）：端口恢复后这些账户自动恢复，不换端口；IP 被限流或一直不通时可以给端口换 IP。',
+    '暂停使用的端口 {ports} 个（账户 {accounts} 个）：端口恢复后这些账户自动恢复；IP 被限流或一直不通时可以给端口换 IP。',
   'settings.proxyPoolFixedPausedUntil': '至 {time}',
   'settings.proxyPoolFixedPausedRecheck': '下次检查 {time}',
   'settings.proxyPoolFixedPausedAccounts': '{count} 个账户',
@@ -1457,10 +1457,73 @@ const zhCN = {
     '重新平均分配：将挪动 {moved} 个账户（其中 {running} 个有运行中的浏览器，关闭后改用新端口），清理 {pruned} 个已不在账户池的记录；之后 {accounts} 个账户分到 {ports} 个端口，每端口 {perPort} 个。被挪的账户会换 IP。',
   'settings.proxyPoolFixedRebalanceNone': '已经是平均分配，不需要挪动（每端口 {perPort} 个）',
   'settings.proxyPoolFixedRebalanceDone': '已重新平均分配：挪动 {moved} 个账户，清理 {pruned} 个记录，每端口 {perPort} 个',
-  'settings.proxyPoolFixedDynamicStatus': '固定会话：{accounts} 个账户一直用各自的会话号，不自动换会话',
+  'settings.proxyPoolFixedDynamicStatus': '固定会话：{accounts} 个账户一直用各自的会话号',
   'settings.proxyPoolFixedNotFixed': '固定分配没有开启（需要静态 IP 且开启固定分配）',
   'settings.proxyPoolFixedNoTarget': '没有其他可分配的端口',
   'settings.proxyPoolFixedOutOfRange': '端口不在当前端口段内',
+  'settings.proxyPoolAutoReplace': '坏 IP 自动换（30 分钟内最多几个）',
+  'settings.proxyPoolAutoReplaceDynamic': '坏会话自动换（30 分钟内最多几个）',
+  'settings.proxyPoolAutoReplaceHelp':
+    '端口冷却（连续出口连不通、不同账号返回限流）时，把这个端口上的账户挪到其他账户最少、没有暂停的端口，坏端口停用（可以恢复），用它的浏览器在进行中的请求结束后关闭；30 分钟内坏掉的端口超过这个数、再换就会让端口段里能用的端口（没有停用、不在冷却；被其他进程占用的不计入）不到一半、换过去的新 IP 又坏了、或 IP 坏掉的账户超过一半时停止自动换（像是代理商整体出了问题），之后坏掉的端口暂停、等你手动换 IP，处理后点“恢复自动换 IP”。被其他进程占用不算坏。0 为不自动换（只暂停）。0 到 5000，保存后立即生效（PROXY_POOL_FIXED_AUTO_REPLACE）。',
+  'settings.proxyPoolAutoReplaceHelpDynamic':
+    '账户的会话连续出口连不通时自动换这个账户的会话号；30 分钟内连不通的会话超过这个数、换出的新会话又连不通、或会话连不通的账户超过一半时停止自动换（像是代理商整体出了问题），之后的账户一直用原会话、等你在下面手动换会话，处理后点“恢复自动换会话”。0 为不自动换。0 到 5000，保存后立即生效（PROXY_POOL_FIXED_AUTO_REPLACE）。',
+  'settings.invalidProxyPoolAutoReplace': '坏 IP 自动换的上限必须是 0 到 5000 的整数',
+  'settings.proxyPoolAutoStatus': '自动换坏 IP：30 分钟内最多 {limit} 个 · 最近 30 分钟坏了 {recent} 个',
+  'settings.proxyPoolAutoStatusDynamic': '自动换坏会话：30 分钟内最多 {limit} 个 · 最近 30 分钟连不通 {recent} 个',
+  'settings.proxyPoolAutoHaltedTitle': '坏 IP 过多，已停止自动换 IP，请手动处理',
+  'settings.proxyPoolAutoHaltedTitleDynamic': '坏会话过多，已停止自动换会话，请手动处理',
+  'settings.proxyPoolAutoHaltedDetail':
+    '{time} 停止（30 分钟内坏了 {count} 个，上限 {limit}）。暂停的端口可以逐个“换 IP”，已经自动换过的不撤回；处理完后点“恢复自动换 IP”。',
+  'settings.proxyPoolAutoHaltedDetailHalf':
+    '{time} 停止（30 分钟内坏了 {count} 个；再自动换的话，端口段里能用的端口会不到一半，账户会越挤越少的 IP 上）。暂停的端口可以逐个“换 IP”，已经自动换过的不撤回；停用的端口多时先在“自动换过的端口”里恢复，处理完后点“恢复自动换 IP”。',
+  'settings.proxyPoolAutoHaltedDetailChain':
+    '{time} 停止（换过去的新 IP 30 分钟内又坏了，像是代理商整体出了问题；30 分钟内坏了 {count} 个，上限 {limit}）。等代理商恢复，或逐个给暂停的端口“换 IP”，已经自动换过的不撤回；处理完后点“恢复自动换 IP”。',
+  'settings.proxyPoolAutoHaltedDetailAccounts':
+    '{time} 停止（30 分钟内 IP 坏掉的账户超过一半，像是代理商整体出了问题；30 分钟内坏了 {count} 个，上限 {limit}）。等代理商恢复，或逐个给暂停的端口“换 IP”，已经自动换过的不撤回；处理完后点“恢复自动换 IP”。',
+  'settings.proxyPoolAutoHaltedSkipped': '停止之后又坏了 {skipped} 个，同样按暂停处理。',
+  'settings.proxyPoolAutoHaltedDetailDynamic':
+    '{time} 停止（30 分钟内 {count} 个会话连不通，上限 {limit}）。可以在下面逐个“换会话”，已经自动换过的不撤回；处理完后点“恢复自动换会话”。',
+  'settings.proxyPoolAutoHaltedDetailDynamicChain':
+    '{time} 停止（换出的新会话 30 分钟内又连不通，像是代理商整体出了问题；30 分钟内 {count} 个会话连不通，上限 {limit}）。等代理商恢复，或在下面逐个“换会话”，已经自动换过的不撤回；处理完后点“恢复自动换会话”。',
+  'settings.proxyPoolAutoHaltedDetailDynamicAccounts':
+    '{time} 停止（30 分钟内会话连不通的账户超过一半，像是代理商整体出了问题；30 分钟内 {count} 个会话连不通，上限 {limit}）。等代理商恢复，或在下面逐个“换会话”，已经自动换过的不撤回；处理完后点“恢复自动换会话”。',
+  'settings.proxyPoolAutoHaltedSkippedDynamic': '停止之后又有 {skipped} 个会话连不通、没有换。',
+  'settings.proxyPoolAutoResume': '恢复自动换 IP',
+  'settings.proxyPoolAutoResumeDynamic': '恢复自动换会话',
+  'settings.proxyPoolAutoResumeConfirm':
+    '恢复自动换 IP：30 分钟计数从 0 开始，之后新坏的端口会自动换；此刻暂停的端口不补做自动换（冷却到期后恢复使用，再坏时按新的计数自动换），需要时手动换 IP。停用与冷却中的端口仍占端口段一半以上时，下一个坏的端口会再次停止自动换，先在“自动换过的端口”里恢复一些。',
+  'settings.proxyPoolAutoResumeConfirmDynamic':
+    '恢复自动换会话：30 分钟计数从 0 开始，之后连不通的会话会自动换；此刻连不通的账户不立刻换，它的浏览器再启动失败时按新的计数自动换（超过上限会再次停止），也可以先手动换会话。',
+  'settings.proxyPoolAutoResumeDone': '已恢复自动换，30 分钟计数从 0 开始（停止期间没有自动换的仍按原样，需要时手动处理）',
+  'settings.proxyPoolAutoResumeNoop': '自动换本来就没有停止',
+  'settings.proxyPoolAutoTagHalted': '已停止自动换',
+  'settings.proxyPoolAutoTagNoTarget': '没有可挪的端口',
+  'settings.proxyPoolAutoReplaced': '自动换过的端口 {count} 个（已停用、账户已挪走；恢复后账户不回原端口）：',
+  'settings.proxyPoolAutoReplacedItem': '{time} · {rule} · 挪走 {moved} 个账户',
+  'settings.proxyPoolAutoRuleUpstream': '连续出口连不通',
+  'settings.proxyPoolAutoRuleRateLimited': '不同账号返回限流',
+  'settings.proxyPoolAutoStuck': '会话连不通、没有自动换的账户 {count} 个：',
+  'settings.proxyPoolAutoStuckSince': '会话 {session} · 自 {time}',
+  'settings.proxyPoolAutoRotate': '换会话',
+  'settings.proxyPoolAutoRotateConfirm':
+    '给 {account} 换会话：之后用新的会话号（代理商会给新的 IP），运行中的浏览器在进行中的请求结束后关闭。',
+  'settings.proxyPoolAutoRotateDone': '已换会话：{from} → {to}',
+  'settings.proxyPoolAutoNotDynamic': '固定会话没有开启（需要动态 IP 且开启固定会话）',
+  'settings.proxyPoolAutoNotPooled': '这个账户有自己的代理，不用 IP 池',
+  'app.proxyPoolAutoHalted': '坏 IP 过多，已停止自动换 IP，请手动处理',
+  'app.proxyPoolAutoHaltedDynamic': '坏会话过多，已停止自动换会话，请手动处理',
+  'app.proxyPoolAutoHaltedDetail': '{time} 停止：30 分钟内坏了 {count} 个（上限 {limit}）',
+  'app.proxyPoolAutoHaltedDetailHalf': '{time} 停止：30 分钟内坏了 {count} 个，再自动换的话能用的端口会不到一半',
+  'app.proxyPoolAutoHaltedDetailChain': '{time} 停止：换过去的新 IP 30 分钟内又坏了（共坏了 {count} 个），像是代理商整体出了问题',
+  'app.proxyPoolAutoHaltedDetailChainDynamic': '{time} 停止：换出的新会话 30 分钟内又连不通（共 {count} 个），像是代理商整体出了问题',
+  'app.proxyPoolAutoHaltedDetailAccounts': '{time} 停止：30 分钟内 IP 坏掉的账户超过一半（共坏了 {count} 个），像是代理商整体出了问题',
+  'app.proxyPoolAutoHaltedDetailAccountsDynamic': '{time} 停止：30 分钟内会话连不通的账户超过一半（共 {count} 个），像是代理商整体出了问题',
+  'app.proxyPoolAutoHaltedSkipped': '，停止之后又坏了 {skipped} 个',
+  'app.proxyPoolAutoHaltedOpen': '去处理',
+  'app.proxyPoolAutoStopped': '已停止自动换 IP',
+  'app.proxyPoolAutoStoppedDynamic': '已停止自动换会话',
+  'app.proxyPoolDetailAuto': '自动换坏 IP：30 分钟内最多 {limit} 个，最近坏了 {recent} 个，自动换过的端口 {replaced} 个',
+  'app.proxyPoolDetailAutoDynamic': '自动换坏会话：30 分钟内最多 {limit} 个，最近连不通 {recent} 个',
   'proxyPoolPause.cooling_upstream': '冷却中（连续出口连不通）',
   'proxyPoolPause.cooling_rate_limited': '冷却中（不同账号返回限流）',
   'proxyPoolPause.cooling': '冷却中',
@@ -1472,7 +1535,7 @@ const zhCN = {
   'app.proxyPoolDetailFixedPaused': '暂停使用：{ports}',
   'app.proxyPoolDetailFixedPausedPort': '{port}（{reason}，{accounts} 个账户）',
   'app.proxyPoolDetailFixedTransitional': '还不在固定端口上的 Worker {count} 个（关闭后改用固定端口）',
-  'app.proxyPoolDetailFixedDynamic': '固定会话：{accounts} 个账户不自动换会话',
+  'app.proxyPoolDetailFixedDynamic': '固定会话：{accounts} 个账户各用固定会话号',
   'accounts.proxyPoolFixedSlot': 'IP 池 · 端口 {port}（固定）',
   'accounts.proxyPoolFixedHelp': '固定分配：这个账户的 Worker、登录、验证与后台请求一直用这个端口（同一端口的几个账户共用这个 IP），重启、更新都不变',
   'accounts.proxyPoolFixedPaused': '暂停使用',
@@ -2825,7 +2888,7 @@ const en: Record<TranslationKey, string> = {
   'settings.proxyPoolHelp':
     'Accounts without their own proxy go out through the IP pool. Static IPs: each port in the range is one fixed IP, every running browser (worker, login, verification) gets a port of its own, and an account returns to the port it used last when possible. Rotating IPs: {session} in the address is replaced with a fixed session ID per account, one sticky IP per session. Priority: the account proxy > the IP pool > the default proxy. "One IP per account" holds at any one moment: with more accounts than ports, one IP serves several accounts over time.',
   'settings.proxyPoolHelpFixed':
-    'Accounts without their own proxy go out through the IP pool. Fixed assignment is on: with static IPs every account has one fixed port (each port in the range is one fixed IP), and the accounts on one port share its IP and can run browsers at the same time instead of one port per browser; with rotating IPs, {session} in the address is replaced with a fixed session ID per account, which is kept and never changed automatically. Priority: the account proxy > the IP pool > the default proxy.',
+    'Accounts without their own proxy go out through the IP pool. Fixed assignment is on: with static IPs every account has one fixed port (each port in the range is one fixed IP), and the accounts on one port share its IP and can run browsers at the same time instead of one port per browser; with rotating IPs, {session} in the address is replaced with a fixed session ID per account, which is kept. When a few IPs (sessions) go bad they are replaced automatically; if more go bad within 30 minutes than the limit allows, automatic replacement stops and they pause until you handle them (a limit of 0 never replaces). Priority: the account proxy > the IP pool > the default proxy.',
   'settings.proxyPoolMode': 'Mode',
   'settings.proxyPoolModeOff': 'Off (use the default proxy)',
   'settings.proxyPoolModeStatic': 'Static IPs (port range, one port per browser)',
@@ -2838,7 +2901,7 @@ const en: Record<TranslationKey, string> = {
   'settings.proxyPoolURLHelpDynamic':
     'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters), which changes only when the proxy cannot be reached; bare 429s never change it (each session has a single account, so they cannot tell the account from the IP), and a session that the upstream limits while the proxy still works is not changed automatically. Set a long session duration at your provider.',
   'settings.proxyPoolURLHelpDynamicFixed':
-    'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters). Fixed sessions are on: every account keeps its session ID, even when the proxy cannot be reached. Set a long session duration at your provider.',
+    'Write {session} (any case) where the session ID goes in the username or password, for example http://customer-account-cc-US-sessid-{session}:pass@gate.ipfoxy.io:58688; it is replaced with a fixed session ID per account (lowercase letters and digits, at most 15 characters). Fixed sessions are on: every account keeps its session ID; when a few sessions keep failing to connect they are changed automatically, and if more than the limit fail within 30 minutes, automatic changes stop until you change sessions by hand (a limit of 0 never changes them). Set a long session duration at your provider.',
   'settings.proxyPoolURLPlaceholderStatic': 'http://user:pass@isp.decodo.com:10000',
   'settings.proxyPoolURLPlaceholderDynamic':
     'http://customer-account-sessid-{session}:pass@gate.ipfoxy.io:58688',
@@ -2944,17 +3007,16 @@ const en: Record<TranslationKey, string> = {
   'accounts.proxyPoolPinned': 'Pinned to the default proxy (no IP pool)',
   'accounts.proxyPoolPinnedHelp':
     'The account proxy equals the default proxy, so this account does not use the IP pool; switch it under Service Configuration → IP pool with "Follow the default proxy"',
-  'settings.proxyPoolFixed':
-    'Fixed assignment (one fixed port per account, no automatic IP changes)',
+  'settings.proxyPoolFixed': 'Fixed assignment (one fixed port per account)',
   'settings.proxyPoolFixedHelpStatic':
-    "Once on, every account that goes through the IP pool (no proxy of its own) gets one fixed port, spread evenly over the ports of the range by account count, for example 2000 accounts on 500 ports → 4 accounts per port (when it does not divide evenly, ports differ by at most 1). The accounts on one port share its IP and can run browsers at the same time; an account's worker, logins, verifications, Chrome imports and background requests all use only its fixed port. It then stays the same across restarts, updates, stopping and starting the service and changes to other settings; while a port is cooling down or held by another process, the accounts on it pause until it recovers (no other port, no default proxy, no direct connection). The assignment is kept in runtime/proxy-pool-fixed.json: the first time it is turned on, accounts keep the port they used last where possible, accounts added later go to the port with the fewest accounts, and deleting an account frees only its own place.",
-  'settings.proxyPoolFixedDynamic': 'Fixed sessions (no automatic session changes)',
+    "Once on, every account that goes through the IP pool (no proxy of its own) gets one fixed port, spread evenly over the ports of the range by account count, for example 2000 accounts on 500 ports → 4 accounts per port (when it does not divide evenly, ports differ by at most 1). The accounts on one port share its IP and can run browsers at the same time; an account's worker, logins, verifications, Chrome imports and background requests all use only its fixed port. It then stays the same across restarts, updates, stopping and starting the service and changes to other settings. When a port cools down (the IP went bad: the exit kept failing, or several accounts were rate limited) a few bad IPs are replaced automatically: the accounts on that port move to the port with the fewest accounts that is not paused, and the bad port is disabled; if more ports go bad within 30 minutes than the limit below, automatic replacement stops and the accounts on ports that go bad afterwards pause until you change the IP by hand; a port held by another process only pauses until it is released (never the default proxy, never a direct connection). The assignment is kept in runtime/proxy-pool-fixed.json: the first time it is turned on, accounts keep the port they used last where possible, accounts added later go to the port with the fewest accounts, and deleting an account frees only its own place.",
+  'settings.proxyPoolFixedDynamic': 'Fixed sessions (one fixed session ID per account)',
   'settings.proxyPoolFixedHelpDynamic':
-    "Once on, every account keeps its session ID (the same IP) and the session is no longer changed automatically when the exit keeps failing; session IDs are kept in runtime/proxy-pool.json and survive restarts and updates. If the provider cannot serve that session, the account's worker fails to start until the session recovers: give the account a proxy of its own, or turn fixed sessions off for a while.",
+    'Once on, every account keeps its session ID (the same IP); session IDs are kept in runtime/proxy-pool.json and survive restarts and updates. When a few sessions keep failing to connect, the session of that account is changed automatically; if more than the limit below fail within 30 minutes, automatic changes stop and those accounts keep their session (their workers fail to start) until you change sessions by hand in the IP pool status. A limit of 0 never changes sessions.',
   'settings.proxyPoolFixedEnableConfirm':
-    'Turn on fixed assignment: {accounts} accounts on {ports} ports, about {perPort} accounts per port (accounts on one port share its IP and can run browsers at the same time; if it was on before, the earlier assignment is kept rather than rebalanced, so use Rebalance after turning it on to even it out). It then stays the same across restarts and updates; while a port is cooling down or held by another process, the accounts on it pause until it recovers instead of moving to another port. Running browsers switch to their fixed port after they close (to switch now, stop the service and start it again).',
+    'Turn on fixed assignment: {accounts} accounts on {ports} ports, about {perPort} accounts per port (accounts on one port share its IP and can run browsers at the same time; if it was on before, the earlier assignment is kept rather than rebalanced, so use Rebalance after turning it on to even it out). It then stays the same across restarts and updates; when a port cools down (the IP went bad) a few are replaced automatically, and if more go bad within 30 minutes than the limit, automatic replacement stops and they pause until you change them by hand (a limit of 0 only pauses); a port held by another process only pauses. Running browsers switch to their fixed port after they close (to switch now, stop the service and start it again).',
   'settings.proxyPoolFixedEnableConfirmDynamic':
-    "Turn on fixed sessions: every account keeps its session ID and the session is no longer changed when the exit keeps failing; if the provider cannot serve a session, that account's worker fails to start until the session recovers.",
+    'Turn on fixed sessions: every account keeps its session ID; when a few sessions keep failing to connect they are changed automatically, and if more than the limit fail within 30 minutes, automatic changes stop until you change sessions by hand (with a limit of 0 sessions are never changed and the worker of that account fails to start until the session recovers).',
   'settings.proxyPoolFixedEnableAction': 'Turn on',
   'settings.proxyPoolFixedDisableConfirm':
     'Turn off fixed assignment: the assignment is kept and used again when it is turned back on; browsers started from now on get ports the usual way (one port per browser, so accounts may change IP), and running browsers switch after they close.',
@@ -2981,7 +3043,7 @@ const en: Record<TranslationKey, string> = {
   'settings.proxyPoolFixedExternal':
     '{count} ports with fixed accounts are also used by account proxies or the default proxy: they are used as usual (sharing the IP with those), and you can change the IP of those ports if needed.',
   'settings.proxyPoolFixedPaused':
-    '{ports} ports paused ({accounts} accounts): the accounts resume when the port recovers, without moving to another port; if the IP is rate limited or keeps failing, change the IP of that port.',
+    '{ports} ports paused ({accounts} accounts): the accounts resume when the port recovers; if the IP is rate limited or keeps failing, change the IP of that port.',
   'settings.proxyPoolFixedPausedUntil': 'until {time}',
   'settings.proxyPoolFixedPausedRecheck': 'next check {time}',
   'settings.proxyPoolFixedPausedAccounts': '{count} accounts',
@@ -3012,11 +3074,93 @@ const en: Record<TranslationKey, string> = {
   'settings.proxyPoolFixedRebalanceDone':
     'Rebalanced: moved {moved} accounts, cleared {pruned} records, {perPort} per port',
   'settings.proxyPoolFixedDynamicStatus':
-    'Fixed sessions: {accounts} accounts keep their session IDs; sessions are not changed automatically',
+    'Fixed sessions: {accounts} accounts keep their session IDs',
   'settings.proxyPoolFixedNotFixed':
     'Fixed assignment is not on (it needs static IPs with fixed assignment turned on)',
   'settings.proxyPoolFixedNoTarget': 'No other port to assign to',
   'settings.proxyPoolFixedOutOfRange': 'The port is not in the current port range',
+  'settings.proxyPoolAutoReplace': 'Replace bad IPs automatically (at most per 30 minutes)',
+  'settings.proxyPoolAutoReplaceDynamic':
+    'Change bad sessions automatically (at most per 30 minutes)',
+  'settings.proxyPoolAutoReplaceHelp':
+    'When a port cools down (the exit kept failing, or several accounts were rate limited), the accounts on it move to the port with the fewest accounts that is not paused, the bad port is disabled (it can be restored), and browsers using it close after their current requests finish; once more ports than this go bad within 30 minutes, replacing one more would leave fewer than half of the ports in the range usable (not disabled, not cooling down; ports held by another process are left out), a new IP that accounts were moved to goes bad again, or the IPs of more than half of the accounts went bad, automatic replacement stops (it looks like a provider-wide problem), ports that go bad afterwards pause until you change their IP by hand, and after handling them click "Resume automatic IP replacement". A port held by another process does not count as bad. 0 never replaces (only pauses). 0 to 5000, applied as soon as it is saved (PROXY_POOL_FIXED_AUTO_REPLACE).',
+  'settings.proxyPoolAutoReplaceHelpDynamic':
+    'When the session of an account keeps failing to connect, that account gets a new session ID automatically; once more sessions than this fail within 30 minutes, a new session fails again, or the sessions of more than half of the accounts fail, automatic changes stop (it looks like a provider-wide problem), later accounts keep their session until you change it below, and after handling them click "Resume automatic session changes". 0 never changes sessions. 0 to 5000, applied as soon as it is saved (PROXY_POOL_FIXED_AUTO_REPLACE).',
+  'settings.invalidProxyPoolAutoReplace':
+    'The limit for replacing bad IPs must be an integer from 0 to 5000',
+  'settings.proxyPoolAutoStatus':
+    'Automatic IP replacement: at most {limit} per 30 minutes · {recent} went bad in the last 30 minutes',
+  'settings.proxyPoolAutoStatusDynamic':
+    'Automatic session changes: at most {limit} per 30 minutes · {recent} failed in the last 30 minutes',
+  'settings.proxyPoolAutoHaltedTitle':
+    'Too many bad IPs: automatic IP replacement stopped, please handle them',
+  'settings.proxyPoolAutoHaltedTitleDynamic':
+    'Too many bad sessions: automatic session changes stopped, please handle them',
+  'settings.proxyPoolAutoHaltedDetail':
+    'Stopped at {time} ({count} went bad within 30 minutes, limit {limit}). Change the IP of paused ports one by one; ports already replaced are not moved back. When done, click "Resume automatic IP replacement".',
+  'settings.proxyPoolAutoHaltedDetailHalf':
+    'Stopped at {time} ({count} went bad within 30 minutes; replacing more would leave fewer than half of the ports in the range usable and crowd accounts onto fewer and fewer IPs). Change the IP of paused ports one by one; ports already replaced are not moved back. If many ports are disabled, restore some under "ports replaced automatically" first; when done, click "Resume automatic IP replacement".',
+  'settings.proxyPoolAutoHaltedDetailChain':
+    'Stopped at {time} (a new IP that accounts were moved to went bad again within 30 minutes, which looks like a provider-wide problem; {count} went bad within 30 minutes, limit {limit}). Wait for the provider to recover or change the IP of paused ports one by one; ports already replaced are not moved back. When done, click "Resume automatic IP replacement".',
+  'settings.proxyPoolAutoHaltedDetailAccounts':
+    'Stopped at {time} (the IPs of more than half of the accounts went bad within 30 minutes, which looks like a provider-wide problem; {count} went bad within 30 minutes, limit {limit}). Wait for the provider to recover or change the IP of paused ports one by one; ports already replaced are not moved back. When done, click "Resume automatic IP replacement".',
+  'settings.proxyPoolAutoHaltedSkipped': '{skipped} more went bad since then and are paused as well.',
+  'settings.proxyPoolAutoHaltedDetailDynamic':
+    'Stopped at {time} ({count} sessions failed within 30 minutes, limit {limit}). Change sessions below one by one; sessions already changed are not reverted. When done, click "Resume automatic session changes".',
+  'settings.proxyPoolAutoHaltedDetailDynamicChain':
+    'Stopped at {time} (a new session failed again within 30 minutes, which looks like a provider-wide problem; {count} sessions failed within 30 minutes, limit {limit}). Wait for the provider to recover or change sessions below one by one; sessions already changed are not reverted. When done, click "Resume automatic session changes".',
+  'settings.proxyPoolAutoHaltedDetailDynamicAccounts':
+    'Stopped at {time} (the sessions of more than half of the accounts failed within 30 minutes, which looks like a provider-wide problem; {count} sessions failed within 30 minutes, limit {limit}). Wait for the provider to recover or change sessions below one by one; sessions already changed are not reverted. When done, click "Resume automatic session changes".',
+  'settings.proxyPoolAutoHaltedSkippedDynamic': '{skipped} more sessions failed since then and were not changed.',
+  'settings.proxyPoolAutoResume': 'Resume automatic IP replacement',
+  'settings.proxyPoolAutoResumeDynamic': 'Resume automatic session changes',
+  'settings.proxyPoolAutoResumeConfirm':
+    'Resume automatic IP replacement: the 30-minute count starts again from 0 and ports that go bad from now on are replaced automatically; ports paused right now are not replaced after the fact (they are used again when their cooldown ends and replaced under the new count if they go bad again), change their IP by hand if needed. While disabled and cooling ports still make up more than half of the range, the next port that goes bad stops automatic replacement again, so restore some under "ports replaced automatically" first.',
+  'settings.proxyPoolAutoResumeConfirmDynamic':
+    'Resume automatic session changes: the 30-minute count starts again from 0 and sessions that fail from now on are changed automatically; accounts failing right now are not changed at once, their session is changed under the new count when their browser fails to start again (going over the limit stops it again), or change their session by hand first.',
+  'settings.proxyPoolAutoResumeDone':
+    'Automatic replacement resumed, the 30-minute count starts again from 0 (what was not replaced while stopped stays as it is; handle it by hand if needed)',
+  'settings.proxyPoolAutoResumeNoop': 'Automatic replacement was not stopped',
+  'settings.proxyPoolAutoTagHalted': 'auto replacement stopped',
+  'settings.proxyPoolAutoTagNoTarget': 'no port to move to',
+  'settings.proxyPoolAutoReplaced':
+    '{count} ports replaced automatically (disabled, accounts moved away; restoring a port does not move accounts back):',
+  'settings.proxyPoolAutoReplacedItem': '{time} · {rule} · {moved} accounts moved',
+  'settings.proxyPoolAutoRuleUpstream': 'exit kept failing',
+  'settings.proxyPoolAutoRuleRateLimited': 'rate limited across accounts',
+  'settings.proxyPoolAutoStuck':
+    '{count} accounts whose session keeps failing and was not changed:',
+  'settings.proxyPoolAutoStuckSince': 'session {session} · since {time}',
+  'settings.proxyPoolAutoRotate': 'Change session',
+  'settings.proxyPoolAutoRotateConfirm':
+    'Change the session of {account}: it uses a new session ID from now on (the provider gives a new IP), and a running browser closes after its current requests finish.',
+  'settings.proxyPoolAutoRotateDone': 'Session changed: {from} → {to}',
+  'settings.proxyPoolAutoNotDynamic':
+    'Fixed sessions are not on (they need rotating IPs with fixed sessions turned on)',
+  'settings.proxyPoolAutoNotPooled': 'This account has its own proxy and does not use the IP pool',
+  'app.proxyPoolAutoHalted':
+    'Too many bad IPs: automatic IP replacement stopped, please handle them',
+  'app.proxyPoolAutoHaltedDynamic':
+    'Too many bad sessions: automatic session changes stopped, please handle them',
+  'app.proxyPoolAutoHaltedDetail': 'Stopped at {time}: {count} went bad within 30 minutes (limit {limit})',
+  'app.proxyPoolAutoHaltedDetailHalf':
+    'Stopped at {time}: {count} went bad within 30 minutes, replacing more would leave fewer than half of the ports usable',
+  'app.proxyPoolAutoHaltedDetailChain':
+    'Stopped at {time}: a new IP went bad again within 30 minutes ({count} in all), which looks like a provider-wide problem',
+  'app.proxyPoolAutoHaltedDetailChainDynamic':
+    'Stopped at {time}: a new session failed again within 30 minutes ({count} in all), which looks like a provider-wide problem',
+  'app.proxyPoolAutoHaltedDetailAccounts':
+    'Stopped at {time}: the IPs of more than half of the accounts went bad within 30 minutes ({count} in all), which looks like a provider-wide problem',
+  'app.proxyPoolAutoHaltedDetailAccountsDynamic':
+    'Stopped at {time}: the sessions of more than half of the accounts failed within 30 minutes ({count} in all), which looks like a provider-wide problem',
+  'app.proxyPoolAutoHaltedSkipped': ', {skipped} more since then',
+  'app.proxyPoolAutoHaltedOpen': 'Handle',
+  'app.proxyPoolAutoStopped': 'auto IP replacement stopped',
+  'app.proxyPoolAutoStoppedDynamic': 'auto session changes stopped',
+  'app.proxyPoolDetailAuto':
+    'Automatic IP replacement: at most {limit} per 30 minutes, {recent} went bad recently, {replaced} ports replaced',
+  'app.proxyPoolDetailAutoDynamic':
+    'Automatic session changes: at most {limit} per 30 minutes, {recent} failed recently',
   'proxyPoolPause.cooling_upstream': 'cooling down (exit kept failing)',
   'proxyPoolPause.cooling_rate_limited': 'cooling down (rate limited across accounts)',
   'proxyPoolPause.cooling': 'cooling down',

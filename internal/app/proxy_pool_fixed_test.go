@@ -275,7 +275,12 @@ func fixedInvariantError(pool *proxyPool, owner *fakeProxyOwner) error {
 		if binding.URL == pool.settings.global && (lease == nil || lease.pooled) {
 			return fmt.Errorf("参与者 %s 的绑定是默认代理", accountID)
 		}
-		if want := pool.fixedHoldTextLocked(entry.port, now); binding.Hold != want {
+		want := pool.fixedHoldTextLocked(entry.port, now)
+		if want == "" && lease != nil {
+			// 坏 IP 自动换：绑定所用的 Worker 还在已自动换 IP 停用的旧端口上时带自动换的暂停（上限为 0 时永远为空，与原来相同）
+			want = pool.fixedAutoHoldLocked(lease, entry.port)
+		}
+		if binding.Hold != want {
 			return fmt.Errorf("%s 的暂停原因 %q，固定端口 %d 此刻应为 %q", accountID, binding.Hold, entry.port, want)
 		}
 	}
@@ -1402,6 +1407,19 @@ func TestProxyPoolFixedDormantNoEffect(t *testing.T) {
 	}
 	if data, err := os.ReadFile(filepath.Join(seededDir, proxyPoolFixedFileName)); err != nil || string(data) != dormant {
 		t.Fatalf("休眠表文件不应被改写：%v\n%s", err, data)
+	}
+	// 坏 IP 自动换的上限为 10 时同样没有影响（只在固定分配开启时有意义）
+	got = runProxyPoolOffScenarioWith(t, func(dir string) {
+		seededDir = dir
+		if err := os.WriteFile(filepath.Join(dir, proxyPoolFixedFileName), []byte(dormant), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}, func(pool *proxyPool) { pool.setFixedAutoReplace(10) })
+	if normalized := strings.ReplaceAll(string(got), `"fixed_file": true`, `"fixed_file": false`); normalized != string(want) {
+		t.Fatalf("上限 10 时休眠表改变了关闭时的行为：%s", goldenDiff(want, []byte(normalized)))
+	}
+	if data, err := os.ReadFile(filepath.Join(seededDir, proxyPoolFixedFileName)); err != nil || string(data) != dormant {
+		t.Fatalf("上限 10 时休眠表文件不应被改写：%v\n%s", err, data)
 	}
 }
 

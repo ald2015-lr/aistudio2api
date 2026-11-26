@@ -37,6 +37,7 @@ T=$(tr -cd '0-9a-fA-F' < .admin-token 2>/dev/null)
 POOL_MODE=$(env_value PROXY_POOL_MODE); POOL_URL=$(env_value PROXY_POOL_URL)
 POOL_START=$(env_value PROXY_POOL_PORT_START); POOL_END=$(env_value PROXY_POOL_PORT_END)
 POOL_FIXED=$(env_value PROXY_POOL_FIXED)
+POOL_AUTO=$(env_value PROXY_POOL_FIXED_AUTO_REPLACE)
 SECRETS=$(echo "$POOL_URL" | sed -n 's#^[a-zA-Z0-9]*://\([^@/]*\)@.*#\1#p')
 export SECRETS
 
@@ -119,9 +120,30 @@ if pool:
             print(f"    暂停端口 {port.get('port')}：{reasons.get(port.get('reason'), port.get('reason'))}，"
                   f"{when} {port.get('until') or '-'}，账户 {port.get('accounts')}")
         if fixed.get("paused_ports"):
-            print("    → 暂停的端口恢复前，固定在它上面的账户不启动 Worker、不参与调度（不换端口）；IP 被限流或一直不通时在管理页给这个端口“换 IP”")
+            print("    → 暂停的端口恢复前，固定在它上面的账户不启动 Worker、不参与调度；IP 被限流或一直不通时在管理页给这个端口“换 IP”")
     elif isinstance(fixed, dict):
-        print(f"  IP 池固定会话：账户 {fixed.get('accounts')}（连不通时也不自动换会话）")
+        auto_note = "连不通时自动换会话" if isinstance(fixed.get("auto"), dict) else "连不通时也不自动换会话"
+        print(f"  IP 池固定会话：账户 {fixed.get('accounts')}（{auto_note}）")
+    # auto 为坏 IP 自动换（PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时才有）：只有计数、端口号与会话号
+    auto = fixed.get("auto") if isinstance(fixed, dict) else None
+    if isinstance(auto, dict):
+        what = "坏会话" if fixed.get("mode") == "dynamic" else "坏 IP"
+        print(f"  自动换{what}：30 分钟内最多 {auto.get('limit')} 个，最近 30 分钟坏了 {auto.get('recent')} 个，"
+              f"自动换过的端口 {auto.get('replaced_total') or 0} 个，会话连不通没换的账户 {auto.get('stuck_total') or 0} 个")
+        if auto.get("halted"):
+            # halted_reason：half 为静态下再自动换会让端口段里能用的端口不到一半，chain 为换过的新 IP（新会话）30 分钟内又坏了，accounts 为 30 分钟内
+            # IP（会话）坏掉的账户超过一半（后两种像代理商整体出了问题），其余为超过上限；skipped 为停止之后又坏的（不含触发停止的那一个）
+            why = {
+                "half": "再换的话能用的端口会不到一半",
+                "chain": "换过的新 IP/会话又坏了，像是代理商整体出了问题",
+                "accounts": "坏掉的账户超过一半，像是代理商整体出了问题",
+            }.get(auto.get("halted_reason"), f"超过上限 {auto.get('limit')}")
+            print(f"    → 已停止自动换（{auto.get('halted_at') or '-'} 停止，当时 30 分钟内坏了 {auto.get('halted_count')} 个，{why}；"
+                  f"之后又坏 {auto.get('skipped') or 0} 个）：在管理页逐个手动处理后点“恢复自动换”")
+    elif isinstance(fixed, dict) and fixed.get("mode") == "dynamic":
+        print("  自动换坏会话：关闭（PROXY_POOL_FIXED_AUTO_REPLACE=0，会话连不通时不换会话；程序版本较旧时也没有这一项）")
+    elif isinstance(fixed, dict):
+        print("  自动换坏 IP：关闭（PROXY_POOL_FIXED_AUTO_REPLACE=0，坏了只暂停；程序版本较旧时也没有这一项）")
 s = d.get("egress_summary")
 if s:
     print(f"出口：共 {s.get('total')}，正常 {s.get('normal')}，判定限流 {s.get('limited')}，已撤销 {s.get('rejected')}")
@@ -146,7 +168,7 @@ PY
 
   echo
   echo "==================== 直连测 IP 池端口（不经程序，看 Decodo 本身）===================="
-  echo "模式 ${POOL_MODE:-off}，端口 ${POOL_START:-?}–${POOL_END:-?}，固定分配 ${POOL_FIXED:-false}"
+  echo "模式 ${POOL_MODE:-off}，端口 ${POOL_START:-?}–${POOL_END:-?}，固定分配 ${POOL_FIXED:-false}，坏 IP 自动换上限 ${POOL_AUTO:-10}"
   if [ "${POOL_MODE:-off}" = static ] && [ -n "$POOL_URL" ] && [ -n "$POOL_START" ] && [ -n "$POOL_END" ]; then
     hostpart=$(echo "$POOL_URL" | sed -E 's#^([a-zA-Z0-9]+)://([^@/]*@)?([^:/]+).*#\1://\3#')
     auth=$(echo "$POOL_URL" | python3 -I -c 'import sys, urllib.parse as u

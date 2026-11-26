@@ -48,6 +48,13 @@ const (
 	maxAccountRPMLimit           = 1000
 )
 
+const (
+	// DefaultProxyPoolFixedAutoReplace 为固定分配下 30 分钟内最多自动换几个坏 IP（坏会话）的默认值（PROXY_POOL_FIXED_AUTO_REPLACE）；
+	// MaxProxyPoolFixedAutoReplace 为允许配置的最大值（与端口段最多的端口数相同）
+	DefaultProxyPoolFixedAutoReplace = 10
+	MaxProxyPoolFixedAutoReplace     = MaxProxyPoolPorts
+)
+
 // defaultUltraPrimaryModels 为 Ultra 主用模型的默认列表：Build 独有、需要订阅的模型只有 Ultra 号池能服务，
 // 默认让它在 /ultra 上没有额度时立即返回 429，不在号池里挨个换号、现场冷启动
 var defaultUltraPrimaryModels = []string{"gemini-4-argon"}
@@ -70,6 +77,7 @@ var configKeys = [...]string{
 	"PROXY_POOL_PORT_START",
 	"PROXY_POOL_PORT_END",
 	"PROXY_POOL_FIXED",
+	"PROXY_POOL_FIXED_AUTO_REPLACE",
 	"INIT_TIMEOUT",
 	"REQUEST_TIMEOUT",
 	"FIRST_EVENT_TIMEOUT",
@@ -290,6 +298,11 @@ type Config struct {
 	// Media 为生成媒体的输出与保存设置（MEDIA_*，见 MediaSettings），保存后立即生效
 	Media     MediaSettings `json:"media"`
 	AutoStart bool          `json:"auto_start"`
+	// ProxyPoolFixedAutoReplace 为固定分配下坏 IP 自动换的上限（PROXY_POOL_FIXED_AUTO_REPLACE，默认 10，0 到 5000）：静态固定下 30 分钟内
+	// 最多自动换几个坏 IP（端口冷却时把账户挪到其他端口、停用坏端口），动态固定会话下 30 分钟内最多自动换几个坏会话；超过时停止自动换、
+	// 之后坏掉的暂停等手动处理。0 为不自动换（坏了就暂停）。只在 PROXY_POOL_FIXED=true 且模式不是 off 时有意义；保存后立即生效。
+	// 不放进 ProxyPool：只改这个数不应让 IP 池版本 +1、全量重推
+	ProxyPoolFixedAutoReplace int `json:"proxy_pool_fixed_auto_replace"`
 	// RequestBodyLog 为真时用量账本同时保存公开 API POST 请求与响应的截断正文（明文保存在本机，默认关闭）
 	RequestBodyLog bool   `json:"request_body_log"`
 	AdminPassword  string `json:"-"`
@@ -357,6 +370,8 @@ func Default() Config {
 		DowngradeGuard:         DefaultDowngradeGuard(),
 		Media:                  DefaultMediaSettings(),
 		AutoStart:              true,
+		// 坏 IP 自动换的上限（config.Config{} 字面量为 0，即不自动换）
+		ProxyPoolFixedAutoReplace: DefaultProxyPoolFixedAutoReplace,
 	}
 }
 
@@ -437,6 +452,17 @@ func Load(path string) (Config, error) {
 		return nil
 	})
 	if err := loadProxyPool(values, &cfg.ProxyPool); err != nil {
+		return Config{}, err
+	}
+	// 坏 IP 自动换的上限写错时启动即报错（与 PROXY_POOL_FIXED 相同）：按默认 10 启动会让本想设 0 的部署悄悄开始换 IP；空值按默认
+	if err := loader.field("PROXY_POOL_FIXED_AUTO_REPLACE", true, func(value string) error {
+		parsed, err := parseProxyPoolFixedAutoReplace(value)
+		if err != nil {
+			return err
+		}
+		cfg.ProxyPoolFixedAutoReplace = parsed
+		return nil
+	}); err != nil {
 		return Config{}, err
 	}
 	duration("INIT_TIMEOUT", false, parsePositiveDuration, &cfg.InitTimeout)
@@ -655,6 +681,7 @@ func (c Config) save(path string, kept map[string]string, omitted map[string]str
 	for key, value := range c.Media.envValues() {
 		values[key] = value
 	}
+	values["PROXY_POOL_FIXED_AUTO_REPLACE"] = strconv.Itoa(c.ProxyPoolFixedAutoReplace)
 	values["OMNI_IGNORE_SYSTEM_PROMPT"] = strconv.FormatBool(c.OmniIgnoreSystemPrompt)
 	values["OMNI_IMAGE_BINDING"] = strconv.FormatBool(c.OmniImageBinding)
 	for key, value := range kept {
@@ -793,6 +820,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		DowngradeGuard         DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string            `json:"waa_backend"`
 		Media                  mediaSettingsJSON `json:"media"`
+		// 固定分配下坏 IP 自动换的上限
+		ProxyPoolFixedAutoReplace int `json:"proxy_pool_fixed_auto_replace"`
 	}
 	return json.Marshal(payload{
 		AuthStates:             c.AuthStates,
@@ -846,6 +875,8 @@ func (c Config) MarshalJSON() ([]byte, error) {
 		DowngradeGuard:         c.DowngradeGuard,
 		WAABackend:             c.WAABackend,
 		Media:                  c.Media.toJSON(),
+		// 固定分配下坏 IP 自动换的上限
+		ProxyPoolFixedAutoReplace: c.ProxyPoolFixedAutoReplace,
 	})
 }
 
@@ -903,6 +934,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		DowngradeGuard         *DowngradeGuard    `json:"downgrade_guard"`
 		WAABackend             string             `json:"waa_backend"`
 		Media                  *mediaSettingsJSON `json:"media"`
+		// 固定分配下坏 IP 自动换的上限：旧数据没有这一项时为默认 10
+		ProxyPoolFixedAutoReplace *int `json:"proxy_pool_fixed_auto_replace"`
 	}
 	var value payload
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -1021,6 +1054,8 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 		DowngradeGuard:         downgradeGuardOrDefault(value.DowngradeGuard),
 		WAABackend:             strings.ToLower(strings.TrimSpace(value.WAABackend)),
 		Media:                  media,
+		// 旧数据没有这一项时为默认 10
+		ProxyPoolFixedAutoReplace: intOrDefault(value.ProxyPoolFixedAutoReplace, DefaultProxyPoolFixedAutoReplace),
 	}
 	if err := parsed.Validate(); err != nil {
 		return err

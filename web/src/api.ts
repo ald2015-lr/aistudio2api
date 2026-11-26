@@ -23,6 +23,8 @@ import type {
   ProxyPoolFixedRebalanceResult,
   ProxyPoolFixedReassignResult,
   ProxyPoolFixedRestoreResult,
+  ProxyPoolFixedAutoResumeResult,
+  ProxyPoolFixedRotateResult,
   ProxyTestResult,
   RequestBody,
   RequestSummary,
@@ -441,6 +443,15 @@ export const api = {
   restoreProxyPoolPort: (port: number) =>
     requestJSON<ProxyPoolFixedRestoreResult>(
       `/api/proxy/pool/fixed/ports/${encodeURIComponent(String(port))}/restore`,
+      { method: 'POST' },
+    ),
+  // resumeProxyPoolAuto 恢复自动换 IP（固定分配）或自动换会话（固定会话）：30 分钟计数从 0 开始；此刻暂停的端口不会补做自动换
+  resumeProxyPoolAuto: () =>
+    requestJSON<ProxyPoolFixedAutoResumeResult>('/api/proxy/pool/fixed/auto/resume', { method: 'POST' }),
+  // rotateProxyPoolSession 动态固定会话下给账户换会话：之后用新的会话号，用旧会话的浏览器在进行中的请求结束后关闭
+  rotateProxyPoolSession: (accountId: string) =>
+    requestJSON<ProxyPoolFixedRotateResult>(
+      `/api/proxy/pool/fixed/accounts/${encodeURIComponent(accountId)}/rotate`,
       { method: 'POST' },
     ),
   cancelRequest: (id: string) =>

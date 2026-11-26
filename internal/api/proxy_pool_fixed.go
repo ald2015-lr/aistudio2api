@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // IP 池固定分配（PROXY_POOL_FIXED）的管理操作：重新平均分配、给端口换 IP（把这个端口上的账户挪到其他账户最少的端口、停用这个端口）、
@@ -49,6 +50,29 @@ type ProxyPoolFixedReassignResult struct {
 type ProxyPoolFixedRestoreResult struct {
 	Port     int  `json:"port"`
 	Restored bool `json:"restored"`
+}
+
+// ProxyPoolFixedAutoResumeResult 为“恢复自动换 IP（会话）”的结果：Resumed 为假时本来就没有停止；HaltedAt 为停止的时刻，Skipped 为停止之后又坏、
+// 仍按暂停处理的个数（不含触发停止的那一个；需要时手动换）
+type ProxyPoolFixedAutoResumeResult struct {
+	Resumed  bool      `json:"resumed"`
+	HaltedAt time.Time `json:"halted_at,omitzero"`
+	Skipped  int       `json:"skipped"`
+}
+
+// ProxyPoolFixedRotateResult 为动态固定会话下给账户手动换会话的结果：From、To 为换前与换后的会话号，Restarted 为登记了后台关闭的 Worker 数
+// （0 或 1：用旧会话的 Worker 在进行中的请求结束后关闭，下次启动用新会话）
+type ProxyPoolFixedRotateResult struct {
+	AccountID string `json:"account_id"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+	Restarted int    `json:"restarted"`
+}
+
+// proxyPoolAutoService 由支持坏 IP 自动换的管理端实现（与 proxyPoolFixedService 分开：不支持的管理端照旧只实现那三个方法）
+type proxyPoolAutoService interface {
+	ResumeProxyPoolAuto(context.Context) (ProxyPoolFixedAutoResumeResult, error)
+	RotateProxyPoolSession(context.Context, string) (ProxyPoolFixedRotateResult, error)
 }
 
 // proxyPoolFixedService 由支持 IP 池固定分配的管理端实现
@@ -133,6 +157,36 @@ func (s *server) handleRestoreProxyPoolPort(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	result, err := service.RestoreProxyPoolPort(r.Context(), port)
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleResumeProxyPoolAuto 恢复自动换 IP（固定分配）或自动换会话（固定会话）：清除“坏得太多已停止”与 30 分钟计数；此刻暂停的端口不补做
+func (s *server) handleResumeProxyPoolAuto(w http.ResponseWriter, r *http.Request) {
+	service, ok := s.config.Admin.(proxyPoolAutoService)
+	if !ok {
+		writeAdminError(w, http.StatusNotImplemented, "proxy_pool_unsupported", "Proxy pool is not supported")
+		return
+	}
+	result, err := service.ResumeProxyPoolAuto(r.Context())
+	if err != nil {
+		writeAdminUpstreamError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleRotateProxyPoolSession 动态固定会话下给账户换会话（之后用新的会话号；用旧会话的 Worker 在进行中的请求结束后关闭）
+func (s *server) handleRotateProxyPoolSession(w http.ResponseWriter, r *http.Request) {
+	service, ok := s.config.Admin.(proxyPoolAutoService)
+	if !ok {
+		writeAdminError(w, http.StatusNotImplemented, "proxy_pool_unsupported", "Proxy pool is not supported")
+		return
+	}
+	result, err := service.RotateProxyPoolSession(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeAdminUpstreamError(w, err)
 		return

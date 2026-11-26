@@ -308,6 +308,8 @@ type proxyPoolCooling struct {
 	Workers             []string
 	// Fixed 为固定分配下的冷却：Workers 只含固定端口不是这个端口的过渡 Worker（关掉后回到自己的固定端口），固定端口就是它的账户暂停使用
 	Fixed bool
+	// Replaced 为固定分配下坏 IP 自动换挪走的账户数（大于 0 时这个端口被自动换了 IP，Workers 含被挪账户仍在这个端口上的 Worker），只用于日志
+	Replaced int
 }
 
 // proxyPoolLog 为锁内收集、锁外写出的一行日志；notify 不为 nil 时不是日志，emit 到这里时调用它（固定分配推送账户列表，见 takeFixedLogsLocked）
@@ -1207,7 +1209,12 @@ func (pool *proxyPool) releaseLocked(lease *proxyPoolLease) []proxyPoolLog {
 		}
 	}
 	if lease.accountID != "" {
+		autoHeld := pool.fixedAutoHeldLocked(lease.accountID)
 		pool.pushLocked(lease.accountID)
+		if autoHeld && !pool.fixedAutoHeldLocked(lease.accountID) {
+			// 旧端口上的 Worker 关闭，自动换 IP 的暂停解除：账户页随推送刷新
+			pool.fixed.notify = true
+		}
 	}
 	if freed && len(pool.defaultWaiting) > 0 && pool.wakeAt.IsZero() {
 		// 端口空出来了：默认出口退回 PROXY 或与别人共用的账户在 proxyPoolWakeDelay 之后合并重推（这段时间里多半有 Worker 来占它）
@@ -1256,6 +1263,8 @@ func (lease *proxyPoolLease) attach(worker proxyPoolCloser) {
 				if session := pool.sessions[lease.accountID]; session != nil {
 					session.strikes, session.firstStrike = 0, time.Time{}
 				}
+				// 会话通了：去掉固定会话下“会话连不通、没有自动换”的记录
+				pool.fixedSessionAttachedLocked(lease)
 			}
 		}
 		if lease.accountID != "" {
@@ -1281,20 +1290,20 @@ func (lease *proxyPoolLease) launchFailed(cause error, canceled bool) {
 	pool.mu.Lock()
 	var logs []proxyPoolLog
 	var cooled []proxyPoolCooling
-	rotated := ""
+	rotated, rotateReason := "", ""
 	if !lease.released && !canceled && cause != nil && lease.pooled && errors.Is(cause, proxyrelay.ErrUpstream) {
 		now := pool.now()
 		if lease.port != 0 {
 			logs, cooled = pool.upstreamFailureLocked(lease, now)
 		} else if lease.accountID != "" {
 			var rotateLogs []proxyPoolLog
-			rotated, rotateLogs = pool.sessionStrikeLocked(lease, now)
+			rotated, rotateLogs, rotateReason = pool.sessionStrikeLocked(lease, now)
 			logs = append(logs, rotateLogs...)
 		}
 	}
 	logs = append(logs, pool.releaseLocked(lease)...)
 	if rotated != "" {
-		logs = append(logs, pool.rotationLogLocked(lease.accountID, lease.logSource(), rotated, "连续 2 次出口连不通"))
+		logs = append(logs, pool.rotationLogLocked(lease.accountID, lease.logSource(), rotated, rotateReason))
 	}
 	logs = append(logs, pool.takeFixedLogsLocked()...)
 	hook := pool.onPortCooled
@@ -1604,6 +1613,9 @@ func (pool *proxyPool) coolLocked(port int, rule, reason string, now time.Time) 
 		// 固定分配：固定端口就是这个端口的账户不重启（暂停使用、等端口恢复，驻留 Worker 按不可调度释放）；只关掉开启前就在这个端口上的过渡
 		// Worker，它们下次启动回到自己的固定端口（回到固定端口，不是挪端口）
 		cooling.Fixed = true
+		// 坏 IP 自动换（上限为 0、已熔断、没有可挪的端口、端口上没有固定账户时什么也不挪）：必须在过滤 Workers 之前，被挪账户的固定端口
+		// 已是新端口，它们正用这个端口服务的 Worker 留在 Workers 里，由冷却回调照“换 IP”的方式登记后台关闭
+		cooling.Replaced = pool.fixedAutoReplaceLocked(port, rule, now)
 		cooling.Workers = slices.DeleteFunc(cooling.Workers, func(accountID string) bool {
 			entry, ok := pool.fixed.entries[accountID]
 			return ok && entry.port == port
@@ -1641,10 +1653,10 @@ func (pool *proxyPool) erroredPortsLocked(port int, now time.Time) (int, int) {
 }
 
 // sessionStrikeLocked 动态 IP：同一账户 30 分钟内 2 次代理上游失败的启动失败、距上次换会话不少于 10 分钟时换会话（代号 +1，持久化）。
-// 返回换会话前的会话号（没有换时为空）与日志
-func (pool *proxyPool) sessionStrikeLocked(lease *proxyPoolLease, now time.Time) (string, []proxyPoolLog) {
+// 返回换会话前的会话号（没有换时为空）、日志与换会话日志的原因（固定会话下见 fixedSessionDecideLocked）
+func (pool *proxyPool) sessionStrikeLocked(lease *proxyPoolLease, now time.Time) (string, []proxyPoolLog, string) {
 	if pool.settings.cfg.Mode != config.ProxyPoolDynamic || pool.sessionURLLocked(lease.slot) != lease.url {
-		return "", nil
+		return "", nil, ""
 	}
 	session := pool.sessionStateLocked(lease.accountID)
 	if session.strikes > 0 && now.Sub(session.firstStrike) > proxyPoolSessionWindow {
@@ -1657,15 +1669,16 @@ func (pool *proxyPool) sessionStrikeLocked(lease *proxyPoolLease, now time.Time)
 	logs := []proxyPoolLog{{source: lease.logSource(), level: "WARN", message: fmt.Sprintf(
 		"IP 池出口连不通 | 会话=%s | 连续=%d/%d", lease.slot, session.strikes, proxyPoolUpstreamFails)}}
 	if session.strikes < proxyPoolUpstreamFails || !session.rotatedAt.IsZero() && now.Sub(session.rotatedAt) < proxyPoolRotateInterval {
-		return "", logs
+		return "", logs, ""
 	}
-	if keepLogs, kept := pool.fixedSessionKeepLocked(lease, session.strikes, now); kept {
-		// 固定会话：不换会话，账户一直用它的会话号
-		return "", append(logs, keepLogs...)
+	keepLogs, kept, reason := pool.fixedSessionDecideLocked(lease, session.strikes, now)
+	if kept {
+		// 固定会话：不换会话（上限为 0、坏会话过多已停止自动换），账户一直用它的会话号
+		return "", append(logs, keepLogs...), ""
 	}
 	previous := pool.sessionLocked(lease.accountID)
 	pool.rotateLocked(lease.accountID, now)
-	return previous, logs
+	return previous, append(logs, keepLogs...), reason
 }
 
 // rotateLocked 把账户的会话代号 +1（超过上限回到 1）并持久化
@@ -2291,6 +2304,10 @@ func (pool *proxyPool) bindingLocked(accountID string, state *proxyPoolAccount, 
 		port := pool.fixedPortLocked(accountID, batch.now, state.known)
 		hold := pool.fixedHoldTextLocked(port, batch.now)
 		if lease := pool.bindingLeaseLocked(accountID); lease != nil {
+			if hold == "" {
+				// 绑定所用的 Worker 还在已自动换 IP 停用的旧端口上：暂停调度到它关闭（见 fixedAutoHoldLocked）
+				hold = pool.fixedAutoHoldLocked(lease, port)
+			}
 			return &aistudio.ProxyBinding{URL: lease.url, Slot: lease.slot, Active: true, EgressTag: lease.egressTag, Hold: hold}
 		}
 		return &aistudio.ProxyBinding{URL: pool.staticURLLocked(port), Slot: strconv.Itoa(port), Hold: hold}

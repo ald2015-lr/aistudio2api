@@ -1564,6 +1564,11 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	if value.ProxyPoolFixed != nil {
 		poolSettings.Fixed = *value.ProxyPoolFixed
 	}
+	// 坏 IP 自动换的上限：旧版页面保存时不带该字段，沿用现值（0 表示不自动换，不能用零值判断是否缺省）；范围由下面的 Validate 校验
+	autoReplace := saved.ProxyPoolFixedAutoReplace
+	if value.ProxyPoolFixedAutoReplace != nil {
+		autoReplace = *value.ProxyPoolFixedAutoReplace
+	}
 	cfg := config.Config{
 		AuthStates: value.AuthStates, ListenAddr: value.ListenAddr, ProxyAPIKey: config.EffectiveProxyAPIKey(value.APIKey),
 		Proxy: proxy, ProxyPool: poolSettings, InitTimeout: initTimeout, RequestTimeout: requestTimeout, FirstEventTimeout: firstEventTimeout,
@@ -1602,6 +1607,8 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 		AdminPassword:          adminPassword,
 		DowngradeGuard:         downgradeGuard,
 		Media:                  media,
+		// 漏写会被存成 0（静默关闭自动换）
+		ProxyPoolFixedAutoReplace: autoReplace,
 	}
 	if err := cfg.Validate(); err != nil {
 		return api.RuntimeConfig{}, invalidConfigError(err)
@@ -1617,6 +1624,10 @@ func (admin *runtimeAdmin) UpdateRuntimeConfig(_ context.Context, value api.Runt
 	// 文件里有这一行后照常写真实值
 	if !poolSettings.Fixed && !config.KeyConfigured(admin.configPath, "PROXY_POOL_FIXED") {
 		unset = append(unset, "PROXY_POOL_FIXED")
+	}
+	// 坏 IP 自动换的上限同理：从没写过这一项、保存的是默认值时不写，.env 与加入这一项之前逐字节相同
+	if autoReplace == config.DefaultProxyPoolFixedAutoReplace && !config.KeyConfigured(admin.configPath, "PROXY_POOL_FIXED_AUTO_REPLACE") {
+		unset = append(unset, "PROXY_POOL_FIXED_AUTO_REPLACE")
 	}
 	if err := cfg.SaveKeepingUnset(admin.configPath, uneditedInvalidConfigKeys(saved.Invalid), unset); err != nil {
 		return api.RuntimeConfig{}, err
@@ -2342,6 +2353,7 @@ func buildVersion() string {
 func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 	media := cfg.Media.Normalized()
 	proxyPoolFixed := cfg.ProxyPool.Fixed
+	proxyPoolFixedAutoReplace := cfg.ProxyPoolFixedAutoReplace
 	streamPlaygroundModels := append([]string{}, cfg.StreamPlaygroundModels...)
 	primaryModels := append([]string{}, cfg.PrimaryModels...)
 	ultraPrimaryModels := append([]string{}, cfg.UltraPrimaryModels...)
@@ -2401,6 +2413,8 @@ func runtimeConfigDTO(cfg config.Config) api.RuntimeConfig {
 		MediaRetention:         config.FormatMediaRetention(media.Retention),
 		MediaMaxSize:           config.FormatMediaSize(media.MaxBytes),
 		InvalidConfig:          invalidConfigDTO(cfg.Invalid),
+		// 坏 IP 自动换的上限（读取时总是返回）
+		ProxyPoolFixedAutoReplace: &proxyPoolFixedAutoReplace,
 	}
 }
 

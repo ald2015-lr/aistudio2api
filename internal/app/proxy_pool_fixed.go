@@ -22,9 +22,11 @@ import (
 //   - 静态：每个走 IP 池的账户（登记过、没有自己的代理，不论启用与状态）在固定表里有一个端口，按账户数平均分到端口段的端口上；同一端口的
 //     账户共用这个 IP、可以同时开浏览器（固定租约不独占、不写亲和与归属）。账户的 Worker、登录、验证、导入与 Go 侧出口都只用固定端口；
 //     固定表只在删除账户、账户改用自己的代理、端口段变化（只挪段外的）与管理员确认的“重新平均分配”“换 IP”时改变，冷却、被其他进程占用、
-//     热更新其他设置、重启、更新都不改变。端口冷却或被其他进程占用时这个端口上的账户暂停使用（绑定带 Hold，账户池按 AccountProxyPaused
-//     排除调度），等端口恢复，不换端口、不走默认代理、不直连；
-//   - 动态：不再自动换会话（连续出口连不通与出口判定都不换），每个账户一直用它的会话号；
+//     热更新其他设置、重启、更新都不改变（例外是坏 IP 自动换：PROXY_POOL_FIXED_AUTO_REPLACE 大于 0 时端口冷却的少数端口自动挪走账户，见
+//     proxy_pool_fixed_auto.go；为 0 时同原来）。端口被其他进程占用、或冷却却没有自动换（上限为 0、坏得太多已停止、没有可挪的端口）时这个
+//     端口上的账户暂停使用（绑定带 Hold，账户池按 AccountProxyPaused 排除调度），等端口恢复，不走默认代理、不直连；
+//   - 动态：每个账户一直用它的会话号（出口判定不换会话）；连续出口连不通时少数会话自动换（PROXY_POOL_FIXED_AUTO_REPLACE，为 0 时同原来：
+//     不再自动换会话）；
 //   - 关闭（默认）：以下全部分支以 fixedStaticLocked / fixedDynamicLocked 或“固定表、预留、暂停记录非空”守门，与原来逐字节一致；
 //     固定表保留（休眠），只有删除账户会释放其中的位置。
 //
@@ -118,11 +120,14 @@ type proxyPoolFixed struct {
 	logs           []proxyPoolLog
 	notify         bool // 有账户页可见的变化（端口暂停与恢复、开启与关闭、对齐改了分配表）待推送账户列表，takeFixedLogsLocked 取走时换成回调
 	dirty          bool
+	autoOnDisk     bool // 文件里有自动换的状态（启动时读到或上次写入时有）：之后自动换的状态清空也要写盘，否则旧的熔断留在文件里
 	saveTimer      *time.Timer
 	saveMu         sync.Mutex
 	externalWarned string               // 固定分配下外部占用 WARN 的去重键
 	sessionWarned  map[string]time.Time // 动态固定会话“不换会话”WARN 的账户 → 上次时间
 	lazyAssigned   int                  // 惰性分配的次数（测试：首次开启与重启路径里应为 0）
+	// auto 为坏 IP 自动换（PROXY_POOL_FIXED_AUTO_REPLACE）的计数、熔断与自动换过的端口（见 proxy_pool_fixed_auto.go）；上限为 0 时永远为空
+	auto proxyPoolFixedAuto
 }
 
 // proxyPoolFixedEntry 为一个账户的固定端口：at 为分配时间，source 为来源代码
@@ -164,6 +169,7 @@ func (fixed *proxyPoolFixed) init(poolPath string) {
 	fixed.adding = make(map[string]time.Time)
 	fixed.held = make(map[int]proxyPoolFixedHold)
 	fixed.sessionWarned = make(map[string]time.Time)
+	fixed.auto.init()
 }
 
 // fixedStaticLocked 判断静态固定分配生效：开关开启、静态模式且有可分配的端口段。调用方持有 pool.mu
@@ -466,6 +472,8 @@ func (pool *proxyPool) fixedPortChangedLocked(port int, now time.Time) {
 	count := pool.fixedCountLocked(port)
 	switch {
 	case reason == "" || count == 0 || !pool.inRangeLocked(port):
+		// 端口恢复、空了或离开端口段：“没有可挪的端口”的记录随之去掉
+		pool.fixedAutoForgetPortLocked(port)
 		if !had {
 			if reason == "" {
 				// 没有登记过暂停、已推送的绑定却带着暂停说明（绑定先于登记推送：账户刚被分到正在暂停、还没登记的端口上，同一次 wake
@@ -514,9 +522,15 @@ func (pool *proxyPool) fixedPortChangedLocked(port int, now time.Time) {
 func (pool *proxyPool) fixedRepushStaleHoldsLocked(port int) {
 	var stale []string
 	for _, accountID := range pool.fixedUsersLocked(port) {
-		if state := pool.accounts[accountID]; state != nil && state.binding != nil && state.binding.Hold != "" {
-			stale = append(stale, accountID)
+		state := pool.accounts[accountID]
+		if state == nil || state.binding == nil || state.binding.Hold == "" {
+			continue
 		}
+		if pool.fixedAutoHoldLocked(pool.bindingLeaseLocked(accountID), port) == state.binding.Hold {
+			// 自动换 IP 的暂停（旧端口上的 Worker 还没关闭）不是过期的说明
+			continue
+		}
+		stale = append(stale, accountID)
 	}
 	if len(stale) > 0 {
 		pool.pushLocked(stale...)
@@ -638,6 +652,9 @@ func (pool *proxyPool) fixedReconcileLocked(present map[string]bool, now time.Ti
 			delete(fixed.excluded, port)
 			changed = true
 		}
+	}
+	if pool.fixedAutoReconcileLocked() {
+		changed = true
 	}
 	var movers []string
 	for accountID, entry := range fixed.entries {
@@ -774,9 +791,17 @@ func (pool *proxyPool) fixedConfigureLocked(old proxyPoolSettings, now time.Time
 	}
 	if wasStatic && !nowStatic {
 		clear(fixed.held)
+		clear(fixed.auto.noTarget)
 		fixed.nextCheck, fixed.rescan = time.Time{}, false
 		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", durable: true, message: fmt.Sprintf(
 			"IP 池固定分配已关闭，分配表保留（再次开启时沿用） | 账户=%d | 运行中的浏览器关闭后按原方式分配端口", len(fixed.entries))})
+	}
+	if wasDynamic && !nowDynamic {
+		clear(fixed.auto.stuck)
+	}
+	if !old.initialized && (nowStatic || nowDynamic) {
+		// 启动时的第一次生效：读回的自动换状态仍是“坏得太多已停止”时提示（只有管理页“恢复自动换”解除）
+		logs = append(logs, pool.fixedAutoStartupLogLocked(nowDynamic)...)
 	}
 	switch {
 	case !old.initialized:
@@ -788,8 +813,12 @@ func (pool *proxyPool) fixedConfigureLocked(old proxyPoolSettings, now time.Time
 				accounts++
 			}
 		}
-		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", durable: true, message: fmt.Sprintf(
-			"IP 池固定会话已开启：不再自动换会话 | 账户=%d", accounts)})
+		message := fmt.Sprintf("IP 池固定会话已开启：不再自动换会话 | 账户=%d", accounts)
+		if limit := fixed.auto.limit; limit > 0 {
+			// 坏会话自动换（PROXY_POOL_FIXED_AUTO_REPLACE 大于 0）：少数会话连不通时照常换，坏得太多才停止
+			message = fmt.Sprintf("IP 池固定会话已开启：会话连不通时自动换会话，30 分钟内超过 %d 个就停止自动换、等手动处理 | 账户=%d", limit, accounts)
+		}
+		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", durable: true, message: message})
 	case wasDynamic && !nowDynamic:
 		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", durable: true, message: "IP 池固定会话已关闭，连续出口连不通时恢复自动换会话"})
 	}
@@ -994,6 +1023,8 @@ func (pool *proxyPool) releaseFixed(accountID, reason string) {
 	}
 	pool.mu.Lock()
 	delete(pool.fixed.adding, accountID)
+	// 会话连不通的记录随账户删除；窗口里的计数保留到过期（删账户不让计数变少）
+	delete(pool.fixed.auto.stuck, accountID)
 	port, ok := pool.fixedDropLocked(accountID)
 	var logs []proxyPoolLog
 	if ok {
@@ -1087,6 +1118,10 @@ func (pool *proxyPool) fixedStatusLocked(now time.Time, known map[string]struct{
 			}
 		}
 		for port := range fixed.excluded {
+			if _, auto := fixed.auto.replaced[port]; auto && fixed.auto.limit > 0 {
+				// 自动换过的端口列在 auto.replaced 里（上限为 0 时没有 auto 区块，照常列在这里）；ExcludedTotal 仍为全部停用端口数
+				continue
+			}
 			status.Excluded = append(status.Excluded, port)
 		}
 		sort.Ints(status.Excluded)
@@ -1104,7 +1139,7 @@ func (pool *proxyPool) fixedStatusLocked(now time.Time, known map[string]struct{
 				status.PausedPorts++
 				status.PausedAccounts += len(users)
 				status.Paused = append(status.Paused, api.AdminProxyPoolPausedPort{
-					Port: port, Reason: reason, Until: proxyPoolUTC(until), Accounts: len(users),
+					Port: port, Reason: reason, Until: proxyPoolUTC(until), Accounts: len(users), Auto: pool.fixedAutoPausedLocked(port, reason),
 				})
 			}
 		}
@@ -1117,6 +1152,7 @@ func (pool *proxyPool) fixedStatusLocked(now time.Time, known map[string]struct{
 		if len(status.Paused) > proxyPoolFixedListLimit {
 			status.Paused = status.Paused[:proxyPoolFixedListLimit]
 		}
+		status.Auto = pool.fixedAutoStatusLocked(now, false)
 		return status
 	case pool.fixedDynamicLocked():
 		status := &api.AdminProxyPoolFixed{Mode: config.ProxyPoolDynamic}
@@ -1125,6 +1161,7 @@ func (pool *proxyPool) fixedStatusLocked(now time.Time, known map[string]struct{
 				status.Accounts++
 			}
 		}
+		status.Auto = pool.fixedAutoStatusLocked(now, true)
 		return status
 	}
 	return nil
@@ -1437,6 +1474,7 @@ func (pool *proxyPool) fixedRestore(port int) (api.ProxyPoolFixedRestoreResult, 
 	var logs []proxyPoolLog
 	if _, ok := pool.fixed.excluded[port]; ok {
 		delete(pool.fixed.excluded, port)
+		pool.fixedAutoRestoreLocked(port)
 		pool.fixedMarkDirtyLocked()
 		result.Restored = true
 		logs = append(logs, proxyPoolLog{source: "service", level: "INFO", durable: true, message: fmt.Sprintf("IP 池固定端口恢复分配 | 端口=%d", port)})
@@ -1461,6 +1499,8 @@ type proxyPoolFixedRecord struct {
 	PortEnd   int                                  `json:"port_end,omitempty"`
 	Accounts  map[string]proxyPoolFixedEntryRecord `json:"accounts"`
 	Excluded  map[string]time.Time                 `json:"excluded,omitempty"`
+	// Auto 为坏 IP 自动换的计数、熔断与自动换过的端口（没有时不写；旧版读到忽略，改写文件时丢掉）
+	Auto *proxyPoolFixedAutoRecord `json:"auto,omitempty"`
 }
 
 type proxyPoolFixedEntryRecord struct {
@@ -1517,6 +1557,8 @@ func (pool *proxyPool) loadFixed() []proxyPoolLog {
 			fixed.excluded[port] = at
 		}
 	}
+	pool.fixedAutoLoad(record.Auto)
+	fixed.autoOnDisk = record.Auto != nil
 	return nil
 }
 
@@ -1544,7 +1586,11 @@ func (pool *proxyPool) fixedFlush() {
 		fixed.saveTimer.Stop()
 		fixed.saveTimer = nil
 	}
-	if fixed.path == "" || !fixed.dirty || fixed.since.IsZero() && len(fixed.entries) == 0 && len(fixed.excluded) == 0 {
+	// 自动换的窗口记录先按此刻剪掉过期的：只剩过期记录时与没有一样；文件里有自动换的状态时照常写（清空也要落盘）。从没有过自动换的状态时
+	// 条件与没有这项设置时相同
+	fixed.auto.prune(pool.now())
+	if fixed.path == "" || !fixed.dirty ||
+		!fixed.autoOnDisk && fixed.since.IsZero() && len(fixed.entries) == 0 && len(fixed.excluded) == 0 && !fixed.auto.persistent() {
 		if fixed.path == "" {
 			fixed.dirty = false
 		}
@@ -1558,6 +1604,11 @@ func (pool *proxyPool) fixedFlush() {
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err == nil {
 		err = writeFileAtomic(path, append(data, '\n'), 0o600)
+	}
+	if err == nil {
+		pool.mu.Lock()
+		fixed.autoOnDisk = record.Auto != nil
+		pool.mu.Unlock()
 	}
 	if err != nil {
 		pool.mu.Lock()
@@ -1584,6 +1635,7 @@ func (pool *proxyPool) fixedSnapshotLocked(now time.Time) proxyPoolFixedRecord {
 			record.Excluded[strconv.Itoa(port)] = proxyPoolUTC(at)
 		}
 	}
+	record.Auto = pool.fixedAutoSnapshotLocked(now)
 	return record
 }
 

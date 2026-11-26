@@ -693,6 +693,11 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		ProxyPool: active.ProxyPool, OmniIgnoreSystemPrompt: active.OmniIgnoreSystemPrompt, OmniImageBinding: active.OmniImageBinding,
 		ModelFallbacks: active.ModelFallbacks, ModelFallbackScope: active.ModelFallbackScope,
 		StudioKeyDelaySeconds: active.StudioKeyDelaySeconds, AbnormalFinishError: active.AbnormalFinishError,
+		ProxyPoolFixedAutoReplace: active.ProxyPoolFixedAutoReplace,
+	}
+	// 坏 IP 自动换的上限：提交时省略（旧版页面）按生效值比较
+	if value.ProxyPoolFixedAutoReplace != nil {
+		saved.ProxyPoolFixedAutoReplace = *value.ProxyPoolFixedAutoReplace
 	}
 	// 获取 API Key 的间隔：提交时省略（旧版页面）按生效值比较
 	if value.StudioKeyDelay != nil {
@@ -825,7 +830,8 @@ func sameDataConfig(value api.RuntimeConfig, active config.Config, overrides dat
 		slices.Equal(saved.UltraOnlyModels, active.UltraOnlyModels) && slices.Equal(saved.PaidOnlyModels, active.PaidOnlyModels) &&
 		saved.ModelFallbacks == active.ModelFallbacks && saved.ModelFallbackScope == active.ModelFallbackScope &&
 		saved.StudioKeyDelaySeconds == active.StudioKeyDelaySeconds &&
-		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media)
+		saved.ProxyPool.Equal(active.ProxyPool) && saved.Media.Equal(active.Media) &&
+		saved.ProxyPoolFixedAutoReplace == active.ProxyPoolFixedAutoReplace
 }
 
 var _ aistudio.Service = (*runtimeManager)(nil)

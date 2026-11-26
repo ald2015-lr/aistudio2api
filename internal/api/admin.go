@@ -722,6 +722,9 @@ type RuntimeConfig struct {
 	// ProxyPoolFixed 为 IP 池固定分配（PROXY_POOL_FIXED，保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值。
 	// 不放进 ProxyPoolConfig：旧版页面带着不含它的 proxy_pool 保存时不能把开关关掉
 	ProxyPoolFixed *bool `json:"proxy_pool_fixed,omitempty"`
+	// ProxyPoolFixedAutoReplace 为固定分配下 30 分钟内最多自动换几个坏 IP（坏会话）（PROXY_POOL_FIXED_AUTO_REPLACE，0 到 5000，0 为不自动换，
+	// 保存后立即生效），读取时总是返回；保存时没有该字段（旧版页面）则沿用现值
+	ProxyPoolFixedAutoReplace *int `json:"proxy_pool_fixed_auto_replace,omitempty"`
 	// MediaOutput、MediaBaseURL、MediaRetention、MediaMaxSize 为生成媒体的输出与保存设置（MEDIA_OUTPUT、MEDIA_BASE_URL、
 	// MEDIA_RETENTION、MEDIA_MAX_SIZE，保存后立即生效），读取时总是返回；保存时没有这些字段（旧版页面）则沿用现值。
 	// 期限与大小为文本（7d、72h、20GB，0 表示不清理或不限）；服务地址可以清空，所以用指针区分缺省
@@ -914,6 +917,8 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/proxy/pool/fixed/rebalance", s.handleRebalanceProxyPool)
 	mux.HandleFunc("POST /api/proxy/pool/fixed/ports/{port}/reassign", s.handleReassignProxyPoolPort)
 	mux.HandleFunc("POST /api/proxy/pool/fixed/ports/{port}/restore", s.handleRestoreProxyPoolPort)
+	mux.HandleFunc("POST /api/proxy/pool/fixed/auto/resume", s.handleResumeProxyPoolAuto)
+	mux.HandleFunc("POST /api/proxy/pool/fixed/accounts/{id}/rotate", s.handleRotateProxyPoolSession)
 	mux.HandleFunc("GET /api/cooldowns", s.handleCooldowns)
 	mux.HandleFunc("GET /api/accounts/permission-denied", s.handlePermissionDenied)
 	mux.HandleFunc("POST /api/accounts/permission-denied/clear", s.handleClearPermissionDenied)

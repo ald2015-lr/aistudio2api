@@ -81,7 +81,8 @@ func (service *trackedService) relaxProxyPort(cooling proxyPoolCooling) {
 	restarted, unregistered := 0, 0
 	source := workerResetProxyPort
 	if cooling.Fixed {
-		// 固定分配：cooling.Workers 只有不在固定端口上的过渡 Worker，关掉后下次启动回到它们自己的固定端口
+		// 固定分配：cooling.Workers 只有固定端口已不是这个端口的 Worker（过渡 Worker，或刚被自动换 IP 挪走的账户），关掉后下次启动用它们自己的
+		// 固定端口
 		source = workerResetProxyFixed
 	}
 	if service.workers != nil {
@@ -112,6 +113,13 @@ func (service *trackedService) relaxProxyPort(cooling proxyPoolCooling) {
 	skipped := ""
 	if unregistered > 0 {
 		skipped = fmt.Sprintf(" | 未登记=%d", unregistered)
+	}
+	if cooling.Fixed && cooling.Replaced > 0 {
+		service.requests.logDurable("service", "INFO", fmt.Sprintf(
+			"IP 池端口冷却：固定分配已自动换 IP，关闭用这个端口的 Worker | 端口=%d | 规则=%s | 挪动=%d | 撤回账号=%d | 撤回坏号=%d | 失败=%d | 关闭 Worker=%d%s | 耗时=%s",
+			cooling.Port, rule, cooling.Replaced, relaxed, pardoned, failed, restarted, skipped, time.Since(startedAt).Round(time.Millisecond),
+		))
+		return
 	}
 	if cooling.Fixed {
 		service.requests.logDurable("service", "INFO", fmt.Sprintf(

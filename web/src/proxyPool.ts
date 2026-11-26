@@ -1,6 +1,11 @@
 // IP 池的界面辅助：组合校验与容量估算只用于设置页提示与提交前的检查，最终以服务端 ProxyPool.Validate 为准
 import type { TranslationKey } from '@/i18n'
-import type { ProxyPoolConfig, ProxyPoolFixedStatus, ProxyPoolStatus } from '@/types'
+import type {
+  ProxyPoolConfig,
+  ProxyPoolFixedAuto,
+  ProxyPoolFixedStatus,
+  ProxyPoolStatus,
+} from '@/types'
 
 // 与服务端 config.DefaultProxyPoolPortStart、DefaultProxyPoolPortEnd、MaxProxyPoolPorts 一致
 export const DEFAULT_PROXY_POOL_PORT_START = 10001
@@ -202,6 +207,31 @@ export function proxyPoolFixedActive(
 // proxyPoolFixedStatic 判断静态 IP 的固定分配生效（账户各有固定端口、同端口的账户共用这个 IP）
 export function proxyPoolFixedStatic(status: ProxyPoolStatus | null | undefined): boolean {
   return proxyPoolFixedActive(status)?.mode === 'static'
+}
+
+// proxyPoolAutoHalted 返回生效中、已停止自动换（坏 IP 或坏会话过多）的自动换状态；没有停止、上限为 0 或旧版服务端时为 null
+export function proxyPoolAutoHalted(
+  status: ProxyPoolStatus | null | undefined,
+): (ProxyPoolFixedAuto & { mode: 'static' | 'dynamic' }) | null {
+  const fixed = proxyPoolFixedActive(status)
+  const auto = fixed?.auto
+  if (fixed === null || auto === undefined || !auto.halted) return null
+  return { ...auto, mode: fixed.mode }
+}
+
+// isAutoReplaceLimit 判断坏 IP 自动换的上限合法：0 到 5000 的整数（与服务端校验相同）
+export function isAutoReplaceLimit(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 5000
+}
+
+const autoTagKeys: Record<string, TranslationKey> = {
+  halted: 'settings.proxyPoolAutoTagHalted',
+  no_target: 'settings.proxyPoolAutoTagNoTarget',
+}
+
+// proxyPoolAutoTagKey 返回暂停端口没有自动换的原因（paused[].auto）的翻译键；没有或不认识时为 null
+export function proxyPoolAutoTagKey(auto: string | undefined): TranslationKey | null {
+  return auto === undefined ? null : (autoTagKeys[auto] ?? null)
 }
 
 const pauseReasonKeys: Record<string, TranslationKey> = {

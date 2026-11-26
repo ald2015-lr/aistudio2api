@@ -56,7 +56,8 @@ func newRuntime(
 
 	requests.log("service", "INFO", "运行时装配 | 3/3 | 创建协议客户端")
 	// IP 池（进程级）先按本次配置生效，再给还没进入账户池的账户对象写默认出口：账户池、公共头与 Go 侧请求第一次就按带绑定的
-	// EffectiveProxy 取出口（见 proxy_pool.go）
+	// EffectiveProxy 取出口（见 proxy_pool.go）。坏 IP 自动换的上限先于 configure 设置：第一次生效时要读到它（读回的熔断提示）
+	proxyPool.setFixedAutoReplace(cfg.ProxyPoolFixedAutoReplace)
 	proxyPool.configure(cfg.ProxyPool, cfg.Proxy, proxyPoolCapacity(cfg, hasProAccounts(accounts)))
 	// 固定分配：账户进账户池、第一次 prime 之前按载入的账户一次对齐完（之后 prime 不再惰性分配）
 	proxyPool.prepareFixed(accounts)

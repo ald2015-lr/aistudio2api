@@ -37,7 +37,12 @@ import RequestsPanel from '@/components/RequestsPanel.vue'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
-import { formatClock, proxyPoolFixedActive, proxyPoolPauseReasonKey } from '@/proxyPool'
+import {
+  formatClock,
+  proxyPoolAutoHalted,
+  proxyPoolFixedActive,
+  proxyPoolPauseReasonKey,
+} from '@/proxyPool'
 import { elapsedSecondsSince, syncServerClock, useSecondClock } from '@/serverClock'
 import { readStorage, writeStorage } from '@/storage'
 
@@ -487,6 +492,49 @@ async function openProPoolSettings(): Promise<void> {
   }
 }
 
+// proxyPoolAutoNotice 为坏 IP（固定会话下为坏会话）过多、已停止自动换时侧栏的醒目提示：不可关闭，管理页点“恢复自动换”后服务端不再返回
+// halted；悬停看停止时间、计数与原因（超过上限、静态下能用的端口会不到一半、换过的新 IP 或新会话又坏了、坏掉的账户超过一半），停止之后又坏的
+// 个数大于 0 时附在后面；“去处理”打开设置页并
+// 滚动到 IP 池分组
+const proxyPoolAutoNotice = computed(() => {
+  const auto = proxyPoolAutoHalted(status.value?.proxy_pool)
+  if (auto === null) return null
+  const dynamic = auto.mode === 'dynamic'
+  const params = {
+    time: formatClock(auto.halted_at, locale.value),
+    count: auto.halted_count ?? 0,
+    limit: auto.limit,
+  }
+  let key: TranslationKey = 'app.proxyPoolAutoHaltedDetail'
+  if (auto.halted_reason === 'half') key = 'app.proxyPoolAutoHaltedDetailHalf'
+  else if (auto.halted_reason === 'chain')
+    key = dynamic ? 'app.proxyPoolAutoHaltedDetailChainDynamic' : 'app.proxyPoolAutoHaltedDetailChain'
+  else if (auto.halted_reason === 'accounts')
+    key = dynamic ? 'app.proxyPoolAutoHaltedDetailAccountsDynamic' : 'app.proxyPoolAutoHaltedDetailAccounts'
+  let detail = tf(key, params)
+  const skipped = auto.skipped ?? 0
+  if (skipped > 0) detail += tf('app.proxyPoolAutoHaltedSkipped', { skipped })
+  return {
+    text: t(dynamic ? 'app.proxyPoolAutoHaltedDynamic' : 'app.proxyPoolAutoHalted'),
+    detail,
+  }
+})
+
+// openProxyPoolSettings 为提示里的“去处理”：切到设置页并滚动到 IP 池分组（写法同 openProPoolSettings）
+async function openProxyPoolSettings(): Promise<void> {
+  currentTab.value = 'settings'
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    await nextTick()
+    if (currentTab.value !== 'settings') return
+    const section = document.querySelector('[data-testid="settings-proxy-pool"]')
+    if (section) {
+      section.scrollIntoView({ block: 'start' })
+      return
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
 // proTierAccounts 为权益为 Pro 的账户数（按账户列表的真实权益，与服务端装配时判断 Pro 分区是否为空的口径相同），设置页估算 IP 池端口需求时用
 const proTierAccounts = computed(
   () =>
@@ -553,6 +601,15 @@ const proxyPoolLine = computed(() => {
         tf('app.proxyPoolDetailFixedTransitional', { count: fixed.transitional ?? 0 }),
       )
     }
+    if (fixed.auto !== undefined) {
+      details.push(
+        tf('app.proxyPoolDetailAuto', {
+          limit: fixed.auto.limit,
+          recent: fixed.auto.recent,
+          replaced: fixed.auto.replaced_total ?? 0,
+        }),
+      )
+    }
   } else if (pool.mode === 'static') {
     parts.push(
       tf('app.proxyPoolStatic', {
@@ -589,6 +646,11 @@ const proxyPoolLine = computed(() => {
     )
     if (fixed !== null) {
       details.push(tf('app.proxyPoolDetailFixedDynamic', { accounts: fixed.accounts }))
+      if (fixed.auto !== undefined) {
+        details.push(
+          tf('app.proxyPoolDetailAutoDynamic', { limit: fixed.auto.limit, recent: fixed.auto.recent }),
+        )
+      }
     }
   } else {
     parts.push(t('app.proxyPoolOff'))
@@ -600,6 +662,11 @@ const proxyPoolLine = computed(() => {
     parts.push(tf('app.proxyPoolExternal', { count: pool.external }))
   }
   if (pool.orphaned > 0) parts.push(tf('app.proxyPoolOrphaned', { count: pool.orphaned }))
+  // 坏 IP（会话）过多、已停止自动换：一行里追加并标黄（侧栏上方另有醒目提示）
+  const autoHalted = fixed?.auto?.halted === true
+  if (autoHalted) {
+    parts.push(t(fixed?.mode === 'dynamic' ? 'app.proxyPoolAutoStoppedDynamic' : 'app.proxyPoolAutoStopped'))
+  }
   if ((pool.cooling_ports ?? []).length > 0) {
     details.push(
       tf('app.proxyPoolDetailCooling', {
@@ -640,9 +707,11 @@ const proxyPoolLine = computed(() => {
   return {
     text: parts.join(' · '),
     detail: details.join('；'),
-    warn: fixedStatic
-      ? (fixed?.paused_ports ?? 0) > 0 || pool.orphaned > 0
-      : shortage || pool.shared > 0 || pool.orphaned > 0,
+    warn:
+      autoHalted ||
+      (fixedStatic
+        ? (fixed?.paused_ports ?? 0) > 0 || pool.orphaned > 0
+        : shortage || pool.shared > 0 || pool.orphaned > 0),
   }
 })
 
@@ -1118,6 +1187,26 @@ onUnmounted(() => {
         :class="switching ? 'launching-shell' : ''"
       >
         <div v-if="switching" class="launching-scan" aria-hidden="true"></div>
+        <!-- 坏 IP（会话）过多、已停止自动换：红色、不可关闭，点“去处理”打开设置页的 IP 池分组；悬停看停止时间与计数 -->
+        <div
+          v-if="proxyPoolAutoNotice"
+          v-tooltip="proxyPoolAutoNotice.detail"
+          class="mb-3 rounded border border-red-500/50 bg-red-500/15 px-2 py-1.5 text-[11px] leading-4 text-red-200"
+          role="alert"
+          data-testid="proxy-pool-auto-halted-notice"
+        >
+          <p class="font-bold break-words">
+            {{ proxyPoolAutoNotice.text }}
+            <button
+              type="button"
+              class="whitespace-nowrap font-normal text-red-100 underline underline-offset-2 hover:text-white"
+              data-testid="proxy-pool-auto-halted-open"
+              @click="openProxyPoolSettings"
+            >
+              {{ t('app.proxyPoolAutoHaltedOpen') }}
+            </button>
+          </p>
+        </div>
         <!-- PRO_POOL 默认开启的升级提示：可关闭，点“去设置”打开设置页并滚动到 Pro 号池分组；悬停看完整说明 -->
         <div
           v-if="proPoolNotice"

@@ -62,8 +62,10 @@ const (
 	// workerResetProxyPort：IP 池端口冷却，让正用这个端口的 Worker 换端口重启（见 proxy_pool_egress.go）
 	workerResetProxyPort
 	// workerResetProxyFixed：IP 池固定分配下把不在固定端口上的 Worker 关掉，下次启动用固定端口（端口冷却回调里的过渡 Worker
-	// 与“给端口换 IP”共用，见 proxy_pool_egress.go、proxy_pool_admin.go）
+	// 与“给端口换 IP”、坏 IP 自动换共用，见 proxy_pool_egress.go、proxy_pool_admin.go）
 	workerResetProxyFixed
+	// workerResetProxySession：IP 池固定会话下管理员给账户换会话后，关掉用旧会话的 Worker，下次启动用新会话（见 proxy_pool_admin.go）
+	workerResetProxySession
 )
 
 // workerResetKey 标识一次后台关闭：账户与它的 Worker 版本
@@ -307,6 +309,10 @@ func (manager *accountWorkerManager) runWorkerReset(
 		manager.requests.log(key.accountID, "WARN", "IP 池固定分配调整后关闭 Worker 出错 | 错误="+strings.TrimSpace(err.Error()))
 	case reset && source == workerResetProxyFixed:
 		manager.requests.log(key.accountID, "INFO", "IP 池固定分配：已关闭不在固定端口上的 Worker，下次启动用固定端口")
+	case err != nil && source == workerResetProxySession:
+		manager.requests.log(key.accountID, "WARN", "IP 池换会话后关闭 Worker 出错 | 错误="+strings.TrimSpace(err.Error()))
+	case reset && source == workerResetProxySession:
+		manager.requests.log(key.accountID, "INFO", "IP 池固定会话已换会话：已关闭用旧会话的 Worker，下次启动用新会话")
 	case err != nil:
 		manager.requests.log(key.accountID, "WARN", "WAA Worker 后台恢复出错 | 错误="+strings.TrimSpace(err.Error()))
 	case reset && source == workerResetSweep:

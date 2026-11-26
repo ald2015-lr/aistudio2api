@@ -24,6 +24,8 @@ var _ interface {
 	RebalanceProxyPool(context.Context, api.ProxyPoolFixedInput) (api.ProxyPoolFixedRebalanceResult, error)
 	ReassignProxyPoolPort(context.Context, int, api.ProxyPoolFixedInput) (api.ProxyPoolFixedReassignResult, error)
 	RestoreProxyPoolPort(context.Context, int) (api.ProxyPoolFixedRestoreResult, error)
+	ResumeProxyPoolAuto(context.Context) (api.ProxyPoolFixedAutoResumeResult, error)
+	RotateProxyPoolSession(context.Context, string) (api.ProxyPoolFixedRotateResult, error)
 } = (*runtimeManager)(nil)
 
 // ipPool 返回生成服务使用的 IP 池；测试构造的管理端没有 Worker 管理器时为 nil（IP 池的方法对 nil 安全）
@@ -372,4 +374,55 @@ func (manager *accountWorkerManager) resetFixedWorkers(accountIDs []string, port
 		}
 	}
 	return restarted
+}
+
+// ResumeProxyPoolAuto 恢复自动换 IP（固定分配）或自动换会话（固定会话）：清除“坏得太多已停止”与 30 分钟计数（见 fixedAutoResume）；
+// 恢复了时推一次账户列表（侧栏与账户页的提示随之消失）
+func (manager *runtimeManager) ResumeProxyPoolAuto(ctx context.Context) (api.ProxyPoolFixedAutoResumeResult, error) {
+	if manager.proxyPool == nil {
+		return api.ProxyPoolFixedAutoResumeResult{}, &adminOperationError{status: http.StatusServiceUnavailable, code: "proxy_pool_unavailable", message: "IP 池尚未就绪"}
+	}
+	result, err := manager.proxyPool.fixedAutoResume()
+	if err == nil && result.Resumed {
+		admin, _ := manager.fixedRunningAdmin()
+		admin.publishFixedChange(ctx)
+	}
+	return result, err
+}
+
+// RotateProxyPoolSession 动态固定会话下给账户手动换会话：之后用新的会话号；服务运行中时给仍用旧会话服务的 Worker 登记后台关闭（等进行中的请求
+// 结束，下次启动用新会话）。不计入自动换的计数
+func (manager *runtimeManager) RotateProxyPoolSession(ctx context.Context, accountID string) (api.ProxyPoolFixedRotateResult, error) {
+	if manager.proxyPool == nil {
+		return api.ProxyPoolFixedRotateResult{}, &adminOperationError{status: http.StatusServiceUnavailable, code: "proxy_pool_unavailable", message: "IP 池尚未就绪"}
+	}
+	result, err := manager.proxyPool.fixedRotateSession(strings.TrimSpace(accountID))
+	if err != nil {
+		return result, err
+	}
+	admin, running := manager.fixedRunningAdmin()
+	if running && admin != nil {
+		result.Restarted = admin.workers.resetSessionWorker(result.AccountID, result.From)
+	}
+	manager.requests.logDurable(result.AccountID, "INFO", fmt.Sprintf("IP 池固定会话手动换会话 | 会话=%s → %s | 关闭 Worker=%d",
+		result.From, result.To, result.Restarted))
+	admin.publishFixedChange(ctx)
+	return result, nil
+}
+
+// resetSessionWorker 给仍用会话 session 服务的账户 Worker 登记后台关闭（workerResetProxySession）：先取版本再核对会话（照 resetFixedWorkers 的写法），
+// 核对之后才换掉的 Worker 按版本登记的关闭不会关掉新的。返回真正登记的个数（0 或 1）
+func (manager *accountWorkerManager) resetSessionWorker(accountID, session string) int {
+	if manager == nil {
+		return 0
+	}
+	generation := manager.WorkerGeneration(accountID)
+	if !manager.hasWorker(accountID) || !manager.ipPool().servesSession(accountID, session) {
+		return 0
+	}
+	pending, _ := manager.scheduleWorkerReset(accountID, generation, nil, workerResetProxySession)
+	if workerResetRegistered(pending) {
+		return 1
+	}
+	return 0
 }
