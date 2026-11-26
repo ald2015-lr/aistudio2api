@@ -901,6 +901,7 @@ func (s *server) registerAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/studio-keys/stop", s.handleStopStudioKeys)
 	mux.HandleFunc("POST /api/studio-keys/export", s.handleExportStudioKeys)
 	mux.HandleFunc("POST /api/studio-keys/clear", s.handleClearStudioKeys)
+	s.registerVault(mux)
 	mux.HandleFunc("POST /api/control/start", s.handleStartService)
 	mux.HandleFunc("POST /api/control/stop", s.handleStopService)
 	mux.HandleFunc("POST /api/control/restart", s.handleRestartService)

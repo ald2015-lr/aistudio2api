@@ -1315,6 +1315,7 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | 出口限流判定 | `POST /api/egress/{id}/withdraw`、`POST /api/egress/{id}/resume` |
 | 日志与事件 | `DELETE /api/logs`、`GET /api/events` |
 | 用量账本 | `GET /api/usage`、`GET /api/usage/records`、`GET /api/usage/records.csv`、`GET /api/requests/{id}/body`（账本打开失败时不注册） |
+| 账号资料与家庭组 | `GET /api/vault`、`POST /api/vault/profiles/{import,update,delete,reveal,export}`、`POST /api/vault/families/import`、`POST /api/vault/families`、`PUT/DELETE /api/vault/families/{id}`、`POST /api/vault/start-empty`（只用于查看、复制与分类显示，不参与登录与调度；管理端不支持时 501 `vault_unsupported`） |
 
 管理 API 使用 DTO（data transfer object）表示请求、响应和事件对象。端点结果：
 
@@ -1353,6 +1354,17 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `GET /api/usage` | 200 | `UsageReport`；必填 `from`、`to`（RFC 3339，不超过 93 天），可选 `tz`、`bucket`、`stack` 与按维度逗号分隔的 `model`、`account`、`channel`、`protocol`、`state`、`pool`（`normal`、`pro` 或 `ultra`）筛选；`stack` 与分项 `groups` 同样包含 `pool`。账户×模型组合明细 `pairs`：不带参数或 `pairs=1` 时与原先相同返回全部组合；`pairs=0` 不聚合组合，`pairs` 为空数组，其余字段不变（管理页的主报告这样请求）；`pairs_account=<账户>` 或 `pairs_model=<模型>`（二选一，取值原样使用、可以为空即未分配的那一行）只返回这一行的组合，时间范围与各维度筛选与主报告相同，组合的统计与主报告里这一行的组合逐项相同，其余字段（`totals`、`buckets`、`groups`、`series`、`options` 等）为空或零值；该维度原有筛选不含这个取值时 `pairs` 为空。`pairs` 取 `0`、`1` 以外的值、两个行参数同时出现或与 `pairs=0` 同时出现时 400 |
 | `GET /api/usage/records`、`records.csv` | 200 | `{"items":[UsageRecord,...],"next_cursor"?}` 或带 BOM 的 UTF-8 CSV；另接受 `status`、`q`（请求 ID、错误或回复指纹）、`cursor`、`limit`（1 到 200）与 `extra=1`（只要由补充池服务的请求，其他取值等于不带；补充池附表还不存在时为空）；记录与 CSV 带 `pool`（`normal`、`pro` 或 `ultra`，按入口），记录另有可选的 `extra`（由补充池服务时为 `true`，CSV 的列不变） |
 | `GET /api/requests/{id}/body` | 200 / 404 | `RequestBody`；只在 `REQUEST_BODY_LOG=true` 时保存 |
+| `GET /api/vault?since=<revision>` | 200 | `VaultView`；`since` 等于当前 `revision` 时只回 `{"revision":…,"unchanged":true}` |
+| `POST /api/vault/profiles/import` | 200 | `ProfileImportResult`；请求 `{"dry_run":bool,"mode":"merge"\|"fill_empty","sources":[{"name","text"}],"base_revision"?,"expect_overwrites"?,"acknowledge_suspect"?:bool}`，预览与确认同一接口 |
+| `POST /api/vault/profiles/update` | 200 | `{"profile":VaultProfile,"created":bool,"changed":[…],"cleared"?:[…],"revision"}`；请求 `{"email","password"?,"recovery_email"?,"totp"?,"note"?,"clear"?:[…]}`，空串等于没给，不存在则新建 |
+| `POST /api/vault/profiles/delete` | 200 | `{"deleted":N,"missing":N,"revision"}`；请求 `{"emails":[…]}`（去重后 ≤ 20 000），删除前存快照 |
+| `POST /api/vault/profiles/reveal` | 200 / 404 / 409 | `ProfileSecret`；请求 `{"email","fields"?:["password","recovery_email","totp","note","totp_code","line"]}`（缺省为全部）；资料不存在 404 `vault_not_found`；`fields` 只有 `totp_code` 时没有 2FA 404 `vault_totp_missing`、算不出码 409 `vault_totp_invalid`，其他组合只给 `totp_code_error`；`Cache-Control: no-store`、`Pragma: no-cache` |
+| `POST /api/vault/profiles/export` | 200 | `ProfileExport`；请求 `{"emails":[…]}`（≤ 20 000，按请求顺序）或 `{"all":true}`（按邮箱排序），可加 `"include_note":true`；从不 404，不存在的列进 `missing`；`no-store` + `Pragma: no-cache` |
+| `POST /api/vault/families/import` | 200 | `FamilyImportResult`；请求 `{"dry_run":bool,"text","mode":"blocks"\|"lines","base_revision"?,"acknowledge_suspect"?:bool}` |
+| `POST /api/vault/families` | 200 | `FamilyBlockResult`（带 `group`）；请求 `{"dry_run":bool,"primary","members":[…],"name"?,"color"?,"base_revision"?}`，规则同录入的一块；`members` 为空 400 `vault_family_empty` |
+| `PUT /api/vault/families/{id}` | 200 | `FamilyBlockResult`；请求 `{"dry_run":bool,"rev"?,"name"?,"color"?,"primary"?,"members"?,"base_revision"?}`，`rev` 不符 409 `vault_conflict`，成员为空 400 `vault_family_empty` |
+| `DELETE /api/vault/families/{id}?rev=N` | 200 | `{"dissolved":true,"members":N,"revision"}`（`members` 为主邮箱 + 成员的总人数）；`rev` 可省略，解散前存快照 |
+| `POST /api/vault/start-empty` | 200 | `{"file","moved_backup"?,"revision"}`；请求 `{"file":"profiles"\|"families"}`，只在主文件缺失而有备份时可用，否则 409 `vault_conflict` |
 
 管理 DTO 字段：
 
@@ -1389,6 +1401,22 @@ server content 的 index `0/1/2/4/5/6` 分别为 model content、turn complete�
 | `AdminRequest` | `id`、`model`、`account_id`、`account_label`、`state`、`started_at`、可选 `channel`、`pool`（`/ultra` 请求为 `ultra`，`/pro` 请求为 `pro`）；可选 `extra`（这次或最后一次尝试的租约借自补充池时为 `true`） |
 | `AdminLog` | `time`、`level`、`source`、`message`、`event`；请求事件携带 `request`，包含 `id`、`state`、HTTP `status`、`model`、`path`（`/ultra`、`/pro` 请求带前缀）、`pool`（`/ultra` 请求为 `ultra`，`/pro` 请求为 `pro`）、`duration_ms`、`tool_calls`、`usage` 与诊断字段，字段口径见 [logging.md](logging.md)；请求事件的 `request.extra` 为由补充池服务（最后一次尝试的租约借自补充池），只在为真时出现 |
 | `AdminEvent` | `type`、`data` |
+
+账号资料与家庭组的 DTO（Go 定义在 `internal/vault/types.go`，管理页 `web/src/types.ts` 同名同字段）。列表、预览与录入结果都只有打码信息；明文只在 `ProfileSecret` 与 `ProfileExport` 里：
+
+| DTO | 字段 |
+| --- | --- |
+| `VaultView` | `revision`（“资料文件标记.家庭组文件标记”，标记为文件内容 sha256 的前 12 位；没有文件为 `0`，错误状态以 `e`、主文件缺失有备份以 `m` 开头）、`unchanged`、`dir`（只在内存时为空）、`persistent`、`profiles`（`VaultProfile`，按邮箱排序）、`families`（`FamilyGroup`，按 `seq` 排序）、`errors?`（`VaultFileError`）、`backups?`（`{file,bak_time?,snapshots,snapshot_latest?}`，只有时间与份数）、`limits`（导入、存储与请求上限）、`palette`（色板颜色数 12） |
+| `VaultProfile` | `email`、`has_password`、`recovery_email?`、`has_totp`、`totp_last4?`、`totp_ok`（存着的 2FA 能算出验证码）、`totp_flags?`（`letters_only`：没有数字 2–7；`otpauth_params`：链接参数不是 6 位/30 秒/SHA1）、`has_note`、`created_at`、`updated_at` |
+| `FamilyGroup` | `id`（`fam-` + 12 位十六进制）、`seq`（创建顺序）、`rev`（每次改动加 1）、`name?`、`color`（0–11）、`primary`、`members`（不含主邮箱，保持录入顺序）、`created_at`、`updated_at` |
+| `VaultFileError` | `file`（`profiles`/`families`）、`code`（`vault_unreadable`）、`reason`（`read`、`json`、`version`、`invalid`、`missing_with_backup`）、`message`、`path?`、`backup?`、`backup_time?`、`backup_count?`、`snapshots?` |
+| `ProfileImportResult` | `dry_run`、`mode`、`revision`（预览为当前版本，确认时作 `base_revision`；确认后为写入后的版本）、`sources`（`{name,lines}`）、`summary`（`lines`、`blank`、`comments`、`valid`、`invalid`、`new`、`updated`、`unchanged`、`duplicate_lines`、`overwrites`/`kept`（按字段 `password`、`recovery_email`、`totp`、`note`；`kept` 只在 `fill_empty` 时有，只算导入前就有值的字段，同一批前面的行写进的值不算）、`warnings`（提示码 → 行数）、`suspect`（“格式可能错位”的提示码）、`hints?`（`looks_like_family_list`）、`total_after`、`over_limit`）、`items`（每行：`source`、`line`、`email?`（无法识别时只在第 1 段是合法邮箱时给）、`status`（`new`/`update`/`unchanged`/`invalid`）、`fields?`（`password`、`recovery_email?`、`totp`、`totp_last4?`、`totp_flags?`、`note`，只有布尔与末四位）、`changes?`、`overwrites?`、`kept?`、`warnings?`、`also?`（同一邮箱的其他行）、`reason?`、`hint?`、`field?`）；空行与注释不在 `items` 里，不回显无法识别行的内容 |
+| `ProfileSecret` | `email`、`password?`、`recovery_email?`、`totp?`、`note?`、`line?`（整行）、`line_format?`（`dash`/`tab`）、`line_lossy?`（重新导入不能完全还原的原因：`edge_whitespace`、`note_ambiguous`、`empty_record`、`other`）、`totp_code?`（`{code,next_code,period,remaining,server_time,flags?}`，RFC 6238：SHA1、30 秒、6 位）、`totp_code_error?`（`missing`/`invalid`） |
+| `ProfileExport` | `lines`、`count`、`missing`、`tab_lines`（改用 Tab 分隔的行数）、`lossy`（`[{email,reason}]`） |
+| `FamilyImportResult` | `dry_run`、`mode`、`revision`、`summary`（`blocks`、`created`、`replaced`、`primary_changed`、`unchanged`、`rejected`、`invalid`、`moved`、`removed`、`dissolved`、`warnings`、`suspect`）、`batch_warnings`（`{code:"primary_repeated"\|"email_in_blocks",email,blocks}`）、`blocks`（`FamilyBlockResult`） |
+| `FamilyBlockResult` | `index`、`first_line?`、`last_line?`、`status`（`created`、`replaced`、`primary_changed`、`updated`（只改了名称或颜色）、`unchanged`、`rejected`、`invalid`）、`primary?`、`members?`、`group_id?`（预览里新建的组为临时编号 `new-1`…）、`color?`、`name?`、`added?`、`removed?`、`moved?`（`{email,from_group,from_primary}`）、`dissolved?`（被移空而自动解散的组 `{group_id,primary,name?,color}`）、`reason?`（`single_email`、`block_too_large`、`token_not_email`、`looks_like_profile`、`member_is_primary`、`primary_is_other_primary`、`limit_groups`、`ambiguous_block`）、`hint?`（`looks_like_name`）、`detail?`（`{email,group_primary,group_name,line,position}`）、`warnings?`（`over_five`、`duplicate_in_block`、`primary_in_members`、`maybe_missing_blank`、`name_ignored`、`comment_split`）、`comment_line?`、`renamed?`、`recolored?`、`group?`（新建与编辑接口返回生效后的组，预览为预计结果）、`dry_run?`、`revision?` |
+
+错误体为管理端通用的 `{"error":{"code","message"}}`，`message` 是固定的中文说明（不回显请求、文件内容与解析错误原文）：400 `invalid_request`、`vault_invalid_email`、`vault_invalid_field`、`vault_family_empty`；413 `vault_too_large`（请求体超过 8 MiB、来源超过 50 个、文本超过 4 MiB、非空行超过 20 000）；409 `vault_unreadable`（文件处于错误状态，含主文件缺失而有备份）、`vault_full`、`vault_conflict`、`vault_suspect_unacked`、`vault_totp_invalid`；404 `vault_not_found`、`vault_family_not_found`、`vault_totp_missing`；503 `vault_busy`（跨进程锁等待超时）；500 `vault_write_failed`；501 `vault_unsupported`。用 GET 访问只接受 POST 的路由返回 405。确认时的冲突为 409 `{"error":{"code":"vault_conflict","message":…},"preview":{…}}`，`preview` 与对应接口 dry-run 的返回同形：资料导入带了 `expect_overwrites` 而按当前内容算出的覆盖条数不同（`base_revision` 不同而覆盖条数相同时照常应用），家庭组录入、新建与编辑带的 `base_revision` 与当前家庭组文件不同；两个字段都省略（脚本直接调用）时不检查。预览里有“格式可能错位”（资料第 2 段像邮箱、像 2FA 或为空的行过多）或“可能少了空行”（家庭组）的提示时，确认请求必须带 `acknowledge_suspect:true`，否则 409 `vault_suspect_unacked`、不写盘。
 
 `AdminAccount`、`AccountCreateInput`、`AccountInput`、`ChromeImportInput` 与 `RuntimeConfig` 的 `proxy` 字段不变：提交时接受任何支持的写法，服务端规范化后保存；读取时返回完整的规范值（含账号密码），只在管理页前端掩码显示。
 

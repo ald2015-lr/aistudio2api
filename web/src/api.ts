@@ -36,6 +36,21 @@ import type {
   StudioKeyExport,
   StudioKeySecret,
   StudioKeyStatus,
+  FamilyBlockResult,
+  FamilyCreateInput,
+  FamilyDissolveResult,
+  FamilyImportResult,
+  FamilyUpdateInput,
+  ProfileDeleteResult,
+  ProfileExport,
+  ProfileImportInput,
+  ProfileImportResult,
+  ProfileSecret,
+  ProfileUpdateInput,
+  ProfileUpdateResult,
+  RevealField,
+  VaultStartEmptyResult,
+  VaultView,
 } from '@/types'
 
 interface AccountsResponse {
@@ -233,6 +248,45 @@ async function requestCommand(path: string, init: RequestInit, withCode = false)
   if (!response.ok) {
     throw await adminResponseError(response, withCode)
   }
+}
+
+// VaultApiError 为账号资料与家庭组接口的错误：code 为错误码（vault_conflict、vault_unreadable 等）；preview 为确认时数据在预览之后
+// 变了（409 vault_conflict）随错误返回的新预览（与 dry-run 的返回同形，打码视图），其余错误没有
+export class VaultApiError extends ApiError {
+  readonly preview: unknown
+
+  constructor(message: string, status: number, code: string, preview: unknown) {
+    super(message, status, { code })
+    this.name = 'VaultApiError'
+    this.preview = preview
+  }
+}
+
+// vaultRequest 执行账号资料与家庭组的管理请求：一律 cache: 'no-store'，错误带错误码与 409 的新预览。
+// 请求体与响应体（含取出、导出的明文）不打印、不保存；错误文案是服务端的固定中文说明，不含机密
+async function vaultRequest<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers)
+  if (init.body !== undefined) headers.set('Content-Type', 'application/json')
+  const response = await fetch(path, { ...init, headers, cache: 'no-store' })
+  if (response.ok) return (await response.json()) as T
+  let message = response.statusText
+  let code = ''
+  let preview: unknown
+  try {
+    const value: unknown = await response.json()
+    const text = pathValue(value, ['error', 'message'])
+    const codeValue = pathValue(value, ['error', 'code'])
+    if (typeof text === 'string') message = text
+    if (typeof codeValue === 'string') code = codeValue
+    preview = pathValue(value, ['preview'])
+  } catch {
+    // 不是 JSON（反向代理的错误页等）：按状态行
+  }
+  throw new VaultApiError(message, response.status, code, preview)
+}
+
+function vaultPost<T>(path: string, body: unknown, method = 'POST'): Promise<T> {
+  return vaultRequest<T>(path, { method, body: JSON.stringify(body) })
 }
 
 // parseAdminEvent 校验单一事件流的事件外壳
@@ -468,6 +522,40 @@ export const api = {
   usageExportURL: (query: URLSearchParams) => `/api/usage/records.csv?${query.toString()}`,
   requestBody: (id: string) =>
     requestJSON<RequestBody>(`/api/requests/${encodeURIComponent(id)}/body`),
+  // 账号资料与家庭组：邮箱只放在请求体里、不进 URL；取出与导出的结果不保存在页面状态里（复制后即丢弃）
+  vault: (since = '') =>
+    vaultRequest<VaultView>(
+      since === '' ? '/api/vault' : `/api/vault?since=${encodeURIComponent(since)}`,
+    ),
+  importProfiles: (input: ProfileImportInput) =>
+    vaultPost<ProfileImportResult>('/api/vault/profiles/import', input),
+  updateProfile: (input: ProfileUpdateInput) =>
+    vaultPost<ProfileUpdateResult>('/api/vault/profiles/update', input),
+  deleteProfiles: (emails: string[]) =>
+    vaultPost<ProfileDeleteResult>('/api/vault/profiles/delete', { emails }),
+  // revealProfile 取出明文：fields 只给需要的字段（只要验证码时为 ['totp_code']），缺省为全部
+  revealProfile: (email: string, fields?: RevealField[]) =>
+    vaultPost<ProfileSecret>('/api/vault/profiles/reveal', fields ? { email, fields } : { email }),
+  exportProfiles: (input: { emails?: string[]; all?: boolean; include_note?: boolean }) =>
+    vaultPost<ProfileExport>('/api/vault/profiles/export', input),
+  importFamilies: (input: {
+    dry_run: boolean
+    text: string
+    mode: 'blocks' | 'lines'
+    base_revision?: string
+    acknowledge_suspect?: boolean
+  }) => vaultPost<FamilyImportResult>('/api/vault/families/import', input),
+  createFamily: (input: FamilyCreateInput) =>
+    vaultPost<FamilyBlockResult>('/api/vault/families', input),
+  updateFamily: (id: string, input: FamilyUpdateInput) =>
+    vaultPost<FamilyBlockResult>(`/api/vault/families/${encodeURIComponent(id)}`, input, 'PUT'),
+  dissolveFamily: (id: string, rev?: number) =>
+    vaultRequest<FamilyDissolveResult>(
+      `/api/vault/families/${encodeURIComponent(id)}${rev === undefined ? '' : `?rev=${rev}`}`,
+      { method: 'DELETE' },
+    ),
+  vaultStartEmpty: (file: 'profiles' | 'families') =>
+    vaultPost<VaultStartEmptyResult>('/api/vault/start-empty', { file }),
 }
 
 // openAdminEvents 建立唯一的管理状态 SSE 连接

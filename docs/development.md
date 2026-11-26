@@ -102,6 +102,8 @@ runtime/camoufox/        Release 使用的 Camoufox 运行时
 runtime/requests.db      用量账本（SQLite，纯 Go 驱动），保留 90 天
 runtime/media/           MEDIA_OUTPUT=url 时按内容命名保存的生成媒体，由 /media/ 提供，按 MEDIA_RETENTION 与 MEDIA_MAX_SIZE 清理
 internal/requestdb/      用量账本的写入、汇总与查询（由补充池服务的请求另有延迟建立的附表 extra_served）
+internal/vault/          账号资料与家庭组：解析、合并、家庭组规则、TOTP、加锁持久化（只用于查看与复制，不接入调度）
+runtime/account-vault/   账号资料与家庭组（profiles.json、families.json、.bak、snapshots/、.lock），删除账户与任何清理都不碰
 ```
 
 主依赖方向：
@@ -115,6 +117,7 @@ cmd/aistudio2api
        -> internal/camoufoxnative
        -> internal/config
        -> internal/webui
+       -> internal/vault（叶子包，只被 app 与 api 引用）
 
 internal/setup
   -> internal/aistudio
@@ -203,6 +206,17 @@ Camoufox 由 Go 通过 WebDriver BiDi 直接管理。启动数据面时，服务
 `LISTEN_ADDR` 使用 `host:port`，端口范围为 `1..65535`。时长和容量字段必须为正值（`FIRST_EVENT_TIMEOUT`、`PRIMARY_QUEUE_WAIT`、`ULTRA_PRIMARY_QUEUE_WAIT` 与 `ULTRA_WARM_WORKER_LIMIT` 可以为 `0`，两个主用模型排队上限都不超过 `REQUEST_TIMEOUT`），`WARM_STARTUP_CONCURRENCY` 的有效范围为 `1..WARM_WORKER_LIMIT`，`ULTRA_MAX_ACTIVE_WORKERS` 不小于 `ULTRA_WARM_WORKER_LIMIT`，`ACCOUNT_RPM_LIMIT` 为 `0..1000` 的整数（超出时报 `ACCOUNT_RPM_LIMIT 必须是 0 到 1000 的整数`）。管理页面保存时没有带四个 Ultra 字段、`account_rpm_limit`、`stream_playground_models`、`primary_models`、`primary_queue_wait`、`ultra_primary_models` 或 `ultra_primary_queue_wait`（旧版页面）则沿用 `.env` 中的现值（省略排队上限而把 `request_timeout` 调到现值以下时按 `request_timeout` 封顶）；`stream_playground_models`、`primary_models` 与 `ultra_primary_models` 为空数组表示清空，排队上限为 `0s` 表示不排队。保存的配置 JSON 缺少 `ultra_primary_models`（旧版数据）时取默认列表，显式的空数组为关闭；缺少 `ultra_include_pro` 时按关闭处理；缺少 `account_rpm_limit` 时取默认值 10，显式的 `0` 为关闭。全局代理与账户代理的写法和规范化规则见 `config.NormalizeProxy` 与下文[代理写法与规范化](#代理写法与规范化)。命令行 `--auth` 与 `--proxy` 会覆盖每次启动生成服务时读取的保存值。
 
 管理页面保存时没有带 `media_output`、`media_base_url`、`media_retention` 或 `media_max_size`（旧版页面）则沿用现值，`media_base_url` 为空串表示清空；保存的配置 JSON 缺少 `media` 对象时取默认设置。
+
+### 账号资料与家庭组
+
+`internal/vault` 是叶子包（除已有的 `gofrs/flock` 外只用标准库），`internal/api/vault.go` 注册 11 条管理路由（`VaultService` 可选接口，不支持时 501），`internal/app/vault.go` 在 `runtimeManager` 上懒打开（`vaultHolder` 零值可用，第一次调用管理接口时才按 `configPath` 定位 `<.env 目录>/runtime/account-vault/`；`configPath` 为空时只在内存）。装配与启动路径零 I/O、零日志，所以 `TestExtraOffGolden` 等金样测试不受影响。这个包不接入任何登录、预热、验证或调度路径，删除、清理与认证文件更新的代码里也不调用它的删除。
+
+- **分层**：`parse.go`（每行先按“有 Tab 只按 Tab、没有 Tab 时 ≥ 4 个单位的破折号串算一个分隔”分段，第 1 段邮箱、第 2 段按位置是密码、第 3 段起按内容判别）、`email.go`（`NormalizeEmail`，资料、家庭组、编辑共用）、`totp.go`（Base32/otpauth 判别与 RFC 6238 验证码）、`profiles.go`（逐行顺序合并、`fill_empty`、覆盖计数、编辑规则）、`line.go`（整行：先 `----` 连接、用同一个解析器回解校验，不一致改用 Tab，仍不一致标 `line_lossy`）、`families.go`（分块、冲突规则、自动解散、12 色自动分配）、`store.go`/`snapshot.go`/`atomic.go`/`jsoncheck.go`（持久化）、`operations.go`（对外方法）、`redact.go`（含秘密的结构体在 `fmt` 与 `slog` 里一律打印为 `[redacted]`）。
+- **锁序与写入**：进程内 `store.mu` → 跨进程 `.lock` 排他锁（`TryLockContext`，10 秒；每次操作新建 `Flock` 对象，不在同一对象上升级）→ 锁内重读字节 → 只应用本次操作 → 批量操作先存快照 → 写 `.bak`（上一版原样字节）→ 原子写主文件（同目录临时名、Sync、Rename、0600）。读路径只取共享锁，`.lock` 不存在时不加锁直接读，只读操作不建目录与文件。导入文本的解析在锁外；确认时在锁内按重读的内容重算，`expect_overwrites`、家庭组的 `base_revision` 对不上就 409 并附新预览。
+- **损坏与缺失**：读不出、坏 JSON、重复键（逐 token 检查）、版本不认识、不变式不满足时不覆盖、不改名，该文件进入只读错误状态（写接口与取出 409 `vault_unreadable`），WARN 每个状态只写一次；内容解析不了的错误按主文件的 stat（inode、修改时间、大小）缓存，读文件本身失败（权限、属主、I/O）则每次载入都重试（修权限只改 ctime，stat 看不出），`.bak` 的条数按它的大小与修改时间缓存、不每次重新解析；主文件缺失而 `.bak` 或快照还在时同样处理（`missing_with_backup`），只有“从空开始”能解除（`.bak` 移进 `snapshots/…-before-start-empty.json`）。快照每个文件保留最近 10 份，轮转只删匹配命名规则的文件。
+- **revision**：每个文件的标记为内容 sha256 的前 12 位（只在内存时用 `write_id`），`VaultView.revision` 为“资料标记.家庭组标记”；`GET /api/vault?since=` 相同时只回 `unchanged`。管理页每 60 秒（窗口可见时）、窗口回到前台与每次写操作后带 `since` 拉取，不走 SSE。
+- **前端**：`web/src/vault.ts` 放模块级数据（`shallowRef` 整体替换、按邮箱建 `Map` 的索引、跨页跳转请求、只在内存的导入草稿、手动复制框与资料编辑框的状态），`components/vault/` 下为资料页（懒加载的 `VaultPanel` 块）与账户页共用的下拉、徽标、复制菜单；账户页把每行要用的装饰预先算进 `Map<account.id, …>`，筛选与模板里只做 O(1) 查找。资料列表 `ProfileList` 由 `VaultPanel` 的 `KeepAlive` 保留（切子页签不丢筛选、搜索、页码与选择，跳转请求换 `key` 重建）；账户列表还不知道时（载入中，或载入失败且一个账户都没有）不判断“未存在”；家庭组下拉选中的组不存在了就回到“全部”。明文只在取出、导出的结果里，复制后即丢弃，不写本地存储；复制菜单清掉明文时代次加一，取出途中关了菜单或页面被隐藏，回来的结果按代次丢弃。资料列表的“更新时间”列按面板宽度（`ResizeObserver`）用 `v-if` 同时控制 `col`、`th`、`td`，不要只把单元格设成 `display:none`（`col` 还在会让后面的列错位）。
+- **测试隔离**：`internal/vault` 的测试都用 `t.TempDir()` 与 `@example.com`、假密码、公开示例密钥；`internal/app` 的测试 `configPath` 为空时只在内存，包目录下不会出现 `runtime/account-vault/`。
 
 ### 生成媒体目录
 

@@ -8,6 +8,7 @@ export type TabID =
   | 'usage'
   | 'settings'
   | 'playground'
+  | 'vault'
 
 // org_disabled 为账号所属组织停用了 AI Studio（不参与任何调度，认证文件更新、管理员清除或长间隔复查通过后恢复）；
 // proxy_paused 为 IP 池固定分配下账户的固定端口暂停使用（端口冷却中或被其他进程占用；不参与调度，端口恢复后自动恢复，message 为原因）
@@ -1434,4 +1435,318 @@ export interface StudioKeyClearCounts {
 // StudioKeyClearResult 为清除之后的状态与计数
 export interface StudioKeyClearResult extends StudioKeyStatus {
   cleared: StudioKeyClearCounts
+}
+
+// ---------- 账号资料与家庭组（只用于查看、复制与分类显示，不参与登录与调度） ----------
+// 列表与预览只有打码视图：密码、备注只给是否记录，2FA 给是否记录与末四位，辅助邮箱完整；明文只经 reveal 与 export 返回，
+// 前端只放在局部变量或短时显示的组件状态里，不写本地存储
+
+// VaultField 为资料的四个字段
+export type VaultField = 'password' | 'recovery_email' | 'totp' | 'note'
+
+// VaultLimits 为导入、存储与请求的上限（前端预检与提示用）
+export interface VaultLimits {
+  import_lines: number
+  import_bytes: number
+  import_sources: number
+  line_bytes: number
+  password_bytes: number
+  note_bytes: number
+  profiles: number
+  groups: number
+  group_emails: number
+  emails_per_request: number
+  request_bytes: number
+  snapshots: number
+}
+
+// VaultProfile 为一条资料的打码视图。totp_ok：保存着的 2FA 能算出验证码；totp_flags：letters_only（没有数字 2–7，可能不是 2FA 密钥）、
+// otpauth_params（来自 otpauth 链接且参数不是 6 位/30 秒/SHA1，验证码可能不准）
+export interface VaultProfile {
+  email: string
+  has_password: boolean
+  recovery_email?: string
+  has_totp: boolean
+  totp_last4?: string
+  totp_ok: boolean
+  totp_flags?: string[]
+  has_note: boolean
+  created_at: string
+  updated_at: string
+}
+
+// FamilyGroup 为一个家庭组：primary 为主邮箱，members 为成员（不含主邮箱，保持录入顺序）；color 为色板编号 0–11（类名 fam-c{color}）；
+// seq 为创建顺序（按家庭组显示时的组顺序）；rev 每次改动加 1（编辑与解散的乐观并发）
+export interface FamilyGroup {
+  id: string
+  seq: number
+  rev: number
+  name?: string
+  color: number
+  primary: string
+  members: string[]
+  created_at: string
+  updated_at: string
+}
+
+// VaultFileError 为处于错误状态（只读、停止写入以免覆盖）的文件：reason 为 read、json、version、invalid 或 missing_with_backup
+export interface VaultFileError {
+  file: 'profiles' | 'families' | string
+  code: string
+  reason: string
+  message: string
+  path?: string
+  backup?: string
+  backup_time?: string
+  backup_count?: number
+  snapshots?: number
+}
+
+// VaultBackupInfo 为一个文件的备份情况（只有时间与份数）
+export interface VaultBackupInfo {
+  file: 'profiles' | 'families' | string
+  bak_time?: string
+  snapshots: number
+  snapshot_latest?: string
+}
+
+// VaultView 为 GET /api/vault 的返回；unchanged 为真时（请求带的 since 等于当前 revision）只有 revision
+export interface VaultView {
+  revision: string
+  unchanged?: boolean
+  dir?: string
+  persistent?: boolean
+  profiles?: VaultProfile[]
+  families?: FamilyGroup[]
+  errors?: VaultFileError[]
+  backups?: VaultBackupInfo[]
+  limits?: VaultLimits
+  palette?: number
+}
+
+// VaultFieldCounts 为按字段的计数
+export interface VaultFieldCounts {
+  password: number
+  recovery_email: number
+  totp: number
+  note: number
+}
+
+// ProfileImportSource 为一个导入来源（粘贴框或一个 .txt 文件）
+export interface ProfileImportSource {
+  name: string
+  text: string
+}
+
+// ProfileImportInput 为导入请求：先 dry_run 预览，确认时带预览的 revision（base_revision）与覆盖计数（expect_overwrites）
+export interface ProfileImportInput {
+  dry_run: boolean
+  mode: 'merge' | 'fill_empty'
+  sources: ProfileImportSource[]
+  base_revision?: string
+  expect_overwrites?: VaultFieldCounts
+  acknowledge_suspect?: boolean
+}
+
+export interface ProfileImportSummary {
+  lines: number
+  blank: number
+  comments: number
+  valid: number
+  invalid: number
+  new: number
+  updated: number
+  unchanged: number
+  duplicate_lines: number
+  overwrites: VaultFieldCounts
+  kept: VaultFieldCounts
+  warnings: Record<string, number> | null
+  suspect: string[] | null
+  hints?: string[]
+  total_after: number
+  over_limit: boolean
+}
+
+// ProfileImportItem 为预览里的一行（空行与注释不出现）：status 为 new、update、unchanged、invalid；
+// 无法识别时只有第 1 段是合法邮箱才带 email（不回显内容）
+export interface ProfileImportItem {
+  source: number
+  line: number
+  email?: string
+  status: 'new' | 'update' | 'unchanged' | 'invalid' | string
+  fields?: {
+    password: boolean
+    recovery_email?: string
+    totp: boolean
+    totp_last4?: string
+    totp_flags?: string[]
+    note: boolean
+  }
+  changes?: string[]
+  overwrites?: string[]
+  kept?: string[]
+  warnings?: string[]
+  also?: { source: number; line: number }[]
+  reason?: string
+  hint?: string
+  field?: string
+}
+
+export interface ProfileImportResult {
+  dry_run: boolean
+  mode: 'merge' | 'fill_empty' | string
+  revision: string
+  sources: { name: string; lines: number }[]
+  summary: ProfileImportSummary
+  items: ProfileImportItem[] | null
+}
+
+// ProfileUpdateInput 为编辑或新增一条资料：只带要改的字段，clear 列出要清空的字段
+export interface ProfileUpdateInput {
+  email: string
+  password?: string
+  recovery_email?: string
+  totp?: string
+  note?: string
+  clear?: VaultField[]
+}
+
+export interface ProfileUpdateResult {
+  profile: VaultProfile
+  created: boolean
+  changed: string[] | null
+  cleared?: string[]
+  revision: string
+}
+
+export interface ProfileDeleteResult {
+  deleted: number
+  missing: number
+  revision: string
+}
+
+// VaultTOTPCode 为服务端按 RFC 6238（SHA1、30 秒、6 位）算出的验证码；remaining 为当前码还剩的秒数（1–30）
+export interface VaultTOTPCode {
+  code: string
+  next_code: string
+  period: number
+  remaining: number
+  server_time: string
+  flags?: string[]
+}
+
+// RevealField 为取出接口的字段：line 为整行（邮箱----密码----辅助邮箱----2FA，需要时改用 Tab）
+export type RevealField = VaultField | 'totp_code' | 'line'
+
+// ProfileSecret 为取出的明文（只由 reveal 返回）：line_format 为 dash 或 tab；line_lossy 为重新导入不能完全还原的原因；
+// totp_code_error 只在没有单独要验证码、而 2FA 缺失（missing）或算不出码（invalid）时出现
+export interface ProfileSecret {
+  email: string
+  password?: string
+  recovery_email?: string
+  totp?: string
+  note?: string
+  line?: string
+  line_format?: 'dash' | 'tab' | string
+  line_lossy?: string
+  totp_code?: VaultTOTPCode
+  totp_code_error?: 'missing' | 'invalid' | string
+}
+
+// ProfileExport 为导出的整行（只由 export 返回）：tab_lines 为改用 Tab 分隔的行数，lossy 为重新导入不能完全还原的行
+export interface ProfileExport {
+  lines: string[]
+  count: number
+  missing: string[]
+  tab_lines: number
+  lossy: { email: string; reason: string }[]
+}
+
+export interface FamilySummary {
+  blocks: number
+  created: number
+  replaced: number
+  primary_changed: number
+  unchanged: number
+  rejected: number
+  invalid: number
+  moved: number
+  removed: number
+  dissolved: number
+  warnings: Record<string, number> | null
+  suspect: string[] | null
+}
+
+// FamilyBlockResult 为一块（或新建、编辑一个组）的结果：status 为 created、replaced、primary_changed、updated（只改了名称或颜色）、
+// unchanged、rejected、invalid；预览里新建的组 group_id 为临时编号 new-1…
+export interface FamilyBlockResult {
+  index: number
+  first_line?: number
+  last_line?: number
+  status: string
+  primary?: string
+  members?: string[]
+  group_id?: string
+  color?: number
+  name?: string
+  added?: string[]
+  removed?: string[]
+  moved?: { email: string; from_group: string; from_primary: string }[]
+  dissolved?: { group_id: string; primary: string; name?: string; color: number }[]
+  reason?: string
+  hint?: string
+  detail?: {
+    email?: string
+    group_primary?: string
+    group_name?: string
+    line?: number
+    position?: number
+  }
+  warnings?: string[]
+  comment_line?: number
+  renamed?: boolean
+  recolored?: boolean
+  group?: FamilyGroup
+  dry_run?: boolean
+  revision?: string
+}
+
+export interface FamilyImportResult {
+  dry_run: boolean
+  mode: 'blocks' | 'lines' | string
+  revision: string
+  summary: FamilySummary
+  batch_warnings: { code: string; email: string; blocks: number[] }[] | null
+  blocks: FamilyBlockResult[] | null
+}
+
+export interface FamilyCreateInput {
+  dry_run: boolean
+  primary: string
+  members: string[]
+  name?: string
+  color?: number
+  base_revision?: string
+}
+
+export interface FamilyUpdateInput {
+  dry_run: boolean
+  rev?: number
+  name?: string
+  color?: number
+  primary?: string
+  members?: string[]
+  base_revision?: string
+}
+
+export interface FamilyDissolveResult {
+  dissolved: boolean
+  members: number
+  revision: string
+}
+
+export interface VaultStartEmptyResult {
+  file: string
+  moved_backup?: string
+  revision: string
 }

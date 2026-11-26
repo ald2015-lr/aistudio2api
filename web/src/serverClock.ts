@@ -30,17 +30,31 @@ export function elapsedSecondsSince(since: string, now: number): number {
 
 // useSecondClock 返回 active 为真期间每秒刷新的本机毫秒时刻，active 变化时立即刷新一次
 export function useSecondClock(active: () => boolean): Readonly<Ref<number>> {
+  return useSyncedSecondClock(active).now
+}
+
+// useSyncedSecondClock 与 useSecondClock 相同，另给 sync()：把时刻刷新到现在，并从现在起重新每秒跳动。
+// 倒计时在 active 已为真时换了起点（例如已在倒数验证码时又取出明文）要调用它：否则 now 最多落后 1 秒，倒计时会多出 1 秒
+export function useSyncedSecondClock(active: () => boolean): {
+  now: Readonly<Ref<number>>
+  sync: () => void
+} {
   const now = ref(Date.now())
   let timer: number | undefined
+  let running = false
+  const sync = (): void => {
+    window.clearInterval(timer)
+    now.value = Date.now()
+    timer = running ? window.setInterval(() => (now.value = Date.now()), 1000) : undefined
+  }
   watch(
     active,
-    (running) => {
-      window.clearInterval(timer)
-      now.value = Date.now()
-      timer = running ? window.setInterval(() => (now.value = Date.now()), 1000) : undefined
+    (value) => {
+      running = value
+      sync()
     },
     { immediate: true },
   )
   onScopeDispose(() => window.clearInterval(timer))
-  return now
+  return { now, sync }
 }

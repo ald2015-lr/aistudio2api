@@ -13,8 +13,6 @@ export type IconName =
   | 'verify'
   | 'save'
   | 'send'
-  | 'copy'
-  | 'eye'
   | 'eye-off'
   | 'usage'
   | 'success'
@@ -42,9 +40,7 @@ const aliases: Partial<Record<IconName, keyof typeof legacyIcons>> = {
   verify: 'check',
   save: 'check',
   send: 'play',
-  copy: 'dashboard',
-  eye: 'info',
-  'eye-off': 'close',
+  'eye-off': 'eyeOff',
   // 用量页沿用已有图标，不引入新的图标库
   usage: 'dashboard',
   success: 'check',

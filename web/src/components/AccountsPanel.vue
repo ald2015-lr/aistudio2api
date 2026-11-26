@@ -13,6 +13,7 @@ import {
   type BulkTarget,
   type BulkTaskResult,
 } from '@/bulk'
+import { stateDotClass, stateKeys, stateTextClass } from '@/accountState'
 import { copyText } from '@/clipboard'
 import { confirmAction } from '@/confirm'
 import { channelLabelKey, useI18n, type TranslationKey } from '@/i18n'
@@ -25,6 +26,7 @@ import type {
   AccountState,
   ChromeImportProfile,
   Cooldown,
+  FamilyGroup,
   OrgDisabledAccount,
   PermissionDeniedAccount,
   PermissionDeniedModel,
@@ -32,16 +34,45 @@ import type {
   ProxyPoolStatus,
   PartitionWorkerCounters,
   ExtraPoolStatus,
+  ProfileExport,
+  VaultProfile,
   WorkerCounters,
   WorkerState,
 } from '@/types'
 import { maskProxy, proxyHasAuth } from '@/proxy'
 import { proxyPoolActive, proxyPoolFixedStatic, slotLabel } from '@/proxyPool'
+import {
+  DEFAULT_LIMITS,
+  famClass,
+  familiesBySeq,
+  familyByEmail,
+  familyFilterGroup,
+  familyFilterMatches,
+  groupEmails,
+  groupSize,
+  groupTitle,
+  matchFamilyIds,
+  openManualCopy,
+  openProfileEditor,
+  openVaultView,
+  profileByEmail,
+  useAccountIndex,
+  useVaultData,
+  vaultData,
+  vaultErrorText,
+  vaultNav,
+  vaultStatus,
+  type FamilyFilter,
+  type FamilyMembership,
+} from '@/vault'
 import OnboardingPanel from './OnboardingPanel.vue'
 import StudioKeysPanel from './StudioKeysPanel.vue'
 import ProxyInput from './ProxyInput.vue'
 import UiIcon from './UiIcon.vue'
 import UiPager from './UiPager.vue'
+import FamilyBadge from './vault/FamilyBadge.vue'
+import FamilyFilterMenu from './vault/FamilyFilterMenu.vue'
+import SecretMenu from './vault/SecretMenu.vue'
 
 const props = defineProps<{
   accounts: Account[]
@@ -845,17 +876,6 @@ const draft = reactive<AccountDraft>({
   timezone: defaultAccountTimezone,
 })
 
-const stateKeys: Record<AccountState, TranslationKey> = {
-  ready: 'state.ready',
-  busy: 'state.busy',
-  cooldown: 'state.cooldown',
-  auth_required: 'state.auth_required',
-  unavailable: 'state.unavailable',
-  disabled: 'state.disabled',
-  org_disabled: 'state.org_disabled',
-  proxy_paused: 'state.proxy_paused',
-}
-
 // restrictionKeys 为 org_disabled 状态各原因种类的显示（组织停用、服务受限、年龄或资格、Workspace 未开放）
 const restrictionKeys: Record<AccountRestriction, TranslationKey> = {
   org_disabled: 'restriction.org_disabled',
@@ -892,28 +912,6 @@ function deviceBoundBadge(account: Account): boolean {
 function accountStateLabel(account: Account): string {
   if (account.state === 'org_disabled') return restrictionLabel(account.restriction)
   return t(stateKeys[account.state])
-}
-
-const stateDotClass: Record<AccountState, string> = {
-  ready: 'bg-green-500',
-  busy: 'bg-blue-500',
-  cooldown: 'bg-yellow-500',
-  auth_required: 'bg-red-500',
-  unavailable: 'bg-red-500',
-  disabled: 'bg-gray-600',
-  org_disabled: 'bg-orange-500',
-  proxy_paused: 'bg-purple-500',
-}
-
-const stateTextClass: Record<AccountState, string> = {
-  ready: 'text-green-400',
-  busy: 'text-blue-400',
-  cooldown: 'text-yellow-400',
-  auth_required: 'text-red-400',
-  unavailable: 'text-red-400',
-  disabled: 'text-gray-500',
-  org_disabled: 'text-orange-400',
-  proxy_paused: 'text-purple-300',
 }
 
 function messageOf(error: unknown): string {
@@ -1450,6 +1448,15 @@ const tierFilter = ref<TierFilter>('all')
 const poolFilter = ref<PoolFilter>('all')
 const sortKey = ref<SortKey>('default')
 const selected = ref<Set<string>>(new Set())
+// familyFilter 为家庭组下拉（见 FamilyFilterMenu），vaultFilter 为“资料”下拉：有资料、没有资料、有 2FA
+type VaultFilter = 'all' | 'has' | 'none' | 'totp'
+const familyFilter = ref<FamilyFilter>('all')
+const vaultFilter = ref<VaultFilter>('all')
+// 资料页家庭组卡片的“在账户页查看本组”：账户页不在 KeepAlive 里，切页会卸载，挂载时读取这个请求把下拉设为这一组
+if (vaultNav.accounts !== null) {
+  familyFilter.value = `group:${vaultNav.accounts.family}`
+  vaultNav.accounts = null
+}
 
 const stateCounts = computed(() => {
   const counts: Record<AccountState, number> = {
@@ -1523,11 +1530,21 @@ const poolFilterOptions = computed(() =>
 // extraWorkerShown、extraMemberShown 表示有账户要显示“补充池”“可补充”标签：只在这时加宽 Worker 列与权益列
 const extraWorkerShown = computed(() => props.accounts.some(extraWorker))
 const extraMemberShown = computed(() => props.accounts.some(extraMember))
-// tableMinWidth 为表格最小宽度：权益列加宽（w-20 → w-32）多 48px，Worker 列加宽（w-24 → w-40）多 64px；都不加宽时与原来一致
-const tableMinWidth = computed(() => {
-  if (extraWorkerShown.value) return poolTagShown.value ? 'min-w-[1172px]' : 'min-w-[1124px]'
-  return poolTagShown.value ? 'min-w-[1108px]' : 'min-w-[1060px]'
-})
+// tableMinWidth 为表格最小宽度（px）：固定列宽之和 + 账户列至少 200px（放得下“主/子”徽标、邮箱与钥匙按钮）。固定列为勾选 40、
+// 状态 112、Worker 96（显示补充池时加宽为 160）、权益 80（加宽为 128）、模型 64、代理 176、区域 176（只在宽屏显示）、
+// 操作 352（六个按钮放得下一行，放不下时换行，不再向左溢出盖住相邻列）
+const tableMinWidth = computed(
+  () =>
+    40 +
+    112 +
+    (extraWorkerShown.value ? 160 : 96) +
+    (poolTagShown.value ? 128 : 80) +
+    64 +
+    176 +
+    (wideScreen.value ? 176 : 0) +
+    352 +
+    200,
+)
 const proReady = computed(
   () => props.accounts.filter((account) => inProPool(account) && account.state === 'ready').length,
 )
@@ -1747,6 +1764,8 @@ async function viewVerifyModel(): Promise<void> {
   workerFilter.value = 'all'
   tierFilter.value = 'all'
   poolFilter.value = 'all'
+  familyFilter.value = 'all'
+  vaultFilter.value = 'all'
   await nextTick()
   accountListAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
@@ -1817,12 +1836,136 @@ async function viewVerifyRequired(): Promise<void> {
   workerFilter.value = 'all'
   tierFilter.value = 'all'
   poolFilter.value = 'all'
+  familyFilter.value = 'all'
+  vaultFilter.value = 'all'
   await nextTick()
   accountListAnchor.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
-const filtered = computed(() => {
+// ---------- 账号资料与家庭组（只用于查看、复制与分类显示，不参与调度） ----------
+// 账户按规范化邮箱（label 去首尾空白转小写）关联资料与家庭组；一个邮箱可能对应多个账户行。每行要用的装饰预先算进 Map，
+// 模板与筛选里只做 O(1) 查找。资料或家庭组文件出错（或拉取失败）时与它有关的徽标、钥匙与计数都不显示，筛选栏给出入口
+useVaultData()
+const accountIndex = useAccountIndex(() => props.accounts)
+const emptyProfiles = new Map<string, VaultProfile>()
+const emptyFamilies = new Map<string, FamilyMembership>()
+
+function vaultFileFailed(file: 'profiles' | 'families'): boolean {
+  if (vaultData.value === null) return vaultStatus.error !== ''
+  return vaultData.value.errors.some((entry) => entry.file === file)
+}
+const profilesFailed = computed(() => vaultFileFailed('profiles'))
+const familiesFailed = computed(() => vaultFileFailed('families'))
+const vaultFailText = computed(() => {
+  const failed = (vaultData.value?.errors ?? []).map((entry) => entry.message)
+  return failed.length > 0 ? failed.join(t('common.clauseSep')) : vaultStatus.error
+})
+
+interface AccountDecoration {
+  email: string
+  membership: FamilyMembership | undefined
+  profile: VaultProfile | undefined
+}
+const decorations = computed(() => {
+  const profiles = profilesFailed.value ? emptyProfiles : profileByEmail.value
+  const families = familiesFailed.value ? emptyFamilies : familyByEmail.value
+  const map = new Map<string, AccountDecoration>()
+  const emailOf = accountIndex.value.emailOf
+  for (const account of props.accounts) {
+    const email = emailOf.get(account.id) ?? account.label.trim().toLowerCase()
+    map.set(account.id, { email, membership: families.get(email), profile: profiles.get(email) })
+  }
+  return map
+})
+function decor(account: Account): AccountDecoration | undefined {
+  return decorations.value.get(account.id)
+}
+
+// familyCounts、vaultCounts 为两个下拉的计数（与权益、号池下拉同口径：对全部账户计，不受其他筛选影响）
+const familyCounts = computed(() => {
+  const result = { all: props.accounts.length, in: 0, primary: 0, member: 0, none: 0 }
+  const groups = new Map<string, number>()
+  for (const account of props.accounts) {
+    const membership = decorations.value.get(account.id)?.membership
+    if (membership === undefined) {
+      result.none += 1
+      continue
+    }
+    result.in += 1
+    result[membership.role] += 1
+    groups.set(membership.group.id, (groups.get(membership.group.id) ?? 0) + 1)
+  }
+  return { result, groups }
+})
+const vaultCounts = computed(() => {
+  const result: Record<VaultFilter, number> = { all: props.accounts.length, has: 0, none: 0, totp: 0 }
+  for (const account of props.accounts) {
+    const profile = decorations.value.get(account.id)?.profile
+    if (profile === undefined) result.none += 1
+    else {
+      result.has += 1
+      if (profile.has_totp) result.totp += 1
+    }
+  }
+  return result
+})
+const vaultFilterOptions: { value: VaultFilter; label: TranslationKey }[] = [
+  { value: 'all', label: 'accounts.vaultFilterAll' },
+  { value: 'has', label: 'accounts.vaultFilterHas' },
+  { value: 'none', label: 'accounts.vaultFilterNone' },
+  { value: 'totp', label: 'accounts.vaultFilterTotp' },
+]
+
+// groupStats 为每个家庭组在账户列表里的情况：账户行数、不在账户里的邮箱、各状态的账户数（按组内全部账户计，不只是当前筛出的）
+const groupStats = computed(() => {
+  const stats = new Map<
+    string,
+    { accounts: number; missing: string[]; states: Map<AccountState, number> }
+  >()
+  if (familiesFailed.value) return stats
+  const byEmail = accountIndex.value.byEmail
+  for (const group of familiesBySeq.value) {
+    const entry = { accounts: 0, missing: [] as string[], states: new Map<AccountState, number>() }
+    for (const email of groupEmails(group)) {
+      const list = byEmail.get(email)
+      if (list === undefined) {
+        entry.missing.push(email)
+        continue
+      }
+      for (const account of list) {
+        entry.accounts += 1
+        entry.states.set(account.state, (entry.states.get(account.state) ?? 0) + 1)
+      }
+    }
+    stats.set(group.id, entry)
+  }
+  return stats
+})
+
+// missingProfiles 为资料里有、账户列表里没有的邮箱数（“资料中未存在的邮箱 N”）；账户或资料还没载入完时不算
+const missingProfiles = computed(() => {
+  // 账户列表还没载入完或载入失败（一个账户都没有）时不知道谁“未存在”，不显示入口
+  if (props.loading || (props.error !== '' && props.accounts.length === 0)) return 0
+  if (profilesFailed.value || vaultData.value === null) return 0
+  const byEmail = accountIndex.value.byEmail
+  let count = 0
+  for (const profile of vaultData.value.profiles) if (!byEmail.has(profile.email)) count += 1
+  return count
+})
+
+// groupedMode 为按家庭组排列（按家庭组显示、仅家庭组账户、按组选择）：组按创建顺序，组内主邮箱在前，组之间插分组标题行
+const groupedMode = computed(
+  () =>
+    familyFilter.value === 'grouped' ||
+    familyFilter.value === 'in' ||
+    familyFilterGroup(familyFilter.value) !== '',
+)
+
+const filterResult = computed(() => {
   const term = query.value.trim().toLowerCase()
+  // 搜索按家庭组整组匹配：搜索词是组名的子串或与主邮箱相同时，整组成员都算匹配（viaFamily 为只因整组匹配才出现的账户）
+  const familyIds = familiesFailed.value ? new Set<string>() : matchFamilyIds(term)
+  const viaFamily = new Set<string>()
   const list = props.accounts.filter((account) => {
     if (stateFilter.value === 'problem') {
       const kinds = problemInfo.value.kinds.get(account.id)
@@ -1835,15 +1978,29 @@ const filtered = computed(() => {
       if (!inExtraPool(account)) return false
     } else if (poolFilter.value !== 'all' && (account.pool ?? 'normal') !== poolFilter.value)
       return false
+    const decoration = decorations.value.get(account.id)
+    if (!familyFilterMatches(familyFilter.value, decoration?.membership)) return false
+    if (vaultFilter.value === 'has' && decoration?.profile === undefined) return false
+    if (vaultFilter.value === 'none' && decoration?.profile !== undefined) return false
+    if (vaultFilter.value === 'totp' && decoration?.profile?.has_totp !== true) return false
     if (term === '') return true
     // 代理按掩码后的显示值匹配，搜不到账号密码；IP 池的端口号或会话号也能搜
-    return [
-      account.label,
-      proxySearchText(account),
-      account.message,
-      account.benefit_tier,
-      problemReasons.value.get(account.id) ?? '',
-    ].some((value) => value.toLowerCase().includes(term))
+    if (
+      [
+        account.label,
+        proxySearchText(account),
+        account.message,
+        account.benefit_tier,
+        problemReasons.value.get(account.id) ?? '',
+      ].some((value) => value.toLowerCase().includes(term))
+    )
+      return true
+    const membership = decoration?.membership
+    if (membership !== undefined && familyIds.has(membership.group.id)) {
+      viaFamily.add(account.id)
+      return true
+    }
+    return false
   })
   if (sortKey.value === 'state') {
     list.sort(
@@ -1864,18 +2021,204 @@ const filtered = computed(() => {
         right.models.length - left.models.length || left.label.localeCompare(right.label),
     )
   }
-  return list
+  if (groupedMode.value) {
+    // 组按创建顺序；默认排序时组内按主邮箱、成员的录入顺序（同一邮箱的多个账户行相邻），其他排序时主邮箱在前、成员按所选排序；
+    // 非家庭组账户（只在“按家庭组显示”里出现）按所选排序排在最后
+    const order = new Map(list.map((account, index) => [account.id, index]))
+    const byPosition = sortKey.value === 'default'
+    const rank = (account: Account): [number, number, number, number] => {
+      const membership = decorations.value.get(account.id)?.membership
+      const index = order.get(account.id) ?? 0
+      if (membership === undefined) return [Number.MAX_SAFE_INTEGER, 0, 0, index]
+      return [
+        membership.group.seq,
+        membership.role === 'primary' ? 0 : 1,
+        byPosition ? membership.position : 0,
+        index,
+      ]
+    }
+    list.sort((left, right) => {
+      const a = rank(left)
+      const b = rank(right)
+      return a[0] - b[0] || a[1] - b[1] || a[2] - b[2] || a[3] - b[3]
+    })
+  }
+  return { list, viaFamily }
 })
+const filtered = computed(() => filterResult.value.list)
 
-const { page, pageSize, pageItems } = usePaging(
+const { page, pageSize, pageCount, pageItems } = usePaging(
   () => filtered.value,
   'aistudio2api_accounts_page_size',
   50,
 )
 
-watch([query, stateFilter, problemKind, workerFilter, tierFilter, poolFilter, sortKey], () => {
-  page.value = 1
+watch(
+  [query, stateFilter, problemKind, workerFilter, tierFilter, poolFilter, sortKey, familyFilter, vaultFilter],
+  () => {
+    page.value = 1
+  },
+)
+
+// DisplayRow 为表格的一行：账户行，或按家庭组排列时插在组变化处与页首的分组标题行（跨页的组写“（续）”），
+// 以及非家庭组账户前的灰色标题行。分页、全选本页都只按账户行计
+interface DisplayRow {
+  key: string
+  kind: 'account' | 'head' | 'none'
+  account?: Account
+  group?: FamilyGroup
+  continued?: boolean
+}
+const noneCount = computed(() =>
+  groupedMode.value
+    ? filtered.value.filter((account) => decorations.value.get(account.id)?.membership === undefined)
+        .length
+    : 0,
+)
+const displayRows = computed<DisplayRow[]>(() => {
+  const items = pageItems.value
+  if (!groupedMode.value) return items.map((account) => ({ key: account.id, kind: 'account', account }))
+  const groupOf = (account: Account | undefined) =>
+    account === undefined ? undefined : decorations.value.get(account.id)?.membership?.group
+  const start = (Math.min(page.value, pageCount.value) - 1) * pageSize.value
+  const before = start > 0 ? filtered.value[start - 1] : undefined
+  const rows: DisplayRow[] = []
+  let previous: string | null = null
+  items.forEach((account, index) => {
+    const group = groupOf(account)
+    const key = group?.id ?? ''
+    if (index === 0 || key !== previous) {
+      const continued = index === 0 && before !== undefined && (groupOf(before)?.id ?? '') === key
+      rows.push(
+        group === undefined
+          ? { key: `none:${page.value}`, kind: 'none', continued }
+          : { key: `head:${group.id}:${page.value}`, kind: 'head', group, continued },
+      )
+    }
+    rows.push({ key: account.id, kind: 'account', account })
+    previous = key
+  })
+  return rows
 })
+
+// 区域 / 时区列只在宽屏（≥1600px）显示：窄一些的屏幕上账户列要放下“主/子”徽标与钥匙按钮，区域与时区并入邮箱的悬停说明
+const wideQuery = window.matchMedia('(min-width: 1600px)')
+const wideScreen = ref(wideQuery.matches)
+function onWideChange(event: MediaQueryListEvent): void {
+  wideScreen.value = event.matches
+}
+onMounted(() => wideQuery.addEventListener('change', onWideChange))
+onBeforeUnmount(() => wideQuery.removeEventListener('change', onWideChange))
+const columnCount = computed(() => (wideScreen.value ? 9 : 8))
+
+function emailTooltip(account: Account): string {
+  return wideScreen.value ? account.label : `${account.label} · ${account.locale} · ${account.timezone}`
+}
+
+function familyMatchedText(account: Account): string {
+  const group = decorations.value.get(account.id)?.membership?.group
+  return group === undefined ? '' : tf('accounts.familyMatched', { group: groupTitle(group) })
+}
+
+function groupHeadAccounts(group: FamilyGroup): string {
+  const stats = groupStats.value.get(group.id)
+  const accounts = tf('accounts.familyHeadAccounts', { count: stats?.accounts ?? 0 })
+  const missing = stats?.missing.length ?? 0
+  return missing > 0 ? `${accounts} · ${tf('accounts.familyHeadMissing', { count: missing })}` : accounts
+}
+
+function groupHeadStates(group: FamilyGroup): { state: AccountState; count: number }[] {
+  const states = groupStats.value.get(group.id)?.states
+  if (states === undefined) return []
+  return filterStates
+    .filter((state) => (states.get(state) ?? 0) > 0)
+    .map((state) => ({ state, count: states.get(state) ?? 0 }))
+}
+
+async function copyGroupEmails(group: FamilyGroup): Promise<void> {
+  const text = groupEmails(group).join('\n')
+  if (await copyText(text)) {
+    emit('notice', tf('accounts.copiedEmails', { count: groupSize(group) }), 'success')
+  } else openManualCopy(text, t('family.copyAll'))
+}
+
+// filtersActive 为有任一筛选不是默认值（显示“重置筛选”）；默认值即各筛选的初值
+const filtersActive = computed(
+  () =>
+    stateFilter.value !== 'all' ||
+    problemKind.value !== 'all' ||
+    query.value !== '' ||
+    workerFilter.value !== 'all' ||
+    tierFilter.value !== 'all' ||
+    poolFilter.value !== 'all' ||
+    familyFilter.value !== 'all' ||
+    vaultFilter.value !== 'all' ||
+    sortKey.value !== 'default',
+)
+function resetFilters(): void {
+  stateFilter.value = 'all'
+  problemKind.value = 'all'
+  query.value = ''
+  workerFilter.value = 'all'
+  tierFilter.value = 'all'
+  poolFilter.value = 'all'
+  familyFilter.value = 'all'
+  vaultFilter.value = 'all'
+  sortKey.value = 'default'
+}
+
+// ---------- 复制选中账户的账号资料（整行） ----------
+
+const copyIncludeNote = ref(false)
+const copyingProfiles = ref(false)
+// selectedProfileEmails 为选中账户里有资料的邮箱（按选中顺序、按规范化邮箱去重）
+const selectedProfileEmails = computed(() => {
+  const emails: string[] = []
+  const seen = new Set<string>()
+  for (const id of selected.value) {
+    const decoration = decorations.value.get(id)
+    if (decoration?.profile === undefined || seen.has(decoration.email)) continue
+    seen.add(decoration.email)
+    emails.push(decoration.email)
+  }
+  return emails
+})
+
+async function copySelectedProfiles(): Promise<void> {
+  const emails = selectedProfileEmails.value
+  if (emails.length === 0 || copyingProfiles.value) return
+  copyingProfiles.value = true
+  try {
+    const total: ProfileExport = { lines: [], count: 0, missing: [], tab_lines: 0, lossy: [] }
+    const batch = vaultData.value?.limits.emails_per_request ?? DEFAULT_LIMITS.emails_per_request
+    for (let start = 0; start < emails.length; start += batch) {
+      const part = await api.exportProfiles({
+        emails: emails.slice(start, start + batch),
+        include_note: copyIncludeNote.value,
+      })
+      total.lines.push(...part.lines)
+      total.count += part.count
+      total.tab_lines += part.tab_lines
+      total.lossy.push(...(part.lossy ?? []))
+    }
+    const text = total.lines.join('\n')
+    const without = [...selected.value].filter(
+      (id) => decorations.value.get(id)?.profile === undefined,
+    ).length
+    if (await copyText(text)) {
+      let message = tf('accounts.copyProfilesDone', { count: total.count, missing: without })
+      if (total.tab_lines > 0 || total.lossy.length > 0)
+        message += ` ${tf('vault.exportReport', { tab: total.tab_lines, lossy: total.lossy.length })}`
+      emit('notice', message, 'success')
+    } else {
+      openManualCopy(text, tf('vault.copiedLinesTitle', { count: total.count }))
+    }
+  } catch (error) {
+    emit('notice', vaultErrorText(error), 'error')
+  } finally {
+    copyingProfiles.value = false
+  }
+}
 
 const selectedAccounts = computed(() =>
   props.accounts.filter((account) => selected.value.has(account.id)),
@@ -3123,75 +3466,152 @@ function closeBulkPanel(): void {
         </details>
       </div>
 
-      <!-- 状态筛选、搜索、排序（需要验证账号汇总块的“在账户列表查看”滚动到这里） -->
-      <div ref="accountListAnchor" class="flex scroll-mt-4 flex-wrap items-center gap-2">
-        <div class="seg">
-          <button
-            class="seg-item"
-            :class="{ active: stateFilter === 'all' }"
-            type="button"
-            @click="stateFilter = 'all'"
+      <!-- 状态筛选、搜索、下拉筛选与排序（需要验证账号汇总块的“在账户列表查看”滚动到这里）。三行：状态胶囊；
+           搜索、排序、重置与资料入口（靠右，放不下时另起一行，搜索框至少 20rem）；五个筛选下拉（手机两列等宽、字号小一号；
+           平板以上按当前选项的文字定宽（field-sizing，不支持的浏览器按最长选项），1280 宽起排成一行、放不下再换行，计数不截断）。
+           各筛选的含义与默认值不变 -->
+      <div ref="accountListAnchor" class="scroll-mt-4 space-y-2" data-testid="accounts-filter-bar">
+        <div class="flex flex-wrap items-center gap-2">
+          <div class="seg">
+            <button
+              class="seg-item"
+              :class="{ active: stateFilter === 'all' }"
+              type="button"
+              @click="stateFilter = 'all'"
+            >
+              {{ t('accounts.filterAll') }}
+              <span class="seg-count">{{ accounts.length }}</span>
+            </button>
+            <button
+              v-for="state in visibleFilterStates"
+              :key="state"
+              class="seg-item"
+              :class="{ active: stateFilter === state }"
+              type="button"
+              @click="stateFilter = state"
+            >
+              <span class="dot" :class="stateDotClass[state]"></span>
+              {{ t(stateKeys[state]) }}
+              <span class="seg-count">{{ stateCounts[state] }}</span>
+            </button>
+            <button
+              v-tooltip="tf('accounts.problemHelp', { hours: PERMISSION_DENIED_STALE_HOURS })"
+              class="seg-item"
+              :class="{ active: stateFilter === 'problem' }"
+              type="button"
+              @click="stateFilter = 'problem'"
+            >
+              <span class="dot bg-red-500"></span>
+              {{ t('accounts.filterProblem') }}
+              <span class="seg-count">{{ problemReasons.size }}</span>
+            </button>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2">
+          <input
+            v-model="query"
+            class="input min-w-48 flex-[1_1_20rem] sm:max-w-xl"
+            type="search"
+            :placeholder="t('accounts.search')"
+            :aria-label="t('accounts.search')"
+          />
+          <select
+            v-model="sortKey"
+            class="input field-sizing-content min-w-[9.5rem] shrink-0"
+            :aria-label="t('accounts.sortDefault')"
           >
-            {{ t('accounts.filterAll') }}
-            <span class="seg-count">{{ accounts.length }}</span>
+            <option v-for="option in sortOptions" :key="option.value" :value="option.value">
+              {{ t(option.label) }}
+            </option>
+          </select>
+          <button
+            v-if="filtersActive"
+            class="btn shrink-0"
+            type="button"
+            data-testid="accounts-reset-filters"
+            @click="resetFilters"
+          >
+            {{ t('accounts.resetFilters') }}
           </button>
           <button
-            v-for="state in visibleFilterStates"
-            :key="state"
-            class="seg-item"
-            :class="{ active: stateFilter === state }"
+            v-if="profilesFailed || familiesFailed"
+            v-tooltip="tf('accounts.vaultFileErrorHelp', { message: vaultFailText })"
+            class="btn ml-auto shrink-0 border-red-500/50 bg-red-500/10 text-red-300"
             type="button"
-            @click="stateFilter = state"
+            data-testid="accounts-vault-error"
+            @click="openVaultView({ sub: 'profiles' })"
           >
-            <span class="dot" :class="stateDotClass[state]"></span>
-            {{ t(stateKeys[state]) }}
-            <span class="seg-count">{{ stateCounts[state] }}</span>
+            <UiIcon name="warning" :size="12" />
+            {{ t('accounts.vaultFileError') }} ›
           </button>
           <button
-            v-tooltip="tf('accounts.problemHelp', { hours: PERMISSION_DENIED_STALE_HOURS })"
-            class="seg-item"
-            :class="{ active: stateFilter === 'problem' }"
+            v-else-if="missingProfiles > 0"
+            v-tooltip="t('accounts.vaultMissingHelp')"
+            class="btn ml-auto shrink-0 border-amber-500/50 bg-amber-500/10 text-amber-300 hover:text-amber-200"
             type="button"
-            @click="stateFilter = 'problem'"
+            data-testid="accounts-vault-missing"
+            @click="openVaultView({ sub: 'profiles', filter: 'missing' })"
           >
-            <span class="dot bg-red-500"></span>
-            {{ t('accounts.filterProblem') }}
-            <span class="seg-count">{{ problemReasons.size }}</span>
+            <UiIcon name="warning" :size="12" />
+            {{ tf('accounts.vaultMissing', { count: missingProfiles }) }} ›
           </button>
         </div>
-        <input
-          v-model="query"
-          class="input min-w-40 flex-1 sm:max-w-80"
-          type="search"
-          :placeholder="t('accounts.search')"
-          :aria-label="t('accounts.search')"
-        />
-        <select v-model="workerFilter" class="input" :aria-label="t('accounts.worker')">
-          <option v-for="option in workerFilterOptions" :key="option.value" :value="option.value">
-            {{ t(option.label) }}
-          </option>
-        </select>
-        <select v-model="tierFilter" class="input" :aria-label="t('accounts.benefitTier')">
-          <option v-for="option in tierFilterOptions" :key="option.value" :value="option.value">
-            {{ t(option.label) }} ({{ tierCounts[option.value] }})
-          </option>
-        </select>
-        <select
-          v-model="poolFilter"
-          v-tooltip="t('accounts.poolFilterHelp')"
-          class="input"
-          :aria-label="t('accounts.poolFilter')"
-          data-testid="accounts-pool-filter"
+        <!-- 字号写在容器上：控件的 font: inherit（style.css 未分层的基础规则）会盖过直接写在控件上的字号工具类 -->
+        <div
+          class="grid grid-cols-2 gap-2 max-sm:text-xs sm:flex sm:flex-wrap sm:items-center"
+          data-testid="accounts-filter-selects"
         >
-          <option v-for="option in poolFilterOptions" :key="option.value" :value="option.value">
-            {{ t(option.label) }} ({{ poolCounts[option.value] }})
-          </option>
-        </select>
-        <select v-model="sortKey" class="input" :aria-label="t('accounts.sortDefault')">
-          <option v-for="option in sortOptions" :key="option.value" :value="option.value">
-            {{ t(option.label) }}
-          </option>
-        </select>
+          <select
+            v-model="workerFilter"
+            class="input w-full min-w-0 sm:w-auto sm:min-w-[9.5rem] sm:field-sizing-content"
+            :aria-label="t('accounts.worker')"
+          >
+            <option v-for="option in workerFilterOptions" :key="option.value" :value="option.value">
+              {{ t(option.label) }}
+            </option>
+          </select>
+          <select
+            v-model="tierFilter"
+            class="input w-full min-w-0 sm:w-auto sm:min-w-[9.5rem] sm:field-sizing-content"
+            :aria-label="t('accounts.benefitTier')"
+          >
+            <option v-for="option in tierFilterOptions" :key="option.value" :value="option.value">
+              {{ t(option.label) }} ({{ tierCounts[option.value] }})
+            </option>
+          </select>
+          <select
+            v-model="poolFilter"
+            v-tooltip="t('accounts.poolFilterHelp')"
+            class="input w-full min-w-0 sm:w-auto sm:min-w-[9.5rem] sm:field-sizing-content"
+            :aria-label="t('accounts.poolFilter')"
+            data-testid="accounts-pool-filter"
+          >
+            <option v-for="option in poolFilterOptions" :key="option.value" :value="option.value">
+              {{ t(option.label) }} ({{ poolCounts[option.value] }})
+            </option>
+          </select>
+          <FamilyFilterMenu
+            v-model="familyFilter"
+            grouped
+            :counts="familyCounts.result"
+            :group-counts="familyCounts.groups"
+            :unavailable="familiesFailed ? t('accounts.familyFilterUnavailable') : ''"
+            trigger-class="input input-trigger w-full min-w-0 sm:w-auto sm:min-w-[9.5rem] sm:max-w-[20rem]"
+          />
+          <select
+            v-model="vaultFilter"
+            class="input w-full min-w-0 max-sm:col-span-2 sm:w-auto sm:min-w-[9.5rem] sm:field-sizing-content"
+            :aria-label="t('accounts.vaultFilter')"
+            data-testid="accounts-vault-filter"
+          >
+            <option v-for="option in vaultFilterOptions" :key="option.value" :value="option.value">
+              {{ t(option.label) }}{{ profilesFailed ? '' : ` (${vaultCounts[option.value]})` }}
+            </option>
+            <option v-if="profilesFailed" disabled value="">
+              {{ t('accounts.vaultFilterUnavailable') }}
+            </option>
+          </select>
+        </div>
       </div>
 
       <!-- 出问题的账户：一键复制邮箱与原因 -->
@@ -3271,6 +3691,24 @@ function closeBulkPanel(): void {
         >
           {{ t('common.delete') }}
         </button>
+        <span class="inline-flex items-center gap-1.5">
+          <label class="flex items-center gap-1 text-gray-300">
+            <input v-model="copyIncludeNote" type="checkbox" data-testid="accounts-copy-note" />
+            {{ t('vault.includeNote') }}
+          </label>
+          <button
+            v-tooltip="selectedProfileEmails.length === 0 ? t('accounts.copyProfilesNone') : ''"
+            class="btn btn-sm"
+            type="button"
+            :disabled="selectedProfileEmails.length === 0 || copyingProfiles || profilesFailed"
+            :aria-busy="copyingProfiles"
+            data-testid="accounts-copy-profiles"
+            @click="copySelectedProfiles"
+          >
+            <UiIcon name="key" :size="12" />
+            {{ tf('accounts.copyProfiles', { count: selectedProfileEmails.length }) }}
+          </button>
+        </span>
         <button
           class="btn btn-sm"
           type="button"
@@ -3296,7 +3734,7 @@ function closeBulkPanel(): void {
       </div>
       <div v-else class="panel">
         <div class="overflow-x-auto">
-          <table class="data-table" :class="tableMinWidth">
+          <table class="data-table" :style="{ minWidth: `${tableMinWidth}px` }">
             <colgroup>
               <col class="w-10" />
               <col class="w-28" />
@@ -3305,8 +3743,8 @@ function closeBulkPanel(): void {
               <col :class="poolTagShown ? 'w-32' : 'w-20'" />
               <col class="w-16" />
               <col class="w-44" />
-              <col class="w-44" />
-              <col class="w-[17.5rem]" />
+              <col v-if="wideScreen" class="w-44" />
+              <col class="w-[22rem]" />
             </colgroup>
             <thead>
               <tr>
@@ -3324,20 +3762,102 @@ function closeBulkPanel(): void {
                 <th>{{ t('accounts.benefitTier') }}</th>
                 <th>{{ t('accounts.models') }}</th>
                 <th>{{ t('accounts.proxy') }}</th>
-                <th>{{ t('accounts.region') }}</th>
+                <th v-if="wideScreen">{{ t('accounts.region') }}</th>
                 <th class="text-right">{{ t('accounts.actions') }}</th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="filtered.length === 0">
-                <td colspan="9" class="py-8 text-center text-gray-500">{{ t('accounts.noMatch') }}</td>
+                <td :colspan="columnCount" class="py-8 text-center text-gray-500">
+                  {{ t('accounts.noMatch') }}
+                </td>
               </tr>
+              <template v-for="row in displayRows" :key="row.key">
+                <!-- 分组标题行：组色条、主邮箱、名称、人数、在账户里的情况与状态汇总（按组内全部账户计） -->
+                <tr
+                  v-if="row.kind === 'head'"
+                  class="family-head"
+                  :class="famClass(row.group!.color)"
+                  data-testid="family-head"
+                  :data-group="row.group!.id"
+                >
+                  <td :colspan="columnCount">
+                    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                      <span class="flex min-w-0 items-center gap-1.5">
+                        <span class="fam-dot h-2.5 w-2.5"></span>
+                        <span class="text-[var(--fam-text)]"><UiIcon name="crown" :size="12" /></span>
+                        <span class="cell-truncate font-mono font-semibold text-gray-100">{{
+                          row.group!.primary
+                        }}</span>
+                        <span v-if="row.group!.name" class="truncate font-semibold text-[var(--fam-text)]">{{
+                          row.group!.name
+                        }}</span>
+                        <span v-if="row.continued" class="text-gray-500">{{
+                          t('accounts.familyContinued')
+                        }}</span>
+                      </span>
+                      <span :class="groupSize(row.group!) > 6 ? 'text-amber-300' : 'text-gray-400'">{{
+                        tf('family.people', { count: groupSize(row.group!) })
+                      }}</span>
+                      <span
+                        v-if="groupSize(row.group!) > 6"
+                        class="tag border-amber-500/50 font-sans text-amber-300"
+                        >{{ t('family.overSix') }}</span
+                      >
+                      <span
+                        v-tooltip="(groupStats.get(row.group!.id)?.missing ?? []).join('\n')"
+                        class="text-gray-400"
+                        :tabindex="(groupStats.get(row.group!.id)?.missing.length ?? 0) > 0 ? 0 : undefined"
+                        >{{ groupHeadAccounts(row.group!) }}</span
+                      >
+                      <span class="flex flex-wrap items-center gap-2">
+                        <span
+                          v-for="entry in groupHeadStates(row.group!)"
+                          :key="entry.state"
+                          v-tooltip="t(stateKeys[entry.state])"
+                          class="inline-flex items-center gap-1 font-mono text-gray-400"
+                          ><span class="dot" :class="stateDotClass[entry.state]"></span
+                          >{{ entry.count }}</span
+                        >
+                      </span>
+                      <span class="ml-auto flex items-center gap-1">
+                        <button class="btn btn-sm btn-ghost" type="button" @click="copyGroupEmails(row.group!)">
+                          <UiIcon name="copy" :size="12" />
+                          {{ t('family.copyAll') }}
+                        </button>
+                        <button
+                          class="btn btn-sm btn-ghost"
+                          type="button"
+                          @click="openVaultView({ sub: 'profiles', family: row.group!.id })"
+                        >
+                          {{ t('accounts.familyViewProfiles') }} ›
+                        </button>
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+                <tr v-else-if="row.kind === 'none'" class="family-head-none" data-testid="family-head-none">
+                  <td :colspan="columnCount" class="text-xs text-gray-400">
+                    {{ tf('accounts.familyNoneHead', { count: noneCount }) }}
+                    <span v-if="row.continued" class="text-gray-500">{{
+                      t('accounts.familyContinued')
+                    }}</span>
+                  </td>
+                </tr>
+                <template v-else>
               <tr
-                v-for="account in pageItems"
+                v-for="account in [row.account!]"
                 :key="account.id"
                 :class="{ 'is-selected': isSelected(account), 'opacity-60': !account.enabled }"
+                :data-account="account.id"
               >
-                <td>
+                <td
+                  :class="
+                    decor(account)?.membership
+                      ? ['fam-bar', famClass(decor(account)?.membership?.group.color)]
+                      : ''
+                  "
+                >
                   <input
                     type="checkbox"
                     :checked="isSelected(account)"
@@ -3385,8 +3905,44 @@ function closeBulkPanel(): void {
                   </span>
                 </td>
                 <td>
-                  <div v-tooltip="account.label" class="cell-truncate font-mono text-gray-200">
-                    {{ account.label }}
+                  <div class="flex min-w-0 items-center gap-1.5">
+                    <FamilyBadge
+                      v-if="decor(account)?.membership"
+                      :membership="decor(account)!.membership!"
+                      :missing="groupStats.get(decor(account)!.membership!.group.id)?.missing.length"
+                    />
+                    <span
+                      v-tooltip="emailTooltip(account)"
+                      class="cell-truncate min-w-0 font-mono text-gray-200"
+                      >{{ account.label }}</span
+                    >
+                    <span
+                      v-if="filterResult.viaFamily.has(account.id)"
+                      v-tooltip="familyMatchedText(account)"
+                      class="shrink-0 text-gray-500"
+                      tabindex="0"
+                      :aria-label="familyMatchedText(account)"
+                      data-testid="family-matched"
+                      ><UiIcon name="link" :size="11"
+                    /></span>
+                    <SecretMenu
+                      v-if="decor(account)?.profile"
+                      :email="decor(account)!.email"
+                      :label="account.label"
+                      :profile="decor(account)!.profile!"
+                      :membership="decor(account)!.membership"
+                    />
+                    <button
+                      v-else-if="!profilesFailed && vaultData !== null"
+                      v-tooltip="t('accounts.addProfile')"
+                      class="key-ghost inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-gray-400 hover:bg-raised hover:text-amber-200"
+                      type="button"
+                      :aria-label="t('accounts.addProfile')"
+                      data-testid="account-add-profile"
+                      @click="openProfileEditor(decor(account)?.email ?? account.label, 'add')"
+                    >
+                      <UiIcon name="key" :size="13" />
+                    </button>
                   </div>
                   <div
                     v-if="stateFilter === 'problem' && problemReasons.has(account.id)"
@@ -3462,13 +4018,13 @@ function closeBulkPanel(): void {
                     {{ t('accounts.proxyPoolPinned') }}
                   </div>
                 </td>
-                <td>
+                <td v-if="wideScreen">
                   <div class="cell-truncate text-xs text-gray-400">
                     {{ account.locale }} · {{ account.timezone }}
                   </div>
                 </td>
                 <td>
-                  <div class="flex justify-end gap-1">
+                  <div class="row-actions flex flex-wrap justify-end gap-1">
                     <button
                       class="btn btn-sm"
                       type="button"
@@ -3525,6 +4081,8 @@ function closeBulkPanel(): void {
                   </div>
                 </td>
               </tr>
+                </template>
+              </template>
             </tbody>
           </table>
         </div>

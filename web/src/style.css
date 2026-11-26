@@ -616,4 +616,179 @@ button[aria-busy='true']::before {
     background: #3b82f6;
     transition: width 200ms ease;
   }
+
+  /* ---------- 账号资料与家庭组 ---------- */
+  /* 家庭组色板（12 色，按深色背景校验：两两最小 ΔE2000 21.6，按编号循环相邻 ≥ 30.5；点/条对面板、画布、悬停行的对比度都 ≥ 3.9:1，
+     徽标字对 14% 着色底 ≥ 10.4:1）。顺序：blue、red、mint、purple、stone、lime、pink、amber、cyan、orchid、yellow、green。组的颜色只经类名 fam-c{编号} 取。
+     控制台只有深色主题，这里不写亮色规则；以后加亮色主题时要按白底重选一套值 */
+  .fam-c0 {
+    --fam: #0284c7;
+    --fam-text: #bae6fd;
+    --fam-base: #0ea5e9;
+  }
+
+  .fam-c1 {
+    --fam: #ef4444;
+    --fam-text: #fecaca;
+    --fam-base: #ef4444;
+  }
+
+  .fam-c2 {
+    --fam: #6ee7b7;
+    --fam-text: #d1fae5;
+    --fam-base: #10b981;
+  }
+
+  .fam-c3 {
+    --fam: #a855f7;
+    --fam-text: #e9d5ff;
+    --fam-base: #a855f7;
+  }
+
+  .fam-c4 {
+    --fam: #a8a29e;
+    --fam-text: #e7e5e4;
+    --fam-base: #78716c;
+  }
+
+  .fam-c5 {
+    --fam: #84cc16;
+    --fam-text: #d9f99d;
+    --fam-base: #84cc16;
+  }
+
+  .fam-c6 {
+    --fam: #ec4899;
+    --fam-text: #fbcfe8;
+    --fam-base: #ec4899;
+  }
+
+  .fam-c7 {
+    --fam: #d97706;
+    --fam-text: #fde68a;
+    --fam-base: #f59e0b;
+  }
+
+  .fam-c8 {
+    --fam: #22d3ee;
+    --fam-text: #cffafe;
+    --fam-base: #06b6d4;
+  }
+
+  .fam-c9 {
+    --fam: #f0abfc;
+    --fam-text: #fae8ff;
+    --fam-base: #d946ef;
+  }
+
+  .fam-c10 {
+    --fam: #fcd34d;
+    --fam-text: #fef9c3;
+    --fam-base: #eab308;
+  }
+
+  .fam-c11 {
+    --fam: #059669;
+    --fam-text: #a7f3d0;
+    --fam-base: #10b981;
+  }
+
+  .fam-dot {
+    display: inline-block;
+    width: 0.5rem;
+    height: 0.5rem;
+    flex-shrink: 0;
+    border-radius: 9999px;
+    background: var(--fam);
+  }
+
+  .fam-bar {
+    box-shadow: inset 3px 0 0 var(--fam);
+  }
+
+  .fam-top {
+    box-shadow: inset 0 3px 0 var(--fam);
+  }
+
+  /* 主/子徽标：与 .tag-ultra 等号池标记同一配方（55% 描边、14% 着色底、浅色字） */
+  .tag-fam {
+    gap: 0.2rem;
+    border-color: color-mix(in srgb, var(--fam-base) 55%, transparent);
+    background: color-mix(in srgb, var(--fam-base) 14%, transparent);
+    color: var(--fam-text);
+    font-family: inherit;
+    font-weight: 600;
+  }
+
+  /* 子成员的徽标弱一级：只有描边 */
+  .tag-fam-member {
+    background: transparent;
+  }
+
+  /* “未存在”（资料或家庭组里有、账户列表里没有）：琥珀描边 */
+  .tag-missing {
+    border-color: rgb(245 158 11 / 50%);
+    background: rgb(245 158 11 / 8%);
+    color: #fcd34d;
+    font-family: inherit;
+  }
+
+  /* 按家庭组显示的分组标题行：不响应行悬停色，左侧 3px 组色条 */
+  .data-table tbody tr.family-head td,
+  .data-table tbody tr.family-head:hover td {
+    padding-top: 0.45rem;
+    padding-bottom: 0.45rem;
+    border-bottom-color: #30363d;
+    background: color-mix(in srgb, var(--fam-base) 9%, #161b22);
+    box-shadow: inset 3px 0 0 var(--fam);
+  }
+
+  .data-table tbody tr.family-head-none td,
+  .data-table tbody tr.family-head-none:hover td {
+    padding-top: 0.45rem;
+    padding-bottom: 0.45rem;
+    border-bottom-color: #30363d;
+    background: #0d1117;
+  }
+
+  /* 编辑框里遮挡密码与 2FA 密钥（不用 type=password，避免浏览器密码管理器抓取第三方密码） */
+  .secret-mask {
+    -webkit-text-security: disc;
+  }
+
+  /* 钥匙按钮：没有资料的行只在悬停、聚焦时淡淡显示（触屏设备常显 40%） */
+  .key-ghost {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+
+  .data-table tbody tr:hover .key-ghost,
+  .key-ghost:focus-visible,
+  .key-ghost[data-state='open'] {
+    opacity: 0.55;
+  }
+
+  @media (hover: none) {
+    .key-ghost {
+      opacity: 0.4;
+    }
+  }
+
+  /* 筛选栏的自绘下拉触发按钮：与 select.input 同高同边框，右侧 ▾ */
+  .input-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+    text-align: left;
+  }
+
+  .input-trigger[data-state='open'] {
+    border-color: #3b82f6;
+  }
+
+  /* 账户表操作列的按钮稍紧凑：六个按钮（含“重新登录”）放得下一行 */
+  .row-actions > .btn-sm {
+    padding-inline: 0.375rem;
+  }
 }

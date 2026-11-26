@@ -112,6 +112,9 @@ type runtimeManager struct {
 	mediaCleaner *mediastore.Cleaner
 	// studioKeys 为管理页手动触发的获取 AI Studio API Key 队列（见 studio_key.go）
 	studioKeys studioKeyJob
+	// vault 为账号资料与家庭组（见 vault.go）：进程级，第一次调用管理接口时才打开（启动与装配零 I/O、零日志），
+	// 跨生成服务重建保留；测试直接构造的管理器为零值，configPath 为空时只在内存
+	vault vaultHolder
 }
 
 // newRuntimeManager 创建进程级管理器与初始生成服务。

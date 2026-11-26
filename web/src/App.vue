@@ -12,7 +12,7 @@ import {
   watch,
 } from 'vue'
 import { api, openAdminEvents, type EventConnection, type EventsState } from '@/api'
-import { assetReloadBlocked, recoverFromAssetError } from '@/assetRecovery'
+import { assetReloadBlocked, recoverFromAssetError, useUnsavedGuard } from '@/assetRecovery'
 import { useI18n, type TranslationKey } from '@/i18n'
 import type {
   Account,
@@ -36,6 +36,7 @@ import PlaygroundPanel from '@/components/PlaygroundPanel.vue'
 import RequestsPanel from '@/components/RequestsPanel.vue'
 import SettingsPanel from '@/components/SettingsPanel.vue'
 import UiConfirm from '@/components/UiConfirm.vue'
+import ManualCopyDialog from '@/components/vault/ManualCopyDialog.vue'
 import UiIcon, { type IconName } from '@/components/UiIcon.vue'
 import {
   formatClock,
@@ -45,6 +46,7 @@ import {
 } from '@/proxyPool'
 import { elapsedSecondsSince, syncServerClock, useSecondClock } from '@/serverClock'
 import { readStorage, writeStorage } from '@/storage'
+import { profileEditor, setVaultNoticeHandler, vaultDraftDirty, vaultNav } from '@/vault'
 
 const { availableLocales, locale, setLocale, t, tf } = useI18n()
 // 用量页按需加载：图表库只在打开用量页时下载，不进入主包。服务升级后旧页面载入旧版的块会失败，
@@ -65,6 +67,36 @@ const UsagePanel = defineAsyncComponent({
   },
   delay: 150,
 })
+// 资料与家庭组页按需加载（导入、预览、家庭组卡片等只在打开这一页时下载）；资料编辑框是单独的块，账户页与资料页都经 vault.ts 打开它。
+// 载入失败的恢复同用量页
+function lazyPanel(loader: () => Promise<unknown>, loadingKey: TranslationKey, failedKey: TranslationKey) {
+  return defineAsyncComponent({
+    loader: () =>
+      loader().catch((error: unknown) => {
+        void recoverFromAssetError()
+        throw error
+      }) as never,
+    loadingComponent: {
+      render: () => h('p', { class: 'p-8 text-sm text-gray-500', role: 'status' }, t(loadingKey)),
+    },
+    errorComponent: {
+      render: () => h('p', { class: 'p-8 text-sm text-red-300', role: 'alert' }, t(failedKey)),
+    },
+    delay: 150,
+  })
+}
+const VaultPanel = lazyPanel(
+  () => import('@/components/vault/VaultPanel.vue'),
+  'vault.panelLoading',
+  'vault.panelFailed',
+)
+const ProfileEditor = defineAsyncComponent({
+  loader: () =>
+    import('@/components/vault/ProfileEditor.vue').catch((error: unknown) => {
+      void recoverFromAssetError()
+      throw error
+    }),
+})
 // 前端最多保留的日志条数；日志面板按可视区域渲染，这里只限制内存占用
 const LOG_LIMIT = 1500
 // 前端最多保留的请求条数；超出时先丢弃最早的已结束请求，进行中的请求始终保留
@@ -78,6 +110,7 @@ const validTabs: TabID[] = [
   'usage',
   'settings',
   'playground',
+  'vault',
 ]
 const savedTab = readStorage(TAB_STORAGE_KEY) as TabID | null
 const currentTab = ref<TabID>(savedTab && validTabs.includes(savedTab) ? savedTab : 'logs')
@@ -114,6 +147,7 @@ const noticeClipped = ref(false)
 const navigation: { id: TabID; label: TranslationKey; icon: IconName }[] = [
   { id: 'logs', label: 'nav.logs', icon: 'dashboard' },
   { id: 'accounts', label: 'nav.accounts', icon: 'key' },
+  { id: 'vault', label: 'nav.vault', icon: 'users' },
   { id: 'models', label: 'nav.models', icon: 'dashboard' },
   { id: 'requests', label: 'nav.requests', icon: 'info' },
   { id: 'usage', label: 'nav.usage', icon: 'usage' },
@@ -1089,6 +1123,19 @@ function handleAdminEvent(event: AdminEvent): void {
   trimRequests(requests.value)
 }
 
+// 资料与家庭组：账户页、资料页之间的跳转请求（切页签后各自在挂载时读取筛选）；操作结果的提示走这里；
+// 有没导入的草稿或资料编辑框开着时，页面文件更新后不自动刷新（草稿只在内存，刷新就丢）
+watch(
+  () => vaultNav.tab,
+  (tab) => {
+    if (tab === null) return
+    currentTab.value = tab
+    vaultNav.tab = null
+  },
+)
+setVaultNoticeHandler(showNotice)
+useUnsavedGuard(() => vaultDraftDirty() || profileEditor.open)
+
 onMounted(async () => {
   document.title = t('app.title')
   statusTimer = window.setInterval(() => void pollStatus(), 3000)
@@ -1649,6 +1696,12 @@ onUnmounted(() => {
           @saved="config = $event"
           @notice="showNotice"
         />
+        <!-- loading 为账户列表还不知道（载入中，或载入失败且一个账户都没有）：这时不判断资料“未存在” -->
+        <VaultPanel
+          v-else-if="currentTab === 'vault'"
+          :accounts="accounts"
+          :loading="loading.accounts || (errors.accounts !== '' && accounts.length === 0)"
+        />
         <PlaygroundPanel
           v-else
           :models="models"
@@ -1715,6 +1768,8 @@ onUnmounted(() => {
       </div>
     </Transition>
     <UiConfirm />
+    <ManualCopyDialog />
+    <ProfileEditor v-if="profileEditor.open" :key="profileEditor.email + profileEditor.mode" />
   </div>
 </template>
 
