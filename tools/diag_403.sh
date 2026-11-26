@@ -46,8 +46,14 @@
 #      号池级 403 判定行与撤销登记的 INFO 行的次数与时间分布；每次 403 时这个账户的 Worker 已运行多久（距最近一次“WAA Worker 就绪”）与
 #      距进程启动多久；Worker 存活时长分布（按停止的“起因=”）；同一分钟 3 个及以上账户出现非 verify 403 的聚类。程序目录与本机其他实例目录
 #      的运行日志分开统计，另读外部轮转出的 .2、.N.gz、-日期 等文件
+#   9. 被迁移账户（不看 MODEL，ACCOUNT 照常；号池里有没有出现被 Google 迁移的账户）：模型目录缓存 runtime/model-catalogs/ 里号池账户引用的
+#      Playground 目录（ListModels 原文）有几份带 gemini-4 行的 field 79 为 [null,null,1,2]（第 3 项写成 true 也算）、几份不带、几份缺失或
+#      读不出（文件缺失、打不开、内容不对分开写），各有多少账户共用与权益分布，带标记的按共用的账户数逐份列出（最多 10 份）；账户目录里找不到
+#      账户时改按目录缓存里的账户（可能含已删除的）；目录按内容在账户间共用（[null,null,1,2] 不改变内容键，原文是最先写入的那个账户的），
+#      看不出具体哪些账户被迁移，所以不按账户对比 403（要比较需要 HAR，或让服务逐个账户记下这项）。每份目录只读、只解析一次（约 300KB 的
+#      一份约 3 毫秒），耗时随号池引用的不同目录份数线性增长（按内容共用时通常只有几份到几十份）
 # 只读：只对本机管理接口发 GET 请求，只读 .env、运行日志（logs/aistudio2api.log 与 .1，第 8 段另读轮转出的其他文件与本机其他实例的运行日志）、
-#   登记文件（管理接口连不上时）与进程信息，
+#   登记文件（管理接口连不上时）与进程信息，第 9 段另读模型目录缓存与各账户 account.json 里的 label，
 # 不改任何配置、记录、冷却或账户；邮箱已打码，不输出管理令牌、API 密钥与提示词（账本里的请求正文只取消息条数、字数、媒体数与参数值，
 # 不输出任何文字内容）。
 #
@@ -94,7 +100,8 @@ env_file_value() {
 }
 
 printf '==================== 403 无权限账户诊断 %s（%s）====================\n' "$(date '+%F %T %z')" "$([ "$MODEL" = all ] && echo "全部模型" || echo "模型 $MODEL")"
-echo "程序目录：$APP${ACCOUNT:+；只看账户含 \"$ACCOUNT\" 的}${VERIFY:+；逐个列出需要验证账号的账户}"
+# ACCOUNT 可以写完整邮箱，程序目录也可能带邮箱：整行打码
+echo "程序目录：$APP${ACCOUNT:+；只看账户含 \"$ACCOUNT\" 的}${VERIFY:+；逐个列出需要验证账号的账户}" | mask
 
 printf '\n== 1. 版本与实例\n'
 FIX_COUNT=""
@@ -113,6 +120,7 @@ APP_AUTH="$(env_file_value .env AISTUDIO_AUTH_STATES)"
 APP_AUTH="${APP_AUTH:-auth}"; APP_AUTH="${APP_AUTH%%,*}"
 case "$APP_AUTH" in /*) ;; *) APP_AUTH="$APP/$APP_AUTH" ;; esac
 APP_AUTH="$(readlink -f "$APP_AUTH" 2>/dev/null || echo "$APP_AUTH")"
+# AISTUDIO_AUTH_STATES 可以直接写以邮箱命名的账户目录（或其中的 storage-state.json），下面输出账户目录的实例行、共用行与登记文件行都打码
 INSTANCES=""
 for p in $(pgrep -x aistudio2api 2>/dev/null); do
   d="$(readlink "/proc/$p/cwd" 2>/dev/null)" || continue
@@ -123,15 +131,15 @@ for p in $(pgrep -x aistudio2api 2>/dev/null); do
   started="$(ps -o etimes= -p "$p" 2>/dev/null | tr -cd '0-9')"
   INSTANCES="$INSTANCES$p|$d|$a|${started:+$(($(date +%s) - started))}
 "
-  echo "实例 PID $p | 目录 $d | 账户目录 $a | 启动于 $(ps -o lstart= -p "$p" 2>/dev/null | sed 's/^ *//')"
+  echo "实例 PID $p | 目录 $d | 账户目录 $a | 启动于 $(ps -o lstart= -p "$p" 2>/dev/null | sed 's/^ *//')" | mask
 done
 [ -z "$INSTANCES" ] && echo "本机没有名为 aistudio2api 的进程（docker 等其他方式运行的实例列不出来）"
 SHARED="$(printf '%s' "$INSTANCES" | awk -F'|' -v dir="$APP_AUTH" '$3 == dir {n++} END {print n + 0}')"
 if [ "${SHARED:-0}" -ge 2 ]; then
-  echo "⚠ $SHARED 个实例共用本目录的账户目录 $APP_AUTH：403 登记文件是共用的，别的实例的请求同样会登记在这里"
+  echo "⚠ $SHARED 个实例共用本目录的账户目录 $APP_AUTH：403 登记文件是共用的，别的实例的请求同样会登记在这里" | mask
 fi
-stat -c '403 登记文件 %n 最后写入 %y（登记表任何变化都会更新它，只能作参考）' "$APP_AUTH/.permission-denied.json" 2>/dev/null ||
-  echo "403 登记文件 $APP_AUTH/.permission-denied.json 不存在"
+{ stat -c '403 登记文件 %n 最后写入 %y（登记表任何变化都会更新它，只能作参考）' "$APP_AUTH/.permission-denied.json" 2>/dev/null ||
+  echo "403 登记文件 $APP_AUTH/.permission-denied.json 不存在"; } | mask
 if git -C "$APP" rev-parse --git-dir >/dev/null 2>&1; then
   echo "源码 $(git -C "$APP" log -1 --format='%h %cd' --date=iso 2>/dev/null)"
   if ! git -C "$APP" cat-file -e '93c16fa^{commit}' 2>/dev/null; then echo "源码里没有 93c16fa 这个提交（更早的版本或不是同一仓库）"
@@ -749,9 +757,19 @@ def same_account(value, entry):
     return value != "" and value in ((entry["id"] or "").lower(), (entry["label"] or "").lower())
 
 
+# Interaction 模型失败（最终状态 4）的上游错误在固定文案后接 field 28 的错误码与原因（aistudio/interaction_failure.go："AI Studio
+# CreateInteractionStream 返回 HTTP 502: interaction failed: <错误码>: <说明>"，原因已压成一行）。原因是上游原文，可能带 403 字样；
+# 运行时它仍是 502、不进 403 登记，按子串找 403 前先去掉。后面接着的 MODEL_FALLBACKS 改用说明保留
+INTERACTION_REASON_RE = re.compile(r"(interaction failed): [^\n]*?(?=（已按 MODEL_FALLBACKS 改用其他模型：|\n|$)")
+
+
+def strip_reason(text):
+    return INTERACTION_REASON_RE.sub(r"\1", text or "")
+
+
 def denied_here(record, entry):
-    tried = [a for a in record.get("attempts") or [] if same_account(a.get("account"), entry) and "403" in (a.get("error") or "")]
-    return bool(tried) or same_account(record.get("account"), entry) and "403" in (record.get("error") or "")
+    tried = [a for a in record.get("attempts") or [] if same_account(a.get("account"), entry) and "403" in strip_reason(a.get("error"))]
+    return bool(tried) or same_account(record.get("account"), entry) and "403" in strip_reason(record.get("error"))
 
 
 def ledger_window(entry):
@@ -1504,7 +1522,7 @@ for entry in entries:
         continue
     print(head + entry["how"])
     if record:
-        chain = [("%s %s" % (mask(a.get("account")), "403" if "403" in (a.get("error") or "") else "失败")) for a in record.get("attempts") or []]
+        chain = [("%s %s" % (mask(a.get("account")), "403" if "403" in strip_reason(a.get("error")) else "失败")) for a in record.get("attempts") or []]
         chain.append("%s %s" % (mask(record.get("account")) or "-", "成功" if record.get("state") in ("completed", "tool_calls", "limited") else record.get("state")))
         print("    %s | %s | %s | HTTP %s %s | 正文记录%s" % (
             show(parse_time(record.get("time"))), record.get("id"), record.get("path"), record.get("status"), record.get("state"),
@@ -2203,7 +2221,7 @@ def pool_label(pool):
 
 def analyze_instance(directory, started_at):
     paths = log_paths(directory)
-    print("\n-- 实例目录 %s（运行日志：%s）" % (directory, "、".join(os.path.basename(path) for path in paths) or "没有"))
+    print("\n-- 实例目录 %s（运行日志：%s）" % (mask(directory), "、".join(os.path.basename(path) for path in paths) or "没有"))
     if not paths:
         print("没有运行日志（logs/aistudio2api.log 与轮转出的 .1 等都不在）")
         return
@@ -2416,7 +2434,7 @@ def analyze_instance(directory, started_at):
 
 
 print("\n== 8. 所有模型的 403 与号池级 403（不看 MODEL%s；判断有没有上游那种“长时间运行后全部账户 403”；时间为本机时区）" % (
-    "，只看账户含 \"%s\" 的" % ACCOUNT if ACCOUNT else ""))
+    "，只看账户含 \"%s\" 的" % mask(ACCOUNT) if ACCOUNT else ""))
 instance_dirs = collections.OrderedDict()
 instance_dirs[os.path.realpath(APP)] = PROC_START
 for row in (ENV.get("INSTANCES") or "").splitlines():
@@ -2434,4 +2452,299 @@ if len(instance_dirs) > 1:
     print("本机有 %d 个实例目录，各自的运行日志分开统计（Worker 只在本实例的日志里就绪、停止）" % len(instance_dirs))
 for directory, started_at in instance_dirs.items():
     analyze_instance(directory, started_at)
+
+
+# ---------- 9. 被迁移账户 ----------
+# 回答“号池里有没有出现被 Google 迁移的账户”（只读，不看 MODEL，ACCOUNT 照常）。
+# 被迁移：2026-11 起 Google 逐个账户给 gemini-4 等普通文本模型的目录行加上 field 79（下标 78）InteractionConfig [null,null,1,2]
+# （第 3 项后台任务为真、第 4 项类型 2 为模型；见 internal/aistudio/models.go 的 decodeInteractionConfig 与 interactionConfig，7c1fa50），
+# 本服务对它们照常经 GenerateContent 生成。第 3 项写成 1 或 true 都认（与 rawBool 相同，只认 0、1、false、true），第 4 项为整数 2；
+# gemini-4 行为模型 ID 去掉 models/ 后以 gemini-4 开头、后面不是数字的行，没有 field 79、行太短、为 null 或别的配置（如 Omni 的
+# [null,null,false,2]）算不带。
+# 模型目录缓存（internal/app/catalog_cache.go）：runtime/model-catalogs/index.json 为
+# {"version":1,"saved_at":…,"accounts":{账户 ID:{"t":权益,"p":Playground 目录的 blob 键,…}}}，blobs/<键>.json 为
+# {"version":1,"kind":"playground","raw":ListModels 原文}，原文 raw[0] 为模型行、行[0] 为 "models/<ID>"；键为 32 位十六进制，每份只读、只解析一次。
+# 只能按目录看，不能按账户看：blob 键是解析结果的内容键（internal/aistudio/catalog_restore.go 的 ContentKey），[null,null,1,2] 不改变解析结果
+# （interactionOnly 与 stream 都为假），同一种目录被迁移与未迁移的账户键相同、共用一份 blob；同键的 blob 只在盘上没有时写一次
+# （catalog_cache.go 的 blobNeeded 与 saveLocked），原文是最先写入（或清理后重新写入）这份目录的那个账户的，之后同步的账户只改 index 里的键、
+# 不改写原文（Client 侧同样按内容键共用一份原文，见 models.go 的 shareCatalogLocked）；服务在别处也不逐个账户记这项。所以带标记的目录只说明
+# 号池里有过被迁移的账户，不带的不说明共用它的账户没被迁移；这一段只按目录汇总，不按账户分组对比 403、需要验证账号与失败率（要按账户比，
+# 需要服务逐个账户记下这项，或在账户上抓 HAR 看它的 ListModels 回复）。
+# 号池账户按 AISTUDIO_AUTH_STATES 列出（与服务的 AccountStore.Load 相同），账户 ID 为目录名；邮箱取 account.json 的 label（ACCOUNT 按它与账户 ID
+# 过滤），只取这一项。目录缓存里有、号池里已经没有的账户（删除后 7 天内的条目）不计入。
+GEMINI4 = re.compile(r"^(?:models/)?gemini-4(?![0-9])", re.I)
+CATALOG_KEY = re.compile(r"^[0-9a-f]{32}$")
+TIER_NAMES = {0: "Free", 1: "Pro", 2: "Ultra", 3: "Plus"}
+TIER_ORDER = ("Ultra", "Pro", "Plus", "Free", "其他", "未知")
+NO_CATALOG_REASONS = (("absent", "目录缓存里没有这个账户"), ("empty", "条目没有 Playground 目录（同步失败或返回空目录）"))
+# 带标记的目录逐份列出的上限（按共用的账户数从多到少）
+MARKED_LIST_LIMIT = 10
+
+
+def interaction_kind(values):
+    """模型目录行 field 79 的分类（internal/aistudio/models.go 的 decodeInteractionConfig）：migrated 为类型 2（模型）且第 3 项后台任务为真，
+    即被迁移账户 gemini-4 的 [null,null,1,2]（[null,null,true,2] 同样）；none 为没有这项配置或别的配置（如 Omni 的 [null,null,false,2]）；
+    odd 为写法认不出（不是数组、第 3 项不是 0/1/false/true、第 4 项不是整数：服务解析这份目录会失败）"""
+    if values is None:
+        return "none"
+    if not isinstance(values, list):
+        return "odd"
+    background = values[2] if len(values) > 2 else None
+    kind = values[3] if len(values) > 3 else None
+    if not (background is None or isinstance(background, bool) or type(background) is int and background in (0, 1)):
+        return "odd"
+    if not (kind is None or type(kind) is int):
+        return "odd"
+    return "migrated" if kind == 2 and background in (True, 1) else "none"
+
+
+def pool_accounts():
+    """号池账户（与服务的 AccountStore.Load 相同）：AISTUDIO_AUTH_STATES 逗号分隔，每一项是 storage-state.json 文件（所在目录为一个账户）、
+    本身有 storage-state.json 或 account.json 的目录（一个账户），或其下一层有这两个文件之一的子目录（跳过 .account-*.tmp 临时目录）；
+    账户 ID 为目录名。返回 (账户 ID → 邮箱, 账户目录的写法)；邮箱取 account.json 的 label，读不到时为账户 ID"""
+    roots = [item.strip() for item in (env_value("AISTUDIO_AUTH_STATES") or "auth").split(",") if item.strip()] or ["auth"]
+    markers = ("storage-state.json", "account.json")
+    directories = []
+    for root in roots:
+        path = root if os.path.isabs(root) else os.path.join(APP, root)
+        if os.path.isfile(path):
+            if os.path.basename(path) == "storage-state.json":
+                directories.append(os.path.dirname(os.path.abspath(path)))
+            continue
+        if not os.path.isdir(path):
+            continue
+        if any(os.path.isfile(os.path.join(path, name)) for name in markers):
+            directories.append(path)
+            continue
+        try:
+            items = sorted(os.scandir(path), key=lambda item: item.name)
+        except OSError:
+            continue
+        for item in items:
+            if item.name.startswith(".account-") and item.name.endswith(".tmp"):
+                continue
+            try:
+                folder = item.is_dir(follow_symlinks=False)
+            except OSError:
+                folder = False
+            if folder and any(os.path.isfile(os.path.join(item.path, name)) for name in markers):
+                directories.append(item.path)
+    accounts = collections.OrderedDict()
+    for directory in directories:
+        account_id = os.path.basename(os.path.normpath(os.path.abspath(directory)))
+        label = account_id
+        try:
+            with open(os.path.join(directory, "account.json"), encoding="utf-8") as handle:
+                stored = json.load(handle)
+            value = stored.get("label") if isinstance(stored, dict) else None
+            if isinstance(value, str) and value.strip():
+                label = value.strip()
+        except (OSError, ValueError):
+            pass
+        accounts.setdefault(account_id, label)
+    return accounts, ",".join(roots)
+
+
+def read_catalog_index(directory):
+    """读 index.json：返回 (账户 ID → 条目, 写盘时间, 读不出时的说明, 读不出时的下一步)。服务（catalog_cache.go 的 readIndexLocked，
+    启动与每次写盘都读）只在内容解析失败时把它改名为 index.json.corrupt-<时间>、按空缓存重新同步；读文件出错（没有权限、是目录）时只写 WARN
+    “模型目录缓存读取失败”，不改名也不写盘；版本不符时不读也不写（WARN“模型目录缓存版本不符，不写盘”）"""
+    path = os.path.join(directory, "index.json")
+    name = "runtime/model-catalogs/index.json"
+    try:
+        with open(path, encoding="utf-8") as handle:
+            index = json.load(handle)
+    except FileNotFoundError:
+        return (None, None, "没有模型目录缓存 %s（服务还没有写过盘，或是没有目录缓存的旧版本）" % name,
+                "服务运行一段时间、同步过模型目录并写盘后再看")
+    except OSError as error:
+        # 本脚本没有读权限时服务（多以 root 运行）未必读不出，不说服务会怎样
+        if isinstance(error, PermissionError):
+            return None, None, "%s 本脚本没有读权限（PermissionError）" % name, "用运行服务的用户（如 root）运行本脚本再看"
+        return (None, None, "%s 读不出（%s；服务读它同样出错：运行日志有 WARN“模型目录缓存读取失败”，不改名、不写盘）" % (
+            name, type(error).__name__), "检查这个路径")
+    except ValueError as error:
+        return (None, None, "%s 内容损坏（%s；服务启动或下一次写盘读到它时会改名为 index.json.corrupt-<时间>、按空缓存重新同步）" % (
+            name, type(error).__name__), "等服务改名、重新写盘后再看")
+    version = index.get("version") if isinstance(index, dict) else None
+    if type(version) is int and version != 1:
+        return (None, None, "%s 的版本不认识（version=%d，本脚本按 1 读；与服务的版本不同时服务同样不读也不写它，运行日志有 WARN“模型目录缓存版本不符，不写盘”）" % (
+            name, version), "确认本脚本与运行中的程序是同一版本")
+    if not isinstance(index, dict) or version != 1 or not isinstance(index.get("accounts"), dict):
+        return (None, None, "%s 的格式不认识（version=%s，本脚本按 1 读）" % (name, version),
+                "确认本脚本与运行中的程序是同一版本，是同一版本时这份文件已损坏")
+    return index["accounts"], parse_time(str(index.get("saved_at") or "")), "", ""
+
+
+def read_catalog_blob(directory, key):
+    """读一份 Playground 目录 blob，返回 (状态, gemini-4 行数, 其中被迁移配置的行数, field 79 写法认不出的行数, 打不开时的错误名)；状态为
+    ok、missing（文件缺失）、unreadable（打不开：没有读权限、是目录等）或 bad（键的写法不对、不是 JSON、版本或种类不符、原文不是模型列表）"""
+    if not isinstance(key, str) or not CATALOG_KEY.match(key):
+        return "bad", 0, 0, 0, ""
+    try:
+        with open(os.path.join(directory, "blobs", key + ".json"), "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        return "missing", 0, 0, 0, ""
+    except OSError as error:
+        return "unreadable", 0, 0, 0, type(error).__name__
+    try:
+        blob = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return "bad", 0, 0, 0, ""
+    raw = blob.get("raw") if isinstance(blob, dict) and blob.get("version") == 1 and blob.get("kind") == "playground" else None
+    if not isinstance(raw, list) or not raw or not isinstance(raw[0], list):
+        return "bad", 0, 0, 0, ""
+    rows = migrated = odd = 0
+    for row in raw[0]:
+        if not isinstance(row, list) or not row or not isinstance(row[0], str) or not GEMINI4.match(row[0].strip()):
+            continue
+        rows += 1
+        kind = interaction_kind(row[78] if len(row) > 78 else None)
+        migrated += kind == "migrated"
+        odd += kind == "odd"
+    return "ok", rows, migrated, odd, ""
+
+
+def tier_text(counter):
+    return "、".join("%s %d" % (tier, counter[tier]) for tier in TIER_ORDER if counter[tier])
+
+
+def migrated_section():
+    # ACCOUNT 可以写完整邮箱：打码后再输出
+    print("\n== 9. 被迁移账户（模型目录里 gemini-4 行的 field 79 为 [null,null,1,2]；不看 MODEL%s；号池里有没有出现被 Google 迁移的账户）" % (
+        "，只看账户含 \"%s\" 的" % mask(ACCOUNT) if ACCOUNT else ""))
+    catalog_dir = os.path.join(APP, "runtime", "model-catalogs")
+    pool, roots = pool_accounts()
+    # AISTUDIO_AUTH_STATES 可以直接写账户目录（以邮箱命名）或其中的 storage-state.json，打码后再输出
+    roots = mask(roots)
+    index, saved_at, index_problem, index_advice = read_catalog_index(catalog_dir)
+    source = "账户目录 %s" % roots
+    universe = collections.OrderedDict((key, label) for key, label in pool.items() if wanted_account(key, label))
+    if not pool and index:
+        source = "账户目录 %s 里没有找到账户，改按模型目录缓存里的账户（可能含已删除的）" % roots
+        universe = collections.OrderedDict((key, key) for key in sorted(index) if wanted_account(key, key))
+    if not universe:
+        if ACCOUNT and (pool or index):
+            print("没有邮箱（账户 ID）含 \"%s\" 的账户，这一段跳过" % mask(ACCOUNT))
+        elif index is None:
+            # 账户目录不经 .env 配置（命令行 --auth、容器环境变量）时这里看不到账户，目录缓存又读不出：写明它为什么读不出
+            print("号池里没有账户（账户目录 %s 里没有账户，也没有读得出的模型目录缓存），这一段跳过" % roots)
+            print("模型目录：%s" % index_problem)
+            print("→ 没有读得出的模型目录，看不出号池里有没有被迁移的账户（%s）" % index_advice)
+        else:
+            print("号池里没有账户（账户目录 %s 里没有账户，模型目录缓存里也没有），这一段跳过" % roots)
+        return
+    print("账户 %d 个（%s）" % (len(universe), source))
+    if index is None:
+        print("模型目录：%s" % index_problem)
+        print("→ 没有读得出的模型目录，看不出号池里有没有被迁移的账户（%s）" % index_advice)
+        return
+    lower_index = None
+    blobs = {}  # blob 键 → read_catalog_blob 的结果
+    users = collections.defaultdict(collections.Counter)  # blob 键 → 权益 → 引用它的账户数
+    no_catalog = collections.Counter()
+    pool_keys = set()
+    for account_id, label in pool.items():
+        pool_keys |= account_keys(account_id, label)
+    for account_id in universe:
+        entry = index.get(account_id)
+        if entry is None:
+            if lower_index is None:
+                lower_index = dict((key.lower(), value) for key, value in index.items())
+            entry = lower_index.get(account_id.lower())
+        if not isinstance(entry, dict):
+            no_catalog["absent"] += 1
+            continue
+        value = entry.get("t")
+        tier = TIER_NAMES.get(value, "其他") if type(value) is int else "未知"
+        key = entry.get("p")
+        if not key:
+            no_catalog["empty"] += 1
+            continue
+        if not isinstance(key, str):
+            key = repr(key)
+        if key not in blobs:
+            blobs[key] = read_catalog_blob(catalog_dir, key)
+        users[key][tier] += 1
+    gone = sum(1 for key in index if key not in pool and key.lower() not in pool_keys and wanted_account(key, key)) if pool else 0
+    print("模型目录缓存 runtime/model-catalogs/index.json（写于 %s）：%d 个账户条目%s" % (
+        show(saved_at), len(index), "，其中 %d 个已不在号池（不计）" % gone if gone else ""))
+    marked = [key for key, result in blobs.items() if result[0] == "ok" and result[2]]
+    plain = [key for key, result in blobs.items() if result[0] == "ok" and not result[2]]
+    bad = [key for key, result in blobs.items() if result[0] != "ok"]
+    # 打不开的（没有读权限、是目录等）与内容不对的分开写：本脚本没有读权限不等于服务读不出，不能当成目录损坏
+    errors = collections.Counter(blobs[key][4] for key in bad if blobs[key][0] == "unreadable")
+    bad_parts = []
+    missing = sum(1 for key in bad if blobs[key][0] == "missing")
+    if missing:
+        bad_parts.append("文件缺失 %d" % missing)
+    if errors:
+        bad_parts.append("打不开 %d：%s%s" % (sum(errors.values()), "、".join("%s %d" % pair for pair in sorted(errors.items())),
+                                            "，本脚本没有读权限时用运行服务的用户（如 root）运行" if errors["PermissionError"] else ""))
+    broken = sum(1 for key in bad if blobs[key][0] == "bad")
+    if broken:
+        bad_parts.append("内容不对 %d：键的写法不对、不是 JSON、版本或种类不符、原文不是模型列表" % broken)
+
+    def sharing(keys):
+        return sum(sum(users[key].values()) for key in keys)
+
+    def tiers_of(keys):
+        total = collections.Counter()
+        for key in keys:
+            total.update(users[key])
+        return tier_text(total)
+
+    if blobs:
+        print("上面这些账户引用的 Playground 目录 %d 份（按内容共用：同一种目录的账户共用一份，原文是最先写入它的那个账户的）：" % len(blobs))
+        partial = sum(1 for key in marked if blobs[key][2] < blobs[key][1])
+        print("  带 [null,null,1,2] 的（第 3 项写成 true 也算）%d 份，共用的账户 %d 个%s%s" % (
+            len(marked), sharing(marked), "（权益 %s）" % tiers_of(marked) if marked else "",
+            "；其中另有 gemini-4 行不带这项配置的 %d 份" % partial if partial else ""))
+        no_rows = sum(1 for key in plain if not blobs[key][1])
+        print("  不带的 %d 份，共用的账户 %d 个%s%s" % (
+            len(plain), sharing(plain), "（权益 %s）" % tiers_of(plain) if plain else "",
+            "；其中没有 gemini-4 行的 %d 份" % no_rows if no_rows else ""))
+        if bad:
+            print("  缺失或读不出的 %d 份（%s），引用它们的账户 %d 个（权益 %s）" % (
+                len(bad), "；".join(bad_parts), sharing(bad), tiers_of(bad)))
+    if sum(no_catalog.values()):
+        print("没有 Playground 目录的账户 %d 个（%s）" % (sum(no_catalog.values()), "、".join(
+            "%s %d" % (label, no_catalog[reason]) for reason, label in NO_CATALOG_REASONS if no_catalog[reason])))
+    if marked:
+        print("带标记的目录（文件为 runtime/model-catalogs/blobs/<键>.json；按共用的账户数，最多列 %d 份）：" % MARKED_LIST_LIMIT)
+        for key in sorted(marked, key=lambda item: (-sum(users[item].values()), item))[:MARKED_LIST_LIMIT]:
+            _, rows, count, _, _ = blobs[key]
+            print("  %s：gemini-4 行 %d 行，其中带标记 %d 行；共用的账户 %d 个（权益 %s）" % (
+                key, rows, count, sum(users[key].values()), tier_text(users[key])))
+        if len(marked) > MARKED_LIST_LIMIT:
+            print("  另有 %d 份没有列出" % (len(marked) - MARKED_LIST_LIMIT))
+    odd = sum(1 for result in blobs.values() if result[3])
+    if odd:
+        print("注意：%d 份目录里有 gemini-4 行的 field 79 写法认不出（不是数组、第 3 项不是 0/1/false/true 或第 4 项不是整数；"
+              "服务按这份目录解析会失败），这些行按不带计" % odd)
+    if not marked and not plain:
+        if errors:
+            advice = "（%d 份目录打不开，见上；%s）" % (sum(errors.values()), "用运行服务的用户（如 root）运行本脚本再看" if errors["PermissionError"] else
+                                                     "检查 runtime/model-catalogs/blobs/ 下这些文件")
+        else:
+            advice = "（服务运行一段时间、同步过模型目录并写盘后再看）" if no_catalog["absent"] else ""
+        print("→ 没有读得出的模型目录，看不出号池里有没有被迁移的账户%s" % advice)
+        return
+    shared = ("目录缓存按解析后的内容在账户间共用一份，[null,null,1,2] 不改变解析结果，被迁移与未迁移的账户共用同一份原文；"
+              "原文是最先写入它的那个账户的，之后同步的账户不改写它，服务也不在别处逐个账户记这项")
+    if marked:
+        print("→ 号池里出现过被迁移的账户（带标记的目录原文来自某个被迁移的账户），但看不出是哪些账户：%s。共用带标记目录的 %d 个账户里可能有"
+              "没被迁移的%s，所以这一段不按账户对比 403、需要验证账号与失败率" % (
+                  shared, sharing(marked), "，共用不带标记目录的 %d 个账户里也可能有被迁移的" % sharing(plain) if plain else ""))
+    else:
+        # 目录内容一变（如官网新加模型）就写一份新 blob，原文来自最先同步到它的账户，迁移开始之后写的同样可能来自未迁移的账户
+        print("→ 目录缓存里没有带 [null,null,1,2] 的目录。这不说明号池里没有被迁移的账户：%s，现有每份目录的原文都可能来自未迁移的账户" % shared)
+    print("→ 要判断被迁移账户的 403 是否明显偏高：在几个账户上用浏览器打开 AI Studio、用 gemini-4 发一句话并导出 HAR（HAR 里这个账户的 ListModels "
+          "回复说明它是否被迁移，生成请求说明官网走哪个接口）发给开发者。HAR 里有 Cookie 等登录凭据与邮箱：导出时选不含敏感数据的方式，"
+          "或发之前去掉 Cookie、Set-Cookie、Authorization 等头，只需要 ListModels 的回复与生成请求的地址和方法，不要公开发出。"
+          "按账户统计需要服务逐个账户记下这项（要改程序）")
+
+
+migrated_section()
 PY

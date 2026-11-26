@@ -391,9 +391,20 @@ def strip_page(text):
     return PAGE_SNAPSHOT_RE.sub("", text or "")
 
 
+# Interaction 模型失败（最终状态 4）的上游错误在固定文案后接 field 28 的错误码与原因（aistudio/interaction_failure.go："AI Studio
+# CreateInteractionStream 返回 HTTP 502: interaction failed: <错误码>: <说明>"，原因已压成一行）。原因是上游原文，可能带
+# PERMISSION_DENIED、DEADLINE_EXCEEDED、HTTP 429、403 这类字样；运行时它仍是 502（换号重试、不进 403 登记），按子串分类前先去掉，
+# 按 5xx 归类。后面接着的 MODEL_FALLBACKS 改用说明保留
+INTERACTION_REASON_RE = re.compile(r"(interaction failed): [^\n]*?(?=（已按 MODEL_FALLBACKS 改用其他模型：|\n|$)")
+
+
+def strip_reason(text):
+    return INTERACTION_REASON_RE.sub(r"\1", text or "")
+
+
 # ---------- 结束原因分类（文案均已在代码里核实，见每条注释） ----------
 def end_class(row):
-    state, status, error = row["state"], row["status"], strip_page(row["error"])
+    state, status, error = row["state"], row["status"], strip_reason(strip_page(row["error"]))
     low = error.lower()
     if state in SUCCESS:
         return ("达到输出上限（limited）" if state == "limited" else "完成"), "ok"
@@ -476,7 +487,7 @@ def end_class(row):
 
 
 def attempt_class(error):
-    error = strip_page(error)
+    error = strip_reason(strip_page(error))
     lower = error.lower()
     if "账户已进入冷却" in error:
         return "发出前已冷却（没有发到上游）"
@@ -1382,7 +1393,9 @@ else:
         print(f"  \"上游首事件超时\"（FIRST_EVENT_TIMEOUT 生效，换号重试）：{first_timeout} 个请求")
     texts = collections.Counter()
     for row in window_rows:
-        error = row["error"]
+        # Interaction 失败（502）后面接的 field 28 原因是上游原文（可能带 DEADLINE_EXCEEDED、Deadline expired），与结束原因分类一样先去掉，
+        # 不算成 Google 侧期限
+        error = strip_reason(row["error"])
         for key in ("本服务首事件前期限", "本服务首事件后空闲期限", "本服务扣住期间空闲期限", "本服务总时长上限", "停在 换号退避",
                     "协议错误码 4", "stream closed before finish",
                     "stream closed before first event", "context deadline exceeded", "Deadline expired", "后请求超时", "后请求已取消",
@@ -1395,6 +1408,7 @@ else:
           "error 只有 context deadline exceeded 本身 = 旧版本整段 REQUEST_TIMEOUT 或其他数据请求，带 AI Studio … 协议位置 或 "
           "BiDi … 等待回复超时 的 = 上游或浏览器链路超时；没有本服务前缀的协议错误码 4 / Deadline expired = Google 侧期限"
           "（状态 504、没有首事件且耗时到了 REQUEST_TIMEOUT 的除外：旧版本在换号退避中到期的文本）；stream closed before finish = 上游断流；"
+          "interaction failed 后面接的上游原因不计入命中；"
           "客户端看到的 504 文案都相同（api/official_errors.go；停在换号退避、限流换号前等待的照旧按上一次的错误返回）")
     finished_cancel = [row for row in window_rows if row["kind"] == "cancel"]
     print(f"  \"请求已取消\"（request.finished WARN，app/request_logging.go requestOutcome）：{len(finished_cancel)}")

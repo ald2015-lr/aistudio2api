@@ -263,6 +263,15 @@ PAGE_SNAPSHOT_RE = re.compile(r" \| 页面=.*?(?=；本机代理中转：| \| |\
 def strip_page(text):
     return PAGE_SNAPSHOT_RE.sub("", text or "")
 
+# Interaction 模型失败（最终状态 4）的上游错误在固定文案后接 field 28 的错误码与原因（aistudio/interaction_failure.go："AI Studio
+# CreateInteractionStream 返回 HTTP 502: interaction failed: <错误码>: <说明>"，原因已压成一行）。原因是上游原文，可能带
+# PERMISSION_DENIED、DEADLINE_EXCEEDED、HTTP 429、403 这类字样；运行时它仍是 502（换号重试、不进 403 登记），按子串分类前先去掉，
+# 按 5xx 归类。后面接着的 MODEL_FALLBACKS 改用说明保留
+INTERACTION_REASON_RE = re.compile(r"(interaction failed): [^\n]*?(?=（已按 MODEL_FALLBACKS 改用其他模型：|\n|$)")
+
+def strip_reason(text):
+    return INTERACTION_REASON_RE.sub(r"\1", text or "")
+
 entries = []
 for line in sys.stdin:
     line = line.strip()
@@ -307,7 +316,7 @@ for e in entries:
     elif event == "request.finished" and rid:
         finished[rid] = e
     elif msg.startswith("账号切换"):
-        reason = strip_page(msg.split("原因:", 1)[-1].strip() if "原因:" in msg else msg)
+        reason = strip_reason(strip_page(msg.split("原因:", 1)[-1].strip() if "原因:" in msg else msg))
         key = ("429 限流/额度" if "429" in reason else "403 无权限" if "403" in reason else
                "超时" if ("deadline" in reason or "超时" in reason) else "浏览器连接断开" if ("BiDi" in reason or "closed network" in reason) else
                "Worker 初始化失败" if "初始化" in reason else "其他")
@@ -387,7 +396,7 @@ def error_summary(text):
 failed = [r for r in rows if r["state"] == "failed"]
 if failed:
     def reason(r):
-        text, status = strip_page(r["error"]), r["status"] or 0
+        text, status = strip_reason(strip_page(r["error"])), r["status"] or 0
         if "Requests ending with a model turn" in text: return "以模型消息结尾（已在新版修复）"
         if "function call turn" in text or "function response turn" in text: return "工具调用历史格式"
         if "超过模型上限" in text or "max output" in text: return "输出长度超上限（已在新版修复）"

@@ -793,7 +793,8 @@ frame 0 为 null（或候选为空数组）且带 prompt feedback 时表示上�
 | Interaction 流尾为 `null`、`[]` 或状态码为 `null`；没见过的 content delta 字段；没有 content 的 delta；空文本 delta（content field 1 为 `[]`，TextContent 全为缺省值）；正文为数字或布尔值；引用字段不足或缺少网址 | 报“流尾状态无效”“未识别的 content delta 字段”“content delta 字段不足”“文本 delta 无效”“期望字符串”“引用缺少网址”等 | 按 0（成功）；跳过该字段；跳过；跳过；按原文转成文本；跳过该条目 |
 | Interaction 媒体的 MIME 枚举不在表中、带小数（`7.0`、`"7.0"`）、写成 MIME 字符串、写成名称等其他写法 | 表外整数取缺省 MIME 但不写日志；不是整数时报“期望整数”，整次生成中止（媒体已生成、额度已扣，与这次的线上事故相同） | 取该类的缺省 MIME；按编号；按字符串（只认表里有的 MIME）；取缺省 MIME。都写一行容错日志（整数写成的数字字符串 `"7"` 与原先一样直接按整数读）。`null` 与 `0`（未设置，官网现有的视频即为 `[null,<数据>]`）照旧取缺省 MIME、不写日志，免得每个正常的视频请求都写一行 |
 | Interaction 用量各数带小数（`5.0`、`"16.0"`）；总数缺位或为 0；用量不是数组、某个数读不出、各数全为 0 | 前两种报“期望整数”“缺少 total tokens”，整次生成中止 | 按整数换算；按输入、输出、思考三项之和；按已交出的正文与思考做本地估算（与 Playground 相同；视频本身不计 token，至少保住输入数与正文数，用量账本不记 0）。上游完全没有带用量时与原先相同（不估算） |
-| Interaction 最终状态不在表中（3 完成、4 失败、5 取消之外）、为 `null` 或不是整数；最终 interaction 为 `[]`、`[[]]` 或 `[null]`（字段全为缺省值） | 报“未识别的最终状态”“最终 interaction 为空” | 已经交出过正文或媒体时按 `other` 结束：前者照常读取 usage，后者没有 usage 可读，交出本地估算（视频已生成、额度已扣，不让非流式整份作废）；还没交出内容时仍报错 |
+| Interaction 最终状态不在表中（2、3 完成，4 失败，5 取消，6 输出达到上限之外，见 [Interaction 终态](#interaction-终态)）、为 `null` 或不是整数；最终 interaction 为 `[]`、`[[]]` 或 `[null]`（字段全为缺省值） | 报“未识别的最终状态”“最终 interaction 为空” | 已经交出过正文或媒体时按 `other` 结束：前者照常读取 usage，后者没有 usage 可读，交出本地估算（视频已生成、额度已扣，不让非流式整份作废）；还没交出内容时仍报错 |
+| Interaction 失败（状态 `4`）的 field 28 不是数组、条目不是数组、错误码或说明是对象或数组，或条目的错误码与说明都没有、下标 1 之后却还有内容（原因不在上游读的位置） | 不读 field 28，固定文案 `interaction failed` | 跳过读不出的部分，读出的照常附在失败文案后面，什么都没读出时为固定文案；写一行容错日志（`失败原因（field 28）读不出，按固定文案报错` 或 `失败原因（field 28）有条目读不出，已跳过`，原文去掉格式字符后把邮箱与像 API Key 的片段打码）；HTTP 状态与分类不变 |
 
 仍按协议证据错误结束（读不出正文，或继续会交出错误内容）：帧、候选、content 或 Part 不是数组；正文是对象或数组；inline media 不是数组、缺少数据或数据不是 Base64；executable code、code execution result 不是数组，或代码、执行输出是对象或数组；函数调用不是数组或缺少函数名；其余候选有不是数组的元素（嵌套层次变了）；转写正文读不出且 Part 没有别的正文；Interaction 媒体 delta 字段不足或数据不是 Base64、文本 delta 不是数组或正文是对象或数组、还没交出内容时最终 interaction 为空或状态不在表中；Build 代理正文不是 JSON（字段类型变化仍整块失败，见 [Build 通道](build.md)）；流尾不是状态（Build 与 Interaction）；流结束前没有完成帧。重新生成、自动续写与流尾的判断不变：容错本身不产生错误，也不改变哪些错误会重新生成；但跳过整帧后流里可能没有完成帧（如每一帧都是空帧或候选为空数组），这时与原先流里没有完成帧时一样按“没有完成帧”处理，还没交出内容时在同账号重新生成。因此决定输入拦截的 promptFeedback 不按跳过处理：候选为空数组时照常读取，本身读不出时按 `unspecified` 拦截，真正的拦截照旧对外 400、不重新生成。
 
@@ -1111,7 +1112,7 @@ thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_eff
 
 视频设置（官网 Run settings 的 Aspect ratio、Video duration、Resolution、Frame rate 与 Advanced 的 Video task）的公开写法见 [Omni 视频设置与模型名后缀](#omni-视频设置与模型名后缀)。协议层按合并目录整理并留下请求日志说明，发送前再按所选账户的目录整理一次（合并目录的时长范围已取各账户的交集，一般不会再改；别名目录缓存还没刷新或协议层没有整理到时可能不同），这一次留下的新说明（协议层没有记过的）以该账户为来源写进同一请求的管理日志；视频任务是否可用以合并目录为准，所选账户目录没有列出时照发，由上游判断（不按单个账户返回 400，免得另一个账户能完成的请求直接失败）；编码时宽高比与分辨率取最接近的上游枚举，在上游能编码的取值上与上游 Mag1cFall/AIStudio2API 的 `interactionVideoFormat` 一致；有两处不同：所选账户目录的默认分辨率为空或为 `368p` 时本服务发 `1`（官网默认 360p），上游不带；另外本服务多接受 `auto`、`ASPECT_RATIO_UNSPECIFIED`、`16x9`、`VIDEO_RESOLUTION_` 与 `VIDEO_TASK_` 前缀、`unspecified` 等写法，上游会报错。帧率只校验不发送（官网只有 24fps 且不可选）。
 
-响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 2 至 5 为图片、音频、文档与视频 `[<MIME 枚举>,"<BASE64>"]`、field 6 为思考摘要、field 7 为思考签名（忽略）、field 10 为引用 `[[[<START>,<END>,…,["<URL>",…]]…]…]`（每项为正文中引用标记的起止字符位置与来源网址，取第一个网址），分别映射为 text、对应 MIME 的媒体、reasoning 与 citation 事件（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植，带图片输入后模型可能返回图片）；不是 Base64 的数据（标准与 URL 安全两种字母表、带或不带填充都接受）或媒体字段不足时按协议证据错误返回，MIME 枚举为 `null` 或不在表里时取该类的缺省 MIME（不是整数等其他写法同样不中止，见[解码容错规则](#解码容错规则)），字段不足或缺少网址的引用只跳过该条目，没见过的 content 字段跳过并写一行容错日志（正文与媒体照常），没有 content 的 delta 与空文本 delta 跳过；索引 19 的最终 interaction 状态 `3` 产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9；带小数或数字字符串按整数换算，总数缺位时按三项之和）与 `stop` 终态，状态 `4`、`5` 返回错误，其他状态（含 `null`）与空的最终 interaction 在已经交出正文或媒体时按 `other` 结束、否则为协议错误；usage 读不出时生成服务按已交出的正文与思考做本地估算，结束事件照常发出。事件列表后的 google.rpc 状态（为 `null`、`[]` 或状态码为 `null` 时按 0）按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
+响应为 `[[<EVENT>...], <STATUS>?]`。事件索引 10 的 content delta 中 field 1 为正文、field 2 至 5 为图片、音频、文档与视频 `[<MIME 枚举>,"<BASE64>"]`、field 6 为思考摘要、field 7 为思考签名（忽略）、field 10 为引用 `[[[<START>,<END>,…,["<URL>",…]]…]…]`（每项为正文中引用标记的起止字符位置与来源网址，取第一个网址），分别映射为 text、对应 MIME 的媒体、reasoning 与 citation 事件（媒体与引用按上游 Mag1cFall/AIStudio2API 的解码移植，带图片输入后模型可能返回图片）；不是 Base64 的数据（标准与 URL 安全两种字母表、带或不带填充都接受）或媒体字段不足时按协议证据错误返回，MIME 枚举为 `null` 或不在表里时取该类的缺省 MIME（不是整数等其他写法同样不中止，见[解码容错规则](#解码容错规则)），字段不足或缺少网址的引用只跳过该条目，没见过的 content 字段跳过并写一行容错日志（正文与媒体照常），没有 content 的 delta 与空文本 delta 跳过；索引 19 的最终 interaction 按下面的 [Interaction 终态](#interaction-终态) 定结束原因或错误；正常结束时产生 usage（输入、输出、思考、总 token 位于 usage 索引 0、4、8、9；带小数或数字字符串按整数换算，总数缺位时按三项之和）与结束事件，usage 读不出时生成服务按已交出的正文与思考做本地估算，结束事件照常发出。事件列表后的 google.rpc 状态（为 `null`、`[]` 或状态码为 `null` 时按 0）按 code 映射 HTTP 状态，额度 code 8 为 429；首个正文事件之前的错误进入换号与冷却，之后的错误以流内 error 结束。
 
 媒体 MIME 枚举与官网前端相同（按上游 45e33b4 移植），枚举为 `null` 或不在表中时取该类的默认 MIME，不按文件头另行判断；原先只认图片 `1`、`2` 与视频 `1`，视频返回 `[null,…]`、表外枚举或 field 3、4 时整次按协议证据错误返回 502（此时视频已经生成、额度已扣）。输入编码用同一张表（见上文的图片输入）：
 
@@ -1123,6 +1124,22 @@ thinking level 取值 MINIMAL=1、LOW=2、MEDIUM=3、HIGH=4，由 `reasoning_eff
 | 视频 field 5 | 1 mp4、2 mpeg、3 mpg、4 mov、5 avi、6 x-flv、7 webm、8 wmv、9 3gpp | `video/mp4` |
 
 排查证据：每次发送前在该请求的管理日志记一行 INFO 请求结构摘要 `Interaction 请求结构 | …`（按编码出的 step 列出角色与 part 种类、数量（按发送顺序，连续同类合并计数，能看出图片与文本谁在前），图片格式与字节数，Drive 引用数，binding 是否计入了图片（`校验值含图片=是（N 张）`、`否`（开关开启、请求体里没有内联图片）或 `关闭`），文本段数与字节数，系统指令有无，思考等级（不发送时为 `不发送`），输出上限，视频设置、field 54 视频格式原样与任务，请求体字节数；不含提示词、系统指令正文、图片数据与文件 ID）；上游返回 4xx（不只 429）时记一行 WARN `上游返回 4xx | 方法=CreateInteractionStream | HTTP=<状态> | 协议错误码=<CODE> | 文案=<上游原文> | 详情类型=<TYPES> | 详情=<details 原文>`（格式见 [logging.md](logging.md)）。经排查路由（`/trace/`）的请求与 GenerateContent 一样记下发往上游的 CreateInteractionStream 请求体与上游原始响应开头（上游返回 HTTP 错误时为错误响应体），请求结构摘要与请求日志同一行、在排查记录的 timeline 里，notes 另记 `CreateInteractionStream binding | 字节=<N> | sha256=<HEX>`（binding 字符串的字节数与摘要，只是证据；是否计入图片见请求结构摘要），便于与官网页面算 proof 时的输入对照。本服务只发 CreateInteractionStream；目录里的 CreateInteraction、GetInteractionStream、CancelInteraction（后台任务）没有调用路径。
+
+#### Interaction 终态
+
+最终 interaction 的状态（interaction field 2）：
+
+| 状态 | 结果 | 各出口 |
+| --- | --- | --- |
+| `3`（完成）、`2`（等待函数结果；本服务不给 Interaction 模型发工具） | 按 `stop` 正常结束 | OpenAI `stop`、Responses `completed`、Anthropic `end_turn`、Gemini `STOP` |
+| `6`（输出达到上限截断） | 按 `max_tokens` 正常结束，正文与用量照常交出，客户端可以自己续写 | OpenAI `length`、Responses `incomplete`（`incomplete_details.reason` 为 `max_output_tokens`）、Anthropic `max_tokens`、Gemini `MAX_TOKENS`；请求日志为 `limited`（达到输出上限） |
+| `4`（失败） | 502 错误 `interaction failed`，field 28 能读出原因时接在后面（见下文） | 与其他上游 5xx 相同：还没交出内容时换号重试，用完后对外 500 `INTERNAL` 官方通用措辞（`An internal error has occurred…`，不带原因）；已交出内容时以流内 error 结束 |
+| `5`（取消） | 502 错误 `interaction cancelled` | 同上 |
+| 其他（`0`、`1`、`7` 及以上）、`null`、不是整数；最终 interaction 为空 | 已经交出正文或媒体时按 `other` 结束并写一行容错日志；还没交出时为协议证据错误（对外 500） | 见[解码容错规则](#解码容错规则) |
+
+状态 `2`、`6` 原先与表外状态相同（已交出内容时按 `other` 结束，没交出时报“未识别的最终状态”、对外 500），现在按上游 ddb1af5 的映射；`6` 的含义来自上游对官网前端的阅读，我们的抓包里还没见过。
+
+状态 `4` 的原因：最终 interaction 的 field 28（下标 27）为错误列表，每项 `[<错误码>, <说明>]`（按上游 ddb1af5 的 `decodeInteractionErrors` 移植，同样还没在抓包里见过）。读出的错误码与说明接在内部错误文案后面：`interaction failed: <错误码>: <说明>`，多项以 `; ` 分隔，只有其中一项时只写那一项，错误码写成整数时按原文，错误码或说明读出时条目下标 1 之后的内容不管；附上前去掉内部标记（`[original: …]`、`generic::…:`、`(qos=…)`）与格式字符（零宽空格与连接符、方向控制、软连字符等 Unicode Cf 类：夹在邮箱里会让打码认不出，方向控制会改变日志的显示顺序），控制字符与连续空白合成一个空格，邮箱打码为前两位加 `***@***`（网址里编码成 `%40` 的 `@` 同样认，如 `authuser=name%40example.com`），像 API Key 的片段打码为 `<key:…末四位>`，整段超过 300 字截断。原因只进管理端的日志与账本（`request.error`、账本 `error`、“账号切换”行与换号进度）与排查记录，不进对外错误；与其他上游 5xx 一样不写冷却，冷却原因里没有它；HTTP 状态（502）、换号重试与 403 分类都与原先相同（5xx 不进 403 登记）。原因是上游原文，可能带 `PERMISSION_DENIED`、`DEADLINE_EXCEEDED`、`HTTP 429` 这类字样，`tools/diag_busy.sh`、`diag_regen.sh`、`diag_slow.sh`、`diag_403.sh` 对账本 error 与日志里的换号原因按子串分类前先去掉 `interaction failed: ` 之后的原因（后面接着的 `MODEL_FALLBACKS` 改用说明保留），与运行时一样按 5xx 统计。唯一按文案、不看状态码的判断是输入超过上限（改为 400、不换号）：原因恰好是这类原文时不附在文案里，改写一行容错日志 `失败原因（field 28）像输入超过上限，不附在文案里，按固定文案报错`。field 28 缺位、为 `null` 或没有条目时为固定文案 `interaction failed`，不写日志；有值却读不出时见[解码容错规则](#解码容错规则)。
 
 ### Build 代理
 

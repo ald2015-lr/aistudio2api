@@ -283,6 +283,17 @@ def strip_page(text):
     return PAGE_SNAPSHOT_RE.sub("", text or "")
 
 
+# Interaction 模型失败（最终状态 4）的上游错误在固定文案后接 field 28 的错误码与原因（aistudio/interaction_failure.go："AI Studio
+# CreateInteractionStream 返回 HTTP 502: interaction failed: <错误码>: <说明>"，原因已压成一行）。原因是上游原文，可能带
+# PERMISSION_DENIED、DEADLINE_EXCEEDED、HTTP 429、403 这类字样；运行时它仍是 502（换号重试、不进 403 登记），按子串分类前先去掉，
+# 按 5xx 归类。后面接着的 MODEL_FALLBACKS 改用说明保留
+INTERACTION_REASON_RE = re.compile(r"(interaction failed): [^\n]*?(?=（已按 MODEL_FALLBACKS 改用其他模型：|\n|$)")
+
+
+def strip_reason(text):
+    return INTERACTION_REASON_RE.sub(r"\1", text or "")
+
+
 # 额度用完改用其他模型（MODEL_FALLBACKS，app/model_fallback.go）：所有目标都不可用时 request.error 为源模型的错误后接
 # "（已按 MODEL_FALLBACKS 改用其他模型：<目标> 额度用完；<目标> 不可用…）"，按源模型的错误分类前先去掉；改用成功或失败时账本的 attempts
 # 里另有一条账户为空、以"模型 "开头的改用备注（不是上游尝试），不计入此前失败的上游尝试；这类请求的每次上游尝试带自己的模型
@@ -361,7 +372,7 @@ DRIVE_TOKEN_401_RE = re.compile(r"GenerateAccessToken 返回 HTTP (?:401|\d+、�
 
 
 def attempt_class(error):
-    error = strip_page(error)
+    error = strip_reason(strip_page(error))
     lower = error.lower()
     if "账户已进入冷却" in error:
         return "发出前已冷却（没有发到上游）"
@@ -388,7 +399,7 @@ def attempt_class(error):
 
 def row_class(row):
     # 请求最终结果的分类（成功返回 None）
-    state, status, error = row["state"], row["status"] or 0, strip_fallback(strip_page(row["error"]))
+    state, status, error = row["state"], row["status"] or 0, strip_fallback(strip_reason(strip_page(row["error"])))
     if state in SUCCESS:
         return None
     if state == "cancelled" or status == 499:

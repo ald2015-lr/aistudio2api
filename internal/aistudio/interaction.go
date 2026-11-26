@@ -568,7 +568,8 @@ func decodeInteractionStream(source io.Reader, emit func(Event) error, tolerance
 	return nil
 }
 
-// decodeInteractionEvent 解码单个流事件，返回是否为最终 interaction。最终状态 3 为完成，4、5 为失败与取消；不在表里、为 null 或读不出时，
+// decodeInteractionEvent 解码单个流事件，返回是否为最终 interaction。最终状态 2、3 按 stop 结束，6 按 max_tokens 结束，4、5 为失败与取消
+// （502；失败时附上 field 28 的错误码与说明，见 interactionFailedError）；不在表里、为 null 或读不出时，
 // 已经交出过正文或媒体（delivered）就写一行容错日志、照常读取用量并按 other 结束（视频已生成、额度已扣，不让整份作废），否则仍按协议证据
 // 错误返回。最终 interaction 为 [] 时同样处理（没有用量可读，有 estimate 时交出本地估算）。用量读不出时有 estimate 就交出本地估算
 func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error, tolerance *decodeTolerance, delivered bool, estimate func() *Usage) (bool, error) {
@@ -618,9 +619,17 @@ func decodeInteractionEvent(raw json.RawMessage, emit func(Event) error, toleran
 	status, statusErr := optionalIntField(interaction, 1, "$event[19][0]", raw)
 	finishReason := "stop"
 	switch {
-	case statusErr == nil && status == 3:
+	case statusErr == nil && (status == 2 || status == 3):
+		// 3 为完成；2 为等待函数结果（requires_action：本服务不给 Interaction 模型发工具，与上游 ddb1af5 一样按正常结束；
+		// 原先还没交出内容时报“未识别的最终状态”、对外 500，已交出时按 other 结束）
+	case statusErr == nil && status == 6:
+		// 6 为输出达到上限截断（incomplete，含义来自上游 ddb1af5 对官网前端的阅读，抓包里还没见过）：按规范终态 max_tokens 正常结束，
+		// 各出口照常换算（OpenAI length、Responses incomplete、Anthropic max_tokens、Gemini MAX_TOKENS），客户端可以自己续写；
+		// 原先与 2 相同
+		finishReason = "max_tokens"
 	case statusErr == nil && status == 4:
-		return false, &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Message: "interaction failed"}
+		// 失败：field 28 的错误码与说明清洗后附在文案后面（见 interaction_failure.go），状态码、换号与分类不变
+		return false, interactionFailedError(rawAt(interaction, 27), tolerance)
 	case statusErr == nil && status == 5:
 		return false, &RPCError{Method: "CreateInteractionStream", StatusCode: http.StatusBadGateway, Message: "interaction cancelled"}
 	case !delivered && statusErr != nil:

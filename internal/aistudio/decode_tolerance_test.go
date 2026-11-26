@@ -940,7 +940,8 @@ func TestToleranceSnippetEscapedBase64(t *testing.T) {
 }
 
 // TestToleranceInteractionFinalStatus Omni 最终 interaction 状态不在表里或为 null：已经交出视频或正文时写一行容错日志、照常读取用量、
-// 按 other 结束（原先视频已交出仍以协议错误结束，非流式整份作废）；还没交出内容时仍按协议错误返回；失败与取消照旧
+// 按 other 结束（原先视频已交出仍以协议错误结束，非流式整份作废）；还没交出内容时仍按协议错误返回；失败与取消照旧。
+// 6 已有含义（按 max_tokens 结束），这里用表外的 7；各状态的完整对照见 interaction_failure_test.go
 func TestToleranceInteractionFinalStatus(t *testing.T) {
 	log := captureToleranceLog(t)
 	video := make([]any, 11)
@@ -950,7 +951,7 @@ func TestToleranceInteractionFinalStatus(t *testing.T) {
 		event[19] = []any{[]any{nil, status, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, []any{4, nil, nil, nil, 6, nil, nil, nil, nil, 10}}}
 		return event
 	}
-	for _, status := range []any{6, nil, "COMPLETED"} {
+	for _, status := range []any{7, nil, "COMPLETED"} {
 		encoded, _ := json.Marshal([]any{[]any{video, final(status)}, []any{0}})
 		var events []Event
 		err := DecodeInteractionStream(bytes.NewReader(encoded), func(event Event) error {
