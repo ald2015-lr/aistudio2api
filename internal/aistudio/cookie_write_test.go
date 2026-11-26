@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"testing"
@@ -313,4 +314,283 @@ func TestRotatingCookieDeferralDroppedOnAuthGeneration(t *testing.T) {
 	if value, _ := state.CookieValue("SIDCC", aiStudioOrigin+"/", time.Now()); value != "s1" {
 		t.Fatalf("应以磁盘为准，SIDCC=%q", value)
 	}
+}
+
+// TestStorageFileSynced 认证文件的修改时间与大小同本服务最近一次读入（载入账户）或写入时相同才算本服务自己的文件：
+// 载入后与写回后都相同；外部原样重写（只改了修改时间）或改了修改时间都不同；账户不存在时为 false
+func TestStorageFileSynced(t *testing.T) {
+	pool := testPoolWithAccount(t, "alice@example.com")
+	synced := func() bool {
+		t.Helper()
+		account, err := pool.Account("alice@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(account.StoragePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pool.StorageFileSynced("alice@example.com", info.ModTime(), info.Size())
+	}
+	if !synced() {
+		t.Fatal("载入账户后认证文件应算本服务读入的那一份")
+	}
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: "alice@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := lease.Account().StoragePath
+	ageStorage(t, path, time.Hour)
+	if synced() {
+		t.Fatal("修改时间变了不应算本服务的文件")
+	}
+	if err := lease.SaveStorageState(testStorageState("B")); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if !synced() {
+		t.Fatal("本服务写回后应算本服务的文件")
+	}
+	state, err := LoadStorageState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := WriteStorageState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	if synced() {
+		t.Fatal("外部原样重写不应算本服务的文件")
+	}
+	if pool.StorageFileSynced("missing@example.com", time.Now(), 1) {
+		t.Fatal("账户不存在时应为 false")
+	}
+}
+
+// TestStorageFileOwned 认证文件内容与本服务最近一次读入或写入的逐字节相同、修改时间不晚于那一次，才算本服务自己的文件：
+// 载入后只把修改时间改早仍算；外部原样重新写入（修改时间变新）不算；内容不同不算；本服务写回后又算；账户不存在时为 false
+func TestStorageFileOwned(t *testing.T) {
+	pool := testPoolWithAccount(t, "alice@example.com")
+	owned := func() bool {
+		t.Helper()
+		account, err := pool.Account("alice@example.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		info, err := os.Stat(account.StoragePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, digest, err := LoadStorageStateDigest(account.StoragePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pool.StorageFileOwned("alice@example.com", info.ModTime(), digest)
+	}
+	account, err := pool.Account("alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := account.StoragePath
+	if !owned() {
+		t.Fatal("载入账户后认证文件应算本服务读入的那一份")
+	}
+	ageStorage(t, path, time.Hour)
+	if !owned() {
+		t.Fatal("只把修改时间改早仍是本服务读入的那一份")
+	}
+	state, err := LoadStorageState(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := WriteStorageState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	if owned() {
+		t.Fatal("外部原样重新写入（修改时间变新）不应算本服务的文件")
+	}
+	if err := WriteStorageState(path, testStorageState("OTHER")); err != nil {
+		t.Fatal(err)
+	}
+	ageStorage(t, path, 2*time.Hour)
+	if owned() {
+		t.Fatal("内容不同不应算本服务的文件")
+	}
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: "alice@example.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveStorageState(testStorageState("B")), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	if !owned() {
+		t.Fatal("本服务写回后应算本服务的文件")
+	}
+	if pool.StorageFileOwned("missing@example.com", time.Now(), StorageDigest{}) {
+		t.Fatal("账户不存在时应为 false")
+	}
+}
+
+// TestStorageFileKnown 认证文件逐字节是本服务从外部读入的（载入账户、SaveLoadedStorageState 记下的重新上传）或自己写过的那一份时为已知，
+// 不看修改时间；本服务之后自己写回不会忘掉读入的那一份；其他内容与不存在的账户不是
+func TestStorageFileKnown(t *testing.T) {
+	const id = "alice@example.com"
+	pool := testPoolWithAccount(t, id)
+	account, err := pool.Account(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, loaded, err := LoadStorageStateDigest(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pool.StorageFileKnown(id, loaded) {
+		t.Fatal("载入账户时读入的文件应为已知")
+	}
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveStorageState(testStorageState("B")), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	_, written, err := LoadStorageStateDigest(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pool.StorageFileKnown(id, written) || !pool.StorageFileKnown(id, loaded) {
+		t.Fatal("本服务自己写过的与之前读入的都应为已知")
+	}
+	upload := StorageDigest{1, 2, 3}
+	if pool.StorageFileKnown(id, upload) {
+		t.Fatal("没读入过的内容不应为已知")
+	}
+	lease, err = pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveLoadedStorageState(testStorageState("C"), upload), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	if !pool.StorageFileKnown(id, upload) {
+		t.Fatal("载入的重新上传应记下它原来的内容指纹")
+	}
+	if pool.StorageFileKnown(id, loaded) {
+		t.Fatal("读入的外部文件只记最近一次")
+	}
+	if pool.StorageFileKnown("missing@example.com", loaded) {
+		t.Fatal("账户不存在时应为 false")
+	}
+}
+
+// TestSaveLoadedStorageStateSkipsIdenticalFile 载入重新上传的认证文件时，磁盘上已经逐字节是要写的内容就不重写文件（修改时间不变），
+// 只推进认证代际、记下原始内容的指纹，文件仍算本服务读入的那一份；内容不同时照常写盘。原先总是重写：共用账户目录的另一个进程看到
+// 修改时间变新，当成又一次重新上传，两边互相触发
+func TestSaveLoadedStorageStateSkipsIdenticalFile(t *testing.T) {
+	const id = "alice@example.com"
+	pool := testPoolWithAccount(t, id)
+	account, err := pool.Account(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ageStorage(t, account.StoragePath, time.Hour)
+	before, err := os.Stat(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, digest, err := LoadStorageStateDigest(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := pool.AuthGeneration(id)
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveLoadedStorageState(state, digest), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(account.StoragePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("磁盘上已经是这份内容时不应重写文件")
+	}
+	if pool.AuthGeneration(id) == generation {
+		t.Fatal("没有重写文件也应推进认证代际")
+	}
+	if !pool.StorageFileSynced(id, after.ModTime(), after.Size()) || !pool.StorageFileKnown(id, digest) {
+		t.Fatal("文件应算本服务读入的那一份")
+	}
+	lease, err = pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.SaveLoadedStorageState(testStorageState("NEW"), StorageDigest{9}), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	if diskSAPISID(t, account.StoragePath) != "NEW" {
+		t.Fatal("内容不同时应照常写盘")
+	}
+}
+
+// TestWriteBacksSkipUploadedNewLogin 磁盘上的认证文件被外部换成另一个能用的登录、还没载入时：浏览器 Cookie 写回（ReplaceCookies）与
+// Set-Cookie 合并（MergeSetCookieHeaders）都不写，读认证状态（ReloadStorageState）照样按磁盘返回但不读进内存，并记下账户由扫描载入；
+// 换上的文件不能签名时照原来的方式合并
+func TestWriteBacksSkipUploadedNewLogin(t *testing.T) {
+	const id = "alice@example.com"
+	pool := testPoolWithAccount(t, id)
+	account, err := pool.Account(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	TakeExternalLoginChanges()
+	if err := WriteStorageState(account.StoragePath, testStorageState("UPLOADED")); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, reloadErr := lease.ReloadStorageState()
+	err = errors.Join(
+		reloadErr,
+		lease.ReplaceCookies(testStorageState("OLD").Cookies),
+		lease.MergeSetCookieHeaders([]string{"NID=old-session; Domain=.google.com; Path=/"}, aiStudioOrigin+"/", time.Now()),
+		lease.Release(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value, _ := reloaded.CookieValue("SAPISID", aiStudioOrigin+"/", time.Now()); value != "UPLOADED" {
+		t.Fatalf("读认证状态照样按磁盘返回，得到 %s", value)
+	}
+	if diskSAPISID(t, account.StoragePath) != "UPLOADED" {
+		t.Fatal("写回不应覆盖换上的新登录")
+	}
+	if state, _ := pool.StorageStateOf(id); LoginIdentity(state) != LoginIdentity(testStorageState("OLD")) {
+		t.Fatal("内存不应换成新文件")
+	}
+	if changes := TakeExternalLoginChanges(); len(changes) != 1 || changes[0] != id {
+		t.Fatalf("应记下账户由扫描载入：%v", changes)
+	}
+	// 换上的文件缺登录签名 Cookie（不能签名）：照原来的方式合并，浏览器里能用的登录写回
+	if err := WriteStorageState(account.StoragePath, StorageState{Cookies: []StateCookie{{Name: "NID", Value: "broken", Domain: ".google.com", Path: "/"}}, Origins: []StorageOrigin{}}); err != nil {
+		t.Fatal(err)
+	}
+	lease, err = pool.AcquireFor(context.Background(), AccountSelection{AccountID: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(lease.ReplaceCookies(testStorageState("OLD").Cookies), lease.Release()); err != nil {
+		t.Fatal(err)
+	}
+	if diskSAPISID(t, account.StoragePath) != "OLD" {
+		t.Fatal("不能签名的文件上应照常合并浏览器里能用的登录")
+	}
+	TakeExternalLoginChanges()
 }

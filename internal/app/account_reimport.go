@@ -168,14 +168,16 @@ func (admin *runtimeAdmin) reimportChromeAccount(ctx context.Context, root strin
 	if _, err := aistudio.NewSigner().Sign(imported[0].State); err != nil {
 		return api.AdminAccount{}, fmt.Errorf("认证状态无法用于 AI Studio: %w", err)
 	}
-	return admin.updateImportedAccount(ctx, status.ID, imported[0].State, "Chrome 重新导入")
+	return admin.updateImportedAccount(ctx, status.ID, imported[0].State, reauthSourceChrome)
 }
 
 // updateImportedAccount 就地替换已有账户的认证状态（Cookie 与 Chrome OAuth 续签材料）：保留账户配置（启用状态、代理、语言、时区）、
 // Camoufox 指纹、AI Studio 的 localStorage、IP 池出口，以及 runtime-state.json 里的资源绑定、冷却与模型资格。步骤与认证文件更新
 // （reloadAccountCredentials）一致：先取消启停的后台收尾，在独占租约内关闭旧 Worker（它用的是旧 Cookie）、写回认证状态、标为就绪，
 // 清除 403 无权限记录与冷却（一并清除组织停用状态），释放后清掉疑似失效与登录复核的记录，再同步一次模型目录。
-// 被取消的收尾在结束时（成功或失败）按原阶段重新开始：停用的账户照常重建固定出口、显示阶段，启用的账户没有目录时同步一次
+// 被取消的收尾在结束时（成功或失败）按原阶段重新开始：停用的账户照常重建固定出口、显示阶段，启用的账户没有目录时同步一次。
+// 与认证文件更新一样，自动停用（没有手动停用记录）的账户按默认启用，启用的账户随后加入新账户自动处理队列，按新的 Cookie 验证一次
+// （见 accountOnboarder.queueReauth）；手动停用的保持停用、不验证，记为跳过（手动停用）
 func (admin *runtimeAdmin) updateImportedAccount(
 	ctx context.Context, accountID string, state aistudio.StorageState, source string,
 ) (api.AdminAccount, error) {
@@ -205,6 +207,12 @@ func (admin *runtimeAdmin) updateImportedAccount(
 		return api.AdminAccount{}, err
 	}
 	admin.service.noteLoginRestored(account.ID)
+	if status, ok := admin.pool.StatusOf(account.ID); ok && !status.Enabled && !accountDisableNotes.keepDisabled(account.ID) {
+		// 账户默认启用（与目录扫描载入认证文件更新相同，见 applyLoginUpdateMode）：自动停用（新账户自动处理或重新验证未通过等）或没有
+		// 停用记录的账户换了新的登录后启用，下面再加入队列验证；原先保持停用、不验证，面板与日志都没有结果。在恢复收尾之前启用：
+		// 被取消的停用收尾随之不再重新开始。正忙时保持停用，记为跳过（见 queueReauthIfEnabled）
+		admin.enableAutoDisabled(ctx, account.ID, source)
+	}
 	admin.syncAccountModelCatalog(ctx, account)
 	// 在返回的账户视图之前恢复收尾，账户行照常显示阶段
 	admin.resumeTransition(account.ID, resume)
@@ -213,5 +221,6 @@ func (admin *runtimeAdmin) updateImportedAccount(
 		"账户已就地重新导入 | 来源=%s | 保留指纹、资源绑定与运行态 | 耗时=%s",
 		source, time.Since(startedAt).Round(time.Millisecond),
 	))
+	admin.queueReauthIfEnabled(account.ID, source)
 	return admin.account(account.ID)
 }

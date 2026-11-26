@@ -38,6 +38,9 @@ type runtimeAdmin struct {
 	config     config.Config
 	// onboard 为新账户自动处理队列
 	onboard *accountOnboarder
+	// loginBacklog 为账户目录扫描检测到认证文件更新、还没载入完的账户数（等后台载入的与正在载入的，见 accountWatcher.publishBacklogLocked），
+	// 新账户自动处理面板显示为“等待载入”：批量重新上传时每轮只载入 40 个，原先这些账户在面板上看不出来
+	loginBacklog atomic.Int64
 	// catalogSlots 为启用后在后台同步模型目录的共用并发名额（见 bulk_enable.go），首次使用时创建
 	catalogSlotsOnce sync.Once
 	catalogSlots     chan struct{}
@@ -877,6 +880,8 @@ func (admin *runtimeAdmin) LoginAccount(ctx context.Context, accountID string) (
 	}
 	// 清掉疑似失效、登录复核记录与疑似登录失效冷却（与管理验证通过、认证文件更新同一处理）
 	admin.service.noteLoginRestored(account.ID)
+	// 重新上传后验证未通过（仍需登录等）的记录改记为已恢复，面板不再计入
+	admin.onboard.noteManualRestored(account.ID, "管理页重新登录成功")
 	if result.DriveError == "" {
 		// 登录时完成了官网的 Drive 授权：按新的认证代际记为 Drive 可用（见 aistudio.PooledService.NoteDriveAuthorized）
 		admin.noteDriveAuthorized(account.ID)
@@ -948,6 +953,8 @@ func (admin *runtimeAdmin) VerifyAccount(ctx context.Context, accountID string) 
 		if refreshed, refreshErr := admin.account(accountID); refreshErr == nil {
 			account = refreshed
 		}
+		// 重新上传后验证未通过（仍需登录等）的记录改记为已恢复，面板不再计入
+		admin.onboard.noteManualRestored(accountID, "管理页验证通过")
 	}
 	account.Authenticated = &authenticated
 	account.VerifyReason = reason

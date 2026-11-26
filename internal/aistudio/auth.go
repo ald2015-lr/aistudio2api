@@ -2,6 +2,7 @@ package aistudio
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -177,31 +178,58 @@ func SupportedLoginMethods() []LoginMethod {
 
 // LoadStorageState 读取并校验 Playwright storage state
 func LoadStorageState(filePath string) (StorageState, error) {
+	state, _, err := LoadStorageStateDigest(filePath)
+	return state, err
+}
+
+// StorageDigest 为认证文件原始内容（字节）的 SHA-256 指纹，用来判断磁盘上的文件是不是本服务最近一次读入或写入的那一份
+// （见 AccountPool.StorageFileOwned）
+type StorageDigest [sha256.Size]byte
+
+// LoadStorageStateDigest 与 LoadStorageState 相同，另返回文件原始内容的指纹
+func LoadStorageStateDigest(filePath string) (StorageState, StorageDigest, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
-		return StorageState{}, fmt.Errorf("读取 storage state: %w", err)
+		return StorageState{}, StorageDigest{}, fmt.Errorf("读取 storage state: %w", err)
 	}
 	var state StorageState
 	if err := json.Unmarshal(data, &state); err != nil {
-		return StorageState{}, fmt.Errorf("解析 storage state: %w", err)
+		return StorageState{}, StorageDigest{}, fmt.Errorf("解析 storage state: %w", err)
 	}
 	if err := state.Validate(); err != nil {
-		return StorageState{}, err
+		return StorageState{}, StorageDigest{}, err
 	}
-	return state, nil
+	return state, sha256.Sum256(data), nil
 }
 
 // WriteStorageState 原子写回 Playwright storage state
 func WriteStorageState(filePath string, state StorageState) error {
+	_, err := writeStorageStateDigest(filePath, state)
+	return err
+}
+
+// writeStorageStateDigest 与 WriteStorageState 相同，另返回写入内容的指纹
+func writeStorageStateDigest(filePath string, state StorageState) (StorageDigest, error) {
+	data, err := encodeStorageState(state)
+	if err != nil {
+		return StorageDigest{}, err
+	}
+	if err := atomicWriteFile(filePath, data, 0o600); err != nil {
+		return StorageDigest{}, err
+	}
+	return sha256.Sum256(data), nil
+}
+
+// encodeStorageState 返回认证状态写进文件的内容（校验后缩进编码、末尾换行），与 WriteStorageState 写出的逐字节相同
+func encodeStorageState(state StorageState) ([]byte, error) {
 	if err := state.Validate(); err != nil {
-		return err
+		return nil, err
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		return fmt.Errorf("编码 storage state: %w", err)
+		return nil, fmt.Errorf("编码 storage state: %w", err)
 	}
-	data = append(data, '\n')
-	return atomicWriteFile(filePath, data, 0o600)
+	return append(data, '\n'), nil
 }
 
 // Validate 校验 storage state 的浏览器字段

@@ -543,6 +543,29 @@ func (registry *permissionDeniedRegistry) accountLevelLastAt() map[string]time.T
 	return result
 }
 
+// latestSince 返回账户登记里 since 之后最近一次 403 的原文；没有时 ok 为假
+func (registry *permissionDeniedRegistry) latestSince(accountID string, since time.Time) (string, bool) {
+	if registry == nil {
+		return "", false
+	}
+	registry.mu.RLock()
+	defer registry.mu.RUnlock()
+	account := registry.accounts[accountID]
+	if account == nil {
+		return "", false
+	}
+	var latest *permissionDeniedModel
+	for _, model := range account.Models {
+		if model != nil && model.LastAt.After(since) && (latest == nil || model.LastAt.After(latest.LastAt)) {
+			latest = model
+		}
+	}
+	if latest == nil {
+		return "", false
+	}
+	return latest.Message, true
+}
+
 // clearAccount 清除账户的全部登记，返回清除的模型数
 func (registry *permissionDeniedRegistry) clearAccount(accountID string) int {
 	if registry == nil {
@@ -793,7 +816,8 @@ func (service *trackedService) permissionDeniedSucceeded(accountID string, model
 }
 
 // recordPermissionDenied 登记账户在该模型该通道上的一次 403 无权限，同时记下账户当前登录签名 Cookie 的指纹与这次的请求来源
-// （last，见 permissionDeniedRequestOf；为空时不记）
+// （last，见 permissionDeniedRequestOf；为空时不记）。账户最近一次重新上传认证文件后验证通过（已恢复）时，把那次的结果改记为
+// 仍需验证或仍有 403（见 accountOnboarder.noteForbidden）
 func (service *trackedService) recordPermissionDenied(
 	accountID string, modelID string, channel aistudio.Channel, message string, now time.Time, last *permissionDeniedRequest,
 ) {
@@ -805,6 +829,41 @@ func (service *trackedService) recordPermissionDenied(
 		identity, _ = service.pool.LoginIdentity(accountID)
 	}
 	service.permissionDenied.recordRequest(accountID, modelID, channel, message, identity, now, last)
+	service.reauthOnboard.Load().noteForbidden(accountID, message, now)
+}
+
+// reauthForbiddenSince 返回账户在 since（重新上传认证文件、清除旧判定的时间）之后是否又返回过 403：登记表里有 since 之后的 403 时
+// 按最近一次的原文，需要验证账号（账户级）为仍需验证、其余为仍有 403；登记表没有、冷却里却有生效的需要验证账号暂停或 403 冷却时
+// （重新上传时已全部清除，有就是之后写的）按冷却原因。都没有时返回空
+func (service *trackedService) reauthForbiddenSince(accountID string, since time.Time) (string, string) {
+	if service == nil {
+		return "", ""
+	}
+	if message, ok := service.permissionDenied.latestSince(accountID, since); ok {
+		if accountLevelPermissionDenied(message) {
+			return reauthVerifyRequired, authRequiredCauseSummary(errors.New(message))
+		}
+		return reauthForbidden, authRequiredCauseSummary(errors.New(message))
+	}
+	if service.pool == nil {
+		return "", ""
+	}
+	status, ok := service.pool.StatusOf(accountID)
+	if !ok {
+		return "", ""
+	}
+	now := time.Now()
+	outcome, reason := "", ""
+	for scope, cooldown := range status.Cooldowns {
+		if !cooldown.Active(now) || !forbiddenCooldown(scope, cooldown) {
+			continue
+		}
+		if verifyCooldown(scope, cooldown) {
+			return reauthVerifyRequired, cooldown.Reason
+		}
+		outcome, reason = reauthForbidden, cooldown.Reason
+	}
+	return outcome, reason
 }
 
 // dropSystemicPermissionDenied 号池级 403 判定成立后撤销号池里该模型的登记：起点为号池里该模型最近一次成功的时间
@@ -823,13 +882,14 @@ func (service *trackedService) dropSystemicPermissionDenied(scope aistudio.PoolS
 
 // reconcilePermissionDenied 在启动时（账户池与登记表都已载入后）对照登记表与账户池。认证文件更新原先只由运行中的账户目录扫描发现，
 // 扫描第一次看到的文件只记作基准：服务停止期间按说明覆盖了认证文件，启动后账户仍然列着、403 冷却（会持久化，第三档到太平洋时间
-// 次日零点）也还在。这里把登录签名 Cookie 的指纹与登记时不同的账户按认证文件更新处理（清除登记、403 冷却与暂停），
-// 不在账户池里的账户（服务停止期间删除了目录）的登记直接清除
-func (service *trackedService) reconcilePermissionDenied() {
+// 次日零点）也还在。这里把登录签名 Cookie 的指纹与登记时不同的账户按认证文件更新处理（清除登记、403 冷却与暂停），返回这些账户
+// （新账户自动处理队列建好后加入验证，见 reconcileAuthFiles）；不在账户池里的账户（服务停止期间删除了目录）的登记直接清除
+func (service *trackedService) reconcilePermissionDenied() []string {
 	if service == nil || service.pool == nil || service.permissionDenied == nil {
-		return
+		return nil
 	}
 	missing := 0
+	var updated []string
 	for accountID, identity := range service.permissionDenied.identities() {
 		current, exists := service.pool.LoginIdentity(accountID)
 		switch {
@@ -839,11 +899,13 @@ func (service *trackedService) reconcilePermissionDenied() {
 			}
 		case identity != "" && current != identity:
 			service.forgetPermissionDenied(accountID, "启动时发现认证文件已更新")
+			updated = append(updated, accountID)
 		}
 	}
 	if missing > 0 && service.requests != nil {
 		service.requests.log("service", "INFO", fmt.Sprintf("清除已不在账户池中的账户的 403 无权限记录 | 账户=%d", missing))
 	}
+	return updated
 }
 
 // verifyReconcileCounts 为启动时整理需要验证账号的暂停的各项计数（见 reconcileVerifyRequiredPauses），汇总行只写计数、不写账户
@@ -1024,7 +1086,9 @@ var rotatingCookies = map[string]struct{}{
 // 同时更新内存，磁盘上的内容与内存不同才是外部更新。这两项都是本服务自己会写回、在进程之间会变的内容，不计入：多个进程共用一个
 // 账户目录时，另一个进程回写它们后磁盘与本进程内存不同，原先按重新上传处理，清除登记与 403 冷却、冷却档位从头计，每次回写都这样，
 // 列表在进程之间来回出现。轮换 Cookie 由 MergeSetCookieHeaders 回写；AI Studio 的 localStorage 由 Worker 启动成功后回写
-// （MergeBrowserLocalStorage，部署后第一次启动几乎每个账号都会改，之后页面改值时也会改）。只有这两项不同的重新导出因此发现不了
+// （MergeBrowserLocalStorage，部署后第一次启动几乎每个账号都会改，之后页面改值时也会改）。只有这两项不同的重新导出因此发现不了。
+// Cookie 按名称、域、路径（再按其余字段）排序后再摘要：内容相同、只是顺序不同的认证文件（换了导出工具、本服务合并 Set-Cookie 时
+// 把更新的 Cookie 挪到末尾）不算变化；只影响摘要，不改文件
 func storageStateDigest(state aistudio.StorageState) string {
 	cookies := make([]aistudio.StateCookie, 0, len(state.Cookies))
 	for _, cookie := range state.Cookies {
@@ -1032,6 +1096,7 @@ func storageStateDigest(state aistudio.StorageState) string {
 			cookies = append(cookies, cookie)
 		}
 	}
+	slices.SortStableFunc(cookies, compareDigestCookies)
 	state.Cookies = cookies
 	origins := make([]aistudio.StorageOrigin, 0, len(state.Origins))
 	for _, origin := range state.Origins {
@@ -1046,6 +1111,20 @@ func storageStateDigest(state aistudio.StorageState) string {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:8])
+}
+
+// compareDigestCookies 为摘要排序 Cookie：先按名称、域（不分大小写）、路径，再按值与其余字段，相同内容不同顺序得到同一个摘要
+func compareDigestCookies(left, right aistudio.StateCookie) int {
+	if order := strings.Compare(left.Name, right.Name); order != 0 {
+		return order
+	}
+	if order := strings.Compare(strings.ToLower(left.Domain), strings.ToLower(right.Domain)); order != 0 {
+		return order
+	}
+	if order := strings.Compare(left.Path, right.Path); order != 0 {
+		return order
+	}
+	return strings.Compare(fmt.Sprintf("%#v", left), fmt.Sprintf("%#v", right))
 }
 
 // PermissionDenied 返回 403 无权限账户列表，按最近一次 403 从新到旧排列

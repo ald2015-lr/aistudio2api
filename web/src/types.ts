@@ -160,11 +160,28 @@ export type OnboardingResult =
   | 'manual'
   | 'baseline'
 
+// ReauthOutcome 为已有账户重新上传认证文件后的结果：已恢复、仍需登录、仍需验证（需要验证账号）、仍有 403、仍受限（组织停用等）、
+// 跳过（手动停用）、已重新载入未验证（自动验证关闭）、验证出错、其他跳过
+export type ReauthOutcome =
+  | 'restored'
+  | 'auth_required'
+  | 'verify_required'
+  | 'forbidden'
+  | 'restricted'
+  | 'manual_disabled'
+  | 'verify_off'
+  | 'error'
+  | 'skipped'
+
+// OnboardingEvent 为一条处理记录；source 为 reauth 时是已有账户重新上传认证文件后的处理，outcome 为重新上传后的结果
+// （旧版服务没有这两个字段）
 export interface OnboardingEvent {
   account_id: string
   result: OnboardingResult
   detail?: string
   at: string
+  source?: 'reauth'
+  outcome?: ReauthOutcome
 }
 
 // BulkEnableInput 为批量启用请求：account_ids 为要启用的账户，all_disabled 为 true 时启用全部停用账户
@@ -212,6 +229,18 @@ export interface OnboardingStatus {
   next_batch_seconds: number
   counts: Partial<Record<OnboardingResult, number>> | null
   recent: OnboardingEvent[] | null
+  // reauth 为待处理与处理中里重新上传认证文件后重新验证的账户数（已计入 pending 与 processing）；unchanged 为本次运行中
+  // 健康账户重新上传了内容相同的认证文件、没有重新认证的次数；same_login 为状态正常的启用账户换上了内容有变化、登录签名没变的
+  // 认证文件、按原口径没有重新载入的次数（同一账户每小时最多计一次）；reauth_outcomes 为各账户最近一次重新上传后的结果计数
+  // （这些记录不计入 counts；旧版服务没有这四个字段）
+  reauth?: number
+  unchanged?: number
+  same_login?: number
+  reauth_outcomes?: Partial<Record<ReauthOutcome, number>>
+  // not_reuploaded 为本次运行中失效账户换上的认证文件被当成本服务自己的文件（保留了原文件的修改时间）或共用账户目录的其他进程回写、
+  // 没有按重新上传处理的次数；loading 为账户目录扫描检测到认证文件更新、还没载入完的账户数（旧版服务没有这两个字段）
+  not_reuploaded?: number
+  loading?: number
 }
 
 // WorkerPartition 为 Worker 分区：普通、Ultra 与 Pro

@@ -937,12 +937,40 @@ const zhCN = {
   'onboard.settings': '设置与记录',
   'onboard.collapse': '收起',
   'onboard.autoVerify':
-    '自动验证新账户（启动浏览器验证登录；账户默认启用，验证未通过的显示为需要登录，仍为停用的账户在停用状态下验证）',
+    '自动验证新账户与重新上传认证文件的已有账户（启动浏览器验证登录；账户默认启用，验证未通过的显示为需要登录，仍为停用的账户在停用状态下验证）',
   'onboard.autoEnable': '自动启用仍为停用的账户（同时开启验证时，只启用验证通过的账户）',
   'onboard.batchSize': '每批数量',
   'onboard.concurrency': '验证并发',
   'onboard.hint':
-    '新目录放进 auth/ 后约 10 秒自动导入并排队；待处理达到每批数量，或最早的账户已等待 2 分钟，就开始处理。验证会启动浏览器，每个账户约 10～30 秒。首次开启时已有账户不做改动；管理页手动添加的账户不自动处理；删除后重新上传的账户会再次处理。',
+    '新目录放进 auth/ 后约 10 秒自动导入并排队；待处理达到每批数量，或最早的账户已等待 2 分钟，就开始处理。验证会启动浏览器，每个账户约 10～30 秒。首次开启时已有账户不做改动；管理页手动添加的账户不自动处理；删除后重新上传的账户会再次处理。已有账户重新上传认证文件（覆盖 storage-state.json，或 Chrome 重新导入）后，清除这个账户原来的需要登录、403 无权限、需要验证账号、单个模型需要验证、组织停用或受限、疑似登录失效等判定，关闭旧浏览器、重新认证（载入后即恢复调度）并立即加入队列验证一次，结果在下面“最近处理”里写“重新上传后：…”；处于这些状态的账户即使上传的内容与原来完全相同（例如在官网解开 403 后原样上传）也照样处理，只有本来就正常的账户内容没变时才只提示“认证文件未变化”；手动停用的只换认证、保持停用；关闭自动验证时只重新载入。服务正常停止期间重新上传的，启动时同样处理。批量上传时每轮扫描最多载入 40 个，没载入的计入“等待载入”。原样重新上传时不要保留原文件的修改时间（WinSCP“保留时间戳”、rsync -a、scp -p），否则看不出文件被重新写入；只差 Google 轮换 Cookie 的重新导出按其他进程回写处理，这两种情况计入“未按重新上传处理”（日志有提示），都可以对账户点“验证”。',
+  'onboard.reauth': '其中重新上传 {count}',
+  'onboard.reauthTip': '已有账户重新上传认证文件后加入的重新验证（已计入待处理与处理中）',
+  'onboard.sourceReauthTip': '已有账户重新上传认证文件后的处理结果',
+  'onboard.loading': '等待载入 {count}',
+  'onboard.loadingTip':
+    '账户目录扫描已检测到认证文件更新、还没载入的账户：每轮扫描（约 10 秒）最多载入 40 个，正在处理请求的账户下一轮再试；载入前账户列表仍显示原来的状态，载入后才加入验证队列',
+  'onboard.notReuploaded': '未按重新上传处理 {count}',
+  'onboard.notReuploadedTip':
+    '处于需要登录、403 等失效状态的账户换上的认证文件，被当成本服务自己的文件（上传时保留了原文件的修改时间）或共用账户目录的其他进程回写（只差 Google 轮换的 Cookie 或 AI Studio 的 localStorage），没有清除旧判定、没有重新认证（本次运行的次数，日志里有每个账户）。如果是你重新上传的：对账户点“验证”（通过即清除 403 与冷却），或关闭保留时间戳后重新上传、上传后 touch 一下',
+  'onboard.unchanged': '认证文件未变化 {count}',
+  'onboard.unchangedTip':
+    '本来就正常的账户（或只是手动停用的账户）重新上传了与当前登录状态相同的认证文件，没有重新认证（本次运行的次数，日志里有每个账户）。处于需要登录、403 等失效状态的账户不会计在这里，照样按重新上传处理',
+  'onboard.sameLogin': '登录未变、未重新载入 {count}',
+  'onboard.sameLoginTip':
+    '状态正常的启用账户换上了内容有变化、但登录签名 Cookie 没变的认证文件（同一会话重新导出，或共用账户目录的其他进程回写），按原口径没有重新载入、没有重新验证；换了登录的文件才会重新认证（本次运行的次数，同一账户每小时最多计一次，日志里有每个账户）',
+  'onboard.sourceReauth': '重新上传',
+  'onboard.reauthAfter': '重新上传后：{outcome}',
+  'onboard.reauthOutcomesTip':
+    '各账户最近一次重新上传认证文件后的结果：已恢复为验证通过、恢复调度；验证通过后 24 小时内又返回 403 的改记为仍需验证（需要验证账号）或仍有 403',
+  'onboard.reauthOutcome.restored': '已恢复',
+  'onboard.reauthOutcome.auth_required': '仍需登录',
+  'onboard.reauthOutcome.verify_required': '仍需验证',
+  'onboard.reauthOutcome.forbidden': '仍有 403',
+  'onboard.reauthOutcome.restricted': '仍受限',
+  'onboard.reauthOutcome.manual_disabled': '跳过（手动停用）',
+  'onboard.reauthOutcome.verify_off': '已重新载入，未验证',
+  'onboard.reauthOutcome.error': '验证出错',
+  'onboard.reauthOutcome.skipped': '跳过',
   'onboard.invalid': '每批数量 1～200，验证并发 1～8',
   'onboard.saving': '保存中…',
   'onboard.saved': '已保存并生效',
@@ -2443,13 +2471,41 @@ const en: Record<TranslationKey, string> = {
   'onboard.settings': 'Settings & history',
   'onboard.collapse': 'Collapse',
   'onboard.autoVerify':
-    'Verify new accounts (launches a browser; accounts are enabled by default and show as needing login if verification fails, accounts still disabled are verified while disabled)',
+    'Verify new accounts and existing accounts whose auth file is re-uploaded (launches a browser; accounts are enabled by default and show as needing login if verification fails, accounts still disabled are verified while disabled)',
   'onboard.autoEnable':
     'Enable accounts that are still disabled (with verification on, only verified accounts)',
   'onboard.batchSize': 'Batch size',
   'onboard.concurrency': 'Verify concurrency',
   'onboard.hint':
-    'New folders in auth/ are imported within ~10s and queued; processing starts when the batch size is reached or the oldest account has waited 2 minutes. Verification launches a browser, ~10-30s per account. Existing accounts are left untouched on first use; accounts added from this page are not processed; re-uploaded accounts are processed again.',
+    'New folders in auth/ are imported within ~10s and queued; processing starts when the batch size is reached or the oldest account has waited 2 minutes. Verification launches a browser, ~10-30s per account. Existing accounts are left untouched on first use; accounts added from this page are not processed; re-uploaded accounts are processed again. When an existing account\'s auth file is re-uploaded (storage-state.json overwritten, or re-imported from Chrome), the account\'s old needs-login, 403, account-verification, single-model verification, organization disabled or restricted and suspected-logout states are cleared, its old browser is closed, it is re-authenticated (scheduled again as soon as it is loaded) and queued for one verification right away, and the result shows below as "After re-upload: …". Accounts in any of these states are processed even if the uploaded file is identical (e.g. re-uploaded as-is after clearing a 403 on the website); only healthy accounts with an unchanged file just get an "auth file unchanged" note. Manually disabled accounts only get the new auth and stay disabled; with verification off the file is only reloaded. Files re-uploaded while the service was stopped normally are handled the same way at startup. A bulk upload is loaded at most 40 accounts per scan; the rest count as "waiting to load". When re-uploading an identical file, do not preserve its original modification time (WinSCP "preserve timestamp", rsync -a, scp -p), or the rewrite cannot be seen; a re-export that only changes Google\'s rotating cookies is treated as another process\'s write-back. Both count as "not treated as re-uploads" (the log says so); in both cases click Verify on the account.',
+  'onboard.reauth': 'incl. {count} re-uploaded',
+  'onboard.reauthTip': 'Existing accounts re-verified after their auth file was re-uploaded (included in pending and processing)',
+  'onboard.sourceReauthTip': 'Result of processing an existing account after its auth file was re-uploaded',
+  'onboard.loading': '{count} waiting to load',
+  'onboard.loadingTip':
+    'The directory scan has seen updated auth files for these accounts but has not loaded them yet: at most 40 are loaded per scan (about every 10 seconds) and accounts busy with requests are retried next scan; until then the account list still shows the old state, and they join the verification queue once loaded',
+  'onboard.notReuploaded': 'Not treated as re-uploads: {count}',
+  'onboard.notReuploadedTip':
+    'Accounts needing login, hitting 403 or in other failed states got an auth file that was taken for this service\'s own copy (the upload kept the original modification time) or for a write-back by another process sharing the account folder (only Google\'s rotating cookies or the AI Studio localStorage differ), so the old states were not cleared and nothing was re-authenticated (number of times in this run; the log lists each account). If it was your re-upload, click Verify on the account (passing clears the 403 records and cooldowns), or upload again without preserving timestamps, or touch the file after uploading',
+  'onboard.unchanged': 'Auth file unchanged: {count}',
+  'onboard.unchangedTip':
+    'Healthy (or merely manually disabled) accounts got an auth file identical to their current login, so nothing was re-authenticated (number of times in this run; the log lists each account). Accounts needing login, hitting 403 or in other failed states are not counted here and are processed as re-uploads',
+  'onboard.sameLogin': 'Same login, not reloaded: {count}',
+  'onboard.sameLoginTip':
+    'Healthy enabled accounts got an auth file whose content changed but whose login-signature cookies did not (a re-export from the same session, or a write-back by another process sharing the account folder), so as before it was not reloaded or re-verified; only a file with a different login is re-authenticated (number of times in this run, at most once per account per hour; the log lists each account)',
+  'onboard.sourceReauth': 'Re-upload',
+  'onboard.reauthAfter': 'After re-upload: {outcome}',
+  'onboard.reauthOutcomesTip':
+    'Result of each account\'s latest auth file re-upload: Restored means verified and scheduled again; accounts that hit a 403 within 24 hours after verifying are changed to Still needs verification (account verification) or Still 403',
+  'onboard.reauthOutcome.restored': 'Restored',
+  'onboard.reauthOutcome.auth_required': 'Still needs login',
+  'onboard.reauthOutcome.verify_required': 'Still needs verification',
+  'onboard.reauthOutcome.forbidden': 'Still 403',
+  'onboard.reauthOutcome.restricted': 'Still restricted',
+  'onboard.reauthOutcome.manual_disabled': 'Skipped (manually disabled)',
+  'onboard.reauthOutcome.verify_off': 'Reloaded, not verified',
+  'onboard.reauthOutcome.error': 'Verification error',
+  'onboard.reauthOutcome.skipped': 'Skipped',
   'onboard.invalid': 'Batch size 1-200, concurrency 1-8',
   'onboard.saving': 'Saving…',
   'onboard.saved': 'Saved and applied',

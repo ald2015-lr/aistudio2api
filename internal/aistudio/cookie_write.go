@@ -1,6 +1,8 @@
 package aistudio
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"os"
 	"strings"
 	"time"
@@ -115,10 +117,115 @@ func (p *AccountPool) deferredValidLocked(account *Account, deferred *deferredSt
 	return generation == deferred.generation
 }
 
-// writeStorageLocked 把认证状态写盘并丢弃暂存（暂存的内容已经是 state 的底）。调用方持有 account.storageMu
+// syncedStorage 为本服务最近一次读入（载入账户）或写入认证文件之后的文件状态（修改时间与大小）与内容指纹，
+// 目录扫描据此区分本服务自己读入或写入的文件与外部重新上传的文件（见 StorageFileSynced、StorageFileOwned）
+type syncedStorage struct {
+	stamp  storageStamp
+	digest StorageDigest
+}
+
+// writeStorageLocked 把认证状态写盘并丢弃暂存（暂存的内容已经是 state 的底），写成功后记下文件状态与内容指纹（见 StorageFileSynced）。
+// 调用方持有 account.storageMu
 func (account *Account) writeStorageLocked(state StorageState) error {
 	account.dropDeferredStorageLocked()
-	return WriteStorageState(account.StoragePath, state)
+	digest, err := writeStorageStateDigest(account.StoragePath, state)
+	if err != nil {
+		account.storageSynced.Store(nil)
+		return err
+	}
+	if stamp, ok := statStorage(account.StoragePath); ok {
+		account.storageSynced.Store(&syncedStorage{stamp: stamp, digest: digest})
+	} else {
+		account.storageSynced.Store(nil)
+	}
+	return nil
+}
+
+// writeStorageUnlessSameLocked 与 writeStorageLocked 相同，只是磁盘上已经逐字节是要写的内容时不重写文件：丢弃暂存、记下文件状态与
+// 内容指纹（读取前后文件状态相同才记），修改时间不变。载入重新上传的认证文件时用（见 SaveLoadedStorageState）：原先总是重写，
+// 多个进程共用账户目录时，一个进程载入后重写（修改时间变新），另一个进程看到的是“外部重新写入、内容与当前登录相同”的文件，
+// 账户仍处于失效状态时又按重新上传处理并重写，两边无限循环。调用方持有 account.storageMu
+func (account *Account) writeStorageUnlessSameLocked(state StorageState) error {
+	data, err := encodeStorageState(state)
+	if err != nil {
+		return err
+	}
+	before, statted := statStorage(account.StoragePath)
+	current, readErr := os.ReadFile(account.StoragePath)
+	if after, ok := statStorage(account.StoragePath); readErr == nil && statted && ok && after.same(before) && bytes.Equal(current, data) {
+		account.dropDeferredStorageLocked()
+		account.storageSynced.Store(&syncedStorage{stamp: after, digest: sha256.Sum256(data)})
+		return nil
+	}
+	return account.writeStorageLocked(state)
+}
+
+// StorageFileStamp 为本服务最近一次读入（载入账户）或写入账户认证文件之后的文件状态（修改时间与大小）与内容指纹
+// （见 StorageFileSynced）
+type StorageFileStamp struct {
+	ModTime time.Time
+	Size    int64
+	Digest  StorageDigest
+}
+
+// StorageFileStampOf 返回账户的 StorageFileStamp；账户不存在或没有记下时 ok 为假
+func (p *AccountPool) StorageFileStampOf(accountID string) (StorageFileStamp, bool) {
+	synced := p.syncedOf(accountID)
+	if synced == nil {
+		return StorageFileStamp{}, false
+	}
+	return StorageFileStamp{ModTime: synced.stamp.modTime, Size: synced.stamp.size, Digest: synced.digest}, true
+}
+
+// syncedOf 返回账户最近一次读入或写入认证文件之后记下的文件状态；账户不存在或没有记下时为 nil
+func (p *AccountPool) syncedOf(accountID string) *syncedStorage {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	account := p.byID[accountID]
+	p.mu.Unlock()
+	if account == nil {
+		return nil
+	}
+	return account.storageSynced.Load()
+}
+
+// StorageFileSynced 判断账户认证文件当前的修改时间与大小（modTime、size，由调用方 stat 得到）是否与本服务最近一次读入
+// （载入账户）或写入它之后相同：相同说明文件就是本服务自己读入或写入的那一份，内存里的登录状态与它一致，不是外部重新上传。
+// 账户不存在或没有记下时返回 false
+func (p *AccountPool) StorageFileSynced(accountID string, modTime time.Time, size int64) bool {
+	synced := p.syncedOf(accountID)
+	return synced != nil && synced.stamp.same(storageStamp{modTime: modTime, size: size})
+}
+
+// StorageFileKnown 判断认证文件原始内容的指纹（digest）是不是本服务最近一次从外部读入（载入账户、载入重新上传的认证文件，
+// 见 SaveLoadedStorageState）或自己写入的那一份，不看修改时间：是时这份内容是原样重新上传的、本服务读入或写过的文件，
+// 不是共用账户目录的其他进程回写的（其他进程把自己收到的 Cookie 合并进磁盘上的文件再写回，几乎不会与本服务读入或写入的逐字节相同）。
+// 账户不存在时返回 false
+func (p *AccountPool) StorageFileKnown(accountID string, digest StorageDigest) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	account := p.byID[accountID]
+	p.mu.Unlock()
+	if account == nil {
+		return false
+	}
+	if loaded := account.storageLoaded.Load(); loaded != nil && *loaded == digest {
+		return true
+	}
+	synced := account.storageSynced.Load()
+	return synced != nil && synced.digest == digest
+}
+
+// StorageFileOwned 判断账户认证文件（digest 为刚读到的内容指纹，modTime 为它的修改时间）是不是本服务最近一次读入（载入账户）
+// 或写入的那一份：内容逐字节相同，修改时间也不晚于那一次。只是修改时间被改回更早（例如工具改了文件时间）也算；
+// 外部把同一份内容重新上传（重新写入）时修改时间更新，不算。账户不存在或没有记下时返回 false
+func (p *AccountPool) StorageFileOwned(accountID string, modTime time.Time, digest StorageDigest) bool {
+	synced := p.syncedOf(accountID)
+	return synced != nil && synced.digest == digest && !modTime.After(synced.stamp.modTime)
 }
 
 // dropDeferredStorageLocked 丢弃暂存状态并停止写盘计时。调用方持有 account.storageMu

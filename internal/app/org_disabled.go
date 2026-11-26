@@ -579,13 +579,14 @@ func (service *trackedService) watchedLogin(accountID string) bool {
 }
 
 // reconcileOrgDisabled 在启动时（账户池与登记表都已载入后）对照登记表与账户池：不在账户池里的账户（服务停止期间删除了目录）
-// 的记录直接清除；登录签名指纹与登记时不同的账户（服务停止期间替换了认证文件）按认证文件更新清除；其余恢复账户池的标记，
-// 重启后仍不参与调度（与 reconcilePermissionDenied 同一识别方式）
-func (service *trackedService) reconcileOrgDisabled() {
+// 的记录直接清除；登录签名指纹与登记时不同的账户（服务停止期间替换了认证文件）按认证文件更新清除，返回这些账户（新账户自动处理
+// 队列建好后加入验证，见 reconcileAuthFiles）；其余恢复账户池的标记，重启后仍不参与调度（与 reconcilePermissionDenied 同一识别方式）
+func (service *trackedService) reconcileOrgDisabled() []string {
 	if service == nil || service.pool == nil || service.orgDisabled == nil {
-		return
+		return nil
 	}
 	missing, restored := 0, 0
+	var updated []string
 	for accountID, identity := range service.orgDisabled.identities() {
 		current, exists := service.pool.LoginIdentity(accountID)
 		switch {
@@ -595,6 +596,7 @@ func (service *trackedService) reconcileOrgDisabled() {
 			}
 		case identity != "" && current != identity:
 			service.forgetOrgDisabled(accountID, "启动时发现认证文件已更新")
+			updated = append(updated, accountID)
 		default:
 			// 按登记的种类恢复（服务受限等的说明不同；旧文件没有种类，按组织停用）
 			if _, err := service.pool.MarkOrgDisabled(accountID, service.orgDisabledKind(accountID)); err == nil {
@@ -603,7 +605,7 @@ func (service *trackedService) reconcileOrgDisabled() {
 		}
 	}
 	if service.requests == nil {
-		return
+		return updated
 	}
 	if missing > 0 {
 		service.requests.log("service", "INFO", fmt.Sprintf("清除已不在账户池中的账户的组织停用记录 | 账户=%d", missing))
@@ -611,6 +613,7 @@ func (service *trackedService) reconcileOrgDisabled() {
 	if restored > 0 {
 		service.requests.log("service", "INFO", fmt.Sprintf("恢复组织停用账户的标记，不参与调度 | 账户=%d", restored))
 	}
+	return updated
 }
 
 // OrgDisabled 返回组织停用账户列表，按最近一次从新到旧排列

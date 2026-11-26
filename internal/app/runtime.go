@@ -148,9 +148,9 @@ func newRuntime(
 	service.orgDisabled = openOrgDisabledRegistry(store.PrimaryDirectory(), requests)
 	// 续签换掉登录签名 Cookie 时在提交处更新两张登记表记下的登录签名，不当作重新上传（见 authRuntimeRefresher.renewed）
 	refresher.renewed = service.noteLoginIdentity
-	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）
-	service.reconcilePermissionDenied()
-	service.reconcileOrgDisabled()
+	// 服务停止期间替换了认证文件或删除了账户目录：账户池与登记表都载入后对照一次（账户目录扫描第一次看到的文件只记作基准）；
+	// 按登录签名清除了登记的账户在新账户自动处理队列建好后加入验证（见 reconcileAuthFiles）
+	reconciled := append(service.reconcilePermissionDenied(), service.reconcileOrgDisabled()...)
 	// 按登记整理需要验证账号的暂停（见 reconcileVerifyRequiredPauses）：只在一个模型上要求验证的账户把整户暂停改为只暂停这个模型，
 	// 两个及以上模型、还没有暂停的补写整户暂停。要在对照之后（认证文件已更新的账户先清除登记）、首次预热之前，免得预热为它们冷启动 Worker
 	// 只为再吃一次 403，也免得只在一个模型上要求验证的账户的 Worker 被当成整户暂停释放
@@ -178,6 +178,11 @@ func newRuntime(
 	service.setStatusPublisher(func() { admin.publishStatus(lifecycle) })
 	// 新账户自动处理：先载入处理记录，再开始扫描目录，保证扫描导入的账户能进入队列
 	admin.onboard = newAccountOnboarder(admin, store.PrimaryDirectory())
+	service.reauthOnboard.Store(admin.onboard)
+	// 服务停止期间重新上传的认证文件（见 auth_file_stamps.go）：对照上次正常关闭时写下的记录，失效账户按重新上传处理、加入验证；
+	// 要在开始处理队列与扫描目录之前。stampsToken 为本实例的编号，关闭时只有最新装配的实例写出新的记录
+	stampsToken := authFileStampsOwner.Add(1)
+	admin.reconcileAuthFiles(loadAuthFileStamps(authFileStampsPath(), requests), reconciled)
 	go admin.onboard.run(lifecycle)
 	// 生成服务实例存活期间自动识别新增、删除与重新登录的账户目录
 	go admin.watchAccountDirectories(lifecycle)
@@ -209,6 +214,8 @@ func newRuntime(
 		if flushErr := pool.FlushAllDeferredStorage(); flushErr != nil {
 			requests.log("service", "WARN", "暂存的认证 Cookie 写盘失败 | 错误="+flushErr.Error())
 		}
+		// Worker 都已关闭、暂存的 Cookie 已写盘：写下各账户认证文件的状态，下次启动对照服务停止期间重新上传的认证文件（见 auth_file_stamps.go）
+		saveAuthFileStamps(authFileStampsPath(), pool, stampsToken, requests)
 		// 推迟写盘的模型资格成功时间（最多 30 秒，见 aistudio/model_access_deferral.go）：Worker 都关了、收尾的请求都已记下成功之后写出，
 		// 之后改为立即写
 		if flushErr := pool.SetModelAccessDeferral(false); flushErr != nil {
@@ -3049,6 +3056,9 @@ type trackedService struct {
 	permissionDenied *permissionDeniedRegistry
 	// orgDisabled 为组织停用 AI Studio 的账户的登记表（见 org_disabled.go），保存在账户目录，跨重启保留；为空时只写账户池的标记
 	orgDisabled *orgDisabledRegistry
+	// reauthOnboard 为新账户自动处理队列：重新上传认证文件后验证通过的账户又返回 403 时改记那次的结果（见 accountOnboarder.noteForbidden）；
+	// 为空时不记
+	reauthOnboard atomic.Pointer[accountOnboarder]
 	// buildPause 为 Build 通道生成的暂停状态（官网停用经 Build 代理的生成，见 build_pause.go），进程内、不持久化；
 	// 经 buildPauses 读取（测试直接构造的实例在第一次使用时建立）
 	buildPause     *buildPauseTracker

@@ -567,7 +567,13 @@ type Account struct {
 	runtimeMu         sync.Mutex
 	persistenceLocked bool
 	// deferredStorage 为只有轮换 Cookie 变化、还没写盘的认证状态（见 cookie_write.go），受 storageMu 保护
-	deferredStorage       *deferredStorage
+	deferredStorage *deferredStorage
+	// storageSynced 为本服务最近一次读入（载入账户）或写入认证文件之后文件的修改时间、大小与内容指纹（见 StorageFileSynced、
+	// StorageFileOwned）：目录扫描据此区分本服务自己读入或写入的文件与外部重新上传的文件
+	storageSynced atomic.Pointer[syncedStorage]
+	// storageLoaded 为本服务最近一次从外部读入的认证文件（载入账户，或目录扫描载入的重新上传，见 SaveLoadedStorageState）原始内容的指纹，
+	// 本服务之后自己写回认证文件也不变（见 StorageFileKnown）
+	storageLoaded         atomic.Pointer[StorageDigest]
 	authGeneration        uint64
 	authCheckedAt         time.Time
 	modelAccessGeneration uint64
@@ -2370,6 +2376,22 @@ func (p *AccountPool) ModelAccessGeneration(accountID string) uint64 {
 
 // SaveStorageState 在租约内原子写回认证状态
 func (l *AccountLease) SaveStorageState(state StorageState) error {
+	return l.saveStorageState(state, false)
+}
+
+// SaveLoadedStorageState 与 SaveStorageState 相同，state 是从外部认证文件（目录扫描发现的重新上传）读入的，digest 为那个文件原始内容的
+// 指纹：保存后记下它，之后原样重新上传同一份文件时能认出来（见 StorageFileKnown）。磁盘上已经逐字节是要写的内容时不重写文件，
+// 只推进认证代际（见 writeStorageUnlessSameLocked）：共用账户目录的进程各自载入同一次上传时不再互相触发
+func (l *AccountLease) SaveLoadedStorageState(state StorageState, digest StorageDigest) error {
+	if err := l.saveStorageState(state, true); err != nil {
+		return err
+	}
+	l.account.storageLoaded.Store(&digest)
+	return nil
+}
+
+// saveStorageState 为 SaveStorageState 与 SaveLoadedStorageState 的实现；unlessSame 为真时磁盘上已经是这份内容就不重写文件
+func (l *AccountLease) saveStorageState(state StorageState, unlessSame bool) error {
 	if l == nil || l.account == nil || l.pool == nil {
 		return fmt.Errorf("账户租约未初始化")
 	}
@@ -2380,7 +2402,11 @@ func (l *AccountLease) SaveStorageState(state StorageState) error {
 	}
 	l.account.storageMu.Lock()
 	defer l.account.storageMu.Unlock()
-	if err := l.account.writeStorageLocked(state); err != nil {
+	write := l.account.writeStorageLocked
+	if unlessSame {
+		write = l.account.writeStorageUnlessSameLocked
+	}
+	if err := write(state); err != nil {
 		return err
 	}
 	l.pool.mu.Lock()
@@ -2596,6 +2622,12 @@ func (l *AccountLease) ReloadStorageState() (StorageState, error) {
 	if err != nil {
 		return StorageState{}, err
 	}
+	if l.pool.usableLoginReplaced(l.account, state) {
+		// 磁盘上的认证文件已被外部换成另一个能用的登录（重新上传了新登录，扫描还没载入）：这次照样按磁盘返回（与原来相同），但不读进
+		// 内存。原先把新文件直接读进内存，内存与磁盘的登录签名一致了，扫描再也看不出这次重新上传（不关旧浏览器、不推进代际、
+		// 不清除 403 登记、不排队验证），旧浏览器随后写回的 Cookie 又把新登录盖掉
+		return state, nil
+	}
 	l.pool.mu.Lock()
 	l.account.StorageState = state
 	l.pool.mu.Unlock()
@@ -2627,6 +2659,12 @@ func (l *AccountLease) ReplaceCookies(cookies []StateCookie) error {
 	previous, err := l.pool.loadStorageLocked(l.account)
 	if err != nil {
 		return err
+	}
+	if l.pool.usableLoginReplaced(l.account, previous) {
+		// 磁盘上的认证文件已被外部换成另一个能用的登录（重新上传了新登录，扫描还没载入，同 MergeBrowserCookies）：浏览器里是旧登录的
+		// Cookie，原先按浏览器的值覆盖磁盘并立即写盘，新登录的签名 Cookie 被旧登录的顶掉，之后扫描只看到本服务自己写的文件，
+		// 这次重新上传整个丢失。不写回，由扫描载入新登录、关闭这个旧浏览器
+		return nil
 	}
 	state := cloneStorageState(previous)
 	state.Cookies = mergeStateCookies(previous.Cookies, cookies, time.Now())
@@ -2692,14 +2730,30 @@ func (p *AccountPool) MergeBrowserCookies(accountID string, generation uint64, c
 // 新登录的签名 Cookie、旧浏览器的 localStorage 盖住新登录的，内存与磁盘的登录签名又一致，扫描再也发现不了这次重新上传
 // （推进代际、清除 403 登记、恢复需要登录的账户等全部丢失）。是时记下账户（同 MergeSetCookieHeaders），由扫描载入
 func (p *AccountPool) externalLoginReplaced(account *Account, state StorageState) bool {
+	differs, _ := p.externalLogin(account, state)
+	return differs
+}
+
+// usableLoginReplaced 与 externalLoginReplaced 相同，只是磁盘上的新文件还要能签名（有效的登录签名 Cookie 齐全）才算被换成了另一个登录。
+// 每个请求都会经过的回写与读取（ReplaceCookies、MergeSetCookieHeaders、ReloadStorageState）用它：换上的文件不能用时照原来的方式合并，
+// 浏览器里能用的登录随之写回，不会因为一份坏文件一直跳过回写、每轮扫描都重新载入失败一次
+func (p *AccountPool) usableLoginReplaced(account *Account, state StorageState) bool {
+	_, usable := p.externalLogin(account, state)
+	return usable
+}
+
+// externalLogin 对照磁盘上的认证文件 state 与内存里的登录状态（调用方持有 storageMu）：differs 为登录签名 Cookie 不同（这时记下账户，
+// 由扫描载入），usable 为不同并且 state 能签名
+func (p *AccountPool) externalLogin(account *Account, state StorageState) (differs bool, usable bool) {
 	p.mu.Lock()
 	memory := account.StorageState
 	p.mu.Unlock()
 	if LoginIdentity(state) == LoginIdentity(memory) {
-		return false
+		return false, false
 	}
 	externalLoginChanges.Store(account.ID, struct{}{})
-	return true
+	_, err := NewSigner().Sign(state)
+	return true, err == nil
 }
 
 // BrowserLocalStorageOrigin 为 Worker 启动后写回 localStorage 的唯一 origin（见 MergeBrowserLocalStorage）
@@ -2929,9 +2983,10 @@ func (l *AccountLease) MergeSetCookieHeaders(headers []string, requestURL string
 		return err
 	}
 	// 磁盘上的登录 Cookie 已被外部更新（与内存不同）：记下来，由账户目录扫描在账户空闲时重启它的浏览器，
-	// 让浏览器与签名用同一份新 Cookie。只比较几个 Cookie 值，不加锁
-	if LoginIdentity(previous) != LoginIdentity(l.account.StorageState) {
-		externalLoginChanges.Store(l.account.ID, struct{}{})
+	// 让浏览器与签名用同一份新 Cookie（见 externalLogin）。换上的是另一个能用的登录时不合并：这次响应属于内存里的旧登录会话，
+	// 原先照样把旧会话的轮换 Cookie（__Secure-1PSIDTS 等）写进新登录的文件，扫描随后载入的新登录带着旧会话的 Cookie
+	if _, usable := l.pool.externalLogin(l.account, previous); usable {
+		return nil
 	}
 	state := cloneStorageState(previous)
 	if err := state.MergeSetCookieHeaders(headers, requestURL, now); err != nil {
@@ -4570,7 +4625,8 @@ func loadAccount(directory string) (*Account, error) {
 	if err != nil {
 		return nil, fmt.Errorf("账户 %s: %w", id, err)
 	}
-	state, err := LoadStorageState(storagePath)
+	before, statted := statStorage(storagePath)
+	state, digest, err := LoadStorageStateDigest(storagePath)
 	if err != nil {
 		return nil, fmt.Errorf("账户 %s: %w", id, err)
 	}
@@ -4579,7 +4635,7 @@ func loadAccount(directory string) (*Account, error) {
 	if err != nil {
 		return nil, fmt.Errorf("账户 %s: %w", id, err)
 	}
-	return &Account{
+	account := &Account{
 		ID:           id,
 		Directory:    directory,
 		ConfigPath:   configPath,
@@ -4590,7 +4646,13 @@ func loadAccount(directory string) (*Account, error) {
 		BenefitTier:  runtimeState.BenefitTier,
 		State:        initialAccountState(accountConfig, state),
 		runtime:      runtimeState,
-	}, nil
+	}
+	// 读取前后文件状态相同才记下：读取期间被改写时不记，目录扫描照常读文件对照
+	if after, ok := statStorage(storagePath); statted && ok && after.same(before) {
+		account.storageSynced.Store(&syncedStorage{stamp: after, digest: digest})
+	}
+	account.storageLoaded.Store(&digest)
+	return account, nil
 }
 
 func initialAccountState(accountConfig AccountConfig, state StorageState) AccountState {

@@ -4,7 +4,13 @@ import { api } from '@/api'
 import { trackPendingWrite } from '@/assetRecovery'
 import { confirmAction } from '@/confirm'
 import { useI18n, type TranslationKey } from '@/i18n'
-import type { OnboardingPolicy, OnboardingResult, OnboardingStatus } from '@/types'
+import type {
+  OnboardingEvent,
+  OnboardingPolicy,
+  OnboardingResult,
+  OnboardingStatus,
+  ReauthOutcome,
+} from '@/types'
 
 // 新账户自动处理：显示队列状态，修改设置后自动保存并立即生效
 const props = defineProps<{
@@ -46,12 +52,71 @@ const resultClass: Record<OnboardingResult, string> = {
 // 顶部汇总只显示与新账户处理相关的结果
 const summaryResults: OnboardingResult[] = ['enabled', 'verified', 'verify_failed', 'error']
 
+// 重新上传认证文件后的结果（最近处理里重新上传的记录与顶部汇总）：绿色为恢复，红色为仍失效，黄色为验证出错，灰色为没有验证
+const outcomeKeys: Record<ReauthOutcome, TranslationKey> = {
+  restored: 'onboard.reauthOutcome.restored',
+  auth_required: 'onboard.reauthOutcome.auth_required',
+  verify_required: 'onboard.reauthOutcome.verify_required',
+  forbidden: 'onboard.reauthOutcome.forbidden',
+  restricted: 'onboard.reauthOutcome.restricted',
+  manual_disabled: 'onboard.reauthOutcome.manual_disabled',
+  verify_off: 'onboard.reauthOutcome.verify_off',
+  error: 'onboard.reauthOutcome.error',
+  skipped: 'onboard.reauthOutcome.skipped',
+}
+const outcomeClass: Record<ReauthOutcome, string> = {
+  restored: 'text-green-400',
+  auth_required: 'text-red-400',
+  verify_required: 'text-red-400',
+  forbidden: 'text-red-400',
+  restricted: 'text-red-400',
+  manual_disabled: 'text-gray-400',
+  verify_off: 'text-gray-400',
+  error: 'text-yellow-400',
+  skipped: 'text-gray-400',
+}
+const outcomeOrder: ReauthOutcome[] = [
+  'restored',
+  'auth_required',
+  'verify_required',
+  'forbidden',
+  'restricted',
+  'error',
+  'manual_disabled',
+  'verify_off',
+  'skipped',
+]
+// reauthOutcomeCounts 为各账户最近一次重新上传后的结果计数（旧版服务没有这个字段，按空处理），只列出有的
+const reauthOutcomeCounts = computed(() => {
+  const counts = status.value?.reauth_outcomes ?? {}
+  return outcomeOrder
+    .filter((outcome) => (counts[outcome] ?? 0) > 0)
+    .map((outcome) => ({ outcome, count: counts[outcome] ?? 0 }))
+})
+
+// eventOutcome 为最近处理里重新上传记录的结果；新账户的记录、旧版服务没有结果时为空
+function eventOutcome(event: OnboardingEvent): ReauthOutcome | null {
+  if (event.source !== 'reauth' || event.outcome === undefined) return null
+  return event.outcome in outcomeKeys ? event.outcome : null
+}
+// recentRows 为最近处理的每一行与它的重新上传结果（没有时按处理结果显示）
+const recentRows = computed(() => recent.value.map((event) => ({ event, outcome: eventOutcome(event) })))
+
 const active = computed(() => {
   const policy = status.value?.policy
   return policy !== undefined && (policy.auto_verify || policy.auto_enable)
 })
 const processing = computed(() => status.value?.processing ?? [])
 const recent = computed(() => status.value?.recent ?? [])
+// 已有账户换上新认证文件后的重新验证（计入待处理与处理中）与内容相同、没有重新认证的次数；旧版服务没有这两个字段
+const reauthCount = computed(() => status.value?.reauth ?? 0)
+const unchangedCount = computed(() => status.value?.unchanged ?? 0)
+// 状态正常的账户换上了登录签名没变的认证文件、没有重新载入的次数；旧版服务没有这个字段
+const sameLoginCount = computed(() => status.value?.same_login ?? 0)
+// 失效账户的上传没有按重新上传处理的次数（保留了原文件的修改时间、只差轮换 Cookie）与检测到认证文件更新、还没载入的账户数；
+// 旧版服务没有这两个字段
+const notReuploadedCount = computed(() => status.value?.not_reuploaded ?? 0)
+const loadingCount = computed(() => status.value?.loading ?? 0)
 
 const dirty = computed(() => {
   if (draft.value === null || status.value === null) return false
@@ -84,7 +149,8 @@ const queueText = computed(() => {
   const parts: string[] = []
   if (value.pending > 0) parts.push(tf('onboard.pending', { count: value.pending }))
   if (processing.value.length > 0) parts.push(tf('onboard.processing', { count: processing.value.length }))
-  if (parts.length === 0) return t('onboard.idle')
+  // 等待载入的另起一个标签显示（见模板）：队列为空、只是还没载入时不写“队列为空”
+  if (parts.length === 0) return loadingCount.value > 0 ? '' : t('onboard.idle')
   if (value.pending > 0 && processing.value.length === 0) {
     parts.push(
       value.next_batch_seconds <= 0
@@ -199,13 +265,42 @@ onUnmounted(() => {
     <div class="flex flex-wrap items-center gap-x-3 gap-y-2">
       <span class="dot" :class="active ? 'bg-green-500' : 'bg-gray-600'"></span>
       <span class="font-bold text-gray-100">{{ t('onboard.title') }}</span>
-      <span v-tooltip="processing.join('\n')" class="text-xs text-gray-400">{{ queueText }}</span>
+      <span v-if="queueText !== ''" v-tooltip="processing.join('\n')" class="text-xs text-gray-400">{{ queueText }}</span>
+      <!-- 待处理与处理中里重新上传的个数（已计入两者），说明挂在这里 -->
+      <span
+        v-if="active && reauthCount > 0"
+        v-tooltip="t('onboard.reauthTip')"
+        class="text-xs text-sky-300"
+      >
+        {{ tf('onboard.reauth', { count: reauthCount }) }}
+      </span>
+      <span v-if="loadingCount > 0" v-tooltip="t('onboard.loadingTip')" class="text-xs text-sky-300">
+        {{ tf('onboard.loading', { count: loadingCount }) }}
+      </span>
       <span class="flex flex-wrap gap-2 text-xs">
         <template v-for="result in summaryResults" :key="result">
           <span v-if="countOf(result) > 0" class="tag" :class="resultClass[result]">
             {{ t(resultKeys[result]) }} {{ countOf(result) }}
           </span>
         </template>
+        <span
+          v-for="item in reauthOutcomeCounts"
+          :key="item.outcome"
+          v-tooltip="t('onboard.reauthOutcomesTip')"
+          class="tag"
+          :class="outcomeClass[item.outcome]"
+        >
+          {{ tf('onboard.reauthAfter', { outcome: t(outcomeKeys[item.outcome]) }) }} {{ item.count }}
+        </span>
+        <span v-if="unchangedCount > 0" v-tooltip="t('onboard.unchangedTip')" class="tag text-gray-400">
+          {{ tf('onboard.unchanged', { count: unchangedCount }) }}
+        </span>
+        <span v-if="sameLoginCount > 0" v-tooltip="t('onboard.sameLoginTip')" class="tag text-gray-400">
+          {{ tf('onboard.sameLogin', { count: sameLoginCount }) }}
+        </span>
+        <span v-if="notReuploadedCount > 0" v-tooltip="t('onboard.notReuploadedTip')" class="tag text-yellow-400">
+          {{ tf('onboard.notReuploaded', { count: notReuploadedCount }) }}
+        </span>
       </span>
       <span v-if="saving" class="text-xs text-gray-400">{{ t('onboard.saving') }}</span>
       <span v-else-if="saved" class="text-xs text-green-400">{{ t('onboard.saved') }}</span>
@@ -271,11 +366,23 @@ onUnmounted(() => {
         <div v-else class="max-h-64 overflow-auto">
           <table class="data-table">
             <tbody>
-              <tr v-for="event in recent" :key="`${event.account_id}-${event.at}`">
-                <td class="w-24 whitespace-nowrap font-mono text-xs text-gray-500">{{ formatTime(event.at) }}</td>
-                <td class="font-mono text-xs text-gray-200">{{ event.account_id }}</td>
-                <td class="w-28 whitespace-nowrap text-xs" :class="resultClass[event.result]">
+              <tr v-for="{ event, outcome } in recentRows" :key="`${event.account_id}-${event.at}`">
+                <!-- 窄屏不显示时间列，账户与结果放得下 -->
+                <td class="hidden w-24 whitespace-nowrap font-mono text-xs text-gray-500 sm:table-cell">
+                  {{ formatTime(event.at) }}
+                </td>
+                <td class="font-mono text-xs text-gray-200">
+                  <div v-tooltip="event.account_id" class="cell-truncate">{{ event.account_id }}</div>
+                </td>
+                <!-- 重新上传后的结果比处理结果长：结果列放宽，窄屏时换行，不压到相邻列 -->
+                <td v-if="outcome !== null" class="w-32 break-words text-xs sm:w-40" :class="outcomeClass[outcome]">
+                  {{ tf('onboard.reauthAfter', { outcome: t(outcomeKeys[outcome]) }) }}
+                </td>
+                <td v-else class="w-32 whitespace-nowrap text-xs sm:w-40" :class="resultClass[event.result]">
                   {{ t(resultKeys[event.result]) }}
+                  <span v-if="event.source === 'reauth'" v-tooltip="t('onboard.sourceReauthTip')" class="tag ml-1 text-sky-300">
+                    {{ t('onboard.sourceReauth') }}
+                  </span>
                 </td>
                 <td>
                   <div v-tooltip="event.detail || ''" class="cell-truncate text-xs text-gray-500">
